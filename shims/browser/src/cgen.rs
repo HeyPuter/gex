@@ -1720,11 +1720,28 @@ pub(crate) fn leaves() -> u64 {
 /// Pages that retired: any an installed unit covers whose bytes are no longer
 /// the ones it was built from gets its bit in `gex_abi::PATCHED_PAGES`, and
 /// compiled code stops calling into it (the native `on_retire`).
-pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
-    on_retire_pages(ranges);
+///
+/// `gone` (within `ranges`): pages no longer mapped executable. A unit there
+/// is dead whatever the bytes still hash to -- an unmapped object's bytes
+/// stay until the next mapping overwrites them, and that mapping retires
+/// nothing. Its entries leave the table now: otherwise the object that next
+/// lands there (HK: libxcb where libdbus had been, both with units) clears
+/// the bits for its own unit and every address it does not define runs the
+/// old object's functions.
+pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
+    on_retire_pages(ranges, gone);
+    libprov::forget_gone(gone);
     // After the bits: a lookup once the probe cache is cleared sees them.
     let memory = crate::guest_bytes();
     ftab(|m| {
+        for &(start, end) in gone {
+            for (a, f) in m.range(start, end).collect::<Vec<_>>() {
+                let i = m.install(f.install);
+                if i.tier == Tier::Unit && i.module < PROVIDER {
+                    m.retire(a);
+                }
+            }
+        }
         for &(start, end) in ranges {
             for (a, _) in m.range(start, end).collect::<Vec<_>>() {
                 gex_kernel::ftab::fcache_clear(memory, a);
@@ -1733,14 +1750,16 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
     });
 }
 
-fn on_retire_pages(ranges: &[(u64, u64)]) {
+fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };
     let memory = crate::guest_bytes();
     for &(start, end) in ranges {
         for page in start / gex_abi::DISPATCH_PAGE..end.div_ceil(gex_abi::DISPATCH_PAGE) {
             let Some(&built) = pages.get(&page) else { continue };
-            if page_hash(memory, page) != built {
+            let at = page * gex_abi::DISPATCH_PAGE;
+            let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
+            if unmapped || page_hash(memory, page) != built {
                 let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
                 if let Some(b) = memory.get_mut(off) {
                     *b |= 1 << (page % 8);

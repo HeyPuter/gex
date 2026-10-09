@@ -973,14 +973,26 @@ static UNIT_PAGES: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 /// Pages that have retired (`retire_translations`): any an installed unit
 /// covers whose bytes are no longer the ones it was built from gets its bit
 /// in `gex_abi::PATCHED_PAGES`, and compiled code stops calling into it.
-pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
+///
+/// `gone` (within `ranges`): pages no longer mapped executable. A unit there
+/// is dead whatever the bytes still hash to -- an unmapped object's bytes stay
+/// until the next mapping overwrites them, and that mapping retires nothing
+/// (the browser's `cgen::on_retire`). An ELF object whose code was there is
+/// placed again if it is mapped again.
+pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
+    ELF_SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(_, _, (lo, hi))| !gone.iter().any(|&(s, e)| s < *hi && *lo < e));
     let memory = memory.bytes();
     let guard = UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = guard.as_ref() else { return };
     for &(start, end) in ranges {
         for page in start / gex_abi::DISPATCH_PAGE..end.div_ceil(gex_abi::DISPATCH_PAGE) {
             let Some(&built) = pages.get(&page) else { continue };
-            if page_hash(memory, page) != built {
+            let at = page * gex_abi::DISPATCH_PAGE;
+            let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
+            if unmapped || page_hash(memory, page) != built {
                 let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
                 if let Some(b) = memory.get_mut(off) {
                     *b |= 1 << (page % 8);
@@ -1676,7 +1688,7 @@ fn elf_wanted(path: &str) -> bool {
 }
 
 /// Objects already looked at in this host process, by path and bias.
-static ELF_SEEN: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+static ELF_SEEN: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new());
 
 /// After a syscall that mapped code: install the unit of each listed ELF
 /// object (`GEX_ELF_UNITS`), before ld.so runs any of it.
@@ -1692,15 +1704,16 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let Some(base) = elf_bias(&bytes, m.start, m.offset) else {
             continue;
         };
-        {
-            let mut seen = ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.iter().any(|(p, b)| *p == m.path && *b == base) {
-                continue;
-            }
-            seen.push((m.path.clone(), base));
+        if ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(p, b, _)| *p == m.path && *b == base) {
+            continue;
         }
         let t0 = std::time::Instant::now();
         let image = elf_image(&bytes, base)?;
+        // The executable span, so a retirement of that code forgets the object (`on_retire`).
+        let span = image.segments.iter().filter(|s| s.executable).fold((u64::MAX, 0u64), |(lo, hi), s| {
+            (lo.min(s.vaddr), hi.max(s.vaddr + s.bytes.len() as u64))
+        });
+        ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((m.path.clone(), base, span));
         let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
         let key = unit_key(&image, &none);
         let cwasm_path = cache_root()?.join(&key).join("c.wasm");

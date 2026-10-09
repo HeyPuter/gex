@@ -1071,6 +1071,44 @@ pub struct CodeMap {
     pub offset: u64,
 }
 
+impl CodeMap {
+    /// The executable segments of an ELF object gex's own loader placed at
+    /// load bias `bias` (the interpreter, at exec): what its `mmap` would have
+    /// reported had `ld.so` mapped it, so a host's ELF units see it too.
+    pub fn of_placed(path: &str, bytes: &[u8], bias: u64) -> Vec<CodeMap> {
+        let rd = |o: usize, n: usize| -> Option<u64> {
+            let b = bytes.get(o..o + n)?;
+            let mut v = [0u8; 8];
+            v[..n].copy_from_slice(b);
+            Some(u64::from_le_bytes(v))
+        };
+        let mut out = Vec::new();
+        if bytes.get(0..4) != Some(b"\x7fELF") || bytes.get(4) != Some(&2) {
+            return out;
+        }
+        let (Some(phoff), Some(phentsize), Some(phnum)) = (rd(0x20, 8), rd(0x36, 2), rd(0x38, 2)) else {
+            return out;
+        };
+        for i in 0..phnum as usize {
+            let ph = phoff as usize + i * phentsize as usize;
+            let (Some(ty), Some(flags), Some(off), Some(vaddr), Some(filesz)) =
+                (rd(ph, 4), rd(ph + 4, 4), rd(ph + 8, 8), rd(ph + 16, 8), rd(ph + 32, 8))
+            else {
+                break;
+            };
+            if ty == 1 && flags & 1 != 0 && filesz != 0 {
+                out.push(CodeMap {
+                    start: bias + (vaddr & !0xfff),
+                    end: crate::mem::page_align_up(bias + vaddr + filesz),
+                    path: path.to_string(),
+                    offset: off & !0xfff,
+                });
+            }
+        }
+        out
+    }
+}
+
 /// A `MAP_SHARED` file mapping, and where its bytes belong.
 ///
 /// A file mapping here is an eager copy rather than a page table pointed at

@@ -190,6 +190,15 @@ async function main() {
   // libraries with two sets of GL state. Symlinks are not followed here: a
   // bundle is made with -h.
   const hard = Object.fromEntries(Object.entries(tree.hard ?? {}).filter(([, t]) => files[t]));
+  // `lazy=URL`: a manifest, {"base": URL prefix, "files": [[guest path, size,
+  // path under base], ...]}, of files the guest reads from the server as it
+  // reads them instead of from the bundle (a game's data).
+  let lazy = [];
+  if (q.get('lazy')) {
+    const m = await (await fetch(q.get('lazy'))).json();
+    lazy = m.files.map(([path, size, rel]) => [path, size, m.base + rel.split('/').map(encodeURIComponent).join('/')]);
+    mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
+  }
   const exe = q.get('exe') || '/t/window.exe';
   const exeBytes = files[exe] ?? files[hard[exe]];
   if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
@@ -219,6 +228,7 @@ async function main() {
     dirs: tree.dirs,
     modes: tree.modes,
     hard,
+    lazy,
     env,
     args,
     cwd: q.get('cwd') || exe.replace(/\/[^/]*$/, '') || '/',

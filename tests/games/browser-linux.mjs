@@ -9,11 +9,18 @@
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST] [--home DIR]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
 //        [--profile AT,SECS[,MATCH]] [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
+//        [--lazy DIR] [--pins FILE]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
 // --gameplay N: report when the page has presented N GL frames.
 // --mem64: a 64-bit guest memory (the wasm64 shim, `?mem64=1`; docs/unity-dotnet.md P5).
+// --lazy DIR: every file under DIR the bundle lacks, at /game/REL, read from the
+// page's server as the game reads it (a megabyte at a time; `?lazy=`), not bundled.
+// The input script's `move X Y` / `click X Y` are in the game window's pixels.
+// --pins FILE: load addresses for libraries, `BASE SPAN PATH` per line (hex; `gexc run --pin`'s
+// format), added to the query's `pins=`: units built for those bases (`elfunits=`) then keep
+// applying when an unrelated change moves where the loader would have put them.
 // --env: more environment for the guest. --end-on-exit: a program that exits is a result
 // (its output and status are printed), not a failure.
 // Needs web/public/gex built (shims/browser/build.sh), Mesa's wasm
@@ -115,6 +122,45 @@ function bundle() {
   return out;
 }
 
+/** --query plus --pins FILE (`BASE SPAN PATH` lines) merged into its `pins=`. */
+function query() {
+  const q = new URLSearchParams(opt('--query', '') || '');
+  const file = opt('--pins', null);
+  if (file) {
+    const more = readFileSync(file, 'utf8').split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean).map((l) => {
+      const [base, span, path] = l.split(/\s+/);
+      if (!path) throw new Error(`--pins ${file}: cannot read '${l}'`);
+      return `${path}@${base.replace(/^0x/, '')}+${span.replace(/^0x/, '')}`;
+    });
+    q.set('pins', [q.get('pins'), ...more].filter(Boolean).join(','));
+  }
+  const s = q.toString();
+  return s ? `&${s}` : '';
+}
+
+/** --lazy DIR: served at /gex/lazy/NAME/ (a link), listed in /gex/nt/NAME.lazy.json. */
+function lazyManifest() {
+  const dir = opt('--lazy', null);
+  if (!dir) return null;
+  const link = join(WEB, `public/gex/lazy/${name}`);
+  mkdirSync(dirname(link), { recursive: true });
+  rmSync(link, { force: true });
+  symlinkSync(dir, link);
+  const files = [];
+  const walk = (rel) => {
+    for (const e of readdirSync(join(dir, rel))) {
+      const r = rel ? `${rel}/${e}` : e;
+      const st = statSync(join(dir, r));
+      if (st.isDirectory()) walk(r);
+      else if (st.isFile()) files.push([`/game/${r}`, st.size, r]);
+    }
+  };
+  walk('');
+  writeFileSync(join(WEB, `public/gex/nt/${name}.lazy.json`), JSON.stringify({ base: `/gex/lazy/${name}/`, files }));
+  log(`lazy: ${files.length} files, ${(files.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB under ${dir}`);
+  return `/gex/nt/${name}.lazy.json`;
+}
+
 /** A GEX_WL_INPUT script: `frames N`, then `SECONDS tap|key NAME [1|0]`. */
 function script() {
   const file = opt('--input', null);
@@ -128,6 +174,7 @@ function script() {
     const t = Number(w[0]);
     if (w[1] === 'tap') { events.push([t, w[2], 'keydown'], [t + 0.1, w[2], 'keyup']); }
     else if (w[1] === 'key') events.push([t, w[2], w[3] === '1' ? 'keydown' : 'keyup']);
+    else if (w[1] === 'move' || w[1] === 'click') events.push([t, `${w[2]},${w[3]}`, w[1]]);
   }
   events.sort((a, b) => a[0] - b[0]);
   return { after, events };
@@ -151,6 +198,7 @@ async function main() {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}`);
   }
   const tar = bundle();
+  const lazy = lazyManifest();
   const libs = (opt('--libs', '') || '').split(':').filter(Boolean).map((_, i) => `/gex/libs/${i}`);
   const genv = [
     `LD_LIBRARY_PATH=${['/gex/gl', ...libs, `/game/${dirname(exe)}`].join(':')}`,
@@ -159,11 +207,12 @@ async function main() {
     ...(opt('--env', '') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean),
   ].join(',');
   const t0 = Date.now();
-  const { evaluate, state, shot, consoleLines, profile } = await openPage(
+  const { browser, page, evaluate, state, shot, consoleLines, profile } = await openPage(
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
       + (argv.includes('--mem64') ? '&mem64=1' : '') + (argv.includes('--fjit') ? '&fjit=1' : '')
       + (opt('--wasmdlls', null) ? `&wasmdlls=${encodeURIComponent(opt('--wasmdlls'))}` : '')
-      + (opt('--query', null) ? `&${opt('--query')}` : '')
+      + query()
+      + (lazy ? `&lazy=${encodeURIComponent(lazy)}` : '')
       + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
     { width: width + 20, height: height + 100, shotDir },
   );
@@ -178,6 +227,20 @@ async function main() {
   let last = 0;
   const key = (c, type) => evaluate(
     `(() => { for (const t of document.querySelectorAll('canvas')) t.dispatchEvent(new KeyboardEvent(${JSON.stringify(type)}, { code: ${JSON.stringify(c)}, key: ${JSON.stringify(c)}, bubbles: true })); return 1; })()`, true);
+  // The game window's place on the page: the compositor's toplevel
+  // (`role=1 WxH@X,Y`), the canvas at the page's origin (as browser-gui.mjs).
+  const pointer = async (type, xy) => {
+    const [x, y] = xy.split(',').map(Number);
+    const d = (await evaluate('globalThis.__gexCompositor?.describe()', true)) ?? {};
+    const m = /role=1 (\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(JSON.stringify(d));
+    const [ox, oy] = m ? [Number(m[3]), Number(m[4])] : [0, 0];
+    const at = { x: ox + x, y: oy + y };
+    await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...at, button: 'none', buttons: 0 }, page);
+    if (type === 'click') {
+      await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, button: 'left', clickCount: 1, buttons: 1 }, page);
+      await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...at, button: 'left', clickCount: 1, buttons: 0 }, page);
+    }
+  };
   const { after, events } = script();
   let first = null, start = null, next = 0, playAt = null, shots = 0, nextShot = Date.now() + 30000;
   const profSpec = opt('--profile', null) ? (([at = '300', secs = '20', match = '']) => ({ at: +at, secs: +secs, match }))(opt('--profile').split(',')) : null;
@@ -216,7 +279,8 @@ async function main() {
     }
     while (start && next < events.length && Date.now() - start >= events[next][0] * 1000) {
       const [t, k, type] = events[next++];
-      await key(code(k), type);
+      if (type === 'move' || type === 'click') await pointer(type, k);
+      else await key(code(k), type);
       log(`input at ${t} s: ${type} ${k} (present ${n})`);
     }
     if (gameplay && !playAt && n >= gameplay) {

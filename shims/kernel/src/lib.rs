@@ -1898,11 +1898,27 @@ pub extern "C" fn k_checksum(at: gex_kmem::PAddr, len: u32) -> u32 {
 
 use gex_kernel::vfs::{remote, FileHandle, FileSystem};
 
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// Fill `len` bytes at `dst` (this module's memory) with the bytes of
+    /// the URL at `url` from `offset`: the host's synchronous ranged
+    /// request, in the Worker that reads. Returns the count, or negative.
+    fn lazy_fetch(url: u32, url_len: u32, offset: u64, dst: u32, len: u32) -> i32;
+}
+
+fn fetch_lazy(url: &str, offset: u64, into: &mut [u8]) -> bool {
+    // SAFETY: both ranges are in this module's memory and stay borrowed for
+    // the call only.
+    let n = unsafe { lazy_fetch(url.as_ptr() as u32, url.len() as u32, offset, into.as_mut_ptr() as u32, into.len() as u32) };
+    n >= 0 && n as usize == into.len()
+}
+
 /// The root every process sees.
 fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     note_panics();
     static ROOT: OnceLock<std::sync::Arc<gex_kernel::vfs::TmpFs>> = OnceLock::new();
     ROOT.get_or_init(|| {
+        gex_kernel::vfs::tmpfs::set_lazy_fetch(fetch_lazy);
         let fs = gex_kernel::vfs::TmpFs::new();
         // Directories a guest expects before anything is bundled: `open(O_CREAT)`
         // under a missing directory is `ENOENT`, not a directory being made.
@@ -2188,6 +2204,17 @@ pub extern "C" fn k_fs_add(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::P
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     rootfs().add_file(&p, buf);
+    0
+}
+
+/// A file in the shared root whose bytes are fetched from `url` as they are
+/// read (`TmpFs::add_lazy`): a game's data served to a page without
+/// bundling it. A path the bundle already has is left alone.
+#[no_mangle]
+pub extern "C" fn k_fs_add_lazy(path: gex_kmem::PAddr, path_len: u32, url: gex_kmem::PAddr, url_len: u32, size: u64) -> i32 {
+    let p = path_of(path, path_len);
+    let u = path_of(url, url_len);
+    rootfs().add_lazy(&p, size, &format!("/{u}"));
     0
 }
 

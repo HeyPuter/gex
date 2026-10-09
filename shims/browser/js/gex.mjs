@@ -11,6 +11,8 @@ const GUEST_BYTES = 0xffff0000;
 // memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
+import { lazyFetch } from "./lazy-fetch.mjs";
+
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
 const LIMIT64_BYTES = 16 * 2 ** 30;
@@ -1293,6 +1295,21 @@ export class Gex {
       free?.(dp, d.length);
     }
     if (partBuf) free?.(partBuf, PART);
+    // Files fetched as they are read (`gex_add_lazy`): [path, size, url],
+    // after the bundle's, which win.
+    for (const [path, size, url] of opts.lazy ?? []) {
+      if (!this.#shim.exports.gex_add_lazy) break;
+      if (files[path] !== undefined) continue;
+      const p = enc.encode(path);
+      const u = enc.encode(url);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const up = this.#shim.exports.gex_alloc(u.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#bytes().set(u, up);
+      this.#shim.exports.gex_add_lazy(pp, p.length, up, u.length, BigInt(size));
+      free?.(pp, p.length);
+      free?.(up, u.length);
+    }
     // Hard links (`web/src/tar.js`), after their targets: one inode with two
     // names, as the host had it. A shim that cannot link gets a copy.
     for (const [path, target] of Object.entries(opts.hard ?? {})) {
@@ -1757,7 +1774,7 @@ export class Gex {
       : await WebAssembly.compile(module);
     _k('instantiate');
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, process: this.#memory },
+      env: { memory, process: this.#memory, lazy_fetch: lazyFetch(memory) },
     });
     _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
