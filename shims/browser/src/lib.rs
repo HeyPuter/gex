@@ -3782,6 +3782,14 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // than copied: this runs once, and a second `gex_load` in the same Worker
     // is an `execve`, which gets its placement from the global table like
     // every other process.
+    // The interpreter, placed by gex's loader rather than mapped by the guest,
+    // announced as its `mmap` would have been: its function-tier unit
+    // (`?elfunits=ld-linux-x86-64.so.2`) is placed after the first syscall.
+    if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
+        if let Some(bytes) = read_file(path) {
+            kernel.new_code.extend(gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base()));
+        }
+    }
     kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.

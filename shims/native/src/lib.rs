@@ -1005,6 +1005,15 @@ fn run_program_with(
             .bind_host(path, Arc::new(w.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
         w
     }));
+    // The interpreter, placed by gex's loader rather than mapped by the guest,
+    // announced as its `mmap` would have been: its function-tier unit
+    // (`GEX_ELF_UNITS=ld-linux-x86-64.so.2`) is placed after the first syscall.
+    if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
+        if let Some(bytes) = kernel.read_file(path) {
+            let maps = gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base());
+            kernel.new_code.extend(maps);
+        }
+    }
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
 
