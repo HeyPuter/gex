@@ -28,6 +28,12 @@ struct Session {
     /// -- it desyncs the stream and leaves the client waiting forever.
     out: Vec<u8>,
     sent: usize,
+    /// Where requests are read into, kept: `pump` runs at every syscall of
+    /// every thread, and a fresh 64 KiB zeroed buffer each time (calloc's
+    /// memset, and glibc growing and trimming its heap around it) was most
+    /// of what a W3 game's threads spent their CPU on. Keeping it took
+    /// Retrocycles (edger, gameplay) from 3.0-3.5 fps to 38-46 fps.
+    rbuf: Vec<u8>,
 }
 
 /// The compositor, as the guest sees it: a name that accepts connections.
@@ -348,7 +354,10 @@ impl Wayland {
         sessions.retain_mut(|s| {
             let mut gone = false;
             // A big read: a toolkit's startup is a few KB of requests at once.
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = std::mem::take(&mut s.rbuf);
+            if buf.is_empty() {
+                buf = vec![0u8; 64 * 1024];
+            }
             loop {
                 let n = match s.socket.recv(&mut buf, 32, false) {
                     Ok(0) => {
@@ -372,6 +381,7 @@ impl Wayland {
                     break;
                 }
             }
+            s.rbuf = buf;
             if !due.is_empty() {
                 eprintln!("[gex] input: {}", s.client.describe_input());
             }
@@ -437,6 +447,7 @@ impl HostListener for Wayland {
             fds: Vec::new(),
             out: Vec::new(),
             sent: 0,
+            rbuf: Vec::new(),
         });
     }
 }
