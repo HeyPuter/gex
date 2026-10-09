@@ -45,6 +45,8 @@ pub(crate) struct Shared {
     pub stateful: HashMap<u32, crate::libprov::Extras>,
     /// Shared-library modules (`dylink`): how each binds its imports.
     pub dylink: HashMap<u32, Arc<crate::dylink::Binds>>,
+    /// The process's link map, when its program uses shared libraries.
+    pub dyproc: Option<crate::dylink::DyProcess>,
     /// Installs that are export providers (`publish_pairs`): native code in
     /// place of a library's, so a rewrite of the library's bytes there does
     /// not retire them (the bytes are not what runs). Noita's mod sandbox

@@ -25,7 +25,7 @@ TRIPLE=wasm32-unknown-linux-musl
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 
 # the sysroot (musl, libgex, compiler-rt, UAPI headers, binaryen)
-GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
+GEX_WASM_EXTRA_CFLAGS=-fvisibility=default GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
 # the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,

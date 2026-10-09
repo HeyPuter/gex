@@ -3,6 +3,8 @@
 //!   gex-dylink selfbind IN OUT          bind a library's imports of its own
 //!                                       functions (gex_dylink::selfbind)
 //!   gex-dylink section IN NAME DATA OUT add custom section NAME (DATA: a file)
+//!   gex-dylink fpcast-prep IN OUT       before binaryen --fpcast-emu: every
+//!   gex-dylink fpcast-post IN OUT       export gets a thunk, exported after
 //!   gex-dylink info FILE                print dylink.0, NEEDED and the table plan
 use gex_dylink::*;
 
@@ -13,6 +15,12 @@ fn main() -> Result<()> {
         Some("selfbind") if a.len() == 4 => {
             let out = selfbind(&read(&a[2])?)?;
             std::fs::write(&a[3], out)?;
+        }
+        Some("fpcast-prep") if a.len() == 4 => {
+            std::fs::write(&a[3], fpcast_prep(&read(&a[2])?)?)?;
+        }
+        Some("fpcast-post") if a.len() == 4 => {
+            std::fs::write(&a[3], fpcast_post(&read(&a[2])?)?)?;
         }
         Some("section") if a.len() == 6 => {
             let out = set_custom_section(&read(&a[2])?, &a[3], &read(&a[4])?)?;

@@ -424,6 +424,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "asyncify", |mut caller: Caller<'_, HostState>, op: i32, arg: i32| -> wasmtime::Result<i32> {
         crate::host(asyncify(&mut caller, op, arg))
     })?;
+    crate::dylink::register(linker)?;
     linker.func_wrap(IMPORT_MODULE, "fork_point", |mut caller: Caller<'_, HostState>, rec: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         match asyncify(&mut caller, 0, 0)? {
             0 => asyncify(&mut caller, 1, rec)?,

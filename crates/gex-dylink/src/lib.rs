@@ -287,34 +287,47 @@ impl Info {
             at.entry(f).or_insert(k as u32);
         }
         let mut len = self.table_size.max(self.elem.len() as u32);
-        let mut names: Vec<(&String, &Export)> = self
-            .exports
-            .iter()
-            .filter(|(_, e)| e.kind == Kind::Func)
-            .collect();
+        let mut names: Vec<(&String, &Export)> =
+            self.exports.iter().filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK)).collect();
         names.sort_by(|a, b| a.0.cmp(b.0));
-        for (_, e) in names {
-            if let std::collections::hash_map::Entry::Vacant(v) = at.entry(e.index) {
-                v.insert(len);
-                len += 1;
-            }
+        for (n, e) in names {
+            // a function pointer to an export of an fpcast module is its
+            // thunk's slot (fpcast_post)
+            let target = self.table_target(n).unwrap_or(e.index);
+            let slot = match at.get(&target) {
+                Some(&s) => s,
+                None => {
+                    at.insert(target, len);
+                    len += 1;
+                    len - 1
+                }
+            };
+            at.entry(e.index).or_insert(slot);
         }
         (len, at)
     }
 
+    /// The function a table slot for export `name` holds: its fpcast thunk
+    /// when the module has one, else the function itself.
+    pub fn table_target(&self, name: &str) -> Option<u32> {
+        let e = self.exports.get(name)?;
+        Some(self.exports.get(&format!("{FPCAST_THUNK}{name}")).map_or(e.index, |t| t.index))
+    }
+
     /// The slots [`Info::slots`] adds after the element segment: (relative
-    /// slot, export name), which the loader fills after instantiating.
+    /// slot, export to fill it with), which the loader fills after
+    /// instantiating.
     pub fn extra_slots(&self) -> Vec<(u32, String)> {
         let (_, at) = self.slots();
         let base = self.table_size.max(self.elem.len() as u32);
         let mut v: Vec<(u32, String)> = self
             .exports
             .iter()
-            .filter(|(_, e)| e.kind == Kind::Func)
+            .filter(|(n, e)| e.kind == Kind::Func && !n.starts_with(FPCAST_THUNK))
             .filter_map(|(n, e)| {
-                at.get(&e.index)
-                    .filter(|&&s| s >= base)
-                    .map(|&s| (s, n.clone()))
+                let thunk = format!("{FPCAST_THUNK}{n}");
+                let fill = if self.exports.contains_key(&thunk) { thunk } else { n.clone() };
+                at.get(&e.index).filter(|&&s| s >= base).map(|&s| (s, fill))
             })
             .collect();
         v.sort();
@@ -452,6 +465,150 @@ pub fn selfbind(wasm: &[u8]) -> Result<Vec<u8>> {
         .validate_all(&out)
         .context("selfbind: the rewritten module does not validate")?;
     Ok(out)
+}
+
+/// The custom section [`fpcast_prep`] leaves for [`fpcast_post`]: the
+/// exported functions, in the order of the passive segment it added.
+const FPCAST_PREP: &str = "gex.fpcast.prep";
+/// The prefix of the export naming an exported function's fpcast thunk.
+pub const FPCAST_THUNK: &str = "__fpcast$";
+
+/// Before binaryen's `--fpcast-emu`: a passive element segment holding
+/// every exported function, so the pass makes each a thunk of the uniform
+/// signature (it rewrites what tables can reach), and the list of their
+/// names. [`fpcast_post`] exports the thunks.
+pub fn fpcast_prep(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::Reencode;
+    let info = Info::parse(wasm)?;
+    let mut names: Vec<(&String, u32)> = info
+        .exports
+        .iter()
+        .filter(|(n, e)| e.kind == Kind::Func && e.index >= info.func_imports && !n.starts_with(FPCAST_THUNK))
+        .map(|(n, e)| (n, e.index))
+        .collect();
+    names.sort();
+    struct R {
+        funcs: Vec<u32>,
+        done: bool,
+    }
+    impl Reencode for R {
+        type Error = std::convert::Infallible;
+        fn parse_element_section(
+            &mut self,
+            elements: &mut wasm_encoder::ElementSection,
+            section: wasmparser::ElementSectionReader<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_element_section(self, elements, section)?;
+            elements.passive(wasm_encoder::Elements::Functions(self.funcs.clone().into()));
+            self.done = true;
+            Ok(())
+        }
+    }
+    let mut r = R { funcs: names.iter().map(|x| x.1).collect(), done: false };
+    let mut module = wasm_encoder::Module::new();
+    r.parse_core_module(&mut module, wasmparser::Parser::new(0), wasm).map_err(|e| anyhow!("fpcast-prep: {e:?}"))?;
+    if !r.done {
+        bail!("fpcast-prep: the module has no element section");
+    }
+    let list: String = names.iter().map(|x| format!("{}\n", x.0)).collect();
+    set_custom_section(&module.finish(), FPCAST_PREP, list.as_bytes())
+}
+
+/// After `--fpcast-emu`: export the thunk of each function [`fpcast_prep`]
+/// listed as `__fpcast$<name>` and drop the passive segment, so the loader
+/// fills function pointers to exports (`GOT.func`, `dlsym`) with thunks.
+pub fn fpcast_post(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::Reencode;
+    let mut names: Vec<String> = Vec::new();
+    let mut segs: Vec<(bool, Vec<u32>)> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            wasmparser::Payload::CustomSection(c) if c.name() == FPCAST_PREP => {
+                names = std::str::from_utf8(c.data())?.lines().map(str::to_string).collect();
+            }
+            wasmparser::Payload::ElementSection(s) => {
+                for el in s {
+                    let el = el?;
+                    let passive = matches!(el.kind, wasmparser::ElementKind::Passive);
+                    let mut fs = Vec::new();
+                    match el.items {
+                        wasmparser::ElementItems::Functions(r) => {
+                            for f in r {
+                                fs.push(f?);
+                            }
+                        }
+                        wasmparser::ElementItems::Expressions(_, r) => {
+                            for e in r {
+                                let mut ops = e?.get_operators_reader();
+                                match ops.read()? {
+                                    wasmparser::Operator::RefFunc { function_index } => fs.push(function_index),
+                                    _ => fs.push(u32::MAX),
+                                }
+                            }
+                        }
+                    }
+                    segs.push((passive, fs));
+                }
+            }
+            _ => {}
+        }
+    }
+    // the segment fpcast_prep added: the last passive one of the list's length
+    let Some(k) = segs.iter().rposition(|(p, fs)| *p && fs.len() == names.len()) else {
+        bail!("fpcast-post: the passive segment fpcast-prep added is gone");
+    };
+    let thunks = segs[k].1.clone();
+    struct R {
+        drop_seg: u32,
+        seg: u32,
+        add: Vec<(String, u32)>,
+    }
+    impl Reencode for R {
+        type Error = std::convert::Infallible;
+        fn parse_element(
+            &mut self,
+            elements: &mut wasm_encoder::ElementSection,
+            element: wasmparser::Element<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            let i = self.seg;
+            self.seg += 1;
+            if i == self.drop_seg {
+                return Ok(());
+            }
+            wasm_encoder::reencode::utils::parse_element(self, elements, element)
+        }
+        fn parse_export_section(
+            &mut self,
+            exports: &mut wasm_encoder::ExportSection,
+            section: wasmparser::ExportSectionReader<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            wasm_encoder::reencode::utils::parse_export_section(self, exports, section)?;
+            for (n, f) in &self.add {
+                exports.export(n, wasm_encoder::ExportKind::Func, *f);
+            }
+            Ok(())
+        }
+        fn parse_custom_section(
+            &mut self,
+            module: &mut wasm_encoder::Module,
+            section: wasmparser::CustomSectionReader<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            if section.name() == FPCAST_PREP {
+                return Ok(());
+            }
+            wasm_encoder::reencode::utils::parse_custom_section(self, module, section)
+        }
+    }
+    let add = names
+        .iter()
+        .zip(&thunks)
+        .filter(|(_, &t)| t != u32::MAX)
+        .map(|(n, &t)| (format!("{FPCAST_THUNK}{n}"), t))
+        .collect();
+    let mut r = R { drop_seg: k as u32, seg: 0, add };
+    let mut module = wasm_encoder::Module::new();
+    r.parse_core_module(&mut module, wasmparser::Parser::new(0), wasm).map_err(|e| anyhow!("fpcast-post: {e:?}"))?;
+    Ok(module.finish())
 }
 
 /// Add (or replace) a custom section at the end of a module.

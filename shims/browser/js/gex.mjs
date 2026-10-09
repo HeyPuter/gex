@@ -2755,6 +2755,10 @@ export class Gex {
           signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
+          // libgex's dlopen past its static registry (Wine's Unix side links
+          // it): no shared libraries here
+          dlopen: () => 0,
+          dlsym: () => 0,
         } : {}),
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
@@ -3221,6 +3225,17 @@ export class Gex {
         else if (st === 2) asyncify(4, 0);
         else throw new Error(`gex.fork_point in asyncify state ${st}`);
       },
+      // libgex's dlopen/dlsym past its static registry: shared libraries
+      // (docs/gexcc.md 7.6) load natively only so far
+      dlopen: (path, err, errlen) => {
+        const msg = new TextEncoder().encode('dlopen: wasm32 shared libraries are not loaded in the browser yet');
+        const n = Math.min(msg.length, errlen - 1);
+        const b = new Uint8Array(this.#memory.buffer, err >>> 0, n + 1);
+        b.set(msg.subarray(0, n));
+        b[n] = 0;
+        return 0;
+      },
+      dlsym: () => 0,
     };
   }
 
