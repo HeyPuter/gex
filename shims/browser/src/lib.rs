@@ -1912,6 +1912,18 @@ pub extern "C" fn gex_dump_threads() {
     });
 }
 
+/// Whether the thread whose context is at `ctx` has exited: a Worker whose
+/// own thread ended while the process goes on (a wasm32 program's worker
+/// thread, joined) is done, not stuck.
+#[no_mangle]
+pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
+    with_host(|h| {
+        h.threads
+            .iter()
+            .any(|t| t.kstate.ctx_addr == ctx as u64 && matches!(t.waiting, Waiting::Exited)) as i32
+    })
+}
+
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
 static PER_MISS_N: std::sync::atomic::AtomicUsize =

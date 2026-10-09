@@ -3808,7 +3808,9 @@ export class Gex {
             // own code and stays quiet. A give-up (nothing exited, nothing woke)
             // is the runtime stuck; that is 125 -- outside a program's range so
             // it is not mistaken for a clean exit -- and it is said out loud.
-            const stalled = e.gex_exited ? !e.gex_exited() : false;
+            // (A thread that ended in a process that goes on -- a joined
+            // worker thread -- is this Worker's end too, not a stall.)
+            const stalled = (e.gex_exited ? !e.gex_exited() : false) && !(e.gex_ctx_exited?.(ctx) > 0);
             if (stalled) {
               // Dump every thread's wait-state + pc so a give-up says WHICH
               // thread is stuck on WHAT (futex vs socket read vs exited), not
