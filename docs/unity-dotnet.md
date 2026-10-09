@@ -1907,3 +1907,43 @@ Not yet:
      - **HK's start-up in the page (hp7, the unit):** first frame 55 s;
        "Performing automatic level start" by 122 s; 18 presents/s by 152 s;
        the menu is up at about 2.5 min (native gate: menu ready 406.5 s).
+     - **After the fix (2026-10-08 evening; `hk-bis.sh`, `hk-bisu.sh` for
+       the unit runs; lit = the compositor's lit pixels, ~59k the menu):**
+
+       | run | config | result |
+       |---|---|---|
+       | hb26 | full fjit, no unit | never lit, 59.5 presents/s; player log: "The selected window backend is (null)", "Video subsystem has not been initialized", "Desktop is 0 x 0" |
+       | hb27 | +UnityPlayer.so | menu (lit from ~270 s) |
+       | hb28 | +libc.so.6 | menu (lit from ~210 s) |
+       | hb29 | -UnityPlayer.so,-libc.so.6 | never lit; SDL's X11 video init fails as in hb26 |
+       | hp8 | full fjit + the pinned unit | died at 32 s: p_memcpy OOB from libxcb `_xcb_in_read_block` (+0xf16f), `queue_len` negative (as hp1) |
+       | hu1 | +libxcb.so.1 + the unit | menu at 393 s, 8.9 presents/s |
+       | hu2 | -libxcb.so.1 + the unit | **menu, 41.6 presents/s** (first frame 128 s, 100 presents 166 s, 41.1-41.7 from 302 s) |
+
+       - hu2 against hp7 (the unit, no fjit): 41.6 vs 26.3 presents/s at
+         the menu (58% more), and against native gexc's 30.59 (36% more);
+         but the first frame is later (128 vs 55 s), as the JIT compiles.
+       - libxcb crashes only with other objects JIT-compiled too, and alone
+         it is fine (hu1). `queue_len` can only go negative if two threads
+         run `read_packet` at once, so the suspect is the iolock: libxcb
+         drops it around `poll()` in `_xcb_conn_wait` and takes it again
+         after. A wrong resume after the blocking poll (the class of the
+         stale-resume bug) would skip the re-lock.
+       - The black screen is in the X/SDL init and needs neither UnityPlayer
+         nor libc JIT-compiled (hb29). `q21.sh` bisects the rest strictly:
+         hb30 libX11+libxcb, hb31 the X extension libraries, hb32 ld.so,
+         libdl, libpthread, libm, libstdc++, libgcc_s, librt.
+     - **xbig in the page (xb3 without fjit, xb4 with):** both print
+       "mapped" and "property ok" (the 300 KB property read back) and then
+       nothing for 10 min, so the next step (XGetImage of the 400x300
+       window, a 480 KB reply) hangs or crawls in the page with or without
+       the JIT. xb5 (xbig with per-step times) is queued.
+     - **Muck's grass is fixed by `?gllimits=41` with GL's rebased Mesa
+       (mods/gpu, mesa-wink gl/perf 60202246):** mpg3 (fjit + the unit):
+       the context is GL 4.2, no "Shader Unsupported" for the grass, and
+       `shots/mpg3/c013.png` shows the grass blades and the full 3D menu
+       scene; 36.6-38.1 presents/s. mpg1/mpg2 (mods/gpu at GL 4.0) were
+       dots. With the site Mesa (mpg4) the 3D scene is never drawn (lit
+       5179; "WebGPU validation: Bind group layout ..."), so it needs both.
+       mp26's black scene was at GL 4.6 (the compute limits too); 4.1's
+       texture limits alone do not cause it.
