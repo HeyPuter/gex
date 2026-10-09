@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 715 claimable, 145 withheld for missing entry
+ * 710 claimable, 150 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -106,7 +106,6 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_explicit_uniform_location",
     "GL_ARB_fragment_coord_conventions",
     "GL_ARB_fragment_layer_viewport",
-    "GL_ARB_fragment_program_shadow",
     "GL_ARB_fragment_shader",
     "GL_ARB_fragment_shader_interlock",
     "GL_ARB_framebuffer_no_attachments",
@@ -288,6 +287,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_EXT_draw_range_elements",
     "GL_EXT_draw_transform_feedback",
     "GL_EXT_float_blend",
+    "GL_EXT_fog_coord",
     "GL_EXT_fragment_shading_rate",
     "GL_EXT_framebuffer_blit",
     "GL_EXT_framebuffer_blit_layers",
@@ -338,6 +338,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_EXT_rescale_normal",
     "GL_EXT_sRGB",
     "GL_EXT_sRGB_write_control",
+    "GL_EXT_secondary_color",
     "GL_EXT_semaphore_fd",
     "GL_EXT_separate_depth_stencil",
     "GL_EXT_separate_specular_color",
@@ -497,9 +498,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_NV_fog_distance",
     "GL_NV_fragment_coverage_to_color",
     "GL_NV_fragment_program",
-    "GL_NV_fragment_program2",
     "GL_NV_fragment_program4",
-    "GL_NV_fragment_program_option",
     "GL_NV_fragment_shader_barycentric",
     "GL_NV_fragment_shader_interlock",
     "GL_NV_framebuffer_blit",
@@ -581,10 +580,6 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_NV_uniform_buffer_unified_memory",
     "GL_NV_vertex_array_range2",
     "GL_NV_vertex_attrib_integer_64bit",
-    "GL_NV_vertex_program1_1",
-    "GL_NV_vertex_program2",
-    "GL_NV_vertex_program2_option",
-    "GL_NV_vertex_program3",
     "GL_NV_vertex_program4",
     "GL_NV_viewport_array2",
     "GL_NV_viewport_swizzle",

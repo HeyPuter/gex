@@ -281,6 +281,9 @@ struct Session {
     /// Event bytes the socket had no room for yet, and how many have gone.
     out: Vec<u8>,
     sent: usize,
+    /// Where requests are read into, kept rather than a fresh zeroed 64 KiB
+    /// each pump (as the native host's `wayland.rs`).
+    rbuf: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -356,7 +359,10 @@ impl WaylandDevice {
         let mut changed = false;
         sessions.retain_mut(|s| {
             let mut gone = false;
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = std::mem::take(&mut s.rbuf);
+            if buf.is_empty() {
+                buf = vec![0u8; 64 * 1024];
+            }
             loop {
                 let n = match s.socket.recv(&mut buf, 32, false) {
                     Ok(0) => {
@@ -379,6 +385,7 @@ impl WaylandDevice {
                     break;
                 }
             }
+            s.rbuf = buf;
             // Deliver this turn's events now that any `get_pointer`/
             // `get_keyboard` from this turn's bytes has been processed.
             if s.client.wants_input() {
@@ -707,6 +714,7 @@ impl HostListener for WaylandDevice {
             fds: Vec::new(),
             out: Vec::new(),
             sent: 0,
+            rbuf: Vec::new(),
         });
     }
 }
