@@ -256,7 +256,18 @@ fn mid_function(addr: u64) -> bool {
         Some(o) => o,
         None => {
             let bytes = crate::with_host(|h| h.kernel.read_file(&path)).unwrap_or_default();
-            let mut f: Vec<(u64, u64)> = gex_xlate::ehframe::fdes(&bytes, 0).into_iter().map(|f| (f.start, f.end)).collect();
+            // Not the PLT's: one FDE covers all of `.plt`, whose stubs are
+            // each an entry (hp9 left them to the fallback, and died).
+            let plt: Vec<(u64, u64)> = gex_xlate::ehframe::sections(&bytes)
+                .into_iter()
+                .filter(|s| s.name.starts_with(".plt"))
+                .map(|s| (s.addr, s.addr + s.size))
+                .collect();
+            let mut f: Vec<(u64, u64)> = gex_xlate::ehframe::fdes(&bytes, 0)
+                .into_iter()
+                .filter(|f| !plt.iter().any(|&(lo, hi)| f.start >= lo && f.start < hi))
+                .map(|f| (f.start, f.end))
+                .collect();
             f.sort_unstable();
             let o = std::sync::Arc::new((f, loads(&bytes)));
             lock(&FDES).get_or_insert_with(Default::default).insert(path.clone(), o.clone());
