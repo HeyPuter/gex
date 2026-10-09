@@ -1834,6 +1834,51 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
+**RESUME HERE (2026-10-09, early).** merge/w3-audio has master 41917e73
+merged (bc6c6e2c) and three commits on top: 39bdabd8 `GEX_GL_WAITS`,
+4d3bd189 the compositor read-buffer fix, dbf61bc7 `GEX_PROF` per-thread
+totals and `GEX_SYS_WAITS`. Suite: `$W/check-w3-gate.sh` (W3 legs through
+`gate-w3boot/run.sh` with `W3_GATE_DIST=$W/w3dist-g`, the audio leg on
+w3dist-g too); 39bdabd8 clean in `$W/w3chk5.out` (the same failure list
+as integ-e2), dbf61bc7 clean in `$W/w3chk6.out` (W3 null 40 of 53,
+Wayland+GL 38 of 49, install as children and audio ok; x86/childloop
+passed this time, it is load-dependent).
+- **Install as children passes again.** Wine's DefaultInstall runs
+  `control.exe appwiz.cpl install_mono`, which waits for an answer; it
+  used to return at once only because control.exe was missing from the
+  corrupted prefix copy. install-as-children.sh passes
+  `WINEDLLOVERRIDES=${INSTALL_OVERRIDES:-mscoree,mshtml=}`. One dist from
+  one build: `$W/w3dist-g` = `$W/w3dist`'s suite dll dir (no wineboot)
+  with w3dist-n's loader.
+- **Where the games' time went: the compositor.** The native host pumps
+  the compositor at every syscall of every guest thread, and each pump
+  allocated a zeroed 64 KiB buffer per client (calloc's memset, glibc
+  growing and trimming its heap: `syscall` and `_dl_mcount_wrapper`, i.e.
+  libc's memset/memcpy, were over half the process's CPU). 4d3bd189 keeps
+  the buffer (native and browser). On edger, against the same loader and
+  prefix: Retrocycles gameplay 3.0-3.5 fps -> 38-46 fps (the game's own
+  counter 37), Katana ZERO menu 4.4 -> 34 fps, Undertale plays its intro
+  at 30 fps (its own cap) once loaded (before: still loading at 420 s).
+- **Undertale's "white window" was the frame dump, not the game.** Its
+  d3d9 output is a 640x480 gex-gl subsurface drawn on the host; the PPM
+  frames came from the decorated toplevel, which is white. Run it with
+  `GEX_PPM_GL_ONLY=1` (gamekit `ut9.sh`, frames in edger's
+  `gameout/undertale`). Its load is still long: the first GL present at
+  107 s, the next 24 by 350 s, then 30 fps.
+  Runs: gamekit `prof2-rc.sh` (before), `prof3-rc.sh` and `run8.sh`
+  (after); `run-game-g.sh` takes `GEXC=`.
+- Tools: `GEX_GL_WAITS=1` (wall time in synchronous GL submits, by the
+  batch's last opcode: 1-3% in all three games, so GL round trips are not
+  the cost; Undertale's 3303 glGetInternalformativ at wined3d init are
+  89 ms in all), `GEX_SYS_WAITS=1` (wall time per thread and syscall),
+  `GEX_PROF` writes `<stem>.threads`, `GEX_PROF_MIN_PCT`.
+- Next costs seen: every Wine child process runs `usd_clock_thread`
+  (wine fork, virtual.c), a 1 ms nanosleep loop that updates its
+  USER_SHARED_DATA clocks: six such threads in Undertale, about 900
+  wakeups a second each. Undertale's 350 s load: its main thread is
+  mostly parked (GEX_SYS_WAITS shows a futex wait of about 10 s in every
+  10 s window), so the next step is which thread it waits for.
+
 **RESUME HERE (2026-10-08 evening, after the reboot).** Branch
 **merge/w3-audio** (wt/w3-boot; master 7a4a62c8 merged): W3.5's OSS null
 audio device (/dev/dsp, /dev/mixer), inet socket fixes (port at bind,
