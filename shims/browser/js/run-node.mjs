@@ -490,6 +490,8 @@ try {
     args,
     opts: {
       strace,
+      // GEX_STRACE_PID=N: narrate that one process (a forked child too).
+      stracePid: process.env.GEX_STRACE_PID ? Number(process.env.GEX_STRACE_PID) : undefined,
       mtimes,
       // The debugging switches, in the run's own options as well as the boot
       // message: `opts` is what a fork record carries to a child's Worker.
