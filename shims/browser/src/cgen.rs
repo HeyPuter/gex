@@ -1072,6 +1072,13 @@ pub(crate) fn unit_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
 }
 
+/// Whether a current JIT function serves `addr` (its pages unchanged since).
+/// After the JIT forgets (`fjit::on_retire`) this is what still knows
+/// which functions it has made.
+pub(crate) fn jit_serves(addr: u64) -> bool {
+    ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Jit && crate::fjit::current(f.install)))
+}
+
 /// How many units are published: a Worker installs up to this many.
 #[no_mangle]
 pub extern "C" fn gex_cgen_count() -> u32 {

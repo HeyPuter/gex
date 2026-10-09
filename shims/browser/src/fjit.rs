@@ -416,8 +416,14 @@ fn translate_root(addr: u64) -> Option<u32> {
     // also what instruction fetch asks of every byte, and the JIT publishes
     // resume points inside functions, so counting its own entries made it
     // decode `cmovle` in libxcb's `_xcb_in_read_block` as illegal (hu15).
+    // (That entry was a function of libdbus, unloaded since: the epoch now
+    // forgets those. A current JIT function's entry counts again: after a
+    // forgetting the JIT no longer knows what it made, and re-translated
+    // libasound into 28 MiB of wasm by the menu, hp12. Fetch meeting one
+    // inside another function would need an entry in the middle of a
+    // function, which misses no longer make, `mid_function`.)
     let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
-    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a));
+    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a) || crate::cgen::jit_serves(a));
     let executable = |a: u64| {
         exec.iter().any(|&(s, e)| a >= s && a < e)
             && !crate::cgen::elfprov::provided(a)
