@@ -847,6 +847,10 @@ pub fn is_wasm_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
 /// compiled bytes, entries) if one was built.
 struct Prepared {
     segs: Vec<(u64, Vec<u8>)>,
+    /// Where its unit is or would be, and the provider stubs its entries
+    /// leave out.
+    path: std::path::PathBuf,
+    stubs: Vec<u64>,
     unit: Option<(std::path::PathBuf, Arc<Vec<u8>>, Vec<u64>)>,
 }
 
@@ -861,34 +865,48 @@ fn prepared(p: &Pending) -> Result<Arc<Prepared>> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write(&p.pe.data);
     let id = (p.path.clone(), p.base, p.pe.data.len(), h.finish());
-    if let Some((_, pr)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id) {
-        return Ok(Arc::clone(pr));
+    let known = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id).map(|(_, pr)| Arc::clone(pr));
+    if let Some(pr) = known {
+        // A unit built since (`--cgen`'s synchronous build, a background
+        // one): read it now.
+        if pr.unit.is_none() && pr.path.exists() {
+            let unit = read_unit(&pr.path, &pr.stubs)?;
+            let fresh = Arc::new(Prepared { segs: pr.segs.clone(), path: pr.path.clone(), stubs: pr.stubs.clone(), unit });
+            let mut m = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = m.iter_mut().find(|(i, _)| *i == id) {
+                e.1 = Arc::clone(&fresh);
+            }
+            return Ok(fresh);
+        }
+        return Ok(pr);
     }
     let (image, _) = gex_xlate::func::pe_input(&p.pe, p.base)
         .map_err(|e| anyhow!("{}: placing the image at {:#x}: {e}", p.path, p.base))?;
     let pv = provided(&p.pe, p.base);
     let cwasm_path = cache_root()?.join(unit_key(&image, &pv)).join("c.wasm");
     let segs = image.segments.iter().filter(|s| s.executable).map(|s| (s.vaddr, s.bytes.clone())).collect();
-    let unit = match std::fs::read(&cwasm_path) {
-        Ok(cwasm) => {
-            let mut entries = gex_cgen::image::read_entries(&cwasm_path)?;
-            // A provider's addresses are its stubs: the provider is bound there.
-            for a in entries.iter_mut() {
-                if pv.stubs.binary_search(a).is_ok() {
-                    *a = 0;
-                }
-            }
-            Some((cwasm_path, Arc::new(cwasm), entries))
-        }
-        Err(_) => None,
-    };
-    let pr = Arc::new(Prepared { segs, unit });
+    let unit = read_unit(&cwasm_path, &pv.stubs)?;
+    let pr = Arc::new(Prepared { segs, path: cwasm_path, stubs: pv.stubs, unit });
     let mut m = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() >= 512 {
         m.remove(0);
     }
     m.push((id, Arc::clone(&pr)));
     Ok(pr)
+}
+
+/// The unit at `path` (`.../c.wasm`), if it is there: its bytes and its
+/// entries, a provider's stubs (`stubs`) left out.
+fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path::PathBuf, Arc<Vec<u8>>, Vec<u64>)>> {
+    let Ok(cwasm) = std::fs::read(path) else { return Ok(None) };
+    let mut entries = gex_cgen::image::read_entries(path)?;
+    // A provider's addresses are its stubs: the provider is bound there.
+    for a in entries.iter_mut() {
+        if stubs.binary_search(a).is_ok() {
+            *a = 0;
+        }
+    }
+    Ok(Some((path.to_path_buf(), Arc::new(cwasm), entries)))
 }
 
 /// A unit for `p`, if one was built, with the byte check.

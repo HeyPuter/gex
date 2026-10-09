@@ -1916,6 +1916,63 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
+**RESUME HERE (2026-10-09, late).** merge/w3-audio has master 9e5ac0ff
+merged (8230816d). Since the morning (§3.17):
+
+- f43fba88 inet without a network stack; it landed in master.
+- 3636e93c clean ranges.
+- 74e29561, 0fc5ff1b, b3e0df43: W3 units.
+- e6a6b8d5 child start costs and the stall tool.
+
+**Session boot (`wine cmd /c echo`, edger, warm).**
+
+| Build | Boot time |
+|---|---|
+| Before | 76.9 s |
+| gexc-k with units | 9.4-9.9 s |
+| Units off (`GEX_W3_UNITS=0`) | 31.0 s; 11.5 s when tier-1's keys happen to repeat |
+
+**Undertale on edger, gexc-n.** Units are on for Wine's images. The
+game's DLL units were still compiling in the background, so those ran on
+tier-1.
+
+| Measure | Before | Now |
+|---|---|---|
+| Session boot inside the game's start | 52.1 s (ut13) | 6.5-7.0 s |
+| First GL frame | 63.6 s (gexc-l, units off) | 20.5-52.5 s |
+| Steady 30 fps from | 289 s | 232-277 s |
+
+**After the boot the main thread computes; it does not wait.**
+GEX_STALL_EVERY (`ut21.sh`) shows it at 100% of a core from 60 to 255 s.
+It is outside system calls, and its last call was sched_yield. The
+profile is tier-1 code (`jit:small-module` 18%), trap unwinding for
+call-outs (6%) and x87 soft-float (`gex_f80`/`x87_op`, about 5%). Putting
+UNDERTALE.exe on its function-tier unit (`GEX_W3_UNITS=all`, unit
+precompiled) is the lever. Not measured yet: the gamekit `pre-ut.sh` +
+`ut23.sh` run was cancelled.
+
+**Open issues.**
+
+1. **A game-time Wine DLL unit stops Undertale's frames.** In ut22-o2,
+   once the game's DLL units had been compiled (d3d9, windowscodecs,
+   propsys, dinput8, dwmapi, hid, xinput1_3, uxtheme, oleaut32,
+   comctl32...), there was no frame in 360 s. The gamekit `ut24.sh`
+   bisect (GEX_W3_UNITS_SKIP lists) is in `boot/ut24.txt`.
+2. **Master re-keyed units.** The merged gexc looks for new unit keys:
+   rebuild with `$W/cgen-w3.sh GEXC LOG` (gooner `w3units/rebuild-h.log`).
+   Once integ/2026-10-09b lands, every unit cache re-keys again.
+3. **The page.** It still needs `gex.image_mapped` wired to its units
+   path, and the clean ranges exported to its fork (§3.17).
+
+**Where things are.**
+
+- Runs:
+  - gamekit `boot-f.sh` and `boot-g.sh`: session boot A/B;
+  - `ut14.sh` through `ut24.sh`: Undertale.
+- Units: gooner `scratch/W/w3units/xdg/gex/cgen`, and edger
+  `scratch/W/boot-xdg/gex/cgen` (cache for the bench runs, XDG_CACHE_HOME).
+- Diagnosis runs on gooner: `w3units/run.sh TAG [K=V]`.
+
 **RESUME HERE (2026-10-09, early).** merge/w3-audio has master 41917e73
 merged (bc6c6e2c) and three commits on top: 39bdabd8 `GEX_GL_WAITS`,
 4d3bd189 the compositor read-buffer fix, dbf61bc7 `GEX_PROF` per-thread
