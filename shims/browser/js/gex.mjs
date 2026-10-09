@@ -1412,7 +1412,7 @@ export class Gex {
     if (opts.fjit && e.gex_set_fjit) {
       e.gex_set_fjit(opts.fjit === 2 ? 2 : 1);
       if (opts.fjitMax != null || opts.fjitOnly) e.gex_fjit_limit?.(opts.fjitMax ?? 0xffffffff, BigInt(opts.fjitOnly ?? 0));
-      if (!this.#cgenMode) this.useCgen(1);
+      if (!(this.#cgenMode & 3)) this.useCgen(this.#cgenMode | 1);
     }
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
@@ -3478,11 +3478,11 @@ export class Gex {
     }
     // A Worker with the function JIT on but no units of its own still
     // replays the function table's log.
-    if (!this.#cgenMode && e.gex_fjit_on?.()) {
+    if (!(this.#cgenMode & 3) && e.gex_fjit_on?.()) {
       this.#cgenCatchUp();
       return;
     }
-    if (!this.#cgenMode || !e.gex_cgen_wanted) return;
+    if (!(this.#cgenMode & 3) || !e.gex_cgen_wanted) return;
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();
       // The image's indirect-call profile is part of its unit's key, as

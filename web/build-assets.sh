@@ -59,6 +59,17 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 # shared pair is what lets a process's threads each be a Worker.
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.shared.wasm"
 
+# Export providers' modules (glibc's mem*/str*, libm: gex-cgen providers/),
+# in a unit cache's layout under gex/cgen/: the page binds them when a
+# translated program maps the library they name, with no units
+# (docs/gexcc.md §7.9; `?providers=0` turns them off).
+echo "building the export providers..."
+rm -rf "$WORK/provcache"
+GEX_CGEN_CACHE="$WORK/provcache" "$ROOT/target/release/gexc" cgen-image --providers 2>/dev/null
+mkdir -p "$PUB/gex/cgen/providers"
+rm -f "$PUB/gex/cgen/providers/"*.wasm
+cp "$WORK/provcache/providers/"*.wasm "$PUB/gex/cgen/providers/"
+
 # -- busybox rootfs --------------------------------------------------------
 
 BB="$WORK/busybox"

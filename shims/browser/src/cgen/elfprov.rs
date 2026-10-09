@@ -40,7 +40,7 @@ static PID: AtomicI32 = AtomicI32::new(0);
 static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn on() -> bool {
-    super::on() && gex_cgen::provider::enabled() && !OFF.load(Ordering::Relaxed)
+    super::providers_on() && gex_cgen::provider::enabled() && !OFF.load(Ordering::Relaxed)
 }
 
 /// No ELF export providers in this process (A/B runs): before it maps any.
