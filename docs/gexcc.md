@@ -1184,3 +1184,70 @@ measure apt, python3.13 and sqlite3 in the page with and without.
    openssl, python's libpython, ncurses, readline); image sizes and page
    start-up measured against static.
 6. Item 3: zlib under an arm64 program, then zstd, then LP64 libc.
+
+### 7.11 As built (natively, 2026-10-09)
+
+Step 3 of §7.10 is in: `crates/gex-dylink` (the shared half),
+`shims/native/src/dylink.rs` (the native loader), gexcc's `GEXCC_SHARED=1`,
+musl's `__gex_dsos` registry (our clone's `gex-wasm32-cc` branch).
+tests/gexcc/run.sh passes with `GEXCC_SHARED=1` (every program against
+libc.so) and without. Where it differs from the design above, or adds to it:
+
+- **A library is a plain wasm module** (`\0asm`), not an ELF container:
+  wasm-ld links against it directly, which build systems need. Programs
+  keep their container.
+- **NEEDED is the soname.** wasm-ld records the file name a library was
+  given; gexcc hands it each library as a link named by its soname (the
+  name section's module name, from `-Wl,-soname`), so a program linked
+  against `libfoo.so` (the -dev symlink) needs `libfoo.so.1`.
+- **Self-binding.** wasm-ld calls every weak definition of a shared
+  library through an import of itself, `-Bsymbolic` or not (musl's weak
+  aliases: `malloc`, `lseek`; every C++ inline function). `gex-dylink
+  selfbind` rewrites those into direct calls at build time: the design's
+  "no interposition into a library's own calls" made literal. One case
+  needed care: musl's `__libc_start_main` now calls the `_init` crt1 hands
+  it (in libc.so its own `_init` is libc's dummy).
+- **Function pointers**: every exported function has a slot in its
+  module's range (element positions, then the rest by name), so
+  `GOT.func.f`, `dlsym` and the module's own `&f` agree.
+- **libc.so** (`tools/gexcc/shared/mklibc.sh`, run by install.sh): musl,
+  libgex and libgexcc but the loop safepoint, built by gexcc itself; 800 KB.
+  `libc_nonshared.a` holds what stays in the program (`__main_argc_argv`).
+  The safepoint counter is every module's own (a wasm global cannot be
+  linked through a .so's symbols; libgexcc.a is linked into each module,
+  its symbols hidden). setjmp's tag `__c_longjmp` is imported from libc by
+  every module, so a longjmp crosses modules.
+- **TLS**: a module's `_Thread_local` data works (its block is laid out by
+  libc from the registry); a TLS variable *exported* to another module does
+  not link (wasm-ld has no TLS GOT): export an accessor. A `dlopen`ed
+  library with TLS is refused for now.
+- **Fork summary (`gex.forkreach`)**, the format the page loader also
+  reads: a custom section, UTF-8 text, first line `gex.forkreach 1`, then
+  one export name per line, each an export that may unwind for a fork.
+  gexcc computes it with forkreach.py over the module: reaching
+  `gex.fork_point`, any `env` import the providing library's summary lists
+  (or whose provider is unknown), or any indirect call. Two calls are taken
+  not to reach: libgex's signal-handler call and `pthread_exit`'s cleanup
+  (forking from a signal handler that interrupted a libc call, or from a
+  cancellation cleanup, is unsupported in a shared program). libc.so's
+  summary lists 312 of its exports: stdio (FILE's function pointers),
+  qsort/bsearch, exit, pthread_once, fork; not malloc, the string
+  functions, read/write. Instrumentation is binaryen's
+  `asyncify-relocatable` on the reaching functions (its two globals are the
+  store's, shared by its modules).
+- **dlopen/dlsym**: libgex's dl.c asks the loader (`gex.dlopen`,
+  `gex.dlsym`) after its static registry; handles are 0xfff00000 and up.
+  `dlsym(RTLD_DEFAULT or dlopen(NULL), name)` sees every module's exports,
+  the program's when linked `-rdynamic`, static programs included. Another
+  thread sees a `dlopen`ed module when it next catches up with the function
+  table's log (not yet forced at `dlopen`).
+- **fpcast**: a static `-fgex-fpcast-emu -rdynamic` program (GTK's demos)
+  exports a thunk of each exported function (`__fpcast$name`, `gex-dylink
+  fpcast-prep/-post` around binaryen's pass) and function pointers to its
+  exports are the thunks, so GtkBuilder's handlers found by `dlsym` are
+  called through the uniform signature. Shared and fpcast do not mix yet:
+  every module of a process, libc included, would need the pass with one
+  parameter count.
+- Not yet: the browser shim (`gex.dlopen` answers "not yet" there), C++
+  across modules (libc++ is linked statically into each), shared Debian
+  packages.
