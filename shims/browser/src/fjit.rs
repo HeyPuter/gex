@@ -191,6 +191,83 @@ fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
     })
 }
 
+/// Each object's `.eh_frame` function ranges (unbiased, sorted by start)
+/// and `PT_LOAD` headers (file offset, vaddr, file size), by file path;
+/// empty when it has none or cannot be read.
+type ObjFdes = (Vec<(u64, u64)>, Vec<(u64, u64, u64)>);
+static FDES: Mutex<Option<std::collections::HashMap<String, std::sync::Arc<ObjFdes>>>> = Mutex::new(None);
+static MID_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An ELF's `PT_LOAD` headers: (file offset, vaddr, file size).
+fn loads(elf: &[u8]) -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    let Some(&class) = elf.get(4) else { return out };
+    let wide = class == 2;
+    let rd = |o: usize, n: usize| -> Option<u64> {
+        let b = elf.get(o..o + n)?;
+        Some(b.iter().rev().fold(0u64, |a, &x| a << 8 | x as u64))
+    };
+    let hdr = if wide { (rd(0x20, 8), rd(0x36, 2), rd(0x38, 2)) } else { (rd(0x1c, 4), rd(0x2a, 2), rd(0x2c, 2)) };
+    let (Some(phoff), Some(phentsize), Some(phnum)) = hdr else { return out };
+    for i in 0..phnum {
+        let ph = (phoff + i * phentsize) as usize;
+        if rd(ph, 4) != Some(1) {
+            continue;
+        }
+        let f = if wide { (rd(ph + 8, 8), rd(ph + 16, 8), rd(ph + 32, 8)) } else { (rd(ph + 4, 4), rd(ph + 8, 4), rd(ph + 16, 4)) };
+        if let (Some(o), Some(v), Some(n)) = f {
+            out.push((o, v, n));
+        }
+    }
+    out
+}
+
+/// Whether `addr` lies strictly inside a function of its object, by the
+/// object's `.eh_frame`: a miss there is a resume into the middle of a
+/// function (a signal's return, a block boundary of the fallback's), not an
+/// entry. Translated as a root, `recover_one` records it as a function start
+/// for good, and every later translation of the function around it ends at
+/// it as at a tail call, with the flags dead across it: libxcb's
+/// `_xcb_in_read_block` lost its `cmp` before the `cmovle` at +0x30 and took
+/// `min(queue_len, len)` from stale flags (hp8, hu16: memmove of -8 bytes),
+/// and SDL's X11 connect failed the same way (hb26, hb45). The fallback runs
+/// it instead; the function's real entry still gets translated.
+fn mid_function(addr: u64) -> bool {
+    let Some((path, off, start)) = crate::with_host(|h| {
+        h.kernel.mem.vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)))
+    }) else {
+        return false;
+    };
+    let cached = lock(&FDES).get_or_insert_with(Default::default).get(&path).cloned();
+    let obj = match cached {
+        Some(o) => o,
+        None => {
+            let bytes = crate::with_host(|h| h.kernel.read_file(&path)).unwrap_or_default();
+            let mut f: Vec<(u64, u64)> = gex_xlate::ehframe::fdes(&bytes, 0).into_iter().map(|f| (f.start, f.end)).collect();
+            f.sort_unstable();
+            let o = std::sync::Arc::new((f, loads(&bytes)));
+            lock(&FDES).get_or_insert_with(Default::default).insert(path.clone(), o.clone());
+            o
+        }
+    };
+    let (fdes, loads) = &*obj;
+    // The vma's file offset gives its vaddr in the file, hence the bias.
+    let Some(base) = loads.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| v + (off - o)) else {
+        return false;
+    };
+    let x = addr - start + base;
+    let i = fdes.partition_point(|&(s, _)| s <= x);
+    let mid = i > 0 && fdes[i - 1].0 < x && x < fdes[i - 1].1;
+    if mid {
+        let n = MID_DECLINED.fetch_add(1, Ordering::Relaxed);
+        if n < 32 || (n + 1).is_power_of_two() {
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            crate::warn_line(&format!("[fjit] {addr:#x} ({name} +{x:#x}) is inside a function: left to the fallback ({} so far)\n", n + 1));
+        }
+    }
+    mid
+}
+
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
 /// its index in the function table, or `None` (the fallback runs it).
 pub(crate) fn translate(addr: u64) -> Option<u32> {
@@ -212,6 +289,9 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         )
     });
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
+        return None;
+    }
+    if mid_function(addr) {
         return None;
     }
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
