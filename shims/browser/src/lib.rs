@@ -3790,13 +3790,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             kernel.new_code.extend(gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base()));
         }
     }
-    let pins = std::mem::take(&mut *PINS.0.borrow_mut());
-    // Each pinned object's span is kept from the arena, so whatever loads
-    // before it cannot take its base (`MemoryMap::reserve`).
-    for (_, base, span) in &pins {
-        kernel.mem.reserve(*base, base + span);
-    }
-    kernel.pins = pins.into_iter().map(|(n, b, _)| (n, b)).collect();
+    kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
     kernel.mem.grows_on_demand(arena_grow, arena_back);
@@ -4057,7 +4051,7 @@ pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64, span: u64)
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return;
     };
-    PINS.0.borrow_mut().push((name.to_string(), base, span));
+    PINS.0.borrow_mut().push((name.to_string(), base));
     // SAFETY: `k_present` takes no borrow, and `k_place_set` takes scalars.
     unsafe {
         if k_present() != 0 {
@@ -4402,7 +4396,7 @@ pub extern "C" fn gex_closure_owner_at(page: u64, k: u32) -> i32 {
 /// Where the closure build says each object goes, staged until there is a
 /// `Host`: `gex_pin_object` runs before `gex_load` (the layout must precede the
 /// loader), when no `Host` exists yet. The global table is told straight away.
-static PINS: SingleThreaded<Vec<(String, u64, u64)>> =
+static PINS: SingleThreaded<Vec<(String, u64)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
 
 /// Files bundled by the page, in the order they arrived.

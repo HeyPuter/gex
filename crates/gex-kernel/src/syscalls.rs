@@ -612,11 +612,6 @@ pub struct Kernel {
     /// this one has to ask, and can only ask once the reservation says how
     /// long the object is.
     pub armed_place: Option<String>,
-    /// The thread that armed [`Self::armed_pin`] / [`Self::armed_place`]:
-    /// only its own next reservation takes them. Another thread's anonymous
-    /// `PROT_NONE` mapping between a `dlopen`'s open and its mmap (a thread
-    /// stack's guard, a GC reservation) took the pin otherwise.
-    pub armed_tid: i32,
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
@@ -1340,7 +1335,6 @@ impl Kernel {
             pins: std::collections::HashMap::new(),
             place: None,
             armed_place: None,
-            armed_tid: 0,
             syscall_pc: 0,
             syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
@@ -1589,7 +1583,6 @@ impl Kernel {
             // same library must be given the same address its parent was.
             place: self.place.clone(),
             armed_place: None,
-            armed_tid: 0,
             syscall_pc: 0,
             syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
@@ -3757,7 +3750,6 @@ impl Kernel {
             // the path is what identifies the object.
             if let Some(base) = self.pin_for(&p) {
                 self.armed_pin = Some((p.clone(), base));
-                self.armed_tid = self.tid;
             }
             // O_CREAT of "name/" that is not there: a slash names a
             // directory, which open does not create (EISDIR, as Linux).
@@ -3788,7 +3780,6 @@ impl Kernel {
             // it loads -- leaves nothing armed.
             if self.place.is_some() && is_shared_object(&p) {
                 self.armed_place = Some(p.clone());
-                self.armed_tid = self.tid;
             }
             h
         };
@@ -5397,7 +5388,7 @@ impl Kernel {
             // pin armed when the object was opened, the same way.
             let mut addr = addr;
             let mut pinned = None;
-            if addr == 0 && flags & crate::mem::flags::FIXED == 0 && self.armed_tid == self.tid {
+            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
                 if let Some((path, base)) = self.armed_pin.take() {
                     if path.rsplit('/').next() == name.rsplit('/').next() {
                         self.armed_place = None;
@@ -5475,7 +5466,7 @@ impl Kernel {
         // a collision is ignored and recorded in `pin_landed`, not forced.
         let mut addr = addr;
         let mut pinned = None;
-        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 && self.armed_tid == self.tid {
+        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
             if let Some((path, base)) = self.armed_pin.take() {
                 self.armed_place = None;
                 addr = base;
