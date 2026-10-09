@@ -38,6 +38,11 @@ struct Entry {
     inside: Option<u64>,
     since: Instant,
     last: u64,
+    /// The latest call-out from a unit: target, return address; how many
+    /// call-outs, and how many of them ended without the callee returning.
+    co: (u64, u64),
+    co_n: u64,
+    co_aborts: u64,
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -65,7 +70,7 @@ pub fn enter(pid: i32, tid: i32, nr: u64) {
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, since: now, last: !0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
     e.tid = tid;
     e.pid = pid;
     e.inside = Some(nr);
@@ -81,6 +86,26 @@ pub fn exit(canonical: u64) {
         e.since = Instant::now();
         e.last = canonical;
     }
+}
+
+/// A unit's call-out to `target`, returning to `ret`, has ended; `aborted`
+/// when the callee did not return through it.
+pub fn callout(target: u64, ret: u64, aborted: bool) {
+    let host = HOST_TID.with(|t| *t);
+    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry {
+        tid: 0,
+        pid: 0,
+        inside: None,
+        since: Instant::now(),
+        last: !0,
+        co: (0, 0),
+        co_n: 0,
+        co_aborts: 0,
+    });
+    e.co = (target, ret);
+    e.co_n += 1;
+    e.co_aborts += aborted as u64;
 }
 
 fn cpu_ms(host: u32) -> Option<u64> {
@@ -140,8 +165,13 @@ fn dump(why: &str) {
             Some(nr) => format!("in raw {nr}"),
             None => format!("outside (last {})", gex_kernel::syscalls::syscall_name(e.last)),
         };
+        let co = if e.co_n > 0 {
+            format!("; call-outs {} ({} aborted), last to {:#x} ret {:#x}", e.co_n, e.co_aborts, e.co.0, e.co.1)
+        } else {
+            String::new()
+        };
         lines.push((e.pid, e.tid, format!(
-            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200",
+            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}",
             e.pid, e.tid, h, comm(*h), state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
         )));
     }

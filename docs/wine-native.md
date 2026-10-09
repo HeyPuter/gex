@@ -904,6 +904,26 @@ section hook. Wiring the import to push a `Pending` gives the page the
 same unit placement, with units fetched as assets by key. The kernel fixes
 (clean ranges, poll, recvmsg) are shared code.
 
+**Wine's thread loop and safepoints (native only).** Every W3 thread but
+the main one runs the program under `gex_call_out(ctx, pc, 0, 0)`
+(signal_wasm32.c), a call-out that never returns. The safepoint import
+abandoned the innermost call-out once the stack was more than 64 KiB above
+its `sp_want`; with `sp_want` 0 that was every safepoint. So such threads
+trapped out and re-entered every 1024 back-edges. wined3d's command-stream
+thread then ran mostly trap round trips (57M abandoned call-outs in 80 s,
+ut30). With wined3d's unit, Undertale drew no frame in 360 s; on tier-1 it
+was only slow. The fix: a call-out with `ret` 0 is never abandoned at a
+safepoint. The page's call-outs (`shims/browser/src/cgen.rs`) have no such
+safepoint check, so this one does not carry.
+
+Tools added with it:
+
+- the `GEX_STALL` dumps give each thread's call-outs (count, how many were
+  abandoned, the last target and return);
+- `GEX_TRACE_CALLOUT_ABORTS=N` prints the first N abandoned call-outs, with
+  the reason and the stack;
+- `GEX_CGEN_KEEP=1` keeps a W3 unit's generated C (`<cache>/<key>/work`).
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -1916,7 +1936,7 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
-**RESUME HERE (2026-10-09, late).** merge/w3-audio has master 9e5ac0ff
+**RESUME HERE (2026-10-09, late; the safepoint fix for Wine's thread loop is §3.17).** merge/w3-audio has master 9e5ac0ff
 merged (8230816d). Since the morning (§3.17):
 
 - f43fba88 inet without a network stack; it landed in master.
@@ -1932,43 +1952,55 @@ merged (8230816d). Since the morning (§3.17):
 | gexc-k with units | 9.4-9.9 s |
 | Units off (`GEX_W3_UNITS=0`) | 31.0 s; 11.5 s when tier-1's keys happen to repeat |
 
-**Undertale on edger, gexc-n.** Units are on for Wine's images. The
-game's DLL units were still compiling in the background, so those ran on
-tier-1.
+**Undertale on edger.** Units are on for Wine's images. Rows below the
+first two are gexc-s: gexc-o's tree plus the safepoint fix (§3.17), in
+the gamekit `ut32.sh` run after a warm-up run. Before the fix, wined3d's
+unit gave no frames, so the gexc-n row ran with the game's DLL units
+still compiling (on tier-1).
 
-| Measure | Before | Now |
+| Run | First GL frame | Steady 30 fps from |
 |---|---|---|
-| Session boot inside the game's start | 52.1 s (ut13) | 6.5-7.0 s |
-| First GL frame | 63.6 s (gexc-l, units off) | 20.5-52.5 s |
-| Steady 30 fps from | 289 s | 232-277 s |
+| ut16 (gexc-l, units off) | 63.6 s | 289 s |
+| gexc-n (Wine's units, game DLLs on tier-1) | 20.5-52.5 s | 232-277 s |
+| ut32 s1 (all of Wine's units, wined3d's included) | 24.5 s | 197 s |
+| ut32 s2 (`GEX_W3_UNITS=all`: UNDERTALE.exe on its unit too) | 16.8 s | 176 s |
 
-**After the boot the main thread computes; it does not wait.**
-GEX_STALL_EVERY (`ut21.sh`) shows it at 100% of a core from 60 to 255 s.
-It is outside system calls, and its last call was sched_yield. The
-profile is tier-1 code (`jit:small-module` 18%), trap unwinding for
-call-outs (6%) and x87 soft-float (`gex_f80`/`x87_op`, about 5%). Putting
-UNDERTALE.exe on its function-tier unit (`GEX_W3_UNITS=all`, unit
-precompiled) is the lever. Not measured yet: the gamekit `pre-ut.sh` +
-`ut23.sh` run was cancelled.
+The session boot inside the game's start went from 52.1 s (ut13) to
+6.5-7.0 s.
+
+**The load after the boot is compute.** GEX_STALL_EVERY (`ut21.sh`)
+shows the main thread at 100% of a core from 60 to 255 s, outside system
+calls (its last call was sched_yield). Its profile:
+
+- tier-1 code (`jit:small-module`), 18%;
+- trap unwinding for call-outs, 6%;
+- x87 soft-float (`gex_f80`/`x87_op`), about 5%.
+
+The exe's unit (s2) moves steady state 21 s earlier than s1 (176 vs
+197 s).
 
 **Open issues.**
 
-1. **A game-time Wine DLL unit stops Undertale's frames.** In ut22-o2,
-   once the game's DLL units had been compiled (d3d9, windowscodecs,
-   propsys, dinput8, dwmapi, hid, xinput1_3, uxtheme, oleaut32,
-   comctl32...), there was no frame in 360 s. The gamekit `ut24.sh`
-   bisect (GEX_W3_UNITS_SKIP lists) is in `boot/ut24.txt`.
+1. **The remaining 176 s.** It is still mostly the main thread computing
+   before the first steady frame. Next, profile s2's main thread with
+   GEX_PROF.
 2. **Master re-keyed units.** The merged gexc looks for new unit keys:
    rebuild with `$W/cgen-w3.sh GEXC LOG` (gooner `w3units/rebuild-h.log`).
    Once integ/2026-10-09b lands, every unit cache re-keys again.
 3. **The page.** It still needs `gex.image_mapped` wired to its units
    path, and the clean ranges exported to its fork (§3.17).
+4. **From DH (2026-10-09).** In the page, `any_signal()` checked the
+   signal state of the last thread to make a syscall, not of the parked
+   thread, so a tgkill never woke a thread waiting on a futex. The fix is
+   research/dual-heap 041a87fd, due in master after the next gate. Suspect
+   it first if Wine threads in the page ever hang idle (SIGUSR1 suspend,
+   APCs).
 
 **Where things are.**
 
 - Runs:
   - gamekit `boot-f.sh` and `boot-g.sh`: session boot A/B;
-  - `ut14.sh` through `ut24.sh`: Undertale.
+  - `ut14.sh` through `ut32.sh`: Undertale. ut24-26 bisect the units (wined3d), ut27-31 diagnose the stall, ut32 measures the fix. gexc-s is built from `$W/wt-o` (3341103b plus the patch) so it keeps the edger unit keys.
 - Units: gooner `scratch/W/w3units/xdg/gex/cgen`, and edger
   `scratch/W/boot-xdg/gex/cgen` (cache for the bench runs, XDG_CACHE_HOME).
 - Diagnosis runs on gooner: `w3units/run.sh TAG [K=V]`.

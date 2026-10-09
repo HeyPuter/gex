@@ -705,7 +705,10 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, &gp);
         gex_cgen::toolchain::set_lto(false);
         let stats = stats?;
-        let _ = std::fs::remove_dir_all(&work);
+        // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
+        if std::env::var_os("GEX_CGEN_KEEP").is_none() {
+            let _ = std::fs::remove_dir_all(&work);
+        }
         std::fs::write(dir.join("members.txt"), member_keys.join("\n") + "\n")?;
         eprintln!(
             "[cgen] link group {key}: {} members, {} functions, {} units ({} compiled, {} cached), {} MiB wasm, {:.1}s; {} devirtualised calls ({iat_hints} from the IATs)",
@@ -776,7 +779,10 @@ fn prepare_with(
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
     let hints = icall_hints(image);
     let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
-    let _ = std::fs::remove_dir_all(&work);
+    // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
+    if std::env::var_os("GEX_CGEN_KEEP").is_none() {
+        let _ = std::fs::remove_dir_all(&work);
+    }
     if verbose {
         eprintln!(
             "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s; {} devirtualised calls ({} hints), {} calls to leaf copies",

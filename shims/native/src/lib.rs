@@ -4246,8 +4246,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD
                         && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
                 };
-                if sp > co.sp_want + co.unwound && !at_function() {
-                    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                // A call-out that never returns (ret 0: Wine's W3 thread loop,
+                // `gex_call_out(ctx, pc, 0, 0)`) has no caller frame to
+                // unwind past. Its sp_want of 0 made every safepoint abandon
+                // it: a whole trap-out and re-entry per safepoint on every
+                // thread but the main one (wined3d's command-stream thread
+                // spun at a crawl, and Undertale drew no frame).
+                if co.ret != 0 && sp > co.sp_want + co.unwound && !at_function() {
+                    if wasm_trace() {
                         eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
                     }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
@@ -5267,6 +5273,9 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
 /// cannot be done, and the caller leaves as before.
 fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64) -> Result<i32> {
     if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
+        if crate::stall::on() {
+            crate::stall::callout(target, ret | 1 << 63, true);
+        }
         return Ok(0);
     }
     let Some(enter) = any_enter(caller) else { return Ok(0) };
@@ -5311,7 +5320,10 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             match sig {
                 CalloutSignal::Return(i) if i == me => break Ok(1),
                 // An outer call-out's return: this one's caller is gone.
-                CalloutSignal::Return(_) | CalloutSignal::Abort => break Ok(0),
+                sig @ (CalloutSignal::Return(_) | CalloutSignal::Abort) => {
+                    trace_callout_abort(caller, &memory, ctx_addr, target, ret, sp_want, &sig);
+                    break Ok(0);
+                }
                 CalloutSignal::Bypass(f) => {
                     next = Some(f);
                     continue;
@@ -5366,7 +5378,45 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     if matches!(result, Ok(0)) {
         CALLOUT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    if crate::stall::on() {
+        crate::stall::callout(target, ret, !matches!(result, Ok(1)));
+    }
     result
+}
+
+/// GEX_TRACE_CALLOUT_ABORTS=N: the first N call-outs that end without
+/// their callee returning, with why and where the guest was.
+fn trace_callout_abort(
+    caller: &Caller<'_, HostState>,
+    memory: &gex_mem::GuestMemory,
+    ctx_addr: u64,
+    target: u64,
+    ret: u64,
+    sp_want: u64,
+    sig: &CalloutSignal,
+) {
+    static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(std::env::var("GEX_TRACE_CALLOUT_ABORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    });
+    if left.load(std::sync::atomic::Ordering::Relaxed) == 0
+        || left.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    let gm = GuestMem::new(memory.bytes());
+    let pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    let sp = gm.read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
+    let why = match sig {
+        CalloutSignal::Return(i) => format!("an outer call-out's return ({i})"),
+        CalloutSignal::Abort => "abort".to_string(),
+        _ => "?".to_string(),
+    };
+    let outer: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}+{:#x}", c.ret, c.sp_want, c.unwound)).collect();
+    eprintln!(
+        "gex: tid {} call-out to {target:#x} ret {ret:#x} sp_want {sp_want:#x} left: {why}; pc {pc:#x} sp {sp:#x}; call-outs {outer:?}",
+        caller.data().thread.tid
+    );
 }
 
 /// Call-outs started and abandoned (GEX_NT_STATS).
