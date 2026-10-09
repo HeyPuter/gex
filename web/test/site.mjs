@@ -34,6 +34,9 @@ const DEMOS = {
   busybox: { want: /~ \$/ },
   // The Debian rootfs built from source (docs/gexcc.md §6): bash -l as root.
   'native-debian': { want: /:~#/ },
+  // Any command, from GEX_CMD, ended by `echo RUN=$((1+1))` (the echo of the
+  // command holds no `RUN=2`).
+  'native-debian-run': { demo: 'native-debian', want: /RUN=2/ },
   // First and second runs of a few programs, each timed in the guest: the
   // first pays the program's compile, the second what is left.
   'native-debian-cmd': {

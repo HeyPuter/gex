@@ -277,7 +277,11 @@ def configure(root, ours, native_pkgs):
       '// copy-on-write in the guest, so no bigger than needed)\n'
       'APT::Cache-Start "100663296";\n'
       'Dpkg::Use-Pty "false";\n'
-      'APT::Install-Recommends "false";\n')
+      'APT::Install-Recommends "false";\n'
+      '// said here so apt does not fork dpkg to ask (two dpkg runs, 3 s of\n'
+      '// every apt-cache in the page)\n'
+      f'APT::Architecture "{NATIVE}";\n'
+      f'APT::Architectures {{ "{NATIVE}"; "{OURS_ARCH}"; }};\n')
     for d in ('var/lib/apt/lists/partial', 'var/cache/apt/archives/partial', 'var/lib/dpkg/updates',
               'var/lib/dpkg/triggers', 'var/log/apt', 'etc/apt/trusted.gpg.d', 'etc/apt/keyrings',
               'etc/dpkg/dpkg.cfg.d', 'var/cache/debconf', 'var/lib/apt/periodic', 'proc', 'dev', 'run', 'sys',
