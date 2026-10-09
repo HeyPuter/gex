@@ -269,3 +269,365 @@ build_util_linux() {
   rm -rf $DEST/usr/include $DEST/usr/lib $DEST/usr/share/doc $DEST/usr/sbin $DEST/usr/bin/kill $DEST/usr/bin/rename \
     $DEST/usr/share/man/man8 $DEST/usr/share/man/man1/kill.1 $DEST/usr/share/man/man1/rename.1
 }
+
+# ---- tier 2
+
+build_make_dfsg() {
+  # the dfsg tarball has no doc/ (the manual is non-free): out of the build,
+  # then the build system regenerated, as dh does
+  sed -i 's| doc/Makefile||' configure.ac
+  sed -i '/^SUBDIRS/s/ doc//' Makefile.am
+  AUTOPOINT=true autoreconf -fi
+  at_configure --disable-nls --without-guile
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/include
+}
+
+# A tclsh for the build machine: SQLite's full source tree generates its
+# amalgamation and keyword tables with Tcl scripts. Debian's tcl8.6, built
+# once into $GEXCC_DEB/host.
+host_tclsh() {
+  local h=$GEXCC_DEB/host
+  if [ ! -x $h/bin/tclsh8.6 ]; then
+    python3 -I "$HERE/debsrc.py" --into $h tcl8.6=8.6.16+dfsg-1 > /dev/null
+    (cd $h/tcl8.6-8.6.16+dfsg-1/unix && CONFIG_SITE= CC=cc ./configure -q --prefix=$h --disable-shared \
+      && make -j$JOBS > /dev/null && make install-binaries install-libraries > /dev/null)
+    ln -sf tclsh8.6 $h/bin/tclsh
+  fi
+  export PATH=$h/bin:$PATH
+}
+
+build_sqlite3() {
+  host_tclsh
+  # Debian's CFLAGS: the extensions its sqlite3 has (FTS, R*Tree, JSON is
+  # built in, column metadata for python)
+  at_configure --disable-tcl --enable-readline --disable-shared --enable-static --enable-fts5 \
+    CFLAGS="-O2 -DSQLITE_ENABLE_FTS3 -DSQLITE_ENABLE_FTS3_PARENTHESIS -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_DBSTAT_VTAB -DSQLITE_SECURE_DELETE -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_MAX_VARIABLE_NUMBER=250000" \
+    CPPFLAGS="-I$SYSROOT/usr/include/ncursesw" LIBS="-lncursesw"
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST/usr/include $DEST/usr/lib
+}
+
+build_libonig() {
+  [ -x configure ] || autoreconf -fi
+  at_configure --disable-shared --enable-static
+  make -j$JOBS
+  both install; nola
+}
+
+build_jq() {
+  autoreconf -fi
+  at_configure --with-oniguruma=$SYSROOT/usr --disable-docs --disable-maintainer-mode --disable-shared --enable-static \
+    --disable-valgrind
+  make -j$JOBS
+  mkdir -p $DEST/usr/bin; cp jq $DEST/usr/bin/
+}
+
+build_lua5_4() {
+  # Debian's makefile builds liblua5.4.so with libtool; here the same
+  # objects, static: the POSIX build plus readline, as Debian's lua5.4 has
+  # what debian/rules generates: where Debian puts C modules
+  echo '#define DEB_HOST_MULTIARCH "wasm32-linux-musl"' > src/lua5.4-deb-multiarch.h
+  cd src
+  local f="-O2 -std=gnu99 -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_READLINE -I$SYSROOT/usr/include/ncursesw"
+  local core="lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser lstate lstring ltable ltm lundump lvm lzio lauxlib lbaselib lcorolib ldblib liolib lmathlib loadlib loslib lstrlib ltablib lutf8lib linit"
+  for o in $core lua luac; do gexcc $f -c $o.c -o $o.o & done; wait
+  gexcc-ar rcs liblua.a $(for o in $core; do echo $o.o; done)
+  gexcc -o lua lua.o liblua.a -lreadline -lncursesw -ltinfo -lm
+  gexcc -o luac luac.o liblua.a -lm
+  cd ..
+  mkdir -p $DEST/usr/bin $SYSROOT/usr/lib $SYSROOT/usr/include/lua5.4
+  cp src/lua $DEST/usr/bin/lua5.4; cp src/luac $DEST/usr/bin/luac5.4
+  # the names Debian's alternatives give them
+  ln -sf lua5.4 $DEST/usr/bin/lua; ln -sf luac5.4 $DEST/usr/bin/luac
+  cp src/liblua.a $SYSROOT/usr/lib/liblua5.4.a
+  cp src/lua.h src/luaconf.h src/lualib.h src/lauxlib.h src/lua.hpp $SYSROOT/usr/include/lua5.4/
+}
+
+build_tree() {
+  make -j$JOBS CC=gexcc CFLAGS="-O2 -std=c11 -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE"
+  mkdir -p $DEST/usr/bin; cp tree $DEST/usr/bin/
+}
+
+build_patch() {
+  at_configure
+  make -j$JOBS
+  make install DESTDIR=$DEST
+}
+
+build_bc() {
+  # bc's math library is compiled at build time by the bc just built: a host
+  # bc of the same source makes libmath.h first
+  # (the patched tree's timestamps ask for automake 1.14: regenerate)
+  autoreconf -fi
+  # libmath.h's last step is an ed script, and the build machine has no ed:
+  # the same edit in sed
+  cat > bc/fix-libmath_h <<'FIX'
+sed -i -e '1s/^/{"/' -e 's/$/",/' -e '2,$s/^/"/' libmath.h
+sed -i -e '$d' libmath.h
+sed -i -e '$s/,$/,0}/' libmath.h
+FIX
+  rm -rf ../bc-host; cp -a . ../bc-host
+  (cd ../bc-host && CONFIG_SITE= CC=cc ./configure -q --build=x86_64-pc-linux-gnu && make -j$JOBS MAKEINFO=true >/dev/null)
+  at_configure --with-readline CPPFLAGS="-I$SYSROOT/usr/include/ncursesw" LIBS="-lncursesw -ltinfo"
+  cp ../bc-host/bc/libmath.h bc/libmath.h
+  make -j$JOBS MAKEINFO=true fbc_EXEEXT= || true
+  touch bc/libmath.h
+  make -j$JOBS MAKEINFO=true
+  make install DESTDIR=$DEST MAKEINFO=true
+  rm -rf $DEST/usr/share/info
+}
+
+build_ed() {
+  ./configure --prefix=/usr --mandir=/usr/share/man --infodir=/usr/share/info CC=gexcc CFLAGS=-O2
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/info
+}
+
+build_libevent() {
+  # Debian's patches touch the build system (dh autoreconfs)
+  autoreconf -fi
+  at_configure --disable-shared --enable-static --disable-openssl --disable-samples --disable-libevent-regress \
+    --disable-debug-mode
+  make -j$JOBS
+  both install; nola
+}
+
+build_tmux() {
+  PKG_CONFIG=gexcc-pkg-config at_configure --disable-utf8proc CPPFLAGS="-I$SYSROOT/usr/include/ncursesw"
+  make -j$JOBS
+  make install DESTDIR=$DEST
+}
+
+build_htop() {
+  [ -x configure ] || autoreconf -fi
+  PKG_CONFIG=gexcc-pkg-config at_configure --enable-unicode --disable-sensors --disable-capabilities \
+    --disable-hwloc --disable-delayacct --disable-unwind CPPFLAGS="-I$SYSROOT/usr/include/ncursesw"
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/icons $DEST/usr/share/pixmaps
+}
+
+build_expat() {
+  # the git tree (Debian's orig): the library in expat/, no configure
+  cd expat
+  ./buildconf.sh
+  at_configure --without-docbook --without-examples --without-tests --disable-shared --enable-static
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST
+  mkdir -p $DEST
+}
+
+build_lz4() {
+  make -j$JOBS -C lib CC=gexcc AR=gexcc-ar liblz4.a
+  make -j$JOBS -C programs CC=gexcc AR=gexcc-ar lz4
+  for d in $DEST $SYSROOT; do
+    make -C lib install-static install-includes install-pc DESTDIR=$d PREFIX=/usr LIBDIR=/usr/lib 2>/dev/null \
+      || { mkdir -p $d/usr/lib $d/usr/include; cp lib/liblz4.a $d/usr/lib/; cp lib/lz4.h lib/lz4hc.h lib/lz4frame.h $d/usr/include/; }
+  done
+  rm -rf $DEST/usr/lib $DEST/usr/include
+  mkdir -p $DEST/usr/bin; cp programs/lz4 $DEST/usr/bin/
+  for n in unlz4 lz4cat; do ln -sf lz4 $DEST/usr/bin/$n; done
+}
+
+build_mpdecimal() {
+  at_configure --disable-shared --enable-static --disable-cxx
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_python3_13() {
+  # A native-style configure, as the corpus's: its checks and the build's
+  # own steps (freezing, the stdlib's bytecode) run the programs just built,
+  # under gexc. Extension modules static (no shared objects). Debian's
+  # patches give its layout (dist-packages).
+  export ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no
+  MODULE_BUILDTYPE=static PKG_CONFIG=gexcc-pkg-config CC=gexcc CXX=gexc++ AR=gexcc-ar RANLIB=gexcc-ranlib \
+    CPPFLAGS="-I$SYSROOT/usr/include/ncursesw" \
+    ./configure --prefix=/usr --disable-shared --without-ensurepip --disable-test-modules \
+      --with-system-expat --with-system-libmpdec --with-pkg-config=yes --with-readline=readline \
+      --without-static-libpython
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  ln -sf python3.13 $DEST/usr/bin/python3
+  rm -rf $DEST/usr/lib/python3.13/test $DEST/usr/lib/python3.13/idlelib/idle_test \
+    $DEST/usr/lib/python3.13/config-3.13-* $DEST/usr/lib/*.a $DEST/usr/include
+  find $DEST -name '*.opt-1.pyc' -o -name '*.opt-2.pyc' | xargs rm -f
+}
+
+build_openssl() {
+  # no assembly (wasm32), static, Debian's openssldir
+  ./Configure linux-generic32 no-asm no-shared no-dso no-tests no-docs no-afalgeng no-async \
+    --prefix=/usr --libdir=lib --openssldir=/usr/lib/ssl CC=gexcc AR=gexcc-ar RANLIB=gexcc-ranlib \
+    -DOPENSSL_NO_SECURE_MEMORY
+  make -j$JOBS build_sw
+  make install_sw DESTDIR=$SYSROOT
+  make install_sw install_ssldirs DESTDIR=$DEST
+  # the openssl binary; the libraries live in the programs that link them
+  rm -rf $DEST/usr/include $DEST/usr/lib/*.a $DEST/usr/lib/pkgconfig $DEST/usr/lib/cmake $DEST/usr/bin/c_rehash
+  # Debian's /usr/lib/ssl points at /etc/ssl (ca-certificates' bundle)
+  rm -rf $DEST/usr/lib/ssl/certs $DEST/usr/lib/ssl/private $DEST/usr/lib/ssl/openssl.cnf*
+  ln -sf /etc/ssl/certs $DEST/usr/lib/ssl/certs
+  ln -sf /etc/ssl/private $DEST/usr/lib/ssl/private
+  mkdir -p $DEST/etc/ssl; cp apps/openssl.cnf $DEST/etc/ssl/openssl.cnf
+  ln -sf /etc/ssl/openssl.cnf $DEST/usr/lib/ssl/openssl.cnf
+}
+
+build_curl() {
+  # OpenSSL, as Debian's curl; the CA bundle ca-certificates writes
+  PKG_CONFIG=gexcc-pkg-config at_configure --with-openssl=$SYSROOT/usr --with-zlib=$SYSROOT/usr \
+    --without-libpsl --disable-ldap --without-brotli --with-zstd=$SYSROOT/usr --without-libidn2 --without-nghttp2 \
+    --without-libssh2 --without-librtmp --disable-shared --enable-static \
+    --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --with-ca-path=/etc/ssl/certs LIBS="-lzstd"
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST/usr/include $DEST/usr/lib $DEST/usr/bin/curl-config $DEST/usr/share/aclocal
+}
+
+build_git() {
+  # git's own makefile; no Tcl/Tk (gitk, git-gui), gettext, Perl or Python
+  # parts (send-email, svn, p4); https through libcurl and OpenSSL
+  local m="prefix=/usr gitexecdir=/usr/lib/git-core CC=gexcc AR=gexcc-ar RANLIB=gexcc-ranlib uname_S=Linux uname_M=wasm32
+    NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 NO_SVN_TESTS=1 USE_LIBPCRE2=1 NO_INSTALL_HARDLINKS=1
+    CURL_CONFIG=$SYSROOT/usr/bin/curl-config CURL_LDFLAGS='-lcurl -lssl -lcrypto -lz -lzstd'
+    EXPATDIR=$SYSROOT/usr ZLIB_PATH=$SYSROOT/usr NEEDS_LIBICONV= HAVE_DEV_TTY=1 NO_REGEX=NeedsStartEnd
+    CFLAGS=-O2 V=1"
+  eval make -j$JOBS $m all
+  eval make $m install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/perl5 $DEST/usr/share/gitweb $DEST/usr/share/git-gui $DEST/usr/share/gitk
+}
+build_dpkg() {
+  # Native architecture arm64 (docs/gexcc.md §6.1a): configure would ask
+  # dpkg-architecture about the wasm32 host triplet; say arm64 instead
+  sed -i 's|^\( *\)cpu_type=\$(PERL=.*$|\1cpu_type=arm64|; s|^\( *\)os_type=\$(PERL=.*$|\1os_type=linux|; s|^\( *\)dpkg_arch=\$(PERL=.*$|\1dpkg_arch=arm64|' configure
+  at_configure --libexecdir=/usr/lib --disable-nls --disable-dselect --disable-devel-docs \
+    --without-libselinux --with-libz --with-liblzma --with-libzstd --with-libbz2 \
+    --disable-shared --enable-static PERL=/usr/bin/perl
+  grep -q '#define ARCHITECTURE "arm64"' config.h
+  make -j$JOBS -C lib
+  make -j$JOBS -C src
+  make -j$JOBS -C utils
+  make -C src install DESTDIR=$DEST
+  make -C utils install DESTDIR=$DEST
+  # Debian's dpkg package (debian/dpkg.install), the C side
+  mkdir -p $DEST/etc/dpkg/dpkg.cfg.d $DEST/etc/alternatives \
+    $DEST/var/lib/dpkg/{alternatives,info,parts,updates} $DEST/usr/share/dpkg/sh
+  cp debian/dpkg.cfg $DEST/etc/dpkg/
+  cp data/*table $DEST/usr/share/dpkg/
+  cp src/sh/dpkg-error.sh $DEST/usr/share/dpkg/sh/
+  rm -rf $DEST/usr/share/polkit-1
+}
+build_xxhash() {
+  make -j$JOBS CC=gexcc AR=gexcc-ar libxxhash.a
+  mkdir -p $SYSROOT/usr/lib $SYSROOT/usr/include
+  cp libxxhash.a $SYSROOT/usr/lib/; cp xxhash.h xxh3.h $SYSROOT/usr/include/
+}
+# apt's build runs triehash (a perl script) on the build machine
+host_triehash() {
+  local h=$GEXCC_DEB/host
+  if [ ! -x $h/bin/triehash ]; then
+    python3 -I "$HERE/debsrc.py" --into $h triehash=0.3-3 > /dev/null
+    mkdir -p $h/bin; install -m755 $h/triehash-0.3-3/triehash.pl $h/bin/triehash
+  fi
+  export PATH=$h/bin:$PATH
+}
+build_apt() {
+  # Native architecture arm64 like our dpkg (docs/gexcc.md §6.1a). Static:
+  # libapt-pkg and libapt-private go into each program. No seccomp, udev,
+  # systemd, berkeley db (apt-ftparchive only), nls or docs. No sqv: the
+  # gpgv method runs our native gpgv.
+  host_triehash
+  # (Size is 64-bit in FileFd, size_t 32-bit: ZSTD buffers narrow it)
+  # without NLS apt defines setlocale and friends inline with throw(); musl
+  # declares them without, which C++ rejects
+  sed -i '/^extern "C" inline/s/ throw()//' CMake/apti18n.h.in
+  sed -i 's/add_library(apt-pkg SHARED/add_library(apt-pkg STATIC/; /-Wl,-version-script=/d' apt-pkg/CMakeLists.txt
+  sed -i 's/add_library(apt-private SHARED/add_library(apt-private STATIC/' apt-private/CMakeLists.txt
+  sed -i 's/^find_package(Berkeley REQUIRED)/find_package(Berkeley)/; s/^add_subdirectory(ftparchive)/#&/; s/^add_subdirectory(test)/#&/; s/^add_subdirectory(doc)/#&/; s/^add_subdirectory(dselect)/#&/' CMakeLists.txt
+  mkdir -p build && cd build
+  cmake .. -G "Unix Makefiles" -DCMAKE_TOOLCHAIN_FILE=$GEXCC_PREFIX/share/gexcc/toolchain.cmake \
+    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var \
+    -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_LIBEXECDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DCMAKE_STAGING_PREFIX= \
+    -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing" -DWITH_DOC=OFF -DWITH_TESTS=OFF -DUSE_NLS=OFF -DCOMMON_ARCH=arm64 -DDPKG_DATADIR=/usr/share/dpkg \
+    -DROOT_GROUP=root -DSQV_EXECUTABLE=SQV_EXECUTABLE-NOTFOUND \
+    -DSECCOMP_FOUND=OFF -DUDEV_FOUND=OFF -DSYSTEMD_FOUND=OFF -DBERKELEY_FOUND=OFF \
+    -DCMAKE_DISABLE_FIND_PACKAGE_SECCOMP=ON -DCMAKE_DISABLE_FIND_PACKAGE_Udev=ON \
+    -DCMAKE_DISABLE_FIND_PACKAGE_Systemd=ON -DCMAKE_DISABLE_FIND_PACKAGE_Berkeley=ON
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  cd ..
+  # (the toolchain's staging prefix, emptied above, also empties the install
+  # prefix for the /usr parts; the compiled-in paths are /usr's)
+  mkdir -p $DEST/usr
+  for d in bin lib share include; do if [ -d $DEST/$d ]; then cp -a $DEST/$d $DEST/usr/; rm -rf $DEST/$d; fi; done
+  # Debian's apt package (debian/apt.install): the programs, methods, config
+  rm -rf $DEST/usr/include $DEST/usr/lib/*.a $DEST/usr/lib/pkgconfig $DEST/usr/share/doc
+  rm -f $DEST/usr/bin/apt-extracttemplates $DEST/usr/bin/apt-ftparchive $DEST/usr/bin/apt-sortpkgs
+  # one program for all of apt's (aptmulti.py): 15 MB instead of 100
+  python3 -I "$HERE/aptmulti.py" $PWD/build $PWD/build/apt-multi > build/multi-names
+  rm -f $DEST/usr/bin/apt*; rm -rf $DEST/usr/lib/apt/methods $DEST/usr/lib/apt/solvers $DEST/usr/lib/apt/planners \
+    $DEST/usr/lib/apt/apt-helper $DEST/usr/lib/apt/apt-extracttemplates
+  install -m755 build/apt-multi $DEST/usr/lib/apt/apt-multi
+  while read -r n; do
+    case $n in
+      bin/*) ln -s ../lib/apt/apt-multi $DEST/usr/$n ;;
+      */*) mkdir -p $DEST/usr/lib/apt/${n%/*}; ln -s ../apt-multi $DEST/usr/lib/apt/$n ;;
+      *) ln -s apt-multi $DEST/usr/lib/apt/$n ;;
+    esac
+  done < build/multi-names
+  mkdir -p $DEST/etc/apt/{apt.conf.d,preferences.d,sources.list.d,trusted.gpg.d,keyrings,auth.conf.d} \
+    $DEST/var/lib/apt/{lists/partial,periodic,mirrors/partial} $DEST/var/cache/apt/archives/partial $DEST/var/log/apt
+  cp debian/apt.conf.autoremove $DEST/etc/apt/apt.conf.d/01autoremove 2>/dev/null || true
+}
+# the GnuPG libraries' configure scripts find each other through gpgrt-config
+# and the .pc files in the sysroot (gpg-error-config is not installed)
+export GPGRT_CONFIG=$SYSROOT/usr/bin/gpgrt-config
+build_libgpg_error() {
+  at_configure --enable-static --disable-shared --disable-nls --disable-doc --disable-tests
+  make -j$JOBS
+  both install; nola
+}
+build_libgcrypt20() {
+  # no assembly (wasm32); the generic C code paths
+  at_configure --enable-static --disable-shared --disable-asm --disable-doc --disable-jent-support \
+    --disable-padlock-support --disable-aesni-support --disable-shaext-support --disable-pclmul-support \
+    --disable-sse41-support --disable-drng-support --disable-avx-support --disable-avx2-support \
+    --disable-neon-support --disable-arm-crypto-support
+  make -j$JOBS -C cipher; make -j$JOBS -C random; make -j$JOBS -C mpi; make -j$JOBS -C compat; make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_libassuan() {
+  at_configure --enable-static --disable-shared --disable-doc
+  make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_libksba() {
+  at_configure --enable-static --disable-shared --disable-doc
+  make -j$JOBS -C gl; make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_npth() {
+  # (gnupg's configure requires it; gpgv itself does not use threads)
+  at_configure --enable-static --disable-shared --disable-tests
+  make -j$JOBS -C src
+  make install DESTDIR=$SYSROOT SUBDIRS=src; nola
+}
+build_gnupg2() {
+  # gpgv only, configured as Debian's gpgv (udeb) build: what apt runs to
+  # check InRelease against debian-archive-keyring
+  at_configure --libexecdir=/usr/lib/gnupg --disable-doc --disable-nls --disable-bzip2 \
+    --disable-gpgtar --disable-gpgsm --disable-scdaemon --disable-dirmngr --disable-tofu --disable-exec \
+    --disable-ldap --disable-gnutls --disable-sqlite --disable-libdns --disable-keyboxd --disable-tpm2d \
+    --disable-card-support --disable-ccid-driver --disable-wks-tools \
+    --with-zlib=$SYSROOT/usr
+  make -j$JOBS -C common; make -j$JOBS -C regexp; make -j$JOBS -C kbx libkeybox.a
+  make -j$JOBS -C g10 gpgv
+  mkdir -p $DEST/usr/bin; cp g10/gpgv $DEST/usr/bin/
+}

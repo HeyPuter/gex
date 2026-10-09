@@ -886,6 +886,17 @@ export class Gex {
       })() : null,
     };
   }
+  /// The program's argv as the shim has it (after any `execve`).
+  get cmdline() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_cmdline) return '';
+    const max = 160;
+    const p = e.gex_alloc(max) >>> 0;
+    const n = e.gex_cmdline(p, max) >>> 0;
+    const s = utf8(this.#bytes().subarray(p, p + n));
+    e.gex_free?.(p, max);
+    return s;
+  }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
     const e = this.#shim?.exports;
@@ -2006,7 +2017,10 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
-    if (child.wasm32) e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    if (child.wasm32) {
+      if (child.wasm32Base && e.gex_wasmprog_adopt_at) e.gex_wasmprog_adopt_at(BigInt(child.wasm32), child.wasm32Base);
+      else e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    }
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
@@ -2274,6 +2288,9 @@ export class Gex {
       compat: e.gex_compat?.() ?? 0,
       // A wasm32 program's entry: the child installs the same module.
       wasm32: e.gex_wasmprog_entry?.() ?? 0n,
+      // And where its module sits in the function table: the child's copy
+      // of the data holds function pointers for that base.
+      wasm32Base: e.gex_wasmprog_base?.() ?? 0,
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
@@ -3791,7 +3808,9 @@ export class Gex {
             // own code and stays quiet. A give-up (nothing exited, nothing woke)
             // is the runtime stuck; that is 125 -- outside a program's range so
             // it is not mistaken for a clean exit -- and it is said out loud.
-            const stalled = e.gex_exited ? !e.gex_exited() : false;
+            // (A thread that ended in a process that goes on -- a joined
+            // worker thread -- is this Worker's end too, not a stall.)
+            const stalled = (e.gex_exited ? !e.gex_exited() : false) && !(e.gex_ctx_exited?.(ctx) > 0);
             if (stalled) {
               // Dump every thread's wait-state + pc so a give-up says WHICH
               // thread is stuck on WHAT (futex vs socket read vs exited), not

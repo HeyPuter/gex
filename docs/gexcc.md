@@ -531,14 +531,66 @@ median of 3, ABBA; `scratch/CC/archbench`, 2026-10-08):
 **dpkg's architectures.**
 - Native architecture **arm64**: apt fetches Debian's arm64 index and
   packages as native, its dependency resolution unmodified. `dpkg
-  --print-architecture` says arm64. Until our own dpkg and apt are built,
-  dpkg, apt, perl-base, debconf and sqv are Debian's arm64 builds,
-  translated.
+  --print-architecture` says arm64. dpkg, apt and gpgv are ours (below);
+  perl-base and debconf are Debian's arm64 builds, translated.
 - Foreign architecture **`musl-linux-wasm32`** (`dpkg --add-architecture`;
   the name dpkg's tables give a musl wasm32 tuple) for every package we
   build. Tested with the host's dpkg: accepted, and an arm64 package's
   `Depends: coreutils (>= 9.7)` is satisfied by
   `coreutils:musl-linux-wasm32`.
+
+**Our dpkg and apt (user, 2026-10-08).** Each translated process in the
+page pays about 1.5-2.5 s before it does its own work (Worker, translated
+ld.so, retranslation; profile in §6.4), and `apt install` runs dozens of
+dpkg, dpkg-deb, dpkg-split and gpgv processes. So dpkg, apt and the
+OpenPGP verifier are gexcc builds:
+- **dpkg** 1.22.22, C, static (libmd, zlib, xz, zstd, bzip2 from tier 1).
+  configure asks dpkg-architecture for the host triplet's name; the recipe
+  answers `arm64`, so `ARCHITECTURE` is compiled in as arm64 and
+  `dpkg --print-architecture` says arm64 (checked natively).
+- **apt** 3.0.3, C++ against gexcc's libc++, CMake. libapt-pkg and
+  libapt-private are static (linked into each program); no seccomp, udev,
+  systemd, NLS, docs, tests, apt-ftparchive (Berkeley DB) or dselect.
+  `COMMON_ARCH=arm64`. Two libc++ patches (`patches/apt/`: no
+  `char_traits<unsigned char>`, no `deque` of an incomplete type).
+  Deps: xxhash (new, static only), zlib, bzip2, xz, lz4, zstd, OpenSSL.
+- **Packaging.** Both are labelled `Architecture: arm64` (binpkgs.txt
+  `arch dpkg arm64`), version Debian's + `+gex1`, from our repository,
+  which now carries `binary-arm64` beside `binary-musl-linux-wasm32`. The
+  `o=gex` pin (1001) keeps them over Debian's, also after a Debian point
+  release (1.22.23 > 1.22.22+gex1 still loses to 1001); the `-1` pin list
+  covers only our wasm32 names, so it does not block them.
+- **Essential/Pre-Depends.** Debian's dpkg is `Essential: yes` with
+  `Pre-Depends: ${shlibs}` (libc6, libbz2, liblzma, libmd0, libselinux1,
+  libzstd1) and `Depends: tar (>= 1.28-1)`. Ours keeps `Essential: yes`
+  and has no library Pre-Depends (static); tar's is a Pre-Depends, met by
+  our tar (Multi-Arch: foreign). Upgrading dpkg is still dpkg's own
+  unpack-then-configure; nothing in the closure Pre-Depends on a library
+  that only our dpkg brought. Those libraries stay installed (other arm64
+  packages need them) but are no longer pulled in for dpkg.
+- **apt's dependencies.** Debian's apt Depends on libapt-pkg7.0 (exact
+  binary version), sqv, base-passwd | adduser and the keyring. Ours:
+  `base-passwd (>= 3.6.1) | adduser, gpgv, debian-archive-keyring`;
+  libapt-pkg7.0 and sqv leave the image. Consequence: Debian's
+  apt-utils (Depends `apt (= 3.0.3)`) is not installable against
+  3.0.3+gex1; build it here if wanted.
+- **OpenPGP.** apt's `sqv` method is built only when the build machine has
+  sqv; without it apt verifies with its `gpgv` method, which runs
+  `APT::Key::gpgvcommand` (default `gpgv`). Ours is gnupg2 2.4.7's gpgv,
+  configured as Debian's gpgv udeb (no npth, gpgsm, dirmngr, ldap, tofu,
+  sqlite...), with libgcrypt 1.11 (no asm), libgpg-error, libassuan and
+  libksba static. Debian's keyring files are unchanged
+  (`/usr/share/keyrings/debian-archive-keyring.gpg`, `Signed-By`).
+- **Hashing.** apt hashes downloads itself (OpenSSL EVP, in-process) and
+  dpkg checks md5sums in-process; neither execs a hashing program during
+  install. TLS is apt's http method's OpenSSL, native.
+- **debconf.** apt's `DPkg::Pre-Install-Pkgs` hook runs debconf's
+  dpkg-preconfigure (perl) before every install: about 19 s in the page
+  for jq. The image clears it (`#clear DPkg::Pre-Install-Pkgs;` in
+  99gex); postinst scripts still ask (noninteractively) at configure.
+- **Later: a Rust target for gexcc** (sqv, ripgrep, fd...): a rustc
+  target over gexcc's sysroot and wasm32 container. Not needed for apt
+  once gpgv is native.
 
 **How arm64 packages' dependencies are satisfied.**
 - **Tools** (bash, coreutils, dash, grep, sed, tar, gzip, findutils,

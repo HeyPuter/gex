@@ -5187,6 +5187,19 @@ impl Kernel {
         put(&mut out, 48, 1 << 17); // f_ffree
         put(&mut out, 72, 255); // f_namelen
         put(&mut out, 80, 4096); // f_frsize
+        if self.compat {
+            // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
+            // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
+            let mut c = [0u8; 84];
+            let w32 = |o: &mut [u8; 84], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            w32(&mut c, 0, 0x0102_1994);
+            w32(&mut c, 4, 4096);
+            c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
+            w32(&mut c, 56, 255);
+            w32(&mut c, 60, 4096);
+            m.write(buf, &c)?;
+            return Ok(0);
+        }
         m.write(buf, &out)?;
         Ok(0)
     }

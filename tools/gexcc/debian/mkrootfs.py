@@ -144,29 +144,34 @@ def write_repo(root, debs):
     Release; the .debs themselves are installed already and not copied
     unless --repo-debs)."""
     repo = os.path.join(root, 'var/lib/gex-apt')
-    bindir = os.path.join(repo, f'dists/{SUITE}/main/binary-{OURS_ARCH}')
-    os.makedirs(bindir, exist_ok=True)
-    stanzas = []
-    for deb, ctl in debs:
-        name = ctl['Package']
-        fn = f'pool/main/{name[0]}/{name}/{os.path.basename(deb)}'
-        data = open(deb, 'rb').read()
-        s = [f'{k}: {v}' for k, v in ctl.items()]
-        s += [f'Filename: {fn}', f'Size: {len(data)}', f'MD5sum: {hashlib.md5(data).hexdigest()}',
-              f'SHA256: {hashlib.sha256(data).hexdigest()}']
-        stanzas.append('\n'.join(s) + '\n')
-    text = '\n'.join(stanzas).encode()
-    open(os.path.join(bindir, 'Packages'), 'wb').write(text)
-    open(os.path.join(bindir, 'Packages.xz'), 'wb').write(lzma.compress(text))
+    rel_sums = []
+    # wasm32 tools, and dpkg/apt labelled arm64 (one index per architecture)
+    for arch in (OURS_ARCH, NATIVE):
+        bindir = os.path.join(repo, f'dists/{SUITE}/main/binary-{arch}')
+        os.makedirs(bindir, exist_ok=True)
+        stanzas = []
+        for deb, ctl in debs:
+            if ctl['Architecture'] != arch:
+                continue
+            name = ctl['Package']
+            fn = f'pool/main/{name[0]}/{name}/{os.path.basename(deb)}'
+            data = open(deb, 'rb').read()
+            st = [f'{k}: {v}' for k, v in ctl.items()]
+            st += [f'Filename: {fn}', f'Size: {len(data)}', f'MD5sum: {hashlib.md5(data).hexdigest()}',
+                   f'SHA256: {hashlib.sha256(data).hexdigest()}']
+            stanzas.append('\n'.join(st) + '\n')
+        text = '\n'.join(stanzas).encode()
+        open(os.path.join(bindir, 'Packages'), 'wb').write(text)
+        open(os.path.join(bindir, 'Packages.xz'), 'wb').write(lzma.compress(text))
+        for leaf in ('Packages', 'Packages.xz'):
+            p = os.path.join(bindir, leaf)
+            rel_sums.append(f' {hashlib.sha256(open(p, "rb").read()).hexdigest()} {os.path.getsize(p)} '
+                            f'main/binary-{arch}/{leaf}')
     import email.utils
     rel = [f'Origin: gex', 'Label: gex native', f'Suite: {SUITE}', f'Codename: {SUITE}',
            f'Date: {email.utils.formatdate(usegmt=True)}',
-           f'Architectures: {OURS_ARCH}', 'Components: main',
-           'Description: Debian tools built from source with gexcc as native wasm32', 'SHA256:']
-    for leaf in ('Packages', 'Packages.xz'):
-        p = os.path.join(bindir, leaf)
-        rel.append(f' {hashlib.sha256(open(p, "rb").read()).hexdigest()} {os.path.getsize(p)} '
-                   f'main/binary-{OURS_ARCH}/{leaf}')
+           f'Architectures: {OURS_ARCH} {NATIVE}', 'Components: main',
+           'Description: Debian tools built from source with gexcc as native wasm32', 'SHA256:'] + rel_sums
     open(os.path.join(repo, f'dists/{SUITE}/Release'), 'w').write('\n'.join(rel) + '\n')
     return repo
 
@@ -261,8 +266,9 @@ def configure(root, ours, native_pkgs):
       f'Architectures: {NATIVE}\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n')
     w('etc/apt/sources.list.d/gex.sources',
       f'Types: deb\nURIs: file:/var/lib/gex-apt\nSuites: {SUITE}\nComponents: main\n'
-      f'Architectures: {OURS_ARCH}\nTrusted: yes\n')
-    names = sorted({c['Package'] for _, c in ours})
+      f'Architectures: {OURS_ARCH} {NATIVE}\nTrusted: yes\n')
+    # (dpkg and apt of ours are labelled arm64: o=gex's 1001 keeps them)
+    names = sorted({c['Package'] for _, c in ours if c['Architecture'] == OURS_ARCH})
     w('etc/apt/preferences.d/gex-native',
       '# Our native tools (musl-linux-wasm32) are never replaced by Debian\'s\n'
       '# arm64 builds; libraries are not pinned (docs/gexcc.md §6.1a).\n'
@@ -277,7 +283,15 @@ def configure(root, ours, native_pkgs):
       '// copy-on-write in the guest, so no bigger than needed)\n'
       'APT::Cache-Start "100663296";\n'
       'Dpkg::Use-Pty "false";\n'
-      'APT::Install-Recommends "false";\n')
+      'APT::Install-Recommends "false";\n'
+      '// said here so apt does not fork dpkg to ask (two dpkg runs, 3 s of\n'
+      '// every apt-cache in the page)\n'
+      f'APT::Architecture "{NATIVE}";\n'
+      f'APT::Architectures {{ "{NATIVE}"; "{OURS_ARCH}"; }};\n'
+      '// debconf\'s dpkg-preconfigure (perl, about 19 s per apt install in the\n'
+      '// page) only asks questions early; postinst asks them anyway, and the\n'
+      '// demo is noninteractive\n'
+      '#clear DPkg::Pre-Install-Pkgs;\n')
     for d in ('var/lib/apt/lists/partial', 'var/cache/apt/archives/partial', 'var/lib/dpkg/updates',
               'var/lib/dpkg/triggers', 'var/log/apt', 'etc/apt/trusted.gpg.d', 'etc/apt/keyrings',
               'etc/dpkg/dpkg.cfg.d', 'var/cache/debconf', 'var/lib/apt/periodic', 'proc', 'dev', 'run', 'sys',
@@ -308,7 +322,8 @@ def main():
     a_minimal = not a.full
 
     ours = []
-    for deb in sorted(glob.glob(os.path.join(a.pool, f'*_{OURS_ARCH}.deb'))):
+    for deb in sorted(glob.glob(os.path.join(a.pool, f'*_{OURS_ARCH}.deb'))
+                      + glob.glob(os.path.join(a.pool, f'*_{NATIVE}.deb'))):
         ours.append((deb, control(deb)))
     excluded = set(filter(None, a.exclude.split(',')))
     image_ours = [(d, c) for d, c in ours if c['Package'] not in excluded]
