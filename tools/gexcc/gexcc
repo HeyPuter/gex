@@ -324,9 +324,14 @@ def expand(items, seen):
             continue
         if it.startswith('-l'):
             nm = it[2:]
+            # libc and its parts are linked last, after libgex, whose
+            # definitions (dlopen, dlsym) must win over musl's weak stubs:
+            # an -lc mid-line would pull those first
+            if nm in LIBC_NAMES:
+                continue
             p = resolve(nm)
             if p is None:
-                if nm in LIBC_NAMES or (CXX and nm in ('stdc++', 'c++', 'c++abi', 'supc++')):
+                if CXX and nm in ('stdc++', 'c++', 'c++abi', 'supc++'):
                     continue
                 missing.append(it)
                 continue
