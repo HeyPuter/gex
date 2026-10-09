@@ -1126,29 +1126,73 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
 /// noita.exe's unit takes about a minute. Not keyed on the build of gex: the
 /// unit directory is keyed on the module's content already, and wasmtime
 /// refuses an artifact from an incompatible engine, which recompiles it.
-/// Queue the unit at `path` for [`precompile_unit`] on one background
-/// thread of the host process, once.
-fn compile_later(path: std::path::PathBuf) {
-    static QUEUE: OnceLock<Mutex<(std::collections::HashSet<std::path::PathBuf>, Option<std::sync::mpsc::Sender<std::path::PathBuf>>)>> = OnceLock::new();
-    let q = QUEUE.get_or_init(|| Mutex::new((Default::default(), None)));
+/// The largest function body in a wasm module, in bytes.
+fn largest_body(wasm: &[u8]) -> usize {
+    let mut max = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+            max = max.max(body.range().len());
+        }
+    }
+    max
+}
+
+/// Units with a function body larger than this are compiled only at
+/// staging (`GEX_CGEN_PRECOMPILE=1`), never at run time: Cranelift's
+/// register allocation on d3dx9_43's 828 KB function takes about ten minutes
+/// (wined3d's 444 KB one, seconds: size alone is a rough guide).
+/// `GEX_W3_UNIT_MAX_BODY` (bytes) overrides.
+fn max_runtime_body() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("GEX_W3_UNIT_MAX_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(640 << 10))
+}
+
+/// Queue the unit at `path` (`wasm` its bytes) for [`precompile_unit`] on
+/// one background thread of the host process, once; smallest first, so a
+/// large unit does not hold up the rest.
+fn compile_later(path: std::path::PathBuf, wasm: &[u8]) {
+    struct Q {
+        seen: std::collections::HashSet<std::path::PathBuf>,
+        todo: Vec<(usize, std::path::PathBuf)>,
+        worker: bool,
+    }
+    static QUEUE: OnceLock<(Mutex<Q>, std::sync::Condvar)> = OnceLock::new();
+    let (q, cv) = QUEUE.get_or_init(|| (Mutex::new(Q { seen: Default::default(), todo: Vec::new(), worker: false }), std::sync::Condvar::new()));
     let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
-    if !g.0.insert(path.clone()) {
+    if !g.seen.insert(path.clone()) {
         return;
     }
-    let tx = g.1.get_or_insert_with(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
-        let _ = std::thread::Builder::new().name("gex-unit-cc".into()).spawn(move || {
-            for p in rx {
-                let t0 = std::time::Instant::now();
-                match precompile_unit(&p) {
-                    Ok(()) => eprintln!("gex-w3: compiled the unit {} in {:.1}s (for the next process)", p.display(), t0.elapsed().as_secs_f64()),
-                    Err(e) => eprintln!("gex-w3: compiling the unit {}: {e:#}", p.display()),
+    let body = largest_body(wasm);
+    if body > max_runtime_body() {
+        eprintln!(
+            "gex-w3: the unit {} has a {} KiB function; not compiled at run time (compile it at staging: \
+             gexc cgen-image with GEX_CGEN_PRECOMPILE=1)",
+            path.display(),
+            body >> 10
+        );
+        return;
+    }
+    g.todo.push((wasm.len(), path));
+    cv.notify_one();
+    if !g.worker {
+        g.worker = true;
+        let _ = std::thread::Builder::new().name("gex-unit-cc".into()).spawn(move || loop {
+            let (q, cv) = QUEUE.get().unwrap();
+            let p = {
+                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                while g.todo.is_empty() {
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 }
+                let i = (0..g.todo.len()).min_by_key(|&i| g.todo[i].0).unwrap();
+                g.todo.swap_remove(i).1
+            };
+            let t0 = std::time::Instant::now();
+            match precompile_unit(&p) {
+                Ok(()) => eprintln!("gex-w3: compiled the unit {} in {:.1}s (for the next process)", p.display(), t0.elapsed().as_secs_f64()),
+                Err(e) => eprintln!("gex-w3: compiling the unit {}: {e:#}", p.display()),
             }
         });
-        tx
-    });
-    let _ = tx.send(path);
+    }
 }
 
 /// Compile the unit at `path` (`.../c.wasm`) for this host into its
@@ -1822,7 +1866,7 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     // the guest for as long as Cranelift takes (d3dx9_43's 7.9 MB unit:
     // ten minutes; Undertale never reached a frame).
     if cache.is_some() && !pl.path.with_extension("cwasm").exists() {
-        compile_later(pl.path.clone());
+        compile_later(pl.path.clone(), &pl.cwasm);
         if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
             eprintln!("gex-w3: {path} at {base:#x}: its unit is compiling in the background; tier-1 this time");
         }
