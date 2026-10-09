@@ -914,6 +914,9 @@ fn remembered_unit_key(id: &(String, u64, usize, u64), image: &gex_ld::Image, pv
     let mut h = std::collections::hash_map::DefaultHasher::new();
     "gex-w3-key 1".hash(&mut h);
     id.hash(&mut h);
+    // What else decides the key at run time: the memory flavour, guards
+    // and store widths (gex-cgen's unit inputs).
+    gex_cgen::image::unit_inputs().hash(&mut h);
     std::env::current_exe().ok().and_then(|e| stamp(&e)).hash(&mut h);
     stamp(&root.join("icall")).hash(&mut h);
     let memo = root.join("w3keys").join(format!("{:016x}", h.finish()));
