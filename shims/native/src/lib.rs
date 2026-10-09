@@ -2182,6 +2182,8 @@ fn take_kernel(cx: &SpawnContext) -> Kernel {
 /// translated are either far too slow or do not load at all (clang's 100 MB
 /// library). Paths are the guest's, so this means something only when the
 /// guest sees the host's tree (no sysroot), as gexcc's runner does.
+/// Opt-in and for build tooling only: no demo, image or test sets it, and
+/// the browser shim has no equivalent.
 ///
 /// The process stays: it waits for the host program and exits as it did.
 /// Descriptors 0-2 are bridged: a stream the guest got from gexc's own stdio
