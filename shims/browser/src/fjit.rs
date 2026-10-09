@@ -74,8 +74,21 @@ static BY_OBJECT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// page's translation offline (scratch/unity/fjitrepro).
 static DUMP_MOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+static DUMP_OBJ: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
 fn dump_module(root: u64, funcs: &[u64], wasm: &[u8]) {
-    let want = DUMP_MOD.load(Ordering::Relaxed);
+    let mut want = DUMP_MOD.load(Ordering::Relaxed);
+    if want == 0 {
+        let obj = lock(&DUMP_OBJ).clone();
+        if let Some((name, off)) = obj {
+            if let Some(&a) = funcs.iter().find(|&&a| crate::object_file_off(a) == (name.clone(), off)) {
+                DUMP_MOD.store(a, Ordering::Relaxed);
+                *lock(&DUMP_OBJ) = None;
+                crate::warn_line(&format!("[fjitdump] {name}@{off:x} is {a:#x}\n"));
+                want = a;
+            }
+        }
+    }
     if want == 0 || !funcs.contains(&want) {
         return;
     }
@@ -437,7 +450,14 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
         // `provcheck=1`: check each provider guest call ends at its return;
         // `byobj=1`: count translations by object (`note_object`).
         if let Some(a) = w.strip_prefix("dumpmod=") {
-            if let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) {
+            // `dumpmod=OBJ@OFF`: by the object's name and the hex offset from
+            // its text mapping (as `object_off_at` prints), for a layout
+            // whose addresses are not known ahead.
+            if let Some((name, off)) = a.split_once('@') {
+                if let Ok(off) = u64::from_str_radix(off.trim_start_matches("0x"), 16) {
+                    *lock(&DUMP_OBJ) = Some((name.to_string(), off));
+                }
+            } else if let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) {
                 DUMP_MOD.store(a, Ordering::Relaxed);
             }
             continue;
