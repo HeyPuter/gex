@@ -111,6 +111,45 @@ fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
+/// A forked child's copy of the mapping [`alloc_low`] made in its parent
+/// (by name): the provider's data, heap and code page are the child's as
+/// the rest of its memory is.
+fn inherited(name: &str) -> Option<u64> {
+    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.name == name).map(|v| v.start))
+}
+
+/// The process the state above is for: a forked child's shim starts with
+/// none of it (or its parent's copy), while its memory holds the parent's
+/// replaced libraries, their providers' data and heap, and the guest's
+/// pointers into them.
+static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Before a Worker's guest first runs (`gex_elfprov_wanted`): in a new
+/// process, the replaced libraries it inherited are bound again, over the
+/// data and code page its parent made (a child must not start a provider
+/// over: an open `z_stream` points into its heap). Returns a unit to serve.
+pub(crate) fn rescan_if_new() -> Option<usize> {
+    let pid = crate::with_host(|h| h.kernel.pid);
+    let was = PID.swap(pid, Ordering::AcqRel);
+    if was == pid || lock(&DLLS).is_empty() {
+        return None;
+    }
+    lock(&LIBS).clear();
+    lock(&REPLACED).clear();
+    THREAD_ENTRY.store(0, Ordering::Release);
+    let mapped: Vec<gex_kernel::CodeMap> = crate::with_host(|h| {
+        use gex_kernel::mem::prot;
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
+            .collect()
+    });
+    maps(&mapped)
+}
+
 /// After a syscall that mapped code: a replaced library becomes a unit with
 /// one provider for JS to serve (`elfprov`'s queue). Returns whether one was
 /// queued.
@@ -118,6 +157,9 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
     let dlls = lock(&DLLS).clone();
     if dlls.is_empty() {
         return None;
+    }
+    if PID.load(Ordering::Acquire) == 0 {
+        PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
     }
     let mut queued = None;
     for m in mapped {
@@ -167,7 +209,11 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
         }
     }
     if let Some(k) = slot("__gex_thread_start") {
-        let at = alloc_low(CODE_PAGE, gex_kernel::mem::prot::READ, &format!("[provider {file} code]", file = wasm_path))?;
+        let name = format!("[provider {wasm_path} code]");
+        let at = match inherited(&name) {
+            Some(a) => a,
+            None => alloc_low(CODE_PAGE, gex_kernel::mem::prot::READ, &name)?,
+        };
         pairs.push((at, k));
         THREAD_ENTRY.store(at, Ordering::Release);
         if let Some(r) = slot("gexp__reverse") {
@@ -189,7 +235,11 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
     lock(&MISSING).get_or_insert_with(Default::default).extend(unprovided);
     let (size, align) = dylink_memory(&wasm)?;
     let a = 1u64 << align;
-    let data = alloc_low((size as u64).max(16) + a, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE, &format!("[provider {wasm_path} data]"))?;
+    let name = format!("[provider {wasm_path} data]");
+    let data = match inherited(&name) {
+        Some(d) => d,
+        None => alloc_low((size as u64).max(16) + a, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE, &name)?,
+    };
     let data = (data + a - 1) & !(a - 1);
     crate::warn_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
     let index = {
