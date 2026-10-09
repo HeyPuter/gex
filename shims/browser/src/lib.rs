@@ -5629,22 +5629,25 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
         return -1;
     }
     let mut ns = max_ms as u64 * 1_000_000;
-    // The nearest deadline any thread holds: a `sleep` or timed `poll` is ended
-    // by the clock, not another Worker, so sleeping past it wakes late. And --
-    // read under the same lock -- whether THIS Worker's own thread is simply
-    // waiting on a futex, with the address and the generation it parked at.
+    // This Worker's thread's deadline: a `sleep` or timed `poll` is ended by
+    // the clock, not another Worker, so sleeping past it wakes late. Only its
+    // own: a Worker runs one thread (`schedule`), and every other thread's
+    // Worker parks to its own deadline. Taking the nearest deadline of *any*
+    // thread in the process woke every Worker whenever one thread's timed wait
+    // came due -- and at once, at the 1 ms floor below, for as long as an
+    // expired deadline sat unrescheduled. With Unity's own Mono in the page,
+    // twenty idle Workers spent ~40% of their time each in KLock::take from
+    // that wake loop (dm19), the main thread 22%. And -- read under the same
+    // lock -- whether this Worker's thread is simply waiting on a futex, with
+    // the address and the generation it parked at.
     let now = now_ns();
     let (soonest, futex) = with_host(|h| {
-        let soonest = h
-            .threads
-            .iter()
-            .filter_map(|t| match &t.waiting {
-                Waiting::Sleep(at) => Some(*at),
-                Waiting::Futex { deadline, .. } => *deadline,
-                Waiting::Net(deadline) => *deadline,
-                _ => None,
-            })
-            .min();
+        let soonest = h.threads.get(cur()).and_then(|t| match &t.waiting {
+            Waiting::Sleep(at) => Some(*at),
+            Waiting::Futex { deadline, .. } => *deadline,
+            Waiting::Net(deadline) => *deadline,
+            _ => None,
+        });
         let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
             Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
             _ => None,
