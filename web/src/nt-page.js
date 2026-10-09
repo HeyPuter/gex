@@ -142,6 +142,8 @@ async function main() {
   // `?attachtrace=1`: time each thread Worker from the guest's clone to its
   // start (host.mjs, gex.mjs `#catchUp`), as main.js does for the demos.
   if (q.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
+  // `?strace=1`: narrate every syscall (`gex_set_trace`), as main.js does.
+  if (q.get('strace')) globalThis.GEX_STRACE = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
   canvas.width = w;
