@@ -492,9 +492,13 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     `CDLL(None)` raises OSError (no dlopen), patched so the import
     survives it.
   - Known: fork inside a C++ catch block traps (asyncify).
-  - Next: perl ours (recipe in progress: Configured natively, miniperl
-    runs under gexc; make_ext needs gexc with x86 for the host's make),
-    bc's dc, /usr/bin/git duplicate, GTK, item 3.
+  - perl 5.40 ours builds (`build_perl`): Debian's options, Configured
+    natively, every extension static; make_ext's make and compiler run on
+    the host through gexc's `GEXC_HOST_EXEC`. POSIX, Digest::MD5,
+    Storable, Encode and threads load. Not shipped: Debian's arm64
+    perl-base stays until ours provides perlapi-5.40.1 and Debian's
+    layout for arm64 Perl packages.
+  - Next: ship perl, bc's dc, /usr/bin/git duplicate, GTK, item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
