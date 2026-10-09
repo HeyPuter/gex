@@ -5,10 +5,14 @@ F_body `gexp_<name>` that reads AAPCS64's arguments (x0-x7, then the stack),
 calls the function and returns to x30 with the result in x0. Integer and
 pointer arguments and results, and structs by value as AAPCS64 passes them
 (up to 16 bytes in registers, larger ones by reference; a larger result
-through x8). No floating point (none in zlib's or zstd's API).
+through x8). Floating-point arguments in v0-v7 and a result in v0.
+Function-pointer arguments are passed as they are (guest addresses, which
+the GexA64Icall pass's exit stubs call). For sqlite (built with gexva.h):
+a variadic export's adapter announces the guest's call to the export's
+va_start, and a va_list argument is the guest's (AAPCS64's).
 
   gen.py LIB [--gz] EXPORTS|- HEADER... > adapters.c
-  LIB: zlib or zstd (which declaration macros mark an export)
+  LIB: zlib, zstd or sqlite (which declaration macros mark an export)
 """
 import re, sys
 
@@ -20,7 +24,9 @@ lib, exp_arg, headers = args[0], args[1], args[2:]
 DECL = {
     'zlib': r'ZEXTERN\s+([^;{]*?)\s*\bZEXPORT[VA]?\s+(\w+)\s*\(([^;{]*?)\)\s*;',
     'zstd': r'\b(?:ZSTDLIB_API|ZSTDLIB_STATIC_API|ZDICTLIB_API|ZDICTLIB_STATIC_API)\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
+    'sqlite': r'\bSQLITE_API\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
 }[lib]
+varargs = lib == 'sqlite'
 protos, structs = {}, set()
 for h in headers:
     text = re.sub(r'/\*.*?\*/', ' ', open(h).read(), flags=re.S)
@@ -28,12 +34,26 @@ for h in headers:
     text = re.sub(r'^[ \t]*#(?:[^\n]*\\\n)*[^\n]*', ' ', text, flags=re.M)  # preprocessor lines
     for m in re.finditer(DECL, text, re.S):
         ret, name, params = (re.sub(r'\s+', ' ', g).strip() for g in m.groups())
+        ret = re.sub(r'\b(?:SQLITE_DEPRECATED|SQLITE_EXPERIMENTAL|SQLITE_EXTERN)\b', ' ', ret).strip()
         protos.setdefault(name, (ret, params))
     for m in re.finditer(r'typedef\s+struct\s*\w*\s*\{[^{}]*\}\s*(\w+)\s*;', text):
         structs.add(m.group(1))
 
+def split_params(params):
+    out, depth, cur = [], 0, ''
+    for ch in params:
+        if ch == ',' and depth == 0:
+            out.append(cur); cur = ''
+            continue
+        depth += (ch == '(') - (ch == ')')
+        cur += ch
+    out.append(cur)
+    return [x.strip() for x in out]
+
 def ptype(p):
     p = p.strip()
+    if '(' in p:                             # a function pointer: drop its name
+        return re.sub(r'\(\s*\*\s*\w*\s*\)', '(*)', p, count=1)
     if p.endswith(']'):                      # T name[N]: a pointer
         p = re.sub(r'\s*\w*\s*\[[^\]]*\]$', '', p) + ' *'
         return p
@@ -54,15 +74,25 @@ for e in exports:
     if e not in protos:
         continue
     ret, params = protos[e]
-    if e == 'gzopen_w' or '...' in params or (not gz and ('gzFile' in params + ret or e.startswith('gz'))) or 'va_list' in params or re.search(r'\b(float|double)\b', params + ret):
+    if e == 'gzopen_w' or (not gz and ('gzFile' in params + ret or e.startswith('gz'))):
         continue
-    ps = [] if params in ('', 'void') else [ptype(p) for p in params.split(',')]
+    if not varargs and ('...' in params or 'va_list' in params):
+        continue
+    ps = [] if params in ('', 'void') else [ptype(p) for p in split_params(params)]
+    variadic = bool(ps) and ps[-1] == '...'
+    if variadic:
+        ps = ps[:-1]
     print(f'GEXP(gexp_{e}) {{')
-    print('\tunsigned k = 0;')
+    print('\tunsigned k = 0, kv = 0;')
     names = []
     for i, t in enumerate(ps):
         v = f'a{i}'
-        if is_struct(t):
+        if t == 'va_list':
+            # AAPCS64 passes the 32-byte struct by reference
+            print(f'\tgexva_list {v} = gexva_guest(A64_ARG(ctx, k++));')
+        elif re.fullmatch(r'(?:const\s+)?(?:double|float)', t):
+            print(f'\t{t} {v} = a64_varg_{t.split()[-1]}(ctx, kv++, &k);')
+        elif is_struct(t):
             t = re.sub(r'\s+', ' ', re.sub(r'\bconst\b', ' ', t)).strip()
             # AAPCS64 B.4/C.10: a composite over 16 bytes goes by reference;
             # a smaller one in consecutive registers (all on the stack when
@@ -71,7 +101,8 @@ for e in exports:
             print(f'\tif (sizeof {v} > 16) {v} = *({t} *)(uintptr_t)A64_ARG(ctx, k++);')
             print(f'\telse {{ uint64_t w[2] = {{ A64_ARG(ctx, k), sizeof {v} > 8 ? A64_ARG(ctx, k + 1) : 0 }}; __builtin_memcpy(&{v}, w, sizeof {v}); k += (sizeof {v} + 7) / 8; }}')
         else:
-            print(f'\t{t} {v} = ({t})A64_ARG(ctx, k++);')
+            tt = f'__typeof__({t})' if '(' in t else t
+            print(f'\t{tt} {v} = ({tt})A64_ARG(ctx, k++);')
         names.append(v)
     # after the arguments are read: a thread's first entry may make syscalls
     print('\ta64_enter(ctx);')
@@ -80,9 +111,27 @@ for e in exports:
     # which wasm-opt would merge under one name, losing the other's slot.
     print(f'\ta64_last_export = {len(table) + 1};')
     call = f'{e}({", ".join(names)})'
+    if variadic:
+        # the named arguments' registers and stack words (k counts both:
+        # integers past x7 are stack words; floating point here never are)
+        print(f'\tgexva_pending("{e}", k < 8 ? k : 8, kv, k > 8 ? k - 8 : 0);')
+        rv = 'void' if ret == 'void' else ret
+        if ret != 'void':
+            print(f'\t{ret} r = {call};')
+            call = 'r'
+        else:
+            print(f'\t{call};')
+        print('\tgexva_done();')
+        if ret == 'void':
+            print('\treturn a64_ret(ctx, ret, 0);')
+            print('}')
+            table.append(e)
+            continue
     if ret == 'void':
         print(f'\t{call};')
         print('\treturn a64_ret(ctx, ret, 0);')
+    elif re.fullmatch(r'(?:const\s+)?(?:double|float)', ret):
+        print(f'\treturn a64_ret_v(ctx, ret, (double){call});')
     elif is_struct(ret):
         print(f'\t{ret} r = {call};')
         print('\tif (sizeof r > 16) {')

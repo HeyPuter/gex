@@ -30,7 +30,7 @@ lib_setup() {
 lib_link() {
   local o=$1 name=$2; shift 2
   wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=4294967296 \
-    --export=gexp_table -o "$o/$name-64.wasm" "$@" $RT_OBJS $LIBS
+    --export=gexp_table --export-if-defined=__gexa_entries -o "$o/$name-64.wasm" "$@" $RT_OBJS $LIBS
   $OPT "$o/$name-64.wasm" --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
     --enable-nontrapping-float-to-int --enable-memory64 --memory64-lowering -O2 -g -o "$o/$name.wasm"
   ls -l "$o/$name.wasm"

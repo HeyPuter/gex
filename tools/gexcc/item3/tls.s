@@ -30,3 +30,50 @@ a64_set:
 	local.get	1
 	global.set	a64_depth_g
 	end_function
+
+	.globaltype	a64_icall_g, i64
+a64_icall_g:
+
+	.globl	a64_icall_set
+	.type	a64_icall_set,@function
+a64_icall_set:
+	.functype	a64_icall_set (i64) -> ()
+	local.get	0
+	global.set	a64_icall_g
+	end_function
+
+	.globl	a64_icall_get
+	.type	a64_icall_get,@function
+a64_icall_get:
+	.functype	a64_icall_get () -> (i64)
+	global.get	a64_icall_g
+	end_function
+
+	.globaltype	a64_va_name_g, i64
+a64_va_name_g:
+	.globaltype	a64_va_counts_g, i32
+a64_va_counts_g:
+
+	.globl	a64_va_set
+	.type	a64_va_set,@function
+a64_va_set:
+	.functype	a64_va_set (i64, i32) -> ()
+	local.get	0
+	global.set	a64_va_name_g
+	local.get	1
+	global.set	a64_va_counts_g
+	end_function
+
+	.globl	a64_va_name
+	.type	a64_va_name,@function
+a64_va_name:
+	.functype	a64_va_name () -> (i64)
+	global.get	a64_va_name_g
+	end_function
+
+	.globl	a64_va_counts
+	.type	a64_va_counts,@function
+a64_va_counts:
+	.functype	a64_va_counts () -> (i32)
+	global.get	a64_va_counts_g
+	end_function

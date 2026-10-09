@@ -27,14 +27,20 @@ fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
 cd "$OUT/crt-build"
+# The comparisons (__lttf2 and the rest) return int, as clang's wasm64 calls
+# expect (compiler-rt types them long for every other LP64 target but
+# aarch64): a patched copy of their sources.
+mkdir -p cmp
+sed 's/^typedef long CMP_RESULT;/typedef int CMP_RESULT;/' "$CRT/fp_compare_impl.inc" > cmp/fp_compare_impl.inc
+cp "$CRT"/compare?f2.c cmp/
 objs=
-for f in "$CRT"/*.c; do
+for f in cmp/compare?f2.c $(ls "$CRT"/*.c | grep -v '/compare.f2\.c$'); do
   b=$(basename "$f" .c)
   case $b in
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $A64W_CFLAGS -nostdinc -isystem "$OUT/sysroot/include" -isystem "$(clang -print-resource-dir)/include" -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || clang $A64W_CFLAGS -nostdinc -isystem "$OUT/sysroot/include" -isystem "$(clang -print-resource-dir)/include" -Wno-everything -I"$CRT" -c "$f" -o "$b.o" &
   objs="$objs $b.o"
   [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done

@@ -31,6 +31,42 @@ static inline int a64_ret(int ctx, uint64_t ret, uint64_t v)
 	return ra == ret;
 }
 
+/* The offset of v0 in the context (gex_abi::ctx::V; 16 bytes a register). */
+uint64_t a64_ctx_v(void);
+#define A64_V(ctx, n) (((volatile uint64_t *)(uintptr_t)((uint32_t)(ctx) + a64_ctx_v()))[2 * (n)])
+/* Floating-point argument `i` (v0-v7; none of these APIs has more). */
+static inline double a64_varg_double(int ctx, unsigned i, unsigned *k)
+{
+	(void)k;
+	if (i >= 8)
+		__builtin_trap();
+	uint64_t b = A64_V(ctx, i);
+	double d;
+	__builtin_memcpy(&d, &b, 8);
+	return d;
+}
+static inline float a64_varg_float(int ctx, unsigned i, unsigned *k)
+{
+	(void)k;
+	if (i >= 8)
+		__builtin_trap();
+	uint32_t b = (uint32_t)A64_V(ctx, i);
+	float f;
+	__builtin_memcpy(&f, &b, 4);
+	return f;
+}
+/* Return with a floating-point result in v0 (x0 as the guest left it). */
+static inline int a64_ret_v(int ctx, uint64_t ret, double d)
+{
+	uint64_t b;
+	__builtin_memcpy(&b, &d, 8);
+	A64_V(ctx, 0) = b;
+	(((volatile uint64_t *)(uintptr_t)((uint32_t)(ctx) + a64_ctx_v()))[1]) = 0;
+	uint64_t ra = A64_X(ctx, 30);
+	A64_X(ctx, A64_PC) = ra;
+	return ra == ret;
+}
+
 /* The calling thread's context and depth (tls.s), set on every entry. */
 int a64_ctx(void);
 int a64_depth(void);
