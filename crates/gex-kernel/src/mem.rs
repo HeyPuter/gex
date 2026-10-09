@@ -119,6 +119,45 @@ pub struct MemoryMap {
     /// there. `None` for every M32 process, whose map behaves exactly as it
     /// always has.
     high: Option<(u64, u64)>,
+    /// Ranges known to hold only zero bytes, sorted and disjoint: memory that
+    /// has not been mapped with contents or writable since it was zeroed (a
+    /// fresh process's, a reservation the kernel zeroed). Empty means nothing
+    /// is known, which is always safe.
+    ///
+    /// Lets an anonymous `mmap` skip zeroing what is zero already, and a
+    /// `fork` skip copying it. Wine under W3 reserves ~3 GiB of PROT_NONE
+    /// address space at each process start and forks twice per child
+    /// process: scanning and copying those reservations was 2-3 s of every
+    /// Windows process start.
+    ///
+    /// Trusts the protection: a page that is never writable is never written.
+    /// gex does not fault every store to a non-writable page (a wasm32
+    /// program's are not checked at all), so a program that writes one
+    /// anyway -- which faults on Linux -- may see that page zeroed by a
+    /// later `mmap` over it, or not copied into a forked child.
+    clean: Vec<(u64, u64)>,
+}
+
+/// The parts of `[start, end)` outside `clean` (sorted, disjoint), in order:
+/// [`MemoryMap::dirty_parts`], or the same against a copy taken before a
+/// change.
+pub fn dirty_parts(clean: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut at = start;
+    let first = clean.partition_point(|&(_, e)| e <= start);
+    for &(s, e) in &clean[first..] {
+        if s >= end {
+            break;
+        }
+        if s > at {
+            out.push((at, s));
+        }
+        at = at.max(e);
+    }
+    if at < end {
+        out.push((at, end));
+    }
+    out
 }
 
 /// Bytes an M32 process asked for and could not be given for lack of address
@@ -167,7 +206,58 @@ impl MemoryMap {
             // Every process of a host with a 64-bit guest memory has the
             // high arena (docs/mem64.md §3).
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+            clean: Vec::new(),
         }
+    }
+
+    /// Record that `[start, end)` holds only zeros (the caller just zeroed it,
+    /// or the memory is new) and is not writable.
+    pub fn mark_clean(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.mark_dirty(start, end);
+        let at = self.clean.partition_point(|&(s, _)| s < start);
+        self.clean.insert(at, (start, end));
+        // Coalesce with touching neighbours.
+        if at + 1 < self.clean.len() && self.clean[at + 1].0 == end {
+            self.clean[at].1 = self.clean.remove(at + 1).1;
+        }
+        if at > 0 && self.clean[at - 1].1 == start {
+            self.clean[at - 1].1 = self.clean.remove(at).1;
+        }
+    }
+
+    /// Forget that anything in `[start, end)` is known to be zero: it was
+    /// mapped with contents or made writable.
+    pub fn mark_dirty(&mut self, start: u64, end: u64) {
+        if start >= end || self.clean.is_empty() {
+            return;
+        }
+        let lo = self.clean.partition_point(|&(_, e)| e <= start);
+        let hi = self.clean.partition_point(|&(s, _)| s < end);
+        if lo >= hi {
+            return;
+        }
+        let mut keep = Vec::with_capacity(2);
+        let (first, last) = (self.clean[lo], self.clean[hi - 1]);
+        if first.0 < start {
+            keep.push((first.0, start));
+        }
+        if last.1 > end {
+            keep.push((end, last.1));
+        }
+        self.clean.splice(lo..hi, keep);
+    }
+
+    /// The parts of `[start, end)` not known to be zero, in order.
+    pub fn dirty_parts(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        dirty_parts(&self.clean, start, end)
+    }
+
+    /// The ranges known to hold only zeros (see `clean`).
+    pub fn clean_ranges(&self) -> &[(u64, u64)] {
+        &self.clean
     }
 
     /// Give this process a 64-bit memory's high arena (docs/mem64.md §3).
@@ -405,6 +495,7 @@ impl MemoryMap {
     /// is a claim about a mapping this process made, not one to inherit.
     pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
         self.generation += 1;
+        self.mark_dirty(page_align_down(start), page_align_up(end));
         self.vmas.push(Vma {
             start: page_align_down(start),
             end: page_align_up(end),
@@ -446,6 +537,9 @@ impl MemoryMap {
     ) {
         self.generation += 1;
         let aligned = page_align_down(start);
+        // Whatever it will hold is the caller's to write; an anonymous
+        // mapping the kernel zeroed is marked clean again after.
+        self.mark_dirty(aligned, page_align_up(end));
         // The offset moves with the start: rounding down to a page boundary
         // walks backwards into the file by the same amount.
         let code = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
@@ -792,6 +886,9 @@ impl MemoryMap {
             );
             return Err(Errno::EACCES);
         }
+        if new_prot & prot::WRITE != 0 {
+            self.mark_dirty(addr, end);
+        }
         let mut out = Vec::with_capacity(self.vmas.len() + 2);
         let mut touched = false;
         for v in std::mem::take(&mut self.vmas) {
@@ -1007,6 +1104,26 @@ mod tests {
         assert!(next < high && next > first, "{next:#x}");
         assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
         assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
+    }
+
+    #[test]
+    fn clean_ranges_split_merge_and_answer() {
+        let mut m = MemoryMap::new(0x10000);
+        m.mark_clean(0x10000, 0x20000);
+        m.mark_clean(0x30000, 0x40000);
+        m.mark_clean(0x20000, 0x30000);
+        assert_eq!(m.clean_ranges(), &[(0x10000, 0x40000)]);
+        m.mark_dirty(0x18000, 0x19000);
+        assert_eq!(m.clean_ranges(), &[(0x10000, 0x18000), (0x19000, 0x40000)]);
+        assert_eq!(m.dirty_parts(0x8000, 0x50000), vec![(0x8000, 0x10000), (0x18000, 0x19000), (0x40000, 0x50000)]);
+        assert_eq!(m.dirty_parts(0x11000, 0x12000), vec![]);
+        // A mapping placed with contents, and a protection made writable,
+        // are no longer known to be zero.
+        m.insert(0x20000, 0x21000, prot::READ, "x");
+        m.protect(0x30000, 0x1000, prot::READ | prot::WRITE).ok();
+        assert_eq!(m.dirty_parts(0x19000, 0x40000), vec![(0x20000, 0x21000), (0x30000, 0x31000)]);
+        m.mark_dirty(0, u64::MAX);
+        assert!(m.clean_ranges().is_empty());
     }
 
     #[test]

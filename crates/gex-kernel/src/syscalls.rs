@@ -5210,6 +5210,8 @@ impl Kernel {
         // over-aligned library into anonymous PROT_NONE memory) will hold
         // code, so in a 64-bit memory it stays below 4 GiB with the code; the
         // loader runs at INTERP_BASE (docs/mem64.md §3).
+        // What was known to be zero before the mapping (which forgets it).
+        let clean_before = self.mem.clean_ranges().to_vec();
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
         let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
             self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
@@ -5225,8 +5227,15 @@ impl Kernel {
             self.pin_landed.push((path, base, start));
         }
         // Anonymous memory is defined to read as zero. Pages that already
-        // are stay untouched, so a large reservation costs no memory.
-        m.zero_dirty(start, crate::mem::page_align_up(len) as usize)?;
+        // are stay untouched, so a large reservation costs no memory, and
+        // ranges known to be zero (`MemoryMap::clean`) are not even read.
+        let end = start + crate::mem::page_align_up(len);
+        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
+            m.zero_dirty(a, (b - a) as usize)?;
+        }
+        if prot_bits & crate::mem::prot::WRITE == 0 {
+            self.mem.mark_clean(start, end);
+        }
         Ok(start)
     }
 
