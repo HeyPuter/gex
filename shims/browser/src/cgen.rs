@@ -1730,6 +1730,7 @@ pub(crate) fn leaves() -> u64 {
 /// old object's functions.
 pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
+    libprov::forget_gone(gone);
     // After the bits: a lookup once the probe cache is cleared sees them.
     let memory = crate::guest_bytes();
     ftab(|m| {

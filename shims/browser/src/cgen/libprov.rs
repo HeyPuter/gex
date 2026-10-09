@@ -723,8 +723,17 @@ pub extern "C" fn gex_libprov_start() {
 
 /// The objects that get units (file names, or `all`).
 static ELF_UNITS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// Objects placed already in this process: (path, bias).
-static ELF_PLACED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+/// Objects placed already in this process: (path, bias, the span of their
+/// executable segments).
+static ELF_PLACED: Mutex<Vec<(String, u64, (u64, u64))>> = Mutex::new(Vec::new());
+
+/// Code no longer mapped executable (`cgen::on_retire`'s `gone`): an object
+/// whose code was there is placed again if it is mapped again (ALSA's
+/// dlopen/dlclose cycles reload libasound at the same base), since its unit
+/// was retired with the pages.
+pub(crate) fn forget_gone(gone: &[(u64, u64)]) {
+    lock(&ELF_PLACED).retain(|(_, _, (lo, hi))| !gone.iter().any(|&(s, e)| s < *hi && *lo < e));
+}
 
 /// `name,name,...` (the page's `?elfunits=`), before the program starts.
 #[no_mangle]
@@ -776,20 +785,21 @@ pub(crate) fn elf_unit_maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         }
         let Some(bytes) = crate::with_host(|h| h.kernel.read_file(&m.path)) else { continue };
         let Some(base) = elf_bias(&bytes, m.start, m.offset) else { continue };
-        {
-            let mut placed = lock(&ELF_PLACED);
-            if placed.iter().any(|(p, b)| *p == m.path && *b == base) {
-                continue;
-            }
-            placed.push((m.path.clone(), base));
+        if lock(&ELF_PLACED).iter().any(|(p, b, _)| *p == m.path && *b == base) {
+            continue;
         }
         let mut image = match gex_ld::elf::load(&bytes, base) {
             Ok(i) => i,
             Err(e) => {
                 crate::warn_line(&format!("gex-cgen: {}: {e:?}; no unit\n", m.path));
+                lock(&ELF_PLACED).push((m.path.clone(), base, (0, 0)));
                 continue;
             }
         };
+        let span = image.segments.iter().filter(|s| s.executable).fold((u64::MAX, 0u64), |(lo, hi), s| {
+            (lo.min(s.vaddr), hi.max(s.vaddr + s.bytes.len() as u64))
+        });
+        lock(&ELF_PLACED).push((m.path.clone(), base, span));
         gex_ld::elf::apply_own_relative(&mut image);
         crate::warn_line(&format!("gex-cgen: {} at {base:#x}: wanting its unit\n", m.path));
         super::place(&image, &m.path, base, true, None);
