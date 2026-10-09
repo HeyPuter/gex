@@ -204,6 +204,11 @@ def configure(root, ours, native_pkgs):
             os.makedirs(os.path.join(root, 'root'), exist_ok=True)
             shutil.copy(src, os.path.join(root, f'root/.{n}'))
     os.chmod(os.path.join(root, 'root'), 0o700)
+    # and its install_from_default: /etc/profile (PS1, PATH), /etc/motd
+    for n in ('profile', 'motd'):
+        src = os.path.join(root, f'usr/share/base-files/{n}')
+        if os.path.exists(src) and not os.path.lexists(os.path.join(root, f'etc/{n}')):
+            shutil.copy(src, os.path.join(root, f'etc/{n}'))
     for d in ('tmp', 'var/tmp'):
         os.makedirs(os.path.join(root, d), exist_ok=True)
         os.chmod(os.path.join(root, d), 0o1777)
