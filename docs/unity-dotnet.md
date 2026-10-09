@@ -2147,5 +2147,18 @@ Not yet:
   39.1; hb55 (both) 121 s, 166 s, 40.1; libasound 26.0 -> 3.7 MiB.
   The HK unit re-keyed for 64efd78e (key 7bd87731, byte-identical c.wasm,
   1,941 s on gooner) is on edger in `units/cgen-page-rk`; Muck's is
-  building (`units/build-muck-rk.log`). Queued: page/q50.sh (hp16 = seed
-  shim + unit, hp17 = the same with the profile).
+  rebuilt too (4e58f35b, 884 s), also in `cgen-page-rk`.
+  With the unit (target configuration, seed shim 1bf5ba09):
+  - hp16 (HK): first frame 56 s (hp13 87 s), 100 presents 85 s (119 s),
+    41.5 presents/s at 392 s (39.9).
+  - hp17 (HK, profiled 10-90 s): `fjit::translate` 20.7 s of 81 s (25.5%;
+    hp14 49.8 s, 61.5%); the main Worker now waits on its threads 31.6 s.
+    Profiled runs' first frame (110 s both) is held by the profile.
+  - mk5 (Muck): first frame 82 s, 100 presents 95 s, 34.0 presents/s at
+    392 s, OpenGL 4.2, no "Shader Unsupported", grass blades
+    (`shots/mk5/c013.png`).
+  Branches: merge/unity-rekey 64efd78e (own round), merge/unity-seed
+  1bf5ba09 on it (worktree wt/unity-rk); merge/unity 1d5b26d9 (pin).
+  Natively the JIT seeds only the main image too (gexc's
+  FjitTranslator::image); a Translator hook per mapped object would do
+  the same there.
