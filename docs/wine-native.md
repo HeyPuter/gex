@@ -1879,6 +1879,15 @@ seven explorers).
   37 of 50, 34 of 46). x86/childloop times out at 120 s under load
   (gooner's load average 21; 3 runs: 1 pass, 2 timeouts, the same with
   merge/w3-audio's gexc): `gate-w3boot/childloop.sh`.
+  The install-as-children leg no longer passes on today's artifacts with
+  any gexc: integ-e2's, merge/w3-audio's and 36dd674f's own
+  (`wt/gate-36dd`) all write the registry (16 crypto provider keys) and
+  then stop after DefaultInstall's rundll32, so wineboot never exits
+  (`gate-w3boot/inst-{i,b}`). The 03:37 loader's PE side was relinked since
+  (`$W/wine-w32-w3`, the W3.5 work), so the 03:37 loader no longer has a
+  matching dll dir; with the current loader (w3dist-a) explorer's window
+  dies with "indirect call type mismatch" there (`inst-a`). Next: one
+  dist whose loader and dll dir come from the same build.
 - **Guest GL (2026-10-08 night):** the loaders linked `$W/gl/gexgl.o` from
   10-06 (wt/w3's gexgl.c); `$W/gl/build-gl.sh` now compiles
   `${GL_TREE:-wt/w3-boot}`'s. 7ef0f203 adds glNormalPointer (the host had
@@ -1898,6 +1907,11 @@ seven explorers).
   for the rest of the 420 s run, no crash; composited 10-12 fps in the
   menus and 1-6 fps in gameplay (the game's own counter: 1). Frames:
   `$W/shots/r7`.
+- With those, Undertale and Katana ZERO got past wined3d (two more
+  fixes: 0a525987, program option extensions claimed only with their
+  base; 552cca51, gex-wayland releases a buffer once per attach, which
+  Wine's buffer queue counts) and then hit the release bug at the first
+  swap-chain resize. gexc 22:25 has the fix; run `gamekit/run7.sh`.
 
 
 **RESUME HERE (2026-10-06, after a Claude Code restart).** `$W` =
