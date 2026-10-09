@@ -409,8 +409,10 @@ const nativeDebian = {
   title: 'Debian, built from source to wasm',
   blurb:
     "Debian trixie whose tools (bash, coreutils, grep, sed, vim...) are built from Debian's own " +
-    'sources with gexcc into native wasm32 programs. apt, dpkg and the libraries stay Debian\'s ' +
-    'arm64 builds, translated; `apt install` fetches arm64 packages over Wisp.',
+    'sources with gexcc into native wasm32 programs, dpkg and apt included; `apt install` ' +
+    'fetches Debian\'s arm64 packages over Wisp and runs them translated. `?gui=1` adds a ' +
+    'screen (Wayland, and X through the page\'s X server) for foot, Chocolate Doom and the ' +
+    'other GUI programs.',
   network: true,
 
   async enter(ctx) {
@@ -427,10 +429,30 @@ const nativeDebian = {
   },
 };
 
+/** `?gui=1`: the compositor's output above the terminal, for the Wayland
+ *  programs in the image (foot...). Made once per visit. */
+function nativeDebianScreen(ctx) {
+  let el = document.getElementById('gex-wl');
+  if (el) return el;
+  const wrap = document.createElement('div');
+  wrap.className = 'canvas-wrap';
+  el = document.createElement('canvas');
+  el.id = 'gex-wl';
+  el.width = 1024;
+  el.height = 640;
+  el.tabIndex = 0;
+  el.classList.add('wl-output');
+  wrap.append(el);
+  document.getElementById('terminal')?.before(wrap);
+  ctx.onLeave(() => wrap.remove());
+  return el;
+}
+
 async function bootNativeDebian(ctx) {
   document.getElementById('nboot').disabled = true;
   const q = new URLSearchParams(location.search);
   const cmd = q.get('cmd');
+  const screen = q.get('gui') === '1' ? nativeDebianScreen(ctx) : null;
   const t0 = performance.now();
   try {
     const tree = await ctx.rootfs(q.get('rootfs') || '/rootfs/native-debian.tar.zst');
@@ -473,8 +495,14 @@ async function bootNativeDebian(ctx) {
         'TERM=xterm-256color',
         'DEBIAN_FRONTEND=noninteractive',
         'LANG=C.UTF-8',
+        ...(screen ? ['XDG_RUNTIME_DIR=/tmp', 'WAYLAND_DISPLAY=wayland-0', 'DISPLAY=:0'] : []),
       ],
       args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-l', '-i'],
+      wl: screen ?? undefined,
+      wlInput: screen ?? undefined,
+      // X clients (SDL programs...) reach the page's X server, which draws
+      // into the same compositor; `?hostx=0` leaves it out.
+      hostX: !!screen && q.get('hostx') !== '0',
       cwd: '/root',
       tty: true,
       network,

@@ -29,10 +29,13 @@ struct Prog {
 }
 
 static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
-/// The program to publish (entry, whether its data is fresh).
-static STAGED: Mutex<Option<(u64, bool)>> = Mutex::new(None);
+/// The program to publish (entry, whether its data is fresh, the table base
+/// it must have: a fork's child's, the parent's).
+static STAGED: Mutex<Option<(u64, bool, Option<u32>)>> = Mutex::new(None);
 /// This process's program's entry while it is a wasm32 one, for a fork.
 static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// And its module's `__table_base`.
+static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
@@ -52,7 +55,7 @@ pub(crate) fn is_wasm32(program: &gex_ld::Program) -> bool {
 /// it runs if it is a wasm32 one.
 pub(crate) fn stage(program: Option<&gex_ld::Program>) {
     CURRENT.store(0, Ordering::Relaxed);
-    *lock(&STAGED) = program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true));
+    *lock(&STAGED) = program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true, None));
 }
 
 /// A fork's child of a wasm32 program at `entry`: the same module, over the
@@ -60,8 +63,24 @@ pub(crate) fn stage(program: Option<&gex_ld::Program>) {
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_adopt(entry: u64) {
     if entry != 0 {
-        *lock(&STAGED) = Some((entry, false));
+        *lock(&STAGED) = Some((entry, false, None));
     }
+}
+
+/// [`gex_wasmprog_adopt`] with the parent's table base
+/// ([`gex_wasmprog_base`]): the data the child copied holds function
+/// pointers for that base, so the module goes there.
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_adopt_at(entry: u64, base: u32) {
+    if entry != 0 {
+        *lock(&STAGED) = Some((entry, false, (base != 0).then_some(base)));
+    }
+}
+
+/// The running wasm32 program's `__table_base` (the fork record's).
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_base() -> u32 {
+    if CURRENT.load(Ordering::Relaxed) == 0 { 0 } else { CURRENT_BASE.load(Ordering::Relaxed) }
 }
 
 /// The running program's entry if it is a wasm32 one (the fork record's).
@@ -73,8 +92,8 @@ pub extern "C" fn gex_wasmprog_entry() -> u64 {
 /// Publish the staged program: its provider module number, or -1.
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_serve() -> i32 {
-    let Some((entry, relocate)) = lock(&STAGED).take() else { return -1 };
-    match publish(entry, relocate) {
+    let Some((entry, relocate, at)) = lock(&STAGED).take() else { return -1 };
+    match publish(entry, relocate, at) {
         Ok(n) => n as i32,
         Err(e) => {
             crate::warn_line(&format!("gex: wasm32 program: {e}\n"));
@@ -84,7 +103,7 @@ pub extern "C" fn gex_wasmprog_serve() -> i32 {
     }
 }
 
-fn publish(entry: u64, relocate: bool) -> Result<u32, String> {
+fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, String> {
     let mem = crate::guest_bytes();
     let at = entry.wrapping_sub(0x40) as usize;
     let h = mem.get(at..at + 36).ok_or("header outside memory")?;
@@ -101,7 +120,19 @@ fn publish(entry: u64, relocate: bool) -> Result<u32, String> {
     let slot = |n: &str| names.iter().position(|s| s.as_deref() == Some(n)).map(|k| k as u32).ok_or(format!("{n} is not in its table"));
     let pairs = vec![(entry, slot("__gex_start")?), (thread_entry, slot("__gex_thread_start")?)];
     let number = lock(&PROVIDERS).len() as u32;
-    ftab(|m| m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs));
+    let install = ftab(|m| match want_base {
+        Some(base) => {
+            let (n, ok) = m.publish_at(base, names.len() as u32, PROVIDER | number, Tier::Unit, &pairs);
+            if !ok {
+                crate::warn_line(&format!(
+                    "gex: wasm32 fork child: table base {base} is taken, its function pointers will be wrong\n"
+                ));
+            }
+            n
+        }
+        None => m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs),
+    });
+    CURRENT_BASE.store(ftab(|m| m.install(install).base), Ordering::Relaxed);
     let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
     for &a in &addrs {
         gex_kernel::ftab::fcache_clear(crate::guest_bytes(), a);

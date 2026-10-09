@@ -171,6 +171,8 @@ function parseArgs(argv) {
     else if (a === '--shot') o.shot = next();
     else if (a === '--gl-capture') o.glCapture = next();
     else if (a === '--input') o.input = true;
+    else if (a === '--wltype') o.wltype = next();
+    else if (a === '--wltype-wait') o.wltypeWait = Number(next()) * 1000;
     else if (a === '--applit') o.applit = true;
     else if (a === '--wllit') o.wllit = true;
     else if (a === '--wlwindows') o.wlwindows = Number(next());
@@ -729,6 +731,33 @@ async function runDemo(o) {
         verdict = { how: 'fail', body: `guest exited ${gone[1]} without matching want` };
       }
     }
+  }
+
+  // --wltype TEXT: once passed, type TEXT and Enter onto the Wayland canvas as a
+  // person would (keydown/keyup with \`code\`s the evdev table maps; letters,
+  // digits, space and - . / only), then wait so the shot shows the answer.
+  if (o.wltype && verdict?.how === 'pass') {
+    const codes = [...o.wltype].map((ch) =>
+      /[a-z]/.test(ch) ? `Key${ch.toUpperCase()}`
+        : /[0-9]/.test(ch) ? `Digit${ch}`
+          : ({ ' ': 'Space', '-': 'Minus', '.': 'Period', '/': 'Slash' })[ch]).concat(['Enter']);
+    const js = `(() => {
+      const cv = document.querySelector('.canvas-wrap canvas:not(.wl-offscreen)');
+      if (!cv) return 'no visible app canvas';
+      cv.focus?.();
+      for (const code of ${JSON.stringify(codes)}) {
+        cv.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+        cv.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
+      }
+      return 'typed ' + ${JSON.stringify(codes.length)} + ' keys';
+    })()`;
+    try {
+      const r = await browser.send('Runtime.evaluate', { expression: js, returnByValue: true }, page);
+      log(`  wltype: ${r?.result?.value ?? '?'}`);
+    } catch (e) {
+      log(`  wltype failed: ${e?.message ?? e}`);
+    }
+    await new Promise((r) => setTimeout(r, o.wltypeWait ?? 5000));
   }
 
   // --- report ---------------------------------------------------------------

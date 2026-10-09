@@ -1,0 +1,13 @@
+musl has no GNU basename (and argv is const here): apt's own flNotDir.
+
+--- a/cmdline/apt-internal-solver.cc	2026-10-09 00:33:52.586737971 -0400
++++ b/cmdline/apt-internal-solver.cc	2026-10-09 00:33:52.589737977 -0400
+@@ -119,7 +119,7 @@
+ 		_config->Set("Debug::EDSP::WriteSolution", true);
+ 
+ 	_config->Set("APT::System", "Debian APT solver interface");
+-	if (strcmp(basename(argv[0]), "solver3") == 0)
++	if (flNotDir(argv[0]) == "solver3")
+ 	   _config->Set("APT::Solver", "3.0");
+ 	else if (_config->Find("APT::Solver") != "3.0")
+ 	   _config->Set("APT::Solver", "internal");

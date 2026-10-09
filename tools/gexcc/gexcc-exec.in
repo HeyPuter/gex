@@ -19,6 +19,10 @@ G=${GEXCC_GEXC:-@GEXC@}
 L=@LIBDIR@
 
 slots=${GEXCC_SLOTS:-4}
+# Under a gexc that ran a host program for its guest (GEXC_HOST_EXEC: perl's
+# miniperl -> make -> miniperl), that gexc holds a slot and waits on this
+# one: taking another would deadlock once every slot is such a parent.
+[ -n "${GEXC_HOSTED:-}" ] && slots=0
 if [ "$slots" -gt 0 ] 2>/dev/null && command -v flock >/dev/null; then
   d=${GEXCC_SLOT_DIR:-${XDG_RUNTIME_DIR:-/tmp}/gexcc-slots-$(id -u)}
   mkdir -p "$d" 2>/dev/null

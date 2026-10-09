@@ -580,6 +580,7 @@ export class ProcessHost {
             // Worker creation, adoption and the wait for a start message. The
             // two must be separable -- a cost has been blamed on the wrong side.
             `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
+              (m.cmdline ? ` {${m.cmdline}}` : '') +
               // What the runtime still held on exit. -1 without GEX_HEAP_COUNTERS=1.
               (m.heapKib >= 0 ? `, runtime holds ${Math.round(m.heapKib / 1024)} MiB` : '') +
               // Dispatch slots the page has left. A budget nothing refills, so
