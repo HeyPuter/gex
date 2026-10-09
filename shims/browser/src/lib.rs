@@ -4152,6 +4152,22 @@ pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path
     0
 }
 
+/// A bundled symbolic link: `path` names `target` (text, resolved when the
+/// guest follows it), as in the bundle. A rootfs whose links became copies
+/// carries a single-binary coreutils once per command name. Returns 1 when
+/// made; 0 tells the caller to add a copy instead (no global kernel).
+#[no_mangle]
+pub extern "C" fn gex_add_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            return (unsafe { k_fs_symlink(gex_kernel::PAddr::from(target), target_len, gex_kernel::PAddr::from(path), path_len) } == 0) as i32;
+        }
+        return 1;
+    }
+    0
+}
+
 /// A bundled file's modification time, as the host's filesystem had it, so a
 /// program that records one (`gzip`, `make`, `tar`) sees what it would
 /// natively. Like `gex_chmod`.
