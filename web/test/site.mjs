@@ -10,6 +10,7 @@ import { readFile, access, stat } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
+import { Cdp, browserWsUrl } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
@@ -32,6 +33,30 @@ const DEMOS = {
   // Prompt patterns taken from a real run: xterm's `innerText` drops the
   // trailing space, so a pattern anchored on "$ " never matches.
   busybox: { want: /~ \$/ },
+  // The Debian rootfs built from source (docs/gexcc.md §6): bash -l as root.
+  'native-debian': { want: /:~#/ },
+  // Typing into the terminal as a person does (CDP key events into xterm's
+  // textarea, after the prompt): `$((1+1))` so the echo of the typed line
+  // cannot pass for the answer.
+  'native-debian-type': { demo: 'native-debian', ready: /:~#/, type: 'echo hi$((1+1))', want: /^hi2$/m },
+  'busybox-type': { demo: 'busybox', ready: /~ \$/, type: 'echo hi$((1+1))', want: /^hi2$/m },
+  'debian-type': { demo: 'debian', ready: /[#$]/, type: 'echo hi$((1+1))', want: /^hi2$/m },
+  // Any command, from GEX_CMD, ended by `echo RUN=$((1+1))` (the echo of the
+  // command holds no `RUN=2`).
+  'native-debian-run': { demo: 'native-debian', want: /RUN=2/ },
+  // First and second runs of a few programs, each timed in the guest: the
+  // first pays the program's compile, the second what is left.
+  'native-debian-cmd': {
+    demo: 'native-debian',
+    cmd:
+      't(){ s=$(date +%s%N); "$@" > /dev/null 2>&1; r=$?; e=$(date +%s%N); echo "T $* rc=$r $(( (e-s)/1000000 ))ms"; }; '
+      + 't true; t ls /; t ls /; t perl -e 1; t perl -e 1; '
+      + 't dpkg -l; t dpkg -l; t apt-cache policy coreutils; t apt-cache policy coreutils; '
+      + 'echo nd=done',
+    // Guest lines only: the page's echo of the command wraps, and holds
+    // `nd=done` too.
+    want: /T apt-cache policy coreutils rc=0 \d+ms[\s\S]*T apt-cache policy coreutils rc=0 \d+ms/,
+  },
   debian: { want: /[#$]/ },
   // A command in the Debian rootfs, judged by a marker the command prints, not
   // by `debian`'s `/[#$]/` prompt (which matches the page's echo of the command
@@ -481,6 +506,10 @@ for (const id of list) {
   // apart from guest output. `URLSearchParams` turns `+` into a space, so
   // `i=$((i+1))` reaches the guest as `i=$((i 1))` -- watch for that.
   const cmdText = new URLSearchParams(extra.slice(1)).get('cmd') || '';
+  const spec = DEMOS[id];
+  let typed = false;
+  // A debugging port only for the typing demos: the keys go in over CDP.
+  const debugPort = spec.type ? 39300 + Math.floor(Math.random() * 600) : 0;
   let last = '';
   let lastTerminal = '';
   // Every terminal line ever shown, in first-appearance order: the reporter
@@ -532,6 +561,13 @@ for (const id of list) {
       // also carries the terminal's last line.
       const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
       console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
+      if (spec.type && !typed && spec.ready.test(history())) {
+        typed = true;
+        typeInto(debugPort, spec.type).then(
+          (how) => console.log(`     [${id}] typed ${JSON.stringify(spec.type)} + Enter (${how})`),
+          (e) => resolve({ how: 'bad', body: `typing failed: ${e?.message ?? e}` }),
+        );
+      }
       if (reached(history()) || text === settle) {
         resolve({ how: 'reached', body: text });
       }
@@ -551,6 +587,8 @@ for (const id of list) {
     };
   });
 
+  // Wall time from launching the browser, for `ok` lines (startup numbers).
+  const t0 = Date.now();
   const child = spawn(
     CHROME,
     [
@@ -565,6 +603,7 @@ for (const id of list) {
       // `performance.memory` exists only behind this -- the only way to measure
       // the JS heap from a Worker here, and the only account of the V8 OOM (#145).
       '--enable-precise-memory-info',
+      ...(debugPort ? [`--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*'] : []),
       url,
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
@@ -611,7 +650,7 @@ for (const id of list) {
         console.log(`     | ${line}`);
       }
     }
-    console.log(`ok   site-${id}`);
+    console.log(`ok   site-${id} (${Date.now() - t0} ms from browser launch)`);
   } else {
     failures++;
     // The tail of the terminal, not just its last line: what a demo printed on
@@ -630,6 +669,36 @@ for (const id of list) {
         .map((l) => `     ${l}`).join('\n'),
     );
   }
+}
+
+// Focus xterm's textarea and type `text` then Enter, the way a key press
+// arrives (Input.insertText is what an IME or a paste produces; the Enter is
+// a real keyDown/keyUp pair).
+async function typeInto(port, text) {
+  const ws = await browserWsUrl(port);
+  if (!ws) throw new Error(`no browser on debugging port ${port}`);
+  const b = await Cdp.connect(ws);
+  const { targetInfos } = await b.send('Target.getTargets');
+  const t = targetInfos.find((x) => x.type === 'page');
+  if (!t) throw new Error('no page target');
+  const { sessionId } = await b.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
+  const focus = await b.send('Runtime.evaluate', {
+    expression: `(() => { const t = document.querySelector('.xterm-helper-textarea'); if (!t) return 'no xterm textarea'; t.focus(); return document.activeElement === t ? 'focused' : 'not focused'; })()`,
+    returnByValue: true,
+  }, sessionId);
+  for (const ch of text) await b.send('Input.insertText', { text: ch }, sessionId);
+  const enter = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+  await b.send('Input.dispatchKeyEvent', { type: 'keyDown', text: '\r', ...enter }, sessionId);
+  await b.send('Input.dispatchKeyEvent', { type: 'keyUp', ...enter }, sessionId);
+  // What the kernel's terminal holds afterwards: bytes typed and not read
+  // say the shell is not reading; none and no echo say the keys never came.
+  await new Promise((r) => setTimeout(r, 3000));
+  const tty = await b.send('Runtime.evaluate', {
+    expression: `(() => { const t = globalThis.gexTty; return t ? 'tty ready=' + t.ready() + ' lflag=0x' + t.lflag().toString(16) : 'no shared tty'; })()`,
+    returnByValue: true,
+  }, sessionId);
+  b.close();
+  return `${focus.result?.value}; ${tty.result?.value}`;
 }
 
 server.close();

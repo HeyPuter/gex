@@ -98,6 +98,7 @@ impl FileHandle for EventFd {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 

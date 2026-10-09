@@ -25,6 +25,7 @@ pub mod nt_cgen;
 pub mod wasmprog;
 pub mod wasmdll;
 mod ready;
+mod sys_waits;
 pub(crate) mod ftab;
 pub mod wayland;
 
@@ -522,12 +523,19 @@ impl std::error::Error for StopExecution {}
 /// placed segments rather than the file, because that is what the translator
 /// reads.
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
+    // The program file goes in as bytes, not through `Debug`: formatting a
+    // multi-MiB file as a list of decimal numbers cost more than all the
+    // rest of an exec (a gexcc busybox: about 12 MB of text, twice, at every
+    // exec in a guest shell's loop).
+    let mut plain = xlate.clone();
+    let elf = plain.image_elf.take();
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
-        format!("{xlate:?}").into_bytes(),
+        format!("{plain:?}").into_bytes(),
+        elf.as_deref().map(|e| e.to_vec()).unwrap_or_default(),
         // The same bytes mean different instructions in 32-bit mode.
         vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
@@ -1953,7 +1961,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut gm = GuestMem::new(dst);
         let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
-            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
+            let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
         if let Some(tls) = req.tls {
             // PowerPC's thread pointer is r2.
@@ -2409,6 +2417,9 @@ fn mount_filesystems(
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
     }
+    // Audio (W3.5): OSS's /dev/dsp and /dev/mixer, a null output, for
+    // native Wine's wineoss.drv (and any OSS program).
+    devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
@@ -2882,8 +2893,31 @@ impl gex_kernel::net::Transport for HostStream {
         sock.peek(&mut scratch).unwrap_or(0)
     }
 
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else { return Err(gex_kernel::Errno::ENOTCONN) };
+        match sock.peek(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(gex_kernel::Errno::EAGAIN),
+            Err(_) => Err(gex_kernel::Errno::ECONNRESET),
+        }
+    }
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    fn shutdown(&self, how: u64) -> Result<(), gex_kernel::Errno> {
+        use std::net::Shutdown;
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else {
+            return Err(gex_kernel::Errno::ENOTCONN);
+        };
+        let h = match how {
+            0 => Shutdown::Read,
+            1 => Shutdown::Write,
+            _ => Shutdown::Both,
+        };
+        sock.shutdown(h).map_err(|e| gex_kernel::Errno::from_io(&e))
     }
 }
 
@@ -2983,7 +3017,8 @@ fn place_image(
     for i in 0..31u8 {
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
-    write_u64(data, ctx_addr + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
@@ -3111,6 +3146,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let nr = gm
                 .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
                 .unwrap_or(!0);
+            // `GEX_SYS_WAITS`: wall time per (thread, syscall), blocking included.
+            let sys_t0 = sys_waits::on().then(std::time::Instant::now);
+            let mut sys_nr = !0u64;
             watch_check(&gm, pc as u64, state.thread.tid);
             lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
             if lockstep::fake_syscall(&mut gm, state.thread.ctx_addr) {
@@ -3167,7 +3205,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if !gex_kernel::skips_proc_snapshot(nr) {
                     k.refresh_proc(&proc_state);
                 }
-                k.syscall(&mut gm, pc as u64)
+                let o = k.syscall(&mut gm, pc as u64);
+                sys_nr = k.syscall_nr;
+                o
             });
             // A blocking syscall is run here, with the kernel unlocked, and
             // then finished under the lock again.
@@ -3268,6 +3308,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             {
                 let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
+            }
+            if let Some(t0) = sys_t0 {
+                sys_waits::record(caller.data().thread.tid, sys_nr, t0.elapsed());
             }
             check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();

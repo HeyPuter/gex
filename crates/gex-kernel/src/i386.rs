@@ -865,9 +865,13 @@ pub fn translate(
             *a = [0, a[0], 0, scratch, 0, 0];
             nr::PRLIMIT64
         }
-        x::GETITIMER | x::GETRUSAGE | x::TIMES => {
-            // Their 32-bit result layouts are not written yet. ENOSYS is
-            // loud where a silently wrong struct would not be.
+        // getrusage(who, &rusage32) and times(&tms32): the kernel writes
+        // their 32-bit layouts itself for an i386 process.
+        x::GETRUSAGE => nr::GETRUSAGE,
+        x::TIMES => nr::TIMES,
+        x::GETITIMER => {
+            // Its 32-bit result layout is not written yet. ENOSYS is loud
+            // where a silently wrong struct would not be.
             UNKNOWN
         }
         x::PRLIMIT64 => {

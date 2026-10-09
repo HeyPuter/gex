@@ -16,6 +16,13 @@ MUSL=$(realpath "${2:-$HERE/../../../musl-wasm}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-4}
 . "$HERE/flags.sh"
+# GEX_WASM_LEGACY_EH=1 (gexcc): the libc's setjmp lowers onto the legacy
+# exception instructions, as programs' does (wcc), so binaryen's asyncify
+# can instrument a libc function a fork can reach (timer_create's thread,
+# which setjmps); the link translates them to the standard ones.
+if [ -n "${GEX_WASM_LEGACY_EH:-}" ]; then
+  WASM_CFLAGS=$(printf '%s' "$WASM_CFLAGS" | sed 's/-wasm-use-legacy-eh=false/-wasm-use-legacy-eh=true/')
+fi
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"

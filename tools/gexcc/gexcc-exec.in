@@ -1,0 +1,47 @@
+#!/bin/sh
+# gexcc-exec: gexc for gexcc programs. A container's host launcher
+# (hoststub.c) execs this; so do gexcc-run, CMake's emulator and Meson's
+# exe_wrapper. install.sh fills in @GEXC@ and @LIBDIR@.
+#
+# Machine-wide slots: every program started from the host is a whole gexc
+# (wasmtime, large reservations, ~27 threads). A configure script or a
+# `make check` on the host starts thousands; many at once took a 24-thread
+# machine down (2026-10-07). So at most GEXCC_SLOTS (default 4) run at
+# once, per user: each holds an flock on one slot file for its lifetime and
+# the rest wait. Programs a gexc's guest execs stay inside that gexc and
+# take no slot. GEXCC_SLOTS=0 turns the limit off.
+#
+# The native busybox is the guest's /bin/sh and coreutils, unless
+# GEXCC_BUSYBOX is set (empty: none; a path: that busybox). GEXCC_GEXC
+# picks another gexc.
+[ "$1" = run ] && shift
+G=${GEXCC_GEXC:-@GEXC@}
+L=@LIBDIR@
+
+slots=${GEXCC_SLOTS:-4}
+if [ "$slots" -gt 0 ] 2>/dev/null && command -v flock >/dev/null; then
+  d=${GEXCC_SLOT_DIR:-${XDG_RUNTIME_DIR:-/tmp}/gexcc-slots-$(id -u)}
+  mkdir -p "$d" 2>/dev/null
+  got=
+  i=0
+  while [ $i -lt "$slots" ]; do
+    exec 9>>"$d/$i"
+    if flock -n 9; then got=1; break; fi
+    exec 9>&-
+    i=$((i + 1))
+  done
+  if [ -z "$got" ]; then
+    # all taken: wait on one (spread by pid); the lock goes with fd 9 into gexc
+    exec 9>>"$d/$(( $$ % slots ))"
+    flock 9
+  fi
+fi
+
+bb=${GEXCC_BUSYBOX-$L/busybox}
+if [ -n "$bb" ] && [ -f "$bb" ]; then
+  if [ "$bb" = "$L/busybox" ] && [ -z "${GEX_BUSYBOX_APPLETS:-}" ] && [ -f "$L/busybox.applets" ]; then
+    GEX_BUSYBOX_APPLETS=$(cat "$L/busybox.applets"); export GEX_BUSYBOX_APPLETS
+  fi
+  exec "$G" run --busybox "$bb" "$@"
+fi
+exec "$G" run "$@"

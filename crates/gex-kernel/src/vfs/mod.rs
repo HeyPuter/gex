@@ -14,6 +14,7 @@ pub mod devfs;
 // instead.
 #[cfg(unix)]
 pub mod hostfs;
+pub mod oss;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
@@ -86,6 +87,19 @@ pub struct Metadata {
     /// Linux's `makedev` encoding. Zero where the node does not say; `stat`
     /// then reports a character device as a pseudo-terminal (136:0).
     pub rdev: u64,
+    /// The other times and the nanoseconds, where the filesystem keeps
+    /// them (the host's). All zero: every time is `mtime`, whole seconds.
+    pub times: Times,
+}
+
+/// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Times {
+    pub mtime_ns: u32,
+    pub atime: i64,
+    pub atime_ns: u32,
+    pub ctime: i64,
+    pub ctime_ns: u32,
 }
 
 impl Metadata {
@@ -98,6 +112,7 @@ impl Metadata {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         }
     }
     pub fn dir() -> Metadata {
@@ -109,6 +124,7 @@ impl Metadata {
             mtime: 0,
             nlink: 2,
             rdev: 0,
+            times: Default::default(),
         }
     }
 }
@@ -149,6 +165,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn set_mtime(&self, _secs: i64) -> Result<(), Errno> {
         Ok(())
     }
+    /// `futimens`: [`FileSystem::set_times`] on an open file.
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let _ = atime;
+        match mtime {
+            Some((secs, _)) => self.set_mtime(secs),
+            None => Ok(()),
+        }
+    }
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let _ = len;
         Err(Errno::EINVAL)
@@ -157,6 +181,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// pipe. Such files also report `ESPIPE` from `lseek`.
     fn is_stream(&self) -> bool {
         false
+    }
+    /// `lseek` on a handle that keeps its own offset (a standard stream
+    /// redirected from a host file: the offset is the host descriptor's).
+    /// `None`: the open-file description's offset, or `ESPIPE` for a stream.
+    fn seek(&self, _offset: i64, _whence: u32) -> Option<SysResult> {
+        None
     }
     /// True when the file should behave like a terminal for `ioctl`.
     fn is_tty(&self) -> bool {
@@ -325,6 +355,16 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, secs);
         Ok(())
     }
+    /// `utimensat` with both times and nanoseconds (`None`: leave it). A
+    /// filesystem that keeps only whole-second modification times takes
+    /// what it can.
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let _ = atime;
+        match mtime {
+            Some((secs, _)) => self.set_mtime(path, secs),
+            None => Ok(()),
+        }
+    }
 
     /// A second name for the same file. `EPERM` is what Linux says for a
     /// filesystem that has no hard links, which is the honest default.
@@ -386,7 +426,58 @@ impl Vfs {
     /// Longest prefix wins, so a `/proc` mount shadows the root mount for
     /// everything beneath it.
     fn resolve<'a>(&'a self, path: &str) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
-        let abs = normalize(path, &self.cwd);
+        let abs = self.through_dir_links(normalize(path, &self.cwd))?;
+        self.mount_of(abs)
+    }
+
+    /// `abs` with every symlink among its directories followed (not the
+    /// final component: each caller decides about that). A filesystem here
+    /// is a map of whole paths, so `/bin/sh` under a merged /usr (`/bin ->
+    /// usr/bin`) names nothing until the `/bin` link is followed. Only the
+    /// root filesystem's links: /proc and /dev resolve their own names.
+    fn through_dir_links(&self, mut abs: String) -> Result<String, Errno> {
+        'again: for _ in 0..40 {
+            let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+            let mut prefix = String::new();
+            for (i, c) in comps.iter().enumerate().take(comps.len().saturating_sub(1)) {
+                prefix.push('/');
+                prefix.push_str(c);
+                let (at, fs) = self.mount_at(&prefix)?;
+                if at != "/" {
+                    break;
+                }
+                if let Ok(target) = fs.read_link(prefix.trim_start_matches('/')) {
+                    let base = if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&prefix))
+                    };
+                    abs = normalize(&comps[i + 1..].join("/"), &base);
+                    continue 'again;
+                }
+            }
+            return Ok(abs);
+        }
+        Err(Errno::ELOOP)
+    }
+
+    /// The mount holding absolute path `abs`, and where it is mounted.
+    fn mount_at<'a>(&'a self, abs: &str) -> Result<(&'a str, &'a Arc<dyn FileSystem>), Errno> {
+        let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
+        for (at, fs) in &self.mounts {
+            let matches = if at == "/" {
+                true
+            } else {
+                abs == *at || abs.starts_with(&format!("{at}/"))
+            };
+            if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
+                best = Some((at, fs));
+            }
+        }
+        best.map(|(at, fs)| (at.as_str(), fs)).ok_or(Errno::ENOENT)
+    }
+
+    fn mount_of<'a>(&'a self, abs: String) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
         let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
         for (at, fs) in &self.mounts {
             let matches = if at == "/" {
@@ -478,6 +569,7 @@ impl Vfs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                times: Default::default(),
             });
         }
         fs.metadata(&rel)
@@ -521,6 +613,12 @@ impl Vfs {
     /// Set the modification time of `path`, following a final symlink when
     /// `follow` (as `utimensat` does without `AT_SYMLINK_NOFOLLOW`).
     pub fn set_mtime(&self, path: &str, secs: i64, follow: bool) -> Result<(), Errno> {
+        self.set_times(path, None, Some((secs, 0)), follow)
+    }
+
+    /// Set the access and modification times of `path` (`None`: leave it),
+    /// following a final symlink when `follow`.
+    pub fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, follow: bool) -> Result<(), Errno> {
         let mut current = normalize(path, &self.cwd);
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
@@ -532,9 +630,13 @@ impl Vfs {
                         normalize(&target, &parent_of(&current))
                     };
                 }
-                _ => {
+                // The link itself (AT_SYMLINK_NOFOLLOW), whether or not
+                // what it names exists yet: dpkg stamps each link it unpacks
+                // as `NAME.dpkg-new`, before its target has that name.
+                Ok(_) => return fs.set_times(&rel, atime, mtime),
+                Err(_) => {
                     fs.metadata(&rel)?;
-                    return fs.set_mtime(&rel, secs);
+                    return fs.set_times(&rel, atime, mtime);
                 }
             }
         }
@@ -692,6 +794,26 @@ mod tests {
         // A path that merely starts with the same letters is not inside it.
         let (_, rel) = vfs.resolve("/procession").unwrap();
         assert_eq!(rel, "procession");
+    }
+
+    #[test]
+    fn directory_symlinks_are_followed() {
+        // A merged /usr: /bin -> usr/bin, /lib -> /usr/lib (absolute).
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("usr/bin/dash", b"sh".to_vec());
+        root.add_file("usr/lib/ld.so", b"ld".to_vec());
+        vfs.mount("/", root);
+        vfs.symlink("usr/bin", "/bin").unwrap();
+        vfs.symlink("/usr/lib", "/lib").unwrap();
+        vfs.symlink("dash", "/usr/bin/sh").unwrap();
+        assert_eq!(vfs.resolve("/bin/dash").unwrap().1, "usr/bin/dash");
+        assert_eq!(vfs.resolve("/lib/ld.so").unwrap().1, "usr/lib/ld.so");
+        // The final component is left to the caller.
+        assert_eq!(vfs.resolve("/bin").unwrap().1, "bin");
+        assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
+        assert!(vfs.metadata("/bin/sh").is_ok());
+        assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
     }
 
     #[test]

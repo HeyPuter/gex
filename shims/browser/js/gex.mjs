@@ -1103,7 +1103,7 @@ export class Gex {
       // Each of these is called through `?.` at its use site so a shim that
       // predates it still loads -- which is how a stale runtime turns into a
       // silent wrong answer (no `gex_chmod` leaves every file 0644).
-      'gex_chmod', 'gex_add_dir', 'gex_add_env',
+      'gex_chmod', 'gex_add_dir', 'gex_add_env', 'gex_add_symlink',
       'gex_paused_for_input', 'gex_paused_for_net', 'gex_paused_for_host',
       'gex_park', 'gex_resume_pc',
       'gex_resume_ctx', 'gex_exit_code', 'gex_jit_pending_len',
@@ -1275,6 +1275,23 @@ export class Gex {
         free?.(dp, d.length);
       }
       if (modes[target] !== undefined) this.#shim.exports.gex_chmod?.(pp, p.length, modes[target]);
+      free?.(pp, p.length);
+      free?.(tp, t.length);
+    }
+    // Symbolic links (`web/src/tar.js`'s `links`), after files and hard links:
+    // path -> target text. Only with the global kernel (a page or run-node):
+    // a process that is the whole system has no filesystem yet to link in,
+    // so a caller without one passes copies as files instead.
+    for (const [path, target] of Object.entries(opts.symlinks ?? {})) {
+      const p = enc.encode(path);
+      const t = enc.encode(target);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const tp = this.#shim.exports.gex_alloc(t.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#bytes().set(t, tp);
+      if (!this.#shim.exports.gex_add_symlink(tp, t.length, pp, p.length)) {
+        console.warn(`gex: symlink ${path} -> ${target} not made (no global kernel)`);
+      }
       free?.(pp, p.length);
       free?.(tp, t.length);
     }

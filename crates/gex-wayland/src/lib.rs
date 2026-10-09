@@ -1236,9 +1236,18 @@ impl Client {
                 }
             }
             // A client may not draw into a buffer again until it is released,
-            // and most will not draw a second frame without this.
-            let w = Writer::new(buffer_id, 0);
-            self.send(w);
+            // and most will not draw a second frame without this. Once per
+            // attach: a commit that attaches nothing new (a subsurface
+            // position, a viewport, an input region) shows the committed
+            // buffer again but does not release it again. Wine's
+            // winewayland counts releases, and fourteen for one attach
+            // freed a buffer still in its queue, which it then destroyed a
+            // second time (Katana ZERO and Undertale, W3: libwayland's
+            // `proxy->refcount > 0` assertion at the first swap-chain resize).
+            if state.pending_buffer.is_some() {
+                let w = Writer::new(buffer_id, 0);
+                self.send(w);
+            }
         }
         if let Some(frame) = produced {
             // The host that composites from copies has one window, and it is
@@ -2752,6 +2761,20 @@ mod tests {
         assert!(
             msgs.iter().any(|(o, op, _)| *o == 11 && *op == 0),
             "wl_callback.done"
+        );
+    }
+
+    #[test]
+    fn a_commit_with_nothing_attached_does_not_release_the_buffer_again() {
+        let px = vec![0u8; 16];
+        let (mut c, _) = draw(px.clone(), 2, 2, 8);
+        let _ = c.take_outgoing();
+        // wl_surface.commit (6) on surface 6, with no attach since the last.
+        c.receive(&Writer::new(6, 6).finish(), &[], &Pool(px));
+        let msgs = messages(&c.take_outgoing());
+        assert!(
+            !msgs.iter().any(|(o, op, _)| *o == 10 && *op == 0),
+            "no second wl_buffer.release for one attach: {msgs:?}"
         );
     }
 

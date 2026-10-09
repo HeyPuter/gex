@@ -310,6 +310,16 @@ pub mod ctx {
     /// Program counter. Only meaningful at block boundaries and safepoints.
     pub const PC: usize = 32 * 8;
 
+    /// The stack pointer of a process on the i386 ABI (`compat`): `esp`,
+    /// `x(4)`, in every build. On x86-64 that is `SP` itself; an AArch64
+    /// build has i386-ABI processes too -- native wasm32 programs, whose
+    /// musl port reads and writes `x(4)` -- and their stack pointer is not
+    /// its `SP`. Everything else on the i386 ABI (the number in `x(0)`, the
+    /// arguments, `PC`) is at the same offsets in both layouts.
+    pub const fn sp_slot(compat: bool) -> usize {
+        if compat && !super::PPC { x(4) } else { SP }
+    }
+
     /// Condition flags: one **byte** each, inside a single 32-bit slot. One
     /// flag stores as one `i32.store8`, all four as one `i32.store`; a byte
     /// (not a bit) each keeps the single-flag store off a read-modify-write.
@@ -434,6 +444,12 @@ pub mod ctx {
     /// must materialise in guest memory on the guest's behalf (an x86-64
     /// `poll` becomes `ppoll` with a timespec that has to live somewhere).
     pub const SCRATCH: usize = X87_TMP + 16;
+
+    /// Scratch for the i386 ABI's rewritten calls (`gex-kernel`'s `i386`):
+    /// `SCRATCH` where the context has one; an AArch64 context ends at
+    /// `v31`, and its only i386-ABI processes are native wasm32 programs,
+    /// which never use the vector registers, so their first 64 bytes.
+    pub const COMPAT_SCRATCH: usize = if super::X86 || super::PPC { SCRATCH } else { V };
 
     /// PowerPC only: the area after `v31` (where x86-64 keeps its x87
     /// stack). The 32 condition-register bits, one byte each: bit `4f + k` is

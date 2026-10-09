@@ -72,7 +72,7 @@ fn file_type_of(md: &std::fs::Metadata) -> FileType {
     }
 }
 
-fn convert(md: &std::fs::Metadata) -> Metadata {
+pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     Metadata {
         file_type: file_type_of(md),
         size: md.len(),
@@ -81,6 +81,13 @@ fn convert(md: &std::fs::Metadata) -> Metadata {
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
         rdev: 0,
+        times: super::Times {
+            mtime_ns: md.mtime_nsec() as u32,
+            atime: md.atime(),
+            atime_ns: md.atime_nsec() as u32,
+            ctime: md.ctime(),
+            ctime_ns: md.ctime_nsec() as u32,
+        },
     }
 }
 
@@ -88,9 +95,33 @@ fn convert(md: &std::fs::Metadata) -> Metadata {
 #[derive(Debug)]
 struct HostHandle {
     file: Mutex<File>,
+    /// Not a regular file (a FIFO, a socket, a device): no offset.
+    stream: bool,
+}
+
+/// `(seconds, nanoseconds)` since the epoch as a host time.
+fn host_time((secs, ns): (i64, u32)) -> std::time::SystemTime {
+    let d = std::time::Duration::new(secs.unsigned_abs(), 0);
+    let t = if secs >= 0 { std::time::UNIX_EPOCH + d } else { std::time::UNIX_EPOCH - d };
+    t + std::time::Duration::from_nanos(ns as u64)
+}
+
+fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::FileTimes {
+    let mut t = std::fs::FileTimes::new();
+    if let Some(a) = atime {
+        t = t.set_accessed(host_time(a));
+    }
+    if let Some(m) = mtime {
+        t = t.set_modified(host_time(m));
+    }
+    t
 }
 
 impl FileHandle for HostHandle {
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
+    }
+
     /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
     /// 0 before hashing a download and reported that as "Unable to truncate".
     fn truncate(&self, len: u64) -> Result<(), Errno> {
@@ -103,8 +134,10 @@ impl FileHandle for HostHandle {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| Errno::from_io(&e))?;
+        if !self.stream {
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| Errno::from_io(&e))?;
+        }
         f.read(buf)
             .map(|n| n as u64)
             .map_err(|e| Errno::from_io(&e))
@@ -112,11 +145,17 @@ impl FileHandle for HostHandle {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| Errno::from_io(&e))?;
+        if !self.stream {
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| Errno::from_io(&e))?;
+        }
         f.write(buf)
             .map(|n| n as u64)
             .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -152,6 +191,11 @@ impl FileSystem for HostFs {
         let host = self.host_path(path)?;
         let md = std::fs::metadata(&host);
         if let Ok(md) = &md {
+            // a directory opens for reading only
+            let acc = flags & oflags::ACCMODE;
+            if md.is_dir() && (acc == oflags::O_WRONLY || acc == oflags::O_RDWR) {
+                return Err(Errno::EISDIR);
+            }
             if md.is_dir() {
                 let mut entries = vec![
                     DirEntry {
@@ -189,24 +233,51 @@ impl FileSystem for HostFs {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
+        // Linux's O_CREAT, O_EXCL, O_TRUNC and O_NONBLOCK on the host.
+        let mut custom = 0;
         if flags & oflags::O_CREAT != 0 {
             // The guest's mode but never without owner rw: gex does not enforce
             // permissions, but the host process is not root, and a file it
             // creates mode 0 (as dpkg does for `.dpkg-new`) it cannot reopen.
-            opts.create(true).mode(mode | 0o600);
+            opts.mode(mode | 0o600);
+            if want_write {
+                opts.create(true);
+            } else {
+                // std refuses to create without write access; Linux creates
+                // with O_RDONLY (gnulib's open tests, `touch`-like opens)
+                custom |= 0o100;
+            }
         }
         if flags & oflags::O_EXCL != 0 {
-            opts.create_new(true);
+            if want_write {
+                opts.create_new(true);
+            } else if flags & oflags::O_CREAT != 0 {
+                custom |= 0o200;
+            }
         }
         if flags & oflags::O_TRUNC != 0 {
-            opts.truncate(true);
+            if want_write {
+                opts.truncate(true);
+            } else {
+                custom |= 0o1000;
+            }
         }
         if flags & oflags::O_APPEND != 0 {
             opts.append(true);
         }
+        // O_NONBLOCK reaches the host: opening a host FIFO without a writer
+        // must not block (grep -D skip opens one so, to fstat and skip it).
+        // Linux's O_NONBLOCK on the host.
+        if flags & oflags::O_NONBLOCK != 0 {
+            custom |= 0o4000;
+        }
+        opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
+        // A FIFO, socket or device has no offset: read and write it as is.
+        let stream = file.metadata().is_ok_and(|m| !m.is_file());
         Ok(Arc::new(HostHandle {
             file: Mutex::new(file),
+            stream,
         }))
     }
 
@@ -291,6 +362,21 @@ impl FileSystem for HostFs {
             std::fs::Permissions::from_mode((mode & 0o7777) | 0o600),
         )
         .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let host = self.host_path(path)?;
+        // A symlink's own times (`utimensat` with AT_SYMLINK_NOFOLLOW: dpkg
+        // stamps every link it unpacks, before its target exists): std opens
+        // only what a link names, so this leaves the link's times as they are.
+        if std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Ok(());
+        }
+        let f = std::fs::File::open(host).map_err(|e| Errno::from_io(&e))?;
+        f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
     }
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {

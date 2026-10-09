@@ -40,12 +40,29 @@ export class PageTty {
     // A maximum, because a memory import's limits are part of its type: one
     // with no maximum does not satisfy an import that declares one. 65535 is
     // what `tools/add-memory.mjs` writes for the process import.
-    const scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
+    //
+    // Shared or plain to match the build: the page loads the kernel whose
+    // process import is shared when its processes' memories are (every
+    // multi-threaded shim), and a memory import's `shared` flag is part of
+    // its type. Only the plain one was offered, so the page's terminal never
+    // opened under the shared shim -- harmless for a translated shell, which
+    // gives its stack back and is fed by the fallback below, and fatal for a
+    // wasm32 one, which waits inside its own frames for keys that only the
+    // kernel's terminal can hand it ("can't even type").
     let inst;
+    let scratch;
     try {
-      inst = await WebAssembly.instantiate(mod, {
-        env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
-      });
+      try {
+        scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared: true });
+        inst = await WebAssembly.instantiate(mod, {
+          env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
+        });
+      } catch {
+        scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
+        inst = await WebAssembly.instantiate(mod, {
+          env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
+        });
+      }
     } catch (e) {
       // A module that will not take a plain process memory is the shared build,
       // not what a page loads. Warn rather than fail silently: the fallback
