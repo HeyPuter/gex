@@ -2024,6 +2024,13 @@ export class Gex {
     );
     if (child.compat) e.gex_set_compat?.(1);
     if (child.wasm32) {
+      if (child.wasm32Link && e.gex_wasmprog_adopt_link) {
+        const b = new TextEncoder().encode(child.wasm32Link);
+        const p = e.gex_alloc(b.length) >>> 0;
+        this.#bytes().set(b, p);
+        e.gex_wasmprog_adopt_link(p, b.length);
+        e.gex_free?.(p, b.length);
+      }
       if (child.wasm32Base && e.gex_wasmprog_adopt_at) e.gex_wasmprog_adopt_at(BigInt(child.wasm32), child.wasm32Base);
       else e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
     }
@@ -2297,6 +2304,8 @@ export class Gex {
       // And where its module sits in the function table: the child's copy
       // of the data holds function pointers for that base.
       wasm32Base: e.gex_wasmprog_base?.() ?? 0,
+      // And its shared libraries: where each module's data and table range are.
+      wasm32Link: this.#wasmprogLink(),
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
@@ -2672,7 +2681,7 @@ export class Gex {
     // Dense: the shim's runtime module dispatches through `blocks` too.
     if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
-    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri], dyl: new Map() };
     this.#cgenGrow();
     ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
@@ -2726,7 +2735,8 @@ export class Gex {
       : (b, c) => e.gex_cgen_regs(u, b, c);
     const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
     const tInst = performance.now();
-    const inst = new WebAssembly.Instance(mod, {
+    let inst;
+    const imports = {
       env: {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
@@ -2737,7 +2747,10 @@ export class Gex {
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
-        __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack()) : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+        // and its shared libraries share it (one per thread, as natively).
+        __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack())
+          : wasmprog ? this.#wasmprogStack()
+          : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
       },
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
@@ -2763,8 +2776,19 @@ export class Gex {
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
-    });
+    };
+    // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
+    const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
+    inst = new WebAssembly.Instance(mod, imports);
     if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    if (wasmprog) {
+      for (const [slot, name] of extra) {
+        const f = inst.exports[name];
+        if (!f) throw new Error(`wasm32 module ${prov}: ${name} is not exported`);
+        st.ftab.set(tIdx(slot), f);
+      }
+      st.dyl.set(prov, inst);
+    }
     // A wasm64 provider's slots' function types, for its JIT's `provider_jit_table` SIG.
     if (libprov && !this.#provSigs.some((x) => x.base === base)) {
       const bytes = new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0);
@@ -3191,6 +3215,87 @@ export class Gex {
     }
   }
 
+  /** The process's wasm32 link map, for a fork's child (cgen/dylink.rs), or null. */
+  #wasmprogLink() {
+    const e = this.#shim.exports;
+    const n = (e.gex_wasmprog_link?.(0, 0) ?? 0) >>> 0;
+    if (!n) return null;
+    const buf = e.gex_alloc(n) >>> 0;
+    try {
+      e.gex_wasmprog_link(buf, n);
+      return new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+  }
+
+  /** This Worker's `__stack_pointer` for wasm32 programs: one global the
+   *  program and its shared libraries share (one C stack per thread). */
+  #wasmprogSp = null;
+  #wasmprogStack() {
+    return (this.#wasmprogSp ??= new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0));
+  }
+
+  /** This Worker's asyncify state and data globals, which a program's
+   *  modules built with relocatable asyncify share. */
+  #wasmprogAsync = null;
+
+  /** Apply provider module `prov`'s binding list (cgen/dylink.rs's format)
+   *  to `imports`; the table slots to fill with exports after
+   *  instantiation, as [slot, name]. */
+  #wasmprogBind(prov, imports, st) {
+    const e = this.#shim.exports;
+    if (!e.gex_wasmprog_binds) return [];
+    const n = e.gex_wasmprog_binds(prov, 0, 0) >>> 0;
+    if (!n) return [];
+    const buf = e.gex_alloc(n) >>> 0;
+    let text;
+    try {
+      e.gex_wasmprog_binds(prov, buf, n);
+      text = new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, n);
+    }
+    const extra = [];
+    const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      const f = line.split('\t');
+      switch (f[0]) {
+        case 'S':
+          if (f[1] === 'env' && (f[2] === '__asyncify_state' || f[2] === '__asyncify_data')) {
+            this.#wasmprogAsync ??= [0, 1].map(() => new WebAssembly.Global({ value: 'i32', mutable: true }, 0));
+            set('env', f[2], this.#wasmprogAsync[f[2] === '__asyncify_state' ? 0 : 1]);
+          }
+          break;
+        case 'G':
+          set(f[1], f[2], new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0));
+          break;
+        case 'E': {
+          const from = st.dyl.get(Number(f[3]));
+          const x = from?.exports[f[4]];
+          if (x === undefined) throw new Error(`wasm32 module ${prov}: ${f[1]}.${f[2]}: ${f[4]} of module ${f[3]} is not instantiated in this Worker`);
+          set(f[1], f[2], x);
+          break;
+        }
+        case 'L': {
+          const slot = tIdx(Number(f[3])), t = st.ftab;
+          set(f[1], f[2], (...a) => t.get(slot)(...a));
+          break;
+        }
+        case 'M': {
+          const msg = f.slice(3).join('\t');
+          set(f[1], f[2], () => { throw new Error(msg); });
+          break;
+        }
+        case 'X':
+          extra.push([Number(f[1]), f[2]]);
+          break;
+      }
+    }
+    return extra;
+  }
+
   /** What a native wasm32 program imports from `gex` (cgen/wasmprog.rs):
    *  its system calls, which return unless the program's frames end (a
    *  thread or a child they staged is handed to the host here), and fork's
@@ -3225,17 +3330,19 @@ export class Gex {
         else if (st === 2) asyncify(4, 0);
         else throw new Error(`gex.fork_point in asyncify state ${st}`);
       },
-      // libgex's dlopen/dlsym past its static registry: shared libraries
-      // (docs/gexcc.md 7.6) load natively only so far
+      // libgex's dlopen/dlsym past its static registry
+      // (cgen/dylink.rs): the shim loads and publishes, this Worker
+      // instantiates the new modules and runs their constructors; other
+      // Workers instantiate them as they next catch up
       dlopen: (path, err, errlen) => {
-        const msg = new TextEncoder().encode('dlopen: wasm32 shared libraries are not loaded in the browser yet');
-        const n = Math.min(msg.length, errlen - 1);
-        const b = new Uint8Array(this.#memory.buffer, err >>> 0, n + 1);
-        b.set(msg.subarray(0, n));
-        b[n] = 0;
-        return 0;
+        const h = e.gex_wasmprog_dlopen(path, err, errlen) >>> 0;
+        if (!h) return 0;
+        this.#cgenCatchUp();
+        const st = this.#cgenStore();
+        for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
+        return h | 0;
       },
-      dlsym: () => 0,
+      dlsym: (h, name) => e.gex_wasmprog_dlsym(h, name) | 0,
     };
   }
 
@@ -3247,6 +3354,8 @@ export class Gex {
     if (n < 0) return;
     this.#cgenCatchUp();
     e.gex_cgen_pmod_installed(n);
+    // libc's registry of the program's shared libraries (cgen/dylink.rs)
+    e.gex_wasmprog_ready?.();
   }
 
   /** Wine's PE module's `gex.syscall` (cgen/wasmdll.rs): a system call from

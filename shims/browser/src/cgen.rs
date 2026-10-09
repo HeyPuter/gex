@@ -39,6 +39,7 @@ pub(crate) mod elfprov;
 pub(crate) mod libprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
+mod dylink;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).
