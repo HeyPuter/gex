@@ -2162,3 +2162,43 @@ Not yet:
   Natively the JIT seeds only the main image too (gexc's
   FjitTranslator::image); a Translator hook per mapped object would do
   the same there.
+- **Single U head for the gate: merge/unity-seed 0ddc9390** (merge/unity
+  a0f6a8c9 merged into merge/unity-seed; has 64efd78e, 1bf5ba09, 4ed5cad3,
+  1d5b26d9). Gated as integ/2026-10-09b. Master 9e5ac0ff merged in at
+  114b6b69. Master's gex-abi change moves GEX_CGEN_RECOVERY_INPUTS, so the
+  HK/Muck units are rebuilding on gooner for 114b6b69
+  (`scratch/unity/units/build-m1.sh`, gexc copy `units/gexc-114b6b69`,
+  logs `build-{hk,muck}-m1.log`). Runs until then use the pre-merge shim
+  `scratch/unity/shim-lazy` (= 1e9154ad) with `units/cgen-page-rk`.
+- **B5: Hollow Knight in the page past the menu into gameplay (1e9154ad,
+  2ea7e6f2).**
+  - Lazy files: `TmpFs::add_lazy(path, size, url)`, which reads 1 MiB chunks
+    through `env.lazy_fetch`: a synchronous XHR with Range and
+    `Cache-Control: no-store`.
+    - nt-page takes `?lazy=MANIFEST`.
+    - browser-linux.mjs takes `--lazy DIR` (the 4.9 GiB install, 1,754
+      files) and `move`/`click` in `--input`.
+    - The script is `tests/games/hollow-knight-page-input.txt`, the native
+      script timed from present 600.
+  - hg1 failed every read past a file's first chunk. Without no-store,
+    Chromium's cache answered later ranges badly; curl against vite gets
+    206 for every range.
+  - hg2 (fixed fetch, .NET wasm JIT on): no failed reads. It went through
+    the menu, profile, scale and brightness pages and the intro skip into
+    the opening sequence. Then Mono asserted at loader.c:1826 (token table
+    != METHOD) at ~340 s.
+  - hg4 (diagnostic provider) shows the method is NULL: the signature of a
+    NULL MonoMethod under `mono_runtime_invoke`.
+  - **hg3 (`PAGE_ENV=GEXMONO_WASM_JIT=0`, the interpreter): King's Pass,
+    the knight walks and the "X Attack" prompt is shown
+    (`shots/hg3/c029.png`). Gameplay runs at 14.4-14.9 presents/s; the
+    menu ran at ~41.**
+  - Native hk130 (the King's Pass reference) ran before the JIT became the
+    default (d4a9389d, Oct 7 18:45), so it used the interpreter too. The
+    JIT bug is not page-specific.
+  - Open: which JIT path asks for the NULL method's signature. hg5 traps
+    there for a named wasm stack (provider `dnc-gc/provider/mono.wasm.diag2`,
+    staged as edger `page/muck-bcl-diag2`). The staged `muck-bcl/mono.wasm`
+    is unchanged (`mono.wasm.good`). The diagnostic edits in
+    `dnc/src/.../loader.c` and in host/gexmono-adapters.h and
+    gexmono-provider.c (`gexmono_last_api`) are uncommitted.
