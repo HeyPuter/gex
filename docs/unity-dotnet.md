@@ -2248,3 +2248,19 @@ Not yet:
     | hp24 | 705dc708 | UnityPlayer | 53 s | 83 s | 41.1 |
     | hp21 | 114b6b69 + zero scan | + libc, libm | 45 s | 77 s | - |
     | hp23 | 705dc708 | + 15 libraries (5 at stale bases) | 43 s | 73 s | 40.1 |
+    | hp25, hp26 | 705dc708 | + 15 libraries at current bases | 40 s, 40 s | 71 s, 70 s | 39.8, 41.2 |
+    | hp27 | 87176416 | same | 37 s | 69 s | 40.3 |
+
+  - hp25/hp26 still JIT-translated libasound (3.1 MiB): ALSA dlopens and
+    dlcloses it six times, and the retired unit was never placed again.
+    That is fixed in the commit after 705dc708.
+  - Left to the JIT by the first frame: ld.so 1.8 MiB (the kernel maps it,
+    so `elf_unit_maps` never sees it), Mesa's `/gex/gl/libGL.so.1`
+    0.2 MiB, and UnityPlayer misses 0.1 MiB. The edger system libGL unit
+    is unused.
+  - Library bases are deterministic for a given shim. 5 of 16 moved when
+    master 9e5ac0ff merged in, and a mismatched unit falls back to the JIT
+    (no fault). Pinning them (`?pins=`) would make the cache independent of
+    layout.
+  - Native has the same hash-only retire test (`nt_cgen::on_retire`) and
+    the same placed-once rule.
