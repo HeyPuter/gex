@@ -45,7 +45,20 @@ struct LinuxProv {
     install: u32,
     /// Whether its entry thunks are bound (`gex_libprov_installed`).
     bound: bool,
+    /// Its code page (0 without one), where its table base is kept for a
+    /// fork's child ([`BASE_AT`]).
+    code: u64,
+    /// In a fork's child: the parent's table base, which the copied data's
+    /// function pointers (zlib's `zalloc = zcalloc`, sqlite's methods) hold.
+    want_base: Option<u32>,
 }
+
+/// Where in a provider's code page its table base is kept (`"GEXB"`, then
+/// the base): the code page is the child's copy, as its data is. The first
+/// 0x100 bytes are never a bound address that runs (the thread entry is at
+/// offset 0 only).
+const BASE_AT: u64 = 8;
+const BASE_MAGIC: u32 = u32::from_le_bytes(*b"GEXB");
 
 static LIBS: Mutex<Vec<LinuxProv>> = Mutex::new(Vec::new());
 
@@ -261,12 +274,21 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
             }
         }
     }
+    let mut code = 0;
+    let mut want_base = None;
     if let Some(k) = slot("__gex_thread_start") {
         let name = format!("[provider {wasm_path} code]");
         let at = match inherited(&name) {
-            Some(a) => a,
+            Some(a) => {
+                let gm = GuestMem::new(crate::guest_bytes());
+                if gm.read_u32(a + BASE_AT).ok() == Some(BASE_MAGIC) {
+                    want_base = gm.read_u32(a + BASE_AT + 4).ok();
+                }
+                a
+            }
             None => alloc_low(CODE_PAGE, gex_kernel::mem::prot::READ, &name)?,
         };
+        code = at;
         pairs.push((at, k));
         THREAD_ENTRY.store(at, Ordering::Release);
         if let Some(r) = slot("gexp__reverse") {
@@ -297,7 +319,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
     crate::warn_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
     let index = {
         let mut libs = lock(&LIBS);
-        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None, install: 0, bound: false });
+        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None, install: 0, bound: false, code, want_base });
         libs.len() - 1
     };
     let u = {
@@ -349,7 +371,22 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
         }
     };
     let number = lock(&PROVIDERS).len() as u32;
-    l.install = ftab(|t| t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs));
+    l.install = ftab(|t| match l.want_base {
+        Some(base) => {
+            let (n, ok) = t.publish_at(base, len, PROVIDER | number, Tier::Unit, &l.pairs);
+            if !ok {
+                crate::warn_line(&format!("gex: {}: fork child: table base {base} is taken, its function pointers will be wrong\n", l.path));
+            }
+            n
+        }
+        None => t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs),
+    });
+    if l.code != 0 {
+        let base = ftab(|t| t.install(l.install).base);
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        let _ = gm.write_u32(l.code + BASE_AT, BASE_MAGIC);
+        let _ = gm.write_u32(l.code + BASE_AT + 4, base);
+    }
     let addrs: Vec<u64> = l.pairs.iter().map(|&(a, _)| a).collect();
     let mem = crate::guest_bytes();
     for &a in &addrs {
