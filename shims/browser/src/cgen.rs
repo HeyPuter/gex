@@ -1065,6 +1065,20 @@ pub(crate) fn index_of(addr: u64) -> Option<u32> {
     ftab(|m| m.get(addr).map(|f| f.idx))
 }
 
+/// Whether a unit built ahead of time (or a provider) serves the function at
+/// `addr`: not the JIT's own functions, whose resume points are published
+/// at addresses inside functions.
+pub(crate) fn unit_serves(addr: u64) -> bool {
+    ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
+}
+
+/// Whether a current JIT function serves `addr` (its pages unchanged since).
+/// After the JIT forgets (`fjit::on_retire`) this is what still knows
+/// which functions it has made.
+pub(crate) fn jit_serves(addr: u64) -> bool {
+    ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Jit && crate::fjit::current(f.install)))
+}
+
 /// How many units are published: a Worker installs up to this many.
 #[no_mangle]
 pub extern "C" fn gex_cgen_count() -> u32 {
@@ -1298,9 +1312,27 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         c.len() - 1
     });
     CALLOUT_N.fetch_add(1, Ordering::Relaxed);
+    // Opened (result -1): one that never closes was abandoned by a throw.
+    CALLOUT_RING.with(|x| {
+        let mut x = x.borrow_mut();
+        if x.len() >= 24 {
+            x.remove(0);
+        }
+        x.push((t, ret as u64, want, depth as u32, -1, sp));
+    });
     // SAFETY: a host import taking scalars; nothing here holds a lock.
     let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
+    {
+        let after = GuestMem::new(crate::guest_bytes()).read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+        CALLOUT_RING.with(|x| {
+            let mut x = x.borrow_mut();
+            if x.len() >= 24 {
+                x.remove(0);
+            }
+            x.push((t, ret as u64, want, depth as u32, r, after));
+        });
+    }
     if r == gex_abi::ftab::RET_LEFT {
         CALLOUT_LEFT.fetch_add(1, Ordering::Relaxed);
         if libprov::provider_return(ret as u64) {
@@ -1424,6 +1456,14 @@ thread_local! {
     static LOOKUP_RING: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// The last stateful-provider guest calls that reached the fallback: (target, return, sp).
     static PROV_RING: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// This Worker's last finished call-outs: (target, return, sp wanted,
+    /// depth, result, sp after), for the wild-branch diagnostic.
+    static CALLOUT_RING: std::cell::RefCell<Vec<(u64, u64, u64, u32, i32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`CALLOUT_RING`], for a diagnostic.
+pub(crate) fn callouts_recent() -> Vec<(u64, u64, u64, u32, i32, u64)> {
+    CALLOUT_RING.with(|r| r.borrow().clone())
 }
 
 /// Whether a stateful provider's guest call is open on this Worker: the guest

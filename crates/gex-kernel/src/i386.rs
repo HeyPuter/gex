@@ -214,6 +214,8 @@ pub mod raw {
     pub const EPOLL_PWAIT: u64 = 319;
     pub const UTIMENSAT: u64 = 320;
     pub const TIMERFD_CREATE: u64 = 322;
+    pub const TIMERFD_SETTIME: u64 = 325;
+    pub const TIMERFD_GETTIME: u64 = 326;
     pub const FALLOCATE: u64 = 324;
     pub const EVENTFD2: u64 = 328;
     pub const EPOLL_CREATE1: u64 = 329;
@@ -279,6 +281,9 @@ pub enum Post {
     /// `getrlimit`'s 32-bit rlimit: the canonical `prlimit64` wrote 16 bytes
     /// at `scratch`; each half saturates to the 32-bit `RLIM_INFINITY`.
     Rlimit32 { user: u64, scratch: u64 },
+    /// A `struct itimerspec` with 32-bit fields (`timerfd_settime`'s old
+    /// value, `timerfd_gettime`): two timespecs at `scratch`, narrowed.
+    Itimerspec32 { user: u64, scratch: u64 },
 }
 
 impl Post {
@@ -301,6 +306,15 @@ impl Post {
                         let v = m.read_u64(scratch + i * 8).unwrap_or(0);
                         let v32 = if v > 0xffff_ffff { 0xffff_ffff } else { v as u32 };
                         let _ = m.write_u32(user + i * 4, v32);
+                    }
+                }
+                r
+            }
+            Post::Itimerspec32 { user, scratch } => {
+                if ok && user != 0 {
+                    for i in 0..4 {
+                        let v = m.read_u64(scratch + i * 8).unwrap_or(0);
+                        let _ = m.write_u32(user + i * 4, v as u32);
                     }
                 }
                 r
@@ -643,6 +657,35 @@ pub fn translate(
             nr::NANOSLEEP
         }
         x::TIMERFD_CREATE => nr::TIMERFD_CREATE,
+        // The 32-bit pair is what musl's time64 `timerfd_settime` issues when
+        // the times fit and no old value is asked for -- foot's delayed-render
+        // timers. Unmapped, it was ENOSYS and those timers never armed, so
+        // foot drew its first frames and then never again.
+        x::TIMERFD_SETTIME => {
+            a[0] = sext(a[0]);
+            // Both timespecs widened into scratch (interval, then value); the
+            // old value, if asked for, comes back through the scratch's
+            // second half and is narrowed afterwards.
+            let new = a[2];
+            if new != 0 {
+                widen_time(m, new, scratch, 1);
+                widen_time(m, new + 8, scratch + 16, 1);
+                a[2] = scratch;
+            }
+            if a[3] != 0 {
+                post = Post::Itimerspec32 { user: a[3], scratch: scratch + 32 };
+                a[3] = scratch + 32;
+            }
+            nr::TIMERFD_SETTIME
+        }
+        x::TIMERFD_GETTIME => {
+            a[0] = sext(a[0]);
+            if a[1] != 0 {
+                post = Post::Itimerspec32 { user: a[1], scratch };
+                a[1] = scratch;
+            }
+            nr::TIMERFD_GETTIME
+        }
         x::TIMERFD_SETTIME64 => {
             a[0] = sext(a[0]);
             nr::TIMERFD_SETTIME
@@ -987,7 +1030,20 @@ pub fn translate(
         // multiplexes calls glibc no longer makes through it.
         x::RECVMMSG | x::SOCKETCALL => UNKNOWN,
         x::REBOOT => nr::REBOOT,
-        x::STATFS | x::FSTATFS | x::STATFS64 | x::FSTATFS64 => UNKNOWN,
+        // statfs64(path, size, buf) / fstatfs64(fd, size, buf): the 64-bit
+        // layout (musl's `struct statfs`), written in its 32-bit form under
+        // `compat` (apt checks for room before it downloads). The old
+        // statfs/fstatfs with 32-bit counts are not made by musl.
+        x::STATFS64 => {
+            a[1] = a[2];
+            nr::STATFS
+        }
+        x::FSTATFS64 => {
+            a[0] = sext(a[0]);
+            a[1] = a[2];
+            nr::FSTATFS
+        }
+        x::STATFS | x::FSTATFS => UNKNOWN,
         x::TRUNCATE | x::TRUNCATE64 | x::GETDENTS => UNKNOWN,
         _ => UNKNOWN,
     };
@@ -1047,5 +1103,42 @@ mod tests {
         // pread64(fd, buf, n, lo, hi)
         let (n, a) = tr(raw::PREAD64, [3, 0x3000, 16, 0x2000, 1, 0], &mut buf);
         assert_eq!((n, a[3]), (nr::PREAD64, 0x1_0000_2000));
+    }
+
+    #[test]
+    fn timerfd_settime_widens_a_32_bit_itimerspec() {
+        let mut buf = vec![0u8; 0x4000];
+        {
+            let mut m = GuestMem::new(&mut buf);
+            // { interval {0, 0}, value {0, 500000} }: foot's lower render timer.
+            for (i, v) in [0u32, 0, 0, 500_000].iter().enumerate() {
+                m.write_u32(0x3000 + i as u64 * 4, *v).unwrap();
+            }
+        }
+        let (n, a) = tr(raw::TIMERFD_SETTIME, [5, 0, 0x3000, 0, 0, 0], &mut buf);
+        assert_eq!(n, nr::TIMERFD_SETTIME);
+        assert_eq!(a[..4], [5, 0, SCRATCH, 0]);
+        let m = GuestMem::new(&mut buf);
+        let words: Vec<u64> = (0..4).map(|i| m.read_u64(SCRATCH + i * 8).unwrap()).collect();
+        assert_eq!(words, vec![0, 0, 0, 500_000]);
+    }
+
+    #[test]
+    fn timerfd_gettime_narrows_into_the_callers_struct() {
+        let mut buf = vec![0u8; 0x4000];
+        let (n, a, post) = {
+            let mut m = GuestMem::new(&mut buf);
+            let mut a = [5, 0x3000, 0, 0, 0, 0];
+            let (n, post) = translate(raw::TIMERFD_GETTIME, &mut a, &mut m, SCRATCH, 0x1000);
+            (n, a, post)
+        };
+        assert_eq!((n, a[1]), (nr::TIMERFD_GETTIME, SCRATCH));
+        let mut m = GuestMem::new(&mut buf);
+        for (i, v) in [1u64, 2, 3, 4].iter().enumerate() {
+            m.write_u64(SCRATCH + i as u64 * 8, *v).unwrap();
+        }
+        assert_eq!(post.finish(&mut m, 0), 0);
+        let words: Vec<u32> = (0..4).map(|i| m.read_u32(0x3000 + i * 4).unwrap()).collect();
+        assert_eq!(words, vec![1, 2, 3, 4]);
     }
 }

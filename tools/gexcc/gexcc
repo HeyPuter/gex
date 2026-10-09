@@ -372,6 +372,10 @@ if not (nostdlib or nodefaultlibs):
     # gexcc's runtime: the loop safepoint (rt/poll.c)
     if os.path.exists(LIB + '/libgexcc.a'):
         libs.insert(0, LIB + '/libgexcc.a')
+        # thread_local destructors (rt/cxa_thread_atexit.c): libc++abi's
+        # reference is weak, which pulls nothing out of an archive
+        if CXX:
+            ld_flags += ['-u', '__cxa_thread_atexit_impl']
 # main(argc, argv, envp): see rt/main3.c
 if not nostartfiles and not nostdlib:
     cand = objs + [x for x in ins if not x.startswith('-') and not is_archive(x)]

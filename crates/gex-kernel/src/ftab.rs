@@ -157,6 +157,20 @@ impl FuncMap {
         n
     }
 
+    /// [`FuncMap::publish`] at `base` when nothing has taken it yet: a fork's
+    /// child of a wasm32 program installs the parent's module where the
+    /// parent had it, because the function pointers in the data it copied
+    /// are `__table_base + i` for the parent's base (an exec'd program's base
+    /// is past its predecessor's range, which is never reused). Returns
+    /// whether the install got that base.
+    pub fn publish_at(&mut self, base: u32, len: u32, module: u32, tier: Tier, funcs: &[(u64, u32)]) -> (u32, bool) {
+        if base >= self.next {
+            self.next = base;
+        }
+        let n = self.publish(len, module, tier, funcs);
+        (n, self.installs[n as usize].base == base)
+    }
+
     /// Map more addresses to slots of install `install`: one module serving
     /// several images (Wine's PE side as one module, docs/wine-native.md
     /// §3.14, bound DLL by DLL as each maps). Nothing changes in any table
@@ -258,6 +272,10 @@ pub trait Translator: Send + Sync {
     fn image(&self, _process: u64, _program: &gex_ld::Program, _bytes: Option<&[u8]>) {}
     /// Guest process `process` is gone (its last reference dropped).
     fn forget(&self, _process: u64) {}
+    /// Guest process `process` unmapped or reprotected the code in
+    /// `ranges` (`Kernel::retired_code`): what the translator learned of
+    /// those addresses no longer describes them.
+    fn retire(&self, _process: u64, _ranges: &[(u64, u64)]) {}
 }
 
 static TRANSLATOR: std::sync::OnceLock<Box<dyn Translator>> = std::sync::OnceLock::new();

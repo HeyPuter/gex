@@ -29,6 +29,7 @@ util-linux     2.41.5-0+deb13u1               tier1
 make-dfsg      4.4.1-2                        tier2
 sqlite3        3.46.1-7+deb13u2               tier2
 lua5.4         5.4.7-1                        tier2
+libonig        6.9.9-1                        tier2
 jq             1.7.1-6+deb13u3                tier2
 tree           2.2.1-1                        tier2
 patch          2.8-2                          tier2
@@ -45,8 +46,40 @@ curl           8.14.1-2+deb13u5               tier2
 git            1:2.47.3-0+deb13u1             tier2
 python3.13     3.13.5-2+deb13u5               tier2
 perl           5.40.1-6+deb13u1               tier2
-dpkg           1.22.22                        tier2
-apt            3.0.3                          tier2
 lz4            1.10.0-4                       tier2
 mawk           1.3.4.20250131-1               tier1
 sysvinit       3.14-4                         tier1
+# pm: dpkg and apt themselves, labelled arm64 (docs/gexcc.md §6.1a), and
+# the OpenPGP verifier apt runs (gpgv); needs tier1's compressors and openssl
+xxhash         0.8.3-2                        pm
+dpkg           1.22.22                        pm
+apt            3.0.3                          pm
+libgpg-error   1.51-4                         pm
+libgcrypt20    1.11.0-7+deb13u1               pm
+libassuan      3.0.2-2                        pm
+libksba        1.6.7-2                        pm
+npth           1.8-3                          pm
+gnupg2         2.4.7-21+deb13u1               pm
+# gui: Wayland clients for gex's compositor (docs/gexcc.md §6.2 tier 3)
+wayland        1.23.1-3                       gui
+wayland-protocols 1.44-1                      gui
+libxkbcommon   1.7.0-2                        gui
+pixman         0.44.0-3                       gui
+freetype       2.13.3+dfsg-1+deb13u1          gui
+fontconfig     2.15.0-2.3                     gui
+utf8proc       2.9.0-1                        gui
+tllist         1.1.0-1                        gui
+fcft           3.3.1-1                        gui
+foot           1.21.0-2                       gui
+xorgproto      2024.1-1                       gui
+xtrans         1.4.0-1                        gui
+xcb-proto      1.17.0-1                       gui
+libxau         1:1.0.11-1                     gui
+libxdmcp       1:1.1.5-1                      gui
+libxcb         1.17.0-2                       gui
+libx11         2:1.8.12-1                     gui
+libxext        2:1.3.4-1                      gui
+libsdl2        2.32.4+dfsg-1                  gui
+libsdl2-net    2.2.0+dfsg-3                   gui
+libsdl2-mixer  2.8.1+dfsg-2                   gui
+chocolate-doom 3.1.0-1                        gui

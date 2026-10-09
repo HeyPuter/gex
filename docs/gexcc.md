@@ -421,10 +421,10 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     to mw.
   - Don't edit crates/gex-cgen without asking.
 - No game runs on gooner; the corpus is fine here. No timing on gooner.
-- **Demo (§6), state 2026-10-08:**
+- **Demo (§6), state 2026-10-09:**
   - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
     approved. Item 1 done (gated as integ/2026-10-08f). Item 2 (aarch64
-    ELF providers) ready on branch `merge/gexcc-a64prov` (ecf2b251), no
+    ELF providers) on this branch, `merge/gexcc-a64prov`, no
     x86 re-key; the coordinator schedules its landing with U. Item 3
     (LP64-layout libraries lowered to wasm32, no memory64) not started:
     measure the lowering's cost in V8 on edger first.
@@ -437,27 +437,69 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     (`src/`, `stage/`, `logs/`, `built.txt`, `pool/`); Debian downloads
     cached in `scratch/CC/deb`. Whole thing: `web/build-native-debian.sh`
     with `GEXCC_PREFIX=~/gex-sandbox/scratch/CC/dtc`, in the build scope.
-  - Tier 1 rootfs: 44 Debian arm64 packages + 27 of ours, 91.5 MiB
-    unpacked, 20.4 MB as tar.zst.
-  - Works (gooner, correctness only): natively (`gexc run --uid 0:0
-    --sysroot TREE`) and in the browser runtime under Node
-    (`run-node.mjs --tar`, `GEX_UID=0`, `GEX_NETWORK=1`): bash, the tools,
-    dpkg (`--audit` clean), `apt-get update` against deb.debian.org
-    (signatures checked), `apt-get install jq` (arm64 jq, libjq1,
-    libonig5 translated) and jq runs; the pins keep ours over
-    `coreutils:arm64`. Test trees in `scratch/CC/rootfs` (`tree` fresh,
-    `native-cache.tar`: lists and jq's .debs, for `apt-get install
-    --no-download` without the network).
-  - Unverified: update and install in one browser-runtime session went
-    past 900 s once on gooner (each alone passes).
-  - Page startup, edger (bench.sh, headless Chromium, 8 threads,
-    `web/test/site.mjs native-debian`): browser launch to the
-    `root@gex:~#` prompt 5.4-5.6 s (5578, 5408, 5395 ms; 20.4 MB rootfs
-    from localhost). In the guest (`native-debian-cmd`, each figure
-    includes two `date` forks, about 0.5 s): `ls /` 1054 then 1041 ms,
-    `perl -e 1` 3234 then 2204 ms, `dpkg -l` 2658 then 2684 ms,
-    `apt-cache policy coreutils` 11504 then 7415 ms.
-  - Next: tier 2; GUI; item 3.
+  - Rootfs (tiers 1, 2 and pm): 22 Debian arm64 packages + 44 of ours,
+    175.6 MiB unpacked, 39.3 MB as tar.zst (`native-debian.tar.zst`);
+    `native-debian-cache.tar.zst` (49.7 MB) adds Debian's lists and jq's
+    .debs for `apt-get install --no-download jq` without the network.
+    Rebuild: `mkrootfs.py --pool $GEXCC_DEB/pool --out TREE --tar TAR`
+    (`--exclude jq` for the cache image), zstd -19 into `web/public/rootfs/`.
+  - dpkg, apt (one `apt-multi` program) and gpgv are ours, labelled arm64
+    (§6.1a). Natively: tampered InRelease rejected, `apt-get update` from
+    deb.debian.org 10.1 MB in 12 s, install/remove, `dpkg --audit` clean.
+  - In the page (edger, bench.sh, `site.mjs native-debian-run`, real Wisp
+    to anura.pro): `apt-get update` 9.33 s (10.1 MB at 1633 kB/s),
+    `apt-get install -y hello` 5.79 s, `hello` runs. The Wisp connection
+    is the page's, served to Workers over shared memory
+    (`shims/browser/js/net-bridge.mjs`): a WebSocket in a wasm32 program's
+    own Worker never delivers, since the program never returns its event
+    loop.
+  - `apt-get install --no-download jq` in the page, 26 processes: 92.9 s
+    with Debian's translated apt/dpkg/debconf, 8.6 s with ours (8.65 and
+    8.56 s). Before, by process: apt-get 92.65 s, dpkg --unpack 39.5 s,
+    dpkg-preconfigure 17.4 s (perl; ld.so 7.3 s, translation 2.5 s), each
+    dpkg-deb 4.6-5.5 s (ld.so ~0.7 s, translation ~0.4 s, compile
+    ~0.37 s), apt-extracttemplates 5.1 s; summed over processes ld.so
+    19.0 s, translation 14.1 s (452k blocks), compile 9.4 s, Worker
+    start 3.7 s. After: apt-get 8.4 s, dpkg --unpack 2.8 s, each dpkg-deb
+    ~0.3 s.
+  - Page startup (browser launch to the prompt): 5441 and 5407 ms.
+    `native-debian-cmd` (each includes two `date` forks, ~0.5 s), before
+    then after: `dpkg -l` 2658/2684 then 1084/1030 ms; `apt-cache policy
+    coreutils` 11504/7415 (first), 5.7/4.9 s (later) then 1330/1167 ms;
+    `ls /` 954/1028 ms; `perl -e 1` 3297/1855 ms (Debian's perl,
+    translated).
+  - GUI tier (2026-10-09), `?gui=1&rootfs=/rootfs/native-debian-gui.tar.zst`
+    (61.6 MB; 27 Debian packages + 48 of ours, 262 MiB unpacked; rebuild
+    with `scratch/CC/mkgui.sh`): a compositor canvas above the terminal,
+    `WAYLAND_DISPLAY=wayland-0` and the page's X server (`DISPLAY=:0`).
+    - foot (ours, with wayland, xkbcommon, pixman, freetype, fontconfig,
+      fcft) runs bash in its window, draws colour and bold, and takes
+      typed keys (`drive.mjs --wltype`). It used to stop drawing after
+      its first frames: musl's time64 `timerfd_settime` issues the 32-bit
+      call (325) when the times fit, which the i386/wasm32 personality
+      did not map, so foot's delayed-render timers never fired.
+    - Chocolate Doom (ours, on SDL2's X11 driver, SDL2_mixer, SDL2_net,
+      libX11/libxcb, all static) on Debian's freedoom plays its demo loop
+      in the page through the page's Xwayland. `-timedemo demo1` stalls
+      after ST_Init with the process alive and its window gone (open).
+      No sound (SDL's dummy driver only).
+    - xkbcommon's Compose tables come from Debian's libx11-data.
+    - edger scripts: `scratch/CC/pipe/gui.sh` (foot), `doom.sh`,
+      `doom2.sh` (timedemo); drive.mjs with `GEX_WEBGPU_SOFTWARE=1`.
+  - python3: `_ctypes` built on the wasm32 libffi
+    (`tools/gexcc/debian/libffi-wasm32`: generated trampolines, no
+    closures); `import ctypes`, types, structures and buffers work;
+    `CDLL(None)` raises OSError (no dlopen), patched so the import
+    survives it.
+  - Known: fork inside a C++ catch block traps (asyncify).
+  - perl 5.40 ours builds (`build_perl`): Debian's options, Configured
+    natively, every extension static; make_ext's make and compiler run on
+    the host through gexc's `GEXC_HOST_EXEC` (an opt-in build aid for
+    build tooling only, never set by a demo or image). POSIX, Digest::MD5,
+    Storable, Encode and threads load. Not shipped: Debian's arm64
+    perl-base stays until ours provides perlapi-5.40.1 and Debian's
+    layout for arm64 Perl packages.
+  - Next: ship perl, bc's dc, /usr/bin/git duplicate, GTK, item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
@@ -531,14 +573,69 @@ median of 3, ABBA; `scratch/CC/archbench`, 2026-10-08):
 **dpkg's architectures.**
 - Native architecture **arm64**: apt fetches Debian's arm64 index and
   packages as native, its dependency resolution unmodified. `dpkg
-  --print-architecture` says arm64. Until our own dpkg and apt are built,
-  dpkg, apt, perl-base, debconf and sqv are Debian's arm64 builds,
-  translated.
+  --print-architecture` says arm64. dpkg, apt and gpgv are ours (below);
+  perl-base and debconf are Debian's arm64 builds, translated.
 - Foreign architecture **`musl-linux-wasm32`** (`dpkg --add-architecture`;
   the name dpkg's tables give a musl wasm32 tuple) for every package we
   build. Tested with the host's dpkg: accepted, and an arm64 package's
   `Depends: coreutils (>= 9.7)` is satisfied by
   `coreutils:musl-linux-wasm32`.
+
+**Our dpkg and apt (user, 2026-10-08).** Each translated process in the
+page pays about 1.5-2.5 s before it does its own work (Worker, translated
+ld.so, retranslation; profile in §6.4), and `apt install` runs dozens of
+dpkg, dpkg-deb, dpkg-split and gpgv processes. So dpkg, apt and the
+OpenPGP verifier are gexcc builds:
+- **dpkg** 1.22.22, C, static (libmd, zlib, xz, zstd, bzip2 from tier 1).
+  configure asks dpkg-architecture for the host triplet's name; the recipe
+  answers `arm64`, so `ARCHITECTURE` is compiled in as arm64 and
+  `dpkg --print-architecture` says arm64 (checked natively).
+- **apt** 3.0.3, C++ against gexcc's libc++, CMake. libapt-pkg and
+  libapt-private are static (linked into each program); no seccomp, udev,
+  systemd, NLS, docs, tests, apt-ftparchive (Berkeley DB) or dselect.
+  `COMMON_ARCH=arm64`. Two libc++ patches (`patches/apt/`: no
+  `char_traits<unsigned char>`, no `deque` of an incomplete type).
+  Deps: xxhash (new, static only), zlib, bzip2, xz, lz4, zstd, OpenSSL.
+- **Packaging.** Both are labelled `Architecture: arm64` (binpkgs.txt
+  `arch dpkg arm64`), version Debian's + `+gex1`, from our repository,
+  which now carries `binary-arm64` beside `binary-musl-linux-wasm32`. The
+  `o=gex` pin (1001) keeps them over Debian's, also after a Debian point
+  release (1.22.23 > 1.22.22+gex1 still loses to 1001); the `-1` pin list
+  covers only our wasm32 names, so it does not block them.
+- **Essential/Pre-Depends.** Debian's dpkg is `Essential: yes` with
+  `Pre-Depends: ${shlibs}` (libc6, libbz2, liblzma, libmd0, libselinux1,
+  libzstd1) and `Depends: tar (>= 1.28-1)`. Ours keeps `Essential: yes`
+  and has no library Pre-Depends (static); tar's is a Pre-Depends, met by
+  our tar (Multi-Arch: foreign). Upgrading dpkg is still dpkg's own
+  unpack-then-configure; nothing in the closure Pre-Depends on a library
+  that only our dpkg brought. Those libraries stay installed (other arm64
+  packages need them) but are no longer pulled in for dpkg.
+- **apt's dependencies.** Debian's apt Depends on libapt-pkg7.0 (exact
+  binary version), sqv, base-passwd | adduser and the keyring. Ours:
+  `base-passwd (>= 3.6.1) | adduser, gpgv, debian-archive-keyring`;
+  libapt-pkg7.0 and sqv leave the image. Consequence: Debian's
+  apt-utils (Depends `apt (= 3.0.3)`) is not installable against
+  3.0.3+gex1; build it here if wanted.
+- **OpenPGP.** apt's `sqv` method is built only when the build machine has
+  sqv; without it apt verifies with its `gpgv` method, which runs
+  `APT::Key::gpgvcommand` (default `gpgv`). Ours is gnupg2 2.4.7's gpgv,
+  configured as Debian's gpgv udeb (no npth, gpgsm, dirmngr, ldap, tofu,
+  sqlite...), with libgcrypt 1.11 (no asm), libgpg-error, libassuan and
+  libksba static. Debian's keyring files are unchanged
+  (`/usr/share/keyrings/debian-archive-keyring.gpg`, `Signed-By`).
+  What translated sqv cost before: in the page it ran three times per
+  `apt-get update` at 5.9-7.8 s each (Rust, about 20 s per update).
+  Tampering with a cached InRelease is rejected (BADSIG, exit 100).
+- **Hashing.** apt hashes downloads itself (OpenSSL EVP, in-process) and
+  dpkg checks md5sums in-process; neither execs a hashing program during
+  install. TLS is apt's http method's OpenSSL, native.
+- **debconf.** apt's `DPkg::Pre-Install-Pkgs` hook runs debconf's
+  dpkg-preconfigure (perl) before every install: about 19 s in the page
+  for jq. The image clears it (`#clear DPkg::Pre-Install-Pkgs;` in
+  99gex); postinst scripts still ask (noninteractively) at configure.
+- **Later: a Rust target for gexcc** (sqv, ripgrep, fd...): a rustc
+  target over gexcc's sysroot and wasm32 container. Not needed for apt
+  once gpgv is native.
 
 **How arm64 packages' dependencies are satisfied.**
 - **Tools** (bash, coreutils, dash, grep, sed, tar, gzip, findutils,
@@ -617,10 +714,30 @@ arm64 program uninstallable).
    tests/gexcc 15/15, a wasm32 bash running Debian's arm64 xz, python3.13
    and sqlite3, python's `os.system` running the wasm32 dash) and on the
    aarch64 browser shim (tests/wasm32 5/5; tests/gexcc as on x86).
-2. **AAPCS64 ELF providers:** the existing ones are SysV x86-64 only. An
-   aarch64 class (x0-x7, v0-v7, `TPIDR_EL0` TLS for errno) in gex-cgen's
-   `provider.rs` re-keys every unit: one commit, landed when the
-   coordinator schedules it.
+2. **AAPCS64 ELF providers: ready on `merge/gexcc-a64prov`.**
+   - `provider.rs` gains an explicit architecture (`PROVIDES ... i386 |
+     x86_64 | aarch64`, `provider::Arch`, `guest_arch(class32)`):
+     i386/x86-64 on an x86 build, aarch64 for 64-bit images on an aarch64
+     build, none on PPC. Before, `for_dll` returned nothing off x86.
+   - `providers/aapcs64.inc` maps the `gp64_` helpers to AAPCS64 (x0-x7,
+     then the stack; result in x0/v0; return to x30). `glibc_mem_a64` and
+     `glibc_math_a64` are the x86-64 bodies with it in front (Rust
+     `concat!`); `glibc_mem_a64.inc` replaces strcmp with a step-for-step
+     port of aarch64 glibc's (its result is not the byte difference, and
+     depends on mutual alignment). A later `GEX_PROVIDE` of an export now
+     replaces an earlier one.
+   - **No x86 unit re-keys:** `provider.h`, the x86 sources and the header
+     are unchanged, so every x86 provider fingerprint (and every unit keyed
+     on one) is the same. Only arm64 libc/libm translations change.
+   - Checked on an AArch64-only gexc with tests/elf-prov cross-built for
+     Debian's arm64 glibc (scratch/CC/a64prov/run-a64.sh): mem, printf,
+     malloc and fork agree with providers off and on (mem binds 14
+     addresses in libc, math 8 in libm). math differs only on round()'s
+     halfway values, where the **translated libm is wrong**: gex-lift
+     lowers FRINTA (ties away from zero) to wasm `nearest` (ties to even),
+     so translated `round(0.5)` is 0 and `round(-2.5)` is -2; the provider
+     gives 1 and -3 as C requires.
+   - Not ported yet: printf (its va_list code is SysV) and malloc.
 3. **arm64-ABI native libraries in the guest's own wasm32 memory** (user,
    2026-10-08: no memory64 at run time). Whole-library providers for
    arm64 programs need aarch64's LP64 data layout. Approach to evaluate:
@@ -738,6 +855,8 @@ page (web/src/demos.js): fetches `/rootfs/native-debian.tar.zst`
 its symbolic links as links (`gex_add_symlink`), and boots `/bin/bash -l`
 (`-l -i`) as pid 1 with uid 0, `HOME=/root`, `TERM`, `PATH`. Network: Wisp,
 default `wss://anura.pro/`, `?wisp=URL` overrides (`?wisp=` empty: none).
+The page holds the one Wisp connection and serves it to every
+guest Worker over shared memory (`shims/browser/js/net-bridge.mjs`).
 Translated programs run on tier 1 (`?fjit=1` turns the function JIT on).
 `?cmd=` runs one command for tests. Under Node the same runtime runs the
 tar with `run-node.mjs --tar FILE` (`GEX_UID=0`, `GEX_NETWORK=1` for real
@@ -745,8 +864,8 @@ sockets instead of Wisp); there apt updates from Debian and installs
 arm64 packages (§5).
 
 Size budget (zstd, transferred): tier 1 at most 15 MB, tier 1+2 at most
-45 MB, everything at most 80 MB. Tier 1 today: 20.4 MB (Debian's arm64
-system pieces are most of it: libc6, perl-base, libssl, apt, dpkg).
+45 MB, everything at most 80 MB. Tiers 1 and 2 with our dpkg/apt/gpgv
+today: 39.3 MB.
 If the whole-tar load is too slow, split into a base tar and per-package
 tars fetched when first opened (the kernel's demand-fill hook).
 

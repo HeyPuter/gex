@@ -44,11 +44,28 @@ export function requestGexDevice() {
       maxStorageBuffersInVertexStage: 16,
       maxStorageBuffersInFragmentStage: 16,
       maxColorAttachmentBytesPerSample: 64,
-      // Not yet: asking for GL 4.1's texture limits (16384 texels, 2048
-      // layers) and GL 4.3's compute ones makes the context GL 4.6, and then
-      // Unity's 4.x shader variants draw Muck's 3D scene black (U, mp26).
-      // Back once that is fixed; see docs/gl-path.md.
+      // GL 4.3's compute limits (with them the context is GL 4.6) drew
+      // Muck's 3D scene black (U, mp26), so they are only per run; GL 4.1's
+      // texture limits are the default, below.
     };
+    // `?gllimits=40|41|43` (GEX_GL_LIMITS, set by the compositor worker;
+    // 41 when unset): GL 4.1 wants 16384 texels a side and 2048 array
+    // layers, GL 4.3's compute shaders 1024 invocations a workgroup and
+    // 32 KiB of shared memory; WebGPU's defaults (8192, 256; 256, 16 KiB)
+    // keep the context at GL 4.0. Unity drops shaders whose target the
+    // context is below: at 4.0 Muck's grass geometry shader ("Shader
+    // Unsupported ... All passes removed") left the grass as dots; at 4.2
+    // with mesa-wink 60202246 it draws blades (U, mpg3).
+    const glLimitsSet = globalThis.GEX_GL_LIMITS;
+    const glLimits = glLimitsSet === undefined ? 41 : Number(glLimitsSet) || 0;
+    if (glLimits >= 41) {
+      Object.assign(want, { maxTextureDimension1D: 16384, maxTextureDimension2D: 16384,
+        maxTextureDimension3D: 2048, maxTextureArrayLayers: 2048 });
+    }
+    if (glLimits >= 43) {
+      Object.assign(want, { maxComputeInvocationsPerWorkgroup: 1024, maxComputeWorkgroupSizeX: 1024,
+        maxComputeWorkgroupSizeY: 1024, maxComputeWorkgroupSizeZ: 64, maxComputeWorkgroupStorageSize: 32768 });
+    }
     const requiredLimits = {};
     for (const [limit, wanted] of Object.entries(want)) {
       const available = adapter.limits[limit];

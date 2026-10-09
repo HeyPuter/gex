@@ -419,6 +419,15 @@ export class HostX {
         }
       },
 
+      /** Room to write: a guest's socket in the kernel fills (256 KiB); the
+       *  compositor's queues never do. */
+      writable(fd) {
+        const ep = self.#fds.get(fd);
+        if (!ep) return -1;
+        if (ep.kind === 'kernel') return self.#k.k_sock_writable(ep.id) ? 1 : 0;
+        return 1;
+      },
+
       send(fd, buf, len, fds, nfds) {
         const ep = self.#fds.get(fd);
         if (!ep) return -EBADF;
@@ -515,7 +524,7 @@ export class HostX {
     const wrapped = {};
     let left = this.#trace;
     for (const [name, fn] of Object.entries(raw)) {
-      if (name === 'tick' || name === 'wait' || name === 'readable') {
+      if (name === 'tick' || name === 'wait' || name === 'readable' || name === 'writable') {
         wrapped[name] = fn;
         continue;
       }
@@ -574,11 +583,13 @@ export class HostX {
       const p = hw.hw_scratch(SLOTS * REC * 4);
       const n = hw.hw_scene(p, SLOTS);
       this.#proxy.publish(this.#hwMem, p, n);
-      // The first publish, and every hundredth: a scene that never leaves here
-      // and a scene the page never draws look the same from the page.
-      // The first few always, then one in a hundred: the interesting ones are
-      // at the start (a window appearing) and a busy client publishes forever.
-      if (this.#published++ < 5 || this.#published % 100 === 0) {
+      // The first few, then at 10, 100, 1000...: a scene that never leaves
+      // here and a scene the page never draws look the same from the page, and
+      // the interesting ones are at the start (a window appearing). A game
+      // publishes forever, and one line in a hundred was a line every three
+      // seconds in its terminal.
+      const k = this.#published++;
+      if (k < 5 || (k >= 10 && /^10*$/.test(String(k)))) {
         this.log(`[hostx] published ${n} surface(s) as token ${this.#proxy.token}`
           + `${this.#proxy.ok ? '' : ' (no block in the arena!)'}`);
       }

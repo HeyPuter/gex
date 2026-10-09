@@ -1,0 +1,16 @@
+SDL_nullvideo.c declares SDL_EVDEV_Init as void; it returns int
+(SDL_evdev.h). C on a real machine gets away with it; wasm calls check
+the signature, and the link either traps there or (with the mismatch
+folded into the call) leaves a module binaryen refuses.
+
+--- a/src/video/dummy/SDL_nullvideo.c	2026-10-09 05:09:30.933302323 -0400
++++ b/src/video/dummy/SDL_nullvideo.c	2026-10-09 05:09:30.936302328 -0400
+@@ -130,7 +130,7 @@
+     DUMMY_CreateDevice,
+     NULL /* no ShowMessageBox implementation */
+ };
+-void SDL_EVDEV_Init(void);
++int SDL_EVDEV_Init(void);
+ void SDL_EVDEV_Poll(void);
+ void SDL_EVDEV_Quit(void);
+ static void DUMMY_EVDEV_Poll(_THIS)

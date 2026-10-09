@@ -806,6 +806,8 @@ export class Gex {
   static wasmDlls = '';
   /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
   static elfUnits = '';
+  /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
+  static fjitLibs = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -885,6 +887,17 @@ export class Gex {
         return [Number(v[0]), Number(v[1]), Number(v[2]), Number(v[3]), Number(v[4])];
       })() : null,
     };
+  }
+  /// The program's argv as the shim has it (after any `execve`).
+  get cmdline() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_cmdline) return '';
+    const max = 160;
+    const p = e.gex_alloc(max) >>> 0;
+    const n = e.gex_cmdline(p, max) >>> 0;
+    const s = utf8(this.#bytes().subarray(p, p + n));
+    e.gex_free?.(p, max);
+    return s;
   }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
@@ -979,6 +992,12 @@ export class Gex {
           const text = utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, '');
+          // `[gex-note]`: worth a line, but nothing went wrong (a large
+          // allocation that succeeded): a warning, not an error.
+          if (text.startsWith('[gex-note] ')) {
+            console.warn(text.slice(11));
+            return;
+          }
           // `[gex-stack]`: the shim wants to be told who called it (the wasm
           // frames are named).
           if (text.startsWith('[gex-stack]')) {
@@ -2006,7 +2025,10 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
-    if (child.wasm32) e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    if (child.wasm32) {
+      if (child.wasm32Base && e.gex_wasmprog_adopt_at) e.gex_wasmprog_adopt_at(BigInt(child.wasm32), child.wasm32Base);
+      else e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    }
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
@@ -2274,6 +2296,9 @@ export class Gex {
       compat: e.gex_compat?.() ?? 0,
       // A wasm32 program's entry: the child installs the same module.
       wasm32: e.gex_wasmprog_entry?.() ?? 0n,
+      // And where its module sits in the function table: the child's copy
+      // of the data holds function pointers for that base.
+      wasm32Base: e.gex_wasmprog_base?.() ?? 0,
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
@@ -2551,6 +2576,13 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    if (Gex.fjitLibs && e.gex_fjit_libs) {
+      const b = new TextEncoder().encode(Gex.fjitLibs);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_fjit_libs(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (Gex.elfUnits && e.gex_cgen_elf_units) {
       const b = new TextEncoder().encode(Gex.elfUnits);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
@@ -2798,6 +2830,8 @@ export class Gex {
    *  exception, so code the provider publishes at run time (its JIT, which imports it)
    *  can catch it with `try_table`, and `provider_try` takes it when nothing did. */
   #provTag = null;
+  /** Traps seen unwinding provider guest calls (reported up to 16). */
+  #provLeaks = 0;
   #providerTag() {
     this.#provTag ??= new WebAssembly.Tag({ parameters: ['i32'] });
     return this.#provTag;
@@ -2818,8 +2852,16 @@ export class Gex {
           ftab.get(f)(arg);
           return 0;
         } catch (err) {
+          const open = e.gex_libprov_guest_calls();
           e.gex_libprov_guest_calls_set(calls);
           if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
+          // Anything else that unwinds a provider's guest calls abandons
+          // frames the guest will return into (their return addresses stay
+          // on its stack): say which trap, where it resumes, and from where.
+          if (open > calls && (this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
+            console.error(`[gex] a trap left through ${open - calls} provider guest call(s): ${err?.message ?? err}; ` +
+              `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
+          }
           throw err;
         }
       },
@@ -3652,6 +3694,15 @@ export class Gex {
         // alone it slid into the guest's stack and overwrote saved registers.
         this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
         const e = this.#shim.exports;
+        // A trap that reached the run loop with a provider's guest call
+        // still open abandoned the provider's frames (see provider_try).
+        if ((e.gex_libprov_guest_calls?.() ?? 0) > 0) {
+          if ((this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
+            console.error(`[gex] a trap reached the run loop with ${e.gex_libprov_guest_calls()} provider guest call(s) open: ${err?.message ?? err}; ` +
+              `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
+          }
+          e.gex_libprov_guest_calls_set(0);
+        }
         // A slot the shim wants written before the guest goes back to it: its
         // module is instantiated with passive segments, so the code is present
         // and simply not in the table. Filling here costs one segment; at
@@ -3791,7 +3842,9 @@ export class Gex {
             // own code and stays quiet. A give-up (nothing exited, nothing woke)
             // is the runtime stuck; that is 125 -- outside a program's range so
             // it is not mistaken for a clean exit -- and it is said out loud.
-            const stalled = e.gex_exited ? !e.gex_exited() : false;
+            // (A thread that ended in a process that goes on -- a joined
+            // worker thread -- is this Worker's end too, not a stall.)
+            const stalled = (e.gex_exited ? !e.gex_exited() : false) && !(e.gex_ctx_exited?.(ctx) > 0);
             if (stalled) {
               // Dump every thread's wait-state + pc so a give-up says WHICH
               // thread is stuck on WHAT (futex vs socket read vs exited), not
@@ -4317,7 +4370,21 @@ export class Gex {
           e.__stack_pointer.value = sp0;
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;
-          if (sig?.kind === 'return') return sig.i === me ? 1 : 0;
+          // A call-out ended here was the trap's whole business: the resume
+          // the miss path set at its return (`cgen::returned`) is spent, and
+          // left in place it is where the run loop next goes -- the next
+          // time this thread blocks with nothing else to run, it "resumed"
+          // at the provider's return address (HK under ?fjit, docs §12 34).
+          // (Only this one's: an outer call-out's hit returns through the
+          // frames between, which leave as before.)
+          const ended = (v) => {
+            if (v === 1) {
+              e.gex_resume_pc();
+              e.gex_resume_ctx();
+            }
+            return v;
+          };
+          if (sig?.kind === 'return') return ended(sig.i === me ? 1 : 0);
           if (sig?.kind === 'bypass') {
             if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
             next = sig.f;
@@ -4334,7 +4401,7 @@ export class Gex {
             throw err;
           }
           const hit = e.gex_callout_hit();
-          if (hit >= 0) return hit === me ? 1 : 0;
+          if (hit >= 0) return ended(hit === me ? 1 : 0);
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.

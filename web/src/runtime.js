@@ -498,6 +498,17 @@ export async function runProgram(
     }
   }
 
+  // The network: the page's Wisp connection, which every Worker calls across
+  // shared memory. A WebSocket in the guest's own Worker delivers on that
+  // Worker's event loop, which a wasm32 program waiting in a syscall never
+  // gives back.
+  let netChannel = null;
+  if (network && globalThis.crossOriginIsolated) {
+    const { makeNetChannel, serveNet } = await import('@gex/net-bridge.mjs');
+    netChannel = makeNetChannel();
+    if (netChannel) serveNet(network, netChannel);
+  }
+
   // The Wayland compositor. The protocol state machine runs in each guest
   // process (the Rust shim, next to the client's memory, which is the only
   // place that can read a wl_shm pool); the scene, the output and the input
@@ -639,7 +650,10 @@ export async function runProgram(
       // The Wayland ring's shared buffers, so a Worker that binds the
       // compositor can carry its frames to the page's canvas. Like glChannel.
       wlChannel: wlChannel ?? undefined,
-      wispUrl: network?.url ?? undefined,
+      // The page's network, served to every Worker over shared memory
+      // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
+      netChannel: netChannel ?? undefined,
+      wispUrl: netChannel ? undefined : network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
       // writes it on startup, so a process forked after a resize would reset the
@@ -677,6 +691,8 @@ export async function runProgram(
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+      // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
+      fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,
@@ -801,7 +817,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, env, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.
@@ -843,3 +859,15 @@ export async function runProgram(
 
 export { TerminalEnv };
 export { loadKernel as globalKernel };
+
+/** A closure's pins plus the page's `?pins=path@base+span,...` (hex; the query wins). */
+function pinsFrom(closurePins, spec) {
+  if (!spec) return closurePins;
+  const out = { ...(closurePins ?? {}) };
+  for (const w of spec.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(.+)@(?:0x)?([0-9a-f]+)(?:\+(?:0x)?([0-9a-f]+))?$/i.exec(w);
+    if (!m) { console.error(`[gex] ?pins: cannot read ${w}`); continue; }
+    out[m[1]] = { base: Number.parseInt(m[2], 16), span: m[3] ? Number.parseInt(m[3], 16) : 0 };
+  }
+  return out;
+}
