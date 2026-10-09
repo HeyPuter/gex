@@ -2112,14 +2112,40 @@ Not yet:
   Oct 8 gexc gets 99,800 of 200,000 wrong under --fjit), fjit-procs,
   x86-programs (82 ok), embed PASS, gex-xlate tests. The page's unit cache
   (scratch/unity/units/cgen-page) must be rebuilt after it lands.
-- **Resume (2026-10-09, HEAD 4ed5cad3 + the Mesa pin work, uncommitted):**
-  Mesa pin bump to mesa-wink 60202246 and `gllimits=41` as default
-  (gpu-device.js; `?gllimits=0` turns it off): third_party/mesa checked out
-  at 60202246 (cloned with `git -c submodule.third_party/mesa.url=` GL's
-  clone), web/build-mesa-wasm.sh gets emdawnwebgpu from wink/build.sh
-  (`--until=emdawn`) when the checkout has wink/lib/emdawn.sh; the build
-  (scratch/unity/mesa-new) has the same JS as GL's mods/gpu. Queued on
-  edger: scratch/unity/urep-pin.sh (Noita and HK replays gpu vs upin; the
-  4-slot repro tinyu, trep2-style), then page/q44.sh (browser-gui --gl
-  x86/x64, Muck mpg5 with no `?gllimits`, hp14 = hp13 with a profile
-  10-90 s for start-up). Then commit the pin and report.
+- **Mesa pin (1d5b26d9): mesa-wink 60202246 and `gllimits=41` by
+  default.** Replays gpu vs this build: Noita 92f095c5, HK 9eece5c5, 0
+  rejects and 0 validation errors each; GL's 4-slot repro (tinyu) 2,777
+  frames with 0 validation errors; browser-gui --gl x86 and x64 12 ok
+  each; HK hp14 (merge/unity shim, this Mesa) menu at 41.8 presents/s.
+  Muck with the default and no `?gllimits` (mk2, the seed shim, no unit):
+  "OpenGL 4.2" context, no "Shader Unsupported", grass blades in
+  `shots/mk2/c013.png`, 36.9 presents/s at 393 s.
+- **Muck dies with SIGILL at ~25 s on merge/unity's shim (977a2236,
+  4ed5cad3)**, with the unit (mpg5, mk1) and without (mk4). It does not
+  with 64efd78e (mk3, 4 minutes, no unit) or 1bf5ba09 (mk2). The page asked
+  "served by the unit or the JIT" of instruction fetch (part of
+  `executable`); with epochs a JIT entry the current epoch has no start
+  for is read as non-code inside the function being recovered and decoded
+  as illegal. 64efd78e passes it as `skip` (batch bound only).
+- **Start-up (decision 3).** hp14's main-Worker profile, 10-90 s (unit +
+  fjit): 61% (49.8 of 81 s) in `fjit::translate`: recover_one 27.2 s
+  (jump tables 16.9, discover 9.2, lift 6.9), summaries 17.7, build_runtime
+  8.8, emit 8.4, prepare 5.5; the per-byte `executable` 5.9 (2.3 in
+  elfprov::provided's locks). Audio: the page has no audio device; FMOD's
+  output init fails ("Unknown PCM default", tried twice), after pulse
+  fails to connect. libasound's 20 MiB was mostly copies: the page's JIT
+  had no function starts but those calls name, so a tail jump absorbed the
+  function it reached, and libasound's exported wrappers each carried one.
+  Offline (fjitrepro, all 1,698 exports): 57.2 MiB / 16.4 s unseeded, 9.7
+  MiB / 7.1 s seeded. ALSA with no config (hp15, ALSA_CONFIG_PATH=/dev/null)
+  cut libasound to 11.2 MiB but not the first frame (112 s against hp14's
+  110 s, both profiled), so it is not the path to cut.
+  merge/unity-seed 1bf5ba09 (on 64efd78e) seeds every mapped object's
+  starts (`Jit::add_image`) before a translation and takes the fetch
+  checks once per translation: no unit, hb53 (64efd78e) 178 s first
+  frame, 225 s 100 presents, 35.7 presents/s; hb54 (seeding) 121 s, 171 s,
+  39.1; hb55 (both) 121 s, 166 s, 40.1; libasound 26.0 -> 3.7 MiB.
+  The HK unit re-keyed for 64efd78e (key 7bd87731, byte-identical c.wasm,
+  1,941 s on gooner) is on edger in `units/cgen-page-rk`; Muck's is
+  building (`units/build-muck-rk.log`). Queued: page/q50.sh (hp16 = seed
+  shim + unit, hp17 = the same with the profile).
