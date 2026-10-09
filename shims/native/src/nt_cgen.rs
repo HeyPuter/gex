@@ -705,7 +705,10 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, &gp);
         gex_cgen::toolchain::set_lto(false);
         let stats = stats?;
-        let _ = std::fs::remove_dir_all(&work);
+        // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
+        if std::env::var_os("GEX_CGEN_KEEP").is_none() {
+            let _ = std::fs::remove_dir_all(&work);
+        }
         std::fs::write(dir.join("members.txt"), member_keys.join("\n") + "\n")?;
         eprintln!(
             "[cgen] link group {key}: {} members, {} functions, {} units ({} compiled, {} cached), {} MiB wasm, {:.1}s; {} devirtualised calls ({iat_hints} from the IATs)",
@@ -776,7 +779,10 @@ fn prepare_with(
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
     let hints = icall_hints(image);
     let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
-    let _ = std::fs::remove_dir_all(&work);
+    // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
+    if std::env::var_os("GEX_CGEN_KEEP").is_none() {
+        let _ = std::fs::remove_dir_all(&work);
+    }
     if verbose {
         eprintln!(
             "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s; {} devirtualised calls ({} hints), {} calls to leaf copies",
@@ -829,7 +835,7 @@ fn take_pending() -> Vec<Pending> {
 /// A unit found for an image, checked against what is mapped.
 struct Placed {
     path: std::path::PathBuf,
-    cwasm: Vec<u8>,
+    cwasm: Arc<Vec<u8>>,
     entries: Vec<u64>,
     /// A hash of each executable page as the unit was built from it.
     pages: Vec<(u64, u64)>,
@@ -842,46 +848,104 @@ pub fn is_wasm_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
     pe.sections.iter().any(|s| s.name == ".wasmref" || s.name == ".wasm")
 }
 
-/// A unit for `p`, if one was built, with the byte check.
-fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
-    if is_wasm_skeleton(&p.pe) {
-        return Ok(None);
+/// What placing an image needs that depends only on the image's bytes and
+/// base: its executable segments as relocated there, and its unit (path,
+/// compiled bytes, entries) if one was built.
+struct Prepared {
+    segs: Vec<(u64, Vec<u8>)>,
+    /// Where its unit is or would be, and the provider stubs its entries
+    /// leave out.
+    path: std::path::PathBuf,
+    stubs: Vec<u64>,
+    unit: Option<(std::path::PathBuf, Arc<Vec<u8>>, Vec<u64>)>,
+}
+
+/// [`Prepared`] for `p`, remembered for the host process by path, base and
+/// a hash of the file: under W3 every Wine process maps the same images at
+/// the same bases, and the unit key (a SHA-256 of the relocated image) was
+/// a fifth of a session boot's CPU.
+fn prepared(p: &Pending) -> Result<Arc<Prepared>> {
+    use std::hash::Hasher;
+    type Memo = Vec<((String, u64, usize, u64), Arc<Prepared>)>;
+    static MEMO: Mutex<Memo> = Mutex::new(Vec::new());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&p.pe.data);
+    let id = (p.path.clone(), p.base, p.pe.data.len(), h.finish());
+    let known = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id).map(|(_, pr)| Arc::clone(pr));
+    if let Some(pr) = known {
+        // A unit built since (`--cgen`'s synchronous build, a background
+        // one): read it now.
+        if pr.unit.is_none() && pr.path.exists() {
+            let unit = read_unit(&pr.path, &pr.stubs)?;
+            let fresh = Arc::new(Prepared { segs: pr.segs.clone(), path: pr.path.clone(), stubs: pr.stubs.clone(), unit });
+            let mut m = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = m.iter_mut().find(|(i, _)| *i == id) {
+                e.1 = Arc::clone(&fresh);
+            }
+            return Ok(fresh);
+        }
+        return Ok(pr);
     }
     let (image, _) = gex_xlate::func::pe_input(&p.pe, p.base)
         .map_err(|e| anyhow!("{}: placing the image at {:#x}: {e}", p.path, p.base))?;
     let pv = provided(&p.pe, p.base);
     let cwasm_path = cache_root()?.join(unit_key(&image, &pv)).join("c.wasm");
-    let Ok(cwasm) = std::fs::read(&cwasm_path) else {
+    let segs = image.segments.iter().filter(|s| s.executable).map(|s| (s.vaddr, s.bytes.clone())).collect();
+    let unit = read_unit(&cwasm_path, &pv.stubs)?;
+    let pr = Arc::new(Prepared { segs, path: cwasm_path, stubs: pv.stubs, unit });
+    let mut m = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= 512 {
+        m.remove(0);
+    }
+    m.push((id, Arc::clone(&pr)));
+    Ok(pr)
+}
+
+/// The unit at `path` (`.../c.wasm`), if it is there: its bytes and its
+/// entries, a provider's stubs (`stubs`) left out.
+fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path::PathBuf, Arc<Vec<u8>>, Vec<u64>)>> {
+    let Ok(cwasm) = std::fs::read(path) else { return Ok(None) };
+    let mut entries = gex_cgen::image::read_entries(path)?;
+    // A provider's addresses are its stubs: the provider is bound there.
+    for a in entries.iter_mut() {
+        if stubs.binary_search(a).is_ok() {
+            *a = 0;
+        }
+    }
+    Ok(Some((path.to_path_buf(), Arc::new(cwasm), entries)))
+}
+
+/// A unit for `p`, if one was built, with the byte check.
+fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
+    if is_wasm_skeleton(&p.pe) {
+        return Ok(None);
+    }
+    let pr = prepared(p)?;
+    let Some((cwasm_path, cwasm, entries)) = pr.unit.clone() else {
         return Ok(None);
     };
     let mut pages = Vec::new();
     // What the unit was built from must be what is mapped.
-    for seg in image.segments.iter().filter(|s| s.executable) {
-        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+    for (vaddr, bytes) in &pr.segs {
+        let (lo, n) = (*vaddr as usize, bytes.len());
         let live = memory
             .get(lo..lo + n)
-            .ok_or_else(|| anyhow!("{}: {:#x}+{n:#x} is outside guest memory", p.path, seg.vaddr))?;
-        if let Some(i) = (0..n).find(|&i| live[i] != seg.bytes[i]) {
+            .ok_or_else(|| anyhow!("{}: {:#x}+{n:#x} is outside guest memory", p.path, vaddr))?;
+        if live != &bytes[..] {
+            let i = (0..n).find(|&i| live[i] != bytes[i]).unwrap_or(0);
             bail!(
                 "{}: the mapped code at {:#x} differs from the image its function-tier unit was \
                  built from (guest {:#04x}, unit {:#04x}); refusing the unit",
                 p.path,
-                seg.vaddr + i as u64,
+                vaddr + i as u64,
                 live[i],
-                seg.bytes[i]
+                bytes[i]
             );
         }
-        let first = seg.vaddr / gex_abi::DISPATCH_PAGE;
-        let last = (seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
+        let first = vaddr / gex_abi::DISPATCH_PAGE;
+        let last = (vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
         for page in first..=last {
             pages.push((page, page_hash(memory, page)));
-        }
-    }
-    let mut entries = gex_cgen::image::read_entries(&cwasm_path)?;
-    // A provider's addresses are its stubs: the provider is bound there.
-    for a in entries.iter_mut() {
-        if pv.stubs.binary_search(a).is_ok() {
-            *a = 0;
         }
     }
     if !entries.iter().any(|&a| a != 0) {
@@ -1086,6 +1150,83 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
 /// noita.exe's unit takes about a minute. Not keyed on the build of gex: the
 /// unit directory is keyed on the module's content already, and wasmtime
 /// refuses an artifact from an incompatible engine, which recompiles it.
+/// The largest function body in a wasm module, in bytes.
+fn largest_body(wasm: &[u8]) -> usize {
+    let mut max = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+            max = max.max(body.range().len());
+        }
+    }
+    max
+}
+
+/// Units with a function body larger than this are compiled only at
+/// staging (`GEX_CGEN_PRECOMPILE=1`), never at run time: Cranelift's
+/// register allocation on d3dx9_43's 828 KB function takes about ten minutes
+/// (wined3d's 444 KB one, seconds: size alone is a rough guide).
+/// `GEX_W3_UNIT_MAX_BODY` (bytes) overrides.
+fn max_runtime_body() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| std::env::var("GEX_W3_UNIT_MAX_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(640 << 10))
+}
+
+/// Queue the unit at `path` (`wasm` its bytes) for [`precompile_unit`] on
+/// one background thread of the host process, once; smallest first, so a
+/// large unit does not hold up the rest.
+fn compile_later(path: std::path::PathBuf, wasm: &[u8]) {
+    struct Q {
+        seen: std::collections::HashSet<std::path::PathBuf>,
+        todo: Vec<(usize, std::path::PathBuf)>,
+        worker: bool,
+    }
+    static QUEUE: OnceLock<(Mutex<Q>, std::sync::Condvar)> = OnceLock::new();
+    let (q, cv) = QUEUE.get_or_init(|| (Mutex::new(Q { seen: Default::default(), todo: Vec::new(), worker: false }), std::sync::Condvar::new()));
+    let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.seen.insert(path.clone()) {
+        return;
+    }
+    let body = largest_body(wasm);
+    if body > max_runtime_body() {
+        eprintln!(
+            "gex-w3: the unit {} has a {} KiB function; not compiled at run time (compile it at staging: \
+             gexc cgen-image with GEX_CGEN_PRECOMPILE=1)",
+            path.display(),
+            body >> 10
+        );
+        return;
+    }
+    g.todo.push((wasm.len(), path));
+    cv.notify_one();
+    if !g.worker {
+        g.worker = true;
+        let _ = std::thread::Builder::new().name("gex-unit-cc".into()).spawn(move || loop {
+            let (q, cv) = QUEUE.get().unwrap();
+            let p = {
+                let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+                while g.todo.is_empty() {
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                let i = (0..g.todo.len()).min_by_key(|&i| g.todo[i].0).unwrap();
+                g.todo.swap_remove(i).1
+            };
+            let t0 = std::time::Instant::now();
+            match precompile_unit(&p) {
+                Ok(()) => eprintln!("gex-w3: compiled the unit {} in {:.1}s (for the next process)", p.display(), t0.elapsed().as_secs_f64()),
+                Err(e) => eprintln!("gex-w3: compiling the unit {}: {e:#}", p.display()),
+            }
+        });
+    }
+}
+
+/// Compile the unit at `path` (`.../c.wasm`) for this host into its
+/// `c.cwasm`, as its first install would.
+pub fn precompile_unit(path: &std::path::Path) -> Result<()> {
+    let wasm = std::fs::read(path)?;
+    gex_cache::load_or_compile_at(&crate::engine()?, &path.with_extension("cwasm"), &wasm)?;
+    Ok(())
+}
+
 fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm_path: &std::path::Path, cwasm: &[u8]) -> Result<Module> {
     if cache.is_none() {
         return Ok(gex_cache::compile(engine, cwasm)?);
@@ -1637,4 +1778,129 @@ fn spawn_elf_build(path: &str, base: u64) {
         Ok(_) => eprintln!("gex-elf: building the function tier for {path} at {base:#x} for the next run"),
         Err(e) => eprintln!("gex-elf: could not start building the function tier for {path}: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wine's own PE loader (stream W, W3; docs/wine-native.md §3.17)
+// ---------------------------------------------------------------------------
+//
+// Under W3 Wine's ntdll.so maps every image itself and tells gex
+// (`gex.image_mapped`, after its relocations); there is no NT layer and no
+// section hook. Its i386 DLLs (ole32, rpcrt4, advapi32, combase, the
+// programs...) were tier-1, and tier-1's units are not reusable across
+// processes (each holds the page-table bases and the "already translated"
+// set of the process that made it), so every Wine process recompiled
+// megabytes of them: about 30 s of compile wall time per session boot.
+// An image with a unit built for its bytes at its base (`gexc cgen-image
+// PATH --pe-base BASE`) gets it here, as the NT layer's images do, and its
+// compiled code comes from the module cache in every later process.
+// Wine's own images only, by default (`GEX_W3_UNITS=all`: the program's
+// too; `=0`: none); `GEX_W3_UNITS_BUILD=1` builds a missing
+// unit in the background for the next run (off by default: Wine's DLLs get
+// theirs at staging, `$W/cgen-w3.sh`).
+
+/// The unit for an i386 image Wine's PE loader mapped at `base`, installed
+/// if one was built. Never fatal: an image whose mapped code differs from
+/// its unit's (or with none) stays on tier-1.
+pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: gex_ld::pe::PeImage) -> Result<()> {
+    // 0: none; all: every image; otherwise Wine's own (its dll directory).
+    // A program's images are not the default: Undertale's exe with its unit
+    // never reached its first frame (2026-10-09, open).
+    static WHICH: OnceLock<u8> = OnceLock::new();
+    let which = *WHICH.get_or_init(|| match std::env::var("GEX_W3_UNITS").as_deref() {
+        Ok("0") => 0,
+        Ok("all") => 2,
+        _ => 1,
+    });
+    if which == 0 || (which == 1 && !path.contains("/lib/wine/")) || mode() == Mode::Off || is_wasm_skeleton(&pe) {
+        return Ok(());
+    }
+    // `GEX_W3_UNITS_SKIP=a.dll,b.dll`: those stay on tier-1 (bisecting).
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    let skip = SKIP.get_or_init(|| std::env::var("GEX_W3_UNITS_SKIP").unwrap_or_default().split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect());
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    if skip.contains(&name) {
+        return Ok(());
+    }
+    let p = Pending { path: path.to_string(), base, pe: Arc::new(pe) };
+    w3_place(caller, p, true)
+}
+
+/// Images [`w3_image`] left for their first miss, by the process (its
+/// `JitShared`) that mapped them.
+static W3_DEFERRED: Mutex<Vec<(usize, Pending)>> = Mutex::new(Vec::new());
+
+/// A tier-1 miss at `pc`: if it is inside an image [`w3_image`] deferred,
+/// place that image's unit now.
+pub(crate) fn w3_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
+    let p = {
+        let mut d = W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        if d.is_empty() {
+            return Ok(());
+        }
+        let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);
+        let Some(i) = d.iter().position(|(o, p)| *o == owner && pc >= p.base && pc < p.base + p.pe.image_size as u64) else {
+            return Ok(());
+        };
+        d.swap_remove(i).1
+    };
+    w3_place(caller, p, false)
+}
+
+/// Place `p`'s unit. `at_map`: Wine has only just mapped it, and an image
+/// it must move is relocated later (ntdll's PE side, `perform_relocations`),
+/// so a mismatch then defers it to its first miss rather than refusing it.
+fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Result<()> {
+    let (path, base) = (p.path.clone(), p.base);
+    let t0 = std::time::Instant::now();
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let placed = match place(&p, memory.bytes()) {
+        Ok(pl) => pl,
+        Err(_) if at_map => {
+            let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);
+            W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((owner, p));
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("gex-w3: {e:#}; it runs on tier-1");
+            return Ok(());
+        }
+    };
+    let Some(pl) = placed else {
+        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
+            let key = gex_xlate::func::pe_input(&p.pe, base)
+                .map(|(image, _)| unit_key(&image, &provided(&p.pe, base)))
+                .unwrap_or_else(|e| format!("(not placeable: {e})"));
+            eprintln!("gex-w3: {path} at {base:#x}: no function-tier unit (key {key}), tier-1");
+        }
+        if std::env::var("GEX_W3_UNITS_BUILD").as_deref() == Ok("1") {
+            match spawn_build(&p) {
+                Ok(child) => drop(child),
+                Err(e) => eprintln!("gex-w3: could not start building the function tier for {path}: {e}"),
+            }
+        }
+        return Ok(());
+    };
+    let (shared, engine, cache) = {
+        let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
+    };
+    // A unit not yet compiled for this host is compiled in the background,
+    // and this process runs the image on tier-1: compiling here would stop
+    // the guest for as long as Cranelift takes (d3dx9_43's 7.9 MB unit:
+    // ten minutes; Undertale never reached a frame).
+    if cache.is_some() && !pl.path.with_extension("cwasm").exists() {
+        compile_later(pl.path.clone(), &pl.cwasm);
+        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
+            eprintln!("gex-w3: {path} at {base:#x}: its unit is compiling in the background; tier-1 this time");
+        }
+        return Ok(());
+    }
+    {
+        let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;
+    }
+    crate::ftab::catch_up(&mut *caller)?;
+    replay_registry(caller)?;
+    Ok(())
 }

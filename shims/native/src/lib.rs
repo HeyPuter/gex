@@ -26,6 +26,7 @@ pub mod wasmprog;
 pub mod wasmdll;
 mod ready;
 mod sys_waits;
+mod stall;
 pub(crate) mod ftab;
 pub mod wayland;
 
@@ -522,20 +523,30 @@ impl std::error::Error for StopExecution {}
 /// The cache key for an image: everything that determines the wasm — the
 /// placed segments rather than the file, because that is what the translator
 /// reads.
+/// The translation options as key text: their Debug form, but without the
+/// program's file (`image_elf`, a whole ELF: its Debug form was a 20 MB list
+/// of numbers, 0.4-1.4 s of every Wine child's start) and with the
+/// intrinsics in address order (a HashMap's order differs per process, so
+/// two with more than one intrinsic never agreed on a key).
+fn xlate_identity(xlate: &Options) -> String {
+    let mut o = xlate.clone();
+    o.image_elf = None;
+    let mut intrinsics: Vec<_> = o.intrinsics.drain().collect();
+    intrinsics.sort_by_key(|(a, _)| *a);
+    format!("{o:?} {intrinsics:?}")
+}
+
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
-    // The program file goes in as bytes, not through `Debug`: formatting a
-    // multi-MiB file as a list of decimal numbers cost more than all the
-    // rest of an exec (a gexcc busybox: about 12 MB of text, twice, at every
-    // exec in a guest shell's loop).
-    let mut plain = xlate.clone();
-    let elf = plain.image_elf.take();
+    // The program file goes in as bytes, not through `Debug`
+    // (`xlate_identity`): formatting a multi-MiB file as a list of decimal
+    // numbers cost more than all the rest of an exec.
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
-        format!("{plain:?}").into_bytes(),
-        elf.as_deref().map(|e| e.to_vec()).unwrap_or_default(),
+        xlate_identity(xlate).into_bytes(),
+        xlate.image_elf.as_deref().unwrap_or(&[]).to_vec(),
         // The same bytes mean different instructions in 32-bit mode.
         vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
@@ -548,6 +559,38 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         fields.push(seg.bytes.clone());
     }
     gex_cache::key(build, fields.iter().map(|f| f.as_slice()))
+}
+
+/// [`cache_key`], remembered for this host process: every Wine process under
+/// W3 execs the same 5.7 MB program, and its SHA-256 was 0.36-0.58 s of each
+/// child's start on edger (with the other processes' threads busy). The memo
+/// is keyed by a 128-bit SipHash of the same fields, a few ms.
+fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    static MEMO: Mutex<Vec<((u64, u64), String)>> = Mutex::new(Vec::new());
+    let mut hs = [std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new()];
+    hs[1].write_u64(0x9e37_79b9_7f4a_7c15);
+    for h in hs.iter_mut() {
+        (image.bias, image.entry, image.text_range, image.class32, image.symbols.len()).hash(h);
+        xlate_identity(xlate).hash(h);
+        h.write(xlate.image_elf.as_deref().unwrap_or(&[]));
+        build.hash(h);
+        for seg in &image.segments {
+            (seg.vaddr, seg.executable).hash(h);
+            h.write(&seg.bytes);
+        }
+    }
+    let id = (hs[0].finish(), hs[1].finish());
+    if let Some((_, k)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id) {
+        return k.clone();
+    }
+    let key = cache_key(image, xlate, build);
+    let mut m = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= 64 {
+        m.remove(0);
+    }
+    m.push((id, key.clone()));
+    key
 }
 
 /// Check that a module is well-formed wasm, without compiling or running it.
@@ -656,7 +699,25 @@ struct Inherited {
 /// The wasm engine every guest process runs on. Code compiled ahead of time
 /// for a run (an ejected project's `.cwasm`) must be compiled by an engine
 /// configured exactly so.
+///
+/// One per host process (per memory flavor): every Wine process under W3
+/// runs the same programs and modules, and with an engine per `execve` none
+/// of them could be reused across processes (`gex_cache`'s memo is per
+/// engine), so each child loaded the 42 MB Wine PE module and the program
+/// again.
 pub fn engine() -> Result<Engine> {
+    static ENGINES: Mutex<Vec<(bool, Engine)>> = Mutex::new(Vec::new());
+    let flavor = gex_abi::mem64();
+    let mut g = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, e)) = g.iter().find(|(f, _)| *f == flavor) {
+        return Ok(e.clone());
+    }
+    let e = new_engine()?;
+    g.push((flavor, e.clone()));
+    Ok(e)
+}
+
+fn new_engine() -> Result<Engine> {
     let mut config = Config::new();
     // Deep guest call chains are wasm recursion (units call units): room for
     // them, on threads with stacks to match (`guest_thread_stack`).
@@ -817,7 +878,18 @@ fn run_program_with(
     } else {
         match use_cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
-            let key = cache_key(image, xlate, &build);
+            let t_key = std::time::Instant::now();
+            let key = cache_key_memo(image, xlate, &build);
+            if wasm_trace() {
+                eprintln!(
+                    "gex: image key {} (bias {:#x}) over {} KiB in {} segments: {:.3}s",
+                    &key[..16],
+                    image.bias,
+                    image.segments.iter().map(|s| s.bytes.len()).sum::<usize>() >> 10,
+                    image.segments.len(),
+                    t_key.elapsed().as_secs_f64()
+                );
+            }
             let mut built: Option<Stats> = None;
             let loaded = gex_cache::load_or_compile(&engine, &dir, &key, || {
                 let (m, s) = translate();
@@ -829,7 +901,7 @@ fn run_program_with(
             }
             let meta = gex_xlate::Metadata::decode(&loaded.metadata)
                 .ok_or_else(|| anyhow!("cached module metadata is unreadable"))?;
-            if opts.verbose {
+            if opts.verbose || wasm_trace() {
                 eprintln!(
                     "[gex] compiled module {} ({})",
                     if loaded.hit { "from cache" } else { "cached" },
@@ -1076,6 +1148,14 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    // The memory is new, so all of the guest's part of it reads as zero: an
+    // anonymous mapping there need not be scanned to be zeroed (Wine reserves
+    // ~3 GiB at each process start), until something is mapped with contents
+    // or made writable (`MemoryMap::clean`).
+    {
+        let top = memory.bytes().len() as u64;
+        store.data_mut().with_kernel(|k| k.mem.mark_clean(gex_abi::RESERVED_END, top));
+    }
     if let Some(dev) = crate::gl::DEVICE.get() {
         dev.set_memory(memory.clone());
     }
@@ -1890,6 +1970,82 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
 /// every module the parent translated. What it cannot share is the memory: it
 /// gets a fresh one with the parent's mapped regions copied in — one address
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
+/// Copies the parent's mapped regions into the child's fresh (all-zero)
+/// memory, skipping what is zero already: ranges the kernel knows are
+/// (`MemoryMap::clean`, the caller's), the pages the host never gave the
+/// parent (`/proc/self/pagemap` says neither present nor swapped) without
+/// reading them, and the present pages that read as zero without writing
+/// them. Wine under W3 reserves ~2.5 GiB of address space, almost none of
+/// it touched, and copying it whole was 2-3 s of every fork -- twice per Wine
+/// child, whose `spawn_process` forks and forks again.
+struct SparseCopy {
+    pagemap: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl SparseCopy {
+    const PAGE: usize = 4096;
+    /// Pages looked up per `pagemap` read.
+    const BATCH: usize = 4096;
+
+    fn new() -> Self {
+        let pagemap = (std::env::var_os("GEX_FORK_FULL_COPY").is_none())
+            .then(|| std::fs::File::open("/proc/self/pagemap").ok())
+            .flatten();
+        SparseCopy { pagemap, buf: vec![0; Self::BATCH * 8] }
+    }
+
+    /// Bytes written to `dst` (the non-zero pages of `src[a..b]`).
+    fn copy(&mut self, src: &[u8], dst: &mut [u8], a: usize, b: usize) -> usize {
+        use std::os::unix::fs::FileExt;
+        let page = Self::PAGE;
+        // Unaligned edges are copied as they are.
+        let (pa, pb) = (a.next_multiple_of(page), b / page * page);
+        if pa >= pb {
+            dst[a..b].copy_from_slice(&src[a..b]);
+            return b - a;
+        }
+        dst[a..pa].copy_from_slice(&src[a..pa]);
+        dst[pb..b].copy_from_slice(&src[pb..b]);
+        let mut written = (pa - a) + (b - pb);
+        let base = src.as_ptr() as usize;
+        let mut p = pa;
+        while p < pb {
+            let n = ((pb - p) / page).min(Self::BATCH);
+            // Each entry: bit 63 present, bit 62 swapped. Without the file
+            // (or on a short read) every page counts as there.
+            let entries = self.pagemap.as_ref().and_then(|f| {
+                let off = ((base + p) / page * 8) as u64;
+                f.read_exact_at(&mut self.buf[..n * 8], off).ok().map(|()| &self.buf[..n * 8])
+            });
+            for k in 0..n {
+                let present = match entries {
+                    Some(e) => u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().unwrap()) >> 62 != 0,
+                    None => true,
+                };
+                if !present {
+                    continue;
+                }
+                let r = p + k * page..p + (k + 1) * page;
+                let s = &src[r.clone()];
+                if s.chunks(64).all(|c| c.iter().fold(0u8, |x, &y| x | y) == 0) {
+                    continue;
+                }
+                dst[r].copy_from_slice(s);
+                written += page;
+            }
+            p += n * page;
+        }
+        written
+    }
+}
+
+/// `GEX_WASM_TRACE`: say what loading wasm modules costs.
+pub(crate) fn wasm_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_WASM_TRACE").is_some())
+}
+
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
@@ -1920,7 +2076,15 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     let child_proc = Arc::new(Mutex::new(ProcState::default()));
     let (mut child_kernel, regions, ctx_addr) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
-        let regions: Vec<(u64, u64)> = k.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
+        // What the parent has mapped, less what it is known to hold only
+        // zeros (its reservations): the child's memory is zero already.
+        let regions: Vec<(u64, u64)> =
+            k.mem.vmas().iter().flat_map(|v| k.mem.dirty_parts(v.start, v.end)).collect();
+        if std::env::var_os("GEX_FORK_VMAS").is_some() {
+            for v in k.mem.vmas().iter().filter(|v| v.end - v.start >= 16 << 20) {
+                eprintln!("gex: fork vma {:#x}..{:#x} {} MiB prot {} {:?} code {}", v.start, v.end, (v.end - v.start) >> 20, v.prot, v.name, v.code.is_some());
+            }
+        }
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
@@ -1939,6 +2103,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     )
     .context("creating the child's memory")?;
     let child_mem = gex_mem::GuestMemory::new(shared);
+    let copy_t0 = std::time::Instant::now();
+    let mut copied = 0usize;
     {
         let src = parent_mem.bytes();
         let dst = child_mem.bytes();
@@ -1950,10 +2116,11 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // fork translates the same block forever.
         let low = (gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4) as usize;
         dst[..low].copy_from_slice(&src[..low]);
+        let mut sparse = SparseCopy::new();
         for (start, end) in &regions {
             let (a, b) = (*start as usize, (*end as usize).min(src.len()));
             if a < b {
-                dst[a..b].copy_from_slice(&src[a..b]);
+                copied += sparse.copy(src, dst, a, b);
             }
         }
         // `fork` returns zero in the child, and a clone that named a stack
@@ -1972,6 +2139,13 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
     }
 
+    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+        eprintln!(
+            "gex: fork {pid}: copied {} MiB of the parent's memory in {:.2}s",
+            copied >> 20,
+            copy_t0.elapsed().as_secs_f64()
+        );
+    }
     let entry = {
         let data = child_mem.bytes();
         read_u64(data, (ctx_addr + ctx::PC as u64) as usize)
@@ -3112,6 +3286,7 @@ fn place_image(
                 seg.vaddr + seg.mem_size
             );
         }
+        gex_kernel::big_op("segment", end - start);
         data[start..end].fill(0);
         data[start..start + seg.bytes.len()].copy_from_slice(&seg.bytes);
 
@@ -3299,6 +3474,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // `GEX_SYS_WAITS`: wall time per (thread, syscall), blocking included.
             let sys_t0 = sys_waits::on().then(std::time::Instant::now);
             let mut sys_nr = !0u64;
+            let stall_on = stall::on();
+            if stall_on {
+                let pid = state.proc_state.lock().map(|p| p.pid).unwrap_or(0);
+                stall::enter(pid, state.thread.tid, nr);
+            }
             watch_check(&gm, pc as u64, state.thread.tid);
             lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
             if lockstep::fake_syscall(&mut gm, state.thread.ctx_addr) {
@@ -3460,7 +3640,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
             if let Some(t0) = sys_t0 {
-                sys_waits::record(caller.data().thread.tid, sys_nr, t0.elapsed());
+                sys_waits::record(caller.data().thread.tid, sys_nr, t0);
+            }
+            if stall_on {
+                stall::exit(sys_nr);
             }
             check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
@@ -4213,8 +4396,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD
                         && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
                 };
-                if sp > co.sp_want + co.unwound && !at_function() {
-                    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                // A call-out that never returns (ret 0: Wine's W3 thread loop,
+                // `gex_call_out(ctx, pc, 0, 0)`) has no caller frame to
+                // unwind past. Its sp_want of 0 made every safepoint abandon
+                // it: a whole trap-out and re-entry per safepoint on every
+                // thread but the main one (wined3d's command-stream thread
+                // spun at a crawl, and Undertale drew no frame).
+                if co.ret != 0 && sp > co.sp_want + co.unwound && !at_function() {
+                    if wasm_trace() {
                         eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
                     }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
@@ -4325,6 +4514,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         return Ok(true);
     }
 
+    // W3: an image Wine relocated gets its function-tier unit at its first
+    // miss (`nt_cgen::w3_image`).
+    nt_cgen::w3_miss(caller, pc)?;
     // A function the table holds, or the run-time translator can make,
     // serves this address: tier-1 reaches it through the bridge.
     if ftab::serve(caller, pc)? {
@@ -4409,7 +4601,15 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     };
     jit_stats::note(pc);
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
-        eprintln!("[miss] pc={pc:#x} blocks={}", stats.blocks);
+        let (name, start) = caller
+            .data_mut()
+            .with_kernel(|k| k.mem.vma_at(pc).map(|v| (v.name.clone(), v.start)).unwrap_or_default());
+        eprintln!(
+            "[miss] pc={pc:#x} blocks={} wasm={} KiB in {name} (+{:#x})",
+            stats.blocks,
+            translated_module.wasm.len() >> 10,
+            pc - start
+        );
     }
     if translated_module.exported_blocks.is_empty() {
         return Ok(false);
@@ -5223,6 +5423,9 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
 /// cannot be done, and the caller leaves as before.
 fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64) -> Result<i32> {
     if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
+        if crate::stall::on() {
+            crate::stall::callout(target, ret | 1 << 63, true);
+        }
         return Ok(0);
     }
     let Some(enter) = any_enter(caller) else { return Ok(0) };
@@ -5267,7 +5470,10 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             match sig {
                 CalloutSignal::Return(i) if i == me => break Ok(1),
                 // An outer call-out's return: this one's caller is gone.
-                CalloutSignal::Return(_) | CalloutSignal::Abort => break Ok(0),
+                sig @ (CalloutSignal::Return(_) | CalloutSignal::Abort) => {
+                    trace_callout_abort(caller, &memory, ctx_addr, target, ret, sp_want, &sig);
+                    break Ok(0);
+                }
                 CalloutSignal::Bypass(f) => {
                     next = Some(f);
                     continue;
@@ -5322,7 +5528,45 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     if matches!(result, Ok(0)) {
         CALLOUT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    if crate::stall::on() {
+        crate::stall::callout(target, ret, !matches!(result, Ok(1)));
+    }
     result
+}
+
+/// GEX_TRACE_CALLOUT_ABORTS=N: the first N call-outs that end without
+/// their callee returning, with why and where the guest was.
+fn trace_callout_abort(
+    caller: &Caller<'_, HostState>,
+    memory: &gex_mem::GuestMemory,
+    ctx_addr: u64,
+    target: u64,
+    ret: u64,
+    sp_want: u64,
+    sig: &CalloutSignal,
+) {
+    static LEFT: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        std::sync::atomic::AtomicU64::new(std::env::var("GEX_TRACE_CALLOUT_ABORTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+    });
+    if left.load(std::sync::atomic::Ordering::Relaxed) == 0
+        || left.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    let gm = GuestMem::new(memory.bytes());
+    let pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    let sp = gm.read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
+    let why = match sig {
+        CalloutSignal::Return(i) => format!("an outer call-out's return ({i})"),
+        CalloutSignal::Abort => "abort".to_string(),
+        _ => "?".to_string(),
+    };
+    let outer: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}+{:#x}", c.ret, c.sp_want, c.unwound)).collect();
+    eprintln!(
+        "gex: tid {} call-out to {target:#x} ret {ret:#x} sp_want {sp_want:#x} left: {why}; pc {pc:#x} sp {sp:#x}; call-outs {outer:?}",
+        caller.data().thread.tid
+    );
 }
 
 /// Call-outs started and abandoned (GEX_NT_STATS).

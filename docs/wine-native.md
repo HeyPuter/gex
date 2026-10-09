@@ -822,6 +822,108 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
 - Not yet run: the page itself (Chrome), and threads that start inside
   native code under load.
 
+### 3.17 Process start under W3 (2026-10-09)
+
+The session boot (wineboot, services, plugplay, winedevice, explorer,
+rpcss, then the program) took 77 s on edger, 8-12 s for each Wine child.
+In 52 s of Undertale's load the program was waiting for it. Where each
+child's time went, and the fixes:
+
+| Cost per child (edger, warm cache) | Before | After | Fix |
+|---|---|---|---|
+| Runtime translations of the i386 DLLs (ole32, rpcrt4, advapi32, combase, shell32, ...) recompiled | 2-3.7 s (about 30 s of compile wall per boot) | 0 | function-tier units, below |
+| fork copying Wine's 3 GiB of PROT_NONE reservations (2 forks per child) | 1.0-1.6 s each | 0.03-0.05 s | `MemoryMap::clean` + a pagemap-guided sparse copy |
+| anonymous mmap zeroing those reservations | 24 GiB per boot | 13 MiB | the same `clean` ranges |
+| the image key (Debug text of the options, which held the whole 5.7 MB ELF) | 0.4-1.4 s | 0.01 s | `xlate_identity` + an in-process memo |
+| Wine's PE module read, hashed, parsed, loaded | 0.3 s | 0 after the first | one engine per host process, `wasmdll::parsed_module` |
+| the loader (wasmprog) compiled | about 2 s | 0.05-0.1 s | its cwasm in the module cache |
+| getaddrinfo of the host name (wineboot) | 5 s, once | 0 | poll skips fd < 0; recvmsg names the sender |
+
+**Function-tier units for Wine's i386 DLLs.** Tier-1's units are not
+reusable across processes: each holds the page-table bases and the
+"already translated" set of the process that made it, so their wasm, and
+so their cache keys, differ per process. About 930 new module-cache
+entries were written per warm boot. Wine's ntdll.so already reports every
+image it maps (`gex.image_mapped`, after `map_image_into_view`). For an
+i386 image (not a skeleton), `nt_cgen::w3_image` now installs the
+function-tier unit built for its bytes at its base, as the NT layer's
+images get theirs. The unit's compiled code then comes from the module
+cache in every process. An image Wine moves (its relocations come later,
+from ntdll's PE side) mismatches at map time and is placed at its first
+miss instead (`w3_miss`). A mismatch then, or a missing unit, leaves it on
+tier-1, which is never fatal.
+
+Units are built at staging. Run once with `GEX_W3_TRACE=1`, then
+`$W/cgen-w3.sh GEXC LOG` runs `gexc cgen-image PATH --pe-base BASE` for
+every "no function-tier unit" line, with `GEX_CGEN_PRECOMPILE=1` so it
+also compiles each unit's `c.cwasm` for that host. Run it on the machine
+that runs the program. The session boot's 53 images take 9 minutes on
+gooner (12 jobs) and 66 MB of units. Undertale's 35 more take 21 minutes
+and 105 MB.
+
+| Variable | Effect |
+|---|---|
+| `GEX_W3_UNITS` | unset: Wine's own images only (its dll directory); `all`: the program's images too; `0`: no units |
+| `GEX_W3_UNITS_SKIP=a.dll,...` | leaves those images on tier-1 |
+| `GEX_W3_UNITS_BUILD=1` | builds missing units in the background for the next run |
+| `GEX_W3_UNIT_MAX_BODY` | the run-time compile limit below, in bytes |
+
+**Compiling a unit is kept off the guest's path.** A unit with no cwasm
+for this host yet is compiled on one background thread of the host
+process ("gex-unit-cc"), smallest unit first. Until it is ready, that
+process runs the image on tier-1. A unit whose largest function body is
+over 640 KiB is never compiled at run time, only at staging.
+
+The limit exists because of d3dx9_43's unit. Its one 828 KB function
+takes Cranelift's register allocator about ten minutes. Compiled at map
+time, it stopped Undertale's main thread for the whole run, so the game
+never reached a frame. Size is only a rough guide: wined3d's 444 KB
+function compiles in seconds.
+
+`nt_cgen::prepared` remembers, per host process, what placing an image
+needs: its relocated segments, unit key, cwasm and entries. The unit
+key's SHA-256 had been about 19% of a session boot's samples.
+
+Result (edger, `wine cmd /c echo`, warm):
+
+| Build | Boot time |
+|---|---|
+| e (before) | 76.9 / 76.8 s |
+| j (units, plus the earlier fixes) | 15.4-16.2 s |
+| k (j, plus the engine, PE-module and image-key fixes) | 9.4-9.9 s |
+| k with `GEX_W3_UNITS=0` | 31.0 s; 11.5 s when tier-1's per-process keys happen to repeat a previous run's |
+
+A child now starts its Wine PE side 0.25 s after its fork.
+
+**In the page.** The browser's fork slices every VMA (about 2.6 GiB per
+fork) and `writeSparse` scans it in the child. The clean ranges need
+exporting to the page's fork (the VMA blob) before that cost goes. The
+browser has no `gex.image_mapped` for W3 yet. Its units path
+(`shims/browser/src/cgen.rs`) takes images only from the NT layer's
+section hook. Wiring the import to push a `Pending` gives the page the
+same unit placement, with units fetched as assets by key. The kernel fixes
+(clean ranges, poll, recvmsg) are shared code.
+
+**Wine's thread loop and safepoints (native only).** Every W3 thread but
+the main one runs the program under `gex_call_out(ctx, pc, 0, 0)`
+(signal_wasm32.c), a call-out that never returns. The safepoint import
+abandoned the innermost call-out once the stack was more than 64 KiB above
+its `sp_want`; with `sp_want` 0 that was every safepoint. So such threads
+trapped out and re-entered every 1024 back-edges. wined3d's command-stream
+thread then ran mostly trap round trips (57M abandoned call-outs in 80 s,
+ut30). With wined3d's unit, Undertale drew no frame in 360 s; on tier-1 it
+was only slow. The fix: a call-out with `ret` 0 is never abandoned at a
+safepoint. The page's call-outs (`shims/browser/src/cgen.rs`) have no such
+safepoint check, so this one does not carry.
+
+Tools added with it:
+
+- the `GEX_STALL` dumps give each thread's call-outs (count, how many were
+  abandoned, the last target and return);
+- `GEX_TRACE_CALLOUT_ABORTS=N` prints the first N abandoned call-outs, with
+  the reason and the stack;
+- `GEX_CGEN_KEEP=1` keeps a W3 unit's generated C (`<cache>/<key>/work`).
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -1834,6 +1936,75 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
+**RESUME HERE (2026-10-09, late; the safepoint fix for Wine's thread loop is §3.17).** merge/w3-audio has master 9e5ac0ff
+merged (8230816d). Since the morning (§3.17):
+
+- f43fba88 inet without a network stack; it landed in master.
+- 3636e93c clean ranges.
+- 74e29561, 0fc5ff1b, b3e0df43: W3 units.
+- e6a6b8d5 child start costs and the stall tool.
+
+**Session boot (`wine cmd /c echo`, edger, warm).**
+
+| Build | Boot time |
+|---|---|
+| Before | 76.9 s |
+| gexc-k with units | 9.4-9.9 s |
+| Units off (`GEX_W3_UNITS=0`) | 31.0 s; 11.5 s when tier-1's keys happen to repeat |
+
+**Undertale on edger.** Units are on for Wine's images. Rows below the
+first two are gexc-s: gexc-o's tree plus the safepoint fix (§3.17), in
+the gamekit `ut32.sh` run after a warm-up run. Before the fix, wined3d's
+unit gave no frames, so the gexc-n row ran with the game's DLL units
+still compiling (on tier-1).
+
+| Run | First GL frame | Steady 30 fps from |
+|---|---|---|
+| ut16 (gexc-l, units off) | 63.6 s | 289 s |
+| gexc-n (Wine's units, game DLLs on tier-1) | 20.5-52.5 s | 232-277 s |
+| ut32 s1 (all of Wine's units, wined3d's included) | 24.5 s | 197 s |
+| ut32 s2 (`GEX_W3_UNITS=all`: UNDERTALE.exe on its unit too) | 16.8 s | 176 s |
+
+The session boot inside the game's start went from 52.1 s (ut13) to
+6.5-7.0 s.
+
+**The load after the boot is compute.** GEX_STALL_EVERY (`ut21.sh`)
+shows the main thread at 100% of a core from 60 to 255 s, outside system
+calls (its last call was sched_yield). Its profile:
+
+- tier-1 code (`jit:small-module`), 18%;
+- trap unwinding for call-outs, 6%;
+- x87 soft-float (`gex_f80`/`x87_op`), about 5%.
+
+The exe's unit (s2) moves steady state 21 s earlier than s1 (176 vs
+197 s).
+
+**Open issues.**
+
+1. **The remaining 176 s.** It is still mostly the main thread computing
+   before the first steady frame. Next, profile s2's main thread with
+   GEX_PROF.
+2. **Master re-keyed units.** The merged gexc looks for new unit keys:
+   rebuild with `$W/cgen-w3.sh GEXC LOG` (gooner `w3units/rebuild-h.log`).
+   Once integ/2026-10-09b lands, every unit cache re-keys again.
+3. **The page.** It still needs `gex.image_mapped` wired to its units
+   path, and the clean ranges exported to its fork (§3.17).
+4. **From DH (2026-10-09).** In the page, `any_signal()` checked the
+   signal state of the last thread to make a syscall, not of the parked
+   thread, so a tgkill never woke a thread waiting on a futex. The fix is
+   research/dual-heap 041a87fd, due in master after the next gate. Suspect
+   it first if Wine threads in the page ever hang idle (SIGUSR1 suspend,
+   APCs).
+
+**Where things are.**
+
+- Runs:
+  - gamekit `boot-f.sh` and `boot-g.sh`: session boot A/B;
+  - `ut14.sh` through `ut32.sh`: Undertale. ut24-26 bisect the units (wined3d), ut27-31 diagnose the stall, ut32 measures the fix. gexc-s is built from `$W/wt-o` (3341103b plus the patch) so it keeps the edger unit keys.
+- Units: gooner `scratch/W/w3units/xdg/gex/cgen`, and edger
+  `scratch/W/boot-xdg/gex/cgen` (cache for the bench runs, XDG_CACHE_HOME).
+- Diagnosis runs on gooner: `w3units/run.sh TAG [K=V]`.
+
 **RESUME HERE (2026-10-09, early).** merge/w3-audio has master 41917e73
 merged (bc6c6e2c) and three commits on top: 39bdabd8 `GEX_GL_WAITS`,
 4d3bd189 the compositor read-buffer fix, dbf61bc7 `GEX_PROF` per-thread
@@ -1872,12 +2043,42 @@ passed this time, it is load-dependent).
   the cost; Undertale's 3303 glGetInternalformativ at wined3d init are
   89 ms in all), `GEX_SYS_WAITS=1` (wall time per thread and syscall),
   `GEX_PROF` writes `<stem>.threads`, `GEX_PROF_MIN_PCT`.
-- Next costs seen: every Wine child process runs `usd_clock_thread`
-  (wine fork, virtual.c), a 1 ms nanosleep loop that updates its
-  USER_SHARED_DATA clocks: six such threads in Undertale, about 900
-  wakeups a second each. Undertale's 350 s load: its main thread is
-  mostly parked (GEX_SYS_WAITS shows a futex wait of about 10 s in every
-  10 s window), so the next step is which thread it waits for.
+- **The fix in the browser: no measurable change, as expected from where
+  the page pumps.** The page pumps the compositor once per scheduler turn
+  (a thread on its way to waiting), not at every syscall. `$W/page/`:
+  wlbench (a static x86-64 guest holding a Wayland connection, syscall
+  rates) in nt.html on edger, shim built before (A) and after (B) 4d3bd189
+  from one tree: getppid, sched_yield and poll(0) at 550k-920k/s
+  whether connected or not and on either shim (they never reach the
+  scheduler); nanosleep(1 us) parks, about 1.15 ms each: 866-874/s on A
+  and 877-884/s on B with a connection, 878-895/s without. The page's
+  games so far open no in-guest Wayland client anyway (hostx's Xwayland
+  is beside the kernel, the NT layer draws directly); Half-Life is the one
+  that does (no Steam runtime GTK2 on gooner or edger to bundle it).
+- **usd_clock_thread every 16 ms** (wine fork bf5af1fc23e, mw): each child
+  process refreshed its USER_SHARED_DATA clocks every 1 ms (about 900
+  wakeups a second per process, six in Undertale); now every 16 ms, as
+  wineserver does (server/fd.c). Loader `$W/w3dist-u` (w3dist-n plus that;
+  the wasm differs in that constant only). Undertale, one run each:
+  62 wakeups a second per thread, process CPU 217 -> 210 s over 600 s,
+  first frame 107 -> 74 s, steady 30 fps from 350 -> 311 s.
+- **Undertale's load is waiting, not working.** Over the first 300 s
+  (gamekit `ut12.sh`): process CPU 104 s, the game's main thread 47.5 s,
+  no other thread above 2.1 s. GEX_SYS_WAITS (ab813f3e, time outside
+  syscalls) has the main thread outside syscalls nearly all the time, so
+  it waits where no syscall shows: a wasm32 futex wait is
+  memory.atomic.wait, and the in-process wineserver is called without
+  one. The run-to-run spread is large (first frame at 74 and 104 s, and
+  none in 240 or 300 s with WINEDEBUG or GEX_PROF on).
+  WINEDEBUG +sync with timestamps (`ut13.sh`, trace in `$W/ut13/log`):
+  the game's main thread waits 52 s at start for `__wineboot_event`, the
+  session's boot: wineboot, services and five more processes, each taking
+  8-12 s to start (pids 0028 to 00ac at 6, 19, 27, 37, 45, 54 and 66 s).
+  After that its NT waits are short (6.4 s over 11 waits, plus
+  NtWaitForAlertByThreadId under 1 s), yet it is neither in a syscall nor
+  on the CPU most of the time. Next: what it is in (host calls? the Unix
+  side's own waits?), and process start time under W3 (each child
+  translates its code afresh).
 
 **RESUME HERE (2026-10-08 evening, after the reboot).** Branch
 **merge/w3-audio** (wt/w3-boot; master 7a4a62c8 merged): W3.5's OSS null

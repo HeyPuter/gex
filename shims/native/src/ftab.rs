@@ -280,7 +280,11 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
             Event::Install(i) => {
                 let inst = &installs[i as usize];
                 let module = &modules[inst.module as usize];
+                let t0 = std::time::Instant::now();
                 instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied())?;
+                if crate::wasm_trace() && t0.elapsed().as_millis() >= 10 {
+                    eprintln!("gex: instantiated install {i} (base {}) in {:.3}s", inst.base, t0.elapsed().as_secs_f64());
+                }
             }
             Event::Retire(idx) => {
                 table.set(cx.as_context_mut(), idx as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
