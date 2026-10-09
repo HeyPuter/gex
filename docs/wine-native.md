@@ -924,6 +924,46 @@ Tools added with it:
   the reason and the stack;
 - `GEX_CGEN_KEEP=1` keeps a W3 unit's generated C (`<cache>/<key>/work`).
 
+**Session start-up against the NT layer (2026-10-09).** On edger, `wine
+cmd /c echo` with the merged gexc and its re-keyed units (gamekit
+`boot-h.sh`, gexc-u, warm caches) takes 8.3-8.5 s and starts 7 processes.
+The NT layer runs a console program in 2.3 s. The W3 session is serial: one
+process at a time, each about 1 s on one core. The sequence:
+
+1. the loader;
+2. `wineboot --init` (Wine runs it for every new session; its own work
+   before it starts services is the longest single step);
+3. services.exe;
+4. a winedevice for MountMgr;
+5. Plug and Play and the Event Log (svchost);
+6. a second winedevice (NDIS and the NSI proxy, which wineboot's
+   `initialize_internet` asks for);
+7. cmd.
+
+Measured on edger:
+
+| Variant | `wine cmd /c echo` | Processes |
+|---|---|---|
+| Kit prefix (default services) | 8.3-8.5 s | 7 |
+| `tools/wine-wasm/lean-session.reg` (Eventlog, NDIS, nsiproxy, PlugPlay demand-start) | 6.2-6.7 s | 5 |
+| A second program in the same warm session (cmd starting cmd) | +0.8-1.0 s | +1 |
+
+So the lean prefix takes 2.1 s off a session start, and a reused session
+would cost about 1 s per program: under the NT layer's 2.3 s. Both carry
+to the page:
+
+- the lean registry is plain prefix configuration, not code;
+- a reused session means the page keeps its kernel (wineserver and
+  services) between programs in a tab.
+
+Natively, one gexc runs one session, so a reused session there would
+need a server mode.
+
+`<cache>/w3keys` (72eb5dac) remembers each image's unit key by file and
+base. The first process to map an image no longer computes two SHA-256s
+of it. That was a third of wineboot's host CPU (perf on gooner); edger
+time not measured separately.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).

@@ -916,7 +916,7 @@ fn remembered_unit_key(id: &(String, u64, usize, u64), image: &gex_ld::Image, pv
     id.hash(&mut h);
     // What else decides the key at run time: the memory flavour, guards
     // and store widths (gex-cgen's unit inputs).
-    gex_cgen::image::unit_inputs().hash(&mut h);
+    (gex_abi::mem64(), gex_cgen::image::unguarded(), gex_cgen::image::narrow_stores()).hash(&mut h);
     std::env::current_exe().ok().and_then(|e| stamp(&e)).hash(&mut h);
     stamp(&root.join("icall")).hash(&mut h);
     let memo = root.join("w3keys").join(format!("{:016x}", h.finish()));

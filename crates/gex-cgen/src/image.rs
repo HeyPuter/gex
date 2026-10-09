@@ -60,7 +60,7 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 
 /// [`UNIT_INPUTS`] and a hash of [`abi_fingerprint`]: everything that
 /// decides a unit from a recovery.
-pub fn unit_inputs() -> String {
+fn unit_inputs() -> String {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let base = S
         .get_or_init(|| {
