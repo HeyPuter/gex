@@ -68,7 +68,8 @@ static TRANSLATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// prints them every 256 translations): what the JIT spends start-up on.
 static BY_OBJECT: Mutex<Option<std::collections::BTreeMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 static BY_OBJECT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `?fjitlibs=dumpmod=ADDR`: print (base64, in 48 KiB lines) every JIT module
+/// `?fjitlibs=dumpmod=ADDR`: print (base64, in 3,000-character lines: the page console cuts
+/// a line at about 4,000) every JIT module
 /// whose functions include guest address ADDR, with its root, to rebuild the
 /// page's translation offline (scratch/unity/fjitrepro).
 static DUMP_MOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -90,10 +91,14 @@ fn dump_module(root: u64, funcs: &[u64], wasm: &[u8]) {
             }
         }
     }
-    let lines = b.len().div_ceil(49152);
-    let list: Vec<String> = funcs.iter().map(|a| format!("{a:x}")).collect();
-    crate::warn_line(&format!("[fjitdump] root {root:#x} funcs {} bytes {} lines {lines}: {}\n", funcs.len(), wasm.len(), list.join(",")));
-    for (i, ch) in b.as_bytes().chunks(49152).enumerate() {
+    const W: usize = 3000;
+    let lines = b.len().div_ceil(W);
+    crate::warn_line(&format!("[fjitdump] root {root:#x} funcs {} bytes {} lines {lines}\n", funcs.len(), wasm.len()));
+    for (i, fs) in funcs.chunks(32).enumerate() {
+        let list: Vec<String> = fs.iter().map(|a| format!("{a:x}")).collect();
+        crate::warn_line(&format!("[fjitdump] {root:x} funcs {i}: {}\n", list.join(",")));
+    }
+    for (i, ch) in b.as_bytes().chunks(W).enumerate() {
         crate::warn_line(&format!("[fjitdump] {root:x} {i} {}\n", std::str::from_utf8(ch).unwrap_or("")));
     }
 }
