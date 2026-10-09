@@ -12,8 +12,11 @@ const OPEN = 1;
 const CLOSED = 2;
 const REFUSED = 3;
 
-/** How much may pile up unread on one stream before the page stops reading. */
-const HIGH_WATER = 4 << 20;
+/** How much may pile up unread on one stream before the page says so. The
+ *  Wisp client cannot be told to stop reading, so past this the bytes are
+ *  kept anyway: dropping them is what turned a 9.6 MB download into a Hash
+ *  Sum mismatch. */
+const HIGH_WATER = 16 << 20;
 
 class Stream {
   constructor(id) {
@@ -117,13 +120,13 @@ export class WispNetwork {
       if (!s.firstRecv) {
         s.firstRecv = now;
         const waited = s.firstSend ? (now - s.firstSend) / 1000 : -1;
-        console.error(
+        console.info(
           `[wisp] stream ${id}: first reply at ${(now / 1000).toFixed(1)}s, `
           + `${waited.toFixed(1)}s after the request`,
         );
       }
       if (meter.last && now - meter.last > 1000) {
-        console.error(
+        console.info(
           `[wisp] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
           + `after ${meter.n} messages and `
           + `${(meter.bytes / 1048576).toFixed(1)} MiB`,
@@ -132,7 +135,10 @@ export class WispNetwork {
       meter.last = now;
       meter.n += 1;
       meter.bytes += bytes.length;
-      if (s.buffered > HIGH_WATER) return;
+      if (s.buffered > HIGH_WATER && !s.warned) {
+        s.warned = true;
+        console.warn(`[wisp] stream ${id}: ${s.buffered >> 20} MiB unread`);
+      }
       s.chunks.push(bytes);
       s.buffered += bytes.length;
     };
@@ -166,7 +172,7 @@ export class WispNetwork {
     // drains.
     s.sends = (s.sends ?? 0) + 1;
     if (!s.firstSend) s.firstSend = performance.now();
-    console.error(
+    console.info(
       `[wisp] stream ${id}: send ${s.sends}, ${bytes.length} bytes at `
       + `${(performance.now() / 1000).toFixed(1)}s`,
     );

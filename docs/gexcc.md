@@ -421,7 +421,7 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     to mw.
   - Don't edit crates/gex-cgen without asking.
 - No game runs on gooner; the corpus is fine here. No timing on gooner.
-- **Demo (§6), state 2026-10-08:**
+- **Demo (§6), state 2026-10-09:**
   - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
     approved. Item 1 done (gated as integ/2026-10-08f). Item 2 (aarch64
     ELF providers) on this branch, `merge/gexcc-a64prov`, no
@@ -437,27 +437,44 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     (`src/`, `stage/`, `logs/`, `built.txt`, `pool/`); Debian downloads
     cached in `scratch/CC/deb`. Whole thing: `web/build-native-debian.sh`
     with `GEXCC_PREFIX=~/gex-sandbox/scratch/CC/dtc`, in the build scope.
-  - Tier 1 rootfs: 44 Debian arm64 packages + 27 of ours, 91.5 MiB
-    unpacked, 20.4 MB as tar.zst.
-  - Works (gooner, correctness only): natively (`gexc run --uid 0:0
-    --sysroot TREE`) and in the browser runtime under Node
-    (`run-node.mjs --tar`, `GEX_UID=0`, `GEX_NETWORK=1`): bash, the tools,
-    dpkg (`--audit` clean), `apt-get update` against deb.debian.org
-    (signatures checked), `apt-get install jq` (arm64 jq, libjq1,
-    libonig5 translated) and jq runs; the pins keep ours over
-    `coreutils:arm64`. Test trees in `scratch/CC/rootfs` (`tree` fresh,
-    `native-cache.tar`: lists and jq's .debs, for `apt-get install
-    --no-download` without the network).
-  - Unverified: update and install in one browser-runtime session went
-    past 900 s once on gooner (each alone passes).
-  - Page startup, edger (bench.sh, headless Chromium, 8 threads,
-    `web/test/site.mjs native-debian`): browser launch to the
-    `root@gex:~#` prompt 5.4-5.6 s (5578, 5408, 5395 ms; 20.4 MB rootfs
-    from localhost). In the guest (`native-debian-cmd`, each figure
-    includes two `date` forks, about 0.5 s): `ls /` 1054 then 1041 ms,
-    `perl -e 1` 3234 then 2204 ms, `dpkg -l` 2658 then 2684 ms,
-    `apt-cache policy coreutils` 11504 then 7415 ms.
-  - Next: tier 2; GUI; item 3.
+  - Rootfs (tiers 1, 2 and pm): 22 Debian arm64 packages + 44 of ours,
+    175.6 MiB unpacked, 39.3 MB as tar.zst (`native-debian.tar.zst`);
+    `native-debian-cache.tar.zst` (49.7 MB) adds Debian's lists and jq's
+    .debs for `apt-get install --no-download jq` without the network.
+    Rebuild: `mkrootfs.py --pool $GEXCC_DEB/pool --out TREE --tar TAR`
+    (`--exclude jq` for the cache image), zstd -19 into `web/public/rootfs/`.
+  - dpkg, apt (one `apt-multi` program) and gpgv are ours, labelled arm64
+    (§6.1a). Natively: tampered InRelease rejected, `apt-get update` from
+    deb.debian.org 10.1 MB in 12 s, install/remove, `dpkg --audit` clean.
+  - In the page (edger, bench.sh, `site.mjs native-debian-run`, real Wisp
+    to anura.pro): `apt-get update` 9.33 s (10.1 MB at 1633 kB/s),
+    `apt-get install -y hello` 5.79 s, `hello` runs. The Wisp connection
+    is the page's, served to Workers over shared memory
+    (`shims/browser/js/net-bridge.mjs`): a WebSocket in a wasm32 program's
+    own Worker never delivers, since the program never returns its event
+    loop.
+  - `apt-get install --no-download jq` in the page, 26 processes: 92.9 s
+    with Debian's translated apt/dpkg/debconf, 8.6 s with ours (8.65 and
+    8.56 s). Before, by process: apt-get 92.65 s, dpkg --unpack 39.5 s,
+    dpkg-preconfigure 17.4 s (perl; ld.so 7.3 s, translation 2.5 s), each
+    dpkg-deb 4.6-5.5 s (ld.so ~0.7 s, translation ~0.4 s, compile
+    ~0.37 s), apt-extracttemplates 5.1 s; summed over processes ld.so
+    19.0 s, translation 14.1 s (452k blocks), compile 9.4 s, Worker
+    start 3.7 s. After: apt-get 8.4 s, dpkg --unpack 2.8 s, each dpkg-deb
+    ~0.3 s.
+  - Page startup (browser launch to the prompt): 5441 and 5407 ms.
+    `native-debian-cmd` (each includes two `date` forks, ~0.5 s), before
+    then after: `dpkg -l` 2658/2684 then 1084/1030 ms; `apt-cache policy
+    coreutils` 11504/7415 (first), 5.7/4.9 s (later) then 1330/1167 ms;
+    `ls /` 954/1028 ms; `perl -e 1` 3297/1855 ms (Debian's perl,
+    translated).
+  - Known: `site.mjs native-debian-run` still reports one console error
+    from `apt-get update`: the shim's note that a 42 MiB allocation (apt's
+    mmap of the arm64 Packages list) takes an arena span of its own.
+    Fork inside a C++ catch block traps (asyncify). python3 has no
+    _ctypes (libffi for wasm32 not built).
+  - Next: tier 2 leftovers (perl ours, bc's dc, /usr/bin/git duplicate,
+    _ctypes), the GUI tier, item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
@@ -581,6 +598,9 @@ OpenPGP verifier are gexcc builds:
   sqlite...), with libgcrypt 1.11 (no asm), libgpg-error, libassuan and
   libksba static. Debian's keyring files are unchanged
   (`/usr/share/keyrings/debian-archive-keyring.gpg`, `Signed-By`).
+  What translated sqv cost before: in the page it ran three times per
+  `apt-get update` at 5.9-7.8 s each (Rust, about 20 s per update).
+  Tampering with a cached InRelease is rejected (BADSIG, exit 100).
 - **Hashing.** apt hashes downloads itself (OpenSSL EVP, in-process) and
   dpkg checks md5sums in-process; neither execs a hashing program during
   install. TLS is apt's http method's OpenSSL, native.
@@ -810,6 +830,8 @@ page (web/src/demos.js): fetches `/rootfs/native-debian.tar.zst`
 its symbolic links as links (`gex_add_symlink`), and boots `/bin/bash -l`
 (`-l -i`) as pid 1 with uid 0, `HOME=/root`, `TERM`, `PATH`. Network: Wisp,
 default `wss://anura.pro/`, `?wisp=URL` overrides (`?wisp=` empty: none).
+The page holds the one Wisp connection and serves it to every
+guest Worker over shared memory (`shims/browser/js/net-bridge.mjs`).
 Translated programs run on tier 1 (`?fjit=1` turns the function JIT on).
 `?cmd=` runs one command for tests. Under Node the same runtime runs the
 tar with `run-node.mjs --tar FILE` (`GEX_UID=0`, `GEX_NETWORK=1` for real
@@ -817,8 +839,8 @@ sockets instead of Wisp); there apt updates from Debian and installs
 arm64 packages (§5).
 
 Size budget (zstd, transferred): tier 1 at most 15 MB, tier 1+2 at most
-45 MB, everything at most 80 MB. Tier 1 today: 20.4 MB (Debian's arm64
-system pieces are most of it: libc6, perl-base, libssl, apt, dpkg).
+45 MB, everything at most 80 MB. Tiers 1 and 2 with our dpkg/apt/gpgv
+today: 39.3 MB.
 If the whole-tar load is too slow, split into a base tar and per-package
 tars fetched when first opened (the kernel's demand-fill hook).
 

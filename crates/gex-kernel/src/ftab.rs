@@ -46,7 +46,7 @@ pub struct Install {
 }
 
 /// What a table replays.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Instantiate install `i` (an index into [`FuncMap::installs`]).
     Install(u32),
@@ -66,6 +66,11 @@ pub struct Func {
 pub struct FuncMap {
     next: u32,
     by_addr: BTreeMap<u64, Func>,
+    /// How many addresses map to each index: one module serving several
+    /// images (Wine's PE side, bound per image as each maps) gives one
+    /// index to the same function at every address it is mapped at, and an
+    /// index is retired only when the last of them goes.
+    refs: std::collections::HashMap<u32, u32>,
     installs: Vec<Install>,
     log: Vec<Event>,
     /// Indices handed out and later retired, for statistics.
@@ -80,7 +85,28 @@ impl Default for FuncMap {
 
 impl FuncMap {
     pub fn new() -> FuncMap {
-        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), installs: Vec::new(), log: Vec::new(), retired: 0 }
+        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), refs: Default::default(), installs: Vec::new(), log: Vec::new(), retired: 0 }
+    }
+
+    /// Map `addr` to `f`, and retire the index it had if nothing else
+    /// maps to that one.
+    fn map_addr(&mut self, addr: u64, f: Func) {
+        *self.refs.entry(f.idx).or_insert(0) += 1;
+        if let Some(old) = self.by_addr.insert(addr, f) {
+            self.unref(old.idx);
+        }
+    }
+
+    /// One address fewer maps to `idx`: when it was the last, the index is
+    /// pointed back at the resolve stub in every table.
+    fn unref(&mut self, idx: u32) {
+        let n = self.refs.entry(idx).or_insert(1);
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.refs.remove(&idx);
+            self.log.push(Event::Retire(idx));
+            self.retired += 1;
+        }
     }
 
     /// How large every table must be to hold every index handed out so far.
@@ -126,10 +152,7 @@ impl FuncMap {
             if addr == 0 || off >= len {
                 continue;
             }
-            if let Some(old) = self.by_addr.insert(addr, Func { idx: base + off, install: n }) {
-                self.log.push(Event::Retire(old.idx));
-                self.retired += 1;
-            }
+            self.map_addr(addr, Func { idx: base + off, install: n });
         }
         n
     }
@@ -159,12 +182,7 @@ impl FuncMap {
             if addr == 0 || off >= len {
                 continue;
             }
-            if let Some(old) = self.by_addr.insert(addr, Func { idx: base + off, install }) {
-                if old.idx != base + off {
-                    self.log.push(Event::Retire(old.idx));
-                    self.retired += 1;
-                }
-            }
+            self.map_addr(addr, Func { idx: base + off, install });
         }
     }
 
@@ -173,8 +191,7 @@ impl FuncMap {
     /// address again. Returns the retired index.
     pub fn retire(&mut self, addr: u64) -> Option<u32> {
         let f = self.by_addr.remove(&addr)?;
-        self.log.push(Event::Retire(f.idx));
-        self.retired += 1;
+        self.unref(f.idx);
         Some(f.idx)
     }
 
@@ -381,6 +398,33 @@ mod tests {
         assert!(matches!(m.log_from(0), [Event::Install(0), Event::Install(1), Event::Retire(i)] if *i == RESERVED + 2));
         assert_eq!(m.retire(0x1000), Some(RESERVED));
         assert!(m.get(0x1000).is_none());
+    }
+
+    #[test]
+    fn a_shared_index_stays_while_another_address_maps_to_it() {
+        // One module serving two images (Wine's PE side: kernel32 loaded,
+        // and a view of the same image mapped elsewhere): both addresses of
+        // a function share its index. Retiring one (its view unmapped, or
+        // its page rewritten) must not retire the index the other uses: a
+        // table pointed back at the resolve stub while the map still sends
+        // the other address there loops in the resolve stub for ever.
+        let mut m = FuncMap::new();
+        let a = m.publish(4, 7, Tier::Unit, &[(0x7bfa_21f8, 2)]);
+        m.bind(a, &[(0x1fcb_21f8, 2)]);
+        let idx = m.get(0x7bfa_21f8).unwrap().idx;
+        assert_eq!(m.get(0x1fcb_21f8).unwrap().idx, idx);
+        let before = m.log_len();
+        assert_eq!(m.retire(0x1fcb_21f8), Some(idx));
+        assert!(!m.log_from(before).contains(&Event::Retire(idx)), "the index the loaded image uses was retired");
+        assert_eq!(m.get(0x7bfa_21f8).unwrap().idx, idx);
+        // The last address going retires it.
+        assert_eq!(m.retire(0x7bfa_21f8), Some(idx));
+        assert!(m.log_from(before).contains(&Event::Retire(idx)));
+        // Rebinding an address to the index it has is no retire either.
+        let b = m.publish(2, 9, Tier::Unit, &[(0x5000, 1)]);
+        let before = m.log_len();
+        m.bind(b, &[(0x5000, 1)]);
+        assert!(m.log_from(before).is_empty());
     }
 
     #[test]

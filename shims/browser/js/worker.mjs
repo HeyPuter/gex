@@ -566,7 +566,13 @@ async function handle(msg) {
     const { NodeNetwork } = await import('./net-node.mjs');
     gex.useNetwork(new NodeNetwork());
   }
-  if (msg.wispUrl) {
+  if (msg.netChannel) {
+    // The page's Wisp connection, called across shared memory (net-bridge.mjs):
+    // a wasm32 program never hands this Worker's event loop back, so a
+    // WebSocket of its own here would never deliver.
+    const { NetProxy } = await import('./net-bridge.mjs');
+    gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1));
+  } else if (msg.wispUrl) {
     // The site's Wisp client, imported only when a proxy was named.
     const { WispNetwork } = await import('../../../web/src/net.js');
     const net = new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e }));

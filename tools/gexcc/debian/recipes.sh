@@ -451,10 +451,12 @@ build_python3_13() {
     CPPFLAGS="-I$SYSROOT/usr/include/ncursesw" \
     ./configure --prefix=/usr --disable-shared --without-ensurepip --disable-test-modules \
       --with-system-expat --with-system-libmpdec --with-pkg-config=yes --with-readline=readline \
-      --without-static-libpython
+      --without-static-libpython --with-openssl=$SYSROOT/usr
   make -j$JOBS
   make install DESTDIR=$DEST
   ln -sf python3.13 $DEST/usr/bin/python3
+  # extension modules are built in; the directory still says where exec_prefix is
+  mkdir -p $DEST/usr/lib/python3.13/lib-dynload
   rm -rf $DEST/usr/lib/python3.13/test $DEST/usr/lib/python3.13/idlelib/idle_test \
     $DEST/usr/lib/python3.13/config-3.13-* $DEST/usr/lib/*.a $DEST/usr/include
   find $DEST -name '*.opt-1.pyc' -o -name '*.opt-2.pyc' | xargs rm -f

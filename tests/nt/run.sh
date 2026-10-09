@@ -108,10 +108,19 @@ for arch in x64 x86; do
     check $arch/icall 0 "icall: 1284803844 -1238658015 2 3 4" "$b/icall.exe"
     # N4: USER without a display.
     check $arch/user_win 0 "$allok" "$b/user_win.exe"
+    # A loaded DLL mapped again as an image section: the loaded one keeps
+    # working (ntdll's Unix calls after the view).
+    check $arch/imageview 0 "ok ntdll mapped twice as an image view" "$b/imageview.exe"
     # The same as a child process (CreateProcess, waited for): native Wine
     # (W3) only, where a child reads the session through requests; the NT
     # layer has no child processes. GEX_NT_CHILDREN=1 runs it.
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childgui 0 "${allok}${nl}child exit 0" "$b/childgui.exe"
+    # And from a console launcher: the child hosts the desktop.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childcon 0 "${allok}${nl}child exit 0" "$b/childcon.exe"
+    # Children one after another, each a new address space.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
+    # A child that dies in native code releases its parent.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"

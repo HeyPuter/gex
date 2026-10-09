@@ -479,6 +479,10 @@ struct JitShared {
     /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
     /// at the first skeleton that names it, bound DLL by DLL.
     wine_pe: Option<Arc<wasmdll::WinePe>>,
+    /// The stateful modules' data addresses whose relocations this address
+    /// space has had (`libprov::relocate_once`). With the process: a fork
+    /// shares it (its memory is a copy, relocated), an exec starts empty.
+    relocated: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -1109,6 +1113,7 @@ fn run_program_with(
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
+                relocated: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1251,7 +1256,22 @@ fn run_program_with(
     if opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
-    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
+    let stopped = match run_thread_loop(&mut store, &instance, ctx_addr, entry) {
+        Ok(s) => s,
+        Err(e) => {
+            // A process that dies takes its threads and descriptors with it,
+            // as `fork_process`'s failure path does for a forked one. That
+            // path cannot for an exec'd process: the kernel moved here. Left
+            // open, an exec'd child that trapped kept its end of every pipe
+            // and socket (native Wine's server connection: its parent waited
+            // for it for ever).
+            stop_other_threads(&spawn, false);
+            let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.fds.close_all();
+            k.sockets.clear();
+            return Err(e);
+        }
+    };
     profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
@@ -1903,6 +1923,12 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
+        // Threads are numbered per process and the counter came from the
+        // parent: the child's Nth clone got tid == pid, its main thread's
+        // (pthread mutex owners, tgkill and the thread table then took one
+        // thread for the other). Clones number above the main tid, as the
+        // browser runtime's fork does (tests/wasm32/forktid.c).
+        child.next_tid = child.next_tid.max(pid + 1);
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
