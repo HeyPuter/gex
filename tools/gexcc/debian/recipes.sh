@@ -804,3 +804,30 @@ build_chocolate_doom() {
   make install DESTDIR=$DEST
   rm -rf $DEST/usr/share/man $DEST/usr/share/doc
 }
+
+# -- tier 2: perl -------------------------------------------------------------
+
+build_perl() {
+  # Debian's layout and options (debian/config.debian), Configured natively:
+  # its probes and miniperl run under gexc. No dynamic loading, so every
+  # extension is built into perl.
+  local v=5.40 a=/usr/lib/wasm32-linux-musl
+  # miniperl (under gexc) runs make and the compiler for every extension:
+  # on the host, not translated (gexc's GEXC_HOST_EXEC)
+  export GEXC_HOST_EXEC=/usr/bin/make:$GEXCC_PREFIX/bin/
+  # perl -V names Debian's patches (debian/rules)
+  local dv; dv=$(dpkg-parsechangelog -S Version)
+  debian/gen-patchlevel -p DEBPKG: -v $dv debian/patches/series > patchlevel-debian.h
+  sh ./Configure -des -Dcc=gexcc -Dld=gexcc -Dar=gexcc-ar -Dranlib=gexcc-ranlib \
+    -Dccflags='-DDEBIAN -D_GNU_SOURCE' -Doptimize=-O2 -Dusethreads -Duselargefiles -Duse64bitint -Uusedl \
+    -Darchname=wasm32-linux-musl -Dprefix=/usr -Dprivlib=/usr/share/perl/$v -Darchlib=$a/perl/$v \
+    -Dvendorprefix=/usr -Dvendorlib=/usr/share/perl5 -Dvendorarch=$a/perl5/$v \
+    -Dsiteprefix=/usr/local -Dsitelib=/usr/local/share/perl/5.40.1 -Dsitearch=/usr/local$a/perl/5.40.1 \
+    -Dman1dir=none -Dman3dir=none -Dsiteman1dir=none -Dsiteman3dir=none \
+    -Dpager=/usr/bin/sensible-pager -Uafs -Ud_csh -Ud_ualarm -Uusesfio -Uusenm -Ui_libutil \
+    -Duseperlio -Dd_dosuid=undef -Dcf_by=Debian -Dcf_email=perl@packages.debian.org \
+    -Dperladmin=root@localhost -Dmyhostname=localhost -Dmydomain= -Dlibpth=$SYSROOT/usr/lib
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/man
+}

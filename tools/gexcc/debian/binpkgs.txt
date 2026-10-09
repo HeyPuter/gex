@@ -84,3 +84,7 @@ libsdl2-mixer -         *
 chocolate-doom chocolate-doom usr/bin/chocolate-doom usr/bin/chocolate-doom-setup usr/share/applications/org.chocolate_doom.Doom* usr/share/icons/* usr/share/metainfo/org.chocolate_doom.Doom*
 chocolate-doom -        *
 depends   chocolate-doom freedoom
+# perl: built and working (XS extensions static), not shipped yet: Debian's
+# arm64 perl-base stays until ours provides perlapi-5.40.1 and the layout
+# Debian's arm64 Perl packages expect
+perl      -             *

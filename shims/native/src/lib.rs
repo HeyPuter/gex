@@ -2174,6 +2174,151 @@ fn take_kernel(cx: &SpawnContext) -> Kernel {
     std::mem::replace(&mut *guard, Kernel::new(0, 0, String::new()))
 }
 
+/// `GEXC_HOST_EXEC` (gexc's own environment, `:`-separated): programs a
+/// guest's `execve` runs on the host instead -- an exact path, or a
+/// directory ending in `/` for everything in it. For builds whose own tools
+/// are guest programs that start the build machine's tools: perl's make_ext
+/// is miniperl (a wasm32 program) running `make` and the C compiler, which
+/// translated are either far too slow or do not load at all (clang's 100 MB
+/// library). Paths are the guest's, so this means something only when the
+/// guest sees the host's tree (no sysroot), as gexcc's runner does.
+///
+/// The process stays: it waits for the host program and exits as it did.
+/// Descriptors 0-2 are bridged: a stream the guest got from gexc's own stdio
+/// is the host's, anything else (a pipe, a file) is copied through a host
+/// pipe. Nothing above 2 is passed (make's jobserver falls back to -j1).
+fn host_exec(req: &ExecRequest, kernel: &Kernel) -> Result<Option<Exit>> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let Ok(list) = std::env::var("GEXC_HOST_EXEC") else {
+        return Ok(None);
+    };
+    let path = if req.path.starts_with('/') {
+        req.path.clone()
+    } else {
+        format!("{}/{}", kernel.vfs.cwd.trim_end_matches('/'), req.path)
+    };
+    let listed = |p: &str| {
+        list.split(':').filter(|e| !e.is_empty()).any(|e| {
+            if e.ends_with('/') {
+                p.starts_with(e) && !p[e.len()..].contains('/')
+            } else {
+                p == e
+            }
+        })
+    };
+    // The kernel has followed a `#!` line by now, so a listed script (gexcc
+    // is Python) arrives as its interpreter with the script's path among the
+    // first arguments: run the script itself, so its interpreter is the
+    // host's too.
+    let script = (1..req.argv.len().min(3)).find(|&i| {
+        let a = &req.argv[i];
+        a.starts_with('/') && listed(a) && kernel.read_file(a).is_some_and(|b| b.starts_with(b"#!"))
+    });
+    let (path, argv): (String, &[String]) = match script {
+        Some(i) => (req.argv[i].clone(), &req.argv[i..]),
+        None if listed(&path) => (path, &req.argv[..]),
+        None => return Ok(None),
+    };
+    let mut cmd = Command::new(&path);
+    if let Some(a0) = argv.first() {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(a0);
+    }
+    cmd.args(argv.iter().skip(1));
+    cmd.env_clear();
+    for kv in &req.envp {
+        if let Some((k, v)) = kv.split_once('=') {
+            cmd.env(k, v);
+        }
+    }
+    cmd.current_dir(&kernel.vfs.cwd);
+    // For a launcher that limits how many gexcs run at once (gexcc-exec): a
+    // gexc started below this one must not wait for a slot this one holds.
+    cmd.env("GEXC_HOSTED", "1");
+    // A guest stream that is gexc's own stdio is passed as is; the rest piped.
+    let files: Vec<Option<Arc<gex_kernel::file::OpenFile>>> = (0..3).map(|fd| kernel.fds.get(fd).ok()).collect();
+    let is_std = |f: &Option<Arc<gex_kernel::file::OpenFile>>, want: &str| {
+        f.as_ref().is_some_and(|f| format!("{:?}", f.handle).contains(want))
+    };
+    let std_names = ["stream: In", "stream: Out", "stream: Err"];
+    let mut piped = [false; 3];
+    for (i, f) in files.iter().enumerate() {
+        let st = if f.is_none() {
+            Stdio::null()
+        } else if is_std(f, std_names[i]) {
+            Stdio::inherit()
+        } else {
+            piped[i] = true;
+            Stdio::piped()
+        };
+        match i {
+            0 => cmd.stdin(st),
+            1 => cmd.stdout(st),
+            _ => cmd.stderr(st),
+        };
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("execve: running {path} on the host (GEXC_HOST_EXEC)"))?;
+    let mut threads = Vec::new();
+    if piped[0] {
+        let (mut to, from) = (child.stdin.take().unwrap(), files[0].clone().unwrap());
+        // Detached: a guest stdin that never ends must not hold the exit up.
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match from.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if to.write_all(&buf[..n as usize]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(gex_kernel::errno::Errno::EAGAIN) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    let out: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>),
+        child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>),
+    ];
+    for (k, r) in out.into_iter().enumerate() {
+        let (Some(mut r), Some(to)) = (r, files[k + 1].clone()) else { continue };
+        if !piped[k + 1] {
+            continue;
+        }
+        threads.push(std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while let Ok(n) = r.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let mut at = 0;
+                while at < n {
+                    match to.write(&buf[at..n]) {
+                        Ok(w) => at += w as usize,
+                        Err(gex_kernel::errno::Errno::EAGAIN) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                        Err(_) => return,
+                    }
+                }
+            }
+        }));
+    }
+    let status = child.wait()?;
+    for t in threads {
+        let _ = t.join();
+    }
+    use std::os::unix::process::ExitStatusExt;
+    Ok(Some(match (status.code(), status.signal()) {
+        (Some(c), _) => Exit::Status(c),
+        (None, Some(sig)) => Exit::Signal { signal: sig, pc: 0, detail: format!("{path} on the host"), internal: false },
+        _ => Exit::Status(1),
+    }))
+}
+
 /// Load and run the program `execve` asked for, keeping the process.
 #[allow(clippy::too_many_arguments)]
 fn exec_program(
@@ -2184,6 +2329,9 @@ fn exec_program(
     proc_state: Arc<Mutex<ProcState>>,
     wayland: Option<wayland::Wayland>,
 ) -> Result<(Exit, Stats)> {
+    if let Some(exit) = host_exec(&req, &kernel)? {
+        return Ok((exit, Stats::default()));
+    }
     // The file comes from the guest's namespace, not the host's, so a sysroot
     // is honoured and `/bin/sh` means the guest's.
     let bytes = kernel
