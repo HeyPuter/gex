@@ -426,6 +426,7 @@ async function handle(msg) {
     // A thread joins its process's memory; a process makes one. `shared` only
     // decides whether the memory a process builds can have threads later.
     memory: msg.memory ?? null,
+    moduleStore: msg.moduleStore ?? null,
     shared: !!msg.shared,
   });
   // Module-scope, so a `sharedModule` message (which arrives outside this
