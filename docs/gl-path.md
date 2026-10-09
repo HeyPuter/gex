@@ -51,21 +51,21 @@ push** (rebased onto upstream wink 0dd84167; nothing pushed):
    - replay it with `replay-run.mjs gpu TRACE --query readback=1`;
    - bisect the shader variants with `shaders.mjs`;
    - then re-apply e204fa1b's two web files.
-2. *Grass is still dots* at GL 4.0 after the -0.0 fix (U mp27; the sea is
-   back). Next: the geometry-shader emulation's output for the grass program
-   (its source is in the Muck trace; `shaders.mjs`). It may resolve with
-   item 1 at GL 4.1+, where Unity's 410 source compiles natively.
+2. *Grass:* fixed at GL 4.2 by GL 4.1's texture limits with mesa-wink
+   60202246 (U mpg3: blades, 36.6-38.1 presents/s). gex's pin is 60202246
+   and `?gllimits=41` is the default since U's pin commit on merge/unity
+   (`?gllimits=0` turns it off; 43 stays per run, item 1).
 3. *Noita's world fps* is bound by its job hand-off, not by GL: the main
    thread is parked about 37% waiting on job threads, and KLock is 0.14%
    (stream F's area). The page's GL submit is no longer the limit
    (CLIENT_ARRAY: 55.5 vs 51.1 world fps on the old path, pewasm 47.2).
 4. Remaining E1: GL draw/pointer calls are on the fast path, but the page
    gain is below noise.
-5. *The 4-slot bind-group repro on the rebased tree* (`$G/urep5.sh`, mods
-   tinyu) timed out at 1200 s with no output. Rerun it the way trep2.sh ran
-   the earlier ones (full trace, `--query stream=1`, timeout 1500, no
-   maxframes) before moving gex's pin; expect 0 validation errors from
-   frame 1343 on.
+5. *The 4-slot bind-group repro on the rebased tree:* done (U,
+   2026-10-09, `scratch/unity/urep-pin.sh` on edger, run like trep2.sh:
+   full trace, `--query stream=1`, timeout 1500): mods/tinyu replays all
+   2,777 frames (3,403 batches) of Noita's trace with 0 validation errors
+   (5f5572e6 and +6d3a4cfd had 2,668 and 2,720 from frame 1343).
 
 Tooling (unchanged):
 

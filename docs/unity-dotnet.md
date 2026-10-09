@@ -2086,6 +2086,8 @@ Not yet:
        | hp12 | full fjit + unit | 58e95157 (epochs only where translated) | 128 s | 158 s | 42.4-42.7 |
        | **hp13** | **full fjit + unit** | **977a2236 (current JIT callees out of batches too)** | **87 s** | **119 s** | **39.6-39.9** |
        | hb51 | full fjit, no unit | 58e95157 | 222 s | 270 s | 33.9 at 392 s, rising (x11 backend; was black) |
+       | hb52 | full fjit, no unit | merge/unity-rekey d146c248 | - | - | SIGILL at start-up (status 132) |
+       | hb53 | full fjit, no unit | merge/unity-rekey 64efd78e | 178 s | 225 s | 35.7 at 392 s (x11 backend) |
 
        Native gexc's gate (unit, no fjit): menu at 406.5 s, 30.59
        presents/s. hp13 against hp7: 52% more presents/s (39.9 vs 26.3),
@@ -2095,17 +2097,68 @@ Not yet:
        the menu rate ranges 39.7-42.7 across these runs. By the menu hp13's
        JIT has made libasound 20 MiB of wasm (947 functions), libc 4.3 MiB,
        libudev 3.2 MiB, libcrypto 2.9 MiB; UnityPlayer is out of the top 12.
-- **Resume (2026-10-09, HEAD after 977a2236; merge/unity has master 41917e73):**
-  HK in the page runs the target configuration (full fjit + the pinned
-  unit, `hk-bisu.sh NAME byobj=1`) to the menu: hp13 above. Fixed today: the
-  black screen and the libxcb crash (stale learned starts across dlclose,
-  763a1538), unit and current JIT callees kept out of batches (5ec43e82,
-  977a2236), mid-function misses to the fallback (a12da54a, 6bc61569).
-  Open: start-up is still ~87 s to the first frame (hp7 without fjit 55 s):
-  profile the main Worker again (ht2's method) to see what the JIT costs
-  now; libasound's 20 MiB of wasm; the native JIT has the same two holes
-  (learned state kept across dlclose, mid-function roots as starts),
-  which want a gex-xlate fix (a re-key: fjit.rs is in
-  GEX_CGEN_RECOVERY_INPUTS although it is runtime-only; build.rs could
-  leave it out, once). Muck's grass needs the mods/gpu Mesa and
-  `?gllimits=41` (not default; GL to decide).
+- **merge/unity-rekey (64efd78e, one commit on 4ed5cad3, for its own
+  round):** the native JIT's two holes fixed in gex-xlate
+  (`Jit::retire(process, ranges)` from both hosts' on_retire; a miss's
+  root stays a start only if it was a strong one already) and fjit.rs out
+  of GEX_CGEN_RECOVERY_INPUTS (key c6014ffc... with and without an
+  fjit.rs edit, 855acf6a... after a func.rs edit). hb52 (d146c248) died
+  with SIGILL: with misses no longer starts, recovery walked over a JIT
+  entry inside the function, and the page's "served" test was part of
+  `executable`, which fetch asks of every byte, so the bytes decoded as
+  illegal. 64efd78e passes it as `skip` (`Jit::translate_skipping`), the
+  batch bound only. hb53: menu, x11, first frame 178 s, 35.7 presents/s
+  (hb51 on the epoch shim: 222 s, 33.9). Native: tests/fjit-remap (the
+  Oct 8 gexc gets 99,800 of 200,000 wrong under --fjit), fjit-procs,
+  x86-programs (82 ok), embed PASS, gex-xlate tests. The page's unit cache
+  (scratch/unity/units/cgen-page) must be rebuilt after it lands.
+- **Mesa pin (1d5b26d9): mesa-wink 60202246 and `gllimits=41` by
+  default.** Replays gpu vs this build: Noita 92f095c5, HK 9eece5c5, 0
+  rejects and 0 validation errors each; GL's 4-slot repro (tinyu) 2,777
+  frames with 0 validation errors; browser-gui --gl x86 and x64 12 ok
+  each; HK hp14 (merge/unity shim, this Mesa) menu at 41.8 presents/s.
+  Muck with the default and no `?gllimits` (mk2, the seed shim, no unit):
+  "OpenGL 4.2" context, no "Shader Unsupported", grass blades in
+  `shots/mk2/c013.png`, 36.9 presents/s at 393 s.
+- **Muck dies with SIGILL at ~25 s on merge/unity's shim (977a2236,
+  4ed5cad3)**, with the unit (mpg5, mk1) and without (mk4). It does not
+  with 64efd78e (mk3, 4 minutes, no unit) or 1bf5ba09 (mk2). The page asked
+  "served by the unit or the JIT" of instruction fetch (part of
+  `executable`); with epochs a JIT entry the current epoch has no start
+  for is read as non-code inside the function being recovered and decoded
+  as illegal. 64efd78e passes it as `skip` (batch bound only).
+- **Start-up (decision 3).** hp14's main-Worker profile, 10-90 s (unit +
+  fjit): 61% (49.8 of 81 s) in `fjit::translate`: recover_one 27.2 s
+  (jump tables 16.9, discover 9.2, lift 6.9), summaries 17.7, build_runtime
+  8.8, emit 8.4, prepare 5.5; the per-byte `executable` 5.9 (2.3 in
+  elfprov::provided's locks). Audio: the page has no audio device; FMOD's
+  output init fails ("Unknown PCM default", tried twice), after pulse
+  fails to connect. libasound's 20 MiB was mostly copies: the page's JIT
+  had no function starts but those calls name, so a tail jump absorbed the
+  function it reached, and libasound's exported wrappers each carried one.
+  Offline (fjitrepro, all 1,698 exports): 57.2 MiB / 16.4 s unseeded, 9.7
+  MiB / 7.1 s seeded. ALSA with no config (hp15, ALSA_CONFIG_PATH=/dev/null)
+  cut libasound to 11.2 MiB but not the first frame (112 s against hp14's
+  110 s, both profiled), so it is not the path to cut.
+  merge/unity-seed 1bf5ba09 (on 64efd78e) seeds every mapped object's
+  starts (`Jit::add_image`) before a translation and takes the fetch
+  checks once per translation: no unit, hb53 (64efd78e) 178 s first
+  frame, 225 s 100 presents, 35.7 presents/s; hb54 (seeding) 121 s, 171 s,
+  39.1; hb55 (both) 121 s, 166 s, 40.1; libasound 26.0 -> 3.7 MiB.
+  The HK unit re-keyed for 64efd78e (key 7bd87731, byte-identical c.wasm,
+  1,941 s on gooner) is on edger in `units/cgen-page-rk`; Muck's is
+  rebuilt too (4e58f35b, 884 s), also in `cgen-page-rk`.
+  With the unit (target configuration, seed shim 1bf5ba09):
+  - hp16 (HK): first frame 56 s (hp13 87 s), 100 presents 85 s (119 s),
+    41.5 presents/s at 392 s (39.9).
+  - hp17 (HK, profiled 10-90 s): `fjit::translate` 20.7 s of 81 s (25.5%;
+    hp14 49.8 s, 61.5%); the main Worker now waits on its threads 31.6 s.
+    Profiled runs' first frame (110 s both) is held by the profile.
+  - mk5 (Muck): first frame 82 s, 100 presents 95 s, 34.0 presents/s at
+    392 s, OpenGL 4.2, no "Shader Unsupported", grass blades
+    (`shots/mk5/c013.png`).
+  Branches: merge/unity-rekey 64efd78e (own round), merge/unity-seed
+  1bf5ba09 on it (worktree wt/unity-rk); merge/unity 1d5b26d9 (pin).
+  Natively the JIT seeds only the main image too (gexc's
+  FjitTranslator::image); a Translator hook per mapped object would do
+  the same there.
