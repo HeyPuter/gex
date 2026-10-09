@@ -822,6 +822,88 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
 - Not yet run: the page itself (Chrome), and threads that start inside
   native code under load.
 
+### 3.17 Process start under W3 (2026-10-09)
+
+The session boot (wineboot, services, plugplay, winedevice, explorer,
+rpcss, then the program) took 77 s on edger, 8-12 s for each Wine child.
+In 52 s of Undertale's load the program was waiting for it. Where each
+child's time went, and the fixes:
+
+| Cost per child (edger, warm cache) | Before | After | Fix |
+|---|---|---|---|
+| Runtime translations of the i386 DLLs (ole32, rpcrt4, advapi32, combase, shell32, ...) recompiled | 2-3.7 s (about 30 s of compile wall per boot) | 0 | function-tier units, below |
+| fork copying Wine's 3 GiB of PROT_NONE reservations (2 forks per child) | 1.0-1.6 s each | 0.03-0.05 s | `MemoryMap::clean` + a pagemap-guided sparse copy |
+| anonymous mmap zeroing those reservations | 24 GiB per boot | 13 MiB | the same `clean` ranges |
+| the image key (Debug text of the options, which held the whole 5.7 MB ELF) | 0.4-1.4 s | 0.01 s | `xlate_identity` + an in-process memo |
+| Wine's PE module read, hashed, parsed, loaded | 0.3 s | 0 after the first | one engine per host process, `wasmdll::parsed_module` |
+| the loader (wasmprog) compiled | about 2 s | 0.05-0.1 s | its cwasm in the module cache |
+| getaddrinfo of the host name (wineboot) | 5 s, once | 0 | poll skips fd < 0; recvmsg names the sender |
+
+**Function-tier units for Wine's i386 DLLs.** Tier-1's units are not
+reusable across processes: each holds the page-table bases and the
+"already translated" set of the process that made it, so their wasm, and
+so their cache keys, differ per process. About 930 new module-cache
+entries were written per warm boot. Wine's ntdll.so already reports every
+image it maps (`gex.image_mapped`, after `map_image_into_view`). For an
+i386 image (not a skeleton), `nt_cgen::w3_image` now installs the
+function-tier unit built for its bytes at its base, as the NT layer's
+images get theirs. The unit's compiled code then comes from the module
+cache in every process. An image Wine moves (its relocations come later,
+from ntdll's PE side) mismatches at map time and is placed at its first
+miss instead (`w3_miss`). A mismatch then, or a missing unit, leaves it on
+tier-1, which is never fatal.
+
+Units are built at staging. Run once with `GEX_W3_TRACE=1`, then
+`$W/cgen-w3.sh GEXC LOG` runs `gexc cgen-image PATH --pe-base BASE` for
+every "no function-tier unit" line, with `GEX_CGEN_PRECOMPILE=1` so it
+also compiles each unit's `c.cwasm` for that host. Run it on the machine
+that runs the program. The session boot's 53 images take 9 minutes on
+gooner (12 jobs) and 66 MB of units. Undertale's 35 more take 21 minutes
+and 105 MB.
+
+| Variable | Effect |
+|---|---|
+| `GEX_W3_UNITS` | unset: Wine's own images only (its dll directory); `all`: the program's images too; `0`: no units |
+| `GEX_W3_UNITS_SKIP=a.dll,...` | leaves those images on tier-1 |
+| `GEX_W3_UNITS_BUILD=1` | builds missing units in the background for the next run |
+| `GEX_W3_UNIT_MAX_BODY` | the run-time compile limit below, in bytes |
+
+**Compiling a unit is kept off the guest's path.** A unit with no cwasm
+for this host yet is compiled on one background thread of the host
+process ("gex-unit-cc"), smallest unit first. Until it is ready, that
+process runs the image on tier-1. A unit whose largest function body is
+over 640 KiB is never compiled at run time, only at staging.
+
+The limit exists because of d3dx9_43's unit. Its one 828 KB function
+takes Cranelift's register allocator about ten minutes. Compiled at map
+time, it stopped Undertale's main thread for the whole run, so the game
+never reached a frame. Size is only a rough guide: wined3d's 444 KB
+function compiles in seconds.
+
+`nt_cgen::prepared` remembers, per host process, what placing an image
+needs: its relocated segments, unit key, cwasm and entries. The unit
+key's SHA-256 had been about 19% of a session boot's samples.
+
+Result (edger, `wine cmd /c echo`, warm):
+
+| Build | Boot time |
+|---|---|
+| e (before) | 76.9 / 76.8 s |
+| j (units, plus the earlier fixes) | 15.4-16.2 s |
+| k (j, plus the engine, PE-module and image-key fixes) | 9.4-9.9 s |
+| k with `GEX_W3_UNITS=0` | 31.0 s; 11.5 s when tier-1's per-process keys happen to repeat a previous run's |
+
+A child now starts its Wine PE side 0.25 s after its fork.
+
+**In the page.** The browser's fork slices every VMA (about 2.6 GiB per
+fork) and `writeSparse` scans it in the child. The clean ranges need
+exporting to the page's fork (the VMA blob) before that cost goes. The
+browser has no `gex.image_mapped` for W3 yet. Its units path
+(`shims/browser/src/cgen.rs`) takes images only from the NT layer's
+section hook. Wiring the import to push a `Pending` gives the page the
+same unit placement, with units fetched as assets by key. The kernel fixes
+(clean ranges, poll, recvmsg) are shared code.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
