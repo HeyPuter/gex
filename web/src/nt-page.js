@@ -139,6 +139,9 @@ async function main() {
   if (q.get('aot')) globalThis.GEX_AOT = 1;
   if (q.get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
   if (q.get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
+  // `?attachtrace=1`: time each thread Worker from the guest's clone to its
+  // start (host.mjs, gex.mjs `#catchUp`), as main.js does for the demos.
+  if (q.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
   canvas.width = w;
