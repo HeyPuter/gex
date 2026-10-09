@@ -217,13 +217,16 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
     // With `?fjitlibs=` rules, callees outside them are not brought in either.
     let rules = !lock(&LIBS).is_empty();
-    // A callee some unit (or an earlier translation) already serves is not
-    // brought into the batch: the call reaches it through the table. Without
-    // this, a miss in UnityPlayer (a function its unit lacks) re-translated up
-    // to 63 of the unit's own functions with it -- 3,667 functions and 36 MiB
-    // of wasm by HK's menu (ht3), JIT code shadowing clang's.
+    // A callee a unit already serves is not brought into the batch: the call
+    // reaches it through the table. Without this, a miss in UnityPlayer (a
+    // function its unit lacks) re-translated up to 63 of the unit's own
+    // functions with it -- 3,667 functions and 36 MiB of wasm by HK's menu
+    // (ht3), JIT code shadowing clang's. Only the unit tier: `executable` is
+    // also what instruction fetch asks of every byte, and the JIT publishes
+    // resume points inside functions, so counting its own entries made it
+    // decode `cmovle` in libxcb's `_xcb_in_read_block` as illegal (hu15).
     let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
-    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::index_of(a).is_some());
+    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a));
     let executable = |a: u64| {
         exec.iter().any(|&(s, e)| a >= s && a < e)
             && !crate::cgen::elfprov::provided(a)

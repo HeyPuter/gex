@@ -1065,6 +1065,13 @@ pub(crate) fn index_of(addr: u64) -> Option<u32> {
     ftab(|m| m.get(addr).map(|f| f.idx))
 }
 
+/// Whether a unit built ahead of time (or a provider) serves the function at
+/// `addr`: not the JIT's own functions, whose resume points are published
+/// at addresses inside functions.
+pub(crate) fn unit_serves(addr: u64) -> bool {
+    ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
+}
+
 /// How many units are published: a Worker installs up to this many.
 #[no_mangle]
 pub extern "C" fn gex_cgen_count() -> u32 {
