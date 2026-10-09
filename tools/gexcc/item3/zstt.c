@@ -10,9 +10,12 @@
  *                   with zstd's, each forked half way through compression,
  *                   finished and checked in both processes; and the struct
  *                   by value calls (ZSTD_getCParams, ZSTD_cParam_getBounds,
- *                   ZSTD_createCCtx_advanced). One JSON line each. */
+ *                   ZSTD_createCCtx_advanced). One JSON line each.
+ *   zstt checkd     and ZDICT_trainFromBuffer, a dictionary's round trip */
 #define ZSTD_STATIC_LINKING_ONLY
 #include "zstd.h"
+#define ZDICT_STATIC_LINKING_ONLY
+#include "zdict.h"
 #include <stdint.h>
 
 static long sys6(long n, long a, long b, long c, long d, long e, long f)
@@ -120,6 +123,31 @@ static int structs(void)
 	return ZSTD_isError(b.error) || b.upperBound < 19 || p.windowLog < 20;
 }
 
+/* The dictionary builder (with the LP64 libc): train on 1000 pieces of the
+ * data, then compress a piece with and without the dictionary. */
+static unsigned char dict[16384];
+static size_t sizes[1000];
+static int dictcheck(void)
+{
+	for (int i = 0; i < 1000; i++) sizes[i] = 2048;
+	size_t d = ZDICT_trainFromBuffer(dict, sizeof dict, src, sizes, 1000);
+	int bad = ZDICT_isError(d);
+	size_t plain = 0, with = 0, back_n = 0;
+	if (!bad) {
+		ZSTD_CCtx *c = ZSTD_createCCtx();
+		ZSTD_DCtx *dc = ZSTD_createDCtx();
+		plain = ZSTD_compressCCtx(c, dst, sizeof dst, src + (3 << 20), 2048, 3);
+		with = ZSTD_compress_usingDict(c, dst, sizeof dst, src + (3 << 20), 2048, dict, d, 3);
+		back_n = ZSTD_decompress_usingDict(dc, back, N, dst, with, dict, d);
+		bad = ZSTD_isError(plain) || ZSTD_isError(with) || back_n != 2048 || !eq(back, src + (3 << 20), 2048) || ZDICT_getDictID(dict, d) == 0;
+		ZSTD_freeCCtx(c); ZSTD_freeDCtx(dc);
+	}
+	put("{\"dict\":"); putu(bad ? 0 : d); put(",\"plain\":"); putu(plain); put(",\"with\":"); putu(with);
+	put(",\"ok\":"); put(bad ? "false" : "true"); put("}\n");
+	flush();
+	return bad;
+}
+
 void cmain(long *sp)
 {
 	const char *variant = sp[0] > 1 ? (const char *)sp[2] : "zstt";
@@ -133,7 +161,8 @@ void cmain(long *sp)
 		if ((x & 0xff) == 7 && i < N) src[i++] = 'A' + (x >> 24) % 26;
 	}
 	if (variant[0] == 'c' && variant[1] == 'h' && variant[2] == 'e' && variant[3] == 'c' && variant[4] == 'k') {
-		int bad = structs() | check(1) | check(0);
+		/* checkd: the dictionary builder too */
+		int bad = structs() | check(1) | check(0) | (variant[5] == 'd' ? dictcheck() : 0);
 		sys6(94, bad, 0, 0, 0, 0, 0);
 	}
 	double tc[5], tu[5];

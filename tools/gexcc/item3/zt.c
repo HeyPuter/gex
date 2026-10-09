@@ -6,6 +6,7 @@
  * 4 MiB of text-like data, and checksums.
  *
  *   zt [VARIANT]
+ *   zt checkgz: gzopen/gzwrite/gzread (the LP64 libc's file I/O)
  *   zt check: streams with the program's own zalloc/zfree (zlib calls back
  *   into guest code) and with zlib's, each forked half way through deflate:
  *   parent and child finish it and check the result. One JSON line each. */
@@ -53,6 +54,11 @@ int deflateEnd(z_stream *);
 int inflateInit_(z_stream *, const char *, int);
 int inflate(z_stream *, int);
 int inflateEnd(z_stream *);
+typedef struct gzFile_s *gzFile;
+gzFile gzopen(const char *, const char *);
+int gzwrite(gzFile, const void *, unsigned);
+int gzread(gzFile, void *, unsigned);
+int gzclose(gzFile);
 
 /* The program's allocator: a bump arena; zfree checks it only ever gets
  * the arena's blocks. */
@@ -77,6 +83,7 @@ enum { N = 4 << 20 };
 static unsigned char src[N], back[N], dst[N + N / 8 + 1024];
 
 static int check(int custom);
+static int checkgz(void);
 void cmain(long *sp)
 {
 	const char *variant = sp[0] > 1 ? (const char *)sp[2] : "zt";
@@ -92,7 +99,9 @@ void cmain(long *sp)
 	}
 	if (is_check) {
 		/* check: both; checkc, checkz: the program's allocator, zlib's */
-		int bad = (variant[5] != 'z' ? check(1) : 0) | (variant[5] != 'c' ? check(0) : 0);
+		/* checkgz: zlib's file functions (the library's own open/read/write) */
+		int bad = variant[5] == 'g' ? checkgz() :
+			(variant[5] != 'z' ? check(1) : 0) | (variant[5] != 'c' ? check(0) : 0);
 		sys6(94, bad, 0, 0, 0, 0, 0);
 	}
 	double tc[5], tu[5];
@@ -155,6 +164,25 @@ static int check(int custom)
 	put(",\"foreign\":"); putu(foreign); put(",\"ok\":"); put(bad ? "false" : "true"); put("}\n");
 	sys6(64, 1, (long)buf, len, 0, 0, 0);
 	if (pid == 0) sys6(94, bad, 0, 0, 0, 0, 0);
+	return bad;
+}
+static int checkgz(void)
+{
+	static const char path[] = "/tmp/zt.gz";
+	gzFile f = gzopen(path, "wb6");
+	int bad = !f;
+	for (unsigned long i = 0; !bad && i < N; i += 65536) bad = gzwrite(f, src + i, 65536) != 65536;
+	if (f) bad |= gzclose(f) != 0;
+	long st[16] = { 0 };
+	long fd = sys6(56, -100, (long)path, 0, 0, 0, 0); /* openat */
+	if (fd >= 0) { sys6(80, fd, (long)st, 0, 0, 0, 0); sys6(57, fd, 0, 0, 0, 0, 0); } /* fstat, close */
+	unsigned long got = 0;
+	f = bad ? 0 : gzopen(path, "rb");
+	if (f) { int n; while ((n = gzread(f, back + got, 100000)) > 0) got += n; bad |= gzclose(f) != 0; }
+	bad |= got != N || !streq(src, back, N);
+	len = 0;
+	put("{\"check\":\"gz\",\"file\":"); putu(st[6]); put(",\"read\":"); putu(got); put(",\"ok\":"); put(bad ? "false" : "true"); put("}\n");
+	sys6(64, 1, (long)buf, len, 0, 0, 0);
 	return bad;
 }
 __asm__(".globl _start\n_start:\n mov x29, #0\n mov x0, sp\n and sp, x0, #-16\n bl cmain\n");

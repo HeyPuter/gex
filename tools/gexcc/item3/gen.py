@@ -7,12 +7,16 @@ pointer arguments and results, and structs by value as AAPCS64 passes them
 (up to 16 bytes in registers, larger ones by reference; a larger result
 through x8). No floating point (none in zlib's or zstd's API).
 
-  gen.py LIB EXPORTS|- HEADER... > adapters.c
+  gen.py LIB [--gz] EXPORTS|- HEADER... > adapters.c
   LIB: zlib or zstd (which declaration macros mark an export)
 """
 import re, sys
 
-lib, exp_arg, headers = sys.argv[1], sys.argv[2], sys.argv[3:]
+args = sys.argv[1:]
+gz = '--gz' in args            # zlib's gz* too (with the LP64 libc)
+args = [a for a in args if a != '--gz']
+lib, exp_arg, headers = args[0], args[1], args[2:]
+# (gzopen_w is Windows's, under an #if gen.py does not read)
 DECL = {
     'zlib': r'ZEXTERN\s+([^;{]*?)\s*\bZEXPORT[VA]?\s+(\w+)\s*\(([^;{]*?)\)\s*;',
     'zstd': r'\b(?:ZSTDLIB_API|ZSTDLIB_STATIC_API|ZDICTLIB_API|ZDICTLIB_STATIC_API)\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
@@ -50,11 +54,10 @@ for e in exports:
     if e not in protos:
         continue
     ret, params = protos[e]
-    if '...' in params or 'gzFile' in params + ret or 'va_list' in params or re.search(r'\b(float|double)\b', params + ret):
+    if e == 'gzopen_w' or '...' in params or (not gz and ('gzFile' in params + ret or e.startswith('gz'))) or 'va_list' in params or re.search(r'\b(float|double)\b', params + ret):
         continue
     ps = [] if params in ('', 'void') else [ptype(p) for p in params.split(',')]
     print(f'GEXP(gexp_{e}) {{')
-    print('\ta64_enter(ctx);')
     print('\tunsigned k = 0;')
     names = []
     for i, t in enumerate(ps):
@@ -70,6 +73,12 @@ for e in exports:
         else:
             print(f'\t{t} {v} = ({t})A64_ARG(ctx, k++);')
         names.append(v)
+    # after the arguments are read: a thread's first entry may make syscalls
+    print('\ta64_enter(ctx);')
+    # Which export this thread last entered (for a crash's report). It also
+    # keeps adapters of identical code apart (ZSTD_isError, ZDICT_isError),
+    # which wasm-opt would merge under one name, losing the other's slot.
+    print(f'\ta64_last_export = {len(table) + 1};')
     call = f'{e}({", ".join(names)})'
     if ret == 'void':
         print(f'\t{call};')
