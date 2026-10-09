@@ -1,0 +1,38 @@
+diff --git a/src/mono/mono/mini/jit-icalls.c b/src/mono/mono/mini/jit-icalls.c
+index 2f18c3115..2c782536b 100644
+--- a/src/mono/mono/mini/jit-icalls.c
++++ b/src/mono/mono/mini/jit-icalls.c
+@@ -157,6 +157,16 @@ mono_ldftn (MonoMethod *method)
+ 		}
+ 	}
+ 
++#ifdef HOST_GEX
++	/* gex runs Mono interpreter-only (MONO_AOT_MODE_INTERP_ONLY, not llvm-only); the only mini-compiled code is
++	 * the wasm JIT's. A function pointer it loads goes to the interpreter (a delegate .ctor the JIT calls through
++	 * interp_entry, ves_icall_mono_delegate_ctor_interp; the JIT bails on raw calli), which takes function
++	 * pointers as InterpMethod* (its MINT_LDFTN). create_method_pointer's native entry read as an InterpMethod
++	 * gave a NULL method there (Hollow Knight, tk2dSpriteAnimator.Start). */
++	if (mono_use_interpreter && method->wrapper_type != MONO_WRAPPER_NATIVE_TO_MANAGED)
++		return mini_get_interp_callbacks ()->get_interp_method (method);
++#endif
++
+ 	/* if we need the address of a native-to-managed wrapper, just compile it now, trampoline needs thread local
+ 	 * variables that won't be there if we run on a thread that's not attached yet. */
+ 	if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
+@@ -211,6 +221,16 @@ ldvirtfn_internal (MonoObject *obj, MonoMethod *method, gboolean gshared)
+ 
+ 	/* An rgctx wrapper is added by the trampolines no need to do it here */
+ 	gboolean need_unbox = m_class_is_valuetype (res->klass) && !m_class_is_valuetype (method->klass);
++#ifdef HOST_GEX
++	/* As mono_ldftn: the interpreter's function pointer (its MINT_LDVIRTFTN: the InterpMethod*, bit 0 set when
++	 * the receiver must be unboxed). */
++	if (mono_use_interpreter) {
++		gpointer im = mini_get_interp_callbacks ()->get_interp_method (res);
++		addr = need_unbox ? (gpointer)((gsize)im | 1) : im;
++		ldvirtfn_cache_write (cache, method, gshared, addr);
++		return addr;
++	}
++#endif
+ 	if (need_unbox) {
+ 		/*
+ 		 * We can't return a jump trampoline here, because the trampoline code

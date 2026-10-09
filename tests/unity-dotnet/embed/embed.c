@@ -230,6 +230,12 @@ main (int argc, char **argv)
 	P clr = mono_runtime_invoke (clears, NULL, clargs, &exc);
 	check ("Clears", exc);
 	printf ("%s\n", mono_string_to_utf8 (clr));
+	P dels = mono_class_get_method_from_name (k, "Delegates", 1);
+	int dn = 40;
+	void *dargs [1] = { &dn };
+	P dr = mono_runtime_invoke (dels, NULL, dargs, &exc);
+	check ("Delegates", exc);
+	printf ("%s\n", mono_string_to_utf8 (dr));
 	/* The liveness walk Unity's UnloadUnusedAssets runs: every Leaf reachable from the root,
 	 * each reported once, in batches of at most 16. */
 	P lvg = mono_class_get_method_from_name (k, "LvGraph", 1);
