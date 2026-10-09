@@ -67,3 +67,20 @@ depends   fontconfig    fonts-dejavu-core
 foot      foot          *
 depends   foot          xkb-data
 depends   foot          fontconfig
+depends   foot          libx11-data
+# X11 clients and SDL: static libraries; the locale and compose data are
+# Debian's libx11-data. Chocolate Doom's engine, on Debian's Freedoom WADs
+xorgproto -             *
+xtrans    -             *
+xcb-proto -             *
+libxau    -             *
+libxdmcp  -             *
+libxcb    -             *
+libx11    -             *
+libxext   -             *
+libsdl2   -             *
+libsdl2-net -           *
+libsdl2-mixer -         *
+chocolate-doom chocolate-doom usr/bin/chocolate-doom usr/bin/chocolate-doom-setup usr/share/applications/org.chocolate_doom.Doom* usr/share/icons/* usr/share/metainfo/org.chocolate_doom.Doom*
+chocolate-doom -        *
+depends   chocolate-doom freedoom

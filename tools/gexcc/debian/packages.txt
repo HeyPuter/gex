@@ -71,3 +71,15 @@ utf8proc       2.9.0-1                        gui
 tllist         1.1.0-1                        gui
 fcft           3.3.1-1                        gui
 foot           1.21.0-2                       gui
+xorgproto      2024.1-1                       gui
+xtrans         1.4.0-1                        gui
+xcb-proto      1.17.0-1                       gui
+libxau         1:1.0.11-1                     gui
+libxdmcp       1:1.1.5-1                      gui
+libxcb         1.17.0-2                       gui
+libx11         2:1.8.12-1                     gui
+libxext        2:1.3.4-1                      gui
+libsdl2        2.32.4+dfsg-1                  gui
+libsdl2-net    2.2.0+dfsg-3                   gui
+libsdl2-mixer  2.8.1+dfsg-2                   gui
+chocolate-doom 3.1.0-1                        gui

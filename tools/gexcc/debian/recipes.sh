@@ -746,3 +746,61 @@ build_foot() {
   meson compile -C build
   DESTDIR=$DEST ms_install
 }
+
+# -- gui: X11 clients (the page's X server, hostx) and SDL ---------------------
+
+# autotools library: configure, make, install into the staging tree and the
+# sysroot; static, with docs and specs off
+at_lib() { at_configure --enable-static --disable-shared "$@"; make -j$JOBS; both install; nola; }
+
+build_xorgproto() { at_configure --disable-specs; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_xtrans() { at_configure --disable-docs; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_xcb_proto() { at_configure; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_libxau() { at_lib; }
+build_libxdmcp() { at_lib --disable-docs; }
+build_libxcb() {
+  # xcbgen is the host's: the copy xcb-proto put in the sysroot
+  export PYTHONPATH=$(echo $SYSROOT/usr/lib/python3*/site-packages)
+  at_lib --disable-docs --without-doxygen --disable-devel-docs
+}
+build_libx11() {
+  # the keysym/compose tables are built by host tools (makekeys)
+  at_lib --disable-specs --without-xmlto --without-fop --enable-xthreads --disable-xf86bigfont \
+    --enable-malloc0returnsnull=no
+}
+build_libxext() { at_lib --disable-specs --without-xmlto --without-fop --enable-malloc0returnsnull=no; }
+
+build_libsdl2() {
+  # X11 only (Wayland needs EGL, which wasm32 programs do not have yet), linked
+  # in; no dlopen, no GL; audio through the dummy driver
+  at_lib --disable-rpath --disable-sdl-dlopen --disable-assembly --disable-video-wayland \
+    --disable-video-opengl --disable-video-opengles --disable-video-opengles1 --disable-video-opengles2 \
+    --disable-video-vulkan --disable-video-kmsdrm --disable-video-rpi --disable-video-vivante \
+    --disable-x11-shared --disable-video-x11-xinput --disable-video-x11-xrandr --disable-video-x11-scrnsaver \
+    --disable-video-x11-xcursor --disable-video-x11-xfixes --disable-video-x11-xdbe \
+    --disable-alsa --disable-pulseaudio --disable-pipewire --disable-jack --disable-sndio --disable-oss \
+    --disable-esd --disable-arts --disable-nas --disable-diskaudio --disable-libsamplerate \
+    --disable-libudev --disable-dbus --disable-ime --disable-ibus --disable-fcitx --disable-hidapi \
+    --disable-joystick-mfi --enable-pthreads
+  # static X11 pulls in xcb, Xau and Xdmcp: say so in what programs link
+  local x; x=$(wasm32-unknown-linux-musl-pkg-config --static --libs-only-l xext x11)
+  sed -i "s|-lX11 -lXext|$x|" $DEST/usr/lib/pkgconfig/sdl2.pc $SYSROOT/usr/lib/pkgconfig/sdl2.pc \
+    $DEST/usr/bin/sdl2-config $SYSROOT/usr/bin/sdl2-config
+}
+build_libsdl2_net() { at_lib --disable-gui; }
+build_libsdl2_mixer() {
+  # sound effects (WAV) and MIDI through the built-in timidity; no codecs
+  # (the dfsg tarball has no configure: autogen.sh's way, without running it)
+  [ -x configure ] || autoreconf -fi -I acinclude
+  at_lib --disable-music-cmd --disable-music-flac --disable-music-ogg --disable-music-mp3 \
+    --disable-music-mod --disable-music-opus --disable-music-midi-fluidsynth --disable-music-wavpack \
+    --disable-music-gme --enable-music-midi-timidity --enable-music-wave
+}
+build_chocolate_doom() {
+  [ -x configure ] || ACLOCAL_PATH=$SYSROOT/usr/share/aclocal autoreconf -fi
+  at_configure --disable-sdltest --without-libsamplerate --without-libpng --without-fluidsynth \
+    --disable-werror
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/man $DEST/usr/share/doc
+}
