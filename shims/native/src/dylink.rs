@@ -257,9 +257,7 @@ fn trace(p: &DyProcess, order: &[usize], what: &str, t0: std::time::Instant) {
     eprintln!("gex: wasm32 {what}: {} modules loaded in {:.3}s", order.len(), t0.elapsed().as_secs_f64());
 }
 
-/// `dlopen` handles gex gives (libgex's dl.c): above everything a 32-bit
-/// process maps data at, one per link-map entry.
-pub const HANDLE_BASE: u32 = 0xfff0_0000;
+use gex_dylink::HANDLE_BASE;
 
 /// `gex.dlopen(path)`: load a library and what it needs into the process,
 /// run their constructors; its handle. Other threads see the new modules
@@ -273,8 +271,7 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     if p.link.mods[0].info.needed.is_empty() {
         bail!("{path}: dlopen in a static program (link it with GEXCC_SHARED=1)");
     }
-    let base = path.rsplit('/').next().unwrap_or(path);
-    if let Some(i) = p.link.mods.iter().position(|m| m.path == path || m.name == path || (!path.contains('/') && m.name == base)) {
+    if let Some(i) = p.link.loaded(path) {
         return Ok(HANDLE_BASE + i as u32 * 16);
     }
     let (found, bytes) = {
@@ -299,7 +296,7 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
         all.push(b);
     }
     for m in &p.link.mods[from..] {
-        if module_value(m, "__tls_size") != 0 {
+        if m.info.value("__tls_size") != 0 {
             bail!("{}: thread-local data in a dlopen'd library is not supported yet", m.path);
         }
     }
@@ -320,59 +317,12 @@ fn dlopen(caller: &mut Caller<'_, HostState>, path: &str) -> Result<u32> {
     Ok(HANDLE_BASE + from as u32 * 16)
 }
 
-/// A global's constant value as exported (`__tls_size`), 0 for none.
-fn module_value(m: &Loaded, n: &str) -> u32 {
-    m.info
-        .exports
-        .get(n)
-        .filter(|e| e.kind == Kind::Global && e.index >= m.info.global_imports)
-        .and_then(|e| m.info.global_init.get((e.index - m.info.global_imports) as usize).copied().flatten())
-        .unwrap_or(0)
-}
-
 /// `gex.dlsym(handle, name)`: a function's table index or a datum's
 /// address; 0 when not found. Handle 0: the global scope.
 fn dlsym(caller: &mut Caller<'_, HostState>, handle: u32, name: &str) -> Result<u32> {
     let shared = shared_of(caller)?;
-    let Some(p) = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.dyproc.clone() else { return Ok(0) };
-    let scope: Vec<usize> = if handle == 0 {
-        (0..p.link.mods.len()).collect()
-    } else {
-        let first = ((handle - HANDLE_BASE) / 16) as usize;
-        // the library and what it needs, breadth first
-        let mut seen = vec![first];
-        let mut k = 0;
-        while k < seen.len() {
-            for n in &p.link.mods[seen[k]].info.needed {
-                if let Some(j) = p.link.mods.iter().position(|m| &m.name == n) {
-                    if !seen.contains(&j) {
-                        seen.push(j);
-                    }
-                }
-            }
-            k += 1;
-        }
-        seen
-    };
-    for i in scope {
-        let m = &p.link.mods[i];
-        let Some(e) = m.info.exports.get(name) else { continue };
-        match e.kind {
-            Kind::Func if e.index >= m.info.func_imports => {
-                let (_, at) = m.info.slots();
-                if let Some(&s) = at.get(&e.index) {
-                    return Ok(m.table_base + s);
-                }
-            }
-            Kind::Global => {
-                if let Some(o) = m.info.data_offset(name) {
-                    return Ok(m.memory_base.wrapping_add(o));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(0)
+    let p = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.dyproc.clone();
+    Ok(p.map_or(0, |p| p.link.dlsym(handle, name)))
 }
 
 fn guest_str(caller: &mut Caller<'_, HostState>, ptr: u32) -> Result<String> {
@@ -422,90 +372,9 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-/// libc's `__gex_dsos` (gex_dso.h): every module but libc, in init order,
-/// with its TLS image and functions (table indices); the program's
-/// constructors are crt1's to run.
+/// libc's `__gex_dsos` (gex-dylink's `Link::write_registry`).
 fn write_registry(memory: &gex_mem::GuestMemory, link: &Link, order: &[usize], libc: usize) -> Result<()> {
-    let lc = &link.mods[libc];
-    let Some(off) = lc.info.data_offset("__gex_dsos") else {
-        bail!("{}: no __gex_dsos (a libc.so older than gex's loader)", lc.path);
-    };
-    let at = (lc.memory_base + off) as usize;
-    let b = memory.bytes();
-    let rd = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
-    let (version, max) = (rd(b, at), rd(b, at + 8));
-    if version != 1 {
-        bail!("{}: __gex_dsos version {version} (want 1)", lc.path);
-    }
-    let own = |m: &Loaded, n: &str| -> u32 {
-        let (_, slots) = m.info.slots();
-        m.info
-            .exports
-            .get(n)
-            .filter(|e| e.kind == Kind::Func)
-            .and_then(|e| slots.get(&e.index))
-            .map_or(0, |&s| m.table_base + s)
-    };
-    let value = |m: &Loaded, n: &str| -> u32 {
-        m.info
-            .exports
-            .get(n)
-            .filter(|e| e.kind == Kind::Global && e.index >= m.info.global_imports)
-            .and_then(|e| {
-                m.info
-                    .global_init
-                    .get((e.index - m.info.global_imports) as usize)
-                    .copied()
-                    .flatten()
-            })
-            .unwrap_or(0)
-    };
-    let mut k = 0usize;
-    for &i in order {
-        if i == libc {
-            continue;
-        }
-        if k as u32 >= max {
-            bail!("more than {max} shared libraries");
-        }
-        let m = &link.mods[i];
-        let tls_size = value(m, "__tls_size");
-        let e = at + 12 + k * 24;
-        let words = [
-            tls_size,
-            value(m, "__tls_align").max(1),
-            if tls_size != 0 { own(m, "__wasm_init_tls") } else { 0 },
-            if tls_size != 0 { own(m, "__gex_set_tls_base") } else { 0 },
-            if i == 0 { 0 } else { own(m, "__wasm_call_ctors") },
-            0,
-        ];
-        if tls_size != 0 && (words[2] == 0 || words[3] == 0) {
-            bail!(
-                "{}: has thread-local data but does not export __wasm_init_tls and __gex_set_tls_base",
-                m.path
-            );
-        }
-        for (j, w) in words.iter().enumerate() {
-            b[e + j * 4..e + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
-        }
-        k += 1;
-    }
-    // libc's own constructors first (it is initialised before anything it
-    // serves): it goes at the head
-    let lctors = own(lc, "__wasm_call_ctors");
-    if lctors != 0 {
-        if k as u32 >= max {
-            bail!("more than {max} shared libraries");
-        }
-        b.copy_within(at + 12..at + 12 + k * 24, at + 12 + 24);
-        let w = [0u32, 1, 0, 0, lctors, 0];
-        for (j, x) in w.iter().enumerate() {
-            b[at + 12 + j * 4..at + 16 + j * 4].copy_from_slice(&x.to_le_bytes());
-        }
-        k += 1;
-    }
-    b[at + 4..at + 8].copy_from_slice(&(k as u32).to_le_bytes());
-    Ok(())
+    link.write_registry(memory.bytes(), order, libc)
 }
 
 /// Define module `module`'s imports per its [`Binds`] in `l`.

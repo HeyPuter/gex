@@ -869,6 +869,152 @@ impl Link {
     }
 }
 
+/// `dlopen` handles gex gives (libgex's dl.c): above everything a 32-bit
+/// process maps data at, one per link-map entry.
+pub const HANDLE_BASE: u32 = 0xfff0_0000;
+
+impl Info {
+    /// An exported global's constant value (`__tls_size`), 0 for none.
+    pub fn value(&self, name: &str) -> u32 {
+        self.exports
+            .get(name)
+            .filter(|e| e.kind == Kind::Global && e.index >= self.global_imports)
+            .and_then(|e| self.global_init.get((e.index - self.global_imports) as usize).copied().flatten())
+            .unwrap_or(0)
+    }
+}
+
+impl Loaded {
+    /// The table index of this module's own exported function `name`, 0 for none.
+    pub fn own_func(&self, name: &str) -> u32 {
+        let (_, slots) = self.info.slots();
+        self.info
+            .exports
+            .get(name)
+            .filter(|e| e.kind == Kind::Func)
+            .and_then(|e| slots.get(&e.index))
+            .map_or(0, |&s| self.table_base + s)
+    }
+}
+
+impl Link {
+    /// The link-map entry `dlopen(path)` names, if loaded: by path, by the
+    /// name it was loaded as, or, for a bare name, by soname.
+    pub fn loaded(&self, path: &str) -> Option<usize> {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        self.mods
+            .iter()
+            .position(|m| m.path == path || m.name == path || (!path.contains('/') && m.name == base))
+    }
+
+    /// `dlsym(handle, name)`: a function's table index or a datum's
+    /// address; 0 when not found. Handle 0: the global scope; otherwise
+    /// the library and what it needs, breadth first.
+    pub fn dlsym(&self, handle: u32, name: &str) -> u32 {
+        let scope: Vec<usize> = if handle == 0 {
+            (0..self.mods.len()).collect()
+        } else {
+            let first = (handle.wrapping_sub(HANDLE_BASE) / 16) as usize;
+            if first >= self.mods.len() {
+                return 0;
+            }
+            let mut seen = vec![first];
+            let mut k = 0;
+            while k < seen.len() {
+                for n in &self.mods[seen[k]].info.needed {
+                    if let Some(j) = self.mods.iter().position(|m| &m.name == n) {
+                        if !seen.contains(&j) {
+                            seen.push(j);
+                        }
+                    }
+                }
+                k += 1;
+            }
+            seen
+        };
+        for i in scope {
+            let m = &self.mods[i];
+            let Some(e) = m.info.exports.get(name) else { continue };
+            match e.kind {
+                Kind::Func if e.index >= m.info.func_imports => {
+                    let (_, at) = m.info.slots();
+                    if let Some(&s) = at.get(&e.index) {
+                        return m.table_base + s;
+                    }
+                }
+                Kind::Global => {
+                    if let Some(o) = m.info.data_offset(name) {
+                        return m.memory_base.wrapping_add(o);
+                    }
+                }
+                _ => {}
+            }
+        }
+        0
+    }
+
+    /// Fill libc's `__gex_dsos` (musl's gex_dso.h) in `mem`, the process's
+    /// memory: every module but libc (index `libc`), in init order
+    /// `order`, with its TLS image and functions (table indices), libc's
+    /// own constructors at the head; the program's constructors are
+    /// crt1's to run.
+    pub fn write_registry(&self, mem: &mut [u8], order: &[usize], libc: usize) -> Result<()> {
+        let lc = &self.mods[libc];
+        let Some(off) = lc.info.data_offset("__gex_dsos") else {
+            bail!("{}: no __gex_dsos (a libc.so older than gex's loader)", lc.path);
+        };
+        let at = (lc.memory_base + off) as usize;
+        let rd = |b: &[u8], a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap());
+        if mem.len() < at + 12 {
+            bail!("{}: __gex_dsos outside memory", lc.path);
+        }
+        let (version, max) = (rd(mem, at), rd(mem, at + 8));
+        if version != 1 {
+            bail!("{}: __gex_dsos version {version} (want 1)", lc.path);
+        }
+        if mem.len() < at + 12 + max as usize * 24 {
+            bail!("{}: __gex_dsos outside memory", lc.path);
+        }
+        let mut entries: Vec<[u32; 6]> = Vec::new();
+        // libc's own constructors first (it is initialised before anything
+        // it serves)
+        let lctors = lc.own_func("__wasm_call_ctors");
+        if lctors != 0 {
+            entries.push([0, 1, 0, 0, lctors, 0]);
+        }
+        for &i in order {
+            if i == libc {
+                continue;
+            }
+            let m = &self.mods[i];
+            let tls_size = m.info.value("__tls_size");
+            let w = [
+                tls_size,
+                m.info.value("__tls_align").max(1),
+                if tls_size != 0 { m.own_func("__wasm_init_tls") } else { 0 },
+                if tls_size != 0 { m.own_func("__gex_set_tls_base") } else { 0 },
+                if i == 0 { 0 } else { m.own_func("__wasm_call_ctors") },
+                0,
+            ];
+            if tls_size != 0 && (w[2] == 0 || w[3] == 0) {
+                bail!("{}: has thread-local data but does not export __wasm_init_tls and __gex_set_tls_base", m.path);
+            }
+            entries.push(w);
+        }
+        if entries.len() > max as usize {
+            bail!("more than {max} shared libraries");
+        }
+        for (k, w) in entries.iter().enumerate() {
+            for (j, x) in w.iter().enumerate() {
+                let a = at + 12 + k * 24 + j * 4;
+                mem[a..a + 4].copy_from_slice(&x.to_le_bytes());
+            }
+        }
+        mem[at + 4..at + 8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        Ok(())
+    }
+}
+
 /// Search for library `name` (a soname, or a path when it has a `/`): the
 /// run path (`$ORIGIN` is the program's directory), `ld_library_path`,
 /// then [`DEFAULT_DIRS`]. `read` gives a file's bytes.
