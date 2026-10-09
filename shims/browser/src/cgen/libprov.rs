@@ -9,6 +9,11 @@
 //! low guest memory, its bytes in the shim's heap for every Worker to
 //! instantiate (`gex.mjs` `#cgenInstall`, with the wasm64 `provider_*` imports).
 //!
+//! A library nothing names is replaced all the same when the guest's
+//! filesystem has a provider installed for its soname, under
+//! `/usr/lib/gex/<arch>/<soname>.wasm` (`libz.so.1.wasm` for an arm64
+//! program's `libz.so.1`); `noauto` in the list turns that off.
+//!
 //! The protocol with `gex.mjs` (`#cgenProviders`):
 //!   - a unit's provider `i` with `gex_cgen_provider_libprov(u, i)` set is
 //!     published by `gex_libprov_publish(u, i)`, which returns its provider
@@ -62,13 +67,56 @@ pub extern "C" fn gex_libprov_config(ptr: u32, len: u32) {
     let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
     let mut v = lock(&DLLS);
     for item in spec.split(',') {
-        if let Some((so, path)) = item.split_once('=') {
+        if item.trim() == "noauto" {
+            AUTO.store(false, Ordering::Relaxed);
+        } else if let Some((so, path)) = item.split_once('=') {
             let pair = (so.trim().to_string(), path.trim().to_string());
             if !v.contains(&pair) {
                 v.push(pair);
             }
         }
     }
+}
+
+/// Whether a library nothing names is replaced by the provider installed
+/// for its soname (`noauto` in the list turns it off).
+static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Where the guest's filesystem holds providers: `<dir>/<arch>/<soname>.wasm`
+/// (`/usr/lib/gex/aarch64/libz.so.1.wasm`), the arch the ELF machine's.
+pub(crate) const PROVIDER_DIR: &str = "/usr/lib/gex";
+
+/// Sonames already looked for under [`PROVIDER_DIR`], and what was found.
+static AUTO_SEEN: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+
+/// The provider installed for the library mapped from `path` (file name
+/// `file`), if there is one: an ELF shared object whose machine has a
+/// directory under [`PROVIDER_DIR`] holding `<file>.wasm`.
+fn installed(path: &str, file: &str) -> Option<String> {
+    if !AUTO.load(Ordering::Relaxed) || !file.contains(".so") {
+        return None;
+    }
+    let key = format!("{path}\0{file}");
+    if let Some((_, r)) = lock(&AUTO_SEEN).iter().find(|(k, _)| *k == key) {
+        return r.clone();
+    }
+    let found = crate::with_host(|h| {
+        let mut ehdr = [0u8; 20];
+        if h.kernel.read_file_at(path, 0, &mut ehdr) != Some(20) || ehdr[..4] != *b"\x7fELF" {
+            return None;
+        }
+        let arch = match u16::from_le_bytes([ehdr[18], ehdr[19]]) {
+            183 => "aarch64",
+            62 => "x86_64",
+            3 => "i386",
+            _ => return None,
+        };
+        let wasm = format!("{PROVIDER_DIR}/{arch}/{file}.wasm");
+        let mut magic = [0u8; 4];
+        (h.kernel.read_file_at(&wasm, 0, &mut magic) == Some(4) && magic == *b"\0asm").then_some(wasm)
+    });
+    lock(&AUTO_SEEN).push((key, found.clone()));
+    found
 }
 
 /// Whether `addr` is in a replaced library's text.
@@ -131,7 +179,7 @@ static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 pub(crate) fn rescan_if_new() -> Option<usize> {
     let pid = crate::with_host(|h| h.kernel.pid);
     let was = PID.swap(pid, Ordering::AcqRel);
-    if was == pid || lock(&DLLS).is_empty() {
+    if was == pid || (lock(&DLLS).is_empty() && !AUTO.load(Ordering::Relaxed)) {
         return None;
     }
     lock(&LIBS).clear();
@@ -155,7 +203,7 @@ pub(crate) fn rescan_if_new() -> Option<usize> {
 /// queued.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
     let dlls = lock(&DLLS).clone();
-    if dlls.is_empty() {
+    if dlls.is_empty() && !AUTO.load(Ordering::Relaxed) {
         return None;
     }
     if PID.load(Ordering::Acquire) == 0 {
@@ -164,8 +212,9 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
     let mut queued = None;
     for m in mapped {
         let file = m.path.rsplit('/').next().unwrap_or(&m.path);
-        let Some((_, wasm_path)) = dlls.iter().find(|(so, _)| so == file) else { continue };
-        match prepare(m, wasm_path) {
+        let named = dlls.iter().find(|(so, _)| so == file).map(|(_, w)| w.clone());
+        let Some(wasm_path) = named.or_else(|| installed(&m.path, file)) else { continue };
+        match prepare(m, &wasm_path) {
             Ok(Some(u)) => queued = Some(u),
             Ok(None) => {}
             Err(e) => {
