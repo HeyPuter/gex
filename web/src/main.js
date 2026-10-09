@@ -114,8 +114,16 @@ async function rootfs(url) {
   const buf = await fetchBytes(url, (got, total) => {
     busy(total ? `fetching root filesystem — ${bytes(got)} of ${bytes(total)}` : `fetching root filesystem — ${bytes(got)}`);
   });
+  let raw = buf;
+  if (url.split('?')[0].endsWith('.zst')) {
+    busy('decompressing');
+    const { ZSTDDecoder } = await import('../eject-site/vendor/zstddec-stream.mjs');
+    const d = new ZSTDDecoder();
+    await d.init();
+    raw = d.decode(buf);
+  }
   busy('unpacking');
-  const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  const tree = untar(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
   rootfsCache.set(url, tree);
   return tree;
 }
