@@ -900,6 +900,12 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     const POLLIN: u16 = 0x001;
     const POLLOUT: u16 = 0x004;
     const POLLNVAL: u16 = 0x020;
+    // A negative descriptor is a slot the caller switched off: no events, as
+    // on Linux (musl's resolver keeps its TCP-fallback slots at -1, and
+    // POLLNVAL there made every getaddrinfo time out with EAI_AGAIN).
+    if p.fd < 0 {
+        return 0;
+    }
     let Some(h) = &p.handle else {
         return POLLNVAL;
     };
@@ -6546,9 +6552,24 @@ impl Kernel {
                 break;
             }
         }
+        // Who sent it, as recvfrom says: musl's resolver drops a reply whose
+        // msg_name is not one of its nameservers. A unix peer has no name.
+        let name = self.msg_rd(m, msg, 0)?;
+        let namelen_at = msg + if self.compat { 4 } else { 8 };
+        if name != 0 {
+            if unix_sock.is_some() {
+                m.write_u32(namelen_at, 0)?;
+            } else {
+                let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
+                let (ip, port) = peer.unwrap_or((0, 0));
+                self.sys_write_sockaddr(m, ip, port, name, namelen_at)?;
+            }
+        }
         let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
+        // msg_flags (int): nothing truncated
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
         Ok(total)
     }
 
