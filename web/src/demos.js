@@ -474,7 +474,7 @@ async function bootNativeDebian(ctx) {
         'DEBIAN_FRONTEND=noninteractive',
         'LANG=C.UTF-8',
       ],
-      args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-l'],
+      args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-l', '-i'],
       cwd: '/root',
       tty: true,
       network,
