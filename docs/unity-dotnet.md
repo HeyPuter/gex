@@ -1801,3 +1801,364 @@ Not yet:
          applies the browser's flat-layout cuts natively, to test that.
      - HK's UnityPlayer maps at 0x11752000 in the page. A unit for that
        base is building on gooner (`scratch/unity/units/build-hk-page.log`).
+     - **Bisecting the HK fjit black screen** (`?fjitlibs=+name,-name`,
+       731faf46; `scratch/unity/page/hk-bis.sh NAME LIBS` gives the last
+       readback's mean brightness: the menu ~37-40, the failure 0):
+
+       | run | fjitlibs | result |
+       |---|---|---|
+       | hb1 | -UnityPlayer.so | black |
+       | hb2 | -UnityPlayer.so,-libc.so.6 | black |
+       | hb3 | +none.so (JIT on, no object) | menu |
+       | hb4 | +libxcb.so.1,+libX11.so.6 | menu (lit 59k from ~210 s; the last readback only black) |
+
+       The compositor's lit-pixel count (every 30 s in the log; ~5179 is
+       the title bar alone, ~59k the menu) separates two things the last
+       readback's brightness mixed up: hb1, hb2 and hp5 are never lit,
+       while hb4 draws the menu and only its final frame is dark. So the X
+       libraries are not the cause; hp1's libxcb crash (`_xcb_in_read_block`
+       copying `queue_len` = -8 bytes) stays open.
+       - **These rules leaked:** `?fjitlibs=` was checked only on tier-1
+         dispatch misses (`serve`), not on `gex.lookup` misses, so JIT code
+         calling through a pointer or a PLT slot translated any object
+         (hb1 and hb2 still JIT-compiled UnityPlayer and libc that way).
+         841b380b checks the rules at every translation and takes
+         `name@lo-hi` (hex offsets into the mapping, as traps print them).
+       - Next with the strict rules: hb6 `+libGL.so.1` (the guest GL;
+         rendering black while presents continue points at the GL stream),
+         hb7 `-libGL.so.1`. `hk-bis.sh` now prints the lit timeline too.
+       - Native xbig (`scratch/unity/xbn/run.sh`, big X replies across
+         many socket reads) passes with `--fjit`, `--fjit --mem64` and
+         `GEX_CGEN_EXP=WASMFLAT`; the page runs of it (xb1, xb2) never
+         printed (the old xbig printed only at the end; it now reports
+         progress).
+     - **hp6 (no fjit, `elfunits=UnityPlayer.so`) did not use the unit:**
+       UnityPlayer mapped at 0x10752000, not 0x11752000. The function
+       JIT's heap spans come from the arena cursor the guest's mappings
+       use, so its 16 MiB chunk moved every later mapping in hp1. hp6 is a
+       no-unit run: first frame 108 s, 100 presents 183 s, menu 15.7-16.0
+       presents/s (hp4: 108 s, 185 s, 15.2-15.6). 841b380b adds
+       `?pins=path@base+span` (the closure pins, `gex_pin_object`).
+     - **hp7 (no fjit, the UnityPlayer unit pinned at 0x11752000,
+       `?cgen=1&elfunits=UnityPlayer.so&pins=UnityPlayer.so@11752000+2674000`):**
+       first frame 55 s (hp6 108 s), 100 presents at 100 s (hp6 183 s),
+       the menu at 24.5-27.6 presents/s from ~180 s (hp6 15.7-16.0), lit
+       from ~150 s; readback `shots/hp7/c017.png` is the real menu. Native
+       gexc on edger (integ/2026-10-08d gate leg): 30.59 presents/s, menu
+       ready at 406.5 s. So the page with the unit is about 14% slower
+       than native at the menu (26.3 vs 30.59) and reaches it sooner.
+       `hk-page.sh` runs want the pin whenever `elfunits` is given.
+     - hb6 (`+libGL.so.1`, strict) died at ~133 s: thread 24 in
+       UnityPlayer (+0x1dcbe60, tier-1) branched to 0x13450100, a mono.wasm
+       export with no bridge (SIGSEGV, status 139). Not seen in any other
+       run; hb10 repeats it.
+     - The page keeps the guest's output (`shots/NAME/out.txt`), and
+       hk-page.sh passes `-logFile -`, so HK's player log is in it.
+     - The HK UnityPlayer unit for 0x11752000 (55,439 functions, 165 MiB
+       wasm, key 81cfd177) is what hp7 ran with.
+     - **The fjit crash (hb6-hb21, strict `?fjitlibs=`).** Every run that
+       JIT-compiles libGL dies at 120-250 s, branching to the provider's
+       return address 0x13450100 (`code_page + 0x100`, depth 0). It shows up
+       on thread 24 (hb6/13/16/20) or thread 0 (hb21). hb10/17 instead had
+       thread 0's poll return to a heap address. `+libxcb,+libX11` (hb4) and
+       `+none.so` (hb3) reach the menu.
+       - Block 0x12c17e60 is UnityPlayer's `syscall@plt`. The diagnostic's
+         `.so +X` is relative to the text mapping, so UnityPlayer's base
+         there is 0x10752000. The caller is Unity's futex lock slow path at
+         +0xdf1ecd (FUTEX_WAIT_PRIVATE through `syscall()`).
+       - At the fault rax is still 0xca (futex, never answered), rcx is
+         after libc syscall()'s `syscall`, and rsp is syscall()'s entry rsp.
+         So the futex trapped out to wait, and the thread resumed at the
+         provider's ra instead of the saved pc (0x12ee34f9).
+       - Every provider guest call in the ring is 0x10d90 deeper than that
+         sp, every call-out is closed, and "provider guest call open" is
+         false.
+       - `provider_try` resets GUEST_CALLS on any exception, not only its
+         raise tag, and rethrows. So a wasm trap that unwound a provider's
+         frames would look exactly like this.
+       - hb21 (`+libGL.so.1` only; since 7e23c82a the rules also keep other
+         objects' callees out of a module) crashed the same way at 248 s. So
+         JIT'd libc is not needed for it.
+       - Diagnostics, f823644f: `[gex] a trap left through N provider guest
+         call(s)` (from provider_try, with the JS stack) and `... reached the
+         run loop with N open`. The wild-branch report now also lists the
+         Worker's last 16 set_resume calls (lib.rs line, pc).
+       - hb23 and hb24 (`+libGL.so.1,provcheck=1`) crashed the same way.
+         provcheck said every provider guest call ended at its slot + 8, and
+         the dump showed the "slot" at 0x57f4830 holding 0x12d7a280: no
+         `ret` read 0x13450100. hb22 (`+libc.so.6`) instead ran a libc
+         continuation (+0x8ea87, after `call *0x378(%r12)` into ld.so's
+         `_dl_catch_error`) with Unity's registers and called a heap address.
+       - **Cause: a stale resume (fixed in e2f06c87).** The dispatch miss
+         that recognises a call-out's return (`cgen::returned`) sets the
+         resume and traps when it cannot leave by returning, which is the
+         case with JIT bodies on the stack. `#callOut`'s catch returned on
+         `gex_callout_hit()` without reading the resume. The next time the
+         thread blocked with nothing else to run (`schedule()` returning 2;
+         here Unity's futex), the run loop took the stale resume. That was
+         the provider's ra 0x13450100 (hb21/23/24, the last resume in the
+         ring) or 0x12e63a87 (hb22). The catch now drops the resume when it
+         ends its own call-out.
+       - hb25 (`+libGL.so.1`, the fix): no crash; lit 59-60k from ~150 s;
+         the last readback (`shots/hb25/c013.png`) is the menu; 15.0
+         presents/s at 392 s (no unit). hb26 (the full function JIT) and hp8
+         (`--fjit` with the pinned unit, the target configuration) are
+         queued (`q16.sh`, `q17.sh`).
+     - **HK's start-up in the page (hp7, the unit):** first frame 55 s;
+       "Performing automatic level start" by 122 s; 18 presents/s by 152 s;
+       the menu is up at about 2.5 min (native gate: menu ready 406.5 s).
+     - **After the fix (2026-10-08 evening; `hk-bis.sh`, `hk-bisu.sh` for
+       the unit runs; lit = the compositor's lit pixels, ~59k the menu):**
+
+       | run | config | result |
+       |---|---|---|
+       | hb26 | full fjit, no unit | never lit, 59.5 presents/s; player log: "The selected window backend is (null)", "Video subsystem has not been initialized", "Desktop is 0 x 0" |
+       | hb27 | +UnityPlayer.so | menu (lit from ~270 s) |
+       | hb28 | +libc.so.6 | menu (lit from ~210 s) |
+       | hb29 | -UnityPlayer.so,-libc.so.6 | never lit; SDL's X11 video init fails as in hb26 |
+       | hp8 | full fjit + the pinned unit | died at 32 s: p_memcpy OOB from libxcb `_xcb_in_read_block` (+0xf16f), `queue_len` negative (as hp1) |
+       | hu1 | +libxcb.so.1 + the unit | menu at 393 s, 8.9 presents/s |
+       | hu2 | -libxcb.so.1 + the unit | **menu, 41.6 presents/s** (first frame 128 s, 100 presents 166 s, 41.1-41.7 from 302 s) |
+
+       - hu2 against hp7 (the unit, no fjit): 41.6 vs 26.3 presents/s at
+         the menu (58% more), and against native gexc's 30.59 (36% more);
+         but the first frame is later (128 vs 55 s), as the JIT compiles.
+       - libxcb crashes only with other objects JIT-compiled too, and alone
+         it is fine (hu1). `queue_len` can only go negative if two threads
+         run `read_packet` at once, so the suspect is the iolock: libxcb
+         drops it around `poll()` in `_xcb_conn_wait` and takes it again
+         after. A wrong resume after the blocking poll (the class of the
+         stale-resume bug) would skip the re-lock.
+       - The black screen is in SDL's X11 video init and needs neither
+         UnityPlayer nor libc JIT-compiled (hb29). 3-minute strict runs,
+         judged by the player log's "window backend is x11|(null)":
+
+         | run | fjitlibs | backend |
+         |---|---|---|
+         | hb30 | +libX11,+libxcb | x11 |
+         | hb31 | +the 12 X extension/aux libraries (Xext, Xrandr, Xi, Xinerama, Xcursor, Xss, Xxf86vm, Xfixes, Xrender, X11-xcb, Xau, Xdmcp) | x11 |
+         | hb32 | +ld.so, libdl, libpthread, libm, libstdc++, libgcc_s, librt | x11 |
+         | hb33 | everything but UnityPlayer, libc and all 14 X libraries | x11 |
+         | hb34 | everything but UnityPlayer, libc, ld.so, libdl, libpthread, libm, libgcc_s, librt | (null) |
+
+         So it takes the X libraries together with something outside them.
+         (A `+` in `?fjitlibs=` must be `%2B` inside a name: hb34 meant to
+         drop libstdc++ too and did not.) `q24.sh`: X plus libstdc++
+         (hb35), plus the GL libraries (hb36), plus audio/system (hb37).
+     - **xbig hung in the page (xb3 without fjit, xb4 with; fixed in
+       895a3b8c).** xb5 (per-step times): round 0 (300 KB property, 480 KB
+       image, 50 atoms) done at 1.7 s, then the second property read never
+       returned. The X server is the host-side wasm Xwayland, and its
+       `gex_poll` (web/xwayland/gexos.c) set POLLOUT on every descriptor
+       but returned only for POLLIN: a reply that did not fit the guest's
+       kernel socket (`SOCK_BUF`, 256 KiB) waited for input that never came,
+       since the client was waiting for the reply. POLLOUT now comes from
+       the socket's room (`k_sock_writable`, `hostx.js` `writable`) and
+       counts. Any X client reading more than 256 KiB at once was exposed
+       (Unity's XGetImage/property reads, Wine). Rebuilding Xwayland.wasm on
+       gooner needed xorgproto 2024.1, util-macros, libxshmfence's header,
+       wayland-protocols and W's host wayland-scanner staged by hand
+       (`scratch/unity/xwl/`, `PKG_CONFIG_PATH`/`ACLOCAL_PATH`).
+     - lockpoll (libxcb's unlock/poll/lock on 4 threads, 80,000 entries,
+       `scratch/unity/page/lockpoll`) passes in the page with and without
+       fjit (lp1/lp2) and natively, so the hp8 libxcb race is not that
+       pattern on its own.
+     - **Muck's grass is fixed by `?gllimits=41` with GL's rebased Mesa
+       (mods/gpu, mesa-wink gl/perf 60202246):** mpg3 (fjit + the unit):
+       the context is GL 4.2, no "Shader Unsupported" for the grass, and
+       `shots/mpg3/c013.png` shows the grass blades and the full 3D menu
+       scene; 36.6-38.1 presents/s. mpg1/mpg2 (mods/gpu at GL 4.0) were
+       dots. With the site Mesa (mpg4) the 3D scene is never drawn (lit
+       5179; "WebGPU validation: Bind group layout ..."), so it needs both.
+       mp26's black scene was at GL 4.6 (the compute limits too); 4.1's
+       texture limits alone do not cause it.
+     - **The black screen bisect, continued (3-minute runs, X = the 14 X
+       libraries, judged by the player log's window backend):**
+
+       | run | fjitlibs | backend |
+       |---|---|---|
+       | hb35 | X + libstdc++ | x11 |
+       | hb36 | X + the GL libraries | x11 |
+       | hb37 | X + audio/system | (null) |
+       | hb39 | X + libbsd, libz, liblzma and the other small ones | x11 |
+       | hb40 | X + audio, dbus, systemd, udev, steam | (null) |
+       | hb43 | X + dbus, systemd, udev | (null) |
+       | hb44 | X + libsteam_api | x11 |
+       | hb45 | X + libdbus-1 | **(null)** |
+       | hb46 | X + libsystemd | x11 |
+       | hb47 | X + libudev | x11 |
+
+       So the X libraries JIT-compiled with libdbus. `LD_DEBUG` (hb41 fails,
+       hb42 passes): after `SDL_X11_LoadSymbols` the failing run unloads
+       the X libraries at once (`X11_CreateDevice` failed) and has opened
+       one X connection, the passing run two. libdbus does not touch X: it
+       only changes which functions land in which batch, so this looks like
+       the same libxcb miscompile as hp8's crash. hs1/hs2 (`?strace=1`, X +
+       libdbus and X + steam) record the syscalls around the connect.
+     - **hp8's libxcb crash, bisected inside libxcb** (the unit + fjit;
+       `name@lo-hi` excludes an offset range of the object's text):
+
+       | run | fjitlibs | result |
+       |---|---|---|
+       | hu3 | +xcb,+X11 | pass |
+       | hu4 | +xcb,+libc | pass |
+       | hu11 | +xcb,+ld.so | pass |
+       | hu12 | +xcb,+libc,+ld.so | pass |
+       | hu6 | everything, xcb 0-9f00 excluded | pass |
+       | hu7 | everything, xcb 9f00-14000 excluded | crash |
+       | hu8 | everything, only xcb 3120-32a0 (`_xcb_in_read_block`) excluded | pass |
+       | hu9 | everything, xcb 0-3120 (the PLT, `xcb_connect_to_fd`'s callers) excluded | pass |
+       | hu13 | everything, `watch=` on `queue_len` (c+0x1074) | queue_len stays 0 to the crash |
+
+       It is deterministic (~30-34 s, libxcb +0x316f). At the crash the
+       registers hold `memmove(queue, queue+8, -8)` with done = 8 while
+       `queue_len` is 0: the `min(queue_len, len)` select came out wrong in
+       the page's code, not a race (the iolock theory above is wrong;
+       lockpoll agrees). The offline harness (`scratch/unity/fjitrepro`:
+       libxcb alone, and with libc and the glibc_mem providers, eager and
+       lazy binding) emits a correct select, so it depends on the page's
+       batch: PLT stubs inlined into it (`gex-fjit` inline.rs) or a callee
+       summary. `?fjitlibs=dumpmod=ADDR` (fjit.rs) dumps the module whose
+       batch root is ADDR as base64 `[fjitdump]` lines; hu14
+       (`dumpmod=1a79d120`) captures the crashing module.
+     - **Start-up in the page (unit + fjit, `-libxcb.so.1`):** ht1
+       (`?attachtrace=1`): thread Workers attach ~0.1 s after their post, and
+       posts are ~0.25 s apart, so spawning threads costs little. ht2 (a
+       Chrome profile of the main Worker, 70-120 s): 64% (33 of 52 s) in
+       `fjit::translate`: recovery 27.6 s (discover/recover_one 16.8, lift
+       10), analyze 6.4, jump tables 4.4, emit 5.5, build_runtime 5.7, and
+       7 s in `lib_wanted`/`object_file_off` (only with `?fjitlibs=` rules).
+       ht3 (`byobj=1`, counts by object up to the menu,
+       translations/functions/wasm): UnityPlayer.so 750 / 3,667 / 36 MB
+       although the unit serves it, then libasound 7.9 MB, libc 4.7 MB,
+       libcrypto 3.5 MB, libX11 2.1 MB; first frame 125 s. A miss in
+       UnityPlayer (a function the unit lacks) pulled up to 63 of the unit's
+       own functions into its batch. 1cf4e76f keeps callees the unit serves
+       out of the batch (`cgen::index_of`).
+     - **Root cause of both: the JIT kept a dlclose'd library's function
+       starts (fixed in 763a1538).** `?fjitlibs=dumpmod=` lines must be
+       under ~4,000 characters (the page console cuts them; ae44c162 uses
+       3,000; `dumpmod=OBJ@OFF` names a function by object and text-mapping
+       offset). hu16's module has `_xcb_in_read_block` ending after its `cmp`
+       at +0x2d with a tail call to +0x30, the `cmovle`, and no flags stored
+       before it: +0x30 was a strong start, so recovery ended the function
+       there as at a tail call, with the flags dead, and the `cmovle` read
+       stale flags: `min(queue_len, len)` gave `len` (hp8's memmove of -8
+       bytes). hs1/hs3 (X + libdbus) show the first X connection shut right
+       after the setup `writev`, with no read: `read_setup`'s
+       `_xcb_in_read_block` took the reply from an empty queue (the black
+       screen). hs4 (`dumpmod=libxcb.so.1@3150`) found no batch holding
+       +0xf150 as a function, and hs5 (`scanconst=0x1310d150`, which reports
+       every module mentioning an address) found it in libdbus's modules:
+       SDL dlopens libdbus, dlcloses it, and libxcb is mapped over the same
+       range, while the JIT's learned starts (and its set of translated
+       functions) are keyed by address and outlived the unmap. That is why
+       hb45 needed libdbus JIT-compiled. 763a1538 keys the learned state by
+       an epoch that `retire_unmapped_code` moves on (`fjit::on_retire`,
+       logged as "code unmapped ... learning afresh"; hb50 had 10 epochs by
+       151 s, six from one libasound plugin range). hb50 (full fjit, no
+       unit): "window backend is x11", where hb26/hb48/hb49 had "(null)".
+     - Also (a12da54a, 6bc61569): a miss strictly inside an `.eh_frame` FDE
+       (vfprintf's computed-goto labels, the code after `clone`'s syscall,
+       return addresses reached through dispatch) is left to the fallback,
+       since `recover_one` records every root as a start for good and would
+       split the enclosing function the same way; `.plt`'s single FDE is
+       exempt (its stubs are entries). Natively the same holes exist (the
+       learned state is per process, kept across dlclose; mid-function
+       roots become starts), masked by the images' seeded starts.
+     - 1cf4e76f's first form used `cgen::index_of`, which also answers for
+       the JIT's own entries, and `executable` is what instruction fetch
+       asks of every byte: hu15 decoded the `cmovle` at 0x1a79d150 (a JIT
+       entry by then) as illegal (SIGILL, status 132). 5ec43e82 counts unit
+       entries only (`cgen::unit_serves`).
+     - **Results after the fixes (2026-10-09, HK in the page on edger;
+       presents/s at the menu, from the last minutes of 7-minute runs):**
+
+       | run | config | shim | first frame | 100 presents | menu presents/s |
+       |---|---|---|---|---|---|
+       | hp7 | unit, no fjit | before | 55 s | - | 26.3 |
+       | hu2 | unit + fjit `-libxcb` | before | 128 s | 166 s | 41.6 |
+       | ht3 | unit + fjit `-libxcb` | before (byobj) | 125 s | - | - |
+       | ht5 | unit + fjit `-libxcb` | 5ec43e82 (unit callees out of batches) | 113 s | - | 40.2 |
+       | ht6 | unit + fjit `-libxcb` | a12da54a (+ mid-function misses to the fallback) | 78 s | 96 s | 39.6-39.7 |
+       | hp9/hp10 | full fjit + unit | a12da54a/6bc61569 | - | - | crash at 23.6 s (memmove after writev: the stale-start split) |
+       | hp11 | full fjit + unit | 763a1538 (epochs) | 131 s | 161 s | 40.7-42.0 |
+       | hp12 | full fjit + unit | 58e95157 (epochs only where translated) | 128 s | 158 s | 42.4-42.7 |
+       | **hp13** | **full fjit + unit** | **977a2236 (current JIT callees out of batches too)** | **87 s** | **119 s** | **39.6-39.9** |
+       | hb51 | full fjit, no unit | 58e95157 | 222 s | 270 s | 33.9 at 392 s, rising (x11 backend; was black) |
+       | hb52 | full fjit, no unit | merge/unity-rekey d146c248 | - | - | SIGILL at start-up (status 132) |
+       | hb53 | full fjit, no unit | merge/unity-rekey 64efd78e | 178 s | 225 s | 35.7 at 392 s (x11 backend) |
+
+       Native gexc's gate (unit, no fjit): menu at 406.5 s, 30.59
+       presents/s. hp13 against hp7: 52% more presents/s (39.9 vs 26.3),
+       first frame 32 s later (87 vs 55 s). hp13's menu rate is 6% below
+       hp12's (39.9 vs 42.4): callees served by older modules are called
+       through the table instead of directly, which may cost that much, but
+       the menu rate ranges 39.7-42.7 across these runs. By the menu hp13's
+       JIT has made libasound 20 MiB of wasm (947 functions), libc 4.3 MiB,
+       libudev 3.2 MiB, libcrypto 2.9 MiB; UnityPlayer is out of the top 12.
+- **merge/unity-rekey (64efd78e, one commit on 4ed5cad3, for its own
+  round):** the native JIT's two holes fixed in gex-xlate
+  (`Jit::retire(process, ranges)` from both hosts' on_retire; a miss's
+  root stays a start only if it was a strong one already) and fjit.rs out
+  of GEX_CGEN_RECOVERY_INPUTS (key c6014ffc... with and without an
+  fjit.rs edit, 855acf6a... after a func.rs edit). hb52 (d146c248) died
+  with SIGILL: with misses no longer starts, recovery walked over a JIT
+  entry inside the function, and the page's "served" test was part of
+  `executable`, which fetch asks of every byte, so the bytes decoded as
+  illegal. 64efd78e passes it as `skip` (`Jit::translate_skipping`), the
+  batch bound only. hb53: menu, x11, first frame 178 s, 35.7 presents/s
+  (hb51 on the epoch shim: 222 s, 33.9). Native: tests/fjit-remap (the
+  Oct 8 gexc gets 99,800 of 200,000 wrong under --fjit), fjit-procs,
+  x86-programs (82 ok), embed PASS, gex-xlate tests. The page's unit cache
+  (scratch/unity/units/cgen-page) must be rebuilt after it lands.
+- **Mesa pin (1d5b26d9): mesa-wink 60202246 and `gllimits=41` by
+  default.** Replays gpu vs this build: Noita 92f095c5, HK 9eece5c5, 0
+  rejects and 0 validation errors each; GL's 4-slot repro (tinyu) 2,777
+  frames with 0 validation errors; browser-gui --gl x86 and x64 12 ok
+  each; HK hp14 (merge/unity shim, this Mesa) menu at 41.8 presents/s.
+  Muck with the default and no `?gllimits` (mk2, the seed shim, no unit):
+  "OpenGL 4.2" context, no "Shader Unsupported", grass blades in
+  `shots/mk2/c013.png`, 36.9 presents/s at 393 s.
+- **Muck dies with SIGILL at ~25 s on merge/unity's shim (977a2236,
+  4ed5cad3)**, with the unit (mpg5, mk1) and without (mk4). It does not
+  with 64efd78e (mk3, 4 minutes, no unit) or 1bf5ba09 (mk2). The page asked
+  "served by the unit or the JIT" of instruction fetch (part of
+  `executable`); with epochs a JIT entry the current epoch has no start
+  for is read as non-code inside the function being recovered and decoded
+  as illegal. 64efd78e passes it as `skip` (batch bound only).
+- **Start-up (decision 3).** hp14's main-Worker profile, 10-90 s (unit +
+  fjit): 61% (49.8 of 81 s) in `fjit::translate`: recover_one 27.2 s
+  (jump tables 16.9, discover 9.2, lift 6.9), summaries 17.7, build_runtime
+  8.8, emit 8.4, prepare 5.5; the per-byte `executable` 5.9 (2.3 in
+  elfprov::provided's locks). Audio: the page has no audio device; FMOD's
+  output init fails ("Unknown PCM default", tried twice), after pulse
+  fails to connect. libasound's 20 MiB was mostly copies: the page's JIT
+  had no function starts but those calls name, so a tail jump absorbed the
+  function it reached, and libasound's exported wrappers each carried one.
+  Offline (fjitrepro, all 1,698 exports): 57.2 MiB / 16.4 s unseeded, 9.7
+  MiB / 7.1 s seeded. ALSA with no config (hp15, ALSA_CONFIG_PATH=/dev/null)
+  cut libasound to 11.2 MiB but not the first frame (112 s against hp14's
+  110 s, both profiled), so it is not the path to cut.
+  merge/unity-seed 1bf5ba09 (on 64efd78e) seeds every mapped object's
+  starts (`Jit::add_image`) before a translation and takes the fetch
+  checks once per translation: no unit, hb53 (64efd78e) 178 s first
+  frame, 225 s 100 presents, 35.7 presents/s; hb54 (seeding) 121 s, 171 s,
+  39.1; hb55 (both) 121 s, 166 s, 40.1; libasound 26.0 -> 3.7 MiB.
+  The HK unit re-keyed for 64efd78e (key 7bd87731, byte-identical c.wasm,
+  1,941 s on gooner) is on edger in `units/cgen-page-rk`; Muck's is
+  rebuilt too (4e58f35b, 884 s), also in `cgen-page-rk`.
+  With the unit (target configuration, seed shim 1bf5ba09):
+  - hp16 (HK): first frame 56 s (hp13 87 s), 100 presents 85 s (119 s),
+    41.5 presents/s at 392 s (39.9).
+  - hp17 (HK, profiled 10-90 s): `fjit::translate` 20.7 s of 81 s (25.5%;
+    hp14 49.8 s, 61.5%); the main Worker now waits on its threads 31.6 s.
+    Profiled runs' first frame (110 s both) is held by the profile.
+  - mk5 (Muck): first frame 82 s, 100 presents 95 s, 34.0 presents/s at
+    392 s, OpenGL 4.2, no "Shader Unsupported", grass blades
+    (`shots/mk5/c013.png`).
+  Branches: merge/unity-rekey 64efd78e (own round), merge/unity-seed
+  1bf5ba09 on it (worktree wt/unity-rk); merge/unity 1d5b26d9 (pin).
+  Natively the JIT seeds only the main image too (gexc's
+  FjitTranslator::image); a Translator hook per mapped object would do
+  the same there.

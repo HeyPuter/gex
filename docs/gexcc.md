@@ -424,7 +424,7 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
 - **Demo (§6), state 2026-10-09:**
   - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
     approved. Item 1 done (gated as integ/2026-10-08f). Item 2 (aarch64
-    ELF providers) ready on branch `merge/gexcc-a64prov` (ecf2b251), no
+    ELF providers) on this branch, `merge/gexcc-a64prov`, no
     x86 re-key; the coordinator schedules its landing with U. Item 3
     (LP64-layout libraries lowered to wasm32, no memory64) not started:
     measure the lowering's cost in V8 on edger first.
@@ -714,10 +714,30 @@ arm64 program uninstallable).
    tests/gexcc 15/15, a wasm32 bash running Debian's arm64 xz, python3.13
    and sqlite3, python's `os.system` running the wasm32 dash) and on the
    aarch64 browser shim (tests/wasm32 5/5; tests/gexcc as on x86).
-2. **AAPCS64 ELF providers:** the existing ones are SysV x86-64 only. An
-   aarch64 class (x0-x7, v0-v7, `TPIDR_EL0` TLS for errno) in gex-cgen's
-   `provider.rs` re-keys every unit: one commit, landed when the
-   coordinator schedules it.
+2. **AAPCS64 ELF providers: ready on `merge/gexcc-a64prov`.**
+   - `provider.rs` gains an explicit architecture (`PROVIDES ... i386 |
+     x86_64 | aarch64`, `provider::Arch`, `guest_arch(class32)`):
+     i386/x86-64 on an x86 build, aarch64 for 64-bit images on an aarch64
+     build, none on PPC. Before, `for_dll` returned nothing off x86.
+   - `providers/aapcs64.inc` maps the `gp64_` helpers to AAPCS64 (x0-x7,
+     then the stack; result in x0/v0; return to x30). `glibc_mem_a64` and
+     `glibc_math_a64` are the x86-64 bodies with it in front (Rust
+     `concat!`); `glibc_mem_a64.inc` replaces strcmp with a step-for-step
+     port of aarch64 glibc's (its result is not the byte difference, and
+     depends on mutual alignment). A later `GEX_PROVIDE` of an export now
+     replaces an earlier one.
+   - **No x86 unit re-keys:** `provider.h`, the x86 sources and the header
+     are unchanged, so every x86 provider fingerprint (and every unit keyed
+     on one) is the same. Only arm64 libc/libm translations change.
+   - Checked on an AArch64-only gexc with tests/elf-prov cross-built for
+     Debian's arm64 glibc (scratch/CC/a64prov/run-a64.sh): mem, printf,
+     malloc and fork agree with providers off and on (mem binds 14
+     addresses in libc, math 8 in libm). math differs only on round()'s
+     halfway values, where the **translated libm is wrong**: gex-lift
+     lowers FRINTA (ties away from zero) to wasm `nearest` (ties to even),
+     so translated `round(0.5)` is 0 and `round(-2.5)` is -2; the provider
+     gives 1 and -3 as C requires.
+   - Not ported yet: printf (its va_list code is SysV) and malloc.
 3. **arm64-ABI native libraries in the guest's own wasm32 memory** (user,
    2026-10-08: no memory64 at run time). Whole-library providers for
    arm64 programs need aarch64's LP64 data layout. Approach to evaluate:

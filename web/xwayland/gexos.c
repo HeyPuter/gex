@@ -36,6 +36,7 @@ EM_JS(int, gexjs_connect, (int fd, const char *path, int len), { return Module.g
 EM_JS(int, gexjs_accept, (int fd), { return Module.gexos.accept(fd); });
 EM_JS(int, gexjs_close, (int fd), { return Module.gexos.close(fd); });
 EM_JS(int, gexjs_readable, (int fd), { return Module.gexos.readable(fd); });
+EM_JS(int, gexjs_writable, (int fd), { return Module.gexos.writable(fd); });
 EM_JS(int, gexjs_send, (int fd, const char *buf, int len, const int *fds, int nfds),
       { return Module.gexos.send(fd, buf, len, fds, nfds); });
 EM_JS(int, gexjs_recv, (int fd, char *buf, int len, int *fds, int maxfds, int *nfds),
@@ -510,7 +511,7 @@ gex_poll(struct pollfd *fds, nfds_t nfds, int timeout)
             fds[i].revents = 0;
             if (fds[i].fd < 0)
                 continue;
-            if (fds[i].events & POLLOUT)
+            if ((fds[i].events & POLLOUT) && gexjs_writable(fds[i].fd) > 0)
                 fds[i].revents |= POLLOUT;
             if (fds[i].events & POLLIN) {
                 int r = gexjs_readable(fds[i].fd);
@@ -519,11 +520,14 @@ gex_poll(struct pollfd *fds, nfds_t nfds, int timeout)
                 else if (r < 0)
                     fds[i].revents |= POLLNVAL;
             }
-            if (fds[i].revents & (POLLIN | POLLNVAL))
+            if (fds[i].revents)
                 ready++;
         }
-        /* POLLOUT alone is not worth waking for: the server asks for it while
-         * it has a client's reply buffered, and a queue here is never full. */
+        /* POLLOUT counts. The server asks for it when a client's socket in
+         * the kernel is full (256 KiB) with a reply still buffered, and it
+         * writes the rest only when poll says so: a poll that kept waiting
+         * for POLLIN instead hung every reply bigger than the socket (the
+         * client waits for the reply and sends nothing). */
         if (ready || timeout == 0)
             return ready;
         int slice = timeout < 0 ? 20 : (timeout - (int) deadline_slept > 20
@@ -539,10 +543,13 @@ gex_poll(struct pollfd *fds, nfds_t nfds, int timeout)
             for (nfds_t i = 0; i < nfds; i++) {
                 fds[i].revents = 0;
                 if (fds[i].fd >= 0 && (fds[i].events & POLLIN) &&
-                    gexjs_readable(fds[i].fd) > 0) {
+                    gexjs_readable(fds[i].fd) > 0)
                     fds[i].revents |= POLLIN;
+                if (fds[i].fd >= 0 && (fds[i].events & POLLOUT) &&
+                    gexjs_writable(fds[i].fd) > 0)
+                    fds[i].revents |= POLLOUT;
+                if (fds[i].revents)
                     last++;
-                }
             }
             return last;
         }

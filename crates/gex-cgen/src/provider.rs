@@ -54,10 +54,46 @@ const SOURCES: &[(&str, &str)] = &[
     ("glibc_mem", include_str!("../providers/glibc_mem.c")),
     ("glibc_printf", include_str!("../providers/glibc_printf.c")),
     ("glibc_math", include_str!("../providers/glibc_math.c")),
+    // The same functions for aarch64's glibc: the x86-64 bodies under
+    // AAPCS64 (`aapcs64.inc` makes the `gp64_` helpers mean its registers).
+    (
+        "glibc_mem_a64",
+        concat!(
+            "/* PROVIDES libc.so.6 aarch64 */\n",
+            include_str!("../providers/aapcs64.inc"),
+            include_str!("../providers/glibc_mem.c"),
+            include_str!("../providers/glibc_mem_a64.inc")
+        ),
+    ),
+    (
+        "glibc_math_a64",
+        concat!("/* PROVIDES libm.so.6 aarch64 */\n", include_str!("../providers/aapcs64.inc"), include_str!("../providers/glibc_math.c")),
+    ),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).
 const INCLUDES: &[(&str, &str)] = &[("dlmalloc.inc", include_str!("../providers/dlmalloc.inc"))];
+
+/// The guest architecture a provider's calling convention is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    I386,
+    X86_64,
+    Aarch64,
+}
+
+/// The provider architecture for an image of this build's guest: i386 or
+/// x86-64 on an x86 build, aarch64's 64-bit images on an aarch64 build
+/// (its 32-bit ones are wasm32 programs, which have no providers); none on
+/// a PPC build.
+pub fn guest_arch(class32: bool) -> Option<Arch> {
+    match (gex_abi::X86, gex_abi::PPC, class32) {
+        (true, _, true) => Some(Arch::I386),
+        (true, _, false) => Some(Arch::X86_64),
+        (false, false, false) => Some(Arch::Aarch64),
+        _ => None,
+    }
+}
 
 /// One provider source, parsed.
 #[derive(Clone, Debug)]
@@ -66,6 +102,8 @@ pub struct Provider {
     text: &'static str,
     /// The libraries, lower case (`msvcr120.dll`).
     pub dlls: Vec<String>,
+    pub arch: Arch,
+    /// `arch` is i386.
     pub class32: bool,
     /// Has data and a stack (`stateful` on the first line).
     pub stateful: bool,
@@ -80,10 +118,16 @@ pub struct Provider {
     pub build_ids: Vec<String>,
 }
 
-/// Every provider gex carries (`gexc cgen-image --providers` builds them
-/// all into a unit cache, for a host that cannot build them at run time).
+/// Every provider gex carries for this build's guest (`gexc cgen-image
+/// --providers` builds them all into a unit cache, for a host that cannot
+/// build them at run time).
 pub fn all() -> Vec<Provider> {
-    SOURCES.iter().map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed")).collect()
+    let archs = [guest_arch(true), guest_arch(false)];
+    SOURCES
+        .iter()
+        .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
+        .filter(|p| archs.contains(&Some(p.arch)))
+        .collect()
 }
 
 /// Whether providers are on (`GEX_PROVIDERS=0` turns them off).
@@ -95,7 +139,7 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
-        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64> [stateful] [nowine]`");
+        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64|aarch64> [stateful] [nowine]`");
     }
     let stateful = w[4..].contains(&"stateful");
     let nowine = w[4..].contains(&"nowine");
@@ -106,11 +150,13 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
         .filter(|x| !x.is_empty())
         .map(|x| x.to_ascii_lowercase())
         .collect();
-    let class32 = match w[3] {
-        "i386" => true,
-        "x86_64" => false,
+    let arch = match w[3] {
+        "i386" => Arch::I386,
+        "x86_64" => Arch::X86_64,
+        "aarch64" => Arch::Aarch64,
         a => bail!("provider {name}: unknown architecture {a}"),
     };
+    let class32 = arch == Arch::I386;
     let mut binds = Vec::new();
     let mut groups = Vec::new();
     for l in text.lines() {
@@ -124,6 +170,9 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
             .split_once(',')
             .ok_or_else(|| anyhow!("provider {name}: malformed {l:?}"))?;
         let e = e.trim().trim_end_matches(')').trim().trim_matches('"');
+        // A later binding of an export replaces an earlier one (an
+        // architecture's own body after a shared source's).
+        binds.retain(|(_, x)| x != e);
         binds.push((f.trim().to_string(), e.to_string()));
     }
     if binds.is_empty() {
@@ -134,20 +183,21 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     // `memcpy@@GLIBC_2.14`).
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e || e.split('@').next() == Some(s)));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, class32, stateful, nowine, binds, groups, build_ids })
+    Ok(Provider { name, text, dlls, arch, class32, stateful, nowine, binds, groups, build_ids })
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
-/// of the given class, when providers are on.
+/// of the given class, for this build's guest ([`guest_arch`]), when
+/// providers are on.
 pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
-    if !enabled() || !gex_abi::X86 {
+    let Some(arch) = guest_arch(class32).filter(|_| enabled()) else {
         return Vec::new();
-    }
+    };
     let dll = dll.to_ascii_lowercase();
     SOURCES
         .iter()
         .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
-        .filter(|p| p.dlls.contains(&dll) && p.class32 == class32)
+        .filter(|p| p.dlls.contains(&dll) && p.arch == arch)
         .collect()
 }
 

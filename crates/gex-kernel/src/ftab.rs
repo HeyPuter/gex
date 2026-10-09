@@ -272,6 +272,10 @@ pub trait Translator: Send + Sync {
     fn image(&self, _process: u64, _program: &gex_ld::Program, _bytes: Option<&[u8]>) {}
     /// Guest process `process` is gone (its last reference dropped).
     fn forget(&self, _process: u64) {}
+    /// Guest process `process` unmapped or reprotected the code in
+    /// `ranges` (`Kernel::retired_code`): what the translator learned of
+    /// those addresses no longer describes them.
+    fn retire(&self, _process: u64, _ranges: &[(u64, u64)]) {}
 }
 
 static TRANSLATOR: std::sync::OnceLock<Box<dyn Translator>> = std::sync::OnceLock::new();

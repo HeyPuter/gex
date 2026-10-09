@@ -252,6 +252,8 @@ async function main() {
           writeFileSync(join(shotDir, `c${String(shots).padStart(3, '0')}.png`), encodePng(r.w, r.h, Buffer.from(r.b64, 'base64')));
         }
       }
+      // The guest's output so far (a game's log with `-logFile -`), kept whole.
+      if (shotDir && s?.out) writeFileSync(join(shotDir, 'out.txt'), s.out);
       const rate = window.length > 1 ? (n - window[0][1]) / ((Date.now() - window[0][0]) / 1000) : 0;
       log(`${((Date.now() - t0) / 1000).toFixed(0)} s: presents ${n}, ${rate.toFixed(1)}/s over the last minute; ${(s?.out ?? '').slice(-160).replace(/\n/g, ' | ')}`);
       // The compositor's own account: its windows, its notes (GL attachment

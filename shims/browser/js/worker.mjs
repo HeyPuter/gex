@@ -416,6 +416,7 @@ async function handle(msg) {
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
+  if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
