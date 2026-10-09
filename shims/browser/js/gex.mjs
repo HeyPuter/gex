@@ -2706,9 +2706,14 @@ export class Gex {
     const wasmprog = wasmdll && !!e.gex_cgen_pmod_wasmprog?.(prov);
     // A replaced Linux library's wasm64 provider (cgen/libprov.rs): the 64-bit provider_* imports.
     const libprov = wasmdll && !!e.gex_cgen_pmod_libprov?.(prov);
+    // A wasm32 program's module is keyed by its bytes (`wasm:`), not its
+    // path: the page keeps those for every process (host.mjs), so a program
+    // run again, by any process, is not compiled again, and a file apt
+    // replaced is not mistaken for the old one.
+    const pbytes = wasmdll ? new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice() : null;
     const mod = wasmdll
-      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
-        new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes,
+        wasmprog ? `wasm:${moduleContentKey(pbytes)}` : null)
       : prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
@@ -3030,8 +3035,8 @@ export class Gex {
 
   /** A module file from the unit cache (an export provider's), compiled
    *  once per process and offered to the siblings. Synchronous. */
-  #cgenFileModule(file, bytes = null) {
-    const name = `cgenfile:${file}`;
+  #cgenFileModule(file, bytes = null, key = null) {
+    const name = key ?? `cgenfile:${file}`;
     let mod = this.#sharedModules.get(name);
     if (mod) return mod;
     bytes ??= this.#env.loadFile?.(file) ?? null;
