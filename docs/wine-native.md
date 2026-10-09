@@ -1834,6 +1834,131 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
+**RESUME HERE (2026-10-09, early).** merge/w3-audio has master 41917e73
+merged (bc6c6e2c) and three commits on top: 39bdabd8 `GEX_GL_WAITS`,
+4d3bd189 the compositor read-buffer fix, dbf61bc7 `GEX_PROF` per-thread
+totals and `GEX_SYS_WAITS`. Suite: `$W/check-w3-gate.sh` (W3 legs through
+`gate-w3boot/run.sh` with `W3_GATE_DIST=$W/w3dist-g`, the audio leg on
+w3dist-g too); 39bdabd8 clean in `$W/w3chk5.out` (the same failure list
+as integ-e2), dbf61bc7 clean in `$W/w3chk6.out` (W3 null 40 of 53,
+Wayland+GL 38 of 49, install as children and audio ok; x86/childloop
+passed this time, it is load-dependent).
+- **Install as children passes again.** Wine's DefaultInstall runs
+  `control.exe appwiz.cpl install_mono`, which waits for an answer; it
+  used to return at once only because control.exe was missing from the
+  corrupted prefix copy. install-as-children.sh passes
+  `WINEDLLOVERRIDES=${INSTALL_OVERRIDES:-mscoree,mshtml=}`. One dist from
+  one build: `$W/w3dist-g` = `$W/w3dist`'s suite dll dir (no wineboot)
+  with w3dist-n's loader.
+- **Where the games' time went: the compositor.** The native host pumps
+  the compositor at every syscall of every guest thread, and each pump
+  allocated a zeroed 64 KiB buffer per client (calloc's memset, glibc
+  growing and trimming its heap: `syscall` and `_dl_mcount_wrapper`, i.e.
+  libc's memset/memcpy, were over half the process's CPU). 4d3bd189 keeps
+  the buffer (native and browser). On edger, against the same loader and
+  prefix: Retrocycles gameplay 3.0-3.5 fps -> 38-46 fps (the game's own
+  counter 37), Katana ZERO menu 4.4 -> 34 fps, Undertale plays its intro
+  at 30 fps (its own cap) once loaded (before: still loading at 420 s).
+- **Undertale's "white window" was the frame dump, not the game.** Its
+  d3d9 output is a 640x480 gex-gl subsurface drawn on the host; the PPM
+  frames came from the decorated toplevel, which is white. Run it with
+  `GEX_PPM_GL_ONLY=1` (gamekit `ut9.sh`, frames in edger's
+  `gameout/undertale`). Its load is still long: the first GL present at
+  107 s, the next 24 by 350 s, then 30 fps.
+  Runs: gamekit `prof2-rc.sh` (before), `prof3-rc.sh` and `run8.sh`
+  (after); `run-game-g.sh` takes `GEXC=`.
+- Tools: `GEX_GL_WAITS=1` (wall time in synchronous GL submits, by the
+  batch's last opcode: 1-3% in all three games, so GL round trips are not
+  the cost; Undertale's 3303 glGetInternalformativ at wined3d init are
+  89 ms in all), `GEX_SYS_WAITS=1` (wall time per thread and syscall),
+  `GEX_PROF` writes `<stem>.threads`, `GEX_PROF_MIN_PCT`.
+- Next costs seen: every Wine child process runs `usd_clock_thread`
+  (wine fork, virtual.c), a 1 ms nanosleep loop that updates its
+  USER_SHARED_DATA clocks: six such threads in Undertale, about 900
+  wakeups a second each. Undertale's 350 s load: its main thread is
+  mostly parked (GEX_SYS_WAITS shows a futex wait of about 10 s in every
+  10 s window), so the next step is which thread it waits for.
+
+**RESUME HERE (2026-10-08 evening, after the reboot).** Branch
+**merge/w3-audio** (wt/w3-boot; master 7a4a62c8 merged): W3.5's OSS null
+audio device (/dev/dsp, /dev/mixer), inet socket fixes (port at bind,
+SHUT_WR, MSG_PEEK), tests/nt attachwin. Wine fork `wasm32-w3` 3710abbd462
+(mw): **explorer's desktop is its own process again** (child processes see
+the session through requests now); `WINEGEX_DESKTOP_THREAD=1` keeps the old
+desktop thread. Why: a DllMain that makes a window holds the loader lock,
+and the desktop thread needed that lock to start (Retrocycles and Katana
+ZERO hung, "loader_section wait timed out"). Fix in the same commit: the
+desktop process (explorer /desktop) does not start another explorer when its
+lazily loaded null driver asks for the desktop window (it did: a chain of
+seven explorers).
+- Dists: `$W/w3dist-a` (the current loader + every W3 program skeleton,
+  wineboot included: games), `$W/w3dist-s` (the current loader over the
+  suite's dll dir without wineboot.exe, so a test doesn't boot the prefix:
+  `W3_DIST=$W/w3dist-s $W/check-w3-gate.sh wt/w3-boot`, output
+  `$W/w3chk4.out`). `$W/w3dist` stays the merge/w3-boot gate's.
+- Games: `$W/gamekit` (gexc, dist -> w3dist-a, the installed prefix,
+  inputs), `gamekit/games.sh` runs Retrocycles, Undertale and Katana ZERO
+  on edger through bench.sh; results in edger's `$W/gameout/<slug>`
+  (summary, log, frames/, frames.txt: frame number and time, for fps).
+- **Pitfall: never stage a W3 prefix with symbolic links into a shared
+  prefix.** stage-native.sh links the DLLs into ~/.cache/gex/wine-11.15;
+  under W3, wineboot writes system32 with CREATE_ALWAYS, which follows the
+  link and overwrites the shared file, and wineserver deletes on close by
+  the realpath() of the name it opened (server/fd.c), so a DeleteFile on a
+  linked file deletes the shared target (2026-10-08: 4 DLLs overwritten and
+  22 programs deleted in gooner's default prefix; the coordinator restored
+  them from edger's). `$W/deref-pfx.sh PREFIX` replaces those links with
+  copies; stage-w3.sh calls it. Any symlinked prefix is unsafe under
+  native Wine. (gooner's and edger's default prefixes have no
+  drive_c/windows/Fonts though the manifest lists 56 fonts: never staged,
+  not from this.)
+- **Gate artifacts for merge/w3-boot** (frozen, nothing shared with the
+  other runs): `$W/gate-w3boot/run.sh TREE GEXC [stage]` stages its own
+  prefixes (pfx-w3 null driver, pfx-w3wl Graphics=wayland) and dists
+  (w3dist-null, w3dist-wl: copies of `$W/w3dist`, the 03:37 loader),
+  generates nt-run-x86.sh from TREE's tests/nt/run.sh, and runs the null,
+  Wayland+GL and install-as-children legs (its own install prefix, dist and
+  log under gate-w3boot). The Wayland leg needs no compositor running:
+  `gexc run --wayland PATH` serves its own at that guest path. On
+  integ/2026-10-08e's gexc: null 37 of 51, Wayland+GL 36 of 47 (w3chk3:
+  37 of 50, 34 of 46). x86/childloop times out at 120 s under load
+  (gooner's load average 21; 3 runs: 1 pass, 2 timeouts, the same with
+  merge/w3-audio's gexc): `gate-w3boot/childloop.sh`.
+  The install-as-children leg no longer passes on today's artifacts with
+  any gexc: integ-e2's, merge/w3-audio's and 36dd674f's own
+  (`wt/gate-36dd`) all write the registry (16 crypto provider keys) and
+  then stop after DefaultInstall's rundll32, so wineboot never exits
+  (`gate-w3boot/inst-{i,b}`). The 03:37 loader's PE side was relinked since
+  (`$W/wine-w32-w3`, the W3.5 work), so the 03:37 loader no longer has a
+  matching dll dir; with the current loader (w3dist-a) explorer's window
+  dies with "indirect call type mismatch" there (`inst-a`). Next: one
+  dist whose loader and dll dir come from the same build.
+- **Guest GL (2026-10-08 night):** the loaders linked `$W/gl/gexgl.o` from
+  10-06 (wt/w3's gexgl.c); `$W/gl/build-gl.sh` now compiles
+  `${GL_TREE:-wt/w3-boot}`'s. 7ef0f203 adds glNormalPointer (the host had
+  GL_NORMAL_ARRAY enabled with no pointer: Retrocycles' host SIGSEGV at
+  gameplay start, core analysed on gooner from edger's,
+  `$W/core/`; the GL capture decoder is `$W/core/capdec`). Loader with it:
+  `$W/w3dist-n` (gamekit/dist points there).
+- Undertale and Katana ZERO (both GameMaker, d3d9 over wined3d) called
+  address 0 in wined3d's caps probe: match_allows_spec_alpha calls
+  glSecondaryColorPointerEXT, which wined3d assumes on GL 1.4, and the guest
+  library had no secondary colour (or fog coordinate) array, so the
+  extension was withheld and wglGetProcAddress returned NULL. 47f830a4
+  adds both (loader `$W/w3dist-n`, 20:22). Found with `gamekit/dbg-ut6.sh`
+  (WINEDEBUG trace+d3d) and `gamekit/glprobe` (glprobe2.exe lists the
+  extension functions wglGetProcAddress cannot resolve).
+- Retrocycles on w3dist-n (edger, 2026-10-08 20:0x): menus, then gameplay
+  for the rest of the 420 s run, no crash; composited 10-12 fps in the
+  menus and 1-6 fps in gameplay (the game's own counter: 1). Frames:
+  `$W/shots/r7`.
+- With those, Undertale and Katana ZERO got past wined3d (two more
+  fixes: 0a525987, program option extensions claimed only with their
+  base; 552cca51, gex-wayland releases a buffer once per attach, which
+  Wine's buffer queue counts) and then hit the release bug at the first
+  swap-chain resize. gexc 22:25 has the fix; run `gamekit/run7.sh`.
+
+
 **RESUME HERE (2026-10-06, after a Claude Code restart).** `$W` =
 `~/gex-sandbox/scratch/W`. Run `. ~/gex-sandbox/scratch/env.sh` first.
 `gexc run` does not pass the host environment: `--env HOME=...`.

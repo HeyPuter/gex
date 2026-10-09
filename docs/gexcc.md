@@ -494,7 +494,8 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
   - Known: fork inside a C++ catch block traps (asyncify).
   - perl 5.40 ours builds (`build_perl`): Debian's options, Configured
     natively, every extension static; make_ext's make and compiler run on
-    the host through gexc's `GEXC_HOST_EXEC`. POSIX, Digest::MD5,
+    the host through gexc's `GEXC_HOST_EXEC` (an opt-in build aid for
+    build tooling only, never set by a demo or image). POSIX, Digest::MD5,
     Storable, Encode and threads load. Not shipped: Debian's arm64
     perl-base stays until ours provides perlapi-5.40.1 and Debian's
     layout for arm64 Perl packages.

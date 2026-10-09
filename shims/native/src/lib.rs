@@ -25,6 +25,7 @@ pub mod nt_cgen;
 pub mod wasmprog;
 pub mod wasmdll;
 mod ready;
+mod sys_waits;
 pub(crate) mod ftab;
 pub mod wayland;
 
@@ -2182,6 +2183,8 @@ fn take_kernel(cx: &SpawnContext) -> Kernel {
 /// translated are either far too slow or do not load at all (clang's 100 MB
 /// library). Paths are the guest's, so this means something only when the
 /// guest sees the host's tree (no sysroot), as gexcc's runner does.
+/// Opt-in and for build tooling only: no demo, image or test sets it, and
+/// the browser shim has no equivalent.
 ///
 /// The process stays: it waits for the host program and exits as it did.
 /// Descriptors 0-2 are bridged: a stream the guest got from gexc's own stdio
@@ -2564,6 +2567,9 @@ fn mount_filesystems(
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
     }
+    // Audio (W3.5): OSS's /dev/dsp and /dev/mixer, a null output, for
+    // native Wine's wineoss.drv (and any OSS program).
+    devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
@@ -3037,6 +3043,15 @@ impl gex_kernel::net::Transport for HostStream {
         sock.peek(&mut scratch).unwrap_or(0)
     }
 
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else { return Err(gex_kernel::Errno::ENOTCONN) };
+        match sock.peek(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(gex_kernel::Errno::EAGAIN),
+            Err(_) => Err(gex_kernel::Errno::ECONNRESET),
+        }
+    }
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
@@ -3281,6 +3296,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let nr = gm
                 .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
                 .unwrap_or(!0);
+            // `GEX_SYS_WAITS`: wall time per (thread, syscall), blocking included.
+            let sys_t0 = sys_waits::on().then(std::time::Instant::now);
+            let mut sys_nr = !0u64;
             watch_check(&gm, pc as u64, state.thread.tid);
             lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
             if lockstep::fake_syscall(&mut gm, state.thread.ctx_addr) {
@@ -3337,7 +3355,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if !gex_kernel::skips_proc_snapshot(nr) {
                     k.refresh_proc(&proc_state);
                 }
-                k.syscall(&mut gm, pc as u64)
+                let o = k.syscall(&mut gm, pc as u64);
+                sys_nr = k.syscall_nr;
+                o
             });
             // A blocking syscall is run here, with the kernel unlocked, and
             // then finished under the lock again.
@@ -3438,6 +3458,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             {
                 let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
+            }
+            if let Some(t0) = sys_t0 {
+                sys_waits::record(caller.data().thread.tid, sys_nr, t0.elapsed());
             }
             check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();

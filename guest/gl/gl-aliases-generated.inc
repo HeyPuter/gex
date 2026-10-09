@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 594 of them whose target this
+ * claimed -- so here are the 596 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -154,6 +154,7 @@ extern __typeof(glEndTransformFeedback) glEndTransformFeedbackNV __attribute__((
 extern __typeof(glFenceSync) glFenceSyncAPPLE __attribute__((alias("glFenceSync")));
 extern __typeof(glFlushMappedBufferRange) glFlushMappedBufferRangeAPPLE __attribute__((alias("glFlushMappedBufferRange")));
 extern __typeof(glFlushMappedBufferRange) glFlushMappedBufferRangeEXT __attribute__((alias("glFlushMappedBufferRange")));
+extern __typeof(glFogCoordPointer) glFogCoordPointerEXT __attribute__((alias("glFogCoordPointer")));
 extern __typeof(glFogCoordd) glFogCoorddEXT __attribute__((alias("glFogCoordd")));
 extern __typeof(glFogCoorddv) glFogCoorddvEXT __attribute__((alias("glFogCoorddv")));
 extern __typeof(glFogCoordf) glFogCoordfEXT __attribute__((alias("glFogCoordf")));
@@ -403,6 +404,7 @@ extern __typeof(glSecondaryColor3ui) glSecondaryColor3uiEXT __attribute__((alias
 extern __typeof(glSecondaryColor3uiv) glSecondaryColor3uivEXT __attribute__((alias("glSecondaryColor3uiv")));
 extern __typeof(glSecondaryColor3us) glSecondaryColor3usEXT __attribute__((alias("glSecondaryColor3us")));
 extern __typeof(glSecondaryColor3usv) glSecondaryColor3usvEXT __attribute__((alias("glSecondaryColor3usv")));
+extern __typeof(glSecondaryColorPointer) glSecondaryColorPointerEXT __attribute__((alias("glSecondaryColorPointer")));
 extern __typeof(glShaderSource) glShaderSourceARB __attribute__((alias("glShaderSource")));
 extern __typeof(glSpecializeShader) glSpecializeShaderARB __attribute__((alias("glSpecializeShader")));
 extern __typeof(glStencilOpSeparate) glStencilOpSeparateATI __attribute__((alias("glStencilOpSeparate")));
