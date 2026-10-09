@@ -29,7 +29,7 @@ build_bzip2() {
     mkdir -p $d/usr/bin $d/usr/lib $d/usr/include
     cp libbz2.a $d/usr/lib/; cp bzlib.h $d/usr/include/
   done
-  cp bzip2 bzip2recover bzgrep bzmore bzdiff $DEST/usr/bin/
+  cp bzip2 bzip2recover bzgrep bzmore bzdiff debian/bzexe $DEST/usr/bin/
   ln -sf bzip2 $DEST/usr/bin/bunzip2; ln -sf bzip2 $DEST/usr/bin/bzcat
   ln -sf bzgrep $DEST/usr/bin/bzegrep; ln -sf bzgrep $DEST/usr/bin/bzfgrep
   ln -sf bzmore $DEST/usr/bin/bzless; ln -sf bzdiff $DEST/usr/bin/bzcmp
@@ -49,7 +49,7 @@ build_libzstd() {
     make -C lib install-static install-includes install-pc DESTDIR=$d PREFIX=/usr LIBDIR=/usr/lib
   done
   mkdir -p $DEST/usr/bin
-  cp programs/zstd $DEST/usr/bin/
+  cp programs/zstd programs/zstdgrep programs/zstdless $DEST/usr/bin/
   for n in unzstd zstdcat zstdmt; do ln -sf zstd $DEST/usr/bin/$n; done
 }
 
@@ -105,6 +105,9 @@ build_bash() {
   cp debian/etc.bash.bashrc $DEST/etc/bash.bashrc
   cp debian/skel.bashrc $DEST/etc/skel/.bashrc; cp debian/skel.profile $DEST/etc/skel/.profile
   cp debian/skel.bash_logout $DEST/etc/skel/.bash_logout
+  ln -sf bash $DEST/usr/bin/rbash
+  mkdir -p $DEST/usr/share/debianutils/shells.d
+  printf '/bin/bash\n/bin/rbash\n/usr/bin/bash\n/usr/bin/rbash\n' > $DEST/usr/share/debianutils/shells.d/bash
   rm -rf $DEST/usr/share/info $DEST/usr/share/doc/bash
 }
 
@@ -112,6 +115,10 @@ build_dash() {
   at_configure
   make -j$JOBS
   make install DESTDIR=$DEST
+  # trixie's dash ships /bin/sh itself
+  ln -sf dash $DEST/usr/bin/sh
+  mkdir -p $DEST/usr/share/debianutils/shells.d
+  printf '/bin/dash\n/usr/bin/dash\n' > $DEST/usr/share/debianutils/shells.d/dash
 }
 
 build_coreutils() {
@@ -119,13 +126,15 @@ build_coreutils() {
   # its own copy of libc and gnulib)
   FORCE_UNSAFE_CONFIGURE=1 at_configure --disable-nls --without-selinux --without-libgmp \
     --enable-single-binary=symlinks --disable-acl --disable-xattr --without-openssl \
-    --enable-no-install-program=kill,uptime,hostname,groups
+    --enable-install-program=arch --enable-no-install-program=kill,uptime,hostname
   make -j$JOBS
   make install DESTDIR=$DEST
+  # Debian: chroot in sbin
+  mkdir -p $DEST/usr/sbin; rm -f $DEST/usr/bin/chroot; ln -s ../bin/coreutils $DEST/usr/sbin/chroot
   rm -rf $DEST/usr/share/info
 }
 
-build_grep() { at_configure --disable-nls; make -j$JOBS; make install DESTDIR=$DEST; rm -rf $DEST/usr/share/info; }
+build_grep() { at_configure --disable-nls; make -j$JOBS; make install DESTDIR=$DEST; cp debian/rgrep $DEST/usr/bin/rgrep; chmod 755 $DEST/usr/bin/rgrep; rm -rf $DEST/usr/share/info; }
 build_sed() { at_configure --disable-nls --without-selinux --disable-acl; make -j$JOBS; make install DESTDIR=$DEST; rm -rf $DEST/usr/share/info; }
 build_gawk() {
   # Debian's (DFSG) source has no Texinfo manual sources: build without doc/,
@@ -151,6 +160,7 @@ build_less() {
   make -j$JOBS
   make install DESTDIR=$DEST
   cp debian/lesspipe $DEST/usr/bin/lesspipe 2>/dev/null || true
+  ln -sf lesspipe $DEST/usr/bin/lessfile
 }
 build_debianutils() {
   # (po4a: translated man pages, which need po4a on the host; left out)
@@ -207,7 +217,10 @@ build_file() {
   (cd ../file-host && CONFIG_SITE= CC=cc ./configure --build=x86_64-pc-linux-gnu --disable-shared --disable-libseccomp -q && make -j$JOBS -C src >/dev/null)
   at_configure --disable-shared --enable-static --disable-libseccomp --disable-bzlib --disable-xzlib --disable-zstdlib --disable-lzlib
   make -j$JOBS FILE_COMPILE=$PWD/../file-host/src/file
+  # the database where Debian's libmagic-mgc (which ours depends on) has it
+  make -C src clean; make -j$JOBS -C src MAGIC=/usr/lib/file/magic
   make install DESTDIR=$DEST FILE_COMPILE=$PWD/../file-host/src/file
+  rm -rf $DEST/usr/share/misc $DEST/usr/lib
   rm -rf $DEST/usr/include $DEST/usr/lib/*.a $DEST/usr/lib/pkgconfig
   rm -rf ../file-host
 }
@@ -233,18 +246,26 @@ build_vim() {
 build_util_linux() {
   # dh autoreconfs (Debian's patches touch Makefile.am); no autopoint: nls is off
   AUTOPOINT=true GTKDOCIZE=true autoreconf -fi
-  # the commands a shell user reaches for; nothing needing devices,
-  # mounts, logins or systemd. Debian splits them across util-linux,
-  # bsdutils, bsdextrautils (and uuid-runtime).
-  at_configure --disable-all-programs --disable-nls --without-systemd --without-udev --without-python \
-    --without-selinux --without-audit --without-libmagic --disable-shared --enable-static \
-    --enable-libuuid --enable-libsmartcols --enable-libblkid \
-    --enable-more --enable-column --enable-hexdump --enable-getopt --enable-script --enable-scriptreplay \
-    --enable-logger --enable-renice --enable-setsid --enable-flock --enable-rev --enable-look --enable-col \
-    --enable-colcrt --enable-colrm --enable-ul --enable-cal --enable-mcookie --enable-whereis --enable-uuidgen \
-    --enable-lscpu --enable-mesg --enable-waitpid --enable-cal \
+  # Every program by default (most have no --enable switch, and
+  # --disable-all-programs turns those off for good), minus what needs
+  # mounts, logins, block devices or systemd. Debian splits the rest across
+  # util-linux, bsdutils, bsdextrautils (and uuid-runtime).
+  at_configure --bindir=/usr/bin --sbindir=/usr/sbin --libdir=/usr/lib \
+    --disable-nls --without-systemd --without-udev --without-python --without-selinux --without-audit \
+    --without-libmagic --disable-shared --enable-static --disable-makeinstall-chown --disable-makeinstall-setuid \
+    --disable-poman --disable-asciidoc --disable-libmount --disable-libfdisk --disable-liblastlog2 --disable-pam-lastlog2 \
+    --disable-login --disable-su --disable-runuser --disable-sulogin --disable-nologin --disable-chfn-chsh --disable-newgrp \
+    --disable-vipw --disable-lslogins --disable-utmpdump --disable-last --disable-mount --disable-losetup --disable-fsck \
+    --disable-swapon --disable-agetty --disable-hwclock --disable-cramfs --disable-bfs --disable-minix --disable-fdisks \
+    --disable-partx --disable-eject --disable-lsfd --disable-irqtop --disable-lsirq --disable-zramctl --disable-wipefs \
+    --disable-mkfs --disable-fstrim --disable-switch_root --disable-pivot_root --disable-unshare --disable-nsenter \
+    --disable-setpriv --disable-lsns --disable-fallocate --disable-uuidd --disable-wdctl \
     CPPFLAGS="-I$SYSROOT/usr/include/ncursesw"
   make -j$JOBS
-  make install DESTDIR=$DEST
-  rm -rf $DEST/usr/include $DEST/usr/lib/*.a $DEST/usr/lib/pkgconfig $DEST/usr/share/doc
+  make install DESTDIR=$DEST RANLIB=gexcc-ranlib
+  # kill is procps's in Debian, rename the perl one's; the sbin tools are
+  # for devices the guest does not have
+  ln -sf hexdump $DEST/usr/bin/hd
+  rm -rf $DEST/usr/include $DEST/usr/lib $DEST/usr/share/doc $DEST/usr/sbin $DEST/usr/bin/kill $DEST/usr/bin/rename \
+    $DEST/usr/share/man/man8 $DEST/usr/share/man/man1/kill.1 $DEST/usr/share/man/man1/rename.1
 }

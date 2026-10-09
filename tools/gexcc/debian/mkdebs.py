@@ -51,9 +51,18 @@ def split_rules(srcpkg):
     rules = []
     for line in open(os.path.join(HERE, 'binpkgs.txt')):
         f = line.split()
-        if f and not f[0].startswith('#') and f[0] == srcpkg:
+        if f and not f[0].startswith('#') and f[0] == srcpkg and f[0] != 'depends':
             rules.append((f[1], f[2:]))
     return rules or [(srcpkg, ['*'])]
+
+
+def depends(binpkg):
+    out = []
+    for line in open(os.path.join(HERE, 'binpkgs.txt')):
+        f = line.split()
+        if len(f) > 2 and f[0] == 'depends' and f[1] == binpkg:
+            out += f[2:]
+    return ', '.join(out)
 
 
 def main():
@@ -114,6 +123,16 @@ def main():
                     ctl.append(f'{k}: {st.get(k, source.get(k))}')
             ma = st.get('Multi-Arch', 'foreign')
             ctl.append(f'Multi-Arch: {"foreign" if ma in ("foreign", "allowed", "no") else ma}')
+            # relations from debian/control, without the substitution
+            # variables dh would have filled (library dependencies, which a
+            # static program does not have)
+            for k in ('Provides', 'Conflicts', 'Breaks', 'Replaces'):
+                v = ', '.join(x.strip() for x in st.get(k, '').replace('\n', ' ').split(',')
+                              if x.strip() and '${' not in x)
+                if v:
+                    ctl.append(f'{k}: {v}')
+            if depends(b):
+                ctl.append(f'Depends: {depends(b)}')
             if 'Homepage' in source:
                 ctl.append(f'Homepage: {source["Homepage"]}')
             desc = st.get('Description', f'{b} (native wasm32 build)')
