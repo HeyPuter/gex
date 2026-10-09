@@ -16,13 +16,14 @@ CF="--target=wasm64-unknown-unknown -D__linux__=1 -D_LARGEFILE64_SOURCE=1 -D_LFS
 # an adapter for every function zlib.h declares (but gz*, which need stdio)
 python3 "$H/gen.py" - "$Z/zlib.h" > "$O/adapters.c"
 for f in adler32 crc32 deflate inflate inftrees inffast trees zutil compress uncompr infback; do
-  clang $CF -c "$Z/$f.c" -o "$O/z_$f.o" &
+  clang $CF -include "$H/zalloc.h" -c "$Z/$f.c" -o "$O/z_$f.o" &
 done
 clang $CF -I"$H" -c "$O/adapters.c" -o "$O/adapters.o" &
 clang $CF -I"$H" -c "$H/rt.c" -o "$O/rt.o" &
+clang --target=wasm64-unknown-unknown -c "$H/tls.s" -o "$O/tls.o" &
 wait
 wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=4294967296 \
-  --export=gexp_table -o "$O/libz-64.wasm" "$O"/*.o
+  --export=gexp_table -o "$O/libz-64.wasm" "$O"/z_*.o "$O"/adapters.o "$O"/rt.o "$O"/tls.o
 $OPT "$O/libz-64.wasm" --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
   --enable-nontrapping-float-to-int --enable-memory64 --memory64-lowering -O2 -g -o "$O/libz.so.1.wasm"
 ls -l "$O/libz.so.1.wasm"

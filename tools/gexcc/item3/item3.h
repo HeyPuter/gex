@@ -26,6 +26,17 @@ static inline int a64_ret(int ctx, uint64_t ret, uint64_t v)
 	return ra == ret;
 }
 
+/* The calling thread's context and depth (tls.s), set on every entry. */
+int a64_ctx(void);
+int a64_depth(void);
+void a64_set(int ctx, int depth);
+#define a64_enter(ctx) a64_set(ctx, depth)
+GEXP(__gex_thread_start);
+
+/* Call the guest function at `fn` (AAPCS64, integer arguments; at most 8)
+ * from inside the library, on the calling guest thread: its x0. */
+uint64_t a64_call_guest(uint64_t fn, unsigned n, const uint64_t *args);
+
 GEXP(gexp__missing);
 GEXP(gexp__noop);
 #endif

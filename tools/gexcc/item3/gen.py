@@ -36,6 +36,7 @@ for e in exports:
     args = ', '.join(f'({t})A64_ARG(ctx, {i})' for i, t in enumerate(ps))
     call = f'{e}({args})'
     print(f'GEXP(gexp_{e}) {{')
+    print('\ta64_enter(ctx);')
     if ret == 'void':
         print(f'\t{call};')
         print('\treturn a64_ret(ctx, ret, 0);')
@@ -48,5 +49,5 @@ for e in exports:
 print('void *gexp_table[] = {')
 for e in table:
     print(f'\t(void *)gexp_{e},')
-print('\t(void *)gexp__missing, (void *)gexp__noop, 0 };')
+print('\t(void *)gexp__missing, (void *)gexp__noop, (void *)__gex_thread_start, 0 };')
 print(f'/* {len(table)} of {len(exports)} exports */', file=sys.stderr)
