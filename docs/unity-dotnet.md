@@ -1929,15 +1929,40 @@ Not yet:
          drops it around `poll()` in `_xcb_conn_wait` and takes it again
          after. A wrong resume after the blocking poll (the class of the
          stale-resume bug) would skip the re-lock.
-       - The black screen is in the X/SDL init and needs neither UnityPlayer
-         nor libc JIT-compiled (hb29). `q21.sh` bisects the rest strictly:
-         hb30 libX11+libxcb, hb31 the X extension libraries, hb32 ld.so,
-         libdl, libpthread, libm, libstdc++, libgcc_s, librt.
-     - **xbig in the page (xb3 without fjit, xb4 with):** both print
-       "mapped" and "property ok" (the 300 KB property read back) and then
-       nothing for 10 min, so the next step (XGetImage of the 400x300
-       window, a 480 KB reply) hangs or crawls in the page with or without
-       the JIT. xb5 (xbig with per-step times) is queued.
+       - The black screen is in SDL's X11 video init and needs neither
+         UnityPlayer nor libc JIT-compiled (hb29). 3-minute strict runs,
+         judged by the player log's "window backend is x11|(null)":
+
+         | run | fjitlibs | backend |
+         |---|---|---|
+         | hb30 | +libX11,+libxcb | x11 |
+         | hb31 | +the 12 X extension/aux libraries (Xext, Xrandr, Xi, Xinerama, Xcursor, Xss, Xxf86vm, Xfixes, Xrender, X11-xcb, Xau, Xdmcp) | x11 |
+         | hb32 | +ld.so, libdl, libpthread, libm, libstdc++, libgcc_s, librt | x11 |
+         | hb33 | everything but UnityPlayer, libc and all 14 X libraries | x11 |
+         | hb34 | everything but UnityPlayer, libc, ld.so, libdl, libpthread, libm, libgcc_s, librt | (null) |
+
+         So it takes the X libraries together with something outside them.
+         (A `+` in `?fjitlibs=` must be `%2B` inside a name: hb34 meant to
+         drop libstdc++ too and did not.) `q24.sh`: X plus libstdc++
+         (hb35), plus the GL libraries (hb36), plus audio/system (hb37).
+     - **xbig hung in the page (xb3 without fjit, xb4 with; fixed in
+       895a3b8c).** xb5 (per-step times): round 0 (300 KB property, 480 KB
+       image, 50 atoms) done at 1.7 s, then the second property read never
+       returned. The X server is the host-side wasm Xwayland, and its
+       `gex_poll` (web/xwayland/gexos.c) set POLLOUT on every descriptor
+       but returned only for POLLIN: a reply that did not fit the guest's
+       kernel socket (`SOCK_BUF`, 256 KiB) waited for input that never came,
+       since the client was waiting for the reply. POLLOUT now comes from
+       the socket's room (`k_sock_writable`, `hostx.js` `writable`) and
+       counts. Any X client reading more than 256 KiB at once was exposed
+       (Unity's XGetImage/property reads, Wine). Rebuilding Xwayland.wasm on
+       gooner needed xorgproto 2024.1, util-macros, libxshmfence's header,
+       wayland-protocols and W's host wayland-scanner staged by hand
+       (`scratch/unity/xwl/`, `PKG_CONFIG_PATH`/`ACLOCAL_PATH`).
+     - lockpoll (libxcb's unlock/poll/lock on 4 threads, 80,000 entries,
+       `scratch/unity/page/lockpoll`) passes in the page with and without
+       fjit (lp1/lp2) and natively, so the hp8 libxcb race is not that
+       pattern on its own.
      - **Muck's grass is fixed by `?gllimits=41` with GL's rebased Mesa
        (mods/gpu, mesa-wink gl/perf 60202246):** mpg3 (fjit + the unit):
        the context is GL 4.2, no "Shader Unsupported" for the grass, and
