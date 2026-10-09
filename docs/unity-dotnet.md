@@ -2071,11 +2071,41 @@ Not yet:
        asks of every byte: hu15 decoded the `cmovle` at 0x1a79d150 (a JIT
        entry by then) as illegal (SIGILL, status 132). 5ec43e82 counts unit
        entries only (`cgen::unit_serves`).
-- **Resume (2026-10-09, HEAD 1cf4e76f; merge/unity has master 41917e73):**
-  hu14 (dumpmod, on the shim before 1cf4e76f) waits in edger's bench
-  queue; then sync the 1cf4e76f shim (copy in `scratch/unity/shim-served/`)
-  and run HK unit + fjit (`-libxcb.so.1,byobj=1`) for start-up against
-  ht3. Decode hu14's module, find the bad select in `_xcb_in_read_block`,
-  fix it, then recheck hb26 (full fjit, no unit) and hp8 (full fjit + unit).
-  Muck's grass needs the mods/gpu Mesa and `?gllimits=41` (not default yet;
-  GL to decide).
+     - **Results after the fixes (2026-10-09, HK in the page on edger;
+       presents/s at the menu, from the last minutes of 7-minute runs):**
+
+       | run | config | shim | first frame | 100 presents | menu presents/s |
+       |---|---|---|---|---|---|
+       | hp7 | unit, no fjit | before | 55 s | - | 26.3 |
+       | hu2 | unit + fjit `-libxcb` | before | 128 s | 166 s | 41.6 |
+       | ht3 | unit + fjit `-libxcb` | before (byobj) | 125 s | - | - |
+       | ht5 | unit + fjit `-libxcb` | 5ec43e82 (unit callees out of batches) | 113 s | - | 40.2 |
+       | ht6 | unit + fjit `-libxcb` | a12da54a (+ mid-function misses to the fallback) | 78 s | 96 s | 39.6-39.7 |
+       | hp9/hp10 | full fjit + unit | a12da54a/6bc61569 | - | - | crash at 23.6 s (memmove after writev: the stale-start split) |
+       | hp11 | full fjit + unit | 763a1538 (epochs) | 131 s | 161 s | 40.7-42.0 |
+       | hp12 | full fjit + unit | 58e95157 (epochs only where translated) | 128 s | 158 s | 42.4-42.7 |
+       | **hp13** | **full fjit + unit** | **977a2236 (current JIT callees out of batches too)** | **87 s** | **119 s** | **39.6-39.9** |
+       | hb51 | full fjit, no unit | 58e95157 | 222 s | 270 s | 33.9 at 392 s, rising (x11 backend; was black) |
+
+       Native gexc's gate (unit, no fjit): menu at 406.5 s, 30.59
+       presents/s. hp13 against hp7: 52% more presents/s (39.9 vs 26.3),
+       first frame 32 s later (87 vs 55 s). hp13's menu rate is 6% below
+       hp12's (39.9 vs 42.4): callees served by older modules are called
+       through the table instead of directly, which may cost that much, but
+       the menu rate ranges 39.7-42.7 across these runs. By the menu hp13's
+       JIT has made libasound 20 MiB of wasm (947 functions), libc 4.3 MiB,
+       libudev 3.2 MiB, libcrypto 2.9 MiB; UnityPlayer is out of the top 12.
+- **Resume (2026-10-09, HEAD after 977a2236; merge/unity has master 41917e73):**
+  HK in the page runs the target configuration (full fjit + the pinned
+  unit, `hk-bisu.sh NAME byobj=1`) to the menu: hp13 above. Fixed today: the
+  black screen and the libxcb crash (stale learned starts across dlclose,
+  763a1538), unit and current JIT callees kept out of batches (5ec43e82,
+  977a2236), mid-function misses to the fallback (a12da54a, 6bc61569).
+  Open: start-up is still ~87 s to the first frame (hp7 without fjit 55 s):
+  profile the main Worker again (ht2's method) to see what the JIT costs
+  now; libasound's 20 MiB of wasm; the native JIT has the same two holes
+  (learned state kept across dlclose, mid-function roots as starts),
+  which want a gex-xlate fix (a re-key: fjit.rs is in
+  GEX_CGEN_RECOVERY_INPUTS although it is runtime-only; build.rs could
+  leave it out, once). Muck's grass needs the mods/gpu Mesa and
+  `?gllimits=41` (not default; GL to decide).
