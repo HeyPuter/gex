@@ -177,10 +177,7 @@ impl<'a> GuestMem<'a> {
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         let r = self.range(addr, len)?;
         for page in self.view_mut()[r].chunks_mut(4096) {
-            // OR-folded 64 bytes at a time, which vectorises: this scan is
-            // the whole cost for the common case of a clean page.
-            let clean = page.chunks(64).all(|c| c.iter().fold(0u8, |a, &b| a | b) == 0);
-            if !clean {
+            if !page_is_zero(page) {
                 page.fill(0);
             }
         }
@@ -301,6 +298,20 @@ mod tests {
     /// Every byte of the range reads as zero afterwards, whichever pages were
     /// dirty, including a range that starts and ends mid-page.
     #[test]
+    fn page_is_zero_sees_every_byte() {
+        let mut buf = vec![0u8; 4096 + 16];
+        for off in [0usize, 1, 3, 8] {
+            let p = &mut buf[off..off + 4096];
+            assert!(super::page_is_zero(p));
+            for i in [0usize, 1, 7, 255, 256, 2049, 4095] {
+                p[i] = 0x80;
+                assert!(!super::page_is_zero(p), "byte {i} at offset {off}");
+                p[i] = 0;
+            }
+        }
+    }
+
+    #[test]
     fn zero_dirty_zeroes_what_was_written() {
         let mut buf = vec![0u8; 0x6000];
         buf[0x1000] = 1;
@@ -319,6 +330,27 @@ mod tests {
         assert!(b[0x800..0x1800].iter().all(|&x| x == 0));
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
+}
+
+/// Whether every byte of `b` is zero. The scan is the whole cost of
+/// [`GuestMem::zero_dirty`] for the common clean page, and a 64-bit build
+/// for wasm has no SIMD: a byte-wise fold is one load per byte, this is one
+/// per eight (an unaligned 64-bit load), four running at once, with an early
+/// out every 256 bytes.
+fn page_is_zero(b: &[u8]) -> bool {
+    let w = |c: &[u8]| u64::from_ne_bytes(c.try_into().unwrap());
+    let mut blocks = b.chunks_exact(256);
+    let clean = (&mut blocks).all(|c| {
+        let (mut a, mut x, mut y, mut z) = (0u64, 0u64, 0u64, 0u64);
+        for q in c.chunks_exact(32) {
+            a |= w(&q[0..8]);
+            x |= w(&q[8..16]);
+            y |= w(&q[16..24]);
+            z |= w(&q[24..32]);
+        }
+        a | x | y | z == 0
+    });
+    clean && blocks.remainder().iter().all(|&v| v == 0)
 }
 
 /// Bumped (after the push, under the kernel lock) whenever code is mapped or
