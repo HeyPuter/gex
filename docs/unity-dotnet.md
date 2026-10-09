@@ -2202,3 +2202,49 @@ Not yet:
     is unchanged (`mono.wasm.good`). The diagnostic edits in
     `dnc/src/.../loader.c` and in host/gexmono-adapters.h and
     gexmono-provider.c (`gexmono_last_api`) are uncommitted.
+- **The .NET JIT's NULL-method assert, located (hg7, provider with a trap
+  at the top of `mono_method_signature_checked_slow`):** JITted
+  `tk2dSpriteAnimator:Start ()` (wasmjit-batch[3]) -> `wj_call_interp_inner`
+  -> `interp_entry` -> interp -> icall `ves_icall_mono_delegate_ctor_interp`
+  -> `interp_delegate_ctor`. There `ftnptr_to_imethod(addr)` gives an
+  InterpMethod whose `method` is NULL, so the ldftn value reaching the
+  delegate ctor is not a live InterpMethod. The diagnostic patches are
+  `scratch/unity/gexdiag-{host,loader}.patch`, and the trap build is
+  `dnc-gc/provider/mono.wasm.diag3`. Both sources are reverted.
+  - hg6 repeats hg3 (interpreter) with no other Chromium on edger: King's
+    Pass, 14.5 presents/s.
+- **Start-up (item 2).**
+  - hp18 profiled every Worker from 5 s to 65 s. The browser-harness now
+    picks up Workers as they start.
+  - The main Worker is active 52.8 of 60.6 s. Of that, `fjit::translate`
+    is 23.6 s: recover_one 8.0, analyze_fn_full 6.6, build_runtime 5.5,
+    emit 5.2 and jump-table resolve_all 5.0.
+  - Mono takes 13 s: the interpreter's transform 7.0 s and class init
+    6.0 s.
+  - `sys_mmap` takes 5.1 s, 4.3 s of it in `zero_dirty`, which scanned
+    bytewise because the shim has no SIMD. The scan is now word-wise
+    (38739efc).
+  - Unity's 20+ other thread Workers are parked; their ~5.8 s each is
+    mostly atomics.wait inside KLock::take.
+  - Translation is almost all system libraries: libc, libasound, libX11,
+    libcrypto, ld.so, libdbus, libudev and libpulse*.
+  - System-library units: edger's libraries (`units/edger-libs`, which
+    differ from gooner's) are built at the page's bases
+    (`build-libs-m1.sh`, `build-libs-m3.sh`) into `units/cgen-page-m1` on
+    edger. That directory also holds the re-keyed HK unit 70db2b08, which
+    is byte-identical to 7bd87731, and Muck's unit. The key is unchanged at
+    7bcb4fbe (master ff69f7e4).
+  - With these units, libdbus-1 unmapped and libxcb mapped at its base
+    exited with status 255 at ~16 s (hp19, hp22). Fixed in 705dc708: a
+    unit on code that is no longer mapped executable is retired whatever
+    its bytes.
+  - Five libraries load at new bases since master 9e5ac0ff, and their
+    units are rebuilt for those bases (build-libs-m3).
+
+    | run | shim | units | first frame | 100 presents | presents/s (212 s) |
+    |---|---|---|---|---|---|
+    | hp16 | 1bf5ba09 | UnityPlayer | 56 s | 85 s | 41.5 (392 s) |
+    | hp20 | 114b6b69 + zero scan | UnityPlayer | 52 s | 70 s | 41.4 |
+    | hp24 | 705dc708 | UnityPlayer | 53 s | 83 s | 41.1 |
+    | hp21 | 114b6b69 + zero scan | + libc, libm | 45 s | 77 s | - |
+    | hp23 | 705dc708 | + 15 libraries (5 at stale bases) | 43 s | 73 s | 40.1 |
