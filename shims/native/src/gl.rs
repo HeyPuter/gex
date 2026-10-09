@@ -56,12 +56,53 @@ pub struct GlDevice {
     /// The guest's memory (`set_memory`): a synchronous batch is read where
     /// it is in it.
     memory: Mutex<Option<gex_mem::GuestMemory>>,
+    /// The last synchronous batch's last opcode, for `GEX_GL_WAITS`.
+    first_op: std::sync::atomic::AtomicU32,
 }
 
 /// `GEX_GL_SYNC=1`: every batch runs before its submit returns.
 fn sync_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GEX_GL_SYNC").as_deref() == Ok("1"))
+}
+
+/// `GEX_GL_WAITS=1`: about once a second, how many synchronous submits the
+/// guest made and how long it waited in them (wall time inside `submit`,
+/// which is all a guest thread does there): whether a slow program is waiting
+/// on GL round trips or on something else.
+fn wait_meter_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_GL_WAITS").is_some_and(|v| v != "0"))
+}
+
+fn wait_meter(waited: std::time::Duration, last_op: u32) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    #[allow(clippy::type_complexity)]
+    static M: Mutex<Option<(Instant, u64, f64, f64, std::collections::HashMap<u32, (u64, f64)>)>> = Mutex::new(None);
+    if !wait_meter_on() {
+        return;
+    }
+    let mut g = M.lock().unwrap();
+    let m = g.get_or_insert_with(|| (Instant::now(), 0, 0.0, 0.0, Default::default()));
+    let ms = waited.as_secs_f64() * 1e3;
+    m.1 += 1;
+    m.2 += ms;
+    m.3 = m.3.max(ms);
+    let e = m.4.entry(last_op).or_default();
+    e.0 += 1;
+    e.1 += ms;
+    let dt = m.0.elapsed().as_secs_f64();
+    if dt >= 1.0 {
+        let mut top: Vec<_> = m.4.iter().map(|(o, (n, t))| (*o, *n, *t)).collect();
+        top.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let top: Vec<String> = top.iter().take(4).map(|(o, n, t)| format!("op {o} x{n} {t:.0} ms")).collect();
+        eprintln!(
+            "[gex-gl] waits: {} submits in {:.2} s, {:.0} ms waited ({:.0}%), max {:.1} ms; by last op: {}",
+            m.1, dt, m.2, m.2 / (dt * 10.0), m.3, top.join(", ")
+        );
+        *g = None;
+    }
 }
 
 /// One batch for the GL thread; `done` takes the result back to a
@@ -131,6 +172,7 @@ impl GlDevice {
             me: me.clone(),
             threaded: std::sync::atomic::AtomicBool::new(false),
             memory: Mutex::new(None),
+            first_op: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -293,7 +335,23 @@ impl GlDevice {
 
     /// Run one batch, reading it out of guest memory and writing the reply back.
     fn submit(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
+        let t0 = std::time::Instant::now();
+        let r = self.submit_inner(m, ring);
+        wait_meter(t0.elapsed(), self.first_op.load(std::sync::atomic::Ordering::Relaxed));
+        r
+    }
+
+    fn submit_inner(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
         let (header, batch) = self.ring_batch(m, ring)?;
+        if wait_meter_on() {
+            // The last command: the one whose reply the guest waits for.
+            let mut c = gex_gl::proto::Commands::new(batch);
+            let mut op = 0;
+            while let Some(Ok((o, _))) = c.next() {
+                op = o;
+            }
+            self.first_op.store(op, std::sync::atomic::Ordering::Relaxed);
+        }
         let (bytes, status, executed) = if self.threaded() {
             // In place when the ring is in the memory the device knows (the
             // process's own; a forked child's is copied as before).
