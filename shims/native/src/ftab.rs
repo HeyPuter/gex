@@ -1002,17 +1002,27 @@ pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots
 /// ranges, and clear their probe cache entries (`retire_translations`).
 /// Their page checks would catch them anyway; this keeps the cache from
 /// sending callers there first.
-pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u64)]) {
+///
+/// `gone` (within `ranges`): pages no longer mapped executable. Units' entries
+/// there leave the table (providers stay): the object that next lands there
+/// clears the patched bits for its own unit, which would otherwise revive
+/// every address of the old one it does not define.
+pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     sh.ftab.epoch += 1;
     if let Some(t) = gex_kernel::ftab::translator() {
         t.retire(sh.ftab.process.0, ranges);
     }
     sh.ftab.queued.retain(|&a| !ranges.iter().any(|&(s, e)| a >= s && a < e));
+    let is_gone = |a: u64| gone.iter().any(|&(s, e)| a >= s && a < e);
     for &(start, end) in ranges {
         let hit: Vec<(u64, gex_kernel::ftab::Func)> = sh.ftab.map.range(start, end).collect();
         for (a, f) in hit {
+            // Every entry's probe cache slot, the units' included: a cached
+            // unit entry would outlive its retirement below.
             gex_kernel::ftab::fcache_clear(memory, a);
-            if sh.ftab.map.install(f.install).tier != Tier::Unit {
+            let install = sh.ftab.map.install(f.install);
+            let unit_gone = install.tier == Tier::Unit && !sh.ftab.providers.contains(&f.install) && is_gone(a);
+            if install.tier != Tier::Unit || unit_gone {
                 sh.ftab.map.retire(a);
             }
         }
