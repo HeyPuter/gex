@@ -97,15 +97,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
     let pairs = [(entry, slot("__gex_start")?), (thread_entry, slot("__gex_thread_start")?)];
     let engine = store.engine().clone();
     let t0 = std::time::Instant::now();
-    // Kept on disk by content (the cache's directory), like a wasm32
-    // library's .cwasm, and in memory for the next process of this run
-    // (gex_cache's memo): every Wine child under W3 starts this same 5.7 MB
-    // loader, and compiling it was 2 s of each one's start.
-    let module = match gex_cache::cache_dir() {
-        Some(dir) => gex_cache::load_or_compile_at(&engine, &dir.join(format!("wasmprog-{}.cwasm", &gex_cache::key("wasmprog", [&wasm[..]])[..32])), &wasm),
-        None => gex_cache::compile(&engine, &wasm),
-    }
-    .context("compiling the wasm32 program")?;
+    let module = gex_cache::compile_cached(&engine, &wasm).context("compiling the wasm32 program")?;
     let shared = store
         .data()
         .jit

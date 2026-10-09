@@ -661,6 +661,9 @@ pub struct Kernel {
     /// it replaced, and a build system that does not get one back concludes
     /// the mask was zero and re-runs itself.
     pub umask: u32,
+    /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource.
+    /// RLIMIT_NOFILE's soft limit is the descriptor table's (`FdTable`).
+    pub rlimits: [[u64; 2]; RLIM_NLIMITS],
     /// The terminal: flags, size, foreground process group, and the line
     /// discipline behind them. See [`crate::tty`].
     ///
@@ -687,6 +690,30 @@ pub struct Itimer {
 }
 
 /// The three interval timers, in the order `which` names them.
+/// Resource limits (prlimit64): Linux's numbering and its defaults for a
+/// login process. RLIM_INFINITY is all ones.
+pub const RLIM_NLIMITS: usize = 16;
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_CORE: usize = 4;
+pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIMIT_NPROC: usize = 6;
+pub const RLIMIT_MEMLOCK: usize = 8;
+pub const RLIMIT_SIGPENDING: usize = 11;
+pub const RLIMIT_MSGQUEUE: usize = 12;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
+    let mut l = [[RLIM_INFINITY; 2]; RLIM_NLIMITS];
+    l[RLIMIT_STACK] = [8 << 20, RLIM_INFINITY];
+    l[RLIMIT_CORE] = [0, RLIM_INFINITY];
+    l[RLIMIT_NOFILE] = [crate::file::NOFILE_SOFT as u64, crate::file::NOFILE_HARD as u64];
+    l[RLIMIT_NPROC] = [63_000, 63_000];
+    l[RLIMIT_MEMLOCK] = [8 << 20, 8 << 20];
+    l[RLIMIT_SIGPENDING] = [63_000, 63_000];
+    l[RLIMIT_MSGQUEUE] = [819_200, 819_200];
+    l
+}
+
 pub const ITIMER_REAL: usize = 0;
 pub const ITIMER_VIRTUAL: usize = 1;
 pub const ITIMER_PROF: usize = 2;
@@ -857,6 +884,9 @@ pub enum PollReport {
         max: u32,
         /// The opaque word to hand back for each descriptor.
         data: Vec<(i32, u64)>,
+        /// `struct epoll_event` packed in 12 bytes (x86-64's, and the i386
+        /// ABI's in any build), rather than 16.
+        packed: bool,
     },
     /// `select`'s three `fd_set`s. A zero address means the caller did not
     /// pass that set.
@@ -929,7 +959,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             }
             Ok(ready)
         }
-        PollReport::Epoll { out, max, data } => {
+        PollReport::Epoll { out, max, data, packed } => {
             // Only the ready ones, each with the caller's own token, which is
             // the whole difference between this and `poll`.
             let mut n = 0u64;
@@ -950,7 +980,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 // on x86-64 (the token at offset four), 16 on aarch64. Xvfb
                 // read its `data.ptr` from the wrong offset after every wait
                 // that had to block, and dereferenced the mask.
-                if gex_abi::X86 {
+                if *packed {
                     let at = out + n * 12;
                     m.write_u32(at, r as u32)?;
                     m.write_u64(at + 4, token)?;
@@ -1284,6 +1314,7 @@ impl Kernel {
             retired_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
+            rlimits: default_rlimits(),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             ports: Arc::new(net::Ports::new()),
@@ -1425,13 +1456,21 @@ impl Kernel {
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let bytes_to_string = |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
         let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         // A 32-bit process hands over vectors of 32-bit pointers.
         let compat = self.compat;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
             let mut out = Vec::new();
-            // A bound, because the vector is the guest's and its terminator
-            // may not be there.
-            for _ in 0..4096 {
+            // Linux's limits: one string up to MAX_ARG_STRLEN (32 pages),
+            // all of them together a quarter of the 8 MiB stack limit;
+            // past either, E2BIG. (A make recipe of several KiB, passed to
+            // sh -c, is ordinary: automake's test-suite.log rule.)
+            const MAX_ARG_STRLEN: usize = 32 * 4096;
+            const ARG_MAX: usize = 2 << 20;
+            let mut total = 0usize;
+            loop {
                 if p == 0 {
                     break;
                 }
@@ -1439,7 +1478,12 @@ impl Kernel {
                 if ptr == 0 {
                     break;
                 }
-                out.push(bytes_to_string(m.read_cstr(ptr, 4096)?)?);
+                let b = m.read_cstr(ptr, MAX_ARG_STRLEN).map_err(|e| if e == Errno::ENAMETOOLONG { Errno::E2BIG } else { e })?;
+                total += b.len() + 1 + if compat { 4 } else { 8 };
+                if total > ARG_MAX {
+                    return Err(Errno::E2BIG);
+                }
+                out.push(bytes_to_string(b)?);
                 p += if compat { 4 } else { 8 };
             }
             Ok(out)
@@ -1518,6 +1562,7 @@ impl Kernel {
             retired_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
+            rlimits: self.rlimits,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             ports: Arc::clone(&self.ports),
@@ -1578,7 +1623,7 @@ impl Kernel {
             m.write_u64(child + off as u64, v)?;
         }
         set_result(m, child, 0)?;
-        m.write_u64(child + ctx::SP as u64, child_stack)?;
+        m.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
@@ -1650,8 +1695,11 @@ impl Kernel {
 
     fn syscall_inner(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         self.syscall_pc = pc;
+        // An i386-ABI process has its number in eax (`x(0)`) in every build:
+        // on an AArch64 build that is a native wasm32 program.
+        let nr_slot = if self.compat && !gex_abi::PPC { ctx::x(0) } else { ctx::SYSCALL_NR };
         let raw = m
-            .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
+            .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
         let mut a: [u64; 6] = if self.compat && !gex_abi::PPC {
             let mut a = [0u64; 6];
@@ -1689,12 +1737,12 @@ impl Kernel {
             post = p;
             ppc_post = pp;
             n
-        } else if gex_abi::X86 && self.compat {
+        } else if self.compat {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,
                 m,
-                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr + ctx::COMPAT_SCRATCH as u64,
                 self.ctx_addr,
             );
             post = p;
@@ -1940,7 +1988,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if (gex_abi::X86 || gex_abi::PPC) && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || gex_abi::PPC || self.compat) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -2103,6 +2151,7 @@ impl Kernel {
                         out: a[1],
                         max: a[2] as u32,
                         data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
+                        packed: gex_abi::X86 || self.compat,
                     },
                 })
             }
@@ -2115,7 +2164,7 @@ impl Kernel {
                     )
                 } else {
                     (
-                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
+                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3]).ok()?,
                         PollReport::Select {
                             nfds: a[0] as u32,
                             readfds: a[1],
@@ -2453,11 +2502,11 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 || gex_abi::PPC => self.sys_dup2(a[0] as i32, a[1] as i32),
-            nr::TIME if gex_abi::X86 || gex_abi::PPC => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 || gex_abi::PPC => self.sys_alarm(m, a[0]),
+            nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
+            nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(m, a[0]),
             nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC => Ok(0),
+            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC || self.compat => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -2553,7 +2602,22 @@ impl Kernel {
             // Ownership is not modelled: there is one user and the guest is
             // it. Refusing would be worse than accepting -- tar treats a
             // failed chown while unpacking as a failure to unpack.
-            nr::FCHOWN | nr::FCHOWNAT => Ok(0),
+            // Ownership is not kept, but the file must be there.
+            nr::FCHOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            nr::FCHOWNAT => {
+                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
+                if empty && a[4] & AT_EMPTY_PATH != 0 {
+                    self.fds.get(a[0] as i32).map(|_| 0)
+                } else {
+                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
+                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
+                            self.vfs.metadata_nofollow(&p).map(|_| 0)
+                        } else {
+                            self.vfs.metadata(&p).map(|_| 0)
+                        }
+                    })
+                }
+            }
 
             // -- memory ------------------------------------------------------
             nr::BRK => {
@@ -2633,7 +2697,7 @@ impl Kernel {
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
             // -- sockets -----------------------------------------------------
-            nr::SOCKET => self.sys_socket(a[0], a[1]),
+            nr::SOCKET => self.sys_socket(a[0], a[1], a[2]),
             // A unix socket and an internet socket are different concrete
             // types behind the same descriptor, so which `connect` this is
             // depends on what the descriptor turned out to be.
@@ -2657,14 +2721,15 @@ impl Kernel {
             // Nothing here has an option worth setting -- no timeouts, no
             // buffer sizes that mean anything -- and refusing makes libraries
             // treat the socket as broken.
-            nr::SETSOCKOPT => Ok(0),
+            // agreed to without effect, on a descriptor that exists
+            nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
             // A unix socket's directions close as asked; any other socket
             // (the proxied network, the global kernel's) just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
                 Err(_) => match self.socket_of(a[0] as i32) {
-                    Ok(sock) => sock.shutdown(a[1]),
+                    Ok(s) => s.shutdown(a[1]),
                     Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
                 },
             },
@@ -2753,7 +2818,7 @@ impl Kernel {
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
-            nr::PRLIMIT64 => self.sys_prlimit(m, a[2], a[3]),
+            nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -3182,12 +3247,86 @@ impl Kernel {
     fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
-        if p.starts_with('/') || dirfd == AT_FDCWD {
-            return Ok(self.vfs.absolute(&p));
+        self.at_path_str(dirfd, &p)
+    }
+
+    /// [`Self::at_path`] for a path already read.
+    fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
+        let p = p.to_string();
+        // An empty path names nothing (the AT_EMPTY_PATH forms check for it
+        // before they get here), as on Linux.
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
         }
-        // Relative to an open directory: its recorded path is the base.
-        let base = self.fds.get(dirfd)?.path.clone();
-        Ok(crate::vfs::normalize(&p, &base))
+        let abs = if p.starts_with('/') || dirfd == AT_FDCWD {
+            self.vfs.absolute(&p)
+        } else {
+            self.at_dir_path(dirfd, &p)?
+        };
+        // A trailing slash names a directory: "file/" is ENOTDIR (the
+        // normalised path has lost the slash, so look now).
+        if p.len() > 1 && p.ends_with('/') {
+            let followed = self.vfs.metadata(&abs);
+            if let Ok(md) = followed.as_ref() {
+                if md.file_type != crate::vfs::FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                // "link/" names the directory the link points to, even for
+                // lstat and the other calls that do not follow a last link
+                let mut cur = abs;
+                for _ in 0..40 {
+                    match self.vfs.read_link(&cur) {
+                        Ok(t) if t.starts_with('/') => cur = crate::vfs::normalize(&t, "/"),
+                        Ok(t) => cur = crate::vfs::normalize(&t, &crate::vfs::parent_of(&cur)),
+                        Err(_) => break,
+                    }
+                }
+                return Ok(cur);
+            }
+            // a dangling or looping link with a slash names nothing: the
+            // error following it gives (ENOENT, ELOOP)
+            if self.vfs.metadata_nofollow(&abs).is_ok() {
+                return Err(followed.err().unwrap_or(Errno::ENOENT));
+            }
+        }
+        Ok(abs)
+    }
+
+    /// How the path at `ptr` ends, which normalising loses: with a slash
+    /// (`name/`), and whether its last component is `.` (1) or `..` (2).
+    fn path_tail(m: &GuestMem<'_>, ptr: u64) -> Result<(bool, u8), Errno> {
+        let raw = m.read_cstr(ptr, 4096)?;
+        let slash = raw.len() > 1 && raw.ends_with(b"/");
+        let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+        let dot = match last {
+            Some(b".") => 1,
+            Some(b"..") => 2,
+            _ => 0,
+        };
+        Ok((slash, dot))
+    }
+
+    /// A new non-directory name (link, symlink) that ends in a slash or in
+    /// `.`/`..` names a directory: EEXIST when something is there, else
+    /// ENOENT, as Linux answers.
+    fn new_name_check(&self, m: &GuestMem<'_>, ptr: u64, p: &str) -> Result<(), Errno> {
+        let (slash, dot) = Self::path_tail(m, ptr)?;
+        if slash || dot != 0 {
+            return Err(if self.vfs.metadata_nofollow(p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
+        Ok(())
+    }
+
+    /// `p` relative to the directory open at `dirfd`.
+    fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
+        // Relative to an open directory: its recorded path is the base. A
+        // descriptor that is not a directory is ENOTDIR.
+        let f = self.fds.get(dirfd)?;
+        if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
+            return Err(Errno::ENOTDIR);
+        }
+        let base = f.path.clone();
+        Ok(crate::vfs::normalize(p, &base))
     }
 
     // -- I/O -----------------------------------------------------------------
@@ -3574,6 +3713,24 @@ impl Kernel {
             if let Some(base) = self.pin_for(&p) {
                 self.armed_pin = Some((p.clone(), base));
             }
+            // O_CREAT of "name/" that is not there: a slash names a
+            // directory, which open does not create (EISDIR, as Linux).
+            if flags & oflags::O_CREAT != 0 && Self::path_tail(m, path)?.0 && self.vfs.metadata(&p).is_err() {
+                return Err(Errno::EISDIR);
+            }
+            // O_NOFOLLOW on a symlink: ELOOP.
+            if flags & oflags::O_NOFOLLOW != 0
+                && self.vfs.metadata_nofollow(&p).is_ok_and(|md| md.file_type == FileType::Symlink)
+            {
+                return Err(Errno::ELOOP);
+            }
+            // A directory opens for reading only, whatever the filesystem.
+            let acc = flags & oflags::ACCMODE;
+            if (acc == oflags::O_WRONLY || acc == oflags::O_RDWR)
+                && self.vfs.metadata(&p).is_ok_and(|md| md.file_type == FileType::Directory)
+            {
+                return Err(Errno::EISDIR);
+            }
             let h = self.vfs.open(&p, flags, mode)?;
             // And arm a placement, for an object nobody pinned. Only for a
             // shared object: the executable's own base is fixed by the
@@ -3676,6 +3833,7 @@ impl Kernel {
             from
         };
         let to = self.at_path(m, a[2] as i32, a[3])?;
+        self.new_name_check(m, a[3], &to)?;
         self.vfs.link(&from, &to).map(|_| 0)
     }
 
@@ -3873,6 +4031,12 @@ impl Kernel {
             blksize: 4096,
             blocks: (md.size as i64 + 511) / 512,
             mtime: md.mtime,
+            // A filesystem that keeps one time reports it for all three.
+            mtime_ns: md.times.mtime_ns,
+            atime: if md.times == Default::default() { md.mtime } else { md.times.atime },
+            atime_ns: md.times.atime_ns,
+            ctime: if md.times == Default::default() { md.mtime } else { md.times.ctime },
+            ctime_ns: md.times.ctime_ns,
             // What the node says, or for a character device that does not,
             // a pseudo-terminal's number (136:0).
             rdev: if md.rdev != 0 {
@@ -3933,10 +4097,16 @@ impl Kernel {
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
         put64(&mut out, 48, st.blocks as u64);
-        // atime, btime, ctime, mtime: 16 bytes each from offset 64. Only the
-        // seconds are known, and all four get the same one.
-        for at in [64usize, 80, 96, 112] {
-            put64(&mut out, at, st.mtime as u64);
+        // atime, btime, ctime, mtime: 16 bytes each from offset 64, seconds
+        // then nanoseconds; btime is reported as mtime.
+        for (at, (t, ns)) in [64usize, 80, 96, 112].into_iter().zip([
+            (st.atime, st.atime_ns),
+            (st.mtime, st.mtime_ns),
+            (st.ctime, st.ctime_ns),
+            (st.mtime, st.mtime_ns),
+        ]) {
+            put64(&mut out, at, t as u64);
+            put32(&mut out, at + 8, ns);
         }
         put32(&mut out, 128, (st.rdev >> 8) as u32);
         put32(&mut out, 132, (st.rdev & 0xff) as u32);
@@ -3987,6 +4157,8 @@ impl Kernel {
         const F_ADD_SEALS: u64 = 1033;
         const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        // every command is on an open descriptor
+        self.fds.get(fd)?;
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let file = self.fds.get(fd)?;
@@ -4529,6 +4701,9 @@ impl Kernel {
     fn sys_chdir(&mut self, m: &GuestMem<'_>, path: u64) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         self.vfs.set_cwd(&p).map(|_| 0)
     }
 
@@ -4550,13 +4725,33 @@ impl Kernel {
     }
 
     fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        // "link/" where link dangles: the name is taken (EEXIST); resolving
+        // the slash would say ENOENT
+        if Self::path_tail(m, path)?.0 {
+            let raw = String::from_utf8(m.read_cstr(path, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(dirfd, raw.trim_end_matches('/'))?;
+            if self.vfs.metadata_nofollow(&bare).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+        }
         let p = self.at_path(m, dirfd, path)?;
+        // "dir/." and "dir/.." exist if dir does, else ENOENT
+        if Self::path_tail(m, path)?.1 != 0 {
+            return Err(if self.vfs.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
         self.vfs.mkdir(&p, mode & !self.umask).map(|_| 0)
     }
 
     fn sys_unlinkat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
+        let tail = Self::path_tail(m, path)?;
         let p = self.at_path(m, dirfd, path)?;
         if flags & AT_REMOVEDIR != 0 {
+            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY
+            match tail.1 {
+                1 => return Err(Errno::EINVAL),
+                2 => return Err(Errno::ENOTEMPTY),
+                _ => {}
+            }
             self.vfs.rmdir(&p).map(|_| 0)
         } else {
             self.vfs.unlink(&p).map(|_| 0)
@@ -4571,9 +4766,7 @@ impl Kernel {
         new_fd: i32,
         new: u64,
     ) -> SysResult {
-        let from = self.at_path(m, old_fd, old)?;
-        let to = self.at_path(m, new_fd, new)?;
-        self.vfs.rename(&from, &to).map(|_| 0)
+        self.sys_renameat2(m, old_fd, old, new_fd, new, 0)
     }
 
     /// `renameat2`: `renameat` plus a flags word. The flags matter -- programs
@@ -4599,8 +4792,32 @@ impl Kernel {
     ) -> SysResult {
         const RENAME_NOREPLACE: u32 = 1;
         const RENAME_EXCHANGE: u32 = 2;
+        // "." or ".." as the last component of either name: EINVAL (the
+        // normalised paths would name the directory itself)
+        for ptr in [old, new] {
+            let raw = m.read_cstr(ptr, 4096)?;
+            let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+            if matches!(last, Some(b".") | Some(b"..")) {
+                return Err(Errno::EINVAL);
+            }
+        }
         let from = self.at_path(m, old_fd, old)?;
+        // "x" to "link/" where link is a symlink: the slash asks to follow
+        // it, and rename never replaces through a link (ENOTDIR, as GNU)
+        if Self::path_tail(m, new)?.0 {
+            let raw = String::from_utf8(m.read_cstr(new, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(new_fd, raw.trim_end_matches('/'))?;
+            if self.vfs.metadata_nofollow(&bare).is_ok_and(|md| md.file_type == FileType::Symlink) {
+                return Err(Errno::ENOTDIR);
+            }
+        }
         let to = self.at_path(m, new_fd, new)?;
+        // "file" to "name/": a slash names a directory, which a file is not
+        if Self::path_tail(m, new)?.0
+            && self.vfs.metadata_nofollow(&from).is_ok_and(|md| md.file_type != FileType::Directory)
+        {
+            return Err(Errno::ENOTDIR);
+        }
         if flags & !RENAME_NOREPLACE != 0 {
             // EXCHANGE, WHITEOUT, or any unknown bit: unsupported here.
             let _ = RENAME_EXCHANGE;
@@ -4625,25 +4842,29 @@ impl Kernel {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
         const UTIME_NOW: u64 = (1 << 30) - 1;
         const UTIME_OMIT: u64 = (1 << 30) - 2;
-        // The modification time to set, if any.
-        let mtime = if times == 0 {
-            Some((self.clock)().0 as i64)
+        // The access and modification times to set (`None`: leave it).
+        let now = {
+            let (s, ns) = (self.clock)();
+            (s as i64, ns as u32)
+        };
+        let (atime, mtime) = if times == 0 {
+            (Some(now), Some(now))
         } else {
-            for t in [times, times + 16] {
+            let mut v = [None, None];
+            for (k, t) in [times, times + 16].into_iter().enumerate() {
                 let ns = m.read_u64(t + 8)?;
-                if ns >= 1_000_000_000 && ns != UTIME_NOW && ns != UTIME_OMIT {
-                    return Err(Errno::EINVAL);
-                }
+                v[k] = match ns {
+                    UTIME_OMIT => None,
+                    UTIME_NOW => Some(now),
+                    _ if ns >= 1_000_000_000 => return Err(Errno::EINVAL),
+                    _ => Some((m.read_u64(t)? as i64, ns as u32)),
+                };
             }
-            match m.read_u64(times + 24)? {
-                UTIME_OMIT => None,
-                UTIME_NOW => Some((self.clock)().0 as i64),
-                _ => Some(m.read_u64(times + 16)? as i64),
-            }
+            (v[0], v[1])
         };
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
-            self.fds.get(dirfd)?;
+            self.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;
@@ -4653,8 +4874,8 @@ impl Kernel {
         } else {
             self.vfs.metadata_nofollow(&p)?;
         }
-        if let Some(t) = mtime {
-            self.vfs.set_mtime(&p, t, follow)?;
+        if atime.is_some() || mtime.is_some() {
+            self.vfs.set_times(&p, atime, mtime, follow)?;
         }
         Ok(0)
     }
@@ -4671,6 +4892,7 @@ impl Kernel {
     ) -> SysResult {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
+        self.new_name_check(m, path, &p)?;
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
@@ -4707,17 +4929,21 @@ impl Kernel {
         readfds: u64,
         writefds: u64,
         exceptfds: u64,
-    ) -> Option<Vec<PollFd>> {
+    ) -> Result<Vec<PollFd>, Errno> {
         const POLLIN: u16 = 0x001;
         const POLLOUT: u16 = 0x004;
+        if (nfds as i32) < 0 {
+            return Err(Errno::EINVAL);
+        }
         let nfds = nfds.min(1024);
         let mut want: std::collections::BTreeMap<i32, u16> = Default::default();
-        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT)] {
+        // (exceptfds: watched for nothing, but its descriptors must be open)
+        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT), (exceptfds, 0)] {
             if set == 0 {
                 continue;
             }
             for w in 0..(nfds as usize).div_ceil(64) {
-                let word = m.read_bits64(set + (w as u64) * 8).ok()?;
+                let word = m.read_bits64(set + (w as u64) * 8).map_err(|_| Errno::EFAULT)?;
                 if word == 0 {
                     continue;
                 }
@@ -4733,9 +4959,12 @@ impl Kernel {
             }
         }
         // An exceptional condition never happens here, so a descriptor named
-        // only in that set is watched for nothing and simply never fires.
-        let _ = exceptfds;
-        Some(
+        // only in that set is watched for nothing and simply never fires. A
+        // descriptor in any set that is not open is EBADF, as on Linux.
+        if want.keys().any(|&fd| self.fds.get(fd).is_err()) {
+            return Err(Errno::EBADF);
+        }
+        Ok(
             want.into_iter()
                 .map(|(fd, events)| {
                     let file = self.fds.get(fd).ok();
@@ -4983,9 +5212,7 @@ impl Kernel {
     /// `pselect6`, for the case where something is ready already. The waiting
     /// case is a [`BlockOp::Poll`], decided before this is reached.
     fn sys_pselect(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = self
-            .collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])
-            .ok_or(Errno::EFAULT)?;
+        let set = self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?;
         poll_finish(
             &set,
             &PollReport::Select {
@@ -5378,7 +5605,7 @@ impl Kernel {
     /// `socket`. AF_UNIX, an inert AF_NETLINK (below), and AF_INET with only the two kinds that matter: a stream,
     /// which the host carries, and a datagram, which only ever goes to the
     /// resolver this kernel is.
-    fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
+    fn sys_socket(&mut self, domain: u64, ty: u64, protocol: u64) -> SysResult {
         const AF_UNIX: u64 = 1;
         const AF_INET: u64 = 2;
         const SOCK_STREAM: u64 = 1;
@@ -5405,7 +5632,16 @@ impl Kernel {
         // its video subsystem too, and Unity 6 then saw no display). There
         // are no devices to announce, so the socket binds, takes its options
         // and never has a message: an empty eventfd behind the descriptor.
+        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
+        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
+        // request with the 8-byte counter its own send wrote, which glibc
+        // aborts on (apt's http method). Without a route socket it assumes
+        // IPv4 and IPv6 are there.
         const AF_NETLINK: u64 = 16;
+        const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
+            return Err(Errno::EAFNOSUPPORT);
+        }
         if domain == AF_NETLINK {
             let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
             let flags = if ty & SOCK_NONBLOCK != 0 { crate::fs::oflags::O_NONBLOCK } else { 0 };
@@ -5621,7 +5857,7 @@ impl Kernel {
         // `EPOLL_CTL_DEL` is allowed a null event pointer.
         let (events, data) = if event == 0 {
             (0, 0)
-        } else if gex_abi::X86 {
+        } else if gex_abi::X86 || self.compat {
             (m.read_u32(event)?, m.read_u64(event + 4)?)
         } else {
             (m.read_u32(event)?, m.read_u64(event + 8)?)
@@ -5722,7 +5958,7 @@ impl Kernel {
     ) -> SysResult {
         let n = ready.len().min(max as usize);
         for (i, (events, data)) in ready.iter().take(n).enumerate() {
-            if gex_abi::X86 {
+            if gex_abi::X86 || self.compat {
                 // Packed: 12 bytes, the token at offset four.
                 let at = out + i as u64 * 12;
                 m.write_u32(at, *events)?;
@@ -6376,7 +6612,7 @@ impl Kernel {
     /// previous timer had left. Both itimervals live in the thread's scratch
     /// area, since the call has none of its own.
     fn sys_alarm(&mut self, m: &mut GuestMem<'_>, secs: u64) -> SysResult {
-        let scratch = self.ctx_addr + ctx::SCRATCH as u64;
+        let scratch = self.ctx_addr + ctx::COMPAT_SCRATCH as u64;
         for off in 0..4 {
             m.write_u64(scratch + off * 8, 0)?;
         }
@@ -6416,7 +6652,10 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat && !gex_abi::PPC { "i686" } else { gex_abi::ARCH_NAME },
+            // An i386 process on the x86 build; a wasm32 program on the
+            // AArch64 build is part of an aarch64 system (its dpkg and
+            // config.guess should agree with the arm64 programs beside it).
+            if self.compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -6514,18 +6753,28 @@ impl Kernel {
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let ticks = (self.cpu_nanos() / 10_000_000) as u64;
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: four 32-bit clock_t
+            m.zero(buf, 16)?;
+            m.write_u32(buf, ticks as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 32)?;
             m.write_u64(buf, ticks)?;
         }
-        Ok(ticks)
+        Ok(if self.compat { ticks as u32 as u64 } else { ticks })
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
     /// context-switch counters stay zero, which is what a program that asks
     /// for them under emulation should expect to see.
     fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: 32-bit timevals and longs (72 bytes)
+            let ns = self.cpu_nanos();
+            m.zero(buf, 72)?;
+            m.write_u32(buf, (ns / 1_000_000_000) as u32)?;
+            m.write_u32(buf + 4, (ns % 1_000_000_000 / 1000) as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 144)?;
             write_timeval(m, buf, self.cpu_nanos())?;
         }
@@ -6571,12 +6820,41 @@ impl Kernel {
         Ok(len as u64)
     }
 
-    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
-        if old != 0 {
-            m.write_u64(old, 8 * 1024 * 1024)?;
-            m.write_u64(old + 8, u64::MAX)?;
+    /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
+    /// processes set only their own). Limits are recorded and reported;
+    /// RLIMIT_NOFILE is enforced by the descriptor table, the rest are not.
+    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
+        let r = resource as usize;
+        if r >= RLIM_NLIMITS {
+            return Err(Errno::EINVAL);
         }
-        let _ = new;
+        if r == RLIMIT_NOFILE {
+            self.rlimits[r][0] = self.fds.limit() as u64;
+        }
+        let cur = self.rlimits[r];
+        let want = if new != 0 { Some([m.read_u64(new)?, m.read_u64(new + 8)?]) } else { None };
+        if let Some([soft, hard]) = want {
+            if soft > hard {
+                return Err(Errno::EINVAL);
+            }
+            // raising the hard limit takes privilege; NOFILE cannot pass
+            // what the table holds
+            if (hard > cur[1] && self.uid != 0)
+                || (r == RLIMIT_NOFILE && hard > crate::file::NOFILE_HARD as u64)
+            {
+                return Err(Errno::EPERM);
+            }
+        }
+        if old != 0 {
+            m.write_u64(old, cur[0])?;
+            m.write_u64(old + 8, cur[1])?;
+        }
+        if let Some(lim) = want {
+            self.rlimits[r] = lim;
+            if r == RLIMIT_NOFILE {
+                self.fds.set_limit(lim[0] as usize);
+            }
+        }
         Ok(0)
     }
 }

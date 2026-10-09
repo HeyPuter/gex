@@ -166,6 +166,9 @@ impl OpenFile {
     }
 
     pub fn seek(&self, offset: i64, whence: u32) -> SysResult {
+        if let Some(r) = self.handle.seek(offset, whence) {
+            return r;
+        }
         if self.handle.is_stream() {
             return Err(Errno::ESPIPE);
         }
@@ -218,7 +221,14 @@ pub struct FdTable {
     /// Bumped by every change, so `/proc/self/fd` can skip rebuilding its
     /// listing when nothing changed -- as `MemoryMap::generation` does.
     generation: u64,
+    /// `RLIMIT_NOFILE`'s soft limit: no descriptor at or above it.
+    limit: usize,
 }
+
+/// `RLIMIT_NOFILE`, as Linux starts a process: 1024 soft, and the hard
+/// limit is what the table can hold.
+pub const NOFILE_SOFT: usize = 1024;
+pub const NOFILE_HARD: usize = 4096;
 
 impl Default for FdTable {
     fn default() -> Self {
@@ -232,7 +242,17 @@ impl FdTable {
             entries: Vec::new(),
             cloexec: Vec::new(),
             generation: 0,
+            limit: NOFILE_SOFT,
         }
+    }
+
+    /// `RLIMIT_NOFILE`'s soft limit (descriptors already above it stay).
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.min(NOFILE_HARD);
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
@@ -248,7 +268,11 @@ impl FdTable {
     /// Install a description at the lowest free descriptor at or above `min`.
     pub fn insert_at(&mut self, file: Arc<OpenFile>, min: i32, cloexec: bool) -> SysResult {
         self.generation += 1;
-        let min = min.max(0) as usize;
+        // F_DUPFD's argument: negative or past the limit is EINVAL
+        if min < 0 || min as usize >= self.limit {
+            return Err(Errno::EINVAL);
+        }
+        let min = min as usize;
         while self.entries.len() <= min {
             self.entries.push(None);
             self.cloexec.push(false);
@@ -258,9 +282,10 @@ impl FdTable {
             .position(|e| e.is_none())
             .map(|p| p + min);
         let idx = match slot {
-            Some(i) => i,
+            Some(i) if i < self.limit => i,
+            Some(_) => return Err(Errno::EMFILE),
             None => {
-                if self.entries.len() >= 4096 {
+                if self.entries.len() >= self.limit {
                     return Err(Errno::EMFILE);
                 }
                 self.entries.push(None);
@@ -280,7 +305,8 @@ impl FdTable {
     /// Force a description into a specific descriptor, closing what was there.
     pub fn install(&mut self, fd: i32, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
         self.generation += 1;
-        if fd < 0 {
+        // dup2/dup3 to a descriptor past RLIMIT_NOFILE: EBADF, as Linux
+        if fd < 0 || fd as usize >= self.limit {
             return Err(Errno::EBADF);
         }
         let fd = fd as usize;
@@ -403,6 +429,7 @@ impl FdTable {
             entries: self.entries.clone(),
             cloexec: self.cloexec.clone(),
             generation: self.generation,
+            limit: self.limit,
         }
     }
 }
@@ -417,8 +444,10 @@ pub struct PipeEnd {
 impl FileHandle for PipeEnd {
     /// An empty pipe is not readable -- the trait default "yes" is right for a
     /// file and wrong here, and a `select` on it would spin ready/read-nothing.
+    /// A write end is never readable (select would report it ready for
+    /// reading when asked about both directions; Linux does not).
     fn poll_readable(&self) -> bool {
-        self.write || self.pipe.readable()
+        !self.write && self.pipe.readable()
     }
 
     fn available(&self) -> Option<u64> {
@@ -461,6 +490,7 @@ impl FileHandle for PipeEnd {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 

@@ -394,6 +394,105 @@ async function bootDebian(ctx) {
   }
 }
 
+// -- 3b: native Debian --------------------------------------------------------
+
+// The proxy this demo uses unless `?wisp=` says otherwise (`?wisp=` empty: no
+// network).
+const NATIVE_WISP = 'wss://anura.pro/';
+const nativeWispUrl = () => {
+  const q = new URLSearchParams(location.search);
+  return q.has('wisp') ? q.get('wisp') : NATIVE_WISP;
+};
+
+const nativeDebian = {
+  id: 'native-debian',
+  title: 'Debian, built from source to wasm',
+  blurb:
+    "Debian trixie whose tools (bash, coreutils, grep, sed, vim...) are built from Debian's own " +
+    'sources with gexcc into native wasm32 programs. apt, dpkg and the libraries stay Debian\'s ' +
+    'arm64 builds, translated; `apt install` fetches arm64 packages over Wisp.',
+  network: true,
+
+  async enter(ctx) {
+    ctx.actions([{ label: 'Run', primary: true, id: 'nboot', onClick: () => bootNativeDebian(ctx) }]);
+    ctx.hint(`network: ${nativeWispUrl() || 'none'} (?wisp= to change)`);
+    ctx.term.writeln('Debian trixie: native wasm32 tools from Debian source, Debian arm64 underneath.');
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.dim('The shell and the tools it runs are wasm32 programs built by'));
+    ctx.term.writeln(ctx.ansi.dim('tools/gexcc/debian from Debian\'s source packages (architecture'));
+    ctx.term.writeln(ctx.ansi.dim('musl-linux-wasm32 in dpkg). apt, dpkg, perl and every library are'));
+    ctx.term.writeln(ctx.ansi.dim("Debian's arm64 packages, translated. apt pins keep ours: try"));
+    ctx.term.writeln(ctx.ansi.dim('`apt update && apt install jq`.'));
+    ctx.term.writeln('');
+  },
+};
+
+async function bootNativeDebian(ctx) {
+  document.getElementById('nboot').disabled = true;
+  const q = new URLSearchParams(location.search);
+  const cmd = q.get('cmd');
+  const t0 = performance.now();
+  try {
+    const tree = await ctx.rootfs(q.get('rootfs') || '/rootfs/native-debian.tar.zst');
+    const files = { ...tree.files };
+    if (cmd) files['/cmd.sh'] = new TextEncoder().encode(`${cmd}\n`);
+    const elf = files['/usr/bin/bash'];
+    if (!elf) throw new Error('the rootfs has no /usr/bin/bash');
+    let network = null;
+    const wisp = nativeWispUrl();
+    if (wisp) {
+      ctx.busy('connecting to the proxy');
+      const { WispNetwork } = await import('./net.js');
+      network = new WispNetwork(wisp, (e) => ctx.setNet(e.split(' ')[0]));
+      await network.start();
+      ctx.setNet('open');
+    } else {
+      ctx.setNet('off');
+    }
+    ctx.idle();
+    ctx.term.reset();
+    const ms = Math.round(performance.now() - t0);
+    ctx.term.writeln(ctx.ansi.dim(`rootfs: ${Object.keys(files).length} files, ready in ${ms} ms`));
+    ctx.term.writeln(ctx.ansi.dim(network ? `network: wisp ${wisp}` : 'network: none'));
+    if (cmd) ctx.term.writeln(ctx.ansi.dim(`command: ${cmd}`));
+    ctx.term.writeln('');
+    ctx.status('running');
+    running(true);
+    // For a harness: when the shell started (the page's own clock).
+    globalThis.GEX_NATIVE_DEBIAN_T0 = t0;
+    const { status } = await ctx.runProgram(ctx.term, {
+      elf,
+      files,
+      dirs: tree.dirs,
+      modes: tree.modes,
+      hard: tree.hard,
+      symlinks: tree.links,
+      env: [
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'HOME=/root',
+        'TERM=xterm-256color',
+        'DEBIAN_FRONTEND=noninteractive',
+        'LANG=C.UTF-8',
+      ],
+      args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-l', '-i'],
+      cwd: '/root',
+      tty: true,
+      network,
+      onNetEvent: (e) => ctx.setNet(e.split(' ')[0]),
+      uid: 0,
+    });
+    ctx.term.writeln(ctx.ansi.dim(`\r\n[bash exited ${status}]`));
+    ctx.status('finished', status === 0 ? 'good' : undefined);
+  } catch (e) {
+    failed(ctx, e);
+  } finally {
+    running(false);
+    ctx.idle();
+    const b = document.getElementById('nboot');
+    if (b) b.disabled = false;
+  }
+}
+
 /** The Mesa device's Gallium driver and module: st/mesa on gex_wgpu. */
 function mesaBackend(query, api) {
   return {
@@ -1851,6 +1950,7 @@ export const DEMOS = [
   upload,
   busybox,
   debian,
+  nativeDebian,
   gears,
   waylandGears,
   compositor,

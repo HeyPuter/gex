@@ -537,6 +537,9 @@ fn xlate_identity(xlate: &Options) -> String {
 }
 
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
+    // The program file goes in as bytes, not through `Debug`
+    // (`xlate_identity`): formatting a multi-MiB file as a list of decimal
+    // numbers cost more than all the rest of an exec.
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
@@ -2125,7 +2128,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut gm = GuestMem::new(dst);
         let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
-            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
+            let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
         if let Some(tls) = req.tls {
             // PowerPC's thread pointer is r2.
@@ -3073,13 +3076,22 @@ impl gex_kernel::net::Transport for HostStream {
             Err(_) => Err(gex_kernel::Errno::ECONNRESET),
         }
     }
-    fn shutdown_write(&self) {
-        if let Some(sock) = self.sock.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            let _ = sock.shutdown(std::net::Shutdown::Write);
-        }
-    }
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    fn shutdown(&self, how: u64) -> Result<(), gex_kernel::Errno> {
+        use std::net::Shutdown;
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else {
+            return Err(gex_kernel::Errno::ENOTCONN);
+        };
+        let h = match how {
+            0 => Shutdown::Read,
+            1 => Shutdown::Write,
+            _ => Shutdown::Both,
+        };
+        sock.shutdown(h).map_err(|e| gex_kernel::Errno::from_io(&e))
     }
 }
 
@@ -3180,7 +3192,8 @@ fn place_image(
     for i in 0..31u8 {
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
-    write_u64(data, ctx_addr + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());

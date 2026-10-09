@@ -75,6 +75,7 @@ impl FileHandle for DevHandle {
             mtime: 0,
             nlink: 1,
             rdev: rdev_of(self.device),
+            times: Default::default(),
         })
     }
 
@@ -174,6 +175,7 @@ impl FileSystem for DevFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: rdev_of(device),
+                times: Default::default(),
             });
         }
         if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
@@ -185,6 +187,7 @@ impl FileSystem for DevFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                times: Default::default(),
             });
         }
         Err(Errno::ENOENT)
@@ -344,6 +347,7 @@ mod tests {
                     mtime: 0,
                     nlink: 1,
                     rdev: 0,
+                    times: Default::default(),
                 })
             }
             fn ioctl(

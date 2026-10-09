@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""gexcc / gexc++: a C/C++ compiler for gex's wasm32 Linux target (docs/gexcc.md).
+
+Used like gcc or clang. Compiles with clang --target=wasm32-unknown-linux-musl
+against the gexcc sysroot (musl with gex's wasm32 arch, libgex, compiler-rt).
+A link writes a program: a position-independent wasm module importing gex's
+memory and function table, in the ELF32 container gexc runs
+(tools/wine-wasm/wasm-elf.py). The container also carries a host launcher
+(hoststub.c): on an x86 Linux build machine the program runs itself under
+gexc, so configure checks and test suites run it like a native binary.
+
+Libraries are static. `-shared` writes an archive (with a `gexcc.deps` member
+naming the libraries it was linked with), so a project that insists on
+building libfoo.so still links: -lfoo then takes the archive, and its
+dependencies follow it into the program.
+
+Layout (tools/gexcc/install.sh PREFIX):
+  PREFIX/bin/gexcc, gexc++, wasm32-unknown-linux-musl-{cc,gcc,c++,g++,ar,...}
+  PREFIX/lib/gexcc/     flags.sh, wasm-elf.py, forkreach.py, hoststub.bin,
+                        runner (the gexc path baked into containers)
+  PREFIX/sysroot/       include/, lib/ (musl, libgex, builtins), binaryen/,
+                        usr/ (where cross-built libraries install)
+
+Environment: GEXCC_SYSROOT overrides the sysroot; GEXCC_RUNNER the gexc a
+container runs under (also read by the container itself at run time);
+GEXCC_KEEP_WASM=1 keeps OUT.wasm beside a linked program; GEXCC_VERBOSE=1
+prints every command."""
+import atexit, os, re, shutil, subprocess, sys, tempfile
+
+TRIPLE = 'wasm32-unknown-linux-musl'
+me = os.path.realpath(__file__)
+PREFIX = os.path.dirname(os.path.dirname(me))
+LIBDIR = os.path.join(PREFIX, 'lib', 'gexcc')
+SYSROOT = os.environ.get('GEXCC_SYSROOT') or os.path.join(PREFIX, 'sysroot')
+VERBOSE = bool(os.environ.get('GEXCC_VERBOSE'))
+name = os.path.basename(sys.argv[0])
+CXX = name.endswith(('++', 'cxx')) or name.endswith('-c++')
+
+
+def die(msg, code=1):
+    sys.stderr.write('gexcc: %s\n' % msg)
+    sys.exit(code)
+
+
+def run(cmd):
+    if VERBOSE:
+        sys.stderr.write('+ %s\n' % ' '.join(cmd))
+    return subprocess.call(cmd)
+
+
+if not os.path.isdir(LIBDIR):
+    die('no %s: run tools/gexcc/install.sh PREFIX and use PREFIX/bin/gexcc' % LIBDIR)
+
+
+def read_flags():
+    flags = {}
+    for line in open(os.path.join(LIBDIR, 'flags.sh')):
+        if '=' in line and not line.startswith('#'):
+            k, v = line.strip().split('=', 1)
+            v = v.strip('"')
+            for kk, vv in flags.items():
+                v = v.replace('$' + kk, vv)
+            flags[k] = v
+    return flags
+
+
+FLAGS = read_flags()
+# Programs and their libraries lower setjmp onto the legacy exception
+# instructions: binaryen's asyncify (fork) can instrument try/catch but not
+# try_table. The link translates them to the standard ones (finish()).
+BASE = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in FLAGS['WASM_CFLAGS'].split()]
+# C++: exceptions and RTTI are on unless asked off (libc++abi over wasm EH).
+# C++ exceptions on wasm EH: clang turns on the backend's lowering
+# (-wasm-enable-eh) only for emscripten; without it every catch is dropped.
+# C gets it too, for -fexceptions cleanups.
+BASE += ['-mllvm', '-wasm-enable-eh']
+if CXX:
+    BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
+# Where cross-built libraries install (--prefix=/usr DESTDIR=SYSROOT); the
+# libc's include/ is clang's own sysroot default.
+INCS = []
+for d in ('include/gexcc', 'usr/local/include', 'usr/include'):
+    if os.path.isdir(os.path.join(SYSROOT, d)):
+        INCS += ['-isystem', os.path.join(SYSROOT, d)]
+# libc++'s headers come before the C library's (its <math.h> wraps musl's),
+# unless asked not to (libc++'s own build, with its headers)
+if CXX and os.path.isdir(os.path.join(SYSROOT, 'include', 'c++', 'v1')) and \
+        not any(a in ('-nostdinc++', '-nostdinc') for a in sys.argv[1:]):
+    INCS = ['-isystem', os.path.join(SYSROOT, 'include', 'c++', 'v1')] + INCS
+CLANG = ['clang++' if CXX else 'clang'] + BASE + ['--sysroot=' + SYSROOT]
+# Loop safepoints (poll/GexPoll.cpp): signals reach code that never makes a
+# system call. GEXCC_POLL=0 or -fno-gex-poll leaves them out.
+POLL = os.environ.get('GEXCC_POLL', '1') != '0' and '-fno-gex-poll' not in sys.argv[1:]
+if POLL and os.path.exists(os.path.join(LIBDIR, 'GexPoll.so')):
+    CLANG += ['-fpass-plugin=' + os.path.join(LIBDIR, 'GexPoll.so')]
+CLANG_TAIL = INCS
+
+
+def expand_rsp(args):
+    out = []
+    for a in args:
+        if a.startswith('@') and os.path.isfile(a[1:]):
+            import shlex
+            out += expand_rsp(shlex.split(open(a[1:]).read()))
+        else:
+            out.append(a)
+    return out
+
+
+# Function pointer cast emulation (finish below): -fgex-fpcast-emu or
+# GEXCC_FPCAST=1, at link time.
+FPCAST = os.environ.get('GEXCC_FPCAST', '0') != '0' or '-fgex-fpcast-emu' in sys.argv[1:]
+args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu')]
+
+# --- queries -------------------------------------------------------------
+if args == ['--print-sysroot'] or args == ['-print-sysroot']:
+    print(SYSROOT); sys.exit(0)
+if args == ['--print-prefix']:
+    print(PREFIX); sys.exit(0)
+if args == ['-dumpmachine']:
+    print(TRIPLE); sys.exit(0)
+for a in args:
+    if a.startswith('-print-file-name='):
+        f = a.split('=', 1)[1]
+        for d in (SYSROOT + '/lib', SYSROOT + '/usr/lib'):
+            if os.path.exists(os.path.join(d, f)):
+                print(os.path.join(d, f)); sys.exit(0)
+        print(f); sys.exit(0)
+    if a == '-print-libgcc-file-name':
+        print(SYSROOT + '/lib/libclang_rt.builtins-wasm32.a'); sys.exit(0)
+    if a == '-print-search-dirs':
+        print('programs: =%s\nlibraries: =%s/lib:%s/usr/lib' % (os.path.dirname(me), SYSROOT, SYSROOT)); sys.exit(0)
+    if a.startswith('-print-prog-name='):
+        t = a.split('=', 1)[1]
+        p = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), TRIPLE + '-' + t)
+        print(p if os.path.exists(p) else t); sys.exit(0)
+    if a == '-print-multi-os-directory':
+        print('.'); sys.exit(0)
+
+# --- compile only -----------------------------------------------------------
+NOLINK = ('-c', '-S', '-E', '-M', '-MM', '-fsyntax-only', '--version', '-v', '-###', '--help')
+if not args or any(a in NOLINK or a.startswith(('-print-', '-dump')) for a in args):
+    if args == ['-v'] or args == ['--version'] or not args:
+        os.execvp(CLANG[0], [CLANG[0], '--target=' + TRIPLE] + args)
+    os.execvp(CLANG[0], CLANG + args + CLANG_TAIL)
+
+# --- link -----------------------------------------------------------------
+LIBC_NAMES = {'c', 'm', 'pthread', 'dl', 'rt', 'util', 'crypt', 'xnet', 'resolv', 'gcc', 'gcc_s', 'gcc_eh',
+              'atomic', 'ssp', 'ssp_nonshared', 'unwind'}
+SRC_EXT = ('.c', '.cc', '.cpp', '.cxx', '.c++', '.C', '.s', '.S', '.i', '.ii')
+# Linker options with no meaning for a static wasm module, dropped quietly.
+LD_DROP = re.compile(r'^(-rpath|-rpath-link|--rpath|-soname|-h|--version-script|-z|--as-needed|--no-as-needed|'
+                     r'--no-undefined|-O\d|--hash-style|--build-id|--enable-new-dtags|--disable-new-dtags|'
+                     r'-Bsymbolic|-Bsymbolic-functions|--start-group|--end-group|--sort-common|--warn-common|'
+                     r'--sort-section|--dynamic-list|-E|--export-dynamic|--no-copy-dt-needed-entries|'
+                     r'--copy-dt-needed-entries|-Bdynamic|-Bstatic|--eh-frame-hdr|--icf|-x|-X|--discard-all|'
+                     r'--discard-locals|--fatal-warnings|--warn-shared-textrel|--no-relax|--relax|--push-state|'
+                     r'--pop-state|-dynamic-linker|--dynamic-linker|--allow-shlib-undefined|--exclude-libs|'
+                     r'--undefined-version|--no-undefined-version|-nostdlib)(=.*)?$')
+LD_ARG = {'-rpath', '-rpath-link', '-soname', '-h', '--version-script', '-z', '--sort-section', '--dynamic-list',
+          '-dynamic-linker', '--dynamic-linker', '--exclude-libs'}
+
+out = None
+srcs, inputs, ld_flags, cflags, libdirs = [], [], [], [], []
+shared = relocatable = nostdlib = nostartfiles = nodefaultlibs = False
+xlang = None
+ld_skip = 0  # a dropped linker option's argument still to come (-Wl,-rpath -Wl,DIR)
+i = 0
+while i < len(args):
+    a = args[i]
+    nxt = args[i + 1] if i + 1 < len(args) else None
+    if a == '-o':
+        out = nxt; i += 2; continue
+    if a.startswith('-o') and len(a) > 2:
+        out = a[2:]
+    elif a == '-shared':
+        shared = True
+    elif a == '-r':
+        relocatable = True
+    elif a == '-nostdlib':
+        nostdlib = True
+    elif a == '-nostartfiles':
+        nostartfiles = True
+    elif a in ('-nodefaultlibs', '-nolibc'):
+        nodefaultlibs = True
+    elif a.startswith('-Wl,') or a == '-Xlinker':
+        if a == '-Xlinker':
+            parts = [nxt]; i += 1
+        else:
+            parts = [x for x in a[4:].split(',') if x]
+        k = 0
+        while k < len(parts):
+            p = parts[k]
+            if ld_skip:
+                ld_skip -= 1; k += 1; continue
+            if p in LD_ARG:
+                if k + 1 == len(parts):
+                    ld_skip = 1
+                k += 2; continue
+            if LD_DROP.match(p):
+                k += 1; continue
+            ld_flags.append(p); k += 1
+        # -Xlinker -rpath -Xlinker DIR: the second half arrives separately
+    elif a == '-L':
+        libdirs.append(nxt); i += 2; continue
+    elif a.startswith('-L'):
+        libdirs.append(a[2:])
+    elif a == '-l':
+        inputs.append('-l' + nxt); i += 2; continue
+    elif a.startswith('-l'):
+        inputs.append(a)
+    elif a == '-x':
+        xlang = nxt; cflags += [a, nxt]; i += 2; continue
+    elif a in ('-I', '-D', '-U', '-include', '-imacros', '-isystem', '-idirafter', '-iquote', '-MF', '-MT', '-MQ',
+               '-target', '--target', '-arch', '-Xclang', '-mllvm', '-iprefix', '-iwithprefix', '-isysroot'):
+        cflags += [a, nxt]; i += 2; continue
+    elif not a.startswith('-') and (a.endswith(SRC_EXT) or (xlang and xlang != 'none')):
+        srcs.append((a, xlang))
+    elif not a.startswith('-'):
+        inputs.append(a)
+    elif a in ('-pthread', '-pthreads', '-rdynamic', '-static', '-static-pie', '-pie', '-no-pie', '-fPIE', '-fpie',
+               '-fPIC', '-fpic', '-s', '-static-libgcc', '-shared-libgcc', '-static-libstdc++', '-symbolic',
+               '-fuse-ld=lld', '-Bstatic', '-Bdynamic', '-export-dynamic', '-Wl'):
+        pass
+    else:
+        cflags.append(a)
+    i += 1
+
+tmp = tempfile.mkdtemp(prefix='gexcc-')
+atexit.register(shutil.rmtree, tmp, True)
+objs = []
+for k, (s, lang) in enumerate(srcs):
+    o = os.path.join(tmp, '%d-%s.o' % (k, os.path.basename(s)))
+    pre = ['-x', lang] if lang else []
+    # clang's -x applies to what follows: name the language per source
+    cf = []
+    j = 0
+    while j < len(cflags):
+        if cflags[j] == '-x':
+            j += 2; continue
+        cf.append(cflags[j]); j += 1
+    r = run(CLANG + cf + pre + ['-c', s, '-o', o] + CLANG_TAIL)
+    if r:
+        sys.exit(r)
+    objs.append(o)
+if not objs and not inputs:
+    # build systems ask the linker who it is (Meson: -Wl,--version)
+    if any(f in ('--version', '-v', '--help') for f in ld_flags):
+        os.execvp('wasm-ld', ['wasm-ld'] + [f for f in ld_flags if f in ('--version', '-v', '--help')][:1])
+    die('no input files')
+if out is None:
+    out = 'a.out'
+
+LIB = SYSROOT + '/lib'
+SEARCH = libdirs + [SYSROOT + '/usr/local/lib', SYSROOT + '/usr/lib', LIB]
+AR_MAGIC = b'!<arch>\n'
+
+
+def is_archive(p):
+    try:
+        with open(p, 'rb') as f:
+            return f.read(8) == AR_MAGIC
+    except OSError:
+        return False
+
+
+def resolve(lib):
+    """-lNAME to a file: an archive libNAME.so (gexcc's -shared) or libNAME.a."""
+    for d in SEARCH:
+        for ext in ('.so', '.a'):
+            p = os.path.join(d, 'lib' + lib + ext)
+            if os.path.exists(p) and (ext == '.a' or is_archive(p)):
+                return os.path.abspath(p)
+    return None
+
+
+def archive_deps(path):
+    """The link inputs recorded in an archive's gexcc.deps.o member."""
+    try:
+        data = open(path, 'rb').read()
+    except OSError:
+        return []
+    if not data.startswith(AR_MAGIC):
+        return []
+    a = data.find(b'GEXCC-DEPS\n')
+    if a < 0:
+        return []
+    b = data.find(b'\nGEXCC-END', a)
+    return data[a + 11:b].decode().split('\n') if b > 0 else []
+
+
+def expand(items, seen):
+    """Link inputs with -l resolved and archives' recorded deps appended."""
+    res, missing = [], []
+    for it in items:
+        if not it:
+            continue
+        if it.startswith('-l'):
+            nm = it[2:]
+            p = resolve(nm)
+            if p is None:
+                if nm in LIBC_NAMES or (CXX and nm in ('stdc++', 'c++', 'c++abi', 'supc++')):
+                    continue
+                missing.append(it)
+                continue
+            it = p
+        elif not it.startswith('-'):
+            it = os.path.abspath(it)
+        if it in seen:
+            continue
+        seen.add(it)
+        res.append(it)
+        if is_archive(it):
+            sub, miss = expand(archive_deps(it), seen)
+            res += sub
+            missing += miss
+    return res, missing
+
+
+if relocatable:
+    ins, miss = expand(inputs, set())
+    sys.exit(run(['wasm-ld', '-r', '-o', out] + objs + ins + [f for f in ld_flags if not f.startswith('--export')]))
+
+if shared:
+    # A static library under the shared name (see the module docstring).
+    deps = []
+    members = list(objs)
+    for it in inputs:
+        if it.startswith('-l'):
+            deps.append(it)
+        elif is_archive(it):
+            # an archive given by path: recorded, not copied (its members
+            # would collide with the same archive linked again later)
+            deps.append(os.path.abspath(it))
+        else:
+            members.append(it)
+    # the -L directories, so the program's link finds the -l names
+    deps = ['-L' + os.path.abspath(d) for d in libdirs] + deps
+    # the deps go in a custom section of an empty wasm object (wasm-ld
+    # reads every member; it never pulls this one, which defines nothing)
+    tmpd = os.path.join(tmp, 'deps')
+    os.makedirs(tmpd)
+    txt = os.path.join(tmpd, 'deps.txt')
+    open(txt, 'w').write('GEXCC-DEPS\n' + '\n'.join(deps) + '\nGEXCC-END')
+    dfile = os.path.join(tmpd, 'gexcc.deps.o')
+    r = run(['llvm-objcopy', '--add-section=gexcc.deps=' + txt, os.path.join(LIBDIR, 'empty.o'), dfile])
+    if r:
+        sys.exit(r)
+    if os.path.exists(out):
+        os.unlink(out)
+    # members by path: objects in different directories may share a name
+    r = run(['llvm-ar', 'crsP', out] + members + [dfile])
+    sys.exit(r)
+
+# A program.
+ins, missing = expand(inputs, set())
+# -L from archives' deps: they only feed resolve(), already applied
+ins = [x for x in ins if not x.startswith('-L')]
+if missing:
+    # wasm-ld says which are missing, as ld would
+    ins += missing
+crt = [] if (nostdlib or nostartfiles) else [LIB + '/crt1.o']
+libs = []
+if not (nostdlib or nodefaultlibs):
+    if CXX:
+        for l in ('c++', 'c++abi', 'unwind'):
+            if os.path.exists('%s/lib%s.a' % (LIB, l)):
+                libs.append('%s/lib%s.a' % (LIB, l))
+    # gex's support library first: its dlopen, __dlsym and vfork replace
+    # libc's; the setjmp runtime and the signal frames are only there.
+    libs += [LIB + '/libgex.a', LIB + '/libc.a', LIB + '/libclang_rt.builtins-wasm32.a']
+    # gexcc's runtime: the loop safepoint (rt/poll.c)
+    if os.path.exists(LIB + '/libgexcc.a'):
+        libs.insert(0, LIB + '/libgexcc.a')
+# main(argc, argv, envp): see rt/main3.c
+if not nostartfiles and not nostdlib:
+    cand = objs + [x for x in ins if not x.startswith('-') and not is_archive(x)]
+    if cand:
+        nm = subprocess.run(['llvm-nm', '-j', '--defined-only', '--extern-only'] + cand,
+                            capture_output=True, text=True).stdout.split()
+        if 'main' in nm and '__main_argc_argv' not in nm and '__main_void' not in nm:
+            objs.append(os.path.join(LIBDIR, 'main3.o'))
+wasm = os.path.join(tmp, 'out.wasm')
+cmd = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296',
+       '-pie', '--no-entry', '-o', wasm] + crt + objs + ins + ld_flags + libs
+r = run(cmd)
+if r:
+    sys.exit(r)
+
+
+def imports(path):
+    """(module, name) of every function import of the module at path."""
+    w = open(path, 'rb').read()
+
+    def leb(p):
+        r = sh = 0
+        while True:
+            x = w[p]; p += 1
+            r |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                return r, p
+
+    def nm(p):
+        n, p = leb(p)
+        return w[p:p + n].decode(), p + n
+    res, p = [], 8
+    while p < len(w):
+        sid = w[p]; n, q = leb(p + 1); end = q + n
+        if sid == 2:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                m, q = nm(q); f, q = nm(q)
+                kind = w[q]; q += 1
+                if kind == 0:
+                    _, q = leb(q); res.append((m, f))
+                elif kind == 1:
+                    q += 1; fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 2:
+                    fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 3:
+                    q += 2
+                elif kind == 4:
+                    q += 1; _, q = leb(q)
+            break
+        p = end
+    return res
+
+
+# Functions above fork's driver (musl's src/process/wasm32/__gex_fork.c): the
+# unwind for a fork stops at the driver, so they keep no state.
+FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c',
+              '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
+opt = os.path.join(SYSROOT, 'binaryen', 'bin', 'wasm-opt')
+feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
+if FPCAST:
+    # Calls through a function pointer of another type trap in wasm, where C
+    # on a real machine gets away with them (bash's unwind-protect cleanups,
+    # old K&R code). binaryen's --fpcast-emu makes every indirect call and
+    # every table entry one uniform signature. gex calls the two entries
+    # (__gex_start, __gex_thread_start) with their own signatures, so their
+    # table entries go back to the real functions afterwards.
+    r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + ['--fpcast-emu', '-o', wasm])
+    if r:
+        die('wasm-opt --fpcast-emu failed')
+    r = run([sys.executable, os.path.join(LIBDIR, 'elemfix.py'), wasm, '__gex_start', '__gex_thread_start'])
+    if r:
+        die('elemfix.py failed after --fpcast-emu')
+passes = []
+if ('gex', 'fork_point') in imports(wasm):
+    passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
+    dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+    reach = subprocess.run([sys.executable, os.path.join(LIBDIR, 'forkreach.py'), dis, wasm, 'gex.fork_point'] + FORK_ROOTS,
+                           capture_output=True, text=True)
+    if reach.returncode == 0:
+        lst = os.path.join(tmp, 'onlylist')
+        open(lst, 'w').write(reach.stdout.strip().replace(',', '\n') + '\n')
+        passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+    else:
+        passes += ['--pass-arg=asyncify-removelist@' + ','.join(FORK_ROOTS)]
+    passes += ['-O2']
+passes += ['--translate-to-exnref']
+# names kept (-g): gex binds the entries by name. (DWARF dropped: binaryen
+# cannot rewrite clang's version 5.)
+r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + passes + ['-o', wasm])
+if r:
+    die('wasm-opt failed')
+cont = ['--host-stub', os.path.join(LIBDIR, 'hoststub.bin')]
+rf = os.path.join(LIBDIR, 'runner')
+if os.path.exists(rf):
+    cont += ['--runner', open(rf).read().strip()]
+r = run([sys.executable, os.path.join(LIBDIR, 'wasm-elf.py'), wasm, out] + cont)
+if r:
+    sys.exit(r)
+if os.environ.get('GEXCC_KEEP_WASM'):
+    shutil.copy(wasm, out + '.wasm')

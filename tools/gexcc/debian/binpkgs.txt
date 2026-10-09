@@ -1,0 +1,22 @@
+# SRCPKG BINPKG GLOB... : how mkdebs.py splits a staging tree into Debian's
+# binary packages. A file goes to the first matching line; BINPKG `-` drops
+# it. A source package with no lines becomes one package of its own name.
+# `depends BINPKG DEPENDS...` adds a Depends field (Debian's data packages
+# ours use: architecture-independent content, Multi-Arch: foreign).
+zlib      -             *
+libmd     -             *
+readline  -             *
+pcre2     -             *
+bzip2     bzip2         *
+xz-utils  xz-utils      *
+libzstd   zstd          *
+ncurses   ncurses-bin   usr/bin/* usr/share/man/*
+ncurses   -             *
+util-linux bsdutils     usr/bin/logger usr/bin/renice usr/bin/script usr/bin/scriptlive usr/bin/scriptreplay usr/bin/wall usr/share/man/*/logger.* usr/share/man/*/renice.* usr/share/man/*/script.* usr/share/man/*/scriptlive.* usr/share/man/*/scriptreplay.* usr/share/man/*/wall.*
+util-linux bsdextrautils usr/bin/col usr/bin/colcrt usr/bin/colrm usr/bin/column usr/bin/hexdump usr/bin/hd usr/bin/look usr/bin/ul usr/bin/write usr/share/man/*/col.* usr/share/man/*/colcrt.* usr/share/man/*/colrm.* usr/share/man/*/column.* usr/share/man/*/hexdump.* usr/share/man/*/look.* usr/share/man/*/ul.*
+util-linux uuid-runtime usr/bin/uuidgen usr/bin/uuidparse usr/share/man/*/uuidgen.* usr/share/man/*/uuidparse.*
+util-linux util-linux   *
+sysvinit  sysvinit-utils *
+file      file          *
+depends file libmagic-mgc
+depends vim vim-common

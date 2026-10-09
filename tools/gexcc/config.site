@@ -1,0 +1,138 @@
+# config.site for gexcc (CONFIG_SITE): configure in cross mode (--build
+# given) runs none of the programs it builds, so it guesses what they would
+# have found. These are the answers gnulib's and autoconf's run-time checks
+# gave on gex itself (measured 2026-10-07, natively, gex at merge/gexcc
+# 24be3714, musl gex-wasm32-slim). A "no" makes gnulib use its own
+# replacement, which is always safe; several are gex gaps being fixed
+# (trailing slashes, select's EBADF, getgroups, sigaltstack), see
+# docs/gexcc.md. Regenerate: tests/gexcc/corpus/config-site.sh.
+ac_cv_func_chown_works=${ac_cv_func_chown_works=yes}
+ac_cv_func_getgroups_works=${ac_cv_func_getgroups_works=yes}
+ac_cv_func_malloc_0_nonnull=${ac_cv_func_malloc_0_nonnull=yes}
+ac_cv_func_realloc_0_nonnull=${ac_cv_func_realloc_0_nonnull=yes}
+ac_cv_func_strcoll_works=${ac_cv_func_strcoll_works=yes}
+ac_cv_func_working_mktime=${ac_cv_func_working_mktime=yes}
+gl_cv_cc_long_double_expbit0=${gl_cv_cc_long_double_expbit0='word 3 bit 16'}
+gl_cv_double_slash_root=${gl_cv_double_slash_root=no}
+gl_cv_func_access_slash_works=${gl_cv_func_access_slash_works=yes}
+gl_cv_func_btowc_consistent=${gl_cv_func_btowc_consistent=yes}
+gl_cv_func_btowc_nul=${gl_cv_func_btowc_nul=yes}
+gl_cv_func_c32rtomb_retval=${gl_cv_func_c32rtomb_retval=yes}
+gl_cv_func_chmod_works=${gl_cv_func_chmod_works=yes}
+gl_cv_func_chown_ctime_works=${gl_cv_func_chown_ctime_works=no}
+gl_cv_func_chown_follows_symlink=${gl_cv_func_chown_follows_symlink=no}
+gl_cv_func_chown_slash_works=${gl_cv_func_chown_slash_works=no}
+gl_cv_func_dup2_works=${gl_cv_func_dup2_works=yes}
+gl_cv_func_dup_works=${gl_cv_func_dup_works=yes}
+gl_cv_func_fchmodat_works=${gl_cv_func_fchmodat_works=no}
+gl_cv_func_fchownat_empty_filename_works=${gl_cv_func_fchownat_empty_filename_works=no}
+gl_cv_func_fchownat_nofollow_works=${gl_cv_func_fchownat_nofollow_works=yes}
+gl_cv_func_fcntl_f_dupfd_cloexec=${gl_cv_func_fcntl_f_dupfd_cloexec='needs runtime check'}
+gl_cv_func_fcntl_f_dupfd_works=${gl_cv_func_fcntl_f_dupfd_works=yes}
+gl_cv_func_fdopendir_works=${gl_cv_func_fdopendir_works=yes}
+gl_cv_func_fdopen_works=${gl_cv_func_fdopen_works=yes}
+gl_cv_func_fflush_stdin=${gl_cv_func_fflush_stdin=yes}
+gl_cv_func_fnmatch_gnu=${gl_cv_func_fnmatch_gnu=no}
+gl_cv_func_fnmatch_posix=${gl_cv_func_fnmatch_posix=yes}
+gl_cv_func_fopen_mode_e=${gl_cv_func_fopen_mode_e=yes}
+gl_cv_func_fopen_mode_x=${gl_cv_func_fopen_mode_x=yes}
+gl_cv_func_fopen_slash=${gl_cv_func_fopen_slash=no}
+gl_cv_func_fpurge_works=${gl_cv_func_fpurge_works=no}
+gl_cv_func_freopen_works_on_closed=${gl_cv_func_freopen_works_on_closed=yes}
+gl_cv_func_fstatat_zero_flag=${gl_cv_func_fstatat_zero_flag=yes}
+gl_cv_func_ftello_works=${gl_cv_func_ftello_works=yes}
+gl_cv_func_futimens_works=${gl_cv_func_futimens_works=yes}
+gl_cv_func_getcwd_null=${gl_cv_func_getcwd_null=yes}
+gl_cv_func_getcwd_path_max=${gl_cv_func_getcwd_path_max=yes}
+gl_cv_func_getcwd_succeeds_beyond_4k=${gl_cv_func_getcwd_succeeds_beyond_4k=yes}
+gl_cv_func_getdtablesize_works=${gl_cv_func_getdtablesize_works=yes}
+gl_cv_func_getgroups_works=${gl_cv_func_getgroups_works=no}
+gl_cv_func_getopt_posix=${gl_cv_func_getopt_posix=no}
+gl_cv_func_isnanf_works=${gl_cv_func_isnanf_works=yes}
+gl_cv_func_isnanl_works=${gl_cv_func_isnanl_works=yes}
+gl_cv_func_iswcntrl_works=${gl_cv_func_iswcntrl_works=yes}
+gl_cv_func_iswpunct_works=${gl_cv_func_iswpunct_works=yes}
+gl_cv_func_itold_works=${gl_cv_func_itold_works=yes}
+gl_cv_func_linkat_nofollow=${gl_cv_func_linkat_nofollow=yes}
+gl_cv_func_linkat_slash=${gl_cv_func_linkat_slash=no}
+gl_cv_func_link_follows_symlink=${gl_cv_func_link_follows_symlink=no}
+gl_cv_func_link_works=${gl_cv_func_link_works=no}
+gl_cv_func_localeconv_works=${gl_cv_func_localeconv_works=yes}
+gl_cv_func_localtime_works=${gl_cv_func_localtime_works=yes}
+gl_cv_func_lstat_dereferences_slashed_symlink=${gl_cv_func_lstat_dereferences_slashed_symlink=yes}
+gl_cv_func_mbrtoc32_C_locale_sans_EILSEQ=${gl_cv_func_mbrtoc32_C_locale_sans_EILSEQ=yes}
+gl_cv_func_mbrtoc32_empty_input=${gl_cv_func_mbrtoc32_empty_input=yes}
+gl_cv_func_mbrtowc_C_locale_sans_EILSEQ=${gl_cv_func_mbrtowc_C_locale_sans_EILSEQ=yes}
+gl_cv_func_memchr_works=${gl_cv_func_memchr_works=yes}
+gl_cv_func_mkdir_trailing_dot_works=${gl_cv_func_mkdir_trailing_dot_works=no}
+gl_cv_func_mkdir_trailing_slash_works=${gl_cv_func_mkdir_trailing_slash_works=yes}
+gl_cv_func_mkfifoat_works=${gl_cv_func_mkfifoat_works=yes}
+gl_cv_func_mkfifo_works=${gl_cv_func_mkfifo_works=yes}
+gl_cv_func_mknod_works=${gl_cv_func_mknod_works=no}
+gl_cv_func_nanosleep=${gl_cv_func_nanosleep='no (mishandles large arguments)'}
+gl_cv_func_nl_langinfo_yesexpr_works=${gl_cv_func_nl_langinfo_yesexpr_works=yes}
+gl_cv_func_open_slash=${gl_cv_func_open_slash=no}
+gl_cv_func_perror_works=${gl_cv_func_perror_works=yes}
+gl_cv_func_printf_positions=${gl_cv_func_printf_positions=yes}
+gl_cv_func_pselect_detects_ebadf=${gl_cv_func_pselect_detects_ebadf=no}
+gl_cv_func_pthread_sigmask_in_libc_works=${gl_cv_func_pthread_sigmask_in_libc_works=yes}
+gl_cv_func_pthread_sigmask_return_works=${gl_cv_func_pthread_sigmask_return_works=yes}
+gl_cv_func_readlink_trailing_slash=${gl_cv_func_readlink_trailing_slash=no}
+gl_cv_func_readlink_truncate=${gl_cv_func_readlink_truncate=yes}
+gl_cv_func_realpath_works=${gl_cv_func_realpath_works=no}
+gl_cv_func_re_compile_pattern_working=${gl_cv_func_re_compile_pattern_working=no}
+gl_cv_func_rename_dest_works=${gl_cv_func_rename_dest_works=yes}
+gl_cv_func_rename_link_works=${gl_cv_func_rename_link_works=yes}
+gl_cv_func_rename_slash_dst_works=${gl_cv_func_rename_slash_dst_works=no}
+gl_cv_func_rename_slash_src_works=${gl_cv_func_rename_slash_src_works=yes}
+gl_cv_func_rmdir_works=${gl_cv_func_rmdir_works=no}
+gl_cv_func_select_detects_ebadf=${gl_cv_func_select_detects_ebadf=no}
+gl_cv_func_select_supports0=${gl_cv_func_select_supports0=yes}
+gl_cv_func_setenv_works=${gl_cv_func_setenv_works=yes}
+gl_cv_func_setlocale_works=${gl_cv_func_setlocale_works=yes}
+gl_cv_func_signbit=${gl_cv_func_signbit=yes}
+gl_cv_func_signbit_builtins=${gl_cv_func_signbit_builtins=yes}
+gl_cv_func_sleep_works=${gl_cv_func_sleep_works=yes}
+gl_cv_func_snprintf_retval_c99=${gl_cv_func_snprintf_retval_c99=yes}
+gl_cv_func_snprintf_size1=${gl_cv_func_snprintf_size1=yes}
+gl_cv_func_snprintf_truncation_c99=${gl_cv_func_snprintf_truncation_c99=yes}
+gl_cv_func_stat_file_slash=${gl_cv_func_stat_file_slash=yes}
+gl_cv_func_strchrnul_works=${gl_cv_func_strchrnul_works=yes}
+gl_cv_func_strerror_0_works=${gl_cv_func_strerror_0_works=yes}
+gl_cv_func_strerror_r_works=${gl_cv_func_strerror_r_works=yes}
+gl_cv_func_strndup_works=${gl_cv_func_strndup_works=yes}
+gl_cv_func_strtoimax=${gl_cv_func_strtoimax=yes}
+gl_cv_func_strtoll_works=${gl_cv_func_strtoll_works=no}
+gl_cv_func_strtol_works=${gl_cv_func_strtol_works=no}
+gl_cv_func_strtoull_works=${gl_cv_func_strtoull_works=no}
+gl_cv_func_strtoul_works=${gl_cv_func_strtoul_works=no}
+gl_cv_func_svid_putenv=${gl_cv_func_svid_putenv=yes}
+gl_cv_func_symlinkat_works=${gl_cv_func_symlinkat_works=no}
+gl_cv_func_symlink_works=${gl_cv_func_symlink_works=no}
+gl_cv_func_tmpfile_works=${gl_cv_func_tmpfile_works=yes}
+gl_cv_func_ungetc_works=${gl_cv_func_ungetc_works=yes}
+gl_cv_func_unlink_honors_slashes=${gl_cv_func_unlink_honors_slashes=yes}
+gl_cv_func_unsetenv_works=${gl_cv_func_unsetenv_works=yes}
+gl_cv_func_usleep_works=${gl_cv_func_usleep_works=yes}
+gl_cv_func_utime_file_slash=${gl_cv_func_utime_file_slash=yes}
+gl_cv_func_utimensat_works=${gl_cv_func_utimensat_works=yes}
+gl_cv_func_wcrtomb_works=${gl_cv_func_wcrtomb_works=yes}
+gl_cv_func_wctype_works=${gl_cv_func_wctype_works=yes}
+gl_cv_func_wcwidth_works=${gl_cv_func_wcwidth_works=yes}
+gl_cv_func_working_getdelim=${gl_cv_func_working_getdelim=yes}
+gl_cv_func_working_mkstemp=${gl_cv_func_working_mkstemp=yes}
+gl_cv_func_working_mktime=${gl_cv_func_working_mktime=yes}
+gl_cv_func_working_strerror=${gl_cv_func_working_strerror=yes}
+gl_cv_func_working_utimes=${gl_cv_func_working_utimes=yes}
+gl_cv_have_weak=${gl_cv_have_weak=no}
+gl_cv_header_working_fcntl_h=${gl_cv_header_working_fcntl_h='no (bad O_NOFOLLOW)'}
+gl_cv_pthread_rwlock_rdlock_prefer_writer=${gl_cv_pthread_rwlock_rdlock_prefer_writer=no}
+gl_cv_struct_dirent_d_ino=${gl_cv_struct_dirent_d_ino=yes}
+gt_cv_func_uselocale_works=${gt_cv_func_uselocale_works=yes}
+gt_cv_locale_fake=${gt_cv_locale_fake=no}
+make_cv_synchronous_posix_spawn=${make_cv_synchronous_posix_spawn=yes}
+sed_cv_fopen_rt=${sed_cv_fopen_rt=yes}
+sed_cv_libcp_needed=${sed_cv_libcp_needed=no}
+sv_cv_sigaltstack=${sv_cv_sigaltstack=no}
+sv_cv_stack_direction=${sv_cv_stack_direction=-1}
+sv_cv_stack_direction_msg=${sv_cv_stack_direction_msg='grows down'}
