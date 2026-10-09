@@ -1984,9 +1984,12 @@ The exe's unit (s2) moves steady state 21 s earlier than s1 (176 vs
 1. **The remaining 176 s.** It is still mostly the main thread computing
    before the first steady frame. Next, profile s2's main thread with
    GEX_PROF.
-2. **Master re-keyed units.** The merged gexc looks for new unit keys:
-   rebuild with `$W/cgen-w3.sh GEXC LOG` (gooner `w3units/rebuild-h.log`).
-   Once integ/2026-10-09b lands, every unit cache re-keys again.
+2. **Units re-keyed by 09b.** f8bea133 merges master ff69f7e4. The gooner
+   units are rebuilt for its keys (`w3units/rebuild-09b.log`; 94 placed
+   in a boot, as before). The edger cache `boot-xdg` still holds keys for
+   gexc-o/gexc-s. Rebuild it there with `$W/cgen-w3.sh` from a
+   GEX_W3_TRACE log before running Undertale on a merged gexc
+   (d3dx9_43's unit takes about 8 minutes to compile).
 3. **The page.** It still needs `gex.image_mapped` wired to its units
    path, and the clean ranges exported to its fork (§3.17).
 4. **From DH (2026-10-09).** In the page, `any_signal()` checked the
