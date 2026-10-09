@@ -2724,6 +2724,11 @@ export class Gex {
     const wasmprog = wasmdll && !!e.gex_cgen_pmod_wasmprog?.(prov);
     // A replaced Linux library's wasm64 provider (cgen/libprov.rs): the 64-bit provider_* imports.
     const libprov = wasmdll && !!e.gex_cgen_pmod_libprov?.(prov);
+    // One built for wasm64 and lowered to this 32-bit memory (an LP64 wasm
+    // library under an aarch64 program, docs/gexcc.md §7.8): its globals
+    // stay i64, with an i32 copy of the table base for its element segment.
+    const lowered = libprov && !m64();
+    const w64 = m64() || lowered;
     // A wasm32 program's module is keyed by its bytes (`wasm:`), not its
     // path: the page keeps those for every process (host.mjs), so a program
     // run again, by any process, is not compiled again, and a file apt
@@ -2750,8 +2755,9 @@ export class Gex {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
         // i64 in a 64-bit memory's process (wasm64 PIC modules).
-        __table_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(base >>> 0) : base | 0),
-        __memory_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(memBase) : memBase),
+        __table_base: new WebAssembly.Global({ value: w64 ? 'i64' : 'i32', mutable: false }, w64 ? BigInt(base >>> 0) : base | 0),
+        __table_base32: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
+        __memory_base: new WebAssembly.Global({ value: w64 ? 'i64' : 'i32', mutable: false }, w64 ? BigInt(memBase) : memBase),
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
@@ -2783,6 +2789,8 @@ export class Gex {
           dlsym: () => 0,
         } : {}),
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
+        // its runtime's heap: fresh guest pages
+        ...(lowered ? { provider_alloc: (size) => e.gex_provider_alloc(size) } : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     };
