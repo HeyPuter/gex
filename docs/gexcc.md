@@ -1271,3 +1271,106 @@ libc.so) and without. Where it differs from the design above, or adds to it:
 - Not yet: the browser shim (`gex.dlopen` answers "not yet" there), C++
   across modules (libc++ is linked statically into each), shared Debian
   packages.
+
+### 7.12 Replacing libc.so.6 itself: design, against a narrower step (2026-10-09)
+
+Item 3 now has an LP64 libc *inside* its libraries (musl's `wasm64a64`
+arch, tools/gexcc/item3/sysroot.sh): zlib, zstd (with its worker threads
+and dictionary builder) link it, and nothing of it is visible to the
+guest. The next step §7.8 names is libc.so.6 itself, glibc's, under a
+translated program. What that requires, what a narrower step would do
+instead, and what each buys.
+
+**Where python3 and sqlite3 spend time in libc today.** `gexc run --record`
+(exact block counts, natively; instruction counts are block sizes times
+entries, so these are shares of guest instructions, not of time):
+
+| workload (archbench) | libc.so.6 share | what it is |
+|---|---|---|
+| python3.13 py.py | 0.49% (3.5M of 707M) | pthread_self (500k calls), malloc/free, strerror_r, wcs* |
+| sqlite3 sq.sql | 4.1% (44M of 1090M) | memcpy/memcmp/memset (the page already serves these as intrinsics), malloc/free, pthread_mutex_lock/trylock/unlock |
+
+The program's own code is 95.9% (sqlite) to 99.5% (python): neither is
+libc-bound, so neither replacement moves these two by more than a few
+percent. Programs that would gain are stdio- and formatting-heavy
+(apt/dpkg's text processing, `sort`, `grep` with locales), not these.
+
+**A. Replace libc.so.6 whole** (an LP64 wasm provider bound at every
+export, as libz.so.1 is now). What the guest and its loader see of a libc
+has to stay glibc's, because translated code (the program, every other
+library, ld.so) is compiled against it:
+
+- *Symbol versions.* ~2,900 versioned exports (`memcpy@GLIBC_2.17`,
+  `pthread_cond_wait@@GLIBC_2.17` and its older twins). Binding is by
+  address (libprov), so each version's address gets the right adapter;
+  where two versions differ in behaviour, two adapters.
+- *Data the guest reads directly.* `stdin/stdout/stderr` are glibc
+  `FILE *` that translated code passes to `putc_unlocked`-style macros
+  and reads fields of (`_IO_read_ptr`/`_IO_write_ptr`), `errno` through
+  `__errno_location`, `environ`, `__libc_single_threaded`, `optarg/optind`,
+  `h_errno`, the `ctype` tables behind `__ctype_b_loc` (the guest indexes
+  them inline), `timezone/daylight/tzname`. All of these must be glibc's
+  layout in guest memory, kept current by the wasm side.
+- *TLS and the thread pointer.* glibc's `struct pthread` lives at
+  `TPIDR_EL0` with the stack guard and pointer guard at fixed offsets that
+  translated code reads inline (`-fstack-protector`: `__stack_chk_guard`
+  is a global on aarch64, but `setjmp`'s pointer mangling and the dynamic
+  TLS (`__tls_get_addr`, the DTV) are ld.so's and libc's together).
+  `pthread_t` is the TP-relative struct address; `pthread_mutex_t`,
+  `pthread_cond_t`, `pthread_attr_t`, `sem_t` are caller-allocated with
+  glibc's sizes (mutex 48 bytes, cond 48, attr 64) and static initializers
+  baked into translated code. Our implementation must use those layouts
+  (or keep a side table keyed by address).
+- *ld.so.* glibc's ld.so and libc.so.6 are one unit: `_rtld_global`,
+  `_dl_*` hooks, `__libc_early_init`, `dl_iterate_phdr`, `dlopen`
+  (`libdl` is in libc since 2.34) share private structures. Either ld.so
+  stays translated and our libc implements its private interface
+  (GLIBC_PRIVATE exports: dozens, undocumented, version-specific), or ld.so
+  is replaced too, which means our own loader for translated ELF objects
+  (gex-ld has the parts: relocation, symbol lookup, TLS) inside the guest.
+- *Signals.* Handlers are translated code; `sigaction`'s `SA_RESTORER`,
+  `ucontext_t` (aarch64 `mcontext` with the FP/SIMD record) must be the
+  kernel's. Delivery at a wasm libc's syscall works now (rtmusl.c runs the
+  handler as a guest call and sigreturns); a signal while wasm code runs
+  long (a big `qsort`) waits for the next syscall.
+- *setjmp/longjmp crossing.* A translated `longjmp` over wasm frames (a
+  `qsort` comparator, a `bsearch`, `pthread_once`, `atexit` handlers
+  that longjmp) must unwind the wasm stack: the provider's `provider_try`
+  / exception tag path (Unity's) handles throws through provider frames;
+  `jmp_buf` itself is glibc's 22-word aarch64 layout with mangled SP/LR.
+- *fork.* Done for a provider's heap and state (be9eba23); with all of
+  libc in wasm, `fork`'s atfork handlers and the stdio locks are ours.
+- *Locale and iconv.* glibc's locale archive format, `LC_*` categories
+  and gconv modules (dlopen'd .so's, translated) would be ours or
+  re-implemented over musl's much smaller set; programs expecting glibc
+  collation would see differences.
+
+Size: weeks of agent time, mostly in the glibc-compat layer, with a long
+tail of programs that depend on a glibc detail; and the gain on the two
+measured workloads is at most their 0.5% and 4%.
+
+**B. The narrower step: more libc exports as per-function providers**
+(docs/elf-providers.md: bound by address, the rest of glibc stays
+translated and owns its state). What exists: mem*/str* (served as
+intrinsics or `glibc_mem_a64.inc`), printf's formatting core
+(`glibc_printf.c`, x86_64), libm, and a malloc family (`glibc_malloc.c`,
+which measured no faster than translated ptmalloc: 177 vs 175 ms for 400k
+pairs, so it is not registered). Candidates by the profile above:
+`pthread_mutex_*` (sqlite: 3.4M calls; the uncontended path is a CAS that
+tier 1 translates well already), `pthread_self` (python: 500k, already
+two instructions), `strtod`/`printf` family and `qsort` for text tools.
+Each is a few hundred lines with the stateless/stateful rules elf-providers
+already has, and each is measured alone. Gain: a few percent at most on
+python3/sqlite3; more on formatting-heavy tools.
+
+**C. What actually moves these workloads** is the program's own code: the
+function JIT and AOT tiers on python3.13 (99.5%) and libsqlite3 (95.9%),
+and whole libraries as wasm providers where a library is the hot part
+(item 3's zlib under python3.13: compress 1.73x faster than translated,
+306 vs 530 ms; zstd level 3 at tier 1: 3.6x faster than translated, 23 vs
+82 ms; edger, medians of an ABBA set). libsqlite3 itself is a pure-C ABI like zlib's and
+could be the next item-3 library: 96% of sqlite3's instructions.
+
+**Recommendation:** not A for now. B only per measured hot function. Make
+libsqlite3 the next item-3 library, and keep the LP64 libc as the inside
+of such libraries.
