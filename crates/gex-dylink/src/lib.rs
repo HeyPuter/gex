@@ -1,0 +1,764 @@
+//! Shared libraries for native wasm32 programs (docs/gexcc.md §7).
+//!
+//! A gexcc shared library is an emscripten-style side module: a wasm module
+//! with a `dylink.0` section (its data size and alignment, its table size,
+//! the libraries it needs), importing the process's memory, function table
+//! and stack pointer, `__memory_base` and `__table_base`, data addresses as
+//! `GOT.mem.<sym>` globals, function addresses (table indices) as
+//! `GOT.func.<sym>` globals and other modules' functions as `env.<sym>`
+//! imports. A program linked against shared libraries is a PIE of the same
+//! shape whose `dylink.0` names them.
+//!
+//! This crate is the half of the loader both shims share: reading a module
+//! ([`Info`]), finding and ordering a program's libraries ([`Link`]), and
+//! deciding what every import of every module is bound to ([`Link::bind`]).
+//! The shims do the rest (data allocation, table ranges, instantiation in
+//! each thread's store). [`selfbind`] is a build step gexcc runs on every
+//! shared library.
+//!
+//! Function addresses. Every function a module exports gets a table slot
+//! in the module's own range: the functions of its element segment keep
+//! their positions, and every other exported function gets one after them
+//! ([`Info::slots`]). `GOT.func.f` is then the slot of the module defining
+//! `f`, the same in every module, so function pointers compare equal across
+//! modules as C requires.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+pub use anyhow::{anyhow, bail, Context, Result};
+
+/// `dylink.0` symbol flags (llvm/BinaryFormat/Wasm.h).
+pub const SYM_BINDING_WEAK: u32 = 0x1;
+pub const SYM_TLS: u32 = 0x400;
+
+/// The directories a library is searched in after the program's run path
+/// and `LD_LIBRARY_PATH`: the multiarch directories gexcc's packages own.
+pub const DEFAULT_DIRS: &[&str] = &[
+    "/usr/lib/wasm32-linux-musl",
+    "/lib/wasm32-linux-musl",
+    "/usr/local/lib/wasm32-linux-musl",
+];
+
+/// The custom section a library's fork summary is in (§7.5): which of its
+/// exports may unwind for a fork.
+pub const FORKREACH_SECTION: &str = "gex.forkreach";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Func,
+    Table,
+    Memory,
+    Global,
+    Tag,
+}
+
+#[derive(Clone, Debug)]
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub kind: Kind,
+    /// For a function: its type index; for a global: whether mutable.
+    pub ty: u32,
+    pub weak: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Export {
+    pub kind: Kind,
+    /// The index in the kind's index space (imports first).
+    pub index: u32,
+}
+
+/// What the loader needs to know of a module.
+#[derive(Clone, Debug, Default)]
+pub struct Info {
+    pub mem_size: u32,
+    /// log2.
+    pub mem_align: u32,
+    pub table_size: u32,
+    pub table_align: u32,
+    pub needed: Vec<String>,
+    pub runpath: Vec<String>,
+    /// Whether the module has a `dylink.0` section at all.
+    pub dylink: bool,
+    pub imports: Vec<Import>,
+    pub exports: HashMap<String, Export>,
+    /// Exports flagged TLS in `dylink.0`.
+    pub tls_exports: HashSet<String>,
+    pub func_imports: u32,
+    pub global_imports: u32,
+    /// The function at each position of the element segment (based at
+    /// `__table_base`).
+    pub elem: Vec<u32>,
+    /// The constant initial value of each defined global (index minus the
+    /// imported globals), if it has one: a data export's address relative
+    /// to `__memory_base`.
+    pub global_init: Vec<Option<u32>>,
+    /// The fork summary (`gex.forkreach`), if the module has one.
+    pub forkreach: Option<ForkReach>,
+}
+
+/// A library's fork summary (`gex.forkreach`, docs/gexcc.md §7.5).
+#[derive(Clone, Debug, Default)]
+pub struct ForkReach {
+    /// Exports that may unwind (fork, or call something that may).
+    pub may_fork: HashSet<String>,
+}
+
+impl ForkReach {
+    /// The section's payload: UTF-8 text, a first line `gex.forkreach 1`,
+    /// then one export name per line.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut names: Vec<&String> = self.may_fork.iter().collect();
+        names.sort();
+        let mut s = String::from("gex.forkreach 1\n");
+        for n in names {
+            s.push_str(n);
+            s.push('\n');
+        }
+        s.into_bytes()
+    }
+
+    pub fn decode(data: &[u8]) -> Result<ForkReach> {
+        let s = std::str::from_utf8(data).context("gex.forkreach: not UTF-8")?;
+        let mut lines = s.lines();
+        if lines.next() != Some("gex.forkreach 1") {
+            bail!("gex.forkreach: unknown version");
+        }
+        Ok(ForkReach {
+            may_fork: lines
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+}
+
+fn kind_of(k: wasmparser::ExternalKind) -> Kind {
+    match k {
+        wasmparser::ExternalKind::Func => Kind::Func,
+        wasmparser::ExternalKind::Table => Kind::Table,
+        wasmparser::ExternalKind::Memory => Kind::Memory,
+        wasmparser::ExternalKind::Global => Kind::Global,
+        wasmparser::ExternalKind::Tag => Kind::Tag,
+    }
+}
+
+impl Info {
+    pub fn parse(wasm: &[u8]) -> Result<Info> {
+        use wasmparser::{Payload, TypeRef};
+        let mut info = Info::default();
+        let mut weak = HashSet::new();
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            match payload? {
+                Payload::CustomSection(c) if c.name() == "dylink.0" => {
+                    info.dylink = true;
+                    let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+                    while !r.eof() {
+                        let id = r.read_u8()?;
+                        let len = r.read_var_u32()? as usize;
+                        let body = r.read_bytes(len)?;
+                        let mut s = wasmparser::BinaryReader::new(body, 0);
+                        match id {
+                            1 => {
+                                info.mem_size = s.read_var_u32()?;
+                                info.mem_align = s.read_var_u32()?;
+                                info.table_size = s.read_var_u32()?;
+                                info.table_align = s.read_var_u32()?;
+                            }
+                            2 | 5 => {
+                                let n = s.read_var_u32()?;
+                                for _ in 0..n {
+                                    let v = s.read_string()?.to_string();
+                                    if id == 2 {
+                                        info.needed.push(v)
+                                    } else {
+                                        info.runpath.push(v)
+                                    }
+                                }
+                            }
+                            3 => {
+                                let n = s.read_var_u32()?;
+                                for _ in 0..n {
+                                    let name = s.read_string()?.to_string();
+                                    let flags = s.read_var_u32()?;
+                                    if flags & SYM_TLS != 0 {
+                                        info.tls_exports.insert(name);
+                                    }
+                                }
+                            }
+                            4 => {
+                                let n = s.read_var_u32()?;
+                                for _ in 0..n {
+                                    let m = s.read_string()?.to_string();
+                                    let f = s.read_string()?.to_string();
+                                    let flags = s.read_var_u32()?;
+                                    if flags & SYM_BINDING_WEAK != 0 {
+                                        weak.insert((m, f));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Payload::CustomSection(c) if c.name() == FORKREACH_SECTION => {
+                    info.forkreach = Some(ForkReach::decode(c.data())?);
+                }
+                Payload::ImportSection(s) => {
+                    for imp in s {
+                        let imp = imp?;
+                        let (kind, ty) = match imp.ty {
+                            TypeRef::Func(t) => {
+                                info.func_imports += 1;
+                                (Kind::Func, t)
+                            }
+                            TypeRef::Global(g) => {
+                                info.global_imports += 1;
+                                (Kind::Global, g.mutable as u32)
+                            }
+                            TypeRef::Table(_) => (Kind::Table, 0),
+                            TypeRef::Memory(_) => (Kind::Memory, 0),
+                            TypeRef::Tag(t) => (Kind::Tag, t.func_type_idx),
+                        };
+                        info.imports.push(Import {
+                            module: imp.module.to_string(),
+                            name: imp.name.to_string(),
+                            kind,
+                            ty,
+                            weak: false,
+                        });
+                    }
+                }
+                Payload::GlobalSection(s) => {
+                    for g in s {
+                        let g = g?;
+                        let mut ops = g.init_expr.get_operators_reader();
+                        let v = match ops.read() {
+                            Ok(wasmparser::Operator::I32Const { value }) => Some(value as u32),
+                            _ => None,
+                        };
+                        info.global_init.push(v);
+                    }
+                }
+                Payload::ExportSection(s) => {
+                    for e in s {
+                        let e = e?;
+                        info.exports.insert(
+                            e.name.to_string(),
+                            Export {
+                                kind: kind_of(e.kind),
+                                index: e.index,
+                            },
+                        );
+                    }
+                }
+                Payload::ElementSection(s) => {
+                    for el in s {
+                        let el = el?;
+                        if !matches!(el.kind, wasmparser::ElementKind::Active { .. }) {
+                            continue;
+                        }
+                        if let wasmparser::ElementItems::Functions(fs) = el.items {
+                            for f in fs {
+                                info.elem.push(f?);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for imp in &mut info.imports {
+            // `GOT.mem.x` / `GOT.func.x` carry `env.x`'s weakness
+            let key = (imp.module.clone(), imp.name.clone());
+            imp.weak = weak.contains(&key) || weak.contains(&("env".to_string(), imp.name.clone()));
+        }
+        Ok(info)
+    }
+
+    /// The module's table range: its length, and the slot (relative to
+    /// `__table_base`) of every exported function. Element segment
+    /// positions first; every exported function not in it gets a slot
+    /// after them, in export-name order (the same in every process).
+    pub fn slots(&self) -> (u32, HashMap<u32, u32>) {
+        let mut at: HashMap<u32, u32> = HashMap::new();
+        for (k, &f) in self.elem.iter().enumerate() {
+            at.entry(f).or_insert(k as u32);
+        }
+        let mut len = self.table_size.max(self.elem.len() as u32);
+        let mut names: Vec<(&String, &Export)> = self
+            .exports
+            .iter()
+            .filter(|(_, e)| e.kind == Kind::Func)
+            .collect();
+        names.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, e) in names {
+            if let std::collections::hash_map::Entry::Vacant(v) = at.entry(e.index) {
+                v.insert(len);
+                len += 1;
+            }
+        }
+        (len, at)
+    }
+
+    /// The slots [`Info::slots`] adds after the element segment: (relative
+    /// slot, export name), which the loader fills after instantiating.
+    pub fn extra_slots(&self) -> Vec<(u32, String)> {
+        let (_, at) = self.slots();
+        let base = self.table_size.max(self.elem.len() as u32);
+        let mut v: Vec<(u32, String)> = self
+            .exports
+            .iter()
+            .filter(|(_, e)| e.kind == Kind::Func)
+            .filter_map(|(n, e)| {
+                at.get(&e.index)
+                    .filter(|&&s| s >= base)
+                    .map(|&s| (s, n.clone()))
+            })
+            .collect();
+        v.sort();
+        v.dedup_by_key(|x| x.0);
+        v
+    }
+
+    /// A data export's address relative to `__memory_base`.
+    pub fn data_offset(&self, name: &str) -> Option<u32> {
+        let e = self.exports.get(name)?;
+        if e.kind != Kind::Global || e.index < self.global_imports {
+            return None;
+        }
+        self.global_init
+            .get((e.index - self.global_imports) as usize)
+            .copied()
+            .flatten()
+    }
+}
+
+/// Rewrite a side module's imports of functions it defines itself into
+/// direct calls. wasm-ld makes every weak definition of a shared library
+/// preemptible -- called through an `env` import even with `-Bsymbolic` --
+/// and musl's weak aliases (`malloc`, `lseek`, the `*_l` functions) and
+/// every C++ inline function are weak. gex's loader does not interpose a
+/// library's own calls (docs/gexcc.md §7.2), so they are bound here, once,
+/// at build time. Returns the module unchanged when nothing is imported
+/// that it defines.
+pub fn selfbind(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
+    let info = Info::parse(wasm)?;
+    // imported function index -> the defined function it becomes
+    let mut bound: HashMap<u32, u32> = HashMap::new();
+    let mut fi = 0u32;
+    for imp in &info.imports {
+        if imp.kind != Kind::Func {
+            continue;
+        }
+        if imp.module == "env" {
+            if let Some(e) = info.exports.get(&imp.name) {
+                if e.kind == Kind::Func && e.index >= info.func_imports {
+                    bound.insert(fi, e.index);
+                }
+            }
+        }
+        fi += 1;
+    }
+    if bound.is_empty() {
+        return Ok(wasm.to_vec());
+    }
+    // old index -> new index
+    let n = info.func_imports;
+    let removed = bound.len() as u32;
+    let mut kept_before = vec![0u32; n as usize + 1];
+    for i in 0..n {
+        kept_before[i as usize + 1] = kept_before[i as usize] + u32::from(!bound.contains_key(&i));
+    }
+    struct R {
+        n: u32,
+        removed: u32,
+        bound: HashMap<u32, u32>,
+        kept_before: Vec<u32>,
+        func_import: u32,
+    }
+    impl R {
+        fn map(&self, f: u32) -> u32 {
+            if f >= self.n {
+                f - self.removed
+            } else if let Some(&d) = self.bound.get(&f) {
+                d - self.removed
+            } else {
+                self.kept_before[f as usize]
+            }
+        }
+    }
+    impl Reencode for R {
+        type Error = std::convert::Infallible;
+        fn function_index(&mut self, f: u32) -> u32 {
+            self.map(f)
+        }
+        fn parse_import(
+            &mut self,
+            imports: &mut wasm_encoder::ImportSection,
+            import: wasmparser::Import<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            if let wasmparser::TypeRef::Func(_) = import.ty {
+                let i = self.func_import;
+                self.func_import += 1;
+                if self.bound.contains_key(&i) {
+                    return Ok(());
+                }
+            }
+            imports.import(import.module, import.name, self.entity_type(import.ty)?);
+            Ok(())
+        }
+        fn parse_custom_name_subsection(
+            &mut self,
+            names: &mut wasm_encoder::NameSection,
+            section: wasmparser::Name<'_>,
+        ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
+            // the bound imports' names go (their functions keep their own)
+            let keep = |i: u32| i >= self.n || !self.bound.contains_key(&i);
+            match section {
+                wasmparser::Name::Function(map) => {
+                    let mut m = wasm_encoder::NameMap::new();
+                    for x in map {
+                        let x = x?;
+                        if keep(x.index) {
+                            m.append(self.map(x.index), x.name);
+                        }
+                    }
+                    names.functions(&m);
+                }
+                wasmparser::Name::Local(_) | wasmparser::Name::Label(_) => {}
+                other => {
+                    wasm_encoder::reencode::utils::parse_custom_name_subsection(self, names, other)?
+                }
+            }
+            Ok(())
+        }
+    }
+    let _ = RoundtripReencoder;
+    let mut r = R {
+        n,
+        removed,
+        bound,
+        kept_before,
+        func_import: 0,
+    };
+    let mut module = wasm_encoder::Module::new();
+    r.parse_core_module(&mut module, wasmparser::Parser::new(0), wasm)
+        .map_err(|e| anyhow!("selfbind: {e:?}"))?;
+    let out = module.finish();
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&out)
+        .context("selfbind: the rewritten module does not validate")?;
+    Ok(out)
+}
+
+/// Add (or replace) a custom section at the end of a module.
+pub fn set_custom_section(wasm: &[u8], name: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = wasm[..8].to_vec();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let payload = payload?;
+        if let wasmparser::Payload::CustomSection(c) = &payload {
+            if c.name() == name {
+                continue;
+            }
+        }
+        if let Some((id, range)) = payload.as_section() {
+            // the section's header (id, size) precedes its contents
+            let mut hdr = vec![id];
+            leb(&mut hdr, range.len() as u32);
+            out.extend_from_slice(&hdr);
+            out.extend_from_slice(&wasm[range]);
+        }
+    }
+    let mut body = Vec::new();
+    leb(&mut body, name.len() as u32);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(data);
+    out.push(0);
+    leb(&mut out, body.len() as u32);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn leb(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// One module of a process's link map.
+#[derive(Clone, Debug)]
+pub struct Loaded {
+    /// The name it was asked for by (a `NEEDED` soname, or the program's path).
+    pub name: String,
+    /// Where it was found.
+    pub path: String,
+    pub info: Info,
+    pub memory_base: u32,
+    pub table_base: u32,
+}
+
+/// What one import of one module is bound to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bind {
+    /// Left to the shim: `env.memory`, the table, `__memory_base`,
+    /// `__table_base`, `__stack_pointer`, `gex.*` and the like.
+    Shim,
+    /// A `GOT.mem` global's value (an address).
+    GotMem(u32),
+    /// A `GOT.func` global's value (a table index).
+    GotFunc(u32),
+    /// An export of a module instantiated before this one (an index into
+    /// the link map).
+    Export { module: usize, name: String },
+    /// A function of a module instantiated after this one (a cycle, or a
+    /// symbol of the program a library uses): called through its table slot.
+    Late { slot: u32 },
+    /// A weak undefined symbol, or a strong function nobody defines
+    /// (an error when called, as lazy binding makes it): a function that
+    /// traps with this message, or 0 for a global.
+    Missing(String),
+}
+
+/// A process's modules: the program and, breadth first, its libraries'
+/// (the global scope, in lookup order).
+#[derive(Clone, Debug, Default)]
+pub struct Link {
+    pub mods: Vec<Loaded>,
+}
+
+/// Imports the shim provides.
+pub fn shim_import(m: &str, name: &str) -> bool {
+    match m {
+        "env" => matches!(
+            name,
+            "memory"
+                | "__indirect_function_table"
+                | "__stack_pointer"
+                | "__memory_base"
+                | "__table_base"
+                | "__asyncify_state"
+                | "__asyncify_data"
+        ),
+        "GOT.mem" | "GOT.func" => false,
+        _ => true,
+    }
+}
+
+impl Link {
+    /// The program's libraries, breadth first from its `NEEDED`: for each,
+    /// `find(soname, runpath)` gives its path and bytes (searching the run
+    /// path, `LD_LIBRARY_PATH` and [`DEFAULT_DIRS`] is the caller's, through
+    /// [`search`]). Libraries already in the link map (by soname) are not
+    /// loaded again.
+    pub fn needed_of(
+        &self,
+        first: usize,
+        mut find: impl FnMut(&str, &[String]) -> Result<(String, Vec<u8>)>,
+    ) -> Result<Vec<(String, String, Vec<u8>, Info)>> {
+        let mut have: HashSet<String> = self.mods.iter().map(|m| m.name.clone()).collect();
+        let mut out = Vec::new();
+        let mut q: VecDeque<(Vec<String>, Vec<String>)> = self.mods[first..]
+            .iter()
+            .map(|m| (m.info.needed.clone(), m.info.runpath.clone()))
+            .collect();
+        while let Some((needed, rp)) = q.pop_front() {
+            for n in needed {
+                if !have.insert(n.clone()) {
+                    continue;
+                }
+                let (path, bytes) = find(&n, &rp)?;
+                let info = Info::parse(&bytes)
+                    .with_context(|| format!("{path}: not a wasm shared library"))?;
+                if !info.dylink {
+                    bail!("{path}: not a wasm shared library (no dylink.0)");
+                }
+                q.push_back((info.needed.clone(), info.runpath.clone()));
+                out.push((n, path, bytes, info));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The order to instantiate `mods[from..]` in: each after what it
+    /// needs (depth first, post-order), cycles broken where they close.
+    pub fn init_order(&self, from: usize) -> Vec<usize> {
+        let by_name: HashMap<&str, usize> = self
+            .mods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.as_str(), i))
+            .collect();
+        let mut state = vec![0u8; self.mods.len()];
+        for s in state.iter_mut().take(from) {
+            *s = 2;
+        }
+        let mut out = Vec::new();
+        fn visit(
+            i: usize,
+            link: &Link,
+            by_name: &HashMap<&str, usize>,
+            state: &mut [u8],
+            out: &mut Vec<usize>,
+        ) {
+            if state[i] != 0 {
+                return;
+            }
+            state[i] = 1;
+            for n in &link.mods[i].info.needed {
+                if let Some(&j) = by_name.get(n.as_str()) {
+                    visit(j, link, by_name, state, out);
+                }
+            }
+            state[i] = 2;
+            out.push(i);
+        }
+        for i in from..self.mods.len() {
+            visit(i, self, &by_name, &mut state, &mut out);
+        }
+        out
+    }
+
+    /// The first module in scope order defining `name` as `kind`.
+    pub fn lookup(&self, name: &str, kind: Kind) -> Option<usize> {
+        self.mods.iter().position(|m| {
+            m.info.exports.get(name).is_some_and(|e| {
+                e.kind == kind
+                    && match kind {
+                        Kind::Func => e.index >= m.info.func_imports,
+                        Kind::Global => e.index >= m.info.global_imports,
+                        _ => true,
+                    }
+            })
+        })
+    }
+
+    /// The table index of `name`'s function, if a module defines it.
+    pub fn func_slot(&self, name: &str) -> Option<u32> {
+        let d = self.lookup(name, Kind::Func)?;
+        let m = &self.mods[d];
+        let (_, at) = m.info.slots();
+        at.get(&m.info.exports[name].index)
+            .map(|&s| m.table_base + s)
+    }
+
+    /// A data symbol's address, if a module defines it.
+    pub fn data_addr(&self, name: &str) -> Option<u32> {
+        let d = self.lookup(name, Kind::Global)?;
+        let m = &self.mods[d];
+        m.info
+            .data_offset(name)
+            .map(|o| m.memory_base.wrapping_add(o))
+    }
+
+    /// What each import of module `i` is bound to, given which modules are
+    /// instantiated before it (`done`).
+    pub fn bind(&self, i: usize, done: &HashSet<usize>) -> Result<Vec<Bind>> {
+        let m = &self.mods[i];
+        let mut out = Vec::with_capacity(m.info.imports.len());
+        for imp in &m.info.imports {
+            let b = match imp.module.as_str() {
+                "GOT.mem" => match self.data_addr(&imp.name) {
+                    Some(a) => Bind::GotMem(a),
+                    None if imp.weak => Bind::GotMem(0),
+                    // a function's address asked for as data (wasm-ld does
+                    // this for an undefined symbol it cannot type)
+                    None => match self.func_slot(&imp.name) {
+                        Some(s) => Bind::GotMem(s),
+                        None => bail!(
+                            "{}: symbol lookup error: undefined symbol: {}",
+                            m.path,
+                            imp.name
+                        ),
+                    },
+                },
+                "GOT.func" => match self.func_slot(&imp.name) {
+                    Some(s) => Bind::GotFunc(s),
+                    None if imp.weak => Bind::GotFunc(0),
+                    None => Bind::Missing(format!("{}: undefined symbol: {}", m.path, imp.name)),
+                },
+                "env" if !shim_import("env", &imp.name) => {
+                    let kind = imp.kind;
+                    match self.lookup(&imp.name, kind) {
+                        Some(d) if done.contains(&d) => Bind::Export { module: d, name: imp.name.clone() },
+                        Some(_) if kind == Kind::Func => match self.func_slot(&imp.name) {
+                            Some(slot) => Bind::Late { slot },
+                            None => Bind::Missing(format!("{}: {} has no table slot", m.path, imp.name)),
+                        },
+                        Some(d) => bail!(
+                            "{}: {} is defined by {}, which loads after it (a cycle of non-function symbols)",
+                            m.path,
+                            imp.name,
+                            self.mods[d].path
+                        ),
+                        None if kind == Kind::Func => Bind::Missing(format!("{}: undefined symbol: {}", m.path, imp.name)),
+                        None if imp.weak => Bind::Missing(String::new()),
+                        None => bail!("{}: symbol lookup error: undefined symbol: {}", m.path, imp.name),
+                    }
+                }
+                _ => Bind::Shim,
+            };
+            out.push(b);
+        }
+        Ok(out)
+    }
+}
+
+/// Search for library `name` (a soname, or a path when it has a `/`): the
+/// run path (`$ORIGIN` is the program's directory), `ld_library_path`,
+/// then [`DEFAULT_DIRS`]. `read` gives a file's bytes.
+pub fn search(
+    name: &str,
+    runpath: &[String],
+    origin: &str,
+    ld_library_path: &[String],
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> Result<(String, Vec<u8>)> {
+    if name.contains('/') {
+        return read(name)
+            .map(|b| (name.to_string(), b))
+            .ok_or_else(|| anyhow!("{name}: cannot open shared object file"));
+    }
+    let dirs = runpath
+        .iter()
+        .flat_map(|r| r.split(':'))
+        .map(|d| d.replace("$ORIGIN", origin).replace("${ORIGIN}", origin))
+        .chain(ld_library_path.iter().cloned())
+        .chain(DEFAULT_DIRS.iter().map(|s| s.to_string()));
+    for d in dirs {
+        if d.is_empty() {
+            continue;
+        }
+        let p = format!("{}/{name}", d.trim_end_matches('/'));
+        if let Some(b) = read(&p) {
+            if b.starts_with(b"\0asm") {
+                return Ok((p, b));
+            }
+        }
+    }
+    bail!("error while loading shared libraries: {name}: cannot open shared object file: No such file or directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forkreach_roundtrip() {
+        let f = ForkReach {
+            may_fork: ["system".to_string(), "fork".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let d = ForkReach::decode(&f.encode()).unwrap();
+        assert_eq!(d.may_fork, f.may_fork);
+    }
+}
