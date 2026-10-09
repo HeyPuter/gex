@@ -2264,3 +2264,59 @@ Not yet:
     layout.
   - Native has the same hash-only retire test (`nt_cgen::on_retire`) and
     the same placed-once rule.
+- **The .NET wasm JIT's delegate bug, fixed (patch 0005, 3302db70).**
+  - Cause: gex runs Mono interpreter-only, so the wasm JIT's `mono_ldftn`
+    and `ldvirtfn_internal` returned `create_method_pointer`'s native entry.
+    The delegate .ctor it calls runs on the interpreter
+    (`ves_icall_mono_delegate_ctor_interp`), which takes function pointers
+    as `InterpMethod*`. Under `HOST_GEX` both now return
+    `get_interp_method` (bit 0 set for an unboxing receiver, as
+    `MINT_LDVIRTFTN` does), except for native-to-managed wrappers.
+  - The embed test gains `T.Delegates`: ldftn, ldvirtftn, a boxed struct's
+    override and a closure, all made in JIT-compiled code at threshold 1.
+    The provider without the patch dies there (exit 139); with it, every
+    pattern holds.
+  - The provider is `dnc-gc/provider/mono.wasm.jitfix1`, staged on edger as
+    `page/muck-bcl-jit1`.
+  - hg8 (JIT on) and hg9 (`GEXMONO_WASM_JIT=0`), otherwise the same: shim-m4
+    with library units, lazy install, the New Game script. Both reach King's
+    Pass, and their screenshots match (`shots/hg8/c023.png`, `hg9/c023.png`).
+    The JIT is slower in both phases:
+
+    | phase | JIT (hg8) | interpreter (hg9) |
+    |---|---|---|
+    | menu, best minute | 39.9 presents/s | 44.6 presents/s |
+    | King's Pass, 602-692 s | 11.7-12.7, mean 12.0 presents/s | 14.8-15.3, mean 15.1 presents/s |
+
+    In King's Pass the JIT is 21% slower than the interpreter (12.0 vs 15.1
+    presents/s). hg10 profiles the JIT run with its counters on.
+- **Native unit retirement matches the browser (0308e2e0).**
+  - `nt_cgen::on_retire` and `ftab::on_retire` take the gone pages. A unit
+    page that is no longer mapped executable is patched, its non-provider
+    entries leave the table, and its ELF object leaves `ELF_SEEN`, so it is
+    placed again when mapped again.
+  - `ftab::on_retire` clears every entry's probe-cache slot before it
+    retires any. Retiring first left a cached unit entry behind: libb,
+    loaded where liba's re-placed unit had been, ran liba's unit, which
+    bailed to tier-1 and was sent straight back (a spin under `--fjit`).
+  - `tests/elf-units-remap`: liba and libb share one pinned base and each
+    has a unit. Each is loaded and unloaded twice, with and without
+    `--fjit`. The output matches native and the units are placed 4 times.
+    The old rule places them twice, so the second loads ran on tier-1.
+- **Start-up, item 3.**
+  - Pins (1fc1a8dd): `browser-linux.mjs --pins FILE` takes
+    `BASE SPAN PATH` lines. `tests/games/hollow-knight-pins.txt` pins the
+    16 objects that have units at their 6158cded bases. libdbus goes at its
+    second base (libxcb keeps the first). Run: hp28.
+  - ld.so (29cbcc4d): gex's loader places the interpreter, so no guest
+    mmap ever announced it. Both hosts now push `CodeMap::of_placed` for
+    it at load, and its unit (`elfunits=ld-linux-x86-64.so.2`, built at
+    0x4a00000 with `--mem64` from edger's ld.so, key 59660fd8) is placed
+    after the first syscall.
+    - Natively, 18 of 20 ld.so lookups in the remap test hit the unit.
+    - Page run: hp29 (shim-m5).
+  - The interpreter's "transform 7.0 s" (hp18) was mostly not transform.
+    5.07 s of it is static constructors run from inside
+    `mono_interp_transform_method` (`mono_runtime_class_init_full`), and
+    `generate` itself is 1.64 s. The JIT does not remove it: methods are
+    still transformed at tier 0 first.
