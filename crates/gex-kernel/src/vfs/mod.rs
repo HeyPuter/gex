@@ -14,6 +14,7 @@ pub mod devfs;
 // instead.
 #[cfg(unix)]
 pub mod hostfs;
+pub mod oss;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
