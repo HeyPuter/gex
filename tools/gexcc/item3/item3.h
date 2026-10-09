@@ -12,7 +12,11 @@
 #define A64_X(ctx, n) (((volatile uint64_t *)(uintptr_t)(uint32_t)(ctx))[n])
 #define A64_SP 31
 #define A64_PC 32
-#define A64_ARG(ctx, i) ((i) < 8 ? A64_X(ctx, i) : *(volatile uint64_t *)(uintptr_t)(A64_X(ctx, A64_SP) + 8 * ((i) - 8)))
+/* Integer argument i: x0-x7, then the stack. */
+static inline uint64_t A64_ARG(int ctx, unsigned i)
+{
+	return i < 8 ? A64_X(ctx, i) : *(volatile uint64_t *)(uintptr_t)(A64_X(ctx, A64_SP) + 8 * (i - 8));
+}
 
 #define GEXP(name) int name(int ctx, int32_t depth, uint32_t need, uint64_t ret)
 
@@ -36,6 +40,9 @@ GEXP(__gex_thread_start);
 /* Call the guest function at `fn` (AAPCS64, integer arguments; at most 8)
  * from inside the library, on the calling guest thread: its x0. */
 uint64_t a64_call_guest(uint64_t fn, unsigned n, const uint64_t *args);
+
+/* Whether `p` is a block of rt.c's heap. */
+int gexp_heap_owns(const void *p);
 
 GEXP(gexp__missing);
 GEXP(gexp__noop);

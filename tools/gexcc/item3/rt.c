@@ -1,5 +1,5 @@
-/* The C runtime an LP64 wasm zlib needs as an aarch64 program's libz
- * (docs/gexcc.md §7.8): malloc and friends over the provider heap
+/* The C runtime an LP64 wasm library needs in place of an aarch64
+ * program's (zlib, zstd; docs/gexcc.md §7.8): malloc and friends over the provider heap
  * (gex.provider_alloc: fresh guest pages), the mem* functions, and the
  * adapters every replaced library has (missing exports, constructors). */
 #include "item3.h"
@@ -15,7 +15,7 @@ GEXP(gexp__noop) { return a64_ret(ctx, ret, A64_X(ctx, 0)); }
 /* Size-class free lists over bump-allocated chunks of provider pages; one
  * lock (the module's data is every thread's). */
 static void *freelist[64];
-static uint64_t chunks[256][2];
+static uint64_t chunks[4096][2];
 static unsigned nchunks;
 static char *cur, *end;
 static volatile int lk;
@@ -51,7 +51,7 @@ void *malloc(size_t n)
 		char *q = (char *)(uintptr_t)gexp_host_alloc((unsigned)want);
 		if (!q) { unlock(); return 0; }
 		cur = q; end = q + want;
-		if (nchunks < 256) { chunks[nchunks][0] = (uint64_t)(uintptr_t)q; chunks[nchunks][1] = (uint64_t)(uintptr_t)end; nchunks++; }
+		if (nchunks < 4096) { chunks[nchunks][0] = (uint64_t)(uintptr_t)q; chunks[nchunks][1] = (uint64_t)(uintptr_t)end; nchunks++; }
 	}
 	size_t *h = (size_t *)cur;
 	cur += sz;
@@ -59,9 +59,11 @@ void *malloc(size_t n)
 	h[0] = c;
 	return h + 2;
 }
+/* Only this heap's blocks: anything else (a guest pointer that reached
+ * here) is left alone. */
 void free(void *p)
 {
-	if (!p) return;
+	if (!p || !gexp_heap_owns(p)) return;
 	unsigned c = (unsigned)((size_t *)p)[-2];
 	void **b = (void **)((size_t *)p - 2);
 	lock();
@@ -146,32 +148,13 @@ uint64_t a64_call_guest(uint64_t fn, unsigned n, const uint64_t *args)
 	return x0;
 }
 
-/* ---- zlib's allocator calls (zalloc.h) ----
- * The stream's zalloc/zfree are either zlib's own (zcalloc, zcfree: this
- * module's functions, which zlib stores when the caller leaves them null)
- * or the caller's: guest code, called as such. A block from this module's
- * heap is never handed to the guest's free, nor a guest block to ours:
- * zcfree frees only what lies in the heap's chunks. */
-#include "zutil.h"
-static int ours(const void *p)
+/* Whether `p` is a block of this module's heap (a pointer zlib or zstd
+ * hands to its own free that the guest's allocator made is never freed
+ * here). */
+int gexp_heap_owns(const void *p)
 {
 	uint64_t a = (uint64_t)(uintptr_t)p;
 	for (unsigned i = 0; i < nchunks; i++)
 		if (a >= chunks[i][0] && a < chunks[i][1]) return 1;
 	return 0;
-}
-voidpf gexp_zalloc(z_streamp strm, uInt items, uInt size)
-{
-	if (strm->zalloc == zcalloc) return zcalloc(strm->opaque, items, size);
-	uint64_t a[3] = { (uint64_t)(uintptr_t)strm->opaque, items, size };
-	return (voidpf)(uintptr_t)a64_call_guest((uint64_t)(uintptr_t)strm->zalloc, 3, a);
-}
-void gexp_zfree(z_streamp strm, voidpf p)
-{
-	if (strm->zfree == zcfree) {
-		if (ours(p)) zcfree(strm->opaque, p);
-		return;
-	}
-	uint64_t a[2] = { (uint64_t)(uintptr_t)strm->opaque, (uint64_t)(uintptr_t)p };
-	a64_call_guest((uint64_t)(uintptr_t)strm->zfree, 2, a);
 }

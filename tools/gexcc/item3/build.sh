@@ -14,16 +14,17 @@ OPT=${GEXCC_PREFIX:?}/sysroot/binaryen/bin/wasm-opt
 INC=$H/../bench-codegen/src/inc
 CF="--target=wasm64-unknown-unknown -D__linux__=1 -D_LARGEFILE64_SOURCE=1 -D_LFS64_LARGEFILE=1 -Doff64_t=long -O2 -fPIC -matomics -mbulk-memory -mmutable-globals -msign-ext -mnontrapping-fptoint -ffreestanding -nostdinc -isystem $(clang -print-resource-dir)/include -isystem $INC -I$Z -w"
 # an adapter for every function zlib.h declares (but gz*, which need stdio)
-python3 "$H/gen.py" - "$Z/zlib.h" > "$O/adapters.c"
+python3 "$H/gen.py" zlib - "$Z/zlib.h" > "$O/adapters.c"
 for f in adler32 crc32 deflate inflate inftrees inffast trees zutil compress uncompr infback; do
   clang $CF -include "$H/zalloc.h" -c "$Z/$f.c" -o "$O/z_$f.o" &
 done
 clang $CF -I"$H" -c "$O/adapters.c" -o "$O/adapters.o" &
 clang $CF -I"$H" -c "$H/rt.c" -o "$O/rt.o" &
+clang $CF -I"$H" -c "$H/zlib-alloc.c" -o "$O/zlib-alloc.o" &
 clang --target=wasm64-unknown-unknown -c "$H/tls.s" -o "$O/tls.o" &
 wait
 wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=4294967296 \
-  --export=gexp_table -o "$O/libz-64.wasm" "$O"/z_*.o "$O"/adapters.o "$O"/rt.o "$O"/tls.o
+  --export=gexp_table -o "$O/libz-64.wasm" "$O"/z_*.o "$O"/adapters.o "$O"/rt.o "$O"/zlib-alloc.o "$O"/tls.o
 $OPT "$O/libz-64.wasm" --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext \
   --enable-nontrapping-float-to-int --enable-memory64 --memory64-lowering -O2 -g -o "$O/libz.so.1.wasm"
 ls -l "$O/libz.so.1.wasm"
