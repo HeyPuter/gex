@@ -450,8 +450,14 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     --no-download` without the network).
   - Unverified: update and install in one browser-runtime session went
     past 900 s once on gooner (each alone passes).
-  - Next: startup on edger (bench.sh, page), merge master, gate heads;
-    tier 2; GUI; item 3.
+  - Page startup, edger (bench.sh, headless Chromium, 8 threads,
+    `web/test/site.mjs native-debian`): browser launch to the
+    `root@gex:~#` prompt 5.4-5.6 s (5578, 5408, 5395 ms; 20.4 MB rootfs
+    from localhost). In the guest (`native-debian-cmd`, each figure
+    includes two `date` forks, about 0.5 s): `ls /` 1054 then 1041 ms,
+    `perl -e 1` 3234 then 2204 ms, `dpkg -l` 2658 then 2684 ms,
+    `apt-cache policy coreutils` 11504 then 7415 ms.
+  - Next: tier 2; GUI; item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
@@ -730,7 +736,7 @@ Demo `native-debian` ("Debian, built from source to wasm") on the aarch64
 page (web/src/demos.js): fetches `/rootfs/native-debian.tar.zst`
 (`?rootfs=` overrides; decoded with the vendored zstddec), bundles it with
 its symbolic links as links (`gex_add_symlink`), and boots `/bin/bash -l`
-as pid 1 with uid 0, `HOME=/root`, `TERM`, `PATH`. Network: Wisp,
+(`-l -i`) as pid 1 with uid 0, `HOME=/root`, `TERM`, `PATH`. Network: Wisp,
 default `wss://anura.pro/`, `?wisp=URL` overrides (`?wisp=` empty: none).
 Translated programs run on tier 1 (`?fjit=1` turns the function JIT on).
 `?cmd=` runs one command for tests. Under Node the same runtime runs the
