@@ -16,7 +16,7 @@
 //! run on worker threads (`GEX_FJIT_BACKGROUND`); here it is always inline.
 
 use gex_kernel::GuestMem;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -338,11 +338,28 @@ fn mid_function(addr: u64) -> bool {
 /// libdbus's), and with the unit, a memmove of -8 bytes (hp8).
 static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The 4 KiB pages holding a root or a function translated this epoch: the
+/// starts the JIT learned lie in them (a batch's callees in other objects
+/// are its members too), so code unmapped elsewhere leaves them be. ALSA
+/// loads and unloads its plugins over and over at start-up (six of hb50's
+/// ten epochs), and each forgetting cost a re-translation of everything
+/// called after it (libasound: 27 MiB of wasm by HK's menu in hp11).
+static TOUCHED: Mutex<Option<BTreeSet<u64>>> = Mutex::new(None);
+
+fn touch(a: u64) {
+    lock(&TOUCHED).get_or_insert_with(Default::default).insert(a >> 12);
+}
+
 /// Code in `ranges` was unmapped or reprotected (`retire_unmapped_code`):
-/// start learning afresh.
+/// start learning afresh, if this epoch learned anything there.
 pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
-    if ranges.iter().all(|&(s, e)| e <= s) {
-        return;
+    {
+        let mut t = lock(&TOUCHED);
+        let set = t.get_or_insert_with(Default::default);
+        if !ranges.iter().any(|&(s, e)| e > s && set.range(s >> 12..=(e - 1) >> 12).next().is_some()) {
+            return;
+        }
+        set.clear();
     }
     let old = EPOCH.fetch_add(1, Ordering::AcqRel);
     if let Some(jit) = JIT.get() {
@@ -424,6 +441,9 @@ fn translate_root(addr: u64) -> Option<u32> {
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
     trace(&format!("translate {addr:#x}"));
     let epoch = EPOCH.load(Ordering::Acquire);
+    // What this epoch learns about (the root, even if it fails: recovery
+    // records it as a start first).
+    touch(addr);
     let Some(wasm) = jit.translate_in(epoch, crate::guest_bytes(), addr, &executable, &read_only, &volatile, &pg, class32) else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         trace(&format!("declined {addr:#x}"));
@@ -433,6 +453,9 @@ fn translate_root(addr: u64) -> Option<u32> {
     if !funcs.contains(&addr) {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         return None;
+    }
+    for &f in &funcs {
+        touch(f);
     }
     note_object(addr, funcs.len(), wasm.len());
     dump_module(addr, &funcs, &wasm);
