@@ -2,7 +2,10 @@
 # binary packages. A file goes to the first matching line; BINPKG `-` drops
 # it. A source package with no lines becomes one package of its own name.
 # `depends BINPKG DEPENDS...` adds a Depends field (Debian's data packages
-# ours use: architecture-independent content, Multi-Arch: foreign).
+# ours use: architecture-independent content, Multi-Arch: foreign);
+# `predepends BINPKG ...` a Pre-Depends field; `arch BINPKG ARCH` labels a
+# package with another architecture (dpkg and apt: arm64, docs/gexcc.md
+# §6.1a). The rest of a depends/predepends line is one relation.
 zlib      -             *
 libmd     -             *
 readline  -             *
@@ -30,4 +33,21 @@ mpdecimal -             *
 python3.13 python3.13   *
 openssl   openssl       *
 curl      curl          *
+git       -             usr/lib/git-core/git-http-push usr/lib/git-core/git-imap-send usr/lib/git-core/git-http-fetch usr/lib/git-core/git-daemon usr/lib/git-core/git-http-backend usr/lib/git-core/scalar usr/bin/scalar usr/lib/git-core/git-shell usr/bin/git-shell
 git       git           *
+xxhash    -             *
+dpkg      dpkg          usr/bin/* usr/sbin/* usr/share/dpkg/* etc/* var/* usr/share/man/*
+dpkg      -             *
+arch      dpkg          arm64
+predepends dpkg         tar (>= 1.28-1)
+apt       apt           *
+arch      apt           arm64
+depends   apt           base-passwd (>= 3.6.1) | adduser
+depends   apt           gpgv
+depends   apt           debian-archive-keyring
+libgpg-error -          *
+libgcrypt20 -           *
+libassuan -             *
+libksba   -             *
+npth      -             *
+gnupg2    gpgv          *

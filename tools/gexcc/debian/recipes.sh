@@ -501,3 +501,133 @@ build_git() {
   eval make $m install DESTDIR=$DEST
   rm -rf $DEST/usr/share/perl5 $DEST/usr/share/gitweb $DEST/usr/share/git-gui $DEST/usr/share/gitk
 }
+build_dpkg() {
+  # Native architecture arm64 (docs/gexcc.md §6.1a): configure would ask
+  # dpkg-architecture about the wasm32 host triplet; say arm64 instead
+  sed -i 's|^\( *\)cpu_type=\$(PERL=.*$|\1cpu_type=arm64|; s|^\( *\)os_type=\$(PERL=.*$|\1os_type=linux|; s|^\( *\)dpkg_arch=\$(PERL=.*$|\1dpkg_arch=arm64|' configure
+  at_configure --libexecdir=/usr/lib --disable-nls --disable-dselect --disable-devel-docs \
+    --without-libselinux --with-libz --with-liblzma --with-libzstd --with-libbz2 \
+    --disable-shared --enable-static PERL=/usr/bin/perl
+  grep -q '#define ARCHITECTURE "arm64"' config.h
+  make -j$JOBS -C lib
+  make -j$JOBS -C src
+  make -j$JOBS -C utils
+  make -C src install DESTDIR=$DEST
+  make -C utils install DESTDIR=$DEST
+  # Debian's dpkg package (debian/dpkg.install), the C side
+  mkdir -p $DEST/etc/dpkg/dpkg.cfg.d $DEST/etc/alternatives \
+    $DEST/var/lib/dpkg/{alternatives,info,parts,updates} $DEST/usr/share/dpkg/sh
+  cp debian/dpkg.cfg $DEST/etc/dpkg/
+  cp data/*table $DEST/usr/share/dpkg/
+  cp src/sh/dpkg-error.sh $DEST/usr/share/dpkg/sh/
+  rm -rf $DEST/usr/share/polkit-1
+}
+build_xxhash() {
+  make -j$JOBS CC=gexcc AR=gexcc-ar libxxhash.a
+  mkdir -p $SYSROOT/usr/lib $SYSROOT/usr/include
+  cp libxxhash.a $SYSROOT/usr/lib/; cp xxhash.h xxh3.h $SYSROOT/usr/include/
+}
+# apt's build runs triehash (a perl script) on the build machine
+host_triehash() {
+  local h=$GEXCC_DEB/host
+  if [ ! -x $h/bin/triehash ]; then
+    python3 -I "$HERE/debsrc.py" --into $h triehash=0.3-3 > /dev/null
+    mkdir -p $h/bin; install -m755 $h/triehash-0.3-3/triehash.pl $h/bin/triehash
+  fi
+  export PATH=$h/bin:$PATH
+}
+build_apt() {
+  # Native architecture arm64 like our dpkg (docs/gexcc.md §6.1a). Static:
+  # libapt-pkg and libapt-private go into each program. No seccomp, udev,
+  # systemd, berkeley db (apt-ftparchive only), nls or docs. No sqv: the
+  # gpgv method runs our native gpgv.
+  host_triehash
+  # (Size is 64-bit in FileFd, size_t 32-bit: ZSTD buffers narrow it)
+  # without NLS apt defines setlocale and friends inline with throw(); musl
+  # declares them without, which C++ rejects
+  sed -i '/^extern "C" inline/s/ throw()//' CMake/apti18n.h.in
+  sed -i 's/add_library(apt-pkg SHARED/add_library(apt-pkg STATIC/; /-Wl,-version-script=/d' apt-pkg/CMakeLists.txt
+  sed -i 's/add_library(apt-private SHARED/add_library(apt-private STATIC/' apt-private/CMakeLists.txt
+  sed -i 's/^find_package(Berkeley REQUIRED)/find_package(Berkeley)/; s/^add_subdirectory(ftparchive)/#&/; s/^add_subdirectory(test)/#&/; s/^add_subdirectory(doc)/#&/; s/^add_subdirectory(dselect)/#&/' CMakeLists.txt
+  mkdir -p build && cd build
+  cmake .. -G "Unix Makefiles" -DCMAKE_TOOLCHAIN_FILE=$GEXCC_PREFIX/share/gexcc/toolchain.cmake \
+    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_SYSCONFDIR=/etc -DCMAKE_INSTALL_LOCALSTATEDIR=/var \
+    -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_LIBEXECDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DCMAKE_STAGING_PREFIX= \
+    -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing" -DWITH_DOC=OFF -DWITH_TESTS=OFF -DUSE_NLS=OFF -DCOMMON_ARCH=arm64 -DDPKG_DATADIR=/usr/share/dpkg \
+    -DROOT_GROUP=root -DSQV_EXECUTABLE=SQV_EXECUTABLE-NOTFOUND \
+    -DSECCOMP_FOUND=OFF -DUDEV_FOUND=OFF -DSYSTEMD_FOUND=OFF -DBERKELEY_FOUND=OFF \
+    -DCMAKE_DISABLE_FIND_PACKAGE_SECCOMP=ON -DCMAKE_DISABLE_FIND_PACKAGE_Udev=ON \
+    -DCMAKE_DISABLE_FIND_PACKAGE_Systemd=ON -DCMAKE_DISABLE_FIND_PACKAGE_Berkeley=ON
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  cd ..
+  # (the toolchain's staging prefix, emptied above, also empties the install
+  # prefix for the /usr parts; the compiled-in paths are /usr's)
+  mkdir -p $DEST/usr
+  for d in bin lib share include; do if [ -d $DEST/$d ]; then cp -a $DEST/$d $DEST/usr/; rm -rf $DEST/$d; fi; done
+  # Debian's apt package (debian/apt.install): the programs, methods, config
+  rm -rf $DEST/usr/include $DEST/usr/lib/*.a $DEST/usr/lib/pkgconfig $DEST/usr/share/doc
+  rm -f $DEST/usr/bin/apt-extracttemplates $DEST/usr/bin/apt-ftparchive $DEST/usr/bin/apt-sortpkgs
+  # one program for all of apt's (aptmulti.py): 15 MB instead of 100
+  python3 -I "$HERE/aptmulti.py" $PWD/build $PWD/build/apt-multi > build/multi-names
+  rm -f $DEST/usr/bin/apt*; rm -rf $DEST/usr/lib/apt/methods $DEST/usr/lib/apt/solvers $DEST/usr/lib/apt/planners \
+    $DEST/usr/lib/apt/apt-helper $DEST/usr/lib/apt/apt-extracttemplates
+  install -m755 build/apt-multi $DEST/usr/lib/apt/apt-multi
+  while read -r n; do
+    case $n in
+      bin/*) ln -s ../lib/apt/apt-multi $DEST/usr/$n ;;
+      */*) mkdir -p $DEST/usr/lib/apt/${n%/*}; ln -s ../apt-multi $DEST/usr/lib/apt/$n ;;
+      *) ln -s apt-multi $DEST/usr/lib/apt/$n ;;
+    esac
+  done < build/multi-names
+  mkdir -p $DEST/etc/apt/{apt.conf.d,preferences.d,sources.list.d,trusted.gpg.d,keyrings,auth.conf.d} \
+    $DEST/var/lib/apt/{lists/partial,periodic,mirrors/partial} $DEST/var/cache/apt/archives/partial $DEST/var/log/apt
+  cp debian/apt.conf.autoremove $DEST/etc/apt/apt.conf.d/01autoremove 2>/dev/null || true
+}
+# the GnuPG libraries' configure scripts find each other through gpgrt-config
+# and the .pc files in the sysroot (gpg-error-config is not installed)
+export GPGRT_CONFIG=$SYSROOT/usr/bin/gpgrt-config
+build_libgpg_error() {
+  at_configure --enable-static --disable-shared --disable-nls --disable-doc --disable-tests
+  make -j$JOBS
+  both install; nola
+}
+build_libgcrypt20() {
+  # no assembly (wasm32); the generic C code paths
+  at_configure --enable-static --disable-shared --disable-asm --disable-doc --disable-jent-support \
+    --disable-padlock-support --disable-aesni-support --disable-shaext-support --disable-pclmul-support \
+    --disable-sse41-support --disable-drng-support --disable-avx-support --disable-avx2-support \
+    --disable-neon-support --disable-arm-crypto-support
+  make -j$JOBS -C cipher; make -j$JOBS -C random; make -j$JOBS -C mpi; make -j$JOBS -C compat; make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_libassuan() {
+  at_configure --enable-static --disable-shared --disable-doc
+  make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_libksba() {
+  at_configure --enable-static --disable-shared --disable-doc
+  make -j$JOBS -C gl; make -j$JOBS -C src
+  make -C src install DESTDIR=$SYSROOT; nola
+}
+build_npth() {
+  # (gnupg's configure requires it; gpgv itself does not use threads)
+  at_configure --enable-static --disable-shared --disable-tests
+  make -j$JOBS -C src
+  make install DESTDIR=$SYSROOT SUBDIRS=src; nola
+}
+build_gnupg2() {
+  # gpgv only, configured as Debian's gpgv (udeb) build: what apt runs to
+  # check InRelease against debian-archive-keyring
+  at_configure --libexecdir=/usr/lib/gnupg --disable-doc --disable-nls --disable-bzip2 \
+    --disable-gpgtar --disable-gpgsm --disable-scdaemon --disable-dirmngr --disable-tofu --disable-exec \
+    --disable-ldap --disable-gnutls --disable-sqlite --disable-libdns --disable-keyboxd --disable-tpm2d \
+    --disable-card-support --disable-ccid-driver --disable-wks-tools \
+    --with-zlib=$SYSROOT/usr
+  make -j$JOBS -C common; make -j$JOBS -C regexp; make -j$JOBS -C kbx libkeybox.a
+  make -j$JOBS -C g10 gpgv
+  mkdir -p $DEST/usr/bin; cp g10/gpgv $DEST/usr/bin/
+}

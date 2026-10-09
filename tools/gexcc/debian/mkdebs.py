@@ -24,6 +24,8 @@ ARCH = 'musl-linux-wasm32'
 DROP = ['usr/include/*', 'usr/lib/*.a', 'usr/lib/pkgconfig/*', 'usr/share/pkgconfig/*',
         'usr/share/aclocal/*', 'usr/share/info/*', 'usr/lib/*.la', 'usr/share/man/man3/*']
 SUFFIX = '+gex1'
+# binpkgs.txt lines that are not splits
+KINDS = ('depends', 'predepends', 'arch')
 
 
 def control_stanzas(path):
@@ -51,18 +53,24 @@ def split_rules(srcpkg):
     rules = []
     for line in open(os.path.join(HERE, 'binpkgs.txt')):
         f = line.split()
-        if f and not f[0].startswith('#') and f[0] == srcpkg and f[0] != 'depends':
+        if f and not f[0].startswith('#') and f[0] == srcpkg and f[0] not in KINDS:
             rules.append((f[1], f[2:]))
     return rules or [(srcpkg, ['*'])]
 
 
-def depends(binpkg):
+def field(kind, binpkg):
+    """`KIND BINPKG VALUE...` lines of binpkgs.txt: the rest of each line,
+    joined with ", " (a Depends field: `depends dpkg tar (>= 1.28-1)`)."""
     out = []
     for line in open(os.path.join(HERE, 'binpkgs.txt')):
-        f = line.split()
-        if len(f) > 2 and f[0] == 'depends' and f[1] == binpkg:
-            out += f[2:]
+        f = line.split(None, 2)
+        if len(f) > 2 and f[0] == kind and f[1] == binpkg:
+            out.append(f[2].strip())
     return ', '.join(out)
+
+
+def depends(binpkg):
+    return field('depends', binpkg)
 
 
 def main():
@@ -96,6 +104,9 @@ def main():
             print(f'{b}: no files', file=sys.stderr)
             continue
         st = bins.get(b, {})
+        # dpkg and apt are labelled with the native architecture, arm64
+        # (docs/gexcc.md §6.1a): `arch dpkg arm64`
+        arch = field('arch', b) or ARCH
         with tempfile.TemporaryDirectory() as t:
             for rel in rels:
                 s, d = os.path.join(a.stage, rel), os.path.join(t, rel)
@@ -114,7 +125,7 @@ def main():
                     md5.append(f'{hashlib.md5(open(p, "rb").read()).hexdigest()}  {rel}')
             open(os.path.join(t, 'DEBIAN', 'md5sums'), 'w').write('\n'.join(md5) + '\n')
             ctl = [f'Package: {b}', f'Source: {a.srcpkg}' + (f' ({a.version})' if a.version else ''),
-                   f'Version: {version}', f'Architecture: {ARCH}',
+                   f'Version: {version}', f'Architecture: {arch}',
                    'Maintainer: gex native builds <gex@localhost>',
                    f'Original-Maintainer: {source.get("Maintainer", "unknown")}',
                    f'Installed-Size: {size}']
@@ -131,6 +142,8 @@ def main():
                               if x.strip() and '${' not in x)
                 if v:
                     ctl.append(f'{k}: {v}')
+            if field('predepends', b):
+                ctl.append(f"Pre-Depends: {field('predepends', b)}")
             if depends(b):
                 ctl.append(f'Depends: {depends(b)}')
             if 'Homepage' in source:
@@ -138,7 +151,7 @@ def main():
             desc = st.get('Description', f'{b} (native wasm32 build)')
             ctl.append(f'Description: {desc}')
             open(os.path.join(t, 'DEBIAN', 'control'), 'w').write('\n'.join(ctl) + '\n')
-            deb = os.path.join(a.out, f'{b}_{version.split(":", 1)[-1]}_{ARCH}.deb')
+            deb = os.path.join(a.out, f'{b}_{version.split(":", 1)[-1]}_{arch}.deb')
             subprocess.run(['dpkg-deb', '--root-owner-group', '-Zxz', '--build', t, deb],
                            check=True, stdout=subprocess.DEVNULL)
             print(b, version, deb)

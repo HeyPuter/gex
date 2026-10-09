@@ -46,8 +46,17 @@ curl           8.14.1-2+deb13u5               tier2
 git            1:2.47.3-0+deb13u1             tier2
 python3.13     3.13.5-2+deb13u5               tier2
 perl           5.40.1-6+deb13u1               tier2
-dpkg           1.22.22                        tier2
-apt            3.0.3                          tier2
 lz4            1.10.0-4                       tier2
 mawk           1.3.4.20250131-1               tier1
 sysvinit       3.14-4                         tier1
+# pm: dpkg and apt themselves, labelled arm64 (docs/gexcc.md §6.1a), and
+# the OpenPGP verifier apt runs (gpgv); needs tier1's compressors and openssl
+xxhash         0.8.3-2                        pm
+dpkg           1.22.22                        pm
+apt            3.0.3                          pm
+libgpg-error   1.51-4                         pm
+libgcrypt20    1.11.0-7+deb13u1               pm
+libassuan      3.0.2-2                        pm
+libksba        1.6.7-2                        pm
+npth           1.8-3                          pm
+gnupg2         2.4.7-21+deb13u1               pm
