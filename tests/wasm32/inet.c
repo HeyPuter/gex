@@ -59,6 +59,20 @@ int main(void)
     ok(poll(&p, 1, 5000) == 1, "poll: a datagram");
     len = sizeof b;
     ok(recvfrom(u1, buf, sizeof buf, 0, (struct sockaddr *)&b, &len) == 5 && !memcmp(buf, "dgram", 5), "recvfrom");
+    {
+        /* What musl's resolver does: poll with unused (negative) slots,
+         * which report nothing, and recvmsg, which names the sender. */
+        struct pollfd ps[3] = {{.fd = -1}, {.fd = -1}, {.fd = u1, .events = POLLIN}};
+        struct sockaddr_in from = {0}, me = {0};
+        struct iovec io = {buf, sizeof buf};
+        struct msghdr mh = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &io, .msg_iovlen = 1};
+        socklen_t ml = sizeof me;
+        ok(sendto(u2, "again", 5, 0, (struct sockaddr *)&a, sizeof a) == 5, "sendto again");
+        ok(poll(ps, 3, 5000) == 1 && ps[0].revents == 0 && ps[2].revents == POLLIN, "poll: negative slots report nothing");
+        ok(recvmsg(u1, &mh, 0) == 5 && !memcmp(buf, "again", 5), "recvmsg");
+        ok(getsockname(u2, (struct sockaddr *)&me, &ml) == 0 && mh.msg_namelen == sizeof from
+           && from.sin_family == AF_INET && from.sin_port == me.sin_port, "recvmsg names the sender");
+    }
     close(u1); close(u2);
     printf("%d failures\n", fails);
     return fails != 0;

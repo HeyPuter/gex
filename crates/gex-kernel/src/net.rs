@@ -81,6 +81,18 @@ pub trait NetStack: Send + Sync + std::fmt::Debug {
     fn tcp(&self) -> Result<Arc<dyn Transport>, Errno>;
 }
 
+/// No network behind the kernel (the browser without a Wisp relay): inet
+/// sockets still work over loopback -- bind, listen, connect and the
+/// kernel's own DNS answers -- and a connection out is unreachable.
+#[derive(Debug)]
+pub struct NoNet;
+
+impl NetStack for NoNet {
+    fn tcp(&self) -> Result<Arc<dyn Transport>, Errno> {
+        Err(Errno::ENETUNREACH)
+    }
+}
+
 // -- names ------------------------------------------------------------------
 
 /// The private range the synthetic answers come from. 240.0.0.0/4 is reserved
@@ -336,6 +348,10 @@ impl Transport for RemoteEnd {
     }
     fn close(&self) {
         (self.remote.close)(self.id);
+    }
+    /// The global kernel's shutdown is SHUT_WR's: the far end reads to its end.
+    fn shutdown_write(&self) {
+        (self.remote.shutdown)(self.id);
     }
 }
 

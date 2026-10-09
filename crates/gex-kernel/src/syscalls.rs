@@ -903,6 +903,15 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     const POLLIN: u16 = 0x001;
     const POLLOUT: u16 = 0x004;
     const POLLNVAL: u16 = 0x020;
+    // A negative descriptor is a slot the caller is not using: its events
+    // are ignored and it reports nothing, as on Linux. musl's resolver keeps
+    // one such slot per query for a TCP retry; reporting POLLNVAL there made
+    // every `ppoll` return at once with nothing to read, and the resolver
+    // spun until its 5 s timeout -- on every `getaddrinfo` (Wine's
+    // `wineboot` resolving the host name was 5 s of each session boot).
+    if p.fd < 0 {
+        return 0;
+    }
     let Some(h) = &p.handle else {
         return POLLNVAL;
     };
@@ -5630,9 +5639,9 @@ impl Kernel {
             let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
             return self.fds.insert(file, ty & SOCK_CLOEXEC != 0);
         }
-        let Some(net) = self.net.clone() else {
-            return Err(Errno::EAFNOSUPPORT);
-        };
+        // Without a network stack (the browser with no relay), loopback still
+        // works: Wine's in-process server and Winsock use it.
+        let net = self.net.clone().unwrap_or_else(|| Arc::new(net::NoNet) as Arc<dyn net::NetStack>);
         if domain != AF_INET {
             return Err(Errno::EAFNOSUPPORT);
         }
@@ -6550,9 +6559,23 @@ impl Kernel {
                 break;
             }
         }
+        let is_unix = unix_sock.is_some();
         let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
+        // Where the datagram came from, as `recvfrom` says it. musl's
+        // resolver (1.2.4 on) reads its answers with `recvmsg` and drops any
+        // whose source is not a nameserver it asked: with the name left
+        // unwritten every answer was dropped, and each `getaddrinfo` waited
+        // out the resolver's 5 s timeout and failed.
+        let name = self.msg_rd(m, msg, 0)?;
+        if name != 0 && !is_unix {
+            if let Ok(sock) = self.socket_of(fd) {
+                let (ip, port) = sock.last_from().or_else(|| sock.peer()).unwrap_or((0, 0));
+                let namelen = msg + if self.compat { 4 } else { 8 };
+                self.sys_write_sockaddr(m, ip, port, name, namelen)?;
+            }
+        }
         Ok(total)
     }
 
@@ -7231,6 +7254,15 @@ fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
 mod tests {
     use super::*;
     use crate::vfs::TmpFs;
+
+    #[test]
+    fn poll_skips_negative_descriptors() {
+        let slot = |fd| PollFd { addr: 0, fd, events: 1, handle: None, writable: false };
+        // An unused slot reports nothing; a closed descriptor is POLLNVAL.
+        assert_eq!(poll_revents(&slot(-1)), 0);
+        assert_eq!(poll_revents(&slot(7)), 0x020);
+        assert!(!poll_ready(&[slot(-1), slot(-1)]));
+    }
 
     fn setup() -> (Vec<u8>, Kernel) {
         let mem = vec![0u8; 0x40000];
