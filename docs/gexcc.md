@@ -468,13 +468,33 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     coreutils` 11504/7415 (first), 5.7/4.9 s (later) then 1330/1167 ms;
     `ls /` 954/1028 ms; `perl -e 1` 3297/1855 ms (Debian's perl,
     translated).
-  - Known: `site.mjs native-debian-run` still reports one console error
-    from `apt-get update`: the shim's note that a 42 MiB allocation (apt's
-    mmap of the arm64 Packages list) takes an arena span of its own.
-    Fork inside a C++ catch block traps (asyncify). python3 has no
-    _ctypes (libffi for wasm32 not built).
-  - Next: tier 2 leftovers (perl ours, bc's dc, /usr/bin/git duplicate,
-    _ctypes), the GUI tier, item 3.
+  - GUI tier (2026-10-09), `?gui=1&rootfs=/rootfs/native-debian-gui.tar.zst`
+    (61.6 MB; 27 Debian packages + 48 of ours, 262 MiB unpacked; rebuild
+    with `scratch/CC/mkgui.sh`): a compositor canvas above the terminal,
+    `WAYLAND_DISPLAY=wayland-0` and the page's X server (`DISPLAY=:0`).
+    - foot (ours, with wayland, xkbcommon, pixman, freetype, fontconfig,
+      fcft) runs bash in its window, draws colour and bold, and takes
+      typed keys (`drive.mjs --wltype`). It used to stop drawing after
+      its first frames: musl's time64 `timerfd_settime` issues the 32-bit
+      call (325) when the times fit, which the i386/wasm32 personality
+      did not map, so foot's delayed-render timers never fired.
+    - Chocolate Doom (ours, on SDL2's X11 driver, SDL2_mixer, SDL2_net,
+      libX11/libxcb, all static) on Debian's freedoom plays its demo loop
+      in the page through the page's Xwayland. `-timedemo demo1` stalls
+      after ST_Init with the process alive and its window gone (open).
+      No sound (SDL's dummy driver only).
+    - xkbcommon's Compose tables come from Debian's libx11-data.
+    - edger scripts: `scratch/CC/pipe/gui.sh` (foot), `doom.sh`,
+      `doom2.sh` (timedemo); drive.mjs with `GEX_WEBGPU_SOFTWARE=1`.
+  - python3: `_ctypes` built on the wasm32 libffi
+    (`tools/gexcc/debian/libffi-wasm32`: generated trampolines, no
+    closures); `import ctypes`, types, structures and buffers work;
+    `CDLL(None)` raises OSError (no dlopen), patched so the import
+    survives it.
+  - Known: fork inside a C++ catch block traps (asyncify).
+  - Next: perl ours (recipe in progress: Configured natively, miniperl
+    runs under gexc; make_ext needs gexc with x86 for the host's make),
+    bc's dc, /usr/bin/git duplicate, GTK, item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.

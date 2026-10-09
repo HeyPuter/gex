@@ -434,6 +434,21 @@ build_lz4() {
   for n in unlz4 lz4cat; do ln -sf lz4 $DEST/usr/bin/$n; done
 }
 
+build_libffi() {
+  # Our wasm32 backend (libffi-wasm32/): Debian's src/wasm32 is emscripten's,
+  # which calls through JavaScript. Static, into the sysroot only.
+  [ -x configure ] || autoreconf -fi
+  cp "$HERE/libffi-wasm32/ffi.c" src/wasm32/ffi.c
+  python3 -I "$HERE/libffi-wasm32/gen.py" > src/wasm32/tramp.inc
+  # closures.c's allocator is for machines with executable memory
+  sed -i 's/^#ifndef __EMSCRIPTEN__$/#if !defined(__EMSCRIPTEN__) \&\& !defined(__wasm__)/' src/closures.c
+  at_configure --disable-shared --enable-static --disable-docs --disable-multi-os-directory \
+    --disable-exec-static-tramp --disable-raw-api
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST; mkdir -p $DEST
+}
+
 build_mpdecimal() {
   at_configure --disable-shared --enable-static --disable-cxx
   make -j$JOBS
@@ -632,4 +647,160 @@ build_gnupg2() {
   make -j$JOBS -C common; make -j$JOBS -C regexp; make -j$JOBS -C kbx libkeybox.a
   make -j$JOBS -C g10 gpgv
   mkdir -p $DEST/usr/bin; cp g10/gpgv $DEST/usr/bin/
+}
+
+# -- gui: Wayland clients (docs/gexcc.md §6.2 tier 3) -------------------------
+
+export PATH=$PATH:$HOME/.local/bin
+# meson cross setup into build/, static, with the host's own tools (a host
+# wayland-scanner) found through the build machine's pkg-config path
+ms_setup() {
+  meson setup build --cross-file $GEXCC_PREFIX/share/gexcc/meson-cross.ini \
+    --prefix=/usr --libdir=lib --sysconfdir=/etc --localstatedir=/var --buildtype=release \
+    -Ddefault_library=static -Dbuild.pkg_config_path=$GEXCC_DEB/host/lib/pkgconfig "$@"
+}
+ms_install() { python3 "$HERE/meson-install.py" -C build --no-rebuild "$@"; }
+ms_both() { DESTDIR=$DEST ms_install; DESTDIR=$SYSROOT ms_install; }
+
+# wayland-scanner for the build machine (protocol code is generated at build time)
+host_wayland_scanner() {
+  [ -x $GEXCC_DEB/host/bin/wayland-scanner ] && return
+  meson setup hostbuild --prefix=$GEXCC_DEB/host --libdir=lib -Dlibraries=false -Dscanner=true \
+    -Dtests=false -Ddocumentation=false -Ddtd_validation=false
+  meson install -C hostbuild
+}
+
+build_wayland() {
+  host_wayland_scanner
+  ms_setup -Dscanner=false -Dtests=false -Ddocumentation=false -Ddtd_validation=false
+  meson compile -C build
+  ms_both
+}
+
+build_wayland_protocols() {
+  ms_setup -Dtests=false
+  meson compile -C build
+  ms_both
+  # headers and XML only: the sysroot is where they are used
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_libxkbcommon() {
+  ms_setup -Denable-tools=false -Denable-x11=false -Denable-docs=false -Denable-wayland=false \
+    -Denable-xkbregistry=false -Denable-bash-completion=false \
+    -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale
+  meson compile -C build
+  ms_both
+}
+
+build_pixman() {
+  ms_setup -Dloongson-mmi=disabled -Dmmx=disabled -Dsse2=disabled -Dssse3=disabled -Dvmx=disabled \
+    -Darm-simd=disabled -Dneon=disabled -Da64-neon=disabled -Dmips-dspr2=disabled -Drvv=disabled \
+    -Dgnu-inline-asm=disabled -Dopenmp=disabled -Dtimers=false -Dgtk=disabled -Dlibpng=disabled \
+    -Dtests=disabled -Ddemos=disabled
+  meson compile -C build
+  ms_both
+}
+
+build_freetype() {
+  ms_setup -Dbrotli=disabled -Dbzip2=disabled -Dharfbuzz=disabled -Dpng=disabled -Dzlib=system -Dtests=disabled
+  meson compile -C build
+  ms_both
+}
+
+build_fontconfig() {
+  ms_setup -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dtools=enabled -Dcache-build=disabled \
+    -Dcache-dir=/var/cache/fontconfig
+  meson compile -C build
+  ms_both
+}
+
+build_utf8proc() {
+  make -j$JOBS CC=gexcc AR=gexcc-ar libutf8proc.a
+  for d in $DEST $SYSROOT; do
+    install -Dm644 libutf8proc.a $d/usr/lib/libutf8proc.a
+    install -Dm644 utf8proc.h $d/usr/include/utf8proc.h
+    mkdir -p $d/usr/lib/pkgconfig
+    sed -e 's|PREFIX|/usr|; s|LIBDIR|lib|; s|INCLUDEDIR|include|' -e "s|VERSION|${PWD##*/utf8proc-}|; s|-[0-9]*$||" \
+      libutf8proc.pc.in > $d/usr/lib/pkgconfig/libutf8proc.pc
+  done
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_tllist() {
+  ms_setup
+  ms_both
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_fcft() {
+  ms_setup -Ddocs=disabled -Dgrapheme-shaping=disabled -Drun-shaping=disabled -Dtest-text-shaping=false \
+    -Dexamples=false -Dsvg-backend=nanosvg
+  meson compile -C build
+  ms_both
+}
+
+build_foot() {
+  ms_setup -Ddocs=disabled -Dgrapheme-clustering=disabled -Dtests=false -Dterminfo=enabled \
+    -Dutmp-backend=none -Dime=true -Dthemes=true -Dwerror=false -Dc_args=-Wno-c2y-extensions
+  meson compile -C build
+  DESTDIR=$DEST ms_install
+}
+
+# -- gui: X11 clients (the page's X server, hostx) and SDL ---------------------
+
+# autotools library: configure, make, install into the staging tree and the
+# sysroot; static, with docs and specs off
+at_lib() { at_configure --enable-static --disable-shared "$@"; make -j$JOBS; both install; nola; }
+
+build_xorgproto() { at_configure --disable-specs; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_xtrans() { at_configure --disable-docs; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_xcb_proto() { at_configure; both install; rm -rf $DEST; mkdir -p $DEST; }
+build_libxau() { at_lib; }
+build_libxdmcp() { at_lib --disable-docs; }
+build_libxcb() {
+  # xcbgen is the host's: the copy xcb-proto put in the sysroot
+  export PYTHONPATH=$(echo $SYSROOT/usr/lib/python3*/site-packages)
+  at_lib --disable-docs --without-doxygen --disable-devel-docs
+}
+build_libx11() {
+  # the keysym/compose tables are built by host tools (makekeys)
+  at_lib --disable-specs --without-xmlto --without-fop --enable-xthreads --disable-xf86bigfont \
+    --enable-malloc0returnsnull=no
+}
+build_libxext() { at_lib --disable-specs --without-xmlto --without-fop --enable-malloc0returnsnull=no; }
+
+build_libsdl2() {
+  # X11 only (Wayland needs EGL, which wasm32 programs do not have yet), linked
+  # in; no dlopen, no GL; audio through the dummy driver
+  at_lib --disable-rpath --disable-sdl-dlopen --disable-assembly --disable-video-wayland \
+    --disable-video-opengl --disable-video-opengles --disable-video-opengles1 --disable-video-opengles2 \
+    --disable-video-vulkan --disable-video-kmsdrm --disable-video-rpi --disable-video-vivante \
+    --disable-x11-shared --disable-video-x11-xinput --disable-video-x11-xrandr --disable-video-x11-scrnsaver \
+    --disable-video-x11-xcursor --disable-video-x11-xfixes --disable-video-x11-xdbe \
+    --disable-alsa --disable-pulseaudio --disable-pipewire --disable-jack --disable-sndio --disable-oss \
+    --disable-esd --disable-arts --disable-nas --disable-diskaudio --disable-libsamplerate \
+    --disable-libudev --disable-dbus --disable-ime --disable-ibus --disable-fcitx --disable-hidapi \
+    --disable-joystick-mfi --enable-pthreads
+  # static X11 pulls in xcb, Xau and Xdmcp: say so in what programs link
+  local x; x=$(wasm32-unknown-linux-musl-pkg-config --static --libs-only-l xext x11)
+  sed -i "s|-lX11 -lXext|$x|" $DEST/usr/lib/pkgconfig/sdl2.pc $SYSROOT/usr/lib/pkgconfig/sdl2.pc \
+    $DEST/usr/bin/sdl2-config $SYSROOT/usr/bin/sdl2-config
+}
+build_libsdl2_net() { at_lib --disable-gui; }
+build_libsdl2_mixer() {
+  # sound effects (WAV) and MIDI through the built-in timidity; no codecs
+  # (the dfsg tarball has no configure: autogen.sh's way, without running it)
+  [ -x configure ] || autoreconf -fi -I acinclude
+  at_lib --disable-music-cmd --disable-music-flac --disable-music-ogg --disable-music-mp3 \
+    --disable-music-mod --disable-music-opus --disable-music-midi-fluidsynth --disable-music-wavpack \
+    --disable-music-gme --enable-music-midi-timidity --enable-music-wave
+}
+build_chocolate_doom() {
+  [ -x configure ] || ACLOCAL_PATH=$SYSROOT/usr/share/aclocal autoreconf -fi
+  at_configure --disable-sdltest --without-libsamplerate --without-libpng --without-fluidsynth \
+    --disable-werror
+  make -j$JOBS
+  make install DESTDIR=$DEST
+  rm -rf $DEST/usr/share/man $DEST/usr/share/doc
 }

@@ -990,6 +990,12 @@ export class Gex {
           const text = utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, '');
+          // `[gex-note]`: worth a line, but nothing went wrong (a large
+          // allocation that succeeded): a warning, not an error.
+          if (text.startsWith('[gex-note] ')) {
+            console.warn(text.slice(11));
+            return;
+          }
           // `[gex-stack]`: the shim wants to be told who called it (the wasm
           // frames are named).
           if (text.startsWith('[gex-stack]')) {

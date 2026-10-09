@@ -930,8 +930,9 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
         return;
     }
     let counts = unsafe { k_pty_counts(id) };
+    // A note (console.warn), not an error: nothing is wrong when it is said.
     warn_line(&format!(
-        "[pty] pid {pid} {what}s the {} of pty {id}: {} master(s), {} slave(s) now\n",
+        "[gex-note] [pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
         if master != 0 { "master" } else { "slave" },
         counts >> 16,
         counts & 0xffff
@@ -940,21 +941,21 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
 
 extern "C" fn rpty_open_master() -> i32 {
     let r = unsafe { k_pty_open_master(my_pid()) };
-    pty_note("open", r >> 16, 1, my_pid());
+    pty_note("opens", r >> 16, 1, my_pid());
     r
 }
 extern "C" fn rpty_open_slave(ptn: i32) -> i32 {
     let r = unsafe { k_pty_open_slave(ptn, my_pid()) };
-    pty_note("open", ptn, 0, my_pid());
+    pty_note("opens", ptn, 0, my_pid());
     r
 }
 extern "C" fn rpty_open_end(id: i32, master: i32) {
     unsafe { k_pty_open_end(id, master, my_pid()) };
-    pty_note("inherit", id, master, my_pid());
+    pty_note("inherits", id, master, my_pid());
 }
 extern "C" fn rpty_close_end(id: i32, master: i32) {
     unsafe { k_pty_close_end(id, master, my_pid()) };
-    pty_note("close", id, master, my_pid());
+    pty_note("closes", id, master, my_pid());
 }
 extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     let r = unsafe { k_pty_read(id, master, at, len) };
@@ -2291,25 +2292,29 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
         // The first few, and only well above a chunk: this is a real event worth
         // a line, not a stream. A run that made one of these per miss printed
         // two hundred of them and drowned everything else in the console.
+        use core::fmt::Write as _;
+        struct Buf([u8; 192], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let room = self.0.len() - self.1;
+                let n = s.len().min(room);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Said once the span is in hand: a large single allocation that
+        // succeeds is legitimate (apt maps its 42 MiB package list), so it is
+        // a note; one the arena cannot serve is an error.
+        let mut said = None;
         if _layout.size() as u64 > 2 * CHUNK
             && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
         {
-            use core::fmt::Write as _;
-            struct Buf([u8; 160], usize);
-            impl core::fmt::Write for Buf {
-                fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    let room = self.0.len() - self.1;
-                    let n = s.len().min(room);
-                    self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
-                    self.1 += n;
-                    Ok(())
-                }
-            }
-            let mut b = Buf([0; 160], 0);
+            let mut b = Buf([0; 192], 0);
             let _ = write!(
                 b,
-                "[gex:{}] a single {} MiB allocation takes a span of its own from \
+                "[gex-note] [gex:{}] a single {} MiB allocation takes a span of its own from \
                  the arena, which never gives one back (in {}, syscall {}, \
                  {} refills so far)\n",
                 my_pid(),
@@ -2318,8 +2323,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
                 HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
             );
-            // SAFETY: `warn` reads the bytes and keeps none of them.
-            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+            said = Some(b);
         }
         arena_note(1, len);
         // Count of refills, plus the biggest single layout that forced one --
@@ -2368,7 +2372,21 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 );
             }
         }
-        let base = arena_take(len).ok_or(())? as *mut u8;
+        let Some(base) = arena_take(len) else {
+            if let Some(mut b) = said {
+                // Not a note any more: the arena could not serve it. Drop the
+                // `[gex-note] ` prefix (11 bytes) so it reaches console.error.
+                let _ = write!(b, "  ... and the arena could not serve it\n");
+                // SAFETY: `warn` reads the bytes and keeps none of them.
+                unsafe { warn(b.0.as_ptr().add(11) as u32, (b.1 - 11) as u32) };
+            }
+            return Err(());
+        };
+        let base = base as *mut u8;
+        if let Some(b) = said {
+            // SAFETY: as above.
+            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        }
         memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, if BIG { "heap span (big)" } else { "heap span" });
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
