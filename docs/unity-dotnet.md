@@ -2035,27 +2035,37 @@ Not yet:
        UnityPlayer (a function the unit lacks) pulled up to 63 of the unit's
        own functions into its batch. 1cf4e76f keeps callees the unit serves
        out of the batch (`cgen::index_of`).
-     - **Root cause of both (hu15, hu16): a miss in the middle of a
-       function.** `?fjitlibs=dumpmod=` lines must be under ~4,000
-       characters (the page console cuts them; ae44c162 uses 3,000). hu16's
-       module (root 0x1a79ef6b, 64 functions) has `_xcb_in_read_block`
-       ending after its `cmp` at +0x2d with a tail call to 0x1a79d150, the
-       `cmovle` at +0x30, and no flags stored before it: an earlier miss at
-       0x1a79d150 had been translated as a root, and `recover_one` records
-       every root in the JIT's `starts` for good. Every later translation of
-       the function then ends there as at a tail call, with the flags dead,
-       and the `cmovle` read stale flags: `min(queue_len, len)` gave `len`
-       (the memmove of -8 bytes). The same shape is in libxcb's `write_vec`
-       (`cmp %ecx,%r14d; cmovle`), and hs1 (X + libdbus) shows the first X
-       connection shut right after the setup `writev`, with no read, where
-       hs2 (X + steam) reads the reply: the black screen. Natively the JIT
-       is seeded with every image's starts; the page's has only its roots.
-       a12da54a (shim only, no re-key) declines a miss that lies strictly
-       inside an `.eh_frame` FDE of its object: the fallback runs it, and
-       it never becomes a start. It logs `[fjit] ADDR (obj +off) is inside a
-       function` for the first 32. Where those misses come from (a signal's
-       return, a fallback block boundary) is still open; native has the same
-       hole if one happens there.
+     - **Root cause of both: the JIT kept a dlclose'd library's function
+       starts (fixed in 763a1538).** `?fjitlibs=dumpmod=` lines must be
+       under ~4,000 characters (the page console cuts them; ae44c162 uses
+       3,000; `dumpmod=OBJ@OFF` names a function by object and text-mapping
+       offset). hu16's module has `_xcb_in_read_block` ending after its `cmp`
+       at +0x2d with a tail call to +0x30, the `cmovle`, and no flags stored
+       before it: +0x30 was a strong start, so recovery ended the function
+       there as at a tail call, with the flags dead, and the `cmovle` read
+       stale flags: `min(queue_len, len)` gave `len` (hp8's memmove of -8
+       bytes). hs1/hs3 (X + libdbus) show the first X connection shut right
+       after the setup `writev`, with no read: `read_setup`'s
+       `_xcb_in_read_block` took the reply from an empty queue (the black
+       screen). hs4 (`dumpmod=libxcb.so.1@3150`) found no batch holding
+       +0xf150 as a function, and hs5 (`scanconst=0x1310d150`, which reports
+       every module mentioning an address) found it in libdbus's modules:
+       SDL dlopens libdbus, dlcloses it, and libxcb is mapped over the same
+       range, while the JIT's learned starts (and its set of translated
+       functions) are keyed by address and outlived the unmap. That is why
+       hb45 needed libdbus JIT-compiled. 763a1538 keys the learned state by
+       an epoch that `retire_unmapped_code` moves on (`fjit::on_retire`,
+       logged as "code unmapped ... learning afresh"; hb50 had 10 epochs by
+       151 s, six from one libasound plugin range). hb50 (full fjit, no
+       unit): "window backend is x11", where hb26/hb48/hb49 had "(null)".
+     - Also (a12da54a, 6bc61569): a miss strictly inside an `.eh_frame` FDE
+       (vfprintf's computed-goto labels, the code after `clone`'s syscall,
+       return addresses reached through dispatch) is left to the fallback,
+       since `recover_one` records every root as a start for good and would
+       split the enclosing function the same way; `.plt`'s single FDE is
+       exempt (its stubs are entries). Natively the same holes exist (the
+       learned state is per process, kept across dlclose; mid-function
+       roots become starts), masked by the images' seeded starts.
      - 1cf4e76f's first form used `cgen::index_of`, which also answers for
        the JIT's own entries, and `executable` is what instruction fetch
        asks of every byte: hu15 decoded the `cmovle` at 0x1a79d150 (a JIT
