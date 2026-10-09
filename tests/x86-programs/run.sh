@@ -18,7 +18,9 @@ fail=0
 SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # tgkill-futex: a signal sent to a thread parked on a futex must end its wait
 # (Boehm's stop-the-world; the page asked the wrong thread's signal state).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex mem64-io mem64-smc mem64-reserve"}
+# exec-tail: code ending in the last bytes of an executable mapping (the page
+# fetched only up to four bytes before the end: SIGILL in Mono's JIT code).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

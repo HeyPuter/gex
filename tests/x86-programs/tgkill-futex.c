@@ -8,9 +8,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 static sem_t never, ack;
-static volatile int handled;
+static int handled;
 static pid_t tids[4];
-static void on_sig(int s) { (void)s; handled++; sem_post(&ack); }
+static void on_sig(int s) { (void)s; __atomic_fetch_add(&handled, 1, __ATOMIC_SEQ_CST); sem_post(&ack); }
 static void *worker(void *p) {
   tids[(long)p] = syscall(SYS_gettid);
   sem_post(&ack);

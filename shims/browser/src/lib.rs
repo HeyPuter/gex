@@ -11682,7 +11682,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
-            &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             h.jit.page_table.clone(),
             Default::default(),
@@ -12192,7 +12192,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         map.start,
         map.end,
         &seeds,
-        &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+        &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
         &|a| known.contains(&a),
         page_table,
         Default::default(),
