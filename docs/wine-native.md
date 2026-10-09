@@ -1872,12 +1872,42 @@ passed this time, it is load-dependent).
   the cost; Undertale's 3303 glGetInternalformativ at wined3d init are
   89 ms in all), `GEX_SYS_WAITS=1` (wall time per thread and syscall),
   `GEX_PROF` writes `<stem>.threads`, `GEX_PROF_MIN_PCT`.
-- Next costs seen: every Wine child process runs `usd_clock_thread`
-  (wine fork, virtual.c), a 1 ms nanosleep loop that updates its
-  USER_SHARED_DATA clocks: six such threads in Undertale, about 900
-  wakeups a second each. Undertale's 350 s load: its main thread is
-  mostly parked (GEX_SYS_WAITS shows a futex wait of about 10 s in every
-  10 s window), so the next step is which thread it waits for.
+- **The fix in the browser: no measurable change, as expected from where
+  the page pumps.** The page pumps the compositor once per scheduler turn
+  (a thread on its way to waiting), not at every syscall. `$W/page/`:
+  wlbench (a static x86-64 guest holding a Wayland connection, syscall
+  rates) in nt.html on edger, shim built before (A) and after (B) 4d3bd189
+  from one tree: getppid, sched_yield and poll(0) at 550k-920k/s
+  whether connected or not and on either shim (they never reach the
+  scheduler); nanosleep(1 us) parks, about 1.15 ms each: 866-874/s on A
+  and 877-884/s on B with a connection, 878-895/s without. The page's
+  games so far open no in-guest Wayland client anyway (hostx's Xwayland
+  is beside the kernel, the NT layer draws directly); Half-Life is the one
+  that does (no Steam runtime GTK2 on gooner or edger to bundle it).
+- **usd_clock_thread every 16 ms** (wine fork bf5af1fc23e, mw): each child
+  process refreshed its USER_SHARED_DATA clocks every 1 ms (about 900
+  wakeups a second per process, six in Undertale); now every 16 ms, as
+  wineserver does (server/fd.c). Loader `$W/w3dist-u` (w3dist-n plus that;
+  the wasm differs in that constant only). Undertale, one run each:
+  62 wakeups a second per thread, process CPU 217 -> 210 s over 600 s,
+  first frame 107 -> 74 s, steady 30 fps from 350 -> 311 s.
+- **Undertale's load is waiting, not working.** Over the first 300 s
+  (gamekit `ut12.sh`): process CPU 104 s, the game's main thread 47.5 s,
+  no other thread above 2.1 s. GEX_SYS_WAITS (ab813f3e, time outside
+  syscalls) has the main thread outside syscalls nearly all the time, so
+  it waits where no syscall shows: a wasm32 futex wait is
+  memory.atomic.wait, and the in-process wineserver is called without
+  one. The run-to-run spread is large (first frame at 74 and 104 s, and
+  none in 240 or 300 s with WINEDEBUG or GEX_PROF on).
+  WINEDEBUG +sync with timestamps (`ut13.sh`, trace in `$W/ut13/log`):
+  the game's main thread waits 52 s at start for `__wineboot_event`, the
+  session's boot: wineboot, services and five more processes, each taking
+  8-12 s to start (pids 0028 to 00ac at 6, 19, 27, 37, 45, 54 and 66 s).
+  After that its NT waits are short (6.4 s over 11 waits, plus
+  NtWaitForAlertByThreadId under 1 s), yet it is neither in a syscall nor
+  on the CPU most of the time. Next: what it is in (host calls? the Unix
+  side's own waits?), and process start time under W3 (each child
+  translates its code afresh).
 
 **RESUME HERE (2026-10-08 evening, after the reboot).** Branch
 **merge/w3-audio** (wt/w3-boot; master 7a4a62c8 merged): W3.5's OSS null
