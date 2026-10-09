@@ -2017,7 +2017,10 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
-    if (child.wasm32) e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    if (child.wasm32) {
+      if (child.wasm32Base && e.gex_wasmprog_adopt_at) e.gex_wasmprog_adopt_at(BigInt(child.wasm32), child.wasm32Base);
+      else e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
+    }
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
@@ -2285,6 +2288,9 @@ export class Gex {
       compat: e.gex_compat?.() ?? 0,
       // A wasm32 program's entry: the child installs the same module.
       wasm32: e.gex_wasmprog_entry?.() ?? 0n,
+      // And where its module sits in the function table: the child's copy
+      // of the data holds function pointers for that base.
+      wasm32Base: e.gex_wasmprog_base?.() ?? 0,
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
