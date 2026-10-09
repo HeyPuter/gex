@@ -2035,6 +2035,32 @@ Not yet:
        UnityPlayer (a function the unit lacks) pulled up to 63 of the unit's
        own functions into its batch. 1cf4e76f keeps callees the unit serves
        out of the batch (`cgen::index_of`).
+     - **Root cause of both (hu15, hu16): a miss in the middle of a
+       function.** `?fjitlibs=dumpmod=` lines must be under ~4,000
+       characters (the page console cuts them; ae44c162 uses 3,000). hu16's
+       module (root 0x1a79ef6b, 64 functions) has `_xcb_in_read_block`
+       ending after its `cmp` at +0x2d with a tail call to 0x1a79d150, the
+       `cmovle` at +0x30, and no flags stored before it: an earlier miss at
+       0x1a79d150 had been translated as a root, and `recover_one` records
+       every root in the JIT's `starts` for good. Every later translation of
+       the function then ends there as at a tail call, with the flags dead,
+       and the `cmovle` read stale flags: `min(queue_len, len)` gave `len`
+       (the memmove of -8 bytes). The same shape is in libxcb's `write_vec`
+       (`cmp %ecx,%r14d; cmovle`), and hs1 (X + libdbus) shows the first X
+       connection shut right after the setup `writev`, with no read, where
+       hs2 (X + steam) reads the reply: the black screen. Natively the JIT
+       is seeded with every image's starts; the page's has only its roots.
+       a12da54a (shim only, no re-key) declines a miss that lies strictly
+       inside an `.eh_frame` FDE of its object: the fallback runs it, and
+       it never becomes a start. It logs `[fjit] ADDR (obj +off) is inside a
+       function` for the first 32. Where those misses come from (a signal's
+       return, a fallback block boundary) is still open; native has the same
+       hole if one happens there.
+     - 1cf4e76f's first form used `cgen::index_of`, which also answers for
+       the JIT's own entries, and `executable` is what instruction fetch
+       asks of every byte: hu15 decoded the `cmovle` at 0x1a79d150 (a JIT
+       entry by then) as illegal (SIGILL, status 132). 5ec43e82 counts unit
+       entries only (`cgen::unit_serves`).
 - **Resume (2026-10-09, HEAD 1cf4e76f; merge/unity has master 41917e73):**
   hu14 (dumpmod, on the shim before 1cf4e76f) waits in edger's bench
   queue; then sync the 1cf4e76f shim (copy in `scratch/unity/shim-served/`)
