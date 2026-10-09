@@ -59,6 +59,38 @@ public static class T {
     }
     return "delegates " + sum + " " + tags;
   }
+  // Call-transition costs (EMBED_BENCH): ns per call for a tiny callee, from a caller in the same
+  // tier, from JIT code into a method the wasm JIT refuses (it holds a calli, never taken), and from
+  // such a method into a JIT-compiled one. With GEXMONO_WASM_JIT=0 every leg is the interpreter's.
+  [MethodImpl(MethodImplOptions.NoInlining)] static int BInc(int x) { return x + 1; }
+  static unsafe delegate*<int, int> bnever = null;
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe int BIncInterp(int x) { if (x == int.MinValue) return bnever(x); return x + 1; }
+  static int BLoopSame(int n) { int a = 0; for (int i = 0; i < n; i++) a = BInc(a); return a; }
+  static int BLoopToInterp(int n) { int a = 0; for (int i = 0; i < n; i++) a = BIncInterp(a); return a; }
+  static unsafe int BLoopFromInterp(int n) {
+    int a = 0;
+    if (n == int.MinValue) return bnever(n);
+    for (int i = 0; i < n; i++) a = BInc(a);
+    return a;
+  }
+  static unsafe int BLoopInterpInterp(int n) {
+    int a = 0;
+    if (n == int.MinValue) return bnever(n);
+    for (int i = 0; i < n; i++) a = BIncInterp(a);
+    return a;
+  }
+  public static string CallBench(int n) {
+    var sb = new System.Text.StringBuilder("callbench ns/call:");
+    foreach (var (name, f) in new (string, Func<int, int>)[] { ("same", BLoopSame), ("to-refused", BLoopToInterp), ("from-refused", BLoopFromInterp), ("refused-refused", BLoopInterpInterp) }) {
+      f(1000); f(1000);   // past the JIT threshold, compiled
+      var sw = System.Diagnostics.Stopwatch.StartNew();
+      int r = f(n);
+      sw.Stop();
+      sb.Append($" {name} {sw.Elapsed.TotalMilliseconds * 1e6 / n:F1}");
+      if (r != n) sb.Append("(wrong)");
+    }
+    return sb.ToString();
+  }
   public static object LvGraph(int n) {
     var r = new LvRoot { arr = new object[n], pairs = new Pair[n], list = new List<Leaf>(), s = "not a leaf" };
     for (int i = 0; i < n; i++) r.arr[i] = i % 2 == 0 ? new SubLeaf { id = i } : new Leaf { id = i };
