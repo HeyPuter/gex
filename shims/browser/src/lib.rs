@@ -8968,9 +8968,21 @@ enum Pick {
 /// the *disposition*, not the bit: an ignored signal interrupts nothing, and
 /// default-ignored `SIGCHLD` would otherwise wake a shell off a pipe with
 /// `EINTR` every time a child exits.
+///
+/// For THIS Worker's thread: the kernel's loaded signal state is whichever
+/// thread made the last syscall in any Worker, so asking it answered for the
+/// wrong thread, and a `tgkill` aimed at a thread parked on a futex never ended
+/// its wait (Boehm's stop-the-world: the collector's `sem_wait` for suspend
+/// acknowledgements never returned; Unity's own Mono stalled at
+/// "ReloadAssembly"). The native host asks `signal_pending_for` the same way.
 fn any_signal(h: &mut Host) -> bool {
-    h.kernel.collect_signals();
-    h.kernel.signals.would_deliver()
+    match h.threads.get(cur()).map(|t| t.kstate.tid) {
+        Some(tid) => h.kernel.signal_pending_for(tid),
+        None => {
+            h.kernel.collect_signals();
+            h.kernel.signals.would_deliver()
+        }
+    }
 }
 
 /// Whether a thread could make progress if given the stack. Asked of threads in
@@ -9477,10 +9489,12 @@ fn schedule() -> i32 {
                 // the wake, so a ready thread means this is not a deadlock: fall
                 // through, let its Worker pick it, and only the genuinely
                 // all-blocked case (no thread ready) reaches the report below.
+                let _ = sig;
+                let k = &mut h.kernel;
                 h.threads
                     .iter()
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    && !h.threads.iter().any(|t| thread_ready(t, now, sig))
+                    && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
             }) && {
                 // Confirm it persists before acting. A single all-blocked instant
                 // is not a deadlock -- during startup one is routine -- so require
