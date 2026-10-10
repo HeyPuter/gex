@@ -408,8 +408,10 @@ async function runInSystemWorker(term, opts) {
   // beside it, the non-pthread Mesa (web/public/gex/st/); a page-side device
   // does not exist there.
   const glHere = gl === 'compositor' && !!canvas;
-  if ((wl && !canvas) || (gl && !glHere) || hostX) {
-    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
+  // The X server too: in the system Worker, beside the compositor.
+  const xHere = !!hostX && !!canvas;
+  if ((wl && !canvas) || (gl && !glHere) || (hostX && !xHere)) {
+    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && !xHere && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
   }
   const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
   globalThis.__gexSystemWorker = w;
@@ -466,6 +468,7 @@ async function runInSystemWorker(term, opts) {
           networkUrl: network?.url ?? null,
           wl: canvas ? { inRealm: true } : undefined,
           gl: glHere ? 'compositor' : undefined,
+          hostX: xHere || undefined,
         },
       });
     });
@@ -697,7 +700,23 @@ async function runProgramHere(
   let xServer = null;
   if (hostX && wlChannel) {
     if (!kernel) throw new Error('the host X server needs the global kernel');
-    xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
+    // The single-thread build (docs/single-thread.md): the server is a fiber of
+    // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
+    // waits suspend. The same messages, without a Worker between.
+    const xDir = single.on ? '/gex/xwayland-st/' : '/gex/xwayland/';
+    if (single.on) {
+      const { HostX } = await import('./hostx.js');
+      let deliver = null;
+      const hx = new HostX((m) => deliver?.({ data: m }));
+      xServer = {
+        set onmessage(f) { deliver = f; },
+        postMessage: (m) => hx.start(m).catch((err) => {
+          hx.log(`[hostx] ${err?.stack || err}`);
+          deliver?.({ data: { kind: 'failed', why: String(err?.message || err) } });
+        }),
+        terminate() {},
+      };
+    } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
     // Waited for below: a guest that starts before the display is listening
     // gets "Can't open display" and dies, and the display here is a name in the
     // global kernel that only exists once the server has bound it.
@@ -715,9 +734,9 @@ async function runProgramHere(
     };
     xServer.postMessage({
       kind: 'start',
-      xwaylandUrl: new URL('/gex/xwayland/Xwayland.mjs', location.href).href,
-      hostwlUrl: new URL('/gex/xwayland/gexhostwl.wasm', location.href).href,
-      keymapUrl: new URL('/gex/xwayland/gex.xkm', location.href).href,
+      xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
+      hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
+      keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
       // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
       // wasm32 build of the kernel (same kernel memory, other process-memory type).
       kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(`/gex/gex_kernel${archInfix()}.wasm`)) : kernel.module, memory: kernel.memory },

@@ -28,6 +28,7 @@
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
 import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
+import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;
@@ -211,7 +212,16 @@ export class HostX {
     this.emit({ kind: 'ready' });
     // And from here the X server owns this thread: `main` does not return, and
     // everything else happens inside `tick`.
-    this.#x.callMain(argv);
+    const ran = this.#x.callMain(argv);
+    // Built with JSPI (the single-thread build), `main` is a promise that
+    // suspends at every wait and this thread is free between them.
+    if (ran instanceof Promise) {
+      ran.then(
+        () => this.log('[hostx] the X server returned, which it should not'),
+        (e) => this.log(`[hostx] the X server failed: ${e?.stack || e}`),
+      );
+      return;
+    }
     this.log('[hostx] the X server returned, which it should not');
   }
 
@@ -513,11 +523,29 @@ export class HostX {
        * what makes the X server's loop look exactly like a native one.
        */
       wait(ms) {
+        // The single-thread build (docs/single-thread.md): the server is a
+        // fiber of the system Worker, so it parks on the scheduler, and the
+        // wait is a promise its stack suspends on (gexos.c GEX_XWL_JSPI).
+        if (single.on) return sched.park(Math.max(1, ms) * 1e6).then(() => 0);
         const seq = self.#k.k_wake_seq();
         self.#k.k_park(seq, BigInt(Math.max(1, ms)) * 1000000n);
         return 0;
       },
     };
+    // And what it does to a guest's socket is a wake the guests' fibers must
+    // see: a guest process bumps the scheduler after every system call
+    // (gex.mjs `k_wake`), and this server makes its socket calls straight
+    // into the kernel module, which has no way to say so.
+    if (single.on) {
+      for (const name of ['connect', 'accept', 'close', 'send', 'recv']) {
+        const fn = raw[name];
+        raw[name] = (...a) => {
+          const r = fn(...a);
+          sched.wake();
+          return r;
+        };
+      }
+    }
     if (!this.#trace) return raw;
     // `?hostxtrace=1`: narrate the transport. A server that gives up without
     // saying why has usually asked for one thing and been told another, and

@@ -77,7 +77,9 @@ set -eu
 # SharedArrayBuffer. Its own output directory, published as xwayland-st/.
 THREADS=${GEX_XWL_THREADS:-1}
 if [ "$THREADS" = 0 ]; then
-    PT=""; PTQ=""; DEFAULT_OUT=${TMPDIR:-/tmp}/gex-xwl-st; PUBDIR=xwayland-st
+    # And its one wait (gexos.c gexjs_wait) suspends through JSPI instead of
+    # blocking: GEX_XWL_JSPI, linked with -sJSPI.
+    PT=""; PTQ="'-DGEX_XWL_JSPI', "; DEFAULT_OUT=${TMPDIR:-/tmp}/gex-xwl-st; PUBDIR=xwayland-st
 else
     PT="-pthread"; PTQ="'-pthread', "; DEFAULT_OUT=${TMPDIR:-/tmp}/gex-xwl; PUBDIR=xwayland
 fi
@@ -681,7 +683,7 @@ say "Xwayland $XWAYLAND_TAG"
 #   default font to start at all, and shipping font files for that would be
 #   silly when the library already carries the two that matter.
 if [ "$THREADS" = 0 ]; then
-    XWL_LINK="-sALLOW_MEMORY_GROWTH=1"
+    XWL_LINK="-sJSPI=1 -sALLOW_MEMORY_GROWTH=1"
 else
     XWL_LINK="-pthread -sPTHREAD_POOL_SIZE=0 -sALLOW_MEMORY_GROWTH=1"
 fi
@@ -697,7 +699,8 @@ s = open(p).read()
 if '-sMODULARIZE=1' not in s:
     words = ', '.join(f"'{w}'" for w in extra.split())
     s = s.replace("c_link_args = ['-pthread', ", "c_link_args = [" + words + ", ")
-    s = s.replace("c_link_args = ['-L", "c_link_args = [" + words + ", '-L")
+    if '-sMODULARIZE=1' not in s:
+        s = s.replace("c_link_args = [", "c_link_args = [" + words + ", ", 1)
     assert '-sMODULARIZE=1' in s, 'the cross file link args did not match'
     open(p, 'w').write(s)
 PATCH
