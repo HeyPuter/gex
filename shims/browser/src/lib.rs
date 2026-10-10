@@ -9949,14 +9949,25 @@ fn finish_parked(
             // flight put almost all of them in nr 63. `sys_read` had the same
             // shape and was fixed with it. See task 140.
             let dst = gm.read_mut(*buf, *len)?;
-            handle.read_at(0, dst)
+            match handle.read_at(0, dst) {
+                // Another reader of the same pipe took what woke this one:
+                // the syscall again, which parks once more.
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
             // the reader has drained.
+            // Still no room (another writer got there first): the syscall
+            // again, which parks once more, rather than EAGAIN on a
+            // descriptor that is not non-blocking.
             let data = gm.read(*buf, *len)?.to_vec();
-            handle.write_at(0, &data)
+            match handle.write_at(0, &data) {
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         // `accept` is finished by the kernel, which is the only thing with a
         // descriptor table; the wait here is only for a connection to arrive.
