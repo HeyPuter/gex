@@ -284,6 +284,12 @@ main (int argc, char **argv)
 	P nfr = mono_runtime_invoke (nf, NULL, nfargs, &exc);
 	check ("NestedFinally", exc);
 	printf ("%s\n", mono_string_to_utf8 (nfr));
+	P rf = mono_class_get_method_from_name (k, "Reflect", 1);
+	int rfn = 50;
+	void *rfargs [1] = { &rfn };
+	P rfr = mono_runtime_invoke (rf, NULL, rfargs, &exc);
+	check ("Reflect", exc);
+	printf ("%s\n", mono_string_to_utf8 (rfr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };

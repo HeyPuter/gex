@@ -162,6 +162,31 @@ public static class T {
     }
     return "finally " + acc + " " + log;
   }
+  // Calls into System.Reflection from a hot method (PlayMaker's LoadActionField shape): the wasm JIT once
+  // refused every such caller ("residual reflection"), a guard needed only once Reflection.Emit is in use.
+  public class RBox { public int a; public string s; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int ReflGet(System.Reflection.FieldInfo fa, System.Reflection.FieldInfo fs, RBox b, int i) {
+    fa.SetValue(b, (int)fa.GetValue(b) + i);
+    var f2 = System.Reflection.FieldInfo.GetFieldFromHandle(fa.FieldHandle);
+    string s = (string)fs.GetValue(b);
+    return (int)f2.GetValue(b) + (s == null ? 0 : s.Length) + (System.Reflection.MethodBase.GetCurrentMethod().Name.Length)
+      + System.Reflection.Assembly.GetExecutingAssembly().GetName().Name.Length * 1000;
+  }
+  // Stack-walking callers: GetCurrentMethod / GetExecutingAssembly (JIT intrinsics) and Type.GetType(string),
+  // which searches the CALLING assembly and so must stay in the interpreter.
+  [MethodImpl(MethodImplOptions.NoInlining)] static int StackWalkers(int i) {
+    int r = System.Reflection.MethodBase.GetCurrentMethod().Name.Length * 100;
+    r += System.Reflection.Assembly.GetExecutingAssembly().GetName().Name.Length * 10;
+    r += Type.GetType("T") != null ? 1 : 0;
+    return r + i;
+  }
+  public static string Reflect(int n) {
+    var b = new RBox { s = "xyz" };
+    var fa = typeof(RBox).GetField("a"); var fs = typeof(RBox).GetField("s");
+    long acc = 0;
+    for (int i = 0; i < n; i++) { acc += ReflGet(fa, fs, b, i); acc = acc * 7 + StackWalkers(i); acc %= 1000000007; }
+    return "reflect " + acc + " " + b.a;
+  }
   public static string Delegates(int n) {
     long sum = 0; string tags = "";
     for (int i = 0; i < n; i++) {
