@@ -151,6 +151,24 @@ public static class T {
     catch (InvalidOperationException) { log += 11; }
     return 1;
   }
+  // ldarga in a method with EH clauses: an int argument and a string argument whose addresses are taken
+  // inside the try, mutated through the address, and read again in the catch / finally and after them.
+  [MethodImpl(MethodImplOptions.NoInlining)] static void BumpRef(ref int v, int by) { v += by; if (v % 5 == 0) throw new InvalidOperationException(); }
+  [MethodImpl(MethodImplOptions.NoInlining)] static void AppendRef(ref string t) { t = t + "!"; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static string FinArg(int i, string s) {
+    int caught = 0;
+    try {
+      BumpRef(ref i, 3);
+      AppendRef(ref s);
+      s = s + i.ToString();
+    } catch (InvalidOperationException) {
+      caught = i;
+      AppendRef(ref s);
+    } finally {
+      finCount += i & 7;
+    }
+    return s + "/" + i + "/" + caught;
+  }
   static int finCount;
   // A value chosen inside the try and used after the leave: out-of-SSA puts its phi move between
   // the CALL_HANDLER and the leave's branch.
@@ -250,6 +268,7 @@ public static class T {
       acc += Fin3(i, ref log);
       acc += FinThrow(i, ref log);
       acc += FinMove(i).Length * 7 + FinMove(i)[0];
+      { string fa = FinArg(i, "s"); acc += fa.Length * 13 + fa[fa.Length - 1]; }
       string sk = (i % 4 == 0) ? "k1" : (i % 4 == 1) ? "k2" : (i % 4 == 2) ? "zz" : "boom";
       try { acc += SrLike(sk)[0]; acc += SrLike(sk).Length; } catch (InvalidOperationException) { acc += 5; }
       try { SrLike2(sk); acc += srOut.Length; } catch (InvalidOperationException) { acc += 3; }
