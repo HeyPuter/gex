@@ -290,6 +290,12 @@ main (int argc, char **argv)
 	P rfr = mono_runtime_invoke (rf, NULL, rfargs, &exc);
 	check ("Reflect", exc);
 	printf ("%s\n", mono_string_to_utf8 (rfr));
+	P ll = mono_class_get_method_from_name (k, "Localloc", 1);
+	int lln = 100000;
+	void *llargs [1] = { &lln };
+	P llr = mono_runtime_invoke (ll, NULL, llargs, &exc);
+	check ("Localloc", exc);
+	printf ("%s\n", mono_string_to_utf8 (llr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };

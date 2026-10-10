@@ -261,6 +261,44 @@ public static class T {
       return a * 3 + b;
     }
   }
+  // stackalloc (OP_LOCALLOC / OP_LOCALLOC_IMM), constant and variable size, zero-initialised, called in a loop
+  // so a leaked SP would overflow the stack; plus BinaryReader.ReadInt32's own stackalloc.
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe int Stack(int n) {
+    byte* a = stackalloc byte[24];
+    Span<int> b = stackalloc int[n % 37 + 1];
+    int s = 0;
+    for (int k = 0; k < 24; k++) s += a[k];
+    for (int k = 0; k < b.Length; k++) { s += b[k]; b[k] = k * n; }
+    for (int k = 0; k < b.Length; k++) s += b[k];
+    a[3] = (byte)n; s += a[3];
+    return s;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static long CMulL(long a, long b) => checked(a * b);
+  [MethodImpl(MethodImplOptions.NoInlining)] static ulong CMulUL(ulong a, ulong b) => checked(a * b);
+  static string MulOvf() {
+    var sb = new System.Text.StringBuilder();
+    long[] ls = { 0, 1, -1, 2, -2, 3, long.MaxValue, long.MinValue, 1L << 31, -(1L << 32), 3037000499, 3037000500, -3037000500 };
+    foreach (long a in ls) foreach (long b in ls) {
+      try { long r = CMulL(a, b); sb.Append((char)('a' + (int)((ulong)r % 26))); } catch (OverflowException) { sb.Append('O'); }
+    }
+    sb.Append(' ');
+    ulong[] us = { 0, 1, 2, 3, ulong.MaxValue, ulong.MaxValue / 2, (ulong)uint.MaxValue, (ulong)uint.MaxValue + 1, 4294967296UL * 2 };
+    foreach (ulong a in us) foreach (ulong b in us) {
+      try { ulong r = CMulUL(a, b); sb.Append((char)('a' + (int)(r % 26))); } catch (OverflowException) { sb.Append('O'); }
+    }
+    return sb.ToString();
+  }
+  public static string Localloc(int n) {
+    long acc = 0;
+    for (int i = 0; i < n; i++) acc += Stack(i);
+    var ms = new System.IO.MemoryStream();
+    var w = new System.IO.BinaryWriter(ms);
+    for (int i = 0; i < 64; i++) w.Write(i * 1000003);
+    ms.Position = 0;
+    var r = new System.IO.BinaryReader(ms);
+    for (int i = 0; i < 64; i++) acc += r.ReadInt32() % 9973;
+    return "localloc " + acc + " " + MulOvf();
+  }
   public static string NestedFinally(int n) {
     long acc = 0; int log = 0; var ums = new UmsLike();
     for (int i = 0; i < n; i++) {
