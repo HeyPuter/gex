@@ -2261,9 +2261,11 @@ impl Kernel {
             // on their first non-empty vector: the parked call is finished
             // with that vector alone, a short count the caller already loops
             // on. Without this a full pipe answered `writev` with `EAGAIN` on
-            // a blocking descriptor (coreutils' `head` writes with it, and
-            // died "Resource temporarily unavailable" once its reader was
-            // slower than it).
+            // a blocking descriptor: coreutils' `head` writes with it and died
+            // "Resource temporarily unavailable" once its reader was slower
+            // than it, and Wine's `send_request` writes the server's requests
+            // with it (a thread that found the request pipe full died with
+            // "wine client error: write: Resource temporarily unavailable").
             nr::WRITEV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 if !file.write_is_atomic() {
