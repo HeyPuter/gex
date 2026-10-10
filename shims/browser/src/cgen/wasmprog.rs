@@ -39,6 +39,9 @@ static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 
 pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
+/// Header flag (offset 36): the program runs i386 code (Wine, W3).
+const FLAG_GUEST_I386: u32 = 1;
+
 /// Whether `program` is a native wasm32 one (its header, from the image's
 /// segments).
 pub(crate) fn is_wasm32(program: &gex_ld::Program) -> bool {
@@ -115,6 +118,30 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         return Err(format!("header version {} (want 1)", w(8)));
     }
     let (wasm_at, wasm_len, mem_base, thread_entry) = (w(12), w(16), w(20), w(32));
+    // The header's flags (offset 36; a version-1 header without them is 0):
+    // Wine's loader (W3) runs i386 code, so as natively (shims/native
+    // lib.rs) the process leaves Windows' fixed addresses free -- no mapping
+    // above KUSER_SHARED_DATA unless asked for there -- and gets the NT
+    // trampoline page native Wine's gexrt sends the guest to. Once per fresh
+    // image: a fork's child has its parent's.
+    let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
+    if flags & FLAG_GUEST_I386 != 0 && relocate {
+        use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
+        let page = gex_kernel::nt::boot::trampoline_page();
+        if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
+            dst.copy_from_slice(&page);
+        }
+        // The address space split as the NT layer splits it (nt.rs): the
+        // memory grown to 2 GiB, the shim's heap above it, and what the
+        // host left below it the process's own arena, where the Unix side's
+        // mappings land and Wine's reservations succeed. Not above the
+        // guest's slice (`GUEST_LIMIT`, just under 2 GiB).
+        let lo = crate::nt::split_windows_space().map_err(|e| format!("W3: {e}"))?;
+        crate::with_host(|h| {
+            crate::w3_address_space(&mut h.kernel.mem, lo);
+            h.kernel.mem.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
+        });
+    }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
     let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
     let slot = |n: &str| names.iter().position(|s| s.as_deref() == Some(n)).map(|k| k as u32).ok_or(format!("{n} is not in its table"));

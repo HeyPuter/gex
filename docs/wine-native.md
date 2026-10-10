@@ -1117,6 +1117,81 @@ its own unit set.
 `tests/x86-programs/x87-zeros.c` checks every sign rule and rounding
 mode against native.
 
+**W3.7: Wine's own processes in the page (2026-10-10).** `wine cmd /c
+echo` now runs in the browser runtime under Node (gooner, diagnosis only):
+wineserver is a thread of pid 1, and wineboot, services, plugplay,
+winedevice and cmd are each a Worker. Every Windows process is a double
+fork and an `execve` of the wine loader, so 10 forks in all. Edger
+Chromium timing is still to do. What it took, in start order:
+
+- **Socket pairs and descriptor passing cross Workers.**
+  - A `SOCK_STREAM` socketpair is made in the global kernel
+    (`k_sock_pair`) whenever there is one. Wine keeps one end of a new
+    process's pair and hands the child the other.
+  - `SCM_RIGHTS` describes each descriptor as text and queues it as a
+    token beside the bytes (`k_sock_write_fds`, `k_sock_read_fds`):
+    - a pipe end opened for no one;
+    - a duplicated global file (`#id:path`) or socket (`sock:id`);
+    - a path.
+  - The token's reference keeps the object alive in flight. The
+    receiver rebuilds the descriptor (`scm_rebuild`). A token dropped
+    unread releases its reference.
+  - Fork carrying (`carry_name`, `rebuild_carried`) uses the same
+    descriptions.
+- **The Windows address space split, early.**
+  - A W3 program's Worker grows its memory to 2 GiB and puts the shim's
+    heap above 0x80000000. This happens before `gex_worker_init`: JS
+    reads the GEXWASM header's i386 flag (`isW3Program`).
+  - The process's arena is then `[0x0b000000, GUEST_LIMIT)` plus the
+    low window. Splitting after the startup heap left the arena starting
+    at 0x10750000, and Wine's fixed map at 0x10000000 failed.
+  - A forked child adopts its parent's split (`gex_adopt_windows_space`)
+    before its worker stack is claimed. An exec keeps the split it
+    already has.
+- **Wine's PE module per process.** When Wine's loader maps a skeleton,
+  `gex.image_mapped(base, fd)` publishes it:
+  - the first skeleton instantiates winepe.wasm, with null `GOT.func`
+    entries and trapping stubs for the three C `main` names;
+  - later skeletons bind their exports;
+  - each DLL's variables are written at its first mapping only.
+  - The ICALL entry thunks include `__gexw_entries_decl`, as natively:
+    a function pointer that winepe hands to i386 code (rpcrt4's) is a
+    table index below 0x3f0000.
+- **Data the process did not write reads as zero.** Provider data
+  (`linux_alloc`) zeroes its dirty pages, as an anonymous `mmap` does. A
+  grandchild's memory holds its forked parent's bytes until something
+  maps over them. winepe's bss sat at the same address in wineboot and
+  in services.exe, so services.exe inherited wineboot's cached
+  dispatcher indices and hung.
+- **The Unix dispatcher ops** (`gex.unix_dispatcher`):
+  - 0/1: the system-call switch;
+  - 2/3: the guest Unix-call hook;
+  - 4/5: `__wine_unix_call_dispatcher`;
+  - an even op sets, the odd op after it gets, as natively. winepe
+    caches ops 1 and 5.
+  - A guest syscall with EAX = `gex_nr::UNIX_CALL` calls the op-3 hook
+    through the new `ftab_call_vi` import.
+  - `gex_nr::NATIVE_LEFT` is served as the NT layer serves it
+    (`nt::native_left`).
+- **The probe cache is reset** at an exec and in a forked child
+  (`fcache_reset`). Otherwise the cache holds another image's indices.
+- **One boot instant for every process.**
+  - gex-kernel based CLOCK_MONOTONIC at each process's first reading
+    (uptime 1000 s), so every Worker had its own clock.
+  - Wine clients give wineserver absolute monotonic deadlines. With
+    separate bases, services.exe's 10 s wait for a new service process
+    timed out at once, and every service "failed to start" (1053).
+  - The global kernel now holds the base (`k_boot_secs`, set through
+    `share_monotonic_base`).
+- **The page's prefix template** is an installed prefix, not a staged
+  one. `wineboot -u` puts plugplay.exe and system32/drivers there.
+  - The template takes w3-session.reg via `reg-apply.py`.
+  - `.update-timestamp` is the dist's wine.inf mtime, so wineboot does
+    not update again.
+  - For now this is built by hand (`$W/page/pfx3`, from
+    gate-w3boot/pfx-w3install). `run-node.mjs --dir` now carries
+    directory symlinks (`dosdevices/c:`) as links.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -2129,7 +2204,20 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
-**RESUME HERE (2026-10-10).** merge/w3-audio, on top of d63ceee2 (all in
+**RESUME HERE (2026-10-10, evening): W3.7.** `wine cmd /c echo` runs in
+the page under Node on gooner. See §3.17, "W3.7".
+- **Driver script:** `$W/page/run-w3.sh TAG EXE|cmd [args]`, with
+  `PFX=pfx3` (the installed template) and `TRAPSTACK=1`.
+- **Next:**
+  1. Chromium timing on edger once the edger reservation ends. Edger was
+     reserved for DH on 2026-10-10; no edger jobs until the
+     coordinator says so.
+  2. A script for the page template.
+  3. Milestone (b): a GUI program on the page compositor.
+  4. Milestone (c): Undertale.
+  5. The session keeper (design below in §3.17).
+
+**Earlier (2026-10-10).** merge/w3-audio, on top of d63ceee2 (all in
 §3.17, "round 2"):
 
 - 3d423c45: copy-loop idiom;

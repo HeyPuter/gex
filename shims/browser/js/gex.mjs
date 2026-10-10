@@ -341,6 +341,31 @@ function slotsNeeded(meta) {
 }
 
 
+/**
+ * Whether `elf` is a wasm32 program flagged as running i386 code (native
+ * Wine's loader, W3): its GEXWASM header sits 0x40 bytes before the entry
+ * point (cgen/wasmprog.rs), with the flags at offset 36.
+ */
+/** clang's names for a C main (see the PE module's instantiation). */
+const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
+
+function isW3Program(elf) {
+  if (!(elf instanceof Uint8Array) || elf.length < 52 || elf[0] !== 0x7f || elf[4] !== 1) return false;
+  const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
+  const at = dv.getUint32(24, true) - 0x40;
+  const phoff = dv.getUint32(28, true), phent = dv.getUint16(42, true), phnum = dv.getUint16(44, true);
+  for (let i = 0; i < phnum; i++) {
+    const p = phoff + i * phent;
+    if (p + 32 > elf.length || dv.getUint32(p, true) !== 1) continue;
+    const off = dv.getUint32(p + 4, true), vaddr = dv.getUint32(p + 8, true), filesz = dv.getUint32(p + 16, true);
+    if (at < vaddr || at + 40 > vaddr + filesz) continue;
+    const h = off + (at - vaddr);
+    const magic = String.fromCharCode(...elf.subarray(h, h + 7));
+    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 1) !== 0;
+  }
+  return false;
+}
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -653,6 +678,9 @@ export class Gex {
   #forkCopied = 0;
   #forkSkipped = 0;
   #forkZeros = 0;
+  /** A W3 process's Windows address-space line: a forked child's from its
+   *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
+  #windowsSpace = 0;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -751,6 +779,12 @@ export class Gex {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
+      // A forked child of a W3 process splits its memory at its parent's
+      // line before anything claims arena -- this stack is the first claim,
+      // and a fresh instance's would otherwise go above the inherited image,
+      // which there is the top of the 2 GiB.
+      if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
+      else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }
@@ -1026,6 +1060,8 @@ export class Gex {
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
         ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+        // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
+        ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -1095,6 +1131,10 @@ export class Gex {
    * pass through to, so whatever the program needs to read is bundled here.
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
+    // A W3 program (native Wine's loader) splits the memory with Windows
+    // before the runtime's startup heap is taken, or that heap sits where
+    // Windows DLLs load (0x10000000).
+    if (isW3Program(elf)) this.#windowsSpace = -1;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
@@ -1983,6 +2023,7 @@ export class Gex {
       return n;
     };
     step(`image copied, ${live()} non-zero bytes in the context`);
+    this.#windowsSpace = child.windowsSpace ?? 0;
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -2302,6 +2343,9 @@ export class Gex {
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
+      // A W3 process's Windows address space starts here (0: none); the
+      // child splits its memory at the same line before its heap takes any.
+      windowsSpace: e.gex_windows_space?.() ?? 0,
       image: (() => {
         const t0 = performance.now();
         const img = this.#processImage();
@@ -2742,7 +2786,13 @@ export class Gex {
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
         __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack()) : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+        // clang's three names for a C main: Wine's crt_main references all
+        // of them weakly and a position-independent module (W3's PE module)
+        // keeps the undefined ones as imports. Null through `GOT.func`, as a
+        // static link leaves them, and a trap behind the null check.
+        ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
         // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
@@ -2759,6 +2809,22 @@ export class Gex {
           signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
+          // W3.7: Wine's Unix side runs the program's code nested
+          // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
+          // that never returns for a thread's loop), and reports each image
+          // it maps (natively for unit placement; the page's units path
+          // takes it once `gex_image_mapped` exists).
+          call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          image_mapped: (base, fd) => {
+            const number = e.gex_image_mapped?.(base, fd) ?? -1;
+            if (number === -1) return;
+            this.#cgenCatchUp();
+            if (number >= 0) {
+              e.gex_cgen_pmod_installed(number);
+              e.gex_wasmdll_installed();
+            }
+            this.#wasmdllCatchUp();
+          },
         } : {}),
         ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),

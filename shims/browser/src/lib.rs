@@ -404,6 +404,21 @@ extern "C" {
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32);
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
+    fn k_sock_dup(id: i32) -> i32;
+    fn k_boot_secs(want: u32) -> u32;
+    fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn k_sock_read_fds(
+        id: i32,
+        at: gex_kernel::PAddr,
+        len: u32,
+        max_fds: u32,
+        peek: i32,
+        pid: i32,
+        out: gex_kernel::PAddr,
+        out_cap: u32,
+    ) -> i32;
 
 }
 
@@ -1085,6 +1100,63 @@ extern "C" fn rs_shutdown(id: i32) {
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
 }
+extern "C" fn rs_pair(out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_pair(out) }
+}
+extern "C" fn rs_dup(id: i32) -> i32 {
+    unsafe { k_sock_dup(id) }
+}
+extern "C" fn rs_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32 {
+    unsafe { k_sock_write_fds(id, at, len, descs, descs_len) }
+}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn rs_read_fds(
+    id: i32,
+    at: gex_kernel::PAddr,
+    len: u32,
+    max_fds: u32,
+    peek: i32,
+    pid: i32,
+    out: gex_kernel::PAddr,
+    out_cap: u32,
+) -> i32 {
+    unsafe { k_sock_read_fds(id, at, len, max_fds, peek, pid, out, out_cap) }
+}
+
+/// Descriptors for `SCM_RIGHTS` that cannot leave this process -- an epoll
+/// set, a memfd, a local socket -- parked by number for a receiver that turns
+/// out to be this same process (a wineserver thread hearing from its own
+/// process's client). Another process finds no entry and gets nothing.
+static LOCAL_FDS: std::sync::Mutex<(u32, Vec<(u32, Arc<gex_kernel::file::OpenFile>)>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+
+/// A descriptor as a line another process can rebuild it from. See
+/// [`carry_name`]; what has no name to travel by is parked in [`LOCAL_FDS`].
+fn scm_describe(k: &gex_kernel::syscalls::Kernel, file: &Arc<gex_kernel::file::OpenFile>) -> Option<String> {
+    const IN_FLIGHT: i32 = -1;
+    let name = carry_name(k, file, IN_FLIGHT).unwrap_or_else(|| {
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        t.0 += 1;
+        let n = t.0;
+        t.1.push((n, Arc::clone(file)));
+        format!("local:{}:{n}", my_pid())
+    });
+    Some(format!("{} {} {}", file.flags(), file.offset(), name))
+}
+
+fn scm_rebuild(k: &mut gex_kernel::syscalls::Kernel, desc: &str) -> Option<Arc<gex_kernel::file::OpenFile>> {
+    let mut p = desc.splitn(3, ' ');
+    let flags = p.next()?.parse::<u64>().ok()?;
+    let offset = p.next()?.parse::<u64>().ok()?;
+    let name = p.next()?;
+    match rebuild_carried(k, name, flags, offset) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn_line(&format!("gex: SCM_RIGHTS lost '{name}': {e}\n"));
+            None
+        }
+    }
+}
 
 /// Where a unix socket's two ends live, when there is a global kernel to put
 /// them in.
@@ -1092,6 +1164,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    // And one boot instant for every process's monotonic clocks.
+    gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
     Some(gex_kernel::unix::Remote {
         bind: rs_bind,
         connect: rs_connect,
@@ -1105,6 +1179,12 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         close: rs_close,
         shutdown: rs_shutdown,
         exists: rs_exists,
+        pair: rs_pair,
+        dup: rs_dup,
+        write_fds: rs_write_fds,
+        read_fds: rs_read_fds,
+        describe: scm_describe,
+        rebuild: scm_rebuild,
     })
 }
 
@@ -2230,6 +2310,14 @@ fn arena_back(end: u64) -> Option<u64> {
             memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest mapping (high arena)");
         }
         return Some(prev);
+    }
+    // Nothing past the guest's slice (`GUEST_LIMIT`): the kernel could map
+    // it, but every access to it (an anonymous mapping's zeroing first)
+    // faults. Wine's reservation of everything above 0x7ffe0000 (W3) then
+    // shrinks to what the guest can name, as reserve_area halves on a
+    // failure.
+    if end > GUEST_LIMIT {
+        return None;
     }
     if !grow_memory_to(end) {
         return None;
@@ -5776,7 +5864,7 @@ fn tracing() -> bool {
 
 /// Something a person must see whatever the tracing settings, on the host's
 /// console at error level rather than in the guest's output.
-fn warn_line(s: &str) {
+pub(crate) fn warn_line(s: &str) {
     unsafe { warn(s.as_ptr() as u32, s.len() as u32) };
 }
 
@@ -5959,6 +6047,24 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    // A Unix call from guest code under Wine's own Unix side (W3): `int 0x80`
+    // with EAX = UNIX_CALL from the trampoline page. ntdll.so's handler takes
+    // it, nested, and sets EAX; the guest goes on after the syscall.
+    // And native Wine's NATIVE_LEFT (gexrt), served as for an NT process.
+    if IN_PROVIDER.with(|c| c.get()) {
+        nt::native_left(ctx, pc);
+    } else {
+        let hook = cgen::guest_unix_call_hook();
+        if hook != 0 {
+            let gm = GuestMem::new(guest_bytes());
+            let eax = gm.read_u64(ctx as u32 as u64 + ctx::x(0) as u64).unwrap_or(0) as u32;
+            if eax == gex_kernel::nt::gex_nr::UNIX_CALL {
+                // SAFETY: a host import taking scalars; no lock is held.
+                unsafe { cgen::ftab_call_vi(hook as i32, ctx) };
+                return;
+            }
+        }
+    }
     fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
@@ -6997,35 +7103,9 @@ static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(St
 fn stage_fork_fds(h: &Host, child: i32) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
-        // A pipe end is re-opened in the global kernel, or the parent closing
-        // its copy looks like the last reference and the reader sees a false
-        // EOF. What the child reopens: a path by default, an id when the kernel
-        // holds the open file, since an id survives the unlink of a file a
-        // child would otherwise fail to reopen by name.
-        let mut name = file.path.clone();
-        if let Some(id) = pipe_id(&file.path) {
-            let write = file.writable;
-            unsafe { k_pipe_open_end(id, write as i32, child) };
-        } else if let Some((id, master)) = pty_ref(&file.path) {
-            // The child inherits this pty end; open it on the child's behalf so
-            // the parent's copy closing is not the last reference.
-            unsafe { k_pty_open_end(id, master as i32, child) };
-            pty_note("hands on", id, master as i32, child);
-        } else if let Some(id) = file.handle.remote_id() {
-            let dup = unsafe { k_fs_dup(id) };
-            if dup < 0 {
-                warn_line(&format!(
-                    "gex: fork could not hand fd {fd} ({}) to pid {child}\n",
-                    file.path
-                ));
-                continue;
-            }
-            name = format!("#{dup}");
-        } else if !file.path.starts_with('/') {
-            // Not a path, not a pipe, and not the terminal: a socket. Nothing
-            // here can rebuild that from a name.
+        let Some(name) = carry_name(&h.kernel, &file, child) else {
             continue;
-        }
+        };
         out.push_str(&format!(
             "{} {} {} {} {}\n",
             fd,
@@ -7036,6 +7116,45 @@ fn stage_fork_fds(h: &Host, child: i32) {
         ));
     }
     *FORK_FDS.0.borrow_mut() = out;
+}
+
+/// The name a descriptor travels to another process by -- a fork's child, or
+/// the far end of `SCM_RIGHTS` -- taking whatever reference keeps it open on
+/// the way. `holder` is who a pipe or pty end is opened for: the child, or no
+/// one yet (the global kernel moves it to the receiver).
+///
+/// A pipe end is re-opened in the global kernel, or the sender closing its
+/// copy looks like the last reference and the reader sees a false EOF. A file
+/// the global kernel holds goes as a duplicated id, which survives the unlink
+/// of a file the receiver would otherwise fail to reopen by name; anything
+/// else with a path, by path. `None`: nothing with a name -- a local socket,
+/// an epoll set.
+fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
+    if let Some(id) = pipe_id(&file.path) {
+        unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
+        return Some(file.path.clone());
+    }
+    if let Some((id, master)) = pty_ref(&file.path) {
+        unsafe { k_pty_open_end(id, master as i32, holder) };
+        pty_note("hands on", id, master as i32, holder);
+        return Some(file.path.clone());
+    }
+    if let Some(id) = file.handle.remote_id() {
+        let dup = unsafe { k_fs_dup(id) };
+        if dup < 0 {
+            warn_line(&format!("gex: could not hand {} to another process\n", file.path));
+            return None;
+        }
+        // With its path after a colon, for what reads it back (`/proc`,
+        // W3's image hook finding the module beside a DLL).
+        return Some(format!("#{dup}:{}", file.path));
+    }
+    if let Some(sock) = k.remote_unix_of_file(file) {
+        // A socket in the global kernel: another id on the same end.
+        let dup = sock.dup_id()?;
+        return Some(format!("sock:{dup}:{}", sock.listening as i32));
+    }
+    file.path.starts_with('/').then(|| file.path.clone())
 }
 
 /// The console descriptors, rebuilt in a child from the name alone. A fork
@@ -7117,85 +7236,14 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = if let Some(id) = pipe_id(path) {
-                let Some(r) = global_pipes() else { continue };
-                // The parent already opened this end on the child's behalf,
-                // before the copy was taken; nothing to open here.
-                let write = flags & gex_kernel::fs::oflags::ACCMODE
-                    != gex_kernel::fs::oflags::O_RDONLY;
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemotePipeEnd {
-                        id,
-                        write,
-                        remote: r,
-                    }),
-                    path.to_string(),
-                    flags,
-                    !write,
-                    write,
-                )
-            } else if let Some((id, master)) = pty_ref(path) {
-                // Same as a pipe end: the parent already opened it for the child.
-                let Some(r) = global_ptys() else { continue };
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
-                    path.to_string(),
-                    flags,
-                    true,
-                    true,
-                )
-            } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
-                // An id the parent already asked the global kernel to
-                // duplicate, so this file is the parent's file whatever has
-                // happened to its name since.
-                let Some(root) = global_root() else { continue };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    gex_kernel::vfs::remote::adopt(root.remote(), id),
-                    String::new(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
-            } else if let Some((handle, readable, writable)) = console_handle(path) {
-                // The terminal, which is this Worker's and not a file. A dup
-                // of it in the parent has to be a dup of it here.
-                gex_kernel::file::OpenFile::new(handle, path.to_string(), flags, readable, writable)
-            } else {
-                // Through the child's own mounts, not the bare root: `/dev` and
-                // `/proc` are per-process, so `/dev/null` is not in the shared
-                // filesystem by name.
-                use gex_kernel::vfs::FileSystem;
-                let handle = h.kernel.vfs.open(path, flags, 0).or_else(|e| {
-                    match global_root() {
-                        Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
-                        None => Err(e),
-                    }
-                });
-                let handle = match handle {
-                    Ok(h) => h,
-                    Err(e) => {
-                        // Never quietly: a missing descriptor is an `EBADF` at
-                        // the child's first use, far from here.
-                        warn_line(&format!(
-                            "gex: fork left fd {fd} ({path}) behind: errno {}\n",
-                            e.0
-                        ));
-                        continue;
-                    }
-                };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    handle,
-                    path.to_string(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
+            let file = match rebuild_carried(&mut h.kernel, path, flags, offset) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Never quietly: a missing descriptor is an `EBADF` at
+                    // the child's first use, far from here.
+                    warn_line(&format!("gex: fork left fd {fd} ({path}) behind: {e}\n"));
+                    continue;
+                }
             };
             if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
                 n += 1;
@@ -7203,6 +7251,143 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
         }
         n
     })
+}
+
+/// The other half of [`carry_name`]: the open file a name stands for, in
+/// this process. The reference the sender took is this one now; nothing more
+/// is opened for a pipe, pty, file id or socket id.
+fn rebuild_carried(
+    k: &mut gex_kernel::syscalls::Kernel,
+    path: &str,
+    flags: u64,
+    offset: u64,
+) -> Result<Arc<gex_kernel::file::OpenFile>, String> {
+    use gex_kernel::file::OpenFile;
+    use gex_kernel::fs::oflags;
+    let acc = flags & oflags::ACCMODE;
+    let file = if let Some(id) = pipe_id(path) {
+        let r = global_pipes().ok_or("no global kernel")?;
+        let write = acc != oflags::O_RDONLY;
+        OpenFile::new(
+            Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write, remote: r }),
+            path.to_string(),
+            flags,
+            !write,
+            write,
+        )
+    } else if let Some((id, master)) = pty_ref(path) {
+        let r = global_ptys().ok_or("no global kernel")?;
+        OpenFile::new(
+            Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
+            path.to_string(),
+            flags,
+            true,
+            true,
+        )
+    } else if let Some((id, name)) = path.strip_prefix('#').and_then(|v| {
+        let (id, name) = v.split_once(':').unwrap_or((v, ""));
+        Some((id.parse::<i32>().ok()?, name))
+    }) {
+        let root = global_root().ok_or("no global kernel")?;
+        let f = OpenFile::new(
+            gex_kernel::vfs::remote::adopt(root.remote(), id),
+            name.to_string(),
+            flags,
+            acc != oflags::O_WRONLY,
+            acc != oflags::O_RDONLY,
+        );
+        f.set_offset(offset);
+        f
+    } else if let Some(rest) = path.strip_prefix("sock:") {
+        let r = global_sockets().ok_or("no global kernel")?;
+        let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
+        let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
+        let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
+        let handle: Arc<dyn FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        k.remote_sockets.insert(key, sock);
+        OpenFile::new(handle, "socket".to_string(), flags, true, true)
+    } else if let Some(rest) = path.strip_prefix("local:") {
+        let (pid, n) = rest.split_once(':').ok_or("bad local name")?;
+        if pid.parse::<i32>().ok() != Some(my_pid()) {
+            return Err(format!("parked in pid {pid}, not here"));
+        }
+        let n = n.parse::<u32>().map_err(|_| "bad local number")?;
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = t.1.iter().position(|e| e.0 == n).ok_or("already taken")?;
+        return Ok(t.1.swap_remove(i).1);
+    } else if let Some((handle, readable, writable)) = console_handle(path) {
+        // The terminal, which is this Worker's and not a file.
+        OpenFile::new(handle, path.to_string(), flags, readable, writable)
+    } else {
+        // Through this process's own mounts, not the bare root: `/dev` and
+        // `/proc` are per-process, so `/dev/null` is not in the shared
+        // filesystem by name.
+        use gex_kernel::vfs::FileSystem;
+        let handle = k
+            .vfs
+            .open(path, flags, 0)
+            .or_else(|e| match global_root() {
+                Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
+                None => Err(e),
+            })
+            .map_err(|e| format!("errno {}", e.0))?;
+        let f = OpenFile::new(handle, path.to_string(), flags, acc != oflags::O_WRONLY, acc != oflags::O_RDONLY);
+        f.set_offset(offset);
+        f
+    };
+    Ok(file)
+}
+
+/// The kernel's half of W3's address-space split (see
+/// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
+/// for there, what the host left below 2 GiB the process's own arena, and the
+/// i386 code kept off the shim's heap above it.
+pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
+    mem.set_mmap_top(0x7ffe_0000);
+    mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    // And the low space a wasm32 program leaves free, between the dispatch
+    // directory and its stack (its image and break are above, in the
+    // placement window): where a Windows executable's 0x400000 is.
+    mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
+    // An access there faults, as in the NT layer.
+    gex_xlate::set_guard_limit(0x8000_0000);
+}
+
+/// Where this process's Windows address space starts (W3), or 0: what a fork
+/// hands its child to split at the same line.
+#[no_mangle]
+pub extern "C" fn gex_windows_space() -> u32 {
+    nt::windows_space() as u32
+}
+
+/// A fresh W3 process (the host saw the program's i386 flag before loading
+/// it): the split, first thing after instantiation, so the line sits at the
+/// bottom of the arena rather than above the startup heap. Where the Windows
+/// space starts, or 0 on failure.
+#[no_mangle]
+pub extern "C" fn gex_split_windows_space() -> u32 {
+    match nt::split_windows_space() {
+        Ok(lo) => lo as u32,
+        Err(e) => {
+            warn_line(&format!("gex: W3: {e}\n"));
+            0
+        }
+    }
+}
+
+/// A forked child of a W3 process: the split, first thing after
+/// instantiation, before the heap takes a span. Zero, or -1 on failure.
+#[no_mangle]
+pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
+    match nt::adopt_windows_space(lo as u64) {
+        Ok(()) => 0,
+        Err(e) => {
+            warn_line(&format!("gex: W3 child: {e}\n"));
+            -1
+        }
+    }
 }
 
 /// A child `fork` has made that the host has not built a Worker for: pid, entry
@@ -7554,6 +7739,8 @@ pub extern "C" fn gex_adopt_child(
     phase(1);
     // The slot maps the copied low region names are the parent's.
     dense::child();
+    // So is the probe cache, which names the parent's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -7587,6 +7774,9 @@ pub extern "C" fn gex_adopt_child(
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
     kernel.mem.grows_on_demand(arena_grow, arena_back);
+    if nt::windows_space() != 0 {
+        w3_address_space(&mut kernel.mem, nt::windows_space());
+    }
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
     // into, and the parent parked on exactly that.
@@ -7866,6 +8056,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
         }
     }
+    // The probe cache names the old program's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
@@ -10143,9 +10335,22 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
+    // Which process and what is mapped there: with a Worker per process the
+    // console interleaves them all.
+    let vma = with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
+            .map(|v| format!("{:#x}-{:#x} {}", v.start, v.end, v.name))
+            .unwrap_or_else(|| "unmapped".into())
+    });
     trace_line(&format!(
-        "gex: illegal instruction {:#010x} at pc={:#x}\n",
-        raw as u32, pc
+        "gex: pid {}: illegal instruction {:#010x} at pc={:#x} ({vma})\n",
+        my_pid(),
+        raw as u32,
+        pc
     ));
     with_host(|h| set_exit(h, 128 + 4));
     trap();

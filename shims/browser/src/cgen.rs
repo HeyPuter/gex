@@ -868,7 +868,22 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
     let len = (size + 0xfff) & !0xfff;
     // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
-    crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    let (start, dirty) = crate::with_host(|h| {
+        let clean = h.kernel.mem.clean_ranges().to_vec();
+        let start = h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
+        Ok::<_, gex_kernel::Errno>((start, gex_kernel::mem::dirty_parts(&clean, start, start + len)))
+    })
+    .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
+    // Read as zero, as the kernel's anonymous `mmap` makes it: the range may
+    // hold what a forked parent left there before this process's `execve`
+    // (W3: Wine's PE module's data in the grandchild of a process that had
+    // it at the same address, whose stale bss cached another process's
+    // function-table indices).
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    for (a, b) in dirty {
+        gm.zero_dirty(a, (b - a) as usize).map_err(|e| format!("zeroing {name}: errno {}", e.0))?;
+    }
+    Ok(start)
 }
 
 /// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
@@ -1352,6 +1367,9 @@ extern "C" {
     /// Call function-table entry `idx` as a function body (AOT-only: one
     /// this Worker has just installed).
     fn ftab_call(idx: i32, ctx: i32, depth: i32, need: i32, ret: i64) -> i32;
+    /// Call function-table entry `idx`, a `void(int)` (W3: ntdll.so's
+    /// handler for a guest's Unix call, given the thread's context).
+    pub(crate) fn ftab_call_vi(idx: i32, arg: i32);
 }
 
 /// AOT-only fallbacks that found their target published and called it.
@@ -1750,17 +1768,28 @@ fn on_retire_pages(ranges: &[(u64, u64)]) {
     }
 }
 
-/// Wine's Unix-side system-call dispatcher (W3.1, as the native
-/// `crate::unix_dispatcher`): op 0 sets it, op 1 returns it (0 for none).
-static UNIX_DISPATCHER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Wine's Unix-side entry points (W3.1, as the native
+/// `crate::unix_dispatcher`), function-table indices of the process's
+/// ntdll.so, each set by an even op and read by the odd one after it (0 for
+/// none): 0/1 its system-call switch, 2/3 its handler for a guest's Unix
+/// call (the trampoline page's `UNIX_CALL_32`), 4/5 `__wine_unix_call_
+/// dispatcher` itself, which Wine's PE module calls directly. Per process:
+/// statics of this instance, set again by a new program at its start.
+static UNIX_DISPATCHERS: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 #[no_mangle]
 pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
-    if op == 0 {
-        UNIX_DISPATCHER.store(idx, Ordering::Relaxed);
+    let Some(slot) = UNIX_DISPATCHERS.get((op.max(0) / 2) as usize) else { return 0 };
+    if op % 2 == 0 {
+        slot.store(idx, Ordering::Relaxed);
         return 0;
     }
-    UNIX_DISPATCHER.load(Ordering::Relaxed)
+    slot.load(Ordering::Relaxed)
+}
+
+/// The process's handler for a guest's Unix call (W3), or 0.
+pub(crate) fn guest_unix_call_hook() -> u32 {
+    UNIX_DISPATCHERS[1].load(Ordering::Relaxed)
 }
 
 /// A native wasm32 program's guest fault hook (W3.1). Recorded; the page

@@ -78,9 +78,22 @@ mod stub {
 
     pub(crate) fn tick() {}
     pub(crate) fn serve_now() {}
+    pub(crate) fn native_left(_ctx: i32, _pc: i64) {}
 
     pub(crate) fn arena_ceiling() -> u64 {
         gex_abi::MMAP_TOP
+    }
+
+    pub(crate) fn split_windows_space() -> Result<u64, String> {
+        Err("a Windows address space needs the shared-memory build".into())
+    }
+
+    pub(crate) fn windows_space() -> u64 {
+        0
+    }
+
+    pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
+        Err("a Windows address space needs the shared-memory build".into())
     }
 
     pub(crate) fn slot_log() -> bool {
@@ -260,6 +273,59 @@ mod imp {
         warn_line(&format!("{s}\n"));
     }
 
+    /// A Windows process's address space (the NT layer's, and native Wine's
+    /// under W3): everything below 2 GiB is Windows', so the memory is grown
+    /// to all of it now -- KUSER_SHARED_DATA at 0x7ffe0000, the PEB and TEBs
+    /// top-down reach its top at once -- rather than allocation by
+    /// allocation. The shim's own stack and data sit at fixed addresses
+    /// inside it, and so does whatever its heap has taken so far: those stay
+    /// the shim's for good, and from here on the heap climbs above 2 GiB,
+    /// where no Windows address is. Returns where the space the host left
+    /// starts (it ends at 2 GiB).
+    pub(crate) fn split_windows_space() -> Result<u64, String> {
+        nt::set_log(log);
+        // Split already (an `execve` in a W3 process, or a fork's child):
+        // the same line again. The heap is above it by now, so measuring
+        // afresh would put the line at 2 GiB and leave no space at all.
+        let lo = WINDOWS_LO.load(Ordering::Relaxed);
+        if lo != 0 {
+            return Ok(lo);
+        }
+        if !grow_memory_to(NT_HEAP_BASE) {
+            return Err("the engine will not grow this memory to 2 GiB, which a Windows process needs".into());
+        }
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
+        let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
+        let host_hi = taken.max(gex_abi::ARENA_BOTTOM).min(NT_HEAP_BASE);
+        crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
+        WINDOWS_LO.store(host_hi, Ordering::Relaxed);
+        Ok(host_hi)
+    }
+
+    /// Where this process's Windows address space starts, or 0 when it has
+    /// none. A fork hands it to the child (`gex_windows_space`).
+    static WINDOWS_LO: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn windows_space() -> u64 {
+        WINDOWS_LO.load(Ordering::Relaxed)
+    }
+
+    /// A forked child's half of [`split_windows_space`]: the same split, at
+    /// the parent's line, before the child's heap takes its first span --
+    /// a fresh instance's heap would otherwise start above the inherited
+    /// image, which in a Windows process is the top of the 2 GiB.
+    pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
+        nt::set_log(log);
+        if !grow_memory_to(NT_HEAP_BASE) {
+            return Err("the engine will not grow this memory to 2 GiB".into());
+        }
+        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
+        ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
+        crate::memmap::claim(crate::memmap::Kind::Guest, 0, lo, NT_HEAP_BASE, "Windows address space");
+        WINDOWS_LO.store(lo, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Build the NT process in place of the ELF placement: the address space
     /// split with the shim, the process, and everything up to the first
     /// instruction of `LdrInitializeThunk`. Returns the main thread's pc (its
@@ -274,18 +340,8 @@ mod imp {
         // fixed parts of it (KUSER_SHARED_DATA at 0x7ffe0000, the PEB and
         // TEBs top-down) reach its top at once, so the memory is grown to all
         // of it now rather than allocation by allocation.
-        if !grow_memory_to(NT_HEAP_BASE) {
-            return Err("the engine will not grow this memory to 2 GiB, which a Windows process needs".into());
-        }
-        // The shim's own stack and data sit at fixed addresses inside it, and
-        // so does whatever its heap has taken so far: those are kept out of
-        // the NT allocator for good, and from here on the heap climbs above
-        // 2 GiB, where no Windows address is.
-        ARENA_CEILING.store(gex_abi::GUEST_MEM_BYTES, Ordering::Relaxed);
-        let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
+        let host_hi = split_windows_space()?;
         let host_lo = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
-        let host_hi = taken.max(gex_abi::ARENA_BOTTOM).min(NT_HEAP_BASE);
-        crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
 
         let var = |name: &str| {
             env.iter().find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
@@ -977,6 +1033,28 @@ mod imp {
         NATIVE_LEFT.with(|c| c.replace(false)) as i32
     }
 
+    /// gexrt's `gex_nr::NATIVE_LEFT`, if that is the call (native Wine's
+    /// mark already stripped from `pc`), from an NT process or from Wine's
+    /// own Unix side (W3): the guest re-enters native code from above the
+    /// innermost native entry, and JS's call-out decides whether its caller
+    /// is gone (`#nativeSyscall` passes this on, `gex_nt_native_left`).
+    /// EAX: the function to call again from `jmp eax` (gexrt left it in
+    /// ctx::BALLAST), whether or not the call-out leaves. Returns for any
+    /// other call.
+    pub(crate) fn native_left(ctx: i32, pc: i64) {
+        let ctx_addr = ctx as u32 as u64;
+        let mut gm = GuestMem::new(guest_bytes());
+        if gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32 != nt::gex_nr::NATIVE_LEFT {
+            return;
+        }
+        let target = gm.read_u64(ctx_addr + ctx::BALLAST as u64).unwrap_or(0);
+        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, target);
+        NATIVE_LEFT.with(|c| c.set(true));
+        set_resume(pc as u64);
+        set_resume_ctx(ctx_addr);
+        trap();
+    }
+
     /// The `syscall` import for an NT process. Returns when the guest carries
     /// straight on; anything else traps back to JS (the outer run loop, or a
     /// nested callback loop) with the resume address set.
@@ -990,19 +1068,8 @@ mod imp {
         // import (gex.mjs `#nativeSyscall`), which returns to it.
         let native = (pc as u64) & NATIVE_SYSCALL != 0;
         let pc = ((pc as u64) & !NATIVE_SYSCALL) as i64;
-        if native && GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32 == nt::gex_nr::NATIVE_LEFT {
-            // The guest re-enters native code from above the innermost
-            // native entry (gexrt): JS's call-out decides whether its caller
-            // is gone (`#nativeSyscall` passes this on, `gex_nt_native_left`).
-            // EAX: the function to call again from `jmp eax` (gexrt left it
-            // in ctx::BALLAST), whether or not the call-out leaves.
-            let mut gm = GuestMem::new(guest_bytes());
-            let target = gm.read_u64(ctx_addr + ctx::BALLAST as u64).unwrap_or(0);
-            let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, target);
-            NATIVE_LEFT.with(|c| c.set(true));
-            set_resume(pc as u64);
-            set_resume_ctx(ctx_addr);
-            trap();
+        if native {
+            native_left(ctx, pc);
         }
         // A clock read (`performance.now()`) costs about a microsecond in a
         // Worker, as much as a cheap syscall: the clocks are brought up to

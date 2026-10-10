@@ -767,6 +767,15 @@ fn is_monotonic_clock(clk: u64) -> bool {
 static MONOTONIC_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The "uptime" the guest sees at its first monotonic reading.
 const MONOTONIC_START_SECS: u64 = 1000;
+/// A host whose processes do not share this static (the browser's, a
+/// Worker and an instance each) names one base for all of them: given the
+/// base this process would pick, the one every process uses.
+static MONOTONIC_SHARED: std::sync::OnceLock<fn(u64) -> u64> = std::sync::OnceLock::new();
+
+/// See [`MONOTONIC_SHARED`]. Set before the first clock reading.
+pub fn share_monotonic_base(f: fn(u64) -> u64) {
+    let _ = MONOTONIC_SHARED.set(f);
+}
 
 /// A monotonic clock reading made from a wall clock reading: seconds since
 /// a shared boot instant, not since the epoch. Programs truncate monotonic
@@ -779,7 +788,10 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     use std::sync::atomic::Ordering;
     let mut base = MONOTONIC_BASE.load(Ordering::Relaxed);
     if base == 0 {
-        let want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
+        let mut want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
+        if let Some(f) = MONOTONIC_SHARED.get() {
+            want = f(want);
+        }
         base = match MONOTONIC_BASE.compare_exchange(0, want, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => want,
             Err(other) => other,
@@ -5747,6 +5759,23 @@ impl Kernel {
         Ok(())
     }
 
+    /// Put a socket that lives in the global kernel at the lowest free
+    /// descriptor.
+    pub fn insert_remote_unix(&mut self, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<i32, Errno> {
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let fd = self.fds.insert(file, cloexec)? as i32;
+        self.remote_sockets.insert(key, sock);
+        Ok(fd)
+    }
+
+    /// The global-kernel socket behind an open file, if that is what it is.
+    pub fn remote_unix_of_file(&self, file: &OpenFile) -> Option<Arc<unix::RemoteUnix>> {
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.remote_sockets.get(&key).cloned()
+    }
+
     /// Put a unix socket in the descriptor table.
     fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
         let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
@@ -6065,8 +6094,32 @@ impl Kernel {
         if domain != AF_UNIX {
             return Err(Errno::EAFNOSUPPORT);
         }
-        let (a, b) = unix::UnixSocket::pair();
         let nonblock = ty & SOCK_NONBLOCK != 0;
+        // A stream pair in the global kernel when there is one: its ends are
+        // often for two processes (Wine makes one per new process, keeps an
+        // end and hands the other to the child), and with a Worker per
+        // process a local pair cannot cross a fork.
+        const SOCK_STREAM: u64 = 1;
+        if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
+            let mut ids = [0u8; 8];
+            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
+            if rc < 0 {
+                return Err(Errno(-rc));
+            }
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let cloexec = ty & SOCK_CLOEXEC != 0;
+            let mut fds = [0i32; 2];
+            for (i, fd) in fds.iter_mut().enumerate() {
+                let id = i32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
+                let sock = Arc::new(unix::RemoteUnix::new(id, false, None, r));
+                sock.set_nonblocking(nonblock);
+                *fd = self.insert_remote_unix(sock, flags, cloexec)?;
+            }
+            m.write_u32(out, fds[0] as u32)?;
+            m.write_u32(out + 4, fds[1] as u32)?;
+            return Ok(0);
+        }
+        let (a, b) = unix::UnixSocket::pair();
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -6490,6 +6543,22 @@ impl Kernel {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
                 sock.stage_send(files);
+            } else if let Ok(sock) = self.remote_unix_of(fd) {
+                // The far end is in another memory, where an `OpenFile` means
+                // nothing: each descriptor goes as a description the host
+                // knows how to rebuild there. One that cannot leave this
+                // process fails the send, as Linux fails one it cannot pass,
+                // rather than arriving as a hole the receiver finds later.
+                let files = self.read_scm_rights(m, control, controllen)?;
+                if !files.is_empty() {
+                    let mut descs = String::new();
+                    for f in &files {
+                        let d = (sock.remote.describe)(self, f).ok_or(Errno::EBADF)?;
+                        descs.push_str(&d);
+                        descs.push('\n');
+                    }
+                    return sock.send_described(&data, &descs);
+                }
             }
         }
         self.fds.get(fd)?.write(&data)
@@ -6562,6 +6631,61 @@ impl Kernel {
     const MSG_PEEK: u64 = 0x2;
     const MSG_DONTWAIT: u64 = 0x40;
 
+    /// `recvmsg` on a socket in the global kernel: one read for the whole
+    /// vector (so descriptors attach to it as they would to the first byte),
+    /// scattered after, and the descriptions that came with it rebuilt here.
+    #[allow(clippy::too_many_arguments)]
+    fn recvmsg_remote(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        sock: &Arc<unix::RemoteUnix>,
+        msg: u64,
+        iov: u64,
+        iovlen: u64,
+        control: u64,
+        controllen: u64,
+        room: usize,
+        peek: bool,
+    ) -> SysResult {
+        let mut parts = Vec::new();
+        let mut want = 0usize;
+        for i in 0..iovlen.min(1024) {
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
+            let len = len.min((1 << 22) - want);
+            if len > 0 {
+                parts.push((base, len));
+                want += len;
+            }
+        }
+        let mut tmp = vec![0u8; want];
+        let (n, descs) = sock.recv_described(&mut tmp, room, peek, self.pid as i32)?;
+        let mut at = 0usize;
+        for (base, len) in parts {
+            if at >= n as usize {
+                break;
+            }
+            let take = len.min(n as usize - at);
+            m.write(base, &tmp[at..at + take])?;
+            at += take;
+        }
+        let mut files = Vec::new();
+        for d in &descs {
+            // One the host cannot rebuild is said there, where it knows why.
+            if let Some(f) = (sock.remote.rebuild)(self, d) {
+                files.push(f);
+            }
+        }
+        let name = self.msg_rd(m, msg, 0)?;
+        if name != 0 {
+            m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
+        }
+        let written = self.write_scm_rights(m, control, controllen, files)?;
+        self.msg_wr(m, msg, 5, written)?;
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
+        Ok(n)
+    }
+
     fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Self::MSG_PEEK != 0;
         let iov = self.msg_rd(m, msg, 2)?;
@@ -6577,6 +6701,11 @@ impl Kernel {
             0
         };
         let unix_sock = self.unix_of(fd).ok();
+        if unix_sock.is_none() {
+            if let Ok(sock) = self.remote_unix_of(fd) {
+                return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
+            }
+        }
         let mut total = 0u64;
         for i in 0..iovlen.min(1024) {
             let base = self.msg_rd(m, iov, 2 * i)?;

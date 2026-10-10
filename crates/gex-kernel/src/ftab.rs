@@ -299,6 +299,20 @@ pub fn fcache_write(mem: &mut [u8], addr: u64, idx: u32) {
     }
 }
 
+/// Empty the whole probe cache: every entry the resolve stub. For a memory
+/// whose cache names another table's indices -- an `execve`'s new program,
+/// or a fork's child, whose low region (and the cache in it) is a copy of
+/// the parent's while its table is its own.
+pub fn fcache_reset(mem: &mut [u8]) {
+    let (lo, hi) = (gex_abi::FCACHE as usize, (gex_abi::FCACHE + gex_abi::FCACHE_BYTES) as usize);
+    let empty = gex_abi::fcache_pack(0, RESOLVE).to_le_bytes();
+    if let Some(c) = mem.get_mut(lo..hi) {
+        for e in c.chunks_exact_mut(8) {
+            e.copy_from_slice(&empty);
+        }
+    }
+}
+
 /// Clear `addr`'s probe cache entry if it names `addr` (another address in
 /// the slot keeps it).
 pub fn fcache_clear(mem: &mut [u8], addr: u64) {

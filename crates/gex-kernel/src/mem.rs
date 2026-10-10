@@ -316,6 +316,25 @@ impl MemoryMap {
         self.arena.clear();
     }
 
+    /// Take `[lo, hi)` as this map's own arena: the host has backed it and
+    /// handed it to the process (the browser's Windows address space, W3),
+    /// so mappings land in it, fixed or not, without asking the host again.
+    pub fn adopt_arena(&mut self, lo: u64, hi: u64) {
+        if lo >= hi {
+            return;
+        }
+        self.arena.push((lo, hi));
+        self.arena.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.arena.len());
+        for (a, b) in std::mem::take(&mut self.arena) {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        self.arena = merged;
+    }
+
     /// The address one past the highest byte in use, which is how much memory
     /// a process actually needs.
     pub fn high_water(&self) -> u64 {

@@ -2369,17 +2369,229 @@ pub extern "C" fn k_sock_available(id: i32) -> i32 {
 /// of file, so a process whose Worker exits still releases its peer.
 #[no_mangle]
 pub extern "C" fn k_sock_close(id: i32) {
-    let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(slot) = t.get_mut(id as usize) {
-        // A listener on an abstract name (a leading NUL) gives the name up
-        // as it closes, as on Linux; a path name stays until it is unlinked.
-        // (TCP ports between a page's processes are abstract names.)
-        if let Some(s) = slot.take() {
-            if let Some(p) = s.bound_path().filter(|p| p.starts_with('\0')) {
-                names().unbind_socket(&p, &s);
-            }
+    // Out of the table under the lock, dropped after it: the last reference
+    // to an end may free descriptors still queued in it, and releasing one of
+    // those can be a `k_sock_close` of its own.
+    let s = {
+        let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
+        t.get_mut(id as usize).and_then(Option::take)
+    };
+    // A listener on an abstract name (a leading NUL) gives the name up as it
+    // closes, as on Linux; a path name stays until it is unlinked. (TCP ports
+    // between a page's processes are abstract names.)
+    if let Some(s) = s {
+        if let Some(p) = s.bound_path().filter(|p| p.starts_with('\0')) {
+            names().unbind_socket(&p, &s);
+        }
+        drop(s);
+    }
+}
+
+/// A connected stream pair, for `socketpair`: both ids as two `u32`s at `out`.
+#[no_mangle]
+pub extern "C" fn k_sock_pair(out: gex_kmem::PAddr) -> i32 {
+    let (a, b) = UnixSocket::pair();
+    let ids = [keep(a) as u32, keep(b) as u32];
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&ids[0].to_le_bytes());
+    bytes[4..].copy_from_slice(&ids[1].to_le_bytes());
+    unsafe { gex_kmem::push_checked(out, bytes.as_ptr(), 8) };
+    0
+}
+
+/// Another id on the same end, so a descriptor in flight to another process
+/// keeps the end open whatever the sender does with its own.
+#[no_mangle]
+pub extern "C" fn k_sock_dup(id: i32) -> i32 {
+    match sock_at(id) {
+        Some(s) => keep(s),
+        None => -9,
+    }
+}
+
+// -- the boot instant ---------------------------------------------------------
+
+/// Where every process's monotonic clocks start, in wall-clock seconds
+/// (gex-kernel's `MONOTONIC_BASE`): the first process to ask sets it to
+/// `want`, and every later one gets that. One base for the machine, as on
+/// Linux: a process hands its monotonic times to another (Wine's clients
+/// give wineserver absolute monotonic deadlines), and each Worker basing its
+/// own at its first reading made them disagree by its start time.
+static BOOT_SECS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn k_boot_secs(want: u32) -> u32 {
+    use std::sync::atomic::Ordering;
+    match BOOT_SECS.compare_exchange(0, want.max(1), Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => want.max(1),
+        Err(had) => had,
+    }
+}
+
+// -- descriptors in flight ---------------------------------------------------
+//
+// `SCM_RIGHTS` between processes: the sender's process describes each
+// descriptor as text and takes a reference that keeps it alive in flight (a
+// pipe end opened for no one, a duplicated file or socket id); here each
+// description rides the socket's own descriptor queue as a token, so it
+// arrives with the byte it was sent with. The receiver takes the description
+// and with it the reference. A token dropped untaken -- the socket closed
+// with the message unread -- gives the reference back.
+
+/// Tokens whose reference a receiver has taken, by serial.
+fn taken() -> &'static std::sync::Mutex<std::collections::BTreeSet<u64>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::BTreeSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// The holder a pipe end in flight is credited to.
+const IN_FLIGHT: i32 = -1;
+
+#[derive(Debug)]
+struct FdToken {
+    serial: u64,
+    desc: String,
+}
+
+/// `<flags> <offset> <name>`, as the shim writes a description.
+fn desc_name(desc: &str) -> (u64, &str) {
+    let mut p = desc.splitn(3, ' ');
+    let flags = p.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let _offset = p.next();
+    (flags, p.next().unwrap_or(""))
+}
+
+fn pipe_of(name: &str) -> Option<i32> {
+    name.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
+}
+
+impl Drop for FdToken {
+    fn drop(&mut self) {
+        if taken().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.serial) {
+            return;
+        }
+        let (flags, name) = desc_name(&self.desc);
+        if let Some(id) = pipe_of(name) {
+            k_pipe_close_end(id, (flags & 3 != 0) as i32, IN_FLIGHT);
+        } else if let Some(id) = name.strip_prefix('#').and_then(|v| v.parse().ok()) {
+            k_fs_close(id);
+        } else if let Some(id) = name.strip_prefix("sock:").and_then(|v| v.split(':').next()?.parse().ok()) {
+            k_sock_close(id);
         }
     }
+}
+
+impl gex_kernel::vfs::FileHandle for FdToken {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> gex_kernel::errno::SysResult {
+        Err(gex_kernel::errno::Errno::EBADF)
+    }
+
+    fn metadata(&self) -> Result<gex_kernel::vfs::Metadata, gex_kernel::errno::Errno> {
+        Err(gex_kernel::errno::Errno::EBADF)
+    }
+}
+
+/// `send` with descriptors: `descs` is one description per line.
+#[no_mangle]
+pub extern "C" fn k_sock_write_fds(
+    id: i32,
+    at: gex_kmem::PAddr,
+    len: u32,
+    descs: gex_kmem::PAddr,
+    descs_len: u32,
+) -> i32 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let text = path_of_raw(descs, descs_len);
+    let files: Vec<_> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|d| {
+            let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            gex_kernel::file::OpenFile::new(
+                std::sync::Arc::new(FdToken {
+                    serial,
+                    desc: d.to_string(),
+                }),
+                format!("{serial} {d}"),
+                0,
+                false,
+                false,
+            )
+        })
+        .collect();
+    let Some(s) = sock_at(id) else {
+        drop(files);
+        return -9;
+    };
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    s.stage_send(files);
+    let r = s.send(&buf);
+    // A send that wrote nothing attached nothing; what is still staged goes
+    // back (and its references with it) rather than riding a later send.
+    s.stage_send(Vec::new());
+    match r {
+        Ok(n) => {
+            k_wake();
+            n as i32
+        }
+        Err(e) => -e.0,
+    }
+}
+
+/// `recv` that takes up to `max_fds` descriptors too. Their descriptions go
+/// to `out` as a `u32` length and the text; their references are now `pid`'s.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn k_sock_read_fds(
+    id: i32,
+    at: gex_kmem::PAddr,
+    len: u32,
+    max_fds: u32,
+    peek: i32,
+    pid: i32,
+    out: gex_kmem::PAddr,
+    out_cap: u32,
+) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    let n = match s.recv(&mut buf, max_fds as usize, peek != 0) {
+        Ok(n) => n as usize,
+        Err(e) => return -e.0,
+    };
+    if n > 0 {
+        unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
+    }
+    let mut text = String::new();
+    for f in s.take_received() {
+        let Some((serial, desc)) = f.path.split_once(' ') else { continue };
+        let Ok(serial) = serial.parse::<u64>() else { continue };
+        if 4 + text.len() + desc.len() + 1 > out_cap as usize {
+            // No room to say it: the token drops untaken and its reference
+            // goes back, as Linux closes what MSG_CTRUNC cut off.
+            continue;
+        }
+        let (flags, name) = desc_name(desc);
+        if let Some(pipe) = pipe_of(name) {
+            let write = flags & 3 != 0;
+            let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = h.get_mut(&IN_FLIGHT) {
+                if let Some(i) = v.iter().position(|e| *e == (pipe, write)) {
+                    v.swap_remove(i);
+                }
+            }
+            h.entry(pid).or_default().push((pipe, write));
+        }
+        taken().lock().unwrap_or_else(|e| e.into_inner()).insert(serial);
+        text.push_str(desc);
+        text.push('\n');
+    }
+    let mut hdr = (text.len() as u32).to_le_bytes().to_vec();
+    hdr.extend_from_slice(text.as_bytes());
+    unsafe { gex_kmem::push_checked(out, hdr.as_ptr(), hdr.len() as u32) };
+    n as i32
 }
 
 #[no_mangle]
