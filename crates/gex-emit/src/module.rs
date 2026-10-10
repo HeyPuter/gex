@@ -922,6 +922,7 @@ impl ModuleBuilder {
                 page_bases: Some(&page_bases),
                 module_id,
                 loop_heads: Some(&heads),
+                enter: Some(self.enter),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.

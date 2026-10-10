@@ -334,6 +334,8 @@ const host = new ProcessHost({
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
     // GEX_LIFT_MAX=N: blocks one dispatch miss may lift (default 2048).
     liftMax: process.env.GEX_LIFT_MAX ? Number(process.env.GEX_LIFT_MAX) : undefined,
+    // GEX_INLINE_DISPATCH=1: dispatch inline in every block (gex-emit's old form).
+    inlineDispatch: process.env.GEX_INLINE_DISPATCH ? 1 : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,

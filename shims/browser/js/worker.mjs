@@ -639,6 +639,7 @@ async function handle(msg) {
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
           liftMax: msg.liftMax ?? msg.opts?.liftMax,
+          inlineDispatch: msg.inlineDispatch ?? msg.opts?.inlineDispatch,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },

@@ -163,6 +163,28 @@ pub struct Context<'a> {
     /// entry, so a block not in here grows none and the walk is skipped.
     /// `None`: no filter.
     pub loop_heads: Option<&'a std::collections::HashSet<u64>>,
+    /// The module's `enter(ctx, pc)` (a local function, relocated), when it
+    /// has one: an indirect dispatch tail-calls it instead of carrying the
+    /// whole table selection inline. See [`set_inline_dispatch`].
+    pub enter: Option<u32>,
+}
+
+/// `GEX_INLINE_DISPATCH=1` natively, `set_inline_dispatch(true)` in the
+/// browser: every dispatch carries the directory lookup and the selection over
+/// the eight tables inline, as before, instead of tail-calling the module's
+/// `enter`. Inline, dispatch was 40% of a module's bytes (`gexc build` of
+/// Debian's xz: 687,595 of 1,228 KiB were dispatch and boundary code), on a
+/// path that a direct tail call reaches for the price of one call.
+static INLINE_DISPATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_inline_dispatch(on: bool) {
+    INLINE_DISPATCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn inline_dispatch() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
+        || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The back-edge targets of `gir`, for [`Context::loop_heads`].
@@ -4929,6 +4951,21 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_dispatch_tail_call_inner(&mut self) {
+        // Outlined: `enter(ctx, target)` records the PC and `LAST_TARGET` and
+        // does the same lookup and selection. Every caller has stored the PC
+        // already (a dispatch miss reads it), so the second store writes the
+        // value that is there.
+        if let Some(enter) = self.cx.enter.filter(|_| !inline_dispatch() && gex_abi::DISPATCH_TABLES > 1) {
+            if gex_abi::X86 {
+                self.ctx_base();
+                self.f.i64_const(self.block_start as i64);
+                self.f.store(0x37, 3, ctx::LAST_SOURCE as u32);
+            }
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.return_call_local(enter);
+            return;
+        }
         if gex_abi::DISPATCH_TABLES <= 1 {
             self.f.local_get(self.ctx_local);
             self.emit_dispatch_index();

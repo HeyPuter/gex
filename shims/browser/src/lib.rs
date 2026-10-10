@@ -1959,6 +1959,15 @@ pub extern "C" fn gex_xlate_stat(i: u32) -> i64 {
     XLATE_STAT.get(i as usize).map_or(-1, |c| c.load(std::sync::atomic::Ordering::Relaxed) as i64)
 }
 
+/// `gex_set_inline_dispatch(1)` (`?inlinedispatch=1`, `GEX_INLINE_DISPATCH=1`
+/// under run-node): blocks translated after this carry their dispatch inline
+/// instead of tail-calling their module's `enter` (gex-emit
+/// `set_inline_dispatch`).
+#[no_mangle]
+pub extern "C" fn gex_set_inline_dispatch(on: i32) {
+    gex_emit::tier1::set_inline_dispatch(on != 0);
+}
+
 /// Set that, from the host (`?liftmax=N`, `GEX_LIFT_MAX`).
 #[no_mangle]
 pub extern "C" fn gex_set_lift_max(n: u32) {

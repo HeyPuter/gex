@@ -696,6 +696,8 @@ export async function runProgram(
       fjit: globalThis.GEX_FJIT || undefined,
       // `?liftmax=N`: blocks one dispatch miss may lift (default 2048).
       liftMax: globalThis.GEX_LIFT_MAX || undefined,
+      // `?inlinedispatch=1`: dispatch inline in every block, as before.
+      inlineDispatch: globalThis.GEX_INLINE_DISPATCH || undefined,
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
