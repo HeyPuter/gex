@@ -1086,8 +1086,9 @@ export class Gex {
           : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
+        // In the single build, on a stack of its own, so the body (and guest
+        // code it calls) can block.
         ftab_call: single.on
-          // On a stack of its own, so the body (and guest code it calls) can block.
           ? new WebAssembly.Suspending((idx, ctx, depth, need, ret) => {
             const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
             return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
@@ -4574,7 +4575,9 @@ export class Gex {
         this.#where = 'syscall-done';
         after?.();
         // A preemption point as well: a program that only makes system
-        // calls gives the other fibers a turn here.
+        // calls gives the other fibers a turn here, and `sched_yield` gives
+        // the woken one at once (single.mjs `Sched#settle`).
+        if (e.gex_last_syscall() === (globalThis.GEX_ARCH === 'x86' ? 24 : 124)) return sched.yieldNow();
         return sched.maybeYield();
       });
     });

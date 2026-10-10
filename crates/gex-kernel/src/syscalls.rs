@@ -2257,6 +2257,49 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
+            // `writev` and `readv` on a stream block as `write` and `read` do,
+            // on their first non-empty vector: the parked call is finished
+            // with that vector alone, a short count the caller already loops
+            // on. Without this a full pipe answered `writev` with `EAGAIN` on
+            // a blocking descriptor (coreutils' `head` writes with it, and
+            // died "Resource temporarily unavailable" once its reader was
+            // slower than it).
+            nr::WRITEV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.write_is_atomic() {
+                    return None;
+                }
+                let (buf, len) = Self::read_iovecs(m, a[1], a[2], self.compat)
+                    .ok()?
+                    .into_iter()
+                    .find(|v| v.1 > 0)?;
+                match file.handle.write_room() {
+                    Some(room) if len <= room => return None,
+                    Some(_) => {}
+                    None if !file.write_would_block() => return None,
+                    None => {}
+                }
+                Some(BlockOp::WriteStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: len.min(1 << 24) as usize,
+                })
+            }
+            nr::READV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.would_block() {
+                    return None;
+                }
+                let (buf, len) = Self::read_iovecs(m, a[1], a[2], self.compat)
+                    .ok()?
+                    .into_iter()
+                    .find(|v| v.1 > 0)?;
+                Some(BlockOp::ReadStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: len.min(1 << 24) as usize,
+                })
+            }
             nr::ACCEPT | nr::ACCEPT4 => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
@@ -7531,6 +7574,36 @@ mod tests {
             let other = read(&mut k, &mut mem, clk);
             assert!(other.abs_diff(mono) <= 1, "clock {clk}: {other} vs {mono}");
         }
+    }
+
+    /// `writev` to a full blocking pipe parks on its first non-empty vector,
+    /// as `write` does, and `readv` on an empty one parks as `read` does --
+    /// they had answered `EAGAIN` on a blocking descriptor.
+    #[test]
+    fn vectored_io_on_a_blocked_pipe_parks() {
+        let (mut mem, mut k) = setup();
+        let p = Arc::new(Pipe::new());
+        let end = |write| OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: Arc::clone(&p), write }), "pipe".into(), 0, !write, write);
+        let rfd = k.fds.insert(end(false), false).unwrap() as u64;
+        let wfd = k.fds.insert(end(true), false).unwrap() as u64;
+        // Two vectors, the first empty: 0x3000 (len 0) and 0x3100 (len 100).
+        let iov = 0x2000usize;
+        for (i, (b, l)) in [(0x3000u64, 0u64), (0x3100, 100)].into_iter().enumerate() {
+            mem[iov + 16 * i..iov + 16 * i + 8].copy_from_slice(&b.to_le_bytes());
+            mem[iov + 16 * i + 8..iov + 16 * i + 16].copy_from_slice(&l.to_le_bytes());
+        }
+        let op = |k: &mut Kernel, mem: &mut Vec<u8>, n| k.blocking_op(&GuestMem::new(mem), n, [if n == nr::READV { rfd } else { wfd }, iov as u64, 2, 0, 0, 0]);
+        match op(&mut k, &mut mem, nr::READV) {
+            Some(BlockOp::ReadStream { buf: 0x3100, len: 100, .. }) => {}
+            other => panic!("readv on an empty pipe: {other:?}"),
+        }
+        assert!(op(&mut k, &mut mem, nr::WRITEV).is_none(), "writev to an empty pipe goes straight through");
+        p.write(&vec![0u8; crate::pipe::PIPE_BUF]).unwrap();
+        match op(&mut k, &mut mem, nr::WRITEV) {
+            Some(BlockOp::WriteStream { buf: 0x3100, len: 100, .. }) => {}
+            other => panic!("writev to a full pipe: {other:?}"),
+        }
+        assert!(op(&mut k, &mut mem, nr::READV).is_none(), "readv on a full pipe goes straight through");
     }
 
     #[test]

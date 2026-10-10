@@ -193,12 +193,15 @@ export class Sched {
   #futex = new Map();
   /** Resolutions held back for a macrotask (see `#resume`). */
   #held = [];
+  /** Woken waiters not yet resumed: they run when the running fiber parks,
+   *  or at the next turn of the event loop (see `#settle`). */
+  #ready = [];
   #turnPosted = false;
   #mc = null;
   /** When the event loop last had a turn. */
   #lastTurn = performance.now();
   /** Counters, for the doc and for a stuck run. */
-  stats = { parks: 0, futexParks: 0, wakes: 0, yields: 0, macroTurns: 0, timeouts: 0 };
+  stats = { parks: 0, futexParks: 0, wakes: 0, yields: 0, macroTurns: 0, timeouts: 0, flushes: 0 };
 
   constructor() {
     if (typeof MessageChannel === 'function') {
@@ -217,7 +220,10 @@ export class Sched {
     this.#lastTurn = performance.now();
     this.stats.macroTurns++;
     const held = this.#held;
+    const ready = this.#ready;
     this.#held = [];
+    this.#ready = [];
+    for (const f of ready) f();
     for (const f of held) f();
   }
 
@@ -260,7 +266,25 @@ export class Sched {
       s?.delete(w);
       if (s && !s.size) this.#futex.delete(w.futex);
     }
-    this.#resume(() => w.resolve(why));
+    // Not resumed yet. A wake comes from the running fiber's system call
+    // (every one bumps the counter), and resolving here would queue the
+    // woken fiber's microtask ahead of the waker's own return from that call:
+    // a writer and its reader would trade places on every write instead of
+    // the writer filling the pipe first. So the woken wait until the running
+    // fiber parks (`#flush`), or until every fiber is blocked on something
+    // else and the event loop turns -- the posted turn. A wake from outside
+    // any fiber (a timer, the network, a key) gets that turn at once.
+    this.#ready.push(() => w.resolve(why));
+    this.#postTurn();
+  }
+
+  /** The running fiber is about to suspend: the woken go now. */
+  #flush() {
+    if (!this.#ready.length) return;
+    this.stats.flushes++;
+    const ready = this.#ready;
+    this.#ready = [];
+    for (const f of ready) this.#resume(f);
   }
 
   #park(futex, ns, fiber) {
@@ -277,6 +301,7 @@ export class Sched {
       if (Number.isFinite(ms) && ms < 2 ** 31) {
         w.timer = setTimeout(() => { this.stats.timeouts++; this.#settle(w, 2); }, ms);
       }
+      this.#flush();
     });
   }
 
@@ -327,6 +352,18 @@ export class Sched {
       this.#held.push(() => resolve(0));
       this.#postTurn();
     });
+  }
+
+  /**
+   * The running fiber asked to give way (`sched_yield`): the woken go first,
+   * then it. Without this a guest spinning on `sched_yield` for a fiber it
+   * just woke would wait out the slice.
+   */
+  yieldNow() {
+    if (!this.#ready.length) return this.maybeYield();
+    this.stats.yields++;
+    this.#flush();
+    return Promise.resolve(0);
   }
 
   /** How many fibers are parked, for a census. */
