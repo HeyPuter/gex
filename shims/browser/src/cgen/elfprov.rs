@@ -199,6 +199,16 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
     }
 }
 
+/// `execve`: the old program's bindings go with it (see `cgen::on_exec`).
+/// Left, a miss at one of their addresses -- which the new program may now
+/// hold other code at -- was re-bridged to the old provider.
+pub(crate) fn on_exec() {
+    lock(&BOUND).clear();
+    lock(&QUEUE).clear();
+    lock(&REBRIDGE).clear();
+    lock(&REBRIDGED).clear();
+}
+
 /// The next provider-only unit for JS to serve (`#cgenProviders`), or -1.
 /// Asked before a Worker's guest first runs, so a forked child binds what
 /// it inherited.
