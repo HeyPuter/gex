@@ -7,6 +7,14 @@
 // than a message back through here. This file starts pid 1, makes a Worker per
 // fork, relays I/O, and holds the run open until pid 1 exits.
 
+// Narration under node goes to stderr: node's console.debug is stdout, the
+// guest's own output there. In a page it stays on the debug console.
+function narrate(text) {
+  const stderr = typeof process !== 'undefined' ? process.stderr : null;
+  if (stderr?.write) stderr.write(`${text}\n`);
+  else console.debug(text);
+}
+
 /**
  * Announce a crash to an automated watcher. These failures are caught (the
  * spawn promise is rejected and handled), so no `error` event fires and a test
@@ -244,7 +252,7 @@ export class ProcessHost {
       // One line per process, to `debug`: a process that never starts leaves
       // no other trace -- the fork is logged by the parent, the exit by the
       // child. #137.
-      console.debug(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
+      narrate(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
       // And now whatever it said while it was still in the pool.
       const held = w[EARLY];
       if (held) {
@@ -323,7 +331,7 @@ export class ProcessHost {
           if (!res.ok) throw new Error(`${entry.url}: ${res.status} ${res.statusText}`);
           const bytes = new Uint8Array(await res.arrayBuffer());
           const mod = await WebAssembly.compile(bytes);
-          console.debug(
+          narrate(
             `[gex] closure library ${i}: ${(bytes.length / 1048576).toFixed(1)} MiB `
             + `fetched and compiled in ${Math.round(performance.now() - t0)}ms`,
           );
@@ -390,7 +398,7 @@ export class ProcessHost {
         }
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
-        console.debug(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
+        narrate(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
           // Awaited: compiling the shim cannot be synchronous in a browser.
           this.#shimModule().then((shimMod) => {
