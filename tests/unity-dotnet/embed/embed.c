@@ -244,6 +244,12 @@ main (int argc, char **argv)
 	P dr = mono_runtime_invoke (dels, NULL, dargs, &exc);
 	check ("Delegates", exc);
 	printf ("%s\n", mono_string_to_utf8 (dr));
+	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
+	int un = 4000;
+	void *uargs [1] = { &un };
+	P ur = mono_runtime_invoke (us, NULL, uargs, &exc);
+	check ("UsedSize", exc);
+	printf ("%s\n", mono_string_to_utf8 (ur));
 	/* The liveness walk Unity's UnloadUnusedAssets runs: every Leaf reachable from the root,
 	 * each reported once, in batches of at most 16. */
 	P lvg = mono_class_get_method_from_name (k, "LvGraph", 1);

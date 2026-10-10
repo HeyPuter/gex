@@ -45,6 +45,34 @@ public static class T {
   public class DSquare : DShape { public override int Area(int x) { return x * x + k; } }
   public struct Tag { public int v; public override string ToString() { return "tag" + v; } }
   static int DSq(int x) { return x * x; }
+  // GC.GetTotalMemory(false) is mono_gc_get_used_size, which patch 0007 caches between collections:
+  // it must still see objects promoted to the major heap, give the same answer when asked again,
+  // and drop once they are collected.
+  // In chunks, each dropped on its own: a stale slot on the (conservatively scanned) stack can keep the
+  // last chunk alive, not all of them.
+  static byte[][][] usKeep = new byte[40][][];
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+  static void UsFill(int n) {
+    for (int c = 0; c < usKeep.Length; c++) {
+      usKeep[c] = new byte[n / usKeep.Length][];
+      for (int i = 0; i < usKeep[c].Length; i++) usKeep[c][i] = new byte[1000];
+    }
+  }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+  static void UsDrop() { for (int c = 0; c < usKeep.Length; c++) usKeep[c] = null; }
+  public static string UsedSize(int n) {
+    GC.Collect();
+    long before = GC.GetTotalMemory(false);
+    UsFill(n);
+    GC.Collect();
+    long held = GC.GetTotalMemory(false), again = GC.GetTotalMemory(false);
+    UsDrop();
+    GC.Collect();
+    long after = GC.GetTotalMemory(false);
+    return "usedsize " + (held - before >= (long)n * 1000 ? "grew" : "flat " + (held - before)) +
+      (again == held ? " stable" : " unstable") +
+      (held - after >= (long)n * 800 ? " shrank" : " kept " + (held - after) + " of " + (held - before));
+  }
   public static string Delegates(int n) {
     long sum = 0; string tags = "";
     for (int i = 0; i < n; i++) {
