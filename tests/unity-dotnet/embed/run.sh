@@ -40,6 +40,14 @@ GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" 
 	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit.txt 2>&1 || true
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit.txt || { echo "FAIL (wasm JIT): no '$p'"; exit 1; }; done
+# Threshold 10 compiles in a different order (callees before callers, tier-2 recompiles), which once put
+# a virtual call's i32 result into an i64 register (UTF8Encoding.GetChars). Same results, and every
+# emitted module must validate: the last stats line has to say invalid=0.
+GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" run --mem64 \
+	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=10 --env MONO_WASM_JIT_STATS=1 --env MONO_WASM_JIT_STATS_EVERY=1 \
+	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit10.txt 2>&1 || true
+for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit10.txt || { echo "FAIL (wasm JIT, threshold 10): no '$p'"; exit 1; }; done
+grep -a '^\[wasm-jit stats\]' wasmjit10.txt | tail -1 | grep -q ' invalid=0 ' || { echo "FAIL (wasm JIT, threshold 10): a module did not validate"; grep -a '^\[wasm-jit stats\]' wasmjit10.txt | tail -1; exit 1; }
 # The liveness walk as it was before the class shapes (field metadata per object): the same set.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_LV_NOSHAPE=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > noshape.txt 2>&1 || true
