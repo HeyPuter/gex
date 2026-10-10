@@ -293,10 +293,78 @@ The page picks the single build when either holds:
 
 ### SAB against single, same commands, edger
 
-(pending: `scratch/SP/page/cmp.sh`, results in
-`scratch/SP/page/out/c1-{sab,single}.txt`)
+Run with `scratch/SP/page/cmp.sh` in headless Chrome 153 under bench.sh.
+
+- The page is the native Debian demo over `wss://wisp.mercurywork.shop/`.
+- "single" is served with no COOP/COEP; "SAB" is the same branch served
+  cross-origin isolated.
+- Runs c1 (before e4779cca and e10ec855) and c2 (after).
+- Raw output is in `scratch/SP/page/out/c{1,2}-{single,sab}.txt`.
+- All values are ms of wall time as measured in the guest, except where the
+  row says s.
+- Network-bound rows (apt) swing 2-4× from run to run with the public Wisp
+  proxy, in both builds.
+
+| command | single c1 | single c2 | SAB c1 | SAB c2 |
+|---|---:|---:|---:|---:|
+| `true` | 135 | 124 | 175 | 156 |
+| `for i in $(seq 100); do x=$(echo $i); done` (100 forks) | 7216 | 6646 | 10417 | 10104 |
+| `yes \| head -c 20000000 \| wc -c` | 2205 | 2072 | 441 | 391 |
+| python3, 2M-iteration loop (its own clock, s) | 2.53 | 2.05 | 2.44 | 2.39 |
+| `apt-get update` | 26266 | 11361 | 10183 | 39357 |
+| `apt-get install ripgrep tcc libc6-dev` | 52342 | 50783 | 47936 | 109482 |
+| `rg --version` | 1408 | 1402 | 1541 | 1531 |
+| `tcc -run hello.c` | 1474 | 1829 | 1839 | 1679 |
+| `rg -c define stdio.h` | 2922 | 3154 | 3221 | 2416 |
+| `apt-get install neovim` | 17051 | 16450 | 18653 | 31483 |
+| `nvim --version` | 3672 | 4135 | 3345 | 3728 |
+| `nvim --headless +q` | 6765 | 7163 | 6755 | 6611 |
+| `apt-get install nodejs` | 78290 | 104249 | 141265 | 169786 |
+| `node --version` | 3380 | 3235 | 3130 | 3464 |
+| `node -e 0` | 59699 | 62812 | 57113 | 56873 |
+| node, 3e7-iteration loop (its own clock) | 8427 | 8434 | crashed | 9980 |
+
+What the table shows:
+
+- **Hot code.** It is not slower on a JSPI stack:
+  - the python loop takes 2.05-2.53 s single against 2.39-2.44 s SAB;
+  - the node loop takes 8427-8434 ms single against 9980 ms SAB.
+- **fork and exec are faster.** 100 command substitutions take 6.6-7.2 s
+  single against 10.1-10.4 s SAB, about 1.5× faster. A fork in the single
+  build makes a fiber, not a Worker.
+- **Pipelines are slower.** A three-process pipeline takes 2072-2205 ms
+  single against 391-441 ms SAB, about 5× slower. It loses the cores its
+  processes ran on, and every byte crosses the kernel on one thread.
+  - Profile (node harness, edger, single): `Pipe::read` popped a byte at a
+    time (182 ms), and `k_pipe_read` zeroed the whole request on every call
+    (`alloc_zeroed`, 240 ms), of 2970 ms in total. Both are fixed in
+    4fcc6417, which helps both builds.
+  - Scheduling itself is small: 48.9k parks and 29.3k wakes for the 20 MB,
+    with `wasm-to-js` at 72 ms.
+- **node start-up** (`node -e 0`) takes 59.7-62.8 s single against
+  56.9-57.1 s SAB, 5-10% slower. It installs about 30k translated modules
+  with an async compile each, on one thread instead of seven.
+- **Not single-specific.** node's child_process calls fail in **both**
+  builds on the page from the provider bug in §7. In single mode it already
+  fires on `node -e "console.log(1+1)"` (rc 137).
+
+Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
+
+| command | SAB | single |
+|---|---:|---:|
+| `yes \| head -c 20000000 \| wc -c` | 1562, 1653 | 2453, 2377 |
+| 100 command substitutions | 7495, 7538 | 5204, 4927 |
 
 ## 7. Limitations and next steps
+
+- **Provider bug (C), both builds, page only.** In node, the panic goes:
+  - "provider address 0x71dc1a1 keeps losing its bridge";
+  - then `gex-emit/src/module.rs:661` "text base must be
+    instruction-aligned".
+
+  In the single build the dead fiber held the process's lock, so its
+  siblings then trap in `memory.atomic.wait32` ("Atomics.wait cannot be
+  called in this context"). In the SAB build they hang instead.
 
 - **Blocking inside a nested JS frame cannot suspend.** This covers a
   call-out (`#nest`: `call_out`, `nt_callback`, `exc_dispatch`,
