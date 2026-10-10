@@ -280,8 +280,8 @@ builds:
 | wl-bridge.mjs | SAB scene arena | plain ArrayBuffer |
 | compositor.js / compositor-worker.js | Worker reading SAB memories, stats SAB | in-realm in the system Worker; stats mirrored to the page every 500 ms |
 | runtime.js kernel | shared kernel memory | plain kernel memory in the system Worker |
-| gl-bridge.mjs, mesa-gl.js | SAB ring + `Atomics.wait`; Mesa is an Emscripten pthread build | **not yet**: needs a non-pthread Mesa build in the system realm, with `gl_submit` as a Suspending import |
-| xwayland-worker.js / hostx.js | Xwayland pthread build, own Worker on kernel SAB | **not yet**: same, needs a non-pthread JSPI Xwayland build |
+| gl-bridge.mjs, mesa-gl.js | SAB ring + `Atomics.wait`; Mesa is an Emscripten pthread build | `gl: 'compositor'`: the non-pthread Mesa (`/gex/st/`) in the system Worker beside the compositor. `gl_submit` is a Suspending import calling `glInRealm.submit` on the guest's own memory, with no ring copy. A page-side device (`gl` as an object) is not supported |
+| xwayland-worker.js / hostx.js | Xwayland pthread build, own Worker on kernel SAB | HostX in the system Worker, on the non-pthread JSPI Xwayland (`/gex/xwayland-st/`): `main` suspends at each wait, which parks on the scheduler |
 | dom-compositor.js | page reads SAB memories | **not yet** (the canvas compositor works) |
 | persist.js, nt-page.js | persist Worker on the kernel SAB; SAB bundle | NT page only, which is not part of this build (the NT layer is legacy) |
 
@@ -407,6 +407,28 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
 | `yes \| head -c 20000000 \| wc -c` | 1562, 1653 | 2453, 2377 |
 | 100 command substitutions | 7495, 7538 | 5204, 4927 |
 
+### c4: ee504238, before the wake fix (edger, `GEX_WALL=900`)
+
+Times in ms. Both modes hit the 900 s wall after `spawnSync nvim`.
+
+| command | single | SAB |
+|---|---:|---:|
+| `true` | 127 | 145 |
+| 100 forks | 6369 | 10087 |
+| pipeline (20 MB) | 1772 | 404 |
+| python loop | 2370 | 2500 |
+| `apt-get update` | 9822 | 9088 |
+| `apt-get install ripgrep tcc libc6-dev` | 77077 | 18282 |
+| `apt-get install neovim` | 29778 | 30462 |
+| `apt-get install nodejs` | 122984 | 114600 |
+| `node -e 'console.log(1+1)'` | 39950 | 38726 |
+| `node -e 0` | 63538 | 56513 |
+| node loop | 8945 | 9761 |
+| `node /tmp/t.js` | 96536 | 81067 |
+
+The pipeline row is the ping-pong that §3's wake deferral removes; the
+timed rerun is pending (see §8).
+
 ## 7. Limitations and next steps
 
 - **Provider bug (C), both builds, page only: fixed.** The panic was
@@ -441,31 +463,28 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   memory) if they ever wait. In the single build only one fiber runs at a
   time, so a lock is never contended while its holder is suspended inside
   it, except across a suspension. This is not seen so far.
-- **GL and the X server: builds done, not yet wired in.** Both are built
-  without `-pthread`, so each has a plain memory. Built locally from the
-  `wink` pin; nothing pushed.
+- **GL and the X server work.** Both are built without `-pthread` (plain
+  memories), locally from the `wink` pin; nothing was pushed.
   - **Mesa:** `GEX_MESA_THREADS=0 web/build-mesa-wasm.sh`.
-    - Uses `web/mesa-wasm-st-cross.ini` and Wink's `st` Tint.
-    - Mesa's `gex-wasm-threads=auto` follows the cross file: no glthread.
-    - Output: `web/public/gex/st/gex-wgpu-replay.{js,wasm}`. It validates,
-      and its memory is defined unshared (flags 0x1).
+    - Uses `web/mesa-wasm-st-cross.ini` and Wink's `st` Tint; no glthread.
+    - Output: `web/public/gex/st/`.
   - **Xwayland:** `GEX_XWL_THREADS=0 web/build-xwayland-wasm.sh`.
+    - Built with `-sJSPI`, and gexos.c's wait is an `EM_ASYNC_JS`.
+    - `strip_pthread` removes the `-pthread` that meson's threads dependency
+      adds.
     - Output: `web/public/gex/xwayland-st/`.
-    - meson's `dependency('threads')` adds `-pthread` on emscripten
-      whatever the cross file says, so `strip_pthread` removes it from each
-      `build.ninja` and the installed `.pc` files.
-    - With `SharedArrayBuffer` deleted, `callMain(['-version'])` prints
-      24.1.9 and its memory is an `ArrayBuffer`.
-    - Gooner lacks some host packages: wayland-scanner, wayland-protocols,
-      xwaylandproto, xorg-macros and `X11/xshmfence.h`.
-      `scratch/SP/hostx/build.sh` builds them into a prefix. Run the
-      script with `PKG_CONFIG_PATH`, `PATH` and `ACLOCAL_PATH` pointed
-      there.
-  - **Next:** wire them in.
-    - `gl_submit` becomes a Suspending import that calls a `MesaGlDevice`
-      in the system Worker, on the guest's memory, instead of the SAB ring
-      (`gl-bridge.mjs`).
-    - Xwayland runs in-realm beside the compositor (`hostx=1`).
+    - Gooner's missing host packages come from `scratch/SP/hostx/build.sh`.
+      Run the script with `PKG_CONFIG_PATH`, `PATH` and `ACLOCAL_PATH`
+      pointed at its prefix.
+  - **Checked on gooner** (software WebGPU, correctness only):
+    - **gears** (single): triangles 640, frames 30, gl error 0, covered
+      15%.
+    - **native-debian `?gui=1`** (`scratch/SP/page/x.sh`), apt over Wisp:
+      - `xdpyinfo` on `:0` reports X.Org 24.1.9;
+      - xlogo and xeyes are managed and drawn;
+      - the screenshot is identical to the SAB build's.
+  - `web/public/fs/libGLESv2.so.2` and `libEGL.so.1` were rebuilt. The
+    checked-in ones spoke GL protocol 12, and gl-proto.js speaks 13.
 - **Wakes are wake-all.** Every parked fiber re-checks its word, though
   only once the running fiber parks (§3). This is fine for tens of fibers;
   a node run peaked at 272.
@@ -485,7 +504,10 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   - suspendable call-outs (`call_out`, `ftab_call`) and
     `tests/single-callout`;
   - `0a9b89f3`: woken fibers wait for the waker to park; blocking
-    `writev`/`readv`.
+    `writev`/`readv`;
+  - `4e75fb43`: non-pthread Mesa and Xwayland builds;
+  - `9b8c8c9a`: GL in-realm (gears through the compositor's replay);
+  - `82f04cce`: Xwayland in-realm (HostX parks on the scheduler).
 - **Merged:**
   - C's e4779cca, fa8ee5fd, 4f1d86e4 (the execve and provider fixes).
   - After them, node's `child_process` (`spawnSync` with input, async
@@ -501,7 +523,8 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
     `GEX_WALL=900`.
   - Time the pipeline change on edger: `scratch/SP/page/pipe.sh TAG single
     sab` (pipelines and forks only, from `wt/sp-new`).
-  - Wire the non-pthread Mesa and Xwayland into the single build (§7).
+  - SAB gears comparison once a threaded Mesa is built into this
+    worktree (`/tmp/gbench/sp-mesa-mt`).
 - **Builds:** `shims/browser/build.sh` (plain and shared), the kernel and
   the seed, then `cd web && npm run build`. web/public has rootfs, cgen and
   xwayland hard-linked from wt/gexcc.
