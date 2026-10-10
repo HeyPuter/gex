@@ -341,6 +341,10 @@ const host = new ProcessHost({
     // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
     // 2 folded call targets, 4 successors).
     discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
+    // GEX_UNIT_CACHE=1: compiled translation units shared by every process.
+    unitCache: process.env.GEX_UNIT_CACHE ? 1 : undefined,
+    // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
+    shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
@@ -429,7 +433,7 @@ const host = new ProcessHost({
         // run); `millis` is only the translator.
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
-            ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+            ` (${m.compileMs}ms compile${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
           // Where the shared-slot lookup went, to say why a forked and exec'd
           // child lifts its parent's libraries again.

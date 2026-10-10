@@ -582,6 +582,8 @@ pub struct ModuleBuilder {
     /// module was started: the helper functions and the region-base global.
     /// `None` leaves the module exactly as it would be without profiling.
     profile: Option<ProfileFns>,
+    /// The imported global holding this module's dense base, if any.
+    dense_global: Option<u32>,
 }
 
 /// The helpers a profiled module defines. See `crate::profile`.
@@ -738,6 +740,13 @@ impl ModuleBuilder {
                 m.import_table(IMPORT_MODULE, crate::dense::TABLE_NAME, 0);
             }
         }
+        // Where this module's dense blocks go, given at instantiation rather
+        // than written into the bytes: the bytes are then the same in every
+        // process, and a module another process compiled is reused as it is
+        // (`crate::dense::GLOBAL`). Not with profiling, whose module defines
+        // a global of its own at index 0.
+        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
+            .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
 
         // The miss stub and `enter` are the first two local functions, so
         // their indices are known before any block is declared.
@@ -761,6 +770,7 @@ impl ModuleBuilder {
             exports_by_addr: Vec::new(),
             demand_fill: false,
             profile: None,
+            dense_global,
         };
 
         if profiling {
@@ -1023,6 +1033,7 @@ impl ModuleBuilder {
                     // not a page, and is never demand filled.
                     guest_page: 0,
                     padded: false,
+                    offset_global: None,
                 });
                 // The dense block table, its entry 0 the miss stub as a slot
                 // nobody installed reads 0 (`crate::dense`).
@@ -1036,6 +1047,7 @@ impl ModuleBuilder {
                         passive: false,
                         guest_page: 0,
                         padded: false,
+                        offset_global: None,
                     });
                 }
             }
@@ -1137,6 +1149,7 @@ impl ModuleBuilder {
                             passive,
                             guest_page: page as u32,
                             padded: false,
+                            offset_global: None,
                         });
                     } else {
                         // A small runtime unit shares its page with a closure whose
@@ -1162,6 +1175,7 @@ impl ModuleBuilder {
                                 passive,
                                 guest_page: page as u32,
                                 padded: false,
+                                offset_global: None,
                             });
                             i = j;
                         }
@@ -1178,6 +1192,7 @@ impl ModuleBuilder {
                         passive: false,
                         guest_page: 0,
                         padded: true,
+                        offset_global: self.dense_global,
                     });
                     dense_section = Some(crate::dense::Section { base: 0, entries: dense_slots }.encode());
                 }

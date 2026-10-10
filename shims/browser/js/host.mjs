@@ -51,6 +51,8 @@ const EARLY = Symbol('gex.early');
  *  code is larger still; python3.13 alone is 24 MiB of wasm). */
 const PAGE_MODULES = 64;
 const PAGE_MODULE_BYTES = 192 << 20;
+/** The most wasm the page-wide unit cache (`#unitModules`) keeps compiled. */
+const UNIT_MODULE_BYTES = 256 << 20;
 /** A `wasm:` key's module size: the key is `wasm:LENGTH:HASH:HASH`. */
 const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 
@@ -89,10 +91,17 @@ export class ProcessHost {
   // content (length plus two 32-bit hashes of every byte), never by path, so
   // a file apt replaced in place is compiled afresh.
   #pageModules = new Map();
+  // Compiled translation units (content keys `len:a:b`) for every process of
+  // the page, with `extra.unitCache`: a process served units another one
+  // built instantiates the other's compiled code instead of compiling the
+  // same bytes again. Most recent first out, to UNIT_MODULE_BYTES of wasm.
+  #unitModules = new Map();
+  #unitBytes = 0;
   /** What a starting Worker gets: its process's modules and the page's. */
   #sharedFor(pid, withProcess) {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
-    return [...own, ...this.#pageModules.entries()];
+    // And the page's translation units (empty unless `extra.unitCache`).
+    return [...own, ...this.#pageModules.entries(), ...this.#unitModules.entries()];
   }
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
@@ -471,6 +480,21 @@ export class ProcessHost {
             this.#pageModules.delete(oldest);
           }
         }
+        // A translation unit for the page's cache (`Gex#unitKey`): kept
+        // for processes to come, not relayed -- the process's own Workers
+        // share it by its content key.
+        if (typeof m.key === 'string' && m.key.startsWith('u:')) {
+          if (this.#extra?.unitCache && !this.#unitModules.has(m.key)) {
+            this.#unitModules.set(m.key, m.mod);
+            this.#unitBytes += Number(m.key.split(':')[1]);
+            while (this.#unitBytes > UNIT_MODULE_BYTES && this.#unitModules.size > 1) {
+              const oldest = this.#unitModules.keys().next().value;
+              this.#unitBytes -= Number(oldest.split(':')[1]);
+              this.#unitModules.delete(oldest);
+            }
+          }
+          break;
+        }
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
           if (this.#extra?.shareTrace) console.warn(`[share] host cached ${m.key.slice(0, 30)} from ${pid} (${cache.size} for process ${proc})`);
@@ -650,7 +674,7 @@ export class ProcessHost {
               (m.byObject ? ` [${m.byObject}]` : '') +
               (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB]` : '') +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
-            ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+            ` (${m.compileMs}ms compile${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
               (m.loader && m.loader.calls
                 ? `, ld.so ${m.loader.calls} syscalls, last at ${m.loader.doneMs}ms`

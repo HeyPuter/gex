@@ -700,6 +700,8 @@ export async function runProgram(
       inlineDispatch: globalThis.GEX_INLINE_DISPATCH || undefined,
       // `?xlatereport=N`: a translator progress line every N translations.
       xlateReport: globalThis.GEX_XLATE_REPORT || undefined,
+      // `?unitcache=1`: compiled translation units shared by every process.
+      unitCache: globalThis.GEX_UNIT_CACHE || undefined,
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).

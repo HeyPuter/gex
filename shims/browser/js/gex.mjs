@@ -512,6 +512,27 @@ export function elementTableNeeds(wasm) {
   return needs;
 }
 
+/** Where a module's `gex.dense` section payload (its base word) starts, or -1. */
+function denseBaseAt(wasm) {
+  let i = 8;
+  const leb = () => {
+    let n = 0, shift = 0, b;
+    do { b = wasm[i++]; n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return n >>> 0;
+  };
+  while (i < wasm.length) {
+    const id = wasm[i++];
+    const size = leb();
+    const end = i + size;
+    if (id === 0) {
+      const n = leb();
+      if (n === 9 && utf8(wasm.subarray(i, i + n)) === 'gex.dense') return i + n;
+    }
+    i = end;
+  }
+  return -1;
+}
+
 /** A module's `gex.dense` section (gex_emit::dense::SECTION), or null. */
 export function denseSection(wasm) {
   if (wasm instanceof WebAssembly.Module) {
@@ -1211,6 +1232,10 @@ export class Gex {
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
+      // The translator's knobs, for every process of the run: set only here,
+      // a forked child (node under `bash -c`) ran with the defaults.
+      perMiss: opts.perMiss, liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
+      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip,
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
@@ -2520,7 +2545,8 @@ export class Gex {
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
       const key = moduleContentKey(bytes);
-      const cached = key ? this.#sharedModules.get(key) : undefined;
+      // Or one the page's unit cache has (another process's).
+      const cached = (key ? this.#sharedModules.get(key) : undefined) ?? this.#unitGet(this.#unitKey(bytes)) ?? undefined;
       let who = 'jit2049';
       if (globalThis.GEX_DUMP_WHERE ?? true) who = `jit2049-${i}-at-${ptr.toString(16)}`;
       try {
@@ -4861,7 +4887,9 @@ export class Gex {
     if (len === 0) return;
     const bytes = this.#bytes().slice(ptr, ptr + len);
     const key = moduleContentKey(bytes);
-    this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', null, true);
+    const ukey = this.#unitKey(bytes);
+    this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', this.#unitGet(ukey), true);
+    this.#unitShare(ukey);
     this.#noteExternal(bytes, key);
     e.gex_jit_installed();
     const count = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
@@ -4873,6 +4901,42 @@ export class Gex {
         this.#env.shareModule?.(key, mod);
       }
     }
+  }
+
+  /**
+   * With the page's unit cache (`?unitcache=1`, GEX_UNIT_CACHE): a
+   * translation's key in it, `u:` and its content key with the dense base
+   * word zeroed -- the one part of a unit's bytes that differs between the
+   * processes it is installed in (gex_emit::dense::GLOBAL) -- else null.
+   * `bytes` is a private copy; the word is put back.
+   */
+  #unitKey(bytes) {
+    if (!globalThis.GEX_UNIT_CACHE || !(bytes instanceof Uint8Array)) return null;
+    const at = denseBaseAt(bytes);
+    if (at < 0) return `u:${moduleContentKey(bytes)}`;
+    const w = bytes.slice(at, at + 4);
+    bytes.fill(0, at, at + 4);
+    const k = moduleContentKey(bytes);
+    bytes.set(w, at);
+    return `u:${k}`;
+  }
+
+  /** The compiled module for `ukey`, counted (`unitHits`), or null. */
+  #unitGet(ukey) {
+    const m = (ukey && this.#sharedModules.get(ukey)) || null;
+    if (m) this.#unitHits++;
+    return m;
+  }
+  #unitHits = 0;
+  get unitHits() { return this.#unitHits; }
+
+  /** The module just installed, to the page's unit cache under `ukey`. */
+  #unitShare(ukey) {
+    if (!ukey || this.#sharedModules.has(ukey)) return;
+    const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+    if (!mod) return;
+    this.#sharedModules.set(ukey, mod);
+    this.#env.shareModule?.(ukey, mod);
   }
 
   /** `#catchUp` (eager) without yielding, for `#ntCallback`. */
@@ -4922,7 +4986,11 @@ export class Gex {
     const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
     const bytes = this.#bytes().slice(ptr, ptr + len);
     const key = moduleContentKey(bytes);
-    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
+    // A module another process compiled (a served unit) comes from the
+    // page's unit cache: instantiated, not compiled again.
+    const ukey = this.#unitKey(bytes);
+    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878', this.#unitGet(ukey));
+    this.#unitShare(ukey);
     this.#noteExternal(bytes, key);
     e.gex_jit_installed();
     if (check && e.gex_miss_pc && e.gex_dispatch_slot && (e.gex_jit_pending_len() >>> 0) === 0) {
@@ -4970,6 +5038,15 @@ export class Gex {
   async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
     const t0 = performance.now();
     this.#installs++;
+    if (sync) {
+      // Timed here: the inner call has done all its work when it returns,
+      // and a `finally` after an `await` would run only once the guest
+      // next yields, counting everything it ran meanwhile (a node start-up
+      // reported hours of "installing").
+      const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync);
+      this.#installMs += performance.now() - t0;
+      return done;
+    }
     try {
       // With `sync` the inner call never awaits, so the install is complete
       // when this returns its promise -- what a nested loop inside an import
@@ -5035,7 +5112,7 @@ export class Gex {
     // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
     // looking at what a translation is made of (docs/jit-guest.md).
     if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
-      try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${globalThis.process.env.GEX_DUMP_WASM}/u-${String(this.#compiled.length).padStart(6, '0')}.wasm`, bytes); } catch {}
+      try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${globalThis.process.env.GEX_DUMP_WASM}/u-${this.#shim.exports.gex_my_pid?.() ?? 0}-${moduleContentKey(bytes).replaceAll(':', '-')}.wasm`, bytes); } catch {}
     }
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must
@@ -5048,6 +5125,9 @@ export class Gex {
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
+    // A runtime module imports its dense base (gex_emit::dense::GLOBAL)
+    // whether or not it has dense blocks; set below when it has.
+    imports.dense_base = 0;
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {
@@ -5063,6 +5143,9 @@ export class Gex {
         // Base 0 is a module nobody numbered: its blocks would land on the
         // miss stub and its neighbours.
         if (base === 0) throw new Error(`gex: a translation with unnumbered dense blocks reached the install (${who})`);
+        // Where a module places its dense segment by import rather than by a
+        // constant in its bytes (gex_emit::dense::GLOBAL).
+        imports.dense_base = base;
       }
     }
     // What this module's own entries need per table, where known. `need` alone

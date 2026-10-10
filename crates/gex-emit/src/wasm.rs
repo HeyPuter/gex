@@ -690,6 +690,10 @@ pub enum ImportKind {
     Table {
         min: u32,
     },
+    /// An immutable global of the given type.
+    Global {
+        ty: ValType,
+    },
 }
 
 /// An import.
@@ -729,6 +733,9 @@ pub struct ElementSegment {
     /// The offset is written as a five-byte LEB, so a host can rewrite it in
     /// place (`crate::dense::set_base`).
     pub padded: bool,
+    /// The offset is this (imported) global's value instead of `offset`:
+    /// given at instantiation, so the module's bytes do not depend on it.
+    pub offset_global: Option<u32>,
 }
 
 /// A memory initialiser.
@@ -841,6 +848,20 @@ impl Module {
             name: name.to_string(),
             kind: ImportKind::Table { min },
         });
+    }
+
+    /// Import an immutable global, returning its index. Imported globals
+    /// come before defined ones, so this must not be mixed with
+    /// [`Module::add_global`].
+    pub fn import_global(&mut self, module: &str, name: &str, ty: ValType) -> u32 {
+        assert!(self.globals.is_empty(), "a global import after a defined global");
+        let n = self.imports.iter().filter(|i| matches!(i.kind, ImportKind::Global { .. })).count() as u32;
+        self.imports.push(Import {
+            module: module.to_string(),
+            name: name.to_string(),
+            kind: ImportKind::Global { ty },
+        });
+        n
     }
 
     /// Number of imported *functions*, which is what local function indices
@@ -1237,6 +1258,11 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *min);
                     }
+                    ImportKind::Global { ty } => {
+                        s.push(0x03);
+                        s.push(ty.byte());
+                        s.push(0x00); // immutable
+                    }
                 }
             }
             section(&mut out, 2, &s);
@@ -1335,6 +1361,13 @@ impl Module {
                     s.push(op::I32_CONST);
                     write_i32(&mut s, e.offset as i32);
                     s.push(op::END);
+                } else if let Some(g) = e.offset_global {
+                    s.push(0x02);
+                    write_u32(&mut s, e.table);
+                    s.push(0x23); // global.get
+                    write_u32(&mut s, g);
+                    s.push(op::END);
+                    s.push(0x00); // elemkind: funcref
                 } else {
                     s.push(0x02);
                     write_u32(&mut s, e.table);

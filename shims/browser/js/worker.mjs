@@ -419,6 +419,7 @@ async function handle(msg) {
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
+  if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -778,6 +779,7 @@ async function handle(msg) {
       // Split: compiling is per bytes and V8 can skip seen bytes, instantiating
       // is per module and paid every time.
       compileMs: gex.compileMillis,
+      unitHits: gex.unitHits,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
       byObject: gex.blocksByObject,
