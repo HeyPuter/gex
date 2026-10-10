@@ -896,6 +896,70 @@ ahead-of-page compilation of the hot set while the rootfs downloads.
 - Program sizes: every program links libc statically; coreutils as one
   binary keeps that once.
 
+### 6.6 The demo today: what runs how, and measured (2026-10-10)
+
+What runs in the page, and as what:
+
+- **Native wasm32, built by us** (gexcc from Debian's sources,
+  architecture `musl-linux-wasm32`, tools/gexcc/debian/packages.txt): bash,
+  dash, coreutils, findutils, grep, sed, gawk/mawk, diffutils, patch, tar,
+  gzip/bzip2/xz/lz4, less, nano, vim, tmux, htop, jq, tree, curl, git,
+  sqlite3, python3.13, perl, lua5.4, make, gnupg2, openssl, and dpkg/apt
+  themselves. These are `:arm64` to apt but pinned (`Pin-Priority -1`, also for the
+  names they `Provides`), so apt never replaces them with Debian's.
+- **Translated arm64, from Debian over Wisp**: everything `apt install`
+  fetches, plus the base it needs (libc6, perl-base, libgcc-s1,
+  libstdc++6...). Tried in the page: subversion, tcc, ripgrep, fd-find,
+  gcc (with libc6-dev), neovim, nodejs (V8's JIT runs translated too).
+- **Replaced libraries (item 3, §7.8, §7.13)**: an arm64 program's
+  `libz.so.1`, `libzstd.so.1` and `libsqlite3.so.0` are wasm builds,
+  lowered from LP64, bound by soname from `/usr/lib/gex/aarch64/`
+  (package `gex-providers-arm64`, in the image). svn uses all three, and
+  node uses libz and libzstd. On top of that, per-function providers bind
+  14 libc functions (glibc_mem_a64) and 8 libm ones (glibc_math_a64).
+  libc.so.6 itself is never replaced.
+
+Measured in the page on edger (`scratch/CC/pipe/devtools4.sh` and
+`devtools5.sh`; `web/test/site.mjs native-debian-run`, Chrome, tier 1,
+Wisp through `wss://wisp.mercurywork.shop/`). Each figure is one run, and
+each timing includes the first-exec compile of every program involved:
+
+| step | run 4 | run 5 |
+|---|---|---|
+| `apt-get update` | 22.0 s | 21.7 s |
+| `apt install subversion tcc ripgrep fd-find libc6-dev` | 76.5 s | |
+| svn create / checkout / add / commit 40 files | 2.2 / 3.4 / 2.4 / 4.7 s | |
+| svn status / diff / commit / update / log | 2.1 / 2.3 / 4.0 / 2.9 / 2.5 s | |
+| `tcc -O2`, run it, `tcc -run` | 2.1, 1.2, 1.8 s | |
+| `rg -c define /usr/include/stdio.h` | 3.3 s | |
+| `apt install gcc` / `gcc -O2 h.c` / run it | 134.2 / 39.7 / 0.9 s | |
+| `apt install neovim` | 32.6 s | 31.6 s |
+| `nvim --version` / `nvim --headless +q` | 4.4 / 14.2 s | 4.3 / 6.5 s |
+| nvim scripted edit (`-c 'normal ...' -c wq`), file checked | 39.0 s | 7.6 s |
+| `apt install nodejs` | 67.6 s | 76.1 s |
+| `node --version` | 3.3 s | 3.4 s |
+| `node -e 'console.log(1+1)'` | trapped (fixed since) | 40.1 s |
+| `node -e 0` (twice) | | 31.9, 29.1 s |
+| fs + zlib + crypto + timer + http on localhost | | 39.4 s |
+| node http server, fetched by curl (incl. node start) | | 34.1 s |
+| child_process: spawnSync, stdin input, spawn | | 169.7 s |
+| nvim `system()` running node | | 44.4 s |
+
+Every command in run 5 returned 0 with the expected output. node starts
+in about 30 s because V8 lifts and runs its builtins and JIT code
+translated. That is the next cost to cut, not a correctness gap.
+
+What had to change for these runs:
+
+- **Kernel.** `F_GETFL` reports the real access mode, and a stream
+  `socketpair` is made of global pipes so it survives fork (libuv spawns
+  every child through one). Socket kinds are reported, which libuv's
+  `uv_guess_handle` needs.
+- **Shim.** The provider re-bridge guard no longer gives up in a
+  long-lived process.
+- **Page.** It redials a Wisp proxy that drops the WebSocket. Since
+  2026-10-10, wss://anura.pro/ closes every WebSocket after 2-6 s.
+
 ## 7. Shared libraries: wasm32 programs, and wasm32 libraries under arm64 programs (design, 2026-10-09)
 
 Two requests from the user, designed together because both load native
