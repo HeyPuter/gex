@@ -12,6 +12,7 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { lazyFetch } from "./lazy-fetch.mjs";
+import { single, sched } from "./single.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -143,7 +144,14 @@ const tIdx = (v) => (m64() ? BigInt(v) : v);
  */
 const DECODER = new TextDecoder();
 export function utf8(view) {
-  return DECODER.decode(view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
+  return DECODER.decode(isShared(view.buffer) ? view.slice() : view);
+}
+
+/** Whether `buf` is a SharedArrayBuffer -- asked without naming the global,
+ *  which a page that is not cross-origin isolated does not have. */
+const SAB = globalThis.SharedArrayBuffer;
+function isShared(buf) {
+  return typeof SAB === 'function' && buf instanceof SAB;
 }
 
 // Registry indices describe a shared queue, not module identity: two Workers
@@ -785,7 +793,9 @@ export class Gex {
       // bootstrap slice of the shim's own stack band below SHIM_STACK_TOP,
       // one of 32 handed out round-robin through a counter in the reserved
       // low region -- Workers starting together get different ones.
-      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && this.#memory.buffer instanceof SharedArrayBuffer) {
+      // The single-thread build runs the shared build's shim on a plain
+      // memory: one memory, several instances (threads), so the same claim.
+      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && (isShared(this.#memory.buffer) || single.on)) {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
@@ -1444,7 +1454,7 @@ export class Gex {
           : e.gex_sysreg_write(ctx, pc, reg, v))
         : e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
-      safepoint: e.gex_safepoint,
+      safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
     };
@@ -1662,7 +1672,7 @@ export class Gex {
       sysreg_read: e.gex_sysreg_read,
       sysreg_write: e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
-      safepoint: e.gex_safepoint,
+      safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
     };
@@ -1895,6 +1905,34 @@ export class Gex {
     }
     // Nobody has asked for a halt, rather than "halt with status 0".
     if (!k) out.k_halt_code = () => -1;
+    // The single-thread build: the wait words are promises (single.mjs
+    // `Sched`). A park that need not wait answers at once, as
+    // `memory.atomic.wait32` does when the value has moved; one that must
+    // suspends this fiber's stack. Every wake also wakes the fibers.
+    if (k && single.on) {
+      const nested = () => {
+        throw new Error('gex (single-thread build): a blocking call inside a nested guest call '
+          + `(${this.#nest.join(' > ')}) cannot suspend`);
+      };
+      out.k_park = new WebAssembly.Suspending((seq, ns) => {
+        if (k.k_wake_seq() !== seq) return 1;
+        if (this.#nest.length) nested();
+        return sched.park(ns);
+      });
+      out.k_park_futex = new WebAssembly.Suspending((addr, gen, ns) => {
+        if ((k.k_futex_gen(addr) >>> 0) !== (gen >>> 0)) return 1;
+        if (this.#nest.length) nested();
+        return sched.parkFutex(addr, ns);
+      });
+      out.k_wake = () => {
+        k.k_wake();
+        sched.wake();
+      };
+      out.k_futex_wake = (addr) => {
+        k.k_futex_wake(addr);
+        sched.wakeFutex(addr);
+      };
+    }
     return out;
   }
 
@@ -2291,7 +2329,9 @@ export class Gex {
     // A thread needs a memory two Workers can both hold. Posting a non-shared
     // memory does not fail -- the structured clone copies it, and the thread
     // runs on a private image nothing else can see -- so it is refused here.
-    if (!(this.#memory?.buffer instanceof SharedArrayBuffer)) {
+    // In the single-thread build a thread is a fiber of this realm, handed
+    // the memory object itself.
+    if (!isShared(this.#memory?.buffer) && !single.on) {
       throw new Error(
         `the guest started thread ${tid} on a memory that is not shared. ` +
           'A guest thread is a Worker and a Worker needs a SharedArrayBuffer: ' +
@@ -3401,14 +3441,18 @@ export class Gex {
       else f();
       return 0;
     };
+    const staged = () => {
+      if (e.gex_wasmprog_staged()) {
+        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+      }
+    };
+    const sync = (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      staged();
+    };
     return {
-      syscall: (ctx, pc) => {
-        e.gex_syscall(ctx, pc);
-        if (e.gex_wasmprog_staged()) {
-          this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-          this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
-        }
-      },
+      syscall: single.on ? this.#suspendingSyscall(sync, staged) : sync,
       asyncify,
       fork_point: (rec) => {
         const st = asyncify(0, 0);
@@ -3454,26 +3498,40 @@ export class Gex {
    *  thread or a child rather than trapping, and the host starts it here. */
   #guestSyscall(e) {
     if (!Gex.wasmDlls) return e.gex_syscall;
-    return (ctx, pc) => {
-      e.gex_syscall(ctx, pc);
+    const staged = () => {
       if (e.gex_wasmprog_staged()) {
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
       }
     };
+    const sync = (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      staged();
+    };
+    return single.on ? this.#suspendingSyscall(sync, staged) : sync;
   }
 
   /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
    *  serves it without leaving the provider's frames (a blocking call waits in place, a
    *  thread is staged); the host then starts what it staged, and the call returns. */
-  #providerSyscall = (ctx, pc) => {
+  #providerSyscallSync = (ctx, pc) => {
     const e = this.#shim.exports;
     e.gex_syscall(ctx, BigInt.asIntN(64, BigInt(pc) | (1n << 61n)));
+    this.#providerStaged();
+  };
+  #providerStaged = () => {
+    const e = this.#shim.exports;
     if (e.gex_wasmprog_staged()) {
       this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
       this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
     }
   };
+  #providerSyscallS = null;
+  /** The single-thread build's: see `#suspendingSyscall`. */
+  get #providerSyscall() {
+    if (!single.on) return this.#providerSyscallSync;
+    return (this.#providerSyscallS ??= this.#suspendingSyscall(this.#providerSyscallSync, this.#providerStaged, 1n << 61n));
+  }
 
   #nativeSyscall = (ctx, pc) => {
     const e = this.#shim.exports;
@@ -3728,7 +3786,10 @@ export class Gex {
           );
         }
         this.#shim.exports.gex_callout_leave_ok?.(0);
-        this.#guest.exports.enter(ctx, pc);
+        // The single-thread build enters on a stack of the guest's own
+        // (JSPI), which a blocking call suspends; see single.mjs.
+        if (single.on) await this.#enterP(ctx, pc);
+        else this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
         if (globalThis.GEX_DEBUG_EXIT) {
@@ -3999,7 +4060,7 @@ export class Gex {
               // asleep and the turn below runs that queue. -1 is "no global
               // kernel to sleep on", and a network wait cannot sleep at all --
               // its bytes arrive on this Worker's own event loop.
-              if (e.gex_paused_for_host() || e.gex_park(20) < 0) {
+              if (e.gex_paused_for_host() || (single.on ? await this.#parkP(20) : e.gex_park(20)) < 0) {
                 // A network wait runs on this Worker's event loop, so it cannot
                 // sleep -- but it needs a turn, not a timer: a MessageChannel
                 // turn returns to the loop in microseconds where a nested
@@ -4426,6 +4487,63 @@ export class Gex {
    *  'callback'): a watch stub reached inside an NT callback is not its
    *  call-out's business. */
   #nest = [];
+
+  // --- The single-thread build (single.mjs, docs/single-thread.md) ---------
+  //
+  // Every guest thread is a fiber of one realm, its guest on a JSPI stack. A
+  // blocking call suspends that stack (`k_park`, below) where the default
+  // build waits in `Atomics.wait`, so wherever JS calls into wasm that may
+  // block it calls through `WebAssembly.promising`, and wherever wasm calls
+  // JS that calls back into wasm that may block, that JS is a
+  // `WebAssembly.Suspending` returning the inner call's promise.
+  #enterPf = null;
+  #enterPOf = null;
+  /** `enter`, on a stack of its own. */
+  #enterP(ctx, pc) {
+    if (this.#enterPOf !== this.#guest) {
+      this.#enterPf = WebAssembly.promising(this.#guest.exports.enter);
+      this.#enterPOf = this.#guest;
+    }
+    return this.#enterPf(ctx, pc);
+  }
+  #parkPf = null;
+  /** `gex_park`, on a stack of its own (it suspends in `k_park`). */
+  #parkP(ms) {
+    this.#parkPf ??= WebAssembly.promising(this.#shim.exports.gex_park);
+    return this.#parkPf(ms);
+  }
+  #sysPf = null;
+  /**
+   * A system call made from JS that wasm called (a wasm32 program's, a
+   * provider's): the shim runs on a stack of its own, so a wait inside it
+   * suspends that stack, and the returned promise suspends the caller's.
+   * `after` runs when it is done, before the caller goes on (a fork's image
+   * is taken there). Nested inside a call-out (JS frames below), nothing can
+   * suspend, so it runs as the default build's does.
+   */
+  #suspendingSyscall(sync, after, mark = 0n) {
+    const e = this.#shim.exports;
+    return new WebAssembly.Suspending((ctx, pc) => {
+      if (this.#nest.length) return sync(ctx, pc);
+      this.#sysPf ??= WebAssembly.promising(e.gex_syscall);
+      const p = this.#sysPf(ctx, mark ? BigInt.asIntN(64, BigInt(pc) | mark) : pc);
+      return p.then(() => {
+        after?.();
+        // A preemption point as well: a program that only makes system
+        // calls gives the other fibers a turn here.
+        return sched.maybeYield();
+      });
+    });
+  }
+  /** A safepoint (every 1024 back edges of translated code): the shim's,
+   *  then a turn for the other fibers if the slice is over. */
+  #safepointS = null;
+  #singleSafepoint(e) {
+    return (this.#safepointS ??= new WebAssembly.Suspending((ctx, pc) => {
+      e.gex_safepoint(ctx, pc);
+      return this.#nest.length ? 0 : sched.maybeYield();
+    }));
+  }
   #watchStub = null;
 
   /** The function a watched table entry holds: it tells JS (`hit`) and

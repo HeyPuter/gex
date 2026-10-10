@@ -67,6 +67,7 @@ function forkTransfer(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
+import { single, registerWorkerMain } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -88,7 +89,11 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
   console.debug = sync;
 }
 
-const port = await channel();
+// Everything below is one Worker's: its port, its process, its state. A
+// function rather than module scope so the single-thread build (single.mjs)
+// can run many of these in one realm, one per fiber; a real Worker runs one.
+async function workerMain(port) {
+
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
@@ -891,3 +896,9 @@ const handed = await (async () => {
 
 port.post({ kind: 'ready' });
 if (handed) handle(handed);
+}
+
+// A real Worker runs itself; the single-thread build registers the function
+// and runs it once per fiber (single.mjs `FiberWorker`).
+if (single.on) registerWorkerMain(workerMain);
+else await workerMain(await channel());
