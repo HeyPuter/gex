@@ -348,6 +348,22 @@ What the table shows:
   builds on the page from the provider bug in §7. In single mode it already
   fires on `node -e "console.log(1+1)"` (rc 137).
 
+**The default build is not slower.** C's head e4779cca (same wasm,
+without this branch's JS; run c3, leg 1, cut short) against this branch's
+SAB build (c2). Raw ms:
+
+| command | C's head | this branch, SAB |
+|---|---:|---:|
+| `true` | 139 | 156 |
+| pipeline (20 MB) | 407 | 391 |
+| `nvim --version` | 3921 | 3728 |
+| `nvim --headless +q` | 6873 | 6611 |
+| `node --version` | 2760 | 3464 |
+| `node -e "console.log(1+1)"` | 38949 | 40063 |
+| `node -e 0` | 57034 | 56873 |
+| node 3e7 loop (guest clock) | 10216 | 9980 |
+| `node t.js` | 80718 | 81141 |
+
 Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
 
 | command | SAB | single |
