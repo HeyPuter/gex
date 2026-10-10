@@ -6430,7 +6430,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         } else {
                             String::new()
                         };
-                        warn_line(&format!(
+                        // Informational (a handler running is normal), so the
+                        // debug console: a console error fails a page test.
+                        trace_line(&format!(
                             "[sig] pid {} runs a handler at {target:#x}{last}\n",
                             h.kernel.pid
                         ));
@@ -10651,8 +10653,10 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let hi = lo + gex_abi::DISPATCH_PAGE;
             h.jit.translated.retain(|&a| a < lo || a >= hi);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // Informational: a JIT (V8 under node) rewrites its code all the
+            // time and this is the runtime keeping up, not a fault.
             if n <= 8 || tracing() {
-                warn_line(&format!(
+                trace_line(&format!(
                     "gex: self-modifying-code: re-lifting page {page:#x} \
                      (addr={:#x}, {n} so far)\n",
                     addr as u64,
