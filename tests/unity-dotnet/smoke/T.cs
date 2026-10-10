@@ -351,6 +351,23 @@ public static class T {
     h.Free();
     return "monoicalls " + acc;
   }
+  // A field loaded twice in a row (the JIT reuses the first load) into a register a negative constant
+  // also writes: `x == 65535 ? -1 : x`, AssemblyName.FillName's shape. On wasm64 that register is an i64
+  // local, and the reused load must be widened into it or the module does not validate.
+  public struct Ver { public int major, build, revision; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe long VerKey(Ver* v) {
+    int build = v->build == 65535 ? -1 : v->build;
+    int revision = v->revision == 65535 ? -1 : v->revision;
+    return build == -1 ? v->major : revision == -1 ? v->major * 1000L + build : (v->major * 1000L + build) * 100000L + revision;
+  }
+  public static unsafe string LcseWide(int n) {
+    long acc = 0; Ver v;
+    for (int i = 0; i < n; i++) {
+      v.major = i & 15; v.build = (i % 3 == 0) ? 65535 : i % 997; v.revision = (i % 5 == 0) ? 65535 : i % 89;
+      acc += VerKey(&v);
+    }
+    return "lcsewide " + acc;
+  }
   public static string Localloc(int n) {
     long acc = 0;
     for (int i = 0; i < n; i++) acc += Stack(i);

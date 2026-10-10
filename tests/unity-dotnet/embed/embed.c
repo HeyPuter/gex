@@ -308,6 +308,12 @@ main (int argc, char **argv)
 	P mir = mono_runtime_invoke (mi, NULL, miargs, &exc);
 	check ("MonoIcalls", exc);
 	printf ("%s\n", mono_string_to_utf8 (mir));
+	P lw = mono_class_get_method_from_name (k, "LcseWide", 1);
+	int lwn = 20000;
+	void *lwargs [1] = { &lwn };
+	P lwr = mono_runtime_invoke (lw, NULL, lwargs, &exc);
+	check ("LcseWide", exc);
+	printf ("%s\n", mono_string_to_utf8 (lwr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };
