@@ -638,6 +638,7 @@ async function handle(msg) {
           fjit: msg.fjit ?? msg.opts?.fjit,
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
+          liftMax: msg.liftMax ?? msg.opts?.liftMax,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },
@@ -763,6 +764,11 @@ async function handle(msg) {
       // the slot it dispatches through is written now. See #136.
       liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // What the translator did: instructions lifted, wasm bytes, translations,
+      // SMC page invalidations, pages retired, retire calls, -, anonymous blocks.
+      xlate: gex.shim.exports.gex_xlate_stat
+        ? [0, 1, 2, 3, 4, 5, 6, 7].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
+        : undefined,
       // What the engine cost, which `millis` does not: compiling and
       // instantiating every module this process installed.
       installMs: gex.installMillis,

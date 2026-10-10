@@ -1208,6 +1208,8 @@ export class Gex {
     }
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
+    // How many blocks one dispatch miss lifts (default 2048).
+    if (opts.liftMax) this.#shim.exports.gex_set_lift_max?.(opts.liftMax);
     // Keep what the guest's dynamic linker produces, and start the next process
     // of the same program from it instead of linking again.
     if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
@@ -2108,6 +2110,7 @@ export class Gex {
     if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
     if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
+    if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first

@@ -1939,6 +1939,34 @@ pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
 static PER_MISS_N: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(16);
 
+/// The most blocks one dispatch miss lifts (discovery follows successors,
+/// call returns and folded call targets breadth-first up to this). 1 lifts
+/// only the block that missed, so the blocks lifted are the blocks run.
+static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+
+/// What the runtime translator did in this process, for `gex_xlate_stat`:
+/// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
+/// that lifted), 3 self-modifying-code page invalidations, 4 pages retired by
+/// unmap/reprotect, 5 retire calls, 6 blocks lifted from writable+executable
+/// memory (a guest JIT's), 7 blocks lifted outside any named object.
+pub(crate) static XLATE_STAT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub(crate) fn xlate_add(i: usize, n: u64) {
+    XLATE_STAT[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "C" fn gex_xlate_stat(i: u32) -> i64 {
+    XLATE_STAT.get(i as usize).map_or(-1, |c| c.load(std::sync::atomic::Ordering::Relaxed) as i64)
+}
+
+/// Set that, from the host (`?liftmax=N`, `GEX_LIFT_MAX`).
+#[no_mangle]
+pub extern "C" fn gex_set_lift_max(n: u32) {
+    if n > 0 {
+        LIFT_MAX.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Set that, from the host.
 #[no_mangle]
 pub extern "C" fn gex_set_per_miss(n: u32) {
@@ -10652,6 +10680,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
             h.jit.translated.retain(|&a| a < lo || a >= hi);
+            xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
             // time and this is the runtime keeping up, not a fault.
@@ -11751,7 +11780,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            2048,
+            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -11770,6 +11799,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if stats.blocks == 0 {
             return false;
         }
+        xlate_add(0, stats.instructions as u64);
+        xlate_add(1, stats.wasm_bytes as u64);
+        xlate_add(2, 1);
         h.jit.page_table = unit.page_table.clone();
         // Into the system-wide store, so a sibling installs it rather than
         // re-lifting. Published by what the unit *covers*, not what it allocated
@@ -11874,6 +11906,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         h.jit.blocks += stats.blocks as u64;
         let whose = object_name_at(h, pc);
+        if whose.is_empty() {
+            xlate_add(7, stats.blocks as u64);
+        }
         note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
@@ -12043,9 +12078,13 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
             continue;
         }
         h.jit.translated.retain(|a| *a < start || *a >= end);
+        xlate_add(5, 1);
         for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 break;
+            }
+            if h.jit.page_table.lookup(page).is_some() {
+                xlate_add(4, 1);
             }
             h.jit.page_table.forget(page);
             h.jit.retired_pages.insert(page);
