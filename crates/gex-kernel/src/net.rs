@@ -353,7 +353,7 @@ impl Transport for RemoteEnd {
     /// end. SHUT_RD only changes this end, which the far end is not told.
     fn shutdown(&self, how: u64) -> Result<(), Errno> {
         if how == 1 || how == 2 {
-            (self.remote.shutdown)(self.id);
+            let _ = (self.remote.shutdown)(self.id, 1);
         }
         Ok(())
     }

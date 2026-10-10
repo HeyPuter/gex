@@ -2595,9 +2595,13 @@ pub extern "C" fn k_sock_read_fds(
 }
 
 #[no_mangle]
-pub extern "C" fn k_sock_shutdown(id: i32) {
-    if let Some(s) = sock_at(id) {
-        s.shutdown();
+pub extern "C" fn k_sock_shutdown(id: i32, how: u32) -> i32 {
+    match sock_at(id) {
+        Some(s) => match s.shutdown_how(how as u64) {
+            Ok(_) => 0,
+            Err(e) => -e.0,
+        },
+        None => -9,
     }
 }
 

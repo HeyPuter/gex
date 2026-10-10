@@ -1093,7 +1093,8 @@ pub struct Remote {
     pub writable: extern "C" fn(id: i32) -> i32,
     pub available: extern "C" fn(id: i32) -> i32,
     pub close: extern "C" fn(id: i32),
-    pub shutdown: extern "C" fn(id: i32),
+    /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
+    pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     /// A connected pair, as `socketpair` makes: both ids written as two
     /// little-endian `u32`s at `out`. Zero or a negated errno.
@@ -1187,8 +1188,12 @@ impl RemoteUnix {
         self.listening && (self.remote.pending)(self.id) != 0
     }
 
-    pub fn shutdown(&self) {
-        (self.remote.shutdown)(self.id);
+    /// `shutdown(2)`: as [`UnixSocket::shutdown_how`], in the global kernel.
+    pub fn shutdown_how(&self, how: u64) -> SysResult {
+        match (self.remote.shutdown)(self.id, how.min(u32::MAX as u64) as u32) {
+            n if n < 0 => Err(Errno(-n)),
+            _ => Ok(0),
+        }
     }
 
     pub fn bound_path(&self) -> Option<String> {

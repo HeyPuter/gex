@@ -2756,13 +2756,19 @@ impl Kernel {
             // agreed to without effect, on a descriptor that exists
             nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
-            // A unix socket's directions close as asked; any other socket
-            // (the proxied network, the global kernel's) just agrees.
+            // A unix socket's directions close as asked, local or in the
+            // global kernel; the proxied network's as it can; anything else
+            // just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
-                Err(_) => match self.socket_of(a[0] as i32) {
-                    Ok(s) => s.shutdown(a[1]),
-                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                // A global-kernel one too (a socketpair's ends in two
+                // Workers): SHUT_WR is how libuv ends a child's stdin.
+                Err(_) => match self.remote_unix_of(a[0] as i32) {
+                    Ok(sock) => sock.shutdown_how(a[1]),
+                    Err(_) => match self.socket_of(a[0] as i32) {
+                        Ok(s) => s.shutdown(a[1]),
+                        Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                    },
                 },
             },
             // A local address means nothing when there is one interface and

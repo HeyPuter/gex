@@ -402,7 +402,7 @@ extern "C" {
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
     fn k_sock_close(id: i32);
-    fn k_sock_shutdown(id: i32);
+    fn k_sock_shutdown(id: i32, how: u32) -> i32;
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
     fn k_sock_dup(id: i32) -> i32;
@@ -1094,8 +1094,8 @@ extern "C" fn rs_available(id: i32) -> i32 {
 extern "C" fn rs_close(id: i32) {
     unsafe { k_sock_close(id) }
 }
-extern "C" fn rs_shutdown(id: i32) {
-    unsafe { k_sock_shutdown(id) }
+extern "C" fn rs_shutdown(id: i32, how: u32) -> i32 {
+    unsafe { k_sock_shutdown(id, how) }
 }
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
