@@ -20,6 +20,41 @@ use gex_ir::*;
 use gex_isa_x86::{Cond, Inst, Mem, Op, Operand, Reg, Rep, Seg, Width};
 
 mod block;
+
+/// A byte-copy loop at `start`, `l: movsb; cmp r32, edi (either order);
+/// jne l` (compilers' and hand-written memcpy tails; 40% of the loop
+/// iterations in Undertale's image loading under Wine): the register `r`
+/// it compares `edi` with, for [`Lifter::lift_copy_loop`]. Drivers try it
+/// at a block's start, where the loop's own branch lands.
+pub fn copy_loop(fetch: &dyn Fn(u64, &mut [u8; 16]) -> usize, start: u64) -> Option<u8> {
+    let dec = |pc: u64| {
+        let mut buf = [0u8; 16];
+        let n = fetch(pc, &mut buf).min(gex_isa_x86::MAX_INST_BYTES);
+        (n > 0).then(|| gex_isa_x86::decode(&buf[..n], pc))
+    };
+    let m = dec(start)?;
+    if m.op != Op::Movs || m.width != Width::B || m.rep != Rep::None || m.len != 1 {
+        return None;
+    }
+    let c = dec(start + 1)?;
+    let r = match (c.op, c.width, c.ops[0], c.ops[1], c.ops[2]) {
+        (Op::Cmp, Width::D, Some(Operand::Reg(Reg::Gp(a, Width::D))), Some(Operand::Reg(Reg::Gp(b, Width::D))), None) => {
+            if a == RDI && b != RDI && b != RSI {
+                b
+            } else if b == RDI && a != RDI && a != RSI {
+                a
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let j = dec(start + 1 + c.len as u64)?;
+    match (j.op, j.ops[0]) {
+        (Op::Jcc(Cond(5)), Some(Operand::Imm(t))) if t as u64 == start => Some(r),
+        _ => None,
+    }
+}
 mod sse;
 mod x87;
 mod x87conv;
@@ -2602,6 +2637,50 @@ impl<'a> Lifter<'a> {
     }
 
     // -- string instructions ---------------------------------------------------------------
+
+    /// The first instruction of a [`copy_loop`] (`movsb`, comparing `edi`
+    /// with register `r`), as all its iterations: one `StrOp` copying
+    /// (r - edi) bytes forward, or (edi - r) backward, mod 2^32 (0 is 2^32,
+    /// as the loop runs until the 32-bit compare wraps round). The loop's
+    /// `cmp` and `jne` are lifted after it as usual: equal, so the branch
+    /// falls through, with the flags the last compare leaves.
+    pub fn lift_copy_loop(&mut self, r: u8) -> Flow {
+        let df = self.read_flag(GuestReg::D);
+        let edi = self.rd_reg(Reg::Gp(RDI, Width::D));
+        let end = self.rd_reg(Reg::Gp(r, Width::D));
+        let fwd = self.b.bin(BinOp::Sub, Ty::I32, end, edi);
+        let back = self.b.bin(BinOp::Sub, Ty::I32, edi, end);
+        let zero32 = self.k32(0);
+        let df_clear = self.b.cmp(CmpOp::Eq, Ty::I32, df, zero32);
+        let n32 = self.b.select(df_clear, fwd, back, Ty::I32);
+        let n = self.b.extend(n32, false);
+        let wrap = self.b.cmp(CmpOp::Eq, Ty::I32, n32, zero32);
+        let full = self.k64(1 << 32);
+        let count = self.b.select(wrap, full, n, Ty::I64);
+        let dst = self.rd64(RDI);
+        let src = self.rd64(RSI);
+        let val = self.rd64(RAX);
+        let (out_count, out_dst, out_src, out_a, out_b) =
+            (self.b.fresh(), self.b.fresh(), self.b.fresh(), self.b.fresh(), self.b.fresh());
+        self.b.stmt(Stmt::StrOp {
+            kind: StrKind::Movs,
+            sz: MemSz::B1,
+            until: StrUntil::Count,
+            count,
+            dst,
+            src,
+            val,
+            df,
+            out_count,
+            out_dst,
+            out_src,
+            out_a,
+            out_b,
+        });
+        self.wr64(RDI, out_dst);
+        self.wr64(RSI, out_src);
+        Flow::Next
+    }
 
     fn string_op(&mut self, i: &Inst) -> Flow {
         let w = i.width;
