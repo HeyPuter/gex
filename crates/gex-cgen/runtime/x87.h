@@ -54,7 +54,7 @@ GEX_INLINE uint64_t gex_x87_narrow(int ctx, uint64_t sig, uint32_t se, uint32_t 
     return gex_x87_slow(ctx, single ? 1 : 2, sig, se, 0, 0, cw);
 }
 
-/* fist / fisttp (X87Op::ToInt): zero, and 1 <= |v| < 2^(bits-1). */
+/* fist / fisttp (X87Op::ToInt): zero, and normal |v| < 2^(bits-1). */
 GEX_INLINE uint64_t gex_x87_toint(int ctx, uint64_t sig, uint32_t se, uint32_t cw, uint32_t bits,
                                   uint32_t trunc) {
     uint32_t e = se & 0x7fff, sign = (se >> 15) & 1;
@@ -82,6 +82,18 @@ GEX_INLINE uint64_t gex_x87_toint(int ctx, uint64_t sig, uint32_t se, uint32_t c
         if (bits < 64)
             v &= (1ull << bits) - 1;
         GEX_C32(GEX_X87_SW) = ((uint32_t)(rem != 0) << 5) | (up << 9);
+        return v;
+    }
+    if ((int64_t)sig < 0 && e - 1 < 16382) { /* 0 < |v| < 1: 0 or +-1, inexact */
+        uint32_t up = 0;
+        if (!trunc) {
+            uint32_t rc = (cw >> 10) & 3;
+            up = ((rc == 0) & (e == 16382) & (sig != 1ull << 63)) | (rc == 2 - sign);
+        }
+        uint64_t v = sign ? 0 - (uint64_t)up : (uint64_t)up;
+        if (bits < 64)
+            v &= (1ull << bits) - 1;
+        GEX_C32(GEX_X87_SW) = (1u << 5) | (up << 9);
         return v;
     }
     return gex_x87_slow(ctx, 0x100 | (int32_t)(bits << 1) | (int32_t)trunc, sig, se, 0, 0, cw);
@@ -183,6 +195,15 @@ GEX_INLINE uint64_t gex_x87_arith(int ctx, uint32_t k, uint64_t asig, uint32_t a
         uint64_t v = gex_x87_div(ctx, asig, ase, bsig, bse, cw, &ok);
         if (ok)
             return v;
+    }
+    /* Two zeros: a sum is +0 unless both are -0 (or, rounding down,
+     * either is); a product the signs' exclusive or. (0/0 is invalid.) */
+    if (azero & bzero & (k != 3)) {
+        uint32_t as = (ase >> 15) & 1, bs = ((k == 1 ? bse ^ 0x8000 : bse) >> 15) & 1;
+        uint32_t s = k == 2 ? as ^ bs : ((cw >> 10) & 3) == 1 ? as | bs : as & bs;
+        GEX_C32(GEX_X87_SE) = s << 15;
+        GEX_C32(GEX_X87_SW) = 0;
+        return 0;
     }
     /* A zero and a normal number. A sum is the normal one (negated for
      * 0 - b), rounded to the precision control; a product, or a zero
