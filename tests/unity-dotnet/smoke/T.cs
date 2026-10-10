@@ -288,6 +288,44 @@ public static class T {
     }
     return sb.ToString();
   }
+  // Hollow Knight's hot interpreter legs (hg10), as shapes: Unity InputSystem's InputStateBlock.ReadFloat
+  // (ldind.* by format, uint -> float through conv.r.un), List<ref>.AddRange (checked add in shared generic code,
+  // OP_IADDCC) and a KeyCombo-style struct accessor that takes the address of a fixed buffer / local.
+  public class Ev { public int id; public Ev(int i) { id = i; } }
+  [MethodImpl(MethodImplOptions.NoInlining)] static float UNorm(uint v, uint min, uint max) => (float)(v - min) / (max - min);
+  [MethodImpl(MethodImplOptions.NoInlining)] static float INorm(int v, int min, int max) => (float)(v - min) / (max - min);
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe float ReadFloatLike(void* p, int fmt) {
+    switch (fmt) {
+      case 0: return INorm(*(int*)p, int.MinValue, int.MaxValue);
+      case 1: return UNorm(*(uint*)p, uint.MinValue, uint.MaxValue);
+      case 2: return INorm(*(short*)p, short.MinValue, short.MaxValue);
+      case 3: return UNorm(*(ushort*)p, ushort.MinValue, ushort.MaxValue);
+      case 4: return UNorm(*(byte*)p, byte.MinValue, byte.MaxValue);
+      case 5: return *(float*)p;
+      default: return (float)*(double*)p;
+    }
+  }
+  public unsafe struct Combo { fixed byte inc[8]; int n;
+    public void Add(int k) { if (n < 8) { inc[n] = (byte)k; n++; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] public int GetInclude(int i) { fixed (byte* b = inc) return b[i]; } }
+  public static unsafe string HotShapes(int n) {
+    double facc = 0; long lacc = 0;
+    var buf = stackalloc byte[8];
+    var list = new List<Ev>();
+    var add = new List<Ev> { new Ev(1), new Ev(2), new Ev(3) };
+    var combo = new Combo();
+    for (int k = 0; k < 8; k++) combo.Add(k * 7 + 1);
+    for (int i = 0; i < n; i++) {
+      *(ulong*)buf = (ulong)(uint)(i * 2654435761u) * 0x9E3779B97F4A7C15UL;
+      if ((i & 7) == 5) *(float*)buf = i * 0.25f;
+      if ((i & 7) >= 6) *(double*)buf = i * 0.125;
+      facc += ReadFloatLike(buf, i & 7);
+      list.AddRange(add);
+      if (list.Count > 300) list.Clear();
+      lacc += list.Count + combo.GetInclude(i & 7);
+    }
+    return "hotshapes " + lacc + " " + facc.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+  }
   public static string Localloc(int n) {
     long acc = 0;
     for (int i = 0; i < n; i++) acc += Stack(i);

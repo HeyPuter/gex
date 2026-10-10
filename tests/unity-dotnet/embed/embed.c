@@ -296,6 +296,12 @@ main (int argc, char **argv)
 	P llr = mono_runtime_invoke (ll, NULL, llargs, &exc);
 	check ("Localloc", exc);
 	printf ("%s\n", mono_string_to_utf8 (llr));
+	P hs = mono_class_get_method_from_name (k, "HotShapes", 1);
+	int hsn = 20000;
+	void *hsargs [1] = { &hsn };
+	P hsr = mono_runtime_invoke (hs, NULL, hsargs, &exc);
+	check ("HotShapes", exc);
+	printf ("%s\n", mono_string_to_utf8 (hsr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };
