@@ -7895,10 +7895,39 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // libraries at the same addresses -- finding the old program's *relocated*
     // copy, whose `.got.plt` sends a call through the PLT into unmapped memory.
     let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
+    let old_code: Vec<(u64, u64)> = h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
+        .map(|v| (v.start, v.end))
+        .collect();
+    // The dead arena the new program may reuse: the old map's own spans, and
+    // in a forked child everything it inherited below `ADOPTED_TOP` (its shim
+    // never allocates there; see `arena_take`) -- less anything the runtime
+    // owns, by the memory map's own record.
+    let mut dead: Vec<(u64, u64)> = h.kernel.mem.arena_spans().to_vec();
+    let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if inherited > gex_abi::ARENA_BOTTOM {
+        dead.push((gex_abi::ARENA_BOTTOM, inherited));
+    }
+    let dead: Option<Vec<(u64, u64)>> = dead
+        .iter()
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem =
         gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    if let Some(dead) = dead {
+        h.kernel.mem.donate_arena(&dead);
+    }
+    // Everything keyed by a code address of the old program forgets it, now
+    // that the new one may map code there.
+    cgen::on_exec(&old_code);
+    fjit::on_retire(&old_code);
     {
         // The live memory size, not `guest_bytes().len()` (which is the whole
         // 4 GiB nameable range): the fill must stay inside what actually exists.

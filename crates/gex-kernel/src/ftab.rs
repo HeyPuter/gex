@@ -34,6 +34,10 @@ pub enum Tier {
     Region,
 }
 
+/// An install's module once its program is gone ([`FuncMap::forget_all`]):
+/// a table catching up skips it.
+pub const DEAD_MODULE: u32 = u32::MAX;
+
 /// One module's functions in the table: `len` slots from `base`, filled by
 /// the module's element segment when a thread instantiates it. `module` is
 /// the host's handle for it (an index into its own list of modules).
@@ -193,6 +197,27 @@ impl FuncMap {
         let f = self.by_addr.remove(&addr)?;
         self.unref(f.idx);
         Some(f.idx)
+    }
+
+    /// `execve`: nothing installed so far belongs to the new program. Every
+    /// address is retired (returned, for the caller's caches) and every
+    /// install is marked [`DEAD_MODULE`], so a table that catches up later --
+    /// a Worker for a thread the new program starts -- skips it rather than
+    /// instantiate the old program's modules (a replaced library's provider
+    /// would be linked as something else, its data where the new program's
+    /// now is).
+    pub fn forget_all(&mut self) -> Vec<(u64, u32)> {
+        let gone: Vec<u64> = self.by_addr.keys().copied().collect();
+        let mut out = Vec::with_capacity(gone.len());
+        for a in gone {
+            if let Some(i) = self.retire(a) {
+                out.push((a, i));
+            }
+        }
+        for i in &mut self.installs {
+            i.module = DEAD_MODULE;
+        }
+        out
     }
 
     /// Retire every function whose entry lies in `[start, end)`.
@@ -388,6 +413,21 @@ fn leb(b: &[u8]) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_all_retires_every_address_and_kills_every_install() {
+        let mut m = FuncMap::new();
+        m.publish(3, 7, Tier::Unit, &[(0x1000, 0), (0x2000, 2)]);
+        m.publish(1, 0x8000_0001, Tier::Unit, &[(0xffff_f000_0000, 0)]);
+        let gone = m.forget_all();
+        assert_eq!(gone.len(), 3);
+        assert!(m.get(0x1000).is_none() && m.get(0xffff_f000_0000).is_none());
+        assert!(m.installs().iter().all(|i| i.module == DEAD_MODULE));
+        // The next program's installs are live, past the old indices.
+        let n = m.publish(2, 9, Tier::Unit, &[(0x1000, 1)]);
+        assert_eq!(m.install(n).module, 9);
+        assert_eq!(m.get(0x1000).unwrap().idx, m.install(n).base + 1);
+    }
 
     #[test]
     fn publish_maps_and_retires() {

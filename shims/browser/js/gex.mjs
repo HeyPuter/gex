@@ -3263,7 +3263,11 @@ export class Gex {
     while (st.have < len) {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
       const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
-      if (kind === 1) this.#cgenInstall(e.gex_ftab_install_unit(v) >>> 0, e.gex_ftab_install_base(v) >>> 0);
+      // A module of a program an execve replaced (`FuncMap::forget_all`) is skipped.
+      if (kind === 1) {
+        const u = e.gex_ftab_install_unit(v) >>> 0;
+        if (u !== 0xffffffff) this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
+      }
       else if (kind === 2) st.ftab.set(tIdx(v), st.resolve);
       st.have++;
       e.gex_cgen_have(st.have);
