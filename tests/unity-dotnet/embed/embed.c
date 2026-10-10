@@ -101,6 +101,19 @@ static void Throws (P msg)
 	mono_raise_exception (mono_get_exception_argument (NULL, mono_string_to_utf8 (msg)));
 	printf ("not reached %d\n", keep);
 }
+/* The wasm JIT's direct guest calls (T.NativeDirect): a byref, both float widths, sub-word integers, a bool return,
+ * more arguments than registers; and a P/Invoke with only scalars. */
+static long long Accum (long long *acc, float f, double d, signed char b, unsigned short c, long long x)
+{
+	*acc += (long long) (f * 4) + (long long) (d * 8) + b + c + (x >> 33);
+	return *acc * 3 + 1;
+}
+static _Bool IsOdd (int x) { return x & 1; }
+static int Inc (int x) { return x + 1; }
+__attribute__((visibility("default"))) long long gex_mad (long long a, int b, double c, float d, long long e, int f, int g)
+{
+	return a * b + (long long) (c * 2) + (long long) d + e - f + g;
+}
 typedef struct { float x, y, z; } Vec3;
 typedef struct { long a, b, c; double d; } Big;
 __attribute__((visibility("default"))) double gex_mix (int a, double b, Vec3 v, long c, float f)
@@ -161,6 +174,9 @@ main (int argc, char **argv)
 	mono_add_internal_call ("T::Twice", Twice);
 	mono_add_internal_call ("T::Concat", Concat);
 	mono_add_internal_call ("T::Throws", Throws);
+	mono_add_internal_call ("T::Accum", Accum);
+	mono_add_internal_call ("T::IsOdd", IsOdd);
+	mono_add_internal_call ("T::Inc", Inc);
 	int n = 50;
 	void *args [1] = { &n };
 	P exc = NULL;
@@ -244,6 +260,24 @@ main (int argc, char **argv)
 	P dr = mono_runtime_invoke (dels, NULL, dargs, &exc);
 	check ("Delegates", exc);
 	printf ("%s\n", mono_string_to_utf8 (dr));
+	P nd = mono_class_get_method_from_name (k, "NativeDirect", 1);
+	int ndn = 50;
+	void *ndargs [1] = { &ndn };
+	P ndr = mono_runtime_invoke (nd, NULL, ndargs, &exc);
+	check ("NativeDirect", exc);
+	printf ("%s\n", mono_string_to_utf8 (ndr));
+	P chk = mono_class_get_method_from_name (k, "Checked", 1);
+	int chn = 40;
+	void *chargs [1] = { &chn };
+	P chr = mono_runtime_invoke (chk, NULL, chargs, &exc);
+	check ("Checked", exc);
+	printf ("%s\n", mono_string_to_utf8 (chr));
+	P aa = mono_class_get_method_from_name (k, "ArgAddr", 1);
+	int aan = 40;
+	void *aaargs [1] = { &aan };
+	P aar = mono_runtime_invoke (aa, NULL, aaargs, &exc);
+	check ("ArgAddr", exc);
+	printf ("%s\n", mono_string_to_utf8 (aar));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };

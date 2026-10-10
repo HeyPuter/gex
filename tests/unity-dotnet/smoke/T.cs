@@ -73,6 +73,57 @@ public static class T {
       (again == held ? " stable" : " unstable") +
       (held - after >= (long)n * 800 ? " shrank" : " kept " + (held - after) + " of " + (held - before));
   }
+  // Checked arithmetic and unsigned-to-double conversions, each in its own clause-free method so the wasm JIT
+  // compiles it (OP_IADDCC/ISUBCC/LADDCC/LSUBCC + COND_EXC, OP_IMUL_OVF[_UN], OP_[I|L]CONV_TO_R_UN).
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CAdd(int a, int b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CSub(int a, int b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CAddU(uint a, uint b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CSubU(uint a, uint b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CMul(int a, int b) => checked(a * b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CMulU(uint a, uint b) => checked(a * b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static long CAddL(long a, long b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static ulong CSubUL(ulong a, ulong b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double UToD(uint a) => a;
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double ULToD(ulong a) => a;
+  static char Ovf(Func<long> f, long want) {
+    try { return f() == want ? '.' : 'W'; } catch (OverflowException) { return 'O'; }
+  }
+  public static string Checked(int n) {
+    var sb = new System.Text.StringBuilder("checked ");
+    for (int r = 0; r < n; r++) {
+      if (r > 0 && r < n - 1) { CAdd(r, r); CSub(r, r); CAddU(1, 2); CSubU(3, 2); CMul(r, 3); CMulU(2, 3); CAddL(r, 1); CSubUL(5, 1); UToD(7); ULToD(7); continue; }
+      sb.Append(Ovf(() => CAdd(int.MaxValue - 1, 1), int.MaxValue)).Append(Ovf(() => CAdd(int.MaxValue, 1), 0));
+      sb.Append(Ovf(() => CAdd(int.MinValue, -1), 0)).Append(Ovf(() => CSub(int.MinValue, 1), 0)).Append(Ovf(() => CSub(-5, 7), -12));
+      sb.Append(Ovf(() => CAddU(uint.MaxValue, 1), 0)).Append(Ovf(() => CAddU(uint.MaxValue - 1, 1), uint.MaxValue));
+      sb.Append(Ovf(() => CSubU(1, 2), 0)).Append(Ovf(() => CSubU(2, 2), 0));
+      sb.Append(Ovf(() => CMul(65536, 32768), 0)).Append(Ovf(() => CMul(-65536, 32768), int.MinValue)).Append(Ovf(() => CMul(46341, -46340), -2147441940));
+      sb.Append(Ovf(() => CMulU(65536, 65536), 0)).Append(Ovf(() => CMulU(65535, 65537), uint.MaxValue));
+      sb.Append(Ovf(() => CAddL(long.MaxValue, 1), 0)).Append(Ovf(() => CAddL(long.MinValue, long.MaxValue), -1));
+      sb.Append(Ovf(() => unchecked((long)CSubUL(0, 1)), 0)).Append(Ovf(() => unchecked((long)CSubUL(ulong.MaxValue, 1)), unchecked((long)(ulong.MaxValue - 1))));
+      sb.Append(UToD(uint.MaxValue) == 4294967295.0 ? '.' : 'W').Append(ULToD(ulong.MaxValue) == 18446744073709551615.0 ? '.' : 'W');
+      sb.Append(' ');
+    }
+    return sb.ToString().TrimEnd();
+  }
+  // ldarga of scalar arguments (OP_LDADDR of an argument): the wasm JIT homes the argument in its addr frame.
+  public struct PtrBox { public IntPtr v; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static PtrBox ArgAsBox(IntPtr p) => Unsafe.As<IntPtr, PtrBox>(ref p);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int ArgInt(int x) { ref int r = ref x; r += 5; return x * 3 + Bump(ref x); }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int ArgByte(byte b, sbyte c) { ref byte r = ref b; r = (byte)(r + 250); ref sbyte q = ref c; q = (sbyte)(q - 100); return b * 1000 + c; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double ArgDouble(double d, float f) { ref double r = ref d; r *= 2; ref float g = ref f; g += 0.5f; return d + f; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static long ArgLong(long l, int k) { ref long r = ref l; for (int i = 0; i < k; i++) r = r * 3 + i; return l; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int Bump(ref int v) { v++; return v; }
+  public static string ArgAddr(int n) {
+    long acc = 0;
+    for (int i = 0; i < n; i++) {
+      acc += ArgAsBox((IntPtr)(i * 8)).v.ToInt64();
+      acc += ArgInt(i);
+      acc += ArgByte((byte)i, (sbyte)i);
+      acc += (long)ArgDouble(i, i);
+      acc += ArgLong(i, 3);
+    }
+    return "argaddr " + acc;
+  }
   public static string Delegates(int n) {
     long sum = 0; string tags = "";
     for (int i = 0; i < n; i++) {
@@ -107,9 +158,19 @@ public static class T {
     for (int i = 0; i < n; i++) a = BIncInterp(a);
     return a;
   }
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern int Inc(int x);
+  // A guest InternalCall: from JIT code it is a direct call (mono_wasm_jit_gex_native_call); "icall-interp" is the
+  // same call from a method the JIT refuses, i.e. the interpreter's own path.
+  static int BLoopIcall(int n) { int a = 0; for (int i = 0; i < n; i++) a = Inc(a); return a; }
+  static unsafe int BLoopIcallInterp(int n) {
+    int a = 0;
+    if (n == int.MinValue) return bnever(n);
+    for (int i = 0; i < n; i++) a = Inc(a);
+    return a;
+  }
   public static string CallBench(int n) {
     var sb = new System.Text.StringBuilder("callbench ns/call:");
-    foreach (var (name, f) in new (string, Func<int, int>)[] { ("same", BLoopSame), ("to-refused", BLoopToInterp), ("from-refused", BLoopFromInterp), ("refused-refused", BLoopInterpInterp) }) {
+    foreach (var (name, f) in new (string, Func<int, int>)[] { ("same", BLoopSame), ("to-refused", BLoopToInterp), ("from-refused", BLoopFromInterp), ("refused-refused", BLoopInterpInterp), ("icall", BLoopIcall), ("icall-interp", BLoopIcallInterp) }) {
       f(1000); f(1000);   // past the JIT threshold, compiled
       var sw = System.Diagnostics.Stopwatch.StartNew();
       int r = f(n);
@@ -150,6 +211,30 @@ public static class T {
   [MethodImpl(MethodImplOptions.InternalCall)] static extern int Twice(int x);
   [MethodImpl(MethodImplOptions.InternalCall)] static extern string Concat(string a, string b);
   [MethodImpl(MethodImplOptions.InternalCall)] static extern void Throws(string msg);
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern long Accum(ref long acc, float f, double d, sbyte b, ushort c, long x);
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern bool IsOdd(int x);
+  [DllImport("__Internal")] static extern long gex_mad(long a, int b, double c, float d, long e, int f, int g);
+  // Clause-free, so the wasm JIT compiles them and calls the guest directly (mono_wasm_jit_gex_native_call).
+  [MethodImpl(MethodImplOptions.NoInlining)] static long NatLoop(int n) {
+    long acc = 0, r = 0;
+    for (int i = 0; i < n; i++) {
+      r += Accum(ref acc, i * 0.5f, i * 0.25, (sbyte)(-i), (ushort)(60000 + i), (long)i << 33);
+      if (IsOdd(i)) r += Twice(i);
+      r += Concat("a", i.ToString()).Length;
+      r += gex_mad(i, 3, i * 0.75, 2.5f, -i, 7, i);
+    }
+    return r ^ acc;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static void Thrower(string m) { Throws(m); }
+  public static string NativeDirect(int n) {
+    // Several rounds: a method is compiled once it has been called, so the first round runs interpreted.
+    long r = 0;
+    for (int k = 0; k < 4; k++) r += NatLoop(n);
+    string t = "";
+    for (int k = 0; k < 3; k++)
+      try { Thrower("directly"); t += " no throw"; } catch (ArgumentException e) { t += " caught " + e.Message; }
+    return "native " + r + t;
+  }
   [DllImport("__Internal")] static extern double gex_mix(int a, double b, Vec3 v, long c, float f);
   [DllImport("__Internal")] static extern Vec3 gex_scale(Vec3 v, float k);
   [DllImport("__Internal")] static extern Big gex_big(long a, Big b, long c, long d, long e, long f, long g, long h);
