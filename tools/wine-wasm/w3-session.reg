@@ -1,0 +1,28 @@
+REGEDIT4
+
+; Every W3 prefix's session (docs/wine-native.md §3.17): stage-native.sh
+; applies it to a staged prefix that has a registry, and a prefix that
+; wineboot installs afresh takes it after the install with
+; `reg-apply.py PFX/system.reg w3-session.reg`.
+;
+; - MountMgr, winebus, wineusb and winebth each need a Unix library the W3
+;   loader does not have (DriverEntry fails with STATUS_DLL_NOT_FOUND), so
+;   services.exe would start a winedevice for each only to see it fail:
+;   MountMgr becomes demand-start and the three root bus devices go. Undo
+;   this when they get their Unix sides.
+; - The Event Log (a svchost) becomes demand-start: Wine's ReportEvent is a
+;   stub that never calls it.
+;
+; Kept: Plug and Play (device notifications), NDIS and the NSI proxy
+; (network adapters, GetAdaptersAddresses). lean-session.reg drops those
+; too, for one-shot console programs.
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\MountMgr]
+"Start"=dword:00000003
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Eventlog]
+"Start"=dword:00000003
+
+[-HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum\ROOT\WINE\WINEBUS]
+[-HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum\ROOT\WINE\WINEUSB]
+[-HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum\ROOT\WINE\WINEBTH]
