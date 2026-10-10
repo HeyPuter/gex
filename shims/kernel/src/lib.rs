@@ -624,7 +624,8 @@ pub extern "C" fn k_slot_count() -> u32 {
 /// compiled code (that is a JS object): the Worker feeds them to the same
 /// `pending` queue a fresh translation uses.
 struct SharedModule {
-    wasm: Vec<u8>,
+    /// Where its bytes are in [`ModStore::slab`]: chunk, offset, length.
+    at: (u32, u32, u32),
     /// How large the dispatch table must be. A fact about the *producing*
     /// process; the installer's own high-water mark understates it, and the
     /// install then throws.
@@ -655,6 +656,37 @@ struct ModStore {
     translated: BTreeSet<u64>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
+    /// The modules' bytes, appended into chunks of [`SLAB_CHUNK`] (a larger
+    /// module gets a chunk of its own). One allocation per module grew the
+    /// kernel's shared memory every few modules -- dlmalloc asks `memory.grow`
+    /// for little more than each request -- and growing a shared memory is
+    /// slow: 1.9 s of a 40 s node start-up in the page's runtime.
+    slab: Vec<Vec<u8>>,
+}
+
+const SLAB_CHUNK: usize = 16 << 20;
+
+impl ModStore {
+    fn bytes(&self, sm: &SharedModule) -> &[u8] {
+        let (c, off, len) = sm.at;
+        self.slab
+            .get(c as usize)
+            .and_then(|v| v.get(off as usize..off as usize + len as usize))
+            .unwrap_or(&[])
+    }
+
+    /// Room for `len` bytes: the chunk and offset they go at (written by the caller).
+    fn reserve(&mut self, len: usize) -> (u32, u32) {
+        let fits = self.slab.last().is_some_and(|v| v.capacity() - v.len() >= len);
+        if !fits {
+            self.slab.push(Vec::with_capacity(len.max(SLAB_CHUNK)));
+        }
+        let c = self.slab.len() - 1;
+        let v = &mut self.slab[c];
+        let off = v.len();
+        v.resize(off + len, 0);
+        (c as u32, off as u32)
+    }
 }
 
 /// How much translated wasm to keep for sharing. The kernel memory is capped at
@@ -669,7 +701,7 @@ fn modules() -> &'static Mutex<ModStore> {
     MODS.get_or_init(|| {
         Mutex::new(ModStore {
             mods: vec![SharedModule {
-                wasm: Vec::new(),
+                at: (u32::MAX, 0, 0),
                 slots: 0,
                 dirs: Vec::new(),
             }],
@@ -678,6 +710,7 @@ fn modules() -> &'static Mutex<ModStore> {
             translating: BTreeMap::new(),
             translated: BTreeSet::new(),
             total: 0,
+            slab: Vec::new(),
         })
     })
 }
@@ -699,8 +732,9 @@ pub unsafe extern "C" fn k_mod_store(
     if len == 0 || m.total + len as usize > MOD_BUDGET {
         return 0;
     }
-    let mut wasm = vec![0u8; len as usize];
-    unsafe { gex_kmem::pull_checked(wasm.as_mut_ptr(), ptr, len) };
+    let (c, off) = m.reserve(len as usize);
+    let dst = m.slab[c as usize][off as usize..].as_mut_ptr();
+    unsafe { gex_kmem::pull_checked(dst, ptr, len) };
     let mut raw = vec![0u8; dirs_len as usize];
     if dirs_len > 0 {
         unsafe { gex_kmem::pull_checked(raw.as_mut_ptr(), dirs_ptr, dirs_len) };
@@ -712,7 +746,7 @@ pub unsafe extern "C" fn k_mod_store(
         dirs.push((page, base));
     }
     m.total += len as usize;
-    m.mods.push(SharedModule { wasm, slots, dirs });
+    m.mods.push(SharedModule { at: (c, off, len), slots, dirs });
     // One-based: zero is how every caller says "no module".
     m.mods.len() as u32
 }
@@ -835,7 +869,7 @@ pub extern "C" fn k_mod_len(id: u32) -> u32 {
         .unwrap_or_else(|e| e.into_inner())
         .mods
         .get((id as usize).wrapping_sub(1))
-        .map(|m| m.wasm.len() as u32)
+        .map(|m| m.at.2)
         .unwrap_or(0)
 }
 
@@ -860,11 +894,12 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> 
     let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else {
         return 0;
     };
-    if sm.wasm.len() > cap as usize {
+    let b = m.bytes(sm);
+    if b.len() > cap as usize {
         return 0;
     }
-    unsafe { gex_kmem::push_checked(out, sm.wasm.as_ptr(), sm.wasm.len() as u32) };
-    sm.wasm.len() as u32
+    unsafe { gex_kmem::push_checked(out, b.as_ptr(), b.len() as u32) };
+    b.len() as u32
 }
 
 /// And the `dirs`, in the same twelve-byte encoding they arrived in.

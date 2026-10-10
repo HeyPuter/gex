@@ -1245,7 +1245,7 @@ impl ModuleBuilder {
             table_slots,
             dir_entries,
             covered,
-            page_table: self.page_table.clone(),
+            page_table: std::mem::take(&mut self.page_table),
             module_id,
             n_blocks,
             exported_blocks,

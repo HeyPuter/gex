@@ -1029,7 +1029,7 @@ fn emit_modules(
             text_base,
             0,
             Linkage::Shared,
-            pages.clone(),
+            std::mem::take(pages),
             shared_memory,
         );
         builder.set_demand_fill(demand_fill);

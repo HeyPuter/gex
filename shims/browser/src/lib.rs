@@ -11771,12 +11771,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         }
         phase(11);
-    let (unit, stats) = gex_xlate::translate_runtime(
+    // The page table moves in and back out: cloning it (a BTreeMap of every
+    // page the process has numbered) on each miss, twice, was a second of a
+    // node start-up's 7,400 misses.
+    let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
-            h.jit.page_table.clone(),
+            std::mem::take(&mut h.jit.page_table),
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
@@ -11788,6 +11791,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             &h.jit.intrinsics,
         );
         h.jit.translated = known;
+        h.jit.page_table = std::mem::take(&mut unit.page_table);
         if pc == 0x10f6d24 {
             let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
@@ -11802,7 +11806,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         xlate_add(0, stats.instructions as u64);
         xlate_add(1, stats.wasm_bytes as u64);
         xlate_add(2, 1);
-        h.jit.page_table = unit.page_table.clone();
         // Into the system-wide store, so a sibling installs it rather than
         // re-lifting. Published by what the unit *covers*, not what it allocated
         // (handed the allocation list, nine of ten units published nothing); the
@@ -13540,12 +13543,22 @@ static EXTERNAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// `moduleContentKey` in gex.mjs, as one u64 (`a` high, `b` low): what a
 /// module's store slot is checked against.
 fn content_key(bytes: &[u8]) -> u64 {
+    // A word at a time (little-endian), then the tail bytes: the same as
+    // gex.mjs `moduleContentKey`, which hashes every module a Worker installs
+    // and spent 0.65 s of a node start-up doing it a byte at a time.
     let mut a: u32 = 0x811c_9dc5;
     let mut b: u32 = 0x9e37_79b9;
-    for (i, &x) in bytes.iter().enumerate() {
-        a = (a ^ x as u32).wrapping_mul(0x0100_0193);
-        b = (b ^ (x as u32).wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+    let mut step = |i: usize, x: u32| {
+        a = (a ^ x).wrapping_mul(0x0100_0193);
+        b = (b ^ x.wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
         b ^= b >> 13;
+    };
+    let words = bytes.len() / 4;
+    for i in 0..words {
+        step(i, u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()));
+    }
+    for (i, &x) in bytes[4 * words..].iter().enumerate() {
+        step(words + i, x as u32);
     }
     ((a as u64) << 32) | b as u64
 }

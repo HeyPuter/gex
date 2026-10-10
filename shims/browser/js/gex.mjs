@@ -188,12 +188,26 @@ function storeAppend(sab, bytes) {
 }
 function moduleContentKey(bytes) {
   if (!(bytes instanceof Uint8Array)) return null;
+  // A little-endian word at a time, then the tail bytes (the shim's
+  // `content_key` is the same function): a byte at a time was 0.65 s of a
+  // node start-up per Worker.
   let a = 0x811c9dc5;
   let b = 0x9e3779b9;
-  for (let i = 0; i < bytes.length; i++) {
+  const n = bytes.length >>> 2;
+  const words = (bytes.byteOffset & 3) === 0 && !(bytes.buffer instanceof SharedArrayBuffer)
+    ? new Uint32Array(bytes.buffer, bytes.byteOffset, n)
+    : null;
+  for (let i = 0; i < n; i++) {
+    const x = words ? words[i]
+      : (bytes[4 * i] | (bytes[4 * i + 1] << 8) | (bytes[4 * i + 2] << 16) | (bytes[4 * i + 3] << 24)) >>> 0;
+    a = Math.imul(a ^ x, 0x01000193);
+    b = Math.imul(b ^ ((x + i) | 0), 0x85ebca6b);
+    b ^= b >>> 13;
+  }
+  for (let i = 4 * n; i < bytes.length; i++) {
     const x = bytes[i];
     a = Math.imul(a ^ x, 0x01000193);
-    b = Math.imul(b ^ (x + i), 0x85ebca6b);
+    b = Math.imul(b ^ (x + (n + i - 4 * n)), 0x85ebca6b);
     b ^= b >>> 13;
   }
   return `${bytes.length}:${a >>> 0}:${b >>> 0}`;
