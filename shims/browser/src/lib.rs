@@ -6430,7 +6430,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         } else {
                             String::new()
                         };
-                        warn_line(&format!(
+                        // Informational (a handler running is normal), so the
+                        // debug console: a console error fails a page test.
+                        trace_line(&format!(
                             "[sig] pid {} runs a handler at {target:#x}{last}\n",
                             h.kernel.pid
                         ));
@@ -7046,6 +7048,12 @@ fn stage_fork_fds(h: &Host, child: i32) {
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
             unsafe { k_pipe_open_end(id, write as i32, child) };
+        } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(&file.path) {
+            // A socketpair end is two pipe ends, both the child's to hold.
+            unsafe {
+                k_pipe_open_end(rx, 0, child);
+                k_pipe_open_end(tx, 1, child);
+            }
         } else if let Some((id, master)) = pty_ref(&file.path) {
             // The child inherits this pty end; open it on the child's behalf so
             // the parent's copy closing is not the last reference.
@@ -7173,6 +7181,16 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     flags,
                     !write,
                     write,
+                )
+            } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(path) {
+                // Both pipe ends were opened for the child by the parent.
+                let Some(r) = global_pipes() else { continue };
+                gex_kernel::file::OpenFile::new(
+                    Arc::new(gex_kernel::pipe::RemoteSockEnd::new(rx, tx, r)),
+                    path.to_string(),
+                    flags,
+                    true,
+                    true,
                 )
             } else if let Some((id, master)) = pty_ref(path) {
                 // Same as a pipe end: the parent already opened it for the child.
@@ -10635,8 +10653,10 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let hi = lo + gex_abi::DISPATCH_PAGE;
             h.jit.translated.retain(|&a| a < lo || a >= hi);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // Informational: a JIT (V8 under node) rewrites its code all the
+            // time and this is the runtime keeping up, not a fault.
             if n <= 8 || tracing() {
-                warn_line(&format!(
+                trace_line(&format!(
                     "gex: self-modifying-code: re-lifting page {page:#x} \
                      (addr={:#x}, {n} so far)\n",
                     addr as u64,

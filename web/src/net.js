@@ -52,6 +52,11 @@ export class WispNetwork {
   #next = 1;
   #url;
   #onEvent;
+  /** Set once a connection has been made: from then on a drop is redialled. */
+  #redialing = false;
+  #drops = 0;
+  /** `[id, host, port]` of connects made while redialling. */
+  #waiting = [];
 
   constructor(wispUrl, onEvent = () => {}) {
     this.#url = wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
@@ -73,24 +78,51 @@ export class WispNetwork {
       const fail = (e) => reject(new Error(`wisp: ${e?.message || 'could not connect'}`));
       c.onopen = () => {
         this.#conn = c;
+        this.#drops = 0;
         resolve();
+        // Streams opened while the connection was down go out now.
+        const waiting = this.#waiting;
+        this.#waiting = [];
+        for (const [id, host, port] of waiting) this.connect(id, host, port);
       };
       c.onerror = fail;
       c.onclose = () => {
         // Every stream on a dropped connection is gone with it.
-        for (const s of this.#streams.values()) s.state = CLOSED;
+        for (const s of this.#streams.values()) if (!s.waiting) s.state = CLOSED;
+        if (this.#conn !== c) return;
         this.#conn = null;
         this.#onEvent('closed');
+        this.#reconnect();
       };
       setTimeout(() => reject(new Error('wisp: the proxy did not answer')), 10000);
     });
     this.#onEvent('open');
   }
 
+  /** A proxy that drops the WebSocket (one closed every connection after a
+   * few seconds) is dialled again, so the guest's *next* connection works:
+   * apt fetches each index on a new stream, and without this every one after
+   * the drop was ENETUNREACH. Streams that were open are lost either way. */
+  #reconnect() {
+    if (this.#redialing) return;
+    this.#redialing = true;
+    const wait = Math.min(250 * 2 ** this.#drops, 8000);
+    this.#drops += 1;
+    console.info(`[wisp] connection dropped; dialling again in ${wait} ms`);
+    setTimeout(() => {
+      this.start()
+        .catch((e) => console.warn(`[wisp] ${e.message}`))
+        .finally(() => {
+          this.#redialing = false;
+          if (!this.#conn) this.#reconnect();
+        });
+    }, wait);
+  }
+
   // -- the seven calls the shim makes --------------------------------------
 
   open() {
-    if (!this.#conn) return 0;
+    if (!this.#conn && !this.#redialing) return 0;
     const id = this.#next++;
     this.#streams.set(id, new Stream(id));
     return id;
@@ -99,7 +131,15 @@ export class WispNetwork {
   /** The shim's `net_connect`: point an already-opened stream at a host. */
   connect(id, host, port) {
     const s = this.#streams.get(id);
-    if (!s || !this.#conn) return;
+    if (!s) return;
+    if (!this.#conn) {
+      // Redialling: the stream stays CONNECTING until the proxy is back.
+      if (!this.#redialing) return;
+      s.waiting = true;
+      this.#waiting.push([id, host, port]);
+      return;
+    }
+    s.waiting = false;
     let w;
     try {
       w = this.#conn.create_stream(host, port, 'tcp');

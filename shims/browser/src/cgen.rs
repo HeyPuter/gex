@@ -802,7 +802,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         }
     }
     let (regs, dirs, slots) = bridges(&addrs);
-    crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    crate::trace_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
 }

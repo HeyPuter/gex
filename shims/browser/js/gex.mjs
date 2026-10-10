@@ -4820,7 +4820,8 @@ export class Gex {
       // lost when the process exits soon after (tests/browser-registry.sh).
       const fs = trace ? globalThis.process?.getBuiltinModule?.('fs') : null;
       if (fs) fs.writeSync(2, `${line}\n`);
-      else console.error(line);
+      // A size report, not an error (a console error fails a page test).
+      else console.debug(line);
     }
     const [, a, b] = key.split(':');
     e.gex_jit_note_external(BigInt(off), bytes.length, Number(a) | 0, Number(b) | 0);
