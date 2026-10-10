@@ -2422,3 +2422,41 @@ Not yet:
     interpreter in between), caching what the lazy interpreter path resolves per site, and then better
     bodies. Even then, the bodies alone are not faster than the interpreter, so HK stays on
     `GEXMONO_WASM_JIT=0`.
+- **Making the hot residual callees compile (patches 0007-0020, 2026-10-10).**
+  The rule: rank callees by how many interpreter legs they cost, then make the emitter handle each
+  bail reason, with a test for each. Leg counts are over a whole 12-minute King's Pass run, from the
+  `iroute top` / `iroute kinds` tables. hg10 is the baseline (0001-0006). hg17 is p9 = 0005-0008
+  plus LDADDR_ARG. hg22 (p25, through 0019) and hg25 (p29, every knob at its default) are queued as
+  q77/q78.
+
+  | reason | example callee (hg10 legs) | fix | after | test |
+  |---|---|---|---|---|
+  | ldarga of a scalar argument | Unmarshal.FromIntPtrUnsafe (3,005,829) | LDADDR_ARG on in the provider | gone in hg17 | T.ArgAddr |
+  | ldaddr (same gate) | KeyCombo.GetInclude (432,402) | same | gone in hg17 | T.HotShapes (Combo) |
+  | OP_IADDCC in shared generic code | List\<DelayedEvent\>.AddRange (707,514) | 0008 checked arithmetic | gone in hg17 | T.Checked, T.HotShapes |
+  | int_conv_to_r_un | InputStateBlock.ReadFloat (571,200) | 0008 | the bail is gone; still 624,382 legs in hg17, now as retries of an invalid module (next row) | T.HotShapes (ReadFloatLike) |
+  | invalid module (a reused 32-bit load in an i64 register) | hg17: invalid=1322; embed: AssemblyName.FillName re-emitted 106 times | 0019 | embed invalid 106 -> 0 | T.LcseWide |
+  | guest icall / P/Invoke | Component.get_gameObject_Injected (1,617,846) and 438 others (13.2M legs in all) | 0009 direct guest calls | hg22 | T.NativeDirect, CallBench |
+  | the runtime's own icalls, handles included | GCHandle.InternalGet (3.84M in hg17), RuntimeType.GetName, Array.GetLowerBoundInternal, FastAllocateString (3.8M "icall-handles" in all) | 0018 | embed residual 70,359 -> 236 | T.MonoIcalls |
+  | string ctors | string(char,int) via the wrapper | 0018 (managed String.Ctor) | embed: 0 | T.MonoIcalls |
+  | nested finally / call_handler continuations | tk2dSprite.UpdateMaterial (99,952), GUILayoutGroup.CalcHeight (42,961) | 0012, 0014 | hg22 | T.NestedFinally |
+  | ldarga of a reference argument | ObjectEqualityComparer\<Type\>.GetHashCode (69,029) | 0011 | hg22 | T.ArgAddr (RefArg) |
+  | "residual reflection" gate | ActionData.LoadActionField (144,905) | 0013: only once a Reflection.Emit image exists | hg22 | T.Reflect |
+  | ldarga in EH methods | - | 0015 | - | T.FinArg |
+  | localloc, 64-bit checked multiply | Number.FormatFloat, BinaryReader.ReadInt32 | 0016 | - | T.Localloc |
+  | vtype call arg lost its variable | BinaryReader.ReadString, NumberToString\<char\>, ResourceManager..ctor | 0017 | embed: compile | T.Localloc (ReadString) |
+
+  Bails left in the embed suite: managed-to-native and runtime-invoke wrappers (marshalling
+  wrappers, deliberately refused), REQSECOBJ methods and their callers (correct: they need a stack
+  walk), and one EH filter clause.
+- **Knob re-enable pass (p25 -> p29).** The wasm64 provider shipped with every JIT fast path that does
+  its own pointer arithmetic set to 0. Each one alone on the embed suite at threshold 1:
+  - Clean as-is: GUARDED_INLINE, DELEGATE_DEVIRT, IC_MID, PRED_MID, LAZY_COLD, INLINE_COLD_THROW,
+    VCALL_AOT_WAYS, LAZY_NOGC, PROF_ORIGIN, PROF_INLINEE.
+  - Emitted modules that do not validate ("expected i64, found i32"): INLINE_ALLOC (55), T2 (688),
+    EH_REC (43), FAST_TLS (7). Patch 0020 ports the inline TLAB bump, the fast thread read, the EH
+    record and the tier-2 poll to pointer width; all four now give invalid=0.
+  - DIRECT_DEPS in the off-list was a no-op: "0" is outside its range [1, 512], so the runtime's 512
+    was kept.
+  - All of them together, at the runtime's own defaults (DELEGATE_DEVIRT=15), pass the suite on both
+    legs: invalid=0, 3-4 tier-2 compiles, 10 guarded inlines. The provider's off-list is removed.
