@@ -132,7 +132,7 @@ pub const WEB_NT_DIR: &str = "runtime/web/nt";
 /// The files of [`WEB_NT_DIR`] besides `js/`.
 pub const WEB_NT_WASM: [&str; 3] = ["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
 /// The host JavaScript a Windows program's web run needs (shims/browser/js).
-pub const WEB_NT_JS: [(&str, &str); 7] = [
+pub const WEB_NT_JS: [(&str, &str); 9] = [
     ("run-node.mjs", include_str!("../../../shims/browser/js/run-node.mjs")),
     ("host.mjs", include_str!("../../../shims/browser/js/host.mjs")),
     ("worker.mjs", include_str!("../../../shims/browser/js/worker.mjs")),
@@ -140,6 +140,8 @@ pub const WEB_NT_JS: [(&str, &str); 7] = [
     ("gl-bridge.mjs", include_str!("../../../shims/browser/js/gl-bridge.mjs")),
     ("wl-bridge.mjs", include_str!("../../../shims/browser/js/wl-bridge.mjs")),
     ("net-node.mjs", include_str!("../../../shims/browser/js/net-node.mjs")),
+    ("net-bridge.mjs", include_str!("../../../shims/browser/js/net-bridge.mjs")),
+    ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
 ];
 /// `run.mjs` of a Windows program's project: the web build under Node, on
 /// the browser runtime a page loads (run-node.mjs), AOT-only.
