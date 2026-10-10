@@ -47,6 +47,7 @@ const kernel = { module: kernelModule, memory: kernelMemory };
 // file makes the memory, so it can instantiate the module once and ask.
 const probe = (await WebAssembly.instantiate(kernelModule, {
   env: {
+    lazy_fetch: () => -1, // the kernel's lazy-file reads (none here)
     memory: kernelMemory,
     process: new WebAssembly.Memory({ initial: 0xffff0000 / 65536, maximum: 0xffff0000 / 65536 }),
   },

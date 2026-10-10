@@ -287,6 +287,42 @@ pub fn load_or_compile(
 /// modules such as a function-tier unit, which the shared cache's budget
 /// would evict at once), compiled from `wasm` when absent or unusable.
 pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<Module> {
+    memo(engine, wasm.len(), || format!("at:{}", path.display()), || load_or_compile_at_uncached(engine, path, wasm))
+}
+
+/// Modules at least this large are kept for the life of the host process
+/// and handed to every later request for the same bytes: a module is
+/// immutable code and every store of one engine can instantiate it, so a
+/// guest process that starts the same program or library as an earlier one
+/// (every Wine child starts the 5.7 MB W3 loader; 2 s of Cranelift each)
+/// takes the compiled one. Small modules (runtime translations, by the
+/// hundred thousand, rarely repeated) are not kept.
+const MEMO_MIN_BYTES: usize = 1 << 20;
+
+/// The compiled modules kept by [`MEMO_MIN_BYTES`]: (engine, key, module).
+#[allow(clippy::type_complexity)]
+static MEMO: std::sync::Mutex<Vec<(Engine, String, Module)>> = std::sync::Mutex::new(Vec::new());
+
+fn memo(engine: &Engine, len: usize, key: impl FnOnce() -> String, make: impl FnOnce() -> Result<Module>) -> Result<Module> {
+    if len < MEMO_MIN_BYTES || std::env::var_os("GEX_NO_MODULE_MEMO").is_some() {
+        return make();
+    }
+    let key = key();
+    if let Some((_, _, m)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(e, k, _)| k == &key && Engine::same(e, engine)) {
+        return Ok(m.clone());
+    }
+    // Compiled outside the lock: another thread may compile the same module
+    // meanwhile, and both results are good; the first one kept wins.
+    let m = make()?;
+    let mut g = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, kept)) = g.iter().find(|(e, k, _)| k == &key && Engine::same(e, engine)) {
+        return Ok(kept.clone());
+    }
+    g.push((engine.clone(), key, m.clone()));
+    Ok(m)
+}
+
+fn load_or_compile_at_uncached(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<Module> {
     if let Ok(bytes) = std::fs::read(path) {
         // SAFETY: as for `load_or_compile`: written by `serialize` below, and
         // `deserialize` rejects an artifact for another engine.
@@ -332,6 +368,10 @@ fn content_name(wasm: &[u8]) -> String {
 /// compiler (no `compile` feature: an ejected project's) can only do the
 /// first, and says so when it cannot.
 pub fn compile(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    memo(engine, wasm.len(), || content_name(wasm), || compile_uncached(engine, wasm))
+}
+
+fn compile_uncached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     if let Some(dir) = precompiled_dir() {
         if let Ok(bytes) = std::fs::read(dir.join(content_name(wasm))) {
             // SAFETY: written by `precompile` with this runtime's engine
@@ -357,25 +397,45 @@ pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     let Some(dir) = cache_dir().map(|d| d.join("wasm32")) else {
         return compile(engine, wasm);
     };
-    let path = dir.join(content_name(wasm));
-    if let Ok(bytes) = std::fs::read(&path) {
-        // SAFETY: written below by this runtime with an engine of the same
-        // kind; `deserialize` checks the engine configuration and version.
-        if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
-            return Ok(m);
+    let name = content_name(wasm);
+    // And in memory for the host process: under W3 every Wine child execs
+    // the same 5.7 MB loader.
+    memo(engine, wasm.len(), || format!("cc:{name}"), || {
+        let path = dir.join(&name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            // SAFETY: written below by this runtime with an engine of the same
+            // kind; `deserialize` checks the engine configuration and version.
+            if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
+                return Ok(m);
+            }
         }
-    }
-    let m = compile_here(engine, wasm)?;
-    #[cfg(feature = "compile")]
-    if let Ok(bytes) = m.serialize() {
-        store(&dir, &path, &bytes);
-    }
-    Ok(m)
+        let m = compile_here(engine, wasm)?;
+        #[cfg(feature = "compile")]
+        if let Ok(bytes) = m.serialize() {
+            store(&dir, &path, &bytes);
+        }
+        Ok(m)
+    })
 }
 
 #[cfg(feature = "compile")]
 fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
-    Module::new(engine, wasm).map_err(anyhow::Error::from)
+    // `GEX_COMPILE_TRACE`: every compile here, its size and time, and who
+    // asked (the first few frames of ours).
+    let t0 = std::time::Instant::now();
+    let m = Module::new(engine, wasm).map_err(anyhow::Error::from);
+    if std::env::var_os("GEX_COMPILE_TRACE").is_some() {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let who: Vec<&str> = bt
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(": gex_") && !l.contains("gex_cache::"))
+            .map(|l| l.split_once(": ").map(|x| x.1).unwrap_or(l))
+            .take(4)
+            .collect();
+        eprintln!("gex: compiled {} KiB in {:.3}s for {}", wasm.len() >> 10, t0.elapsed().as_secs_f64(), who.join(" < "));
+    }
+    m
 }
 
 #[cfg(not(feature = "compile"))]

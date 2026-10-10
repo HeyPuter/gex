@@ -276,6 +276,7 @@ extern "C" {
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_add_lazy(path: gex_kernel::PAddr, path_len: u32, url: gex_kernel::PAddr, url_len: u32, size: u64) -> i32;
     /// The system-wide map from a page of a mapped object to the dispatch slots
     /// its code was translated into; zero means nobody has. In the kernel so
     /// the second process to run `ls` finds what the first one translated.
@@ -2520,6 +2521,16 @@ struct Jit {
     /// joining Worker instantiates these into its own tables to catch up. Order
     /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
+    /// Per registry entry: where its bytes are in the process's JS-side module
+    /// store (`Gex#moduleStore`) as `(offset, len)`, or `None` when they are in
+    /// `registry` itself. An entry kept there holds no bytes in this module's
+    /// heap: the registry grew without bound in a long fjit run (980 MiB of
+    /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
+    registry_ext: Vec<Option<(u64, u32)>>,
+    /// The bytes of the last modules kept in the JS-side store, still alive:
+    /// a sibling Worker that read the pending queue's front just before this
+    /// one popped it is copying them out (`gex_jit_pending_refresh`).
+    store_grace: std::collections::VecDeque<Vec<u8>>,
     /// Per registry module, a hash of each 256-byte chunk as it was pushed,
     /// so a stray write into the bytes can be found (`verify_registry`).
     registry_sums: Vec<Vec<u64>>,
@@ -3781,6 +3792,14 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // than copied: this runs once, and a second `gex_load` in the same Worker
     // is an `execve`, which gets its placement from the global table like
     // every other process.
+    // The interpreter, placed by gex's loader rather than mapped by the guest,
+    // announced as its `mmap` would have been: its function-tier unit
+    // (`?elfunits=ld-linux-x86-64.so.2`) is placed after the first syscall.
+    if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
+        if let Some(bytes) = read_file(path) {
+            kernel.new_code.extend(gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base()));
+        }
+    }
     kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
@@ -4000,6 +4019,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             provider: Default::default(),
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
+                registry_ext: Vec::new(),
+                store_grace: std::collections::VecDeque::new(),
                 registry_sums: Vec::new(),
                 registry_dense: Vec::new(),
                 ever_threaded: false,
@@ -4172,6 +4193,22 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     // exist yet -- `gex_load` builds it.
     let bytes = shim_slice(data, data_len).to_vec();
     FILES.0.borrow_mut().push((name.to_string(), bytes));
+}
+
+/// A file the guest reads from `url` (same origin) a megabyte at a time, as
+/// it reads (`TmpFs::add_lazy` in the global kernel): data too big to
+/// bundle. Only with a global kernel; a path the bundle has is left alone.
+#[no_mangle]
+pub extern "C" fn gex_add_lazy(path: u32, path_len: u32, url: u32, url_len: u32, size: u64) {
+    // SAFETY: scalars naming ranges of this module's memory, which the
+    // kernel copies from.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_add_lazy(gex_kernel::PAddr::from(path), path_len, gex_kernel::PAddr::from(url), url_len, size) };
+        }
+        return;
+    }
+    warn_line("gex_add_lazy: no global kernel; a lazy file is left out\n");
 }
 
 /// A bundled hard link: `path` becomes another name for the already-added
@@ -5617,22 +5654,25 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
         return -1;
     }
     let mut ns = max_ms as u64 * 1_000_000;
-    // The nearest deadline any thread holds: a `sleep` or timed `poll` is ended
-    // by the clock, not another Worker, so sleeping past it wakes late. And --
-    // read under the same lock -- whether THIS Worker's own thread is simply
-    // waiting on a futex, with the address and the generation it parked at.
+    // This Worker's thread's deadline: a `sleep` or timed `poll` is ended by
+    // the clock, not another Worker, so sleeping past it wakes late. Only its
+    // own: a Worker runs one thread (`schedule`), and every other thread's
+    // Worker parks to its own deadline. Taking the nearest deadline of *any*
+    // thread in the process woke every Worker whenever one thread's timed wait
+    // came due -- and at once, at the 1 ms floor below, for as long as an
+    // expired deadline sat unrescheduled. With Unity's own Mono in the page,
+    // twenty idle Workers spent ~40% of their time each in KLock::take from
+    // that wake loop (dm19), the main thread 22%. And -- read under the same
+    // lock -- whether this Worker's thread is simply waiting on a futex, with
+    // the address and the generation it parked at.
     let now = now_ns();
     let (soonest, futex) = with_host(|h| {
-        let soonest = h
-            .threads
-            .iter()
-            .filter_map(|t| match &t.waiting {
-                Waiting::Sleep(at) => Some(*at),
-                Waiting::Futex { deadline, .. } => *deadline,
-                Waiting::Net(deadline) => *deadline,
-                _ => None,
-            })
-            .min();
+        let soonest = h.threads.get(cur()).and_then(|t| match &t.waiting {
+            Waiting::Sleep(at) => Some(*at),
+            Waiting::Futex { deadline, .. } => *deadline,
+            Waiting::Net(deadline) => *deadline,
+            _ => None,
+        });
         let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
             Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
             _ => None,
@@ -7688,6 +7728,8 @@ pub extern "C" fn gex_adopt_child(
             provider: Default::default(),
             coverage_snap: Vec::new(),
             registry: Vec::new(),
+            registry_ext: Vec::new(),
+            store_grace: std::collections::VecDeque::new(),
             registry_sums: Vec::new(),
             registry_dense: Vec::new(),
             ever_threaded: false,
@@ -8883,6 +8925,7 @@ fn backfill_registry(h: &mut Host) {
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         h.jit.registry_sums.push(chunk_sums(&wasm));
         h.jit.registry.push(wasm);
+        h.jit.registry_ext.push(None);
     }
 }
 
@@ -9053,9 +9096,21 @@ enum Pick {
 /// the *disposition*, not the bit: an ignored signal interrupts nothing, and
 /// default-ignored `SIGCHLD` would otherwise wake a shell off a pipe with
 /// `EINTR` every time a child exits.
+///
+/// For THIS Worker's thread: the kernel's loaded signal state is whichever
+/// thread made the last syscall in any Worker, so asking it answered for the
+/// wrong thread, and a `tgkill` aimed at a thread parked on a futex never ended
+/// its wait (Boehm's stop-the-world: the collector's `sem_wait` for suspend
+/// acknowledgements never returned; Unity's own Mono stalled at
+/// "ReloadAssembly"). The native host asks `signal_pending_for` the same way.
 fn any_signal(h: &mut Host) -> bool {
-    h.kernel.collect_signals();
-    h.kernel.signals.would_deliver()
+    match h.threads.get(cur()).map(|t| t.kstate.tid) {
+        Some(tid) => h.kernel.signal_pending_for(tid),
+        None => {
+            h.kernel.collect_signals();
+            h.kernel.signals.would_deliver()
+        }
+    }
 }
 
 /// Whether a thread could make progress if given the stack. Asked of threads in
@@ -9562,10 +9617,12 @@ fn schedule() -> i32 {
                 // the wake, so a ready thread means this is not a deadlock: fall
                 // through, let its Worker pick it, and only the genuinely
                 // all-blocked case (no thread ready) reaches the report below.
+                let _ = sig;
+                let k = &mut h.kernel;
                 h.threads
                     .iter()
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    && !h.threads.iter().any(|t| thread_ready(t, now, sig))
+                    && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
             }) && {
                 // Confirm it persists before acting. A single all-blocked instant
                 // is not a deadlock -- during startup one is routine -- so require
@@ -11668,7 +11725,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
-            &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             h.jit.page_table.clone(),
             Default::default(),
@@ -11927,11 +11984,34 @@ fn retire_unmapped_code() {
     with_host(|h| {
         let retired = std::mem::take(&mut h.kernel.retired_code);
         if !retired.is_empty() {
-            crate::cgen::on_retire(&retired);
+            crate::cgen::on_retire(&retired, &gone_code(h, &retired));
             crate::fjit::on_retire(&retired);
             retire_code(h, &retired);
         }
     });
+}
+
+/// The pages of `ranges` no longer mapped executable (an unmapped object,
+/// code made non-executable), merged into ranges: `cgen::on_retire` drops
+/// the units there whatever the bytes are.
+pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    use gex_kernel::mem::prot;
+    let page = gex_abi::DISPATCH_PAGE;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in ranges {
+        let mut a = start / page * page;
+        while a < end {
+            let exec = h.kernel.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0);
+            if !exec {
+                match out.last_mut() {
+                    Some(last) if last.1 == a => last.1 = a + page,
+                    _ => out.push((a, a + page)),
+                }
+            }
+            a += page;
+        }
+    }
+    out
 }
 
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
@@ -12178,7 +12258,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         map.start,
         map.end,
         &seeds,
-        &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+        &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
         &|a| known.contains(&a),
         page_table,
         Default::default(),
@@ -13094,7 +13174,25 @@ pub extern "C" fn gex_jit_installed() {
         // Shrunk before keeping: `encode_with_custom` starts each module at a
         // 1 MiB capacity, and a batch averages ~26 KB, so a retained module
         // held a megabyte for twenty-six kilobytes.
+        let ext = NEXT_EXTERNAL.with(|n| n.take());
         if h.jit.ever_threaded {
+            // Already in the JS-side store, and the same module (a sibling can
+            // take the front of the shared queue between this Worker's read and
+            // this pop, so the note is checked against what was popped): keep
+            // only where it is.
+            if let Some((off, len, _)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+                EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                h.jit.registry_sums.push(Vec::new());
+                h.jit.registry.push(Vec::new());
+                h.jit.registry_ext.push(Some((off, len)));
+                h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
+                h.jit.store_grace.push_back(done.wasm);
+                if h.jit.store_grace.len() > STORE_GRACE {
+                    h.jit.store_grace.pop_front();
+                }
+                publish_pending(h);
+                return;
+            }
             let mut wasm = done.wasm;
             wasm.shrink_to_fit();
             // Counted for the arena report (which cannot borrow the host,
@@ -13103,6 +13201,7 @@ pub extern "C" fn gex_jit_installed() {
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             h.jit.registry_sums.push(chunk_sums(&wasm));
             h.jit.registry.push(wasm);
+            h.jit.registry_ext.push(None);
             h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
         }
         publish_pending(h);
@@ -13356,6 +13455,73 @@ fn publish_pending(h: &Host) {
     });
 }
 
+thread_local! {
+    /// The JS-side store slot (`offset, len, content key`) of the module this
+    /// Worker is about to report installed: `gex_jit_note_external`.
+    static NEXT_EXTERNAL: std::cell::Cell<Option<(u64, u32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// How many popped modules' bytes stay alive after going to the JS-side store.
+/// A Worker's view of the queue (`gex_jit_pending_ptr`) is refreshed right
+/// before it copies the bytes out, so only a pop in that instant can free them
+/// under it, and it would take this many more pops to reuse the memory.
+const STORE_GRACE: usize = 256;
+
+/// Make this Worker's view of the pending queue (`gex_jit_pending_*`) the
+/// queue's front now. The view is set only by this Worker's own pushes and
+/// pops, so it may name a module a sibling installed long ago.
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_refresh() {
+    with_host(|h| publish_pending(h));
+}
+
+/// Bytes of registry entries kept in the JS-side store instead of this heap.
+static EXTERNAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `moduleContentKey` in gex.mjs, as one u64 (`a` high, `b` low): what a
+/// module's store slot is checked against.
+fn content_key(bytes: &[u8]) -> u64 {
+    let mut a: u32 = 0x811c_9dc5;
+    let mut b: u32 = 0x9e37_79b9;
+    for (i, &x) in bytes.iter().enumerate() {
+        a = (a ^ x as u32).wrapping_mul(0x0100_0193);
+        b = (b ^ (x as u32).wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+        b ^= b >> 13;
+    }
+    ((a as u64) << 32) | b as u64
+}
+
+/// Whether the next `gex_jit_installed` keeps its module for joining Workers
+/// (this process has threaded): only then is a JS-side store slot worth
+/// writing.
+#[no_mangle]
+pub extern "C" fn gex_jit_keeps() -> u32 {
+    with_host(|h| h.jit.ever_threaded as u32)
+}
+
+/// The module this Worker installs next is at `off` in the process's JS-side
+/// module store, `len` bytes, with content key `key_hi:key_lo`
+/// (`moduleContentKey`). `gex_jit_installed` then keeps the place, not the
+/// bytes, if the module it pops matches.
+#[no_mangle]
+pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo: u32) {
+    NEXT_EXTERNAL.with(|n| n.set(Some((off, len, ((key_hi as u64) << 32) | key_lo as u64))));
+}
+
+/// Where registry module `i` is in the JS-side store, plus one; 0 when its
+/// bytes are in this module's memory (`gex_module_ptr`).
+#[no_mangle]
+pub extern "C" fn gex_module_ext(i: u32) -> u64 {
+    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _)| off + 1))
+}
+
+/// MiB of registry modules kept in the JS-side store (1) and in this heap (0).
+#[no_mangle]
+pub extern "C" fn gex_registry_mib(external: u32) -> u32 {
+    let b = if external != 0 { &EXTERNAL_BYTES } else { &REGISTRY_BYTES };
+    (b.load(std::sync::atomic::Ordering::Relaxed) >> 20) as u32
+}
+
 /// How many translated modules this process has, for a Worker catching up.
 #[no_mangle]
 pub extern "C" fn gex_module_count() -> u32 {
@@ -13387,7 +13553,10 @@ pub extern "C" fn gex_jit_slots_total() -> u32 {
 /// How long module `i` is.
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
-    with_host(|h| h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32))
+    with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
+        Some((_, len)) => len,
+        None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
+    })
 }
 
 /// A direct-mapped table of back-edge counts, keyed by guest pc.

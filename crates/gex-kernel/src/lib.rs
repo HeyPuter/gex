@@ -21,6 +21,24 @@ pub type PAddr = u64;
 #[cfg(not(any(target_arch = "wasm64", feature = "process64")))]
 pub type PAddr = u32;
 
+/// `GEX_MEM_TRACE`: say where a guest memory fill or copy of 8 MiB or more
+/// came from (what a process start spends its memset on).
+#[track_caller]
+#[inline]
+pub fn big_op(what: &str, len: usize) {
+    if len >= 8 << 20 {
+        big_op_slow(what, len, std::panic::Location::caller());
+    }
+}
+
+#[cold]
+fn big_op_slow(what: &str, len: usize, at: &std::panic::Location<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("GEX_MEM_TRACE").is_some()) {
+        eprintln!("gex-mem: {what} {} MiB at {at}", len >> 20);
+    }
+}
+
 pub mod errno;
 pub mod eventfd;
 pub mod file;
@@ -153,7 +171,9 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    #[track_caller]
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        big_op("zero", len);
         let r = self.range(addr, len)?;
         self.view_mut()[r].fill(0);
         Ok(())
@@ -162,7 +182,9 @@ impl<'a> GuestMem<'a> {
     /// `len` bytes from `src` to `dst`, both guest addresses, overlap allowed:
     /// no host buffer in between (in the browser every host buffer is shim
     /// heap, and a frame-sized one per frame fragmented it to exhaustion).
+    #[track_caller]
     pub fn copy_within(&mut self, src: u64, dst: u64, len: usize) -> Result<(), Errno> {
+        big_op("copy_within", len);
         let s = self.range(src, len)?;
         let d = self.range(dst, len)?;
         self.view_mut().copy_within(s, d.start);
@@ -174,13 +196,12 @@ impl<'a> GuestMem<'a> {
     /// touched costs no memory, writing it commits it, so a large
     /// reservation zeroed with `zero` cost its whole size in resident memory
     /// (a 1 GiB `PROT_NONE` mmap took ~1 GiB of RSS natively).
+    #[track_caller]
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
         for page in self.view_mut()[r].chunks_mut(4096) {
-            // OR-folded 64 bytes at a time, which vectorises: this scan is
-            // the whole cost for the common case of a clean page.
-            let clean = page.chunks(64).all(|c| c.iter().fold(0u8, |a, &b| a | b) == 0);
-            if !clean {
+            if !page_is_zero(page) {
                 page.fill(0);
             }
         }
@@ -301,6 +322,20 @@ mod tests {
     /// Every byte of the range reads as zero afterwards, whichever pages were
     /// dirty, including a range that starts and ends mid-page.
     #[test]
+    fn page_is_zero_sees_every_byte() {
+        let mut buf = vec![0u8; 4096 + 16];
+        for off in [0usize, 1, 3, 8] {
+            let p = &mut buf[off..off + 4096];
+            assert!(super::page_is_zero(p));
+            for i in [0usize, 1, 7, 255, 256, 2049, 4095] {
+                p[i] = 0x80;
+                assert!(!super::page_is_zero(p), "byte {i} at offset {off}");
+                p[i] = 0;
+            }
+        }
+    }
+
+    #[test]
     fn zero_dirty_zeroes_what_was_written() {
         let mut buf = vec![0u8; 0x6000];
         buf[0x1000] = 1;
@@ -319,6 +354,27 @@ mod tests {
         assert!(b[0x800..0x1800].iter().all(|&x| x == 0));
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
+}
+
+/// Whether every byte of `b` is zero. The scan is the whole cost of
+/// [`GuestMem::zero_dirty`] for the common clean page, and a 64-bit build
+/// for wasm has no SIMD: a byte-wise fold is one load per byte, this is one
+/// per eight (an unaligned 64-bit load), four running at once, with an early
+/// out every 256 bytes.
+fn page_is_zero(b: &[u8]) -> bool {
+    let w = |c: &[u8]| u64::from_ne_bytes(c.try_into().unwrap());
+    let mut blocks = b.chunks_exact(256);
+    let clean = (&mut blocks).all(|c| {
+        let (mut a, mut x, mut y, mut z) = (0u64, 0u64, 0u64, 0u64);
+        for q in c.chunks_exact(32) {
+            a |= w(&q[0..8]);
+            x |= w(&q[8..16]);
+            y |= w(&q[16..24]);
+            z |= w(&q[24..32]);
+        }
+        a | x | y | z == 0
+    });
+    clean && blocks.remainder().iter().all(|&v| v == 0)
 }
 
 /// Bumped (after the push, under the kernel lock) whenever code is mapped or

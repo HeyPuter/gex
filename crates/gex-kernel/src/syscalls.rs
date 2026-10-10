@@ -1071,6 +1071,44 @@ pub struct CodeMap {
     pub offset: u64,
 }
 
+impl CodeMap {
+    /// The executable segments of an ELF object gex's own loader placed at
+    /// load bias `bias` (the interpreter, at exec): what its `mmap` would have
+    /// reported had `ld.so` mapped it, so a host's ELF units see it too.
+    pub fn of_placed(path: &str, bytes: &[u8], bias: u64) -> Vec<CodeMap> {
+        let rd = |o: usize, n: usize| -> Option<u64> {
+            let b = bytes.get(o..o + n)?;
+            let mut v = [0u8; 8];
+            v[..n].copy_from_slice(b);
+            Some(u64::from_le_bytes(v))
+        };
+        let mut out = Vec::new();
+        if bytes.get(0..4) != Some(b"\x7fELF") || bytes.get(4) != Some(&2) {
+            return out;
+        }
+        let (Some(phoff), Some(phentsize), Some(phnum)) = (rd(0x20, 8), rd(0x36, 2), rd(0x38, 2)) else {
+            return out;
+        };
+        for i in 0..phnum as usize {
+            let ph = phoff as usize + i * phentsize as usize;
+            let (Some(ty), Some(flags), Some(off), Some(vaddr), Some(filesz)) =
+                (rd(ph, 4), rd(ph + 4, 4), rd(ph + 8, 8), rd(ph + 16, 8), rd(ph + 32, 8))
+            else {
+                break;
+            };
+            if ty == 1 && flags & 1 != 0 && filesz != 0 {
+                out.push(CodeMap {
+                    start: bias + (vaddr & !0xfff),
+                    end: crate::mem::page_align_up(bias + vaddr + filesz),
+                    path: path.to_string(),
+                    offset: off & !0xfff,
+                });
+            }
+        }
+        out
+    }
+}
+
 /// A `MAP_SHARED` file mapping, and where its bytes belong.
 ///
 /// A file mapping here is an eager copy rather than a page table pointed at
@@ -5450,6 +5488,8 @@ impl Kernel {
         // over-aligned library into anonymous PROT_NONE memory) will hold
         // code, so in a 64-bit memory it stays below 4 GiB with the code; the
         // loader runs at INTERP_BASE (docs/mem64.md §3).
+        // What was known to be zero before the mapping (which forgets it).
+        let clean_before = self.mem.clean_ranges().to_vec();
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
         let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
             self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
@@ -5465,8 +5505,15 @@ impl Kernel {
             self.pin_landed.push((path, base, start));
         }
         // Anonymous memory is defined to read as zero. Pages that already
-        // are stay untouched, so a large reservation costs no memory.
-        m.zero_dirty(start, crate::mem::page_align_up(len) as usize)?;
+        // are stay untouched, so a large reservation costs no memory, and
+        // ranges known to be zero (`MemoryMap::clean`) are not even read.
+        let end = start + crate::mem::page_align_up(len);
+        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
+            m.zero_dirty(a, (b - a) as usize)?;
+        }
+        if prot_bits & crate::mem::prot::WRITE == 0 {
+            self.mem.mark_clean(start, end);
+        }
         Ok(start)
     }
 

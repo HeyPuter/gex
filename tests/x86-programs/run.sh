@@ -5,13 +5,22 @@
 #
 #   tests/x86-programs/run.sh [gexc]      (default target/x86/release/gexc)
 #
-# Needs an x86-64 host and zig (for the musl targets).
+# Needs an x86-64 host and zig (for the musl targets). The `page` tier runs the
+# x86-64 build under the browser shim in Node (run-node.mjs, memory64 shared
+# seed) for the programs listed in PAGE_PROGRAMS, when that seed has been built
+# (GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh) and node is on PATH.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 fail=0
+SEED64=web/public/gex/seed.x86.m64.shared.wasm
+# tgkill-futex: a signal sent to a thread parked on a futex must end its wait
+# (Boehm's stop-the-world; the page asked the wrong thread's signal state).
+# exec-tail: code ending in the last bytes of an executable mapping (the page
+# fetched only up to four bytes before the end: SIGILL in Mono's JIT code).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -22,8 +31,12 @@ for src in "$HERE"/*.c; do
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
     case $name in *smc*) tiers="t1 fjit" ;; esac
+    case " $PAGE_PROGRAMS " in *" $name "*)
+        if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
+    esac
     for target in $targets; do
     for tier in $tiers; do
+        [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
         flags=$gexflags
         [ $tier = fjit ] && flags="$flags --fjit"
         extra=""
@@ -35,7 +48,18 @@ for src in "$HERE"/*.c; do
         # and fixing its guard, so the writer's stores land in between.
         envs=""
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
-        gex=$(env $envs "$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
+        if [ $tier = page ]; then
+            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+            # 125: run-node's flaky "nothing could wake it" after a threaded
+            # program has finished (OPTIMIZATION-BACKLOG.md); once more.
+            if [ $gs = 125 ]; then
+                echo "     $name (page): exit 125, once more"
+                env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+            fi
+            gex=$(grep -v '^\[host\]' "$WORK/$name.page")
+        else
+            gex=$(env $envs "$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
+        fi
         if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
             echo "ok   $name ($target, $tier, exit $ns)"
         else

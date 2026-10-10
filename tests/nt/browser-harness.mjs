@@ -320,17 +320,28 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   // `ms`: [{ url, profile }] (Chrome's .cpuprofile shape).
   // `withPage`: the page's own (main) thread too, first, as url 'page'.
   const profile = async (match, ms, withPage = false) => {
-    const sids = [...(withPage ? [page] : []), ...[...targets].filter(([, u]) => u.includes(match)).map(([s]) => s)];
-    for (const s of sids) {
-      await browser.send('Profiler.enable', {}, s);
-      await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
-      await browser.send('Profiler.start', {}, s);
-    }
-    await sleep(ms);
+    // Workers that start during the window (a game's threads) are profiled
+    // from when they attach.
+    const sids = [];
+    const start = async () => {
+      for (const s of [...(withPage ? [page] : []), ...[...targets].filter(([, u]) => u.includes(match)).map(([x]) => x)]) {
+        if (sids.includes(s)) continue;
+        sids.push(s);
+        try {
+          await browser.send('Profiler.enable', {}, s);
+          await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
+          await browser.send('Profiler.start', {}, s);
+        } catch { /* gone already */ }
+      }
+    };
+    const end = Date.now() + ms;
+    while (Date.now() < end) { await start(); await sleep(Math.min(500, Math.max(0, end - Date.now()))); }
     const out = [];
     for (const s of sids) {
-      const { profile } = await browser.send('Profiler.stop', {}, s);
-      out.push({ url: s === page ? 'page' : targets.get(s), profile });
+      try {
+        const { profile } = await browser.send('Profiler.stop', {}, s);
+        out.push({ url: s === page ? 'page' : targets.get(s), profile });
+      } catch { /* the Worker ended */ }
     }
     return out;
   };

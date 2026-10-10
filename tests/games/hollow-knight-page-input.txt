@@ -1,0 +1,28 @@
+# Hollow Knight in the page (tests/games/browser-linux.mjs --input): main menu -> Start Game -> profile 1
+# (new) -> screen-scale page -> brightness page -> intro (skipped) -> King's Pass. As
+# hollow-knight-input.txt (native), timed from the page's 600th GL present (the menu is up and
+# taking input by then on edger); keys held 2 s, steps 40 s apart (a new game's scene loads come
+# through ?lazy= a megabyte at a time).
+frames 600
+8    move 2 2
+12   key enter 1        # Start Game (selected by default)
+14   key enter 0
+50   key enter 1        # profile 1 (selected by default): new game
+52   key enter 0
+110  move 400 434       # screen-scale page: Done
+112  click 400 434
+150  click 400 434      # brightness page: Done
+190  click 400 434      # (again, in case the page came up late)
+195  move 2 2
+230  key enter 1        # the intro cinematic: skip prompt
+232  key enter 0
+240  key enter 1        # confirm the skip
+242  key enter 0
+400  key right 1        # King's Pass: walk right
+430  key right 0
+435  key z 1            # jump
+437  key z 0
+445  key x 1            # attack
+446  key x 0
+460  key left 1         # walk back left
+480  key left 0
