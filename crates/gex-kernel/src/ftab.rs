@@ -34,7 +34,7 @@ pub enum Tier {
     Region,
 }
 
-/// An install's module once its program is gone ([`FuncMap::forget_all`]):
+/// An install's module once its program is gone ([`FuncMap::kill_module`]):
 /// a table catching up skips it.
 pub const DEAD_MODULE: u32 = u32::MAX;
 
@@ -199,25 +199,19 @@ impl FuncMap {
         Some(f.idx)
     }
 
-    /// `execve`: nothing installed so far belongs to the new program. Every
-    /// address is retired (returned, for the caller's caches) and every
-    /// install is marked [`DEAD_MODULE`], so a table that catches up later --
-    /// a Worker for a thread the new program starts -- skips it rather than
-    /// instantiate the old program's modules (a replaced library's provider
-    /// would be linked as something else, its data where the new program's
-    /// now is).
-    pub fn forget_all(&mut self) -> Vec<(u64, u32)> {
-        let gone: Vec<u64> = self.by_addr.keys().copied().collect();
-        let mut out = Vec::with_capacity(gone.len());
-        for a in gone {
-            if let Some(i) = self.retire(a) {
-                out.push((a, i));
+    /// Mark every install of `module` [`DEAD_MODULE`]: a table that catches
+    /// up later (a Worker for a thread started after an `execve`) skips it
+    /// rather than instantiate a module whose program is gone -- a replaced
+    /// library's provider, linked as something else and with its data where
+    /// the new program's now is. Unit modules are not killed: an exec'd
+    /// program that maps the same object at the same place reuses its
+    /// install, and a Worker that skipped it would lift block by block.
+    pub fn kill_module(&mut self, module: u32) {
+        for i in &mut self.installs {
+            if i.module == module {
+                i.module = DEAD_MODULE;
             }
         }
-        for i in &mut self.installs {
-            i.module = DEAD_MODULE;
-        }
-        out
     }
 
     /// Retire every function whose entry lies in `[start, end)`.
@@ -415,18 +409,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forget_all_retires_every_address_and_kills_every_install() {
+    fn kill_module_marks_only_that_modules_installs() {
         let mut m = FuncMap::new();
-        m.publish(3, 7, Tier::Unit, &[(0x1000, 0), (0x2000, 2)]);
-        m.publish(1, 0x8000_0001, Tier::Unit, &[(0xffff_f000_0000, 0)]);
-        let gone = m.forget_all();
-        assert_eq!(gone.len(), 3);
-        assert!(m.get(0x1000).is_none() && m.get(0xffff_f000_0000).is_none());
-        assert!(m.installs().iter().all(|i| i.module == DEAD_MODULE));
-        // The next program's installs are live, past the old indices.
-        let n = m.publish(2, 9, Tier::Unit, &[(0x1000, 1)]);
-        assert_eq!(m.install(n).module, 9);
-        assert_eq!(m.get(0x1000).unwrap().idx, m.install(n).base + 1);
+        let a = m.publish(3, 7, Tier::Unit, &[(0x1000, 0)]);
+        let b = m.publish(1, 0x8000_0001, Tier::Unit, &[(0x2000, 0)]);
+        m.kill_module(0x8000_0001);
+        assert_eq!(m.install(a).module, 7);
+        assert_eq!(m.install(b).module, DEAD_MODULE);
     }
 
     #[test]
