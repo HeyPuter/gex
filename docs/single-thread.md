@@ -166,6 +166,15 @@ Where the SAB build waits, the single build suspends:
 - The fibers share the realm, so they also share the one `WispNetwork`
   (`wispNet` in `extra`). No net-bridge is needed.
 - Each stream event calls `onActivity`, which wakes the parked fibers.
+  `NodeNetwork` (the node harness) does the same.
+- A process waiting on the network **parks**: a bounded `gex_park`, i.e. a
+  promise.
+  - The SAB build instead takes a MessageChannel turn per loop, because its
+    bytes arrive on the Worker's own event loop.
+  - Copied into the single build, that turn spun the one thread. An exec'd
+    `node` child installing about 30k translated modules got a turn only
+    between thirteen spinning node threads. `child_process.spawn` then took
+    minutes, and the page run hit its 900 s cap.
 
 ### Terminal
 
