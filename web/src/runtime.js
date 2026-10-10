@@ -702,6 +702,8 @@ export async function runProgram(
       xlateReport: globalThis.GEX_XLATE_REPORT || undefined,
       // `?t1fold=1`: tier-1's tee folding (gex-emit `set_t1_fold`).
       t1Fold: globalThis.GEX_T1_FOLD || undefined,
+      // `?sharedenter=1`: units import the image module's `enter`.
+      sharedEnter: globalThis.GEX_SHARED_ENTER || undefined,
       // `?unitcache=1`: compiled translation units shared by every process.
       unitCache: globalThis.GEX_UNIT_CACHE || undefined,
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).

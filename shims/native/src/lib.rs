@@ -1531,6 +1531,10 @@ mod cache_key_tests {
         gex_emit::tier1::set_inline_dispatch(true);
         let inline = cache_key(&image, &o, "b");
         gex_emit::tier1::set_inline_dispatch(false);
+        gex_emit::tier1::set_shared_enter(true);
+        let shared = cache_key(&image, &o, "b");
+        gex_emit::tier1::set_shared_enter(false);
+        assert_ne!(base, shared);
         assert_ne!(base, fold);
         assert_ne!(base, inline);
         assert_ne!(fold, inline);

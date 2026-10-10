@@ -37,6 +37,7 @@ fn main() {
         module_id: 0,
         loop_heads: None,
         enter: None,
+            enter_import: false,
     };
     let wasm = gex_emit::tier1::compile(&block, &cx);
     println!("=== WASM ({} bytes) ===", wasm.len());

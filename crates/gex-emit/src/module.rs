@@ -565,6 +565,8 @@ pub struct ModuleBuilder {
     miss_stub: u32,
     /// `enter(ctx, pc)`, which the miss stub re-dispatches through.
     enter: u32,
+    /// `enter` is imported (`crate::tier1::shared_enter`).
+    enter_import: bool,
     /// Guest block address -> wasm function index.
     blocks: HashMap<u64, u32>,
     /// Blocks awaiting code generation, paired with their function index.
@@ -748,10 +750,15 @@ impl ModuleBuilder {
         let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
             .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
 
+        // `enter` from the image module (`crate::tier1::shared_enter`), when
+        // the host provides it: the seed's is the same function, dense-capable.
+        let enter_import = (linkage == Linkage::Shared && crate::tier1::shared_enter() && !profiling)
+            .then(|| m.import_func(IMPORT_MODULE, exports::ENTER, t_syscall));
+
         // The miss stub and `enter` are the first two local functions, so
         // their indices are known before any block is declared.
         let miss_stub = m.declare_func(block_ty);
-        let enter = m.declare_func(t_syscall);
+        let enter = enter_import.unwrap_or_else(|| m.declare_func(t_syscall));
 
         let mut b = ModuleBuilder {
             m,
@@ -762,6 +769,7 @@ impl ModuleBuilder {
             block_ty,
             miss_stub,
             enter,
+            enter_import: enter_import.is_some(),
             blocks: HashMap::new(),
             pending: Vec::new(),
             imports,
@@ -798,8 +806,10 @@ impl ModuleBuilder {
 
         let stub_body = b.build_miss_stub();
         b.m.define_func(miss_stub, stub_body);
-        let enter_body = b.build_enter();
-        b.m.define_func(enter, enter_body);
+        if !b.enter_import {
+            let enter_body = b.build_enter();
+            b.m.define_func(enter, enter_body);
+        }
 
         if linkage == Linkage::Own {
             // Re-export the imported memory (index 0, imports coming first),
@@ -933,6 +943,7 @@ impl ModuleBuilder {
                 module_id,
                 loop_heads: Some(&heads),
                 enter: Some(self.enter),
+                enter_import: self.enter_import,
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
@@ -1321,7 +1332,11 @@ impl ModuleBuilder {
         f.local_get(0);
         f.addr_i32();
         f.load(0x29, 3, ctx::PC as u32);
-        f.return_call_local(self.enter);
+        if self.enter_import {
+            f.return_call(self.enter);
+        } else {
+            f.return_call_local(self.enter);
+        }
         f.end();
         f.local_get(r);
         f.i32_const(DISPATCH_MISS_LEAVE);

@@ -294,6 +294,7 @@ for (const [event, describe] of [
   if (params.has('liftmax')) globalThis.GEX_LIFT_MAX = Number(params.get('liftmax'));
   if (params.has('unitcache')) globalThis.GEX_UNIT_CACHE = Number(params.get('unitcache'));
   if (params.has('t1fold')) globalThis.GEX_T1_FOLD = Number(params.get('t1fold'));
+  if (params.has('sharedenter')) globalThis.GEX_SHARED_ENTER = Number(params.get('sharedenter'));
   if (params.has('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(params.get('xlatereport'));
   if (params.has('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(params.get('inlinedispatch'));
   // `?link=1`: keep the address space the guest's `ld.so` produced and start

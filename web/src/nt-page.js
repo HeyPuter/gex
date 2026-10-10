@@ -148,6 +148,7 @@ async function main() {
   if (q.get('liftmax')) globalThis.GEX_LIFT_MAX = Number(q.get('liftmax'));
   if (q.get('unitcache')) globalThis.GEX_UNIT_CACHE = Number(q.get('unitcache'));
   if (q.get('t1fold')) globalThis.GEX_T1_FOLD = Number(q.get('t1fold'));
+  if (q.get('sharedenter')) globalThis.GEX_SHARED_ENTER = Number(q.get('sharedenter'));
   if (q.get('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(q.get('xlatereport'));
   if (q.get('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(q.get('inlinedispatch'));
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
