@@ -2219,6 +2219,26 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
+            // A `writev` to a full stream that should block waits as a
+            // `write` of its first non-empty vector does: the call returns
+            // that vector's count, a short write the caller retries. (It
+            // went straight to `EAGAIN`, and Wine's `send_request` writes
+            // its requests to the server with `writev`: a thread that found
+            // the request pipe full died with "wine client error: write:
+            // Resource temporarily unavailable", hanging NDIS's start.)
+            nr::WRITEV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.write_is_atomic() || !file.write_would_block() {
+                    return None;
+                }
+                let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
+                let (buf, len) = vecs.into_iter().find(|&(_, len)| len != 0)?;
+                Some(BlockOp::WriteStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: (len as usize).min(1 << 24),
+                })
+            }
             nr::ACCEPT | nr::ACCEPT4 => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
