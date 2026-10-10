@@ -346,6 +346,40 @@ fn serialize(m: &Module) -> Option<Vec<u8>> {
     m.serialize().ok()
 }
 
+/// [`key`], remembered for the host process when the fields come to
+/// [`MEMO_MIN_BYTES`] or more, by a 128-bit SipHash of the same
+/// length-prefixed stream: under W3 every Wine child execs the same 5.7 MB
+/// loader and installs the same 8.8 MB PE module, and SHA-256 over them was
+/// about a tenth of a session boot's host CPU.
+pub fn key_memo<'a>(build: &str, fields: impl IntoIterator<Item = &'a [u8]> + Clone) -> String {
+    use std::hash::Hasher;
+    let total: usize = fields.clone().into_iter().map(|f| f.len()).sum();
+    if total < MEMO_MIN_BYTES {
+        return key(build, fields);
+    }
+    static KEYS: std::sync::Mutex<Vec<((u64, u64), String)>> = std::sync::Mutex::new(Vec::new());
+    let mut hs = [std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new()];
+    hs[1].write_u64(0x9e37_79b9_7f4a_7c15);
+    for h in hs.iter_mut() {
+        h.write(build.as_bytes());
+        for f in fields.clone() {
+            h.write_u64(f.len() as u64);
+            h.write(f);
+        }
+    }
+    let id = (hs[0].finish(), hs[1].finish());
+    if let Some((_, k)) = KEYS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id) {
+        return k.clone();
+    }
+    let k = key(build, fields);
+    let mut m = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= 64 {
+        m.remove(0);
+    }
+    m.push((id, k.clone()));
+    k
+}
+
 #[cfg(not(feature = "compile"))]
 fn serialize(_m: &Module) -> Option<Vec<u8>> {
     None
@@ -358,9 +392,36 @@ pub fn precompiled_dir() -> Option<PathBuf> {
 }
 
 fn content_name(wasm: &[u8]) -> String {
+    // (the same SHA-256, remembered for a large module: see `key_memo`)
+    let id = (wasm.len() >= MEMO_MIN_BYTES).then(|| sip128(wasm));
+    if let Some(id) = id {
+        if let Some((_, k)) = KEYS_CONTENT.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id) {
+            return k.clone();
+        }
+    }
     let mut h = sha256::Sha256::new();
     h.update(wasm);
-    format!("{}.cwasm", sha256::hex(&h.finish()))
+    let name = format!("{}.cwasm", sha256::hex(&h.finish()));
+    if let Some(id) = id {
+        let mut m = KEYS_CONTENT.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() >= 64 {
+            m.remove(0);
+        }
+        m.push((id, name.clone()));
+    }
+    name
+}
+
+static KEYS_CONTENT: std::sync::Mutex<Vec<((u64, u64), String)>> = std::sync::Mutex::new(Vec::new());
+
+fn sip128(bytes: &[u8]) -> (u64, u64) {
+    use std::hash::Hasher;
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    b.write_u64(0x9e37_79b9_7f4a_7c15);
+    a.write(bytes);
+    b.write(bytes);
+    (a.finish(), b.finish())
 }
 
 /// A module for `wasm`: compiled ahead of time and found by its content in

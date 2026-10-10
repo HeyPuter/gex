@@ -846,7 +846,7 @@ fn run_program_with(
     let use_cache = opts.cache && build.is_some();
     let build = build.unwrap_or_default();
     let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
-    let image_key = cache_key(image, &Options::default(), &build);
+    let image_key = cache_key_memo(image, &Options::default(), &build);
     let mut xlate = xlate.clone();
     // Off unless asked for: measured, the profile costs a recompile on the
     // second run and buys nothing measurable after it on programs this size.

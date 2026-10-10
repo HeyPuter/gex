@@ -291,7 +291,7 @@ pub(crate) fn install(
 /// module is never run from a stale artifact. Anything that precompiles a
 /// provider ahead of time (an ejected project) names it with this too.
 pub fn cwasm_path(wasm_path: &std::path::Path, wasm: &[u8]) -> PathBuf {
-    let key = gex_cache::key("libprov", [wasm]);
+    let key = gex_cache::key_memo("libprov", [wasm]);
     let stem = wasm_path.file_stem().and_then(|s| s.to_str()).unwrap_or("provider");
     wasm_path.with_file_name(format!("{stem}.{}.cwasm", &key[..16]))
 }
