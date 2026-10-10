@@ -70,10 +70,11 @@ for m in translated wasm; do
   [ "$bad" = 0 ] && [ "$good" -ge 16 ] && [ "$rcs" = 0 ] && [ "$ran" = 7 ] || fail=1
 done
 for lib in libz.so.1 libzstd.so.1 libsqlite3.so.0; do
-  grep -q "$lib replaced by" "$WORK/wasm.err" || { echo "item3: $lib was not replaced"; fail=1; }
-  grep -q "$lib replaced by" "$WORK/translated.err" && { echo "item3: $lib replaced with noauto"; fail=1; }
+  # (the shim's debug channel: stdout under node)
+  cat "$WORK/wasm.out" "$WORK/wasm.err" | grep -q "$lib replaced by" || { echo "item3: $lib was not replaced"; fail=1; }
+  cat "$WORK/translated.out" "$WORK/translated.err" | grep -q "$lib replaced by" && { echo "item3: $lib replaced with noauto"; fail=1; }
 done
-sq() { sed -n '/^== sqlite3 sq.sql/,$p' "$1" | grep -v '^\[\|^Memory Used\|^Number of Outstanding\|^Largest Allocation'; }
+sq() { sed -n '/^== sqlite3 sq.sql/,$p' "$1" | grep -v '^\[\|^gex: \|^gex-nt: \|^Memory Used\|^Number of Outstanding\|^Largest Allocation'; }
 if ! diff <(sq "$WORK/translated.out") <(sq "$WORK/wasm.out") > "$WORK/sqlite.diff"; then
   echo "item3: the sqlite3 shell's output differs:"; head -20 "$WORK/sqlite.diff"; fail=1
 fi

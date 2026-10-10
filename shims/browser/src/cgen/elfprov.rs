@@ -129,7 +129,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
             if binds.is_empty() {
                 continue;
             }
-            crate::warn_line(&format!("gex: provider {} for {} at {bias:#x}: {} addresses bound\n", p.name, m.path, binds.len()));
+            crate::trace_line(&format!("gex: provider {} for {} at {bias:#x}: {} addresses bound\n", p.name, m.path, binds.len()));
             provided.push(Provided {
                 file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
                 binds,

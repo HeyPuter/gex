@@ -316,7 +316,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
         None => alloc_low((size as u64).max(16) + a, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE, &name)?,
     };
     let data = (data + a - 1) & !(a - 1);
-    crate::warn_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
+    crate::trace_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
     let index = {
         let mut libs = lock(&LIBS);
         libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None, install: 0, bound: false, code, want_base });
@@ -436,7 +436,7 @@ pub extern "C" fn gex_libprov_installed(number: u32) {
         }
         pairs.push((f, (t - base) as u32));
     }
-    crate::warn_line(&format!("gex: {path}: {} entry thunks bound\n", pairs.len()));
+    crate::trace_line(&format!("gex: {path}: {} entry thunks bound\n", pairs.len()));
     super::wasmdll::bind(install, &pairs);
 }
 
