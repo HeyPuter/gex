@@ -230,6 +230,14 @@ main (int argc, char **argv)
 	P clr = mono_runtime_invoke (clears, NULL, clargs, &exc);
 	check ("Clears", exc);
 	printf ("%s\n", mono_string_to_utf8 (clr));
+	if (getenv ("EMBED_BENCH")) {   /* transition costs, for the bench box only */
+		P cb = mono_class_get_method_from_name (k, "CallBench", 1);
+		int cn = atoi (getenv ("EMBED_BENCH"));
+		void *cargs [1] = { &cn };
+		P cr = mono_runtime_invoke (cb, NULL, cargs, &exc);
+		check ("CallBench", exc);
+		fprintf (stderr, "%s\n", mono_string_to_utf8 (cr));
+	}
 	P dels = mono_class_get_method_from_name (k, "Delegates", 1);
 	int dn = 40;
 	void *dargs [1] = { &dn };
