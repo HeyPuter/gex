@@ -165,31 +165,34 @@ the page's unit cache removes the repeat compiles.
 
 ## 2. State / resume
 
-- Branch head bbb7f237. Commits, in order:
-  - 9e84b3cc knobs and per-process counters (`xlate[...]`);
-  - 0f5d120b region grown only at back-edge targets, once per block
-    (byte-identical output);
-  - 3e8dab8e no page-table clones per miss, slab kernel module store,
-    word-wise content key;
-  - 43fa9fc5 dispatch through the module's `enter` (`GEX_INLINE_DISPATCH=1`
-    restores the old form byte for byte);
-  - c15680ca translator progress report (`?xlatereport=N`), re-lift and
-    anonymous-memory counters, served-module cursor;
-  - 6928037b page-wide cache of compiled units (`?unitcache=1`, off by
-    default); dense base as an imported global, so a served unit's bytes are
-    the same in every process;
-  - 64b129ce fewer allocations and no SipHash in tier-1 emission;
-  - bbb7f237 tier-1 tee folding (`GEX_T1_FOLD` / `?t1fold=1`, off by default,
-    loop-safe), emitter switches in the native module cache key.
-- Tests: gate on 64b129ce passed (a64 485, x86 474, nt 85/85 both, glibc,
-  lockstep). Integration ladder with `GEX_T1_FOLD=1` on bbb7f237: 100 passed;
-  the 50 failures all reproduce on the base tree (c47bbff1): the browser
-  comparisons see host.mjs's `console.debug` lines on stdout, vfs segfaults,
-  priority sees the run's nice level, park-across-switch, two-workers and
-  threads-shared fail identically, browser-builds hit the scope's task limit.
-- Queued on edger: `page.sh p1` (base vs new vs new with `unitcache=1`, node
-  in the native-debian page).
-- Next: decide the unit cache and fold defaults from page numbers; HK
-  translation volume with `?xlatereport=500` (needs a coordinator run);
-  per-unit fixed overhead (about 830 B a unit); discovery overshoot (63% of
-  lifted blocks never run).
+- Commits since 64b129ce, in order:
+  - bbb7f237: tier-1 tee folding (`GEX_T1_FOLD` / `?t1fold=1`), off by
+    default and loop-safe; the emitter switches are now in the native module
+    cache key;
+  - 60cf5cd8: a test that those switches change the key;
+  - 130bdf20: the nt page reads `?liftmax`, `?unitcache`, `?t1fold`,
+    `?xlatereport` and `?inlinedispatch`;
+  - 5fe9525e: discovery log and depth limit (experiment knobs);
+  - 11b1b601: no `gex.reloc` section in dense units (3.5% of the wasm);
+  - 34cf5db9: units may import the seed's `enter` (`GEX_SHARED_ENTER` /
+    `?sharedenter=1`), off by default.
+- Tests:
+  - The gate on 64b129ce passed.
+  - Integration ladder with `GEX_T1_FOLD=1` on bbb7f237: every failure also
+    fails on the base tree (c47bbff1). The browser comparisons fail on
+    host.mjs's `console.debug` lines on stdout; the coordinator is fixing that
+    in the integ branch, and this branch rebases after it lands.
+  - Unit tests pass: gex-emit (17), gex-xlate (22 + 3) and the gex-native
+    cache-key test.
+- Queued on edger, in order:
+  - `page.sh p1`: node in the native-debian page, three legs: base, new, and
+    new with `unitcache=1`.
+  - `hk1.sh`: Hollow Knight as U ships it (provider p30, .NET wasm JIT,
+    `?xlatereport=500`), on stream T's own edger tree `wt/unity-T`. Two legs:
+    tk1, and tk2 (tk1 with `unitcache=1`).
+  - `b5.sh`: node under run-node, with legs for the unit cache, fold, the
+    depth limits, a lift cap of 512 and the shared `enter`.
+- Dropped: Hollow Knight and Muck on their own Mono JIT (the coordinator ruled
+  them not worth testing).
+- Next: choose the defaults for the unit cache, fold and shared `enter` from
+  p1 and b5; get Hollow Knight's translation volume from tk1.
