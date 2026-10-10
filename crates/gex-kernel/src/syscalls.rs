@@ -2714,23 +2714,42 @@ impl Kernel {
             nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
             // One interface, unnamed. A guest that asks where it is calling
             // from gets 0.0.0.0, which is what an unbound socket reports.
-            nr::GETSOCKNAME => {
-                let (ip, port) = self.socket_of(a[0] as i32).map(|s| s.local()).unwrap_or((0, 0));
-                self.sys_write_sockaddr(m, ip, port, a[1], a[2])
-            }
+            //
+            // A unix socket is AF_UNIX and unnamed: libuv's
+            // `uv_guess_handle` decides from the family whether a socket on
+            // stdout is a pipe or TCP, and node made the stdout of every
+            // child it spawned a black hole when told AF_INET.
+            nr::GETSOCKNAME => match self.socket_family_type(a[0] as i32) {
+                // AF_UNIX
+                Ok((1, _)) => Self::write_sockaddr_unnamed(m, a[1], a[2]),
+                _ => {
+                    let (ip, port) = self.socket_of(a[0] as i32).map(|s| s.local()).unwrap_or((0, 0));
+                    self.sys_write_sockaddr(m, ip, port, a[1], a[2])
+                }
+            },
             // Nothing here has an option worth setting -- no timeouts, no
             // buffer sizes that mean anything -- and refusing makes libraries
             // treat the socket as broken.
             // agreed to without effect, on a descriptor that exists
             nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
+            nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[1], a[2], a[3]),
             // A unix socket's directions close as asked; any other socket
             // (the proxied network, the global kernel's) just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
                 Err(_) => match self.socket_of(a[0] as i32) {
                     Ok(s) => s.shutdown(a[1]),
-                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                    Err(_) => {
+                        // SHUT_WR (1) or SHUT_RDWR (2) on a shared socketpair
+                        // end: the peer reads end-of-file, as `uv_shutdown`
+                        // expects of a child's stdin.
+                        self.fds.get(a[0] as i32).map(|f| {
+                            if a[1] >= 1 {
+                                f.handle.shutdown_write();
+                            }
+                            0
+                        })
+                    }
                 },
             },
             // A local address means nothing when there is one interface and
@@ -4179,10 +4198,33 @@ impl Kernel {
                     | oflags::O_NONBLOCK
                     | 0o40000 // O_DIRECT
                     | 0o4010000; // O_SYNC | O_NOATIME
-                Ok(self.fds.get(fd)?.flags() & STATUS)
+                // The access mode comes from what the description can do,
+                // not from the stored flags: inherited stdio, socketpair
+                // pipes and `F_SETFL` callers all leave it at 0 there.
+                // libuv's `uv_pipe_open` reads it to decide whether a
+                // stream is writable, and node's stdout reported EPIPE on
+                // every write while a write end said `O_RDONLY`.
+                let f = self.fds.get(fd)?;
+                let acc = match (f.readable, f.writable) {
+                    (true, true) => oflags::O_RDWR,
+                    (false, true) => oflags::O_WRONLY,
+                    _ => oflags::O_RDONLY,
+                };
+                Ok(f.flags() & STATUS & !oflags::ACCMODE | acc)
             }
+            // Only what Linux lets F_SETFL change (O_APPEND, O_ASYNC,
+            // O_DIRECT, O_NOATIME, O_NONBLOCK); the access mode and the rest
+            // stay. Taking `arg` whole lost a pipe write end's `O_WRONLY`
+            // whenever a caller passed a bare `O_NONBLOCK`, and a forked
+            // child then rebuilt that end as a read end.
             F_SETFL => {
-                self.fds.get(fd)?.set_flags(arg);
+                const SETTABLE: u64 = oflags::O_APPEND
+                    | oflags::O_NONBLOCK
+                    | 0o20000 // O_ASYNC
+                    | 0o40000 // O_DIRECT
+                    | 0o1000000; // O_NOATIME
+                let f = self.fds.get(fd)?;
+                f.set_flags(f.flags() & !SETTABLE | arg & SETTABLE);
                 Ok(0)
             }
             // Advisory locks always succeed: gex runs one process tree over
@@ -6036,8 +6078,35 @@ impl Kernel {
         if domain != AF_UNIX {
             return Err(Errno::EAFNOSUPPORT);
         }
-        let (a, b) = unix::UnixSocket::pair();
         let nonblock = ty & SOCK_NONBLOCK != 0;
+        // A stream pair with a global kernel to put it in, so either end can
+        // go to a forked child (a Worker of its own). See
+        // [`crate::pipe::RemoteSockEnd`].
+        const SOCK_STREAM: u64 = 1;
+        if let Some(r) = self.pipes.filter(|_| ty & 0xf == SOCK_STREAM) {
+            let p = (r.new)(self.pid);
+            if p < 0 {
+                return Err(Errno::ENFILE);
+            }
+            let q = (r.new)(self.pid);
+            if q < 0 {
+                (r.close_end)(p, 0);
+                (r.close_end)(p, 1);
+                return Err(Errno::ENFILE);
+            }
+            let flags = oflags::O_RDWR | if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let cloexec = ty & SOCK_CLOEXEC != 0;
+            // `a` writes p and reads q; `b` the other way round.
+            let a = crate::pipe::RemoteSockEnd::new(q, p, r);
+            let b = crate::pipe::RemoteSockEnd::new(p, q, r);
+            let (pa, pb) = (a.path(), b.path());
+            let fa = self.fds.insert(OpenFile::new(Arc::new(a), pa, flags, true, true), cloexec)?;
+            let fb = self.fds.insert(OpenFile::new(Arc::new(b), pb, flags, true, true), cloexec)?;
+            m.write_u32(out, fa as u32)?;
+            m.write_u32(out + 4, fb as u32)?;
+            return Ok(0);
+        }
+        let (a, b) = unix::UnixSocket::pair();
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -6294,8 +6363,61 @@ impl Kernel {
     }
 
     /// `getsockopt`. The only one anybody asks: has the connection come up?
-    fn sys_getsockopt(&mut self, m: &mut GuestMem<'_>, fd: i32, name: u64, val: u64) -> SysResult {
+    /// An unnamed `sockaddr_un`: the family alone, two bytes long.
+    fn write_sockaddr_unnamed(m: &mut GuestMem<'_>, addr: u64, addrlen: u64) -> SysResult {
+        if addr != 0 {
+            let room = if addrlen != 0 { m.read_u32(addrlen)? } else { 2 };
+            if room >= 2 {
+                m.write(addr, &1u16.to_le_bytes())?;
+            }
+            if addrlen != 0 {
+                m.write_u32(addrlen, 2)?;
+            }
+        }
+        Ok(0)
+    }
+
+    /// `(family, type)` of the socket at `fd`: AF_INET for the proxied
+    /// network, AF_UNIX for a local, global-kernel or shared-pair unix socket.
+    fn socket_family_type(&self, fd: i32) -> Result<(u64, u32), Errno> {
+        const AF_INET: u64 = 2;
+        const AF_UNIX: u64 = 1;
+        const SOCK_STREAM: u32 = 1;
+        const SOCK_DGRAM: u32 = 2;
+        if let Ok(s) = self.socket_of(fd) {
+            return Ok((AF_INET, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
+        }
+        if self.unix_of(fd).is_ok() || self.remote_unix_of(fd).is_ok() {
+            return Ok((AF_UNIX, SOCK_STREAM));
+        }
+        let f = self.fds.get(fd)?;
+        match f.handle.metadata() {
+            Ok(md) if md.file_type == crate::vfs::FileType::Socket => Ok((AF_UNIX, SOCK_STREAM)),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
+    fn sys_getsockopt(&mut self, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64) -> SysResult {
+        const SOL_SOCKET: u64 = 1;
+        const SO_TYPE: u64 = 3;
         const SO_ERROR: u64 = 4;
+        const SO_PROTOCOL: u64 = 38;
+        const SO_DOMAIN: u64 = 39;
+        // What kind of socket this is, which libuv asks before it decides
+        // how to wrap a descriptor it was handed (`uv_guess_handle`): a type
+        // of 0 is no kind at all, and node's stdout became a black hole.
+        if level == SOL_SOCKET && matches!(name, SO_TYPE | SO_DOMAIN | SO_PROTOCOL) {
+            let (family, ty) = self.socket_family_type(fd)?;
+            let v = match name {
+                SO_TYPE => ty as u64,
+                SO_DOMAIN => family,
+                _ => 0,
+            };
+            if val != 0 {
+                m.write_u32(val, v as u32)?;
+            }
+            return Ok(0);
+        }
         let err = if name == SO_ERROR {
             match self.socket_of(fd)?.status() {
                 net::Status::Refused => Errno::ECONNREFUSED.0,
@@ -7284,6 +7406,35 @@ mod tests {
         k.vfs.mount("/", Arc::new(TmpFs::new()));
         k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
         (mem, k)
+    }
+
+    /// `F_GETFL` reports the access mode a descriptor can actually do, even
+    /// when it was installed with flags of 0 (inherited stdio), and `F_SETFL`
+    /// changes only the status flags. libuv's `uv_pipe_open` reads the mode to
+    /// decide if a stream is writable; node's stdout said EPIPE on every write.
+    #[test]
+    fn getfl_reports_the_access_mode_and_setfl_keeps_it() {
+        let (_mem, mut k) = setup();
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        let r = Arc::new(Pipe::new());
+        let wfd = k
+            .fds
+            .insert(
+                OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: r, write: true }), "pipe".into(), 0, false, true),
+                false,
+            )
+            .unwrap() as i32;
+        assert_eq!(k.sys_fcntl(wfd, F_GETFL, 0), Ok(oflags::O_WRONLY));
+        assert_eq!(k.sys_fcntl(wfd, F_SETFL, oflags::O_NONBLOCK), Ok(0));
+        assert_eq!(k.sys_fcntl(wfd, F_GETFL, 0), Ok(oflags::O_WRONLY | oflags::O_NONBLOCK));
+        let (a, _b) = unix::UnixSocket::pair();
+        let sfd = k.install_unix(a, 0, false).unwrap() as i32;
+        assert_eq!(k.sys_fcntl(sfd, F_GETFL, 0), Ok(oflags::O_RDWR));
+        // And the socket says what it is, which is how libuv tells a pipe
+        // from TCP (`uv_guess_handle`).
+        assert_eq!(k.socket_family_type(sfd), Ok((1, 1)));
+        assert_eq!(k.socket_family_type(wfd), Err(Errno::ENOTSOCK));
     }
 
     /// A unix socket that arrived over SCM_RIGHTS is placed straight in the

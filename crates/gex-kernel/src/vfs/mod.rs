@@ -227,6 +227,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// `shutdown(SHUT_WR)` on a socket that is not a [`crate::unix::UnixSocket`]
+    /// but can still close its sending direction (a shared socketpair end).
+    /// False: not such a handle, and `shutdown` carries on as before.
+    fn shutdown_write(&self) -> bool {
+        false
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

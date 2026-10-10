@@ -7006,6 +7006,12 @@ fn stage_fork_fds(h: &Host, child: i32) {
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
             unsafe { k_pipe_open_end(id, write as i32, child) };
+        } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(&file.path) {
+            // A socketpair end is two pipe ends, both the child's to hold.
+            unsafe {
+                k_pipe_open_end(rx, 0, child);
+                k_pipe_open_end(tx, 1, child);
+            }
         } else if let Some((id, master)) = pty_ref(&file.path) {
             // The child inherits this pty end; open it on the child's behalf so
             // the parent's copy closing is not the last reference.
@@ -7133,6 +7139,16 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     flags,
                     !write,
                     write,
+                )
+            } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(path) {
+                // Both pipe ends were opened for the child by the parent.
+                let Some(r) = global_pipes() else { continue };
+                gex_kernel::file::OpenFile::new(
+                    Arc::new(gex_kernel::pipe::RemoteSockEnd::new(rx, tx, r)),
+                    path.to_string(),
+                    flags,
+                    true,
+                    true,
                 )
             } else if let Some((id, master)) = pty_ref(path) {
                 // Same as a pipe end: the parent already opened it for the child.
