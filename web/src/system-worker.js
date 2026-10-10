@@ -50,9 +50,50 @@ class TermProxy {
 
 const term = new TermProxy();
 
+/**
+ * The compositor, in this realm (compositor-worker.js's `inRealm`): it reads
+ * every guest's pixels out of memories only this thread has. The page keeps
+ * its listeners and sends what it would post to a compositor Worker as `comp`
+ * messages; what that Worker would post back goes out as `comp-out`.
+ */
+let comp = null;
+async function openCompositor(width, height) {
+  globalThis.GEX_COMPOSITOR_IN_REALM = true;
+  const [{ inRealm }, { makeWlChannel, setOutputSize }] = await Promise.all([
+    import('./compositor-worker.js'),
+    import('../../shims/browser/js/wl-bridge.mjs'),
+  ]);
+  const channel = makeWlChannel();
+  setOutputSize(channel, width, height);
+  const stats = new Int32Array(4);
+  const send = inRealm((m, transfer) => self.postMessage({ kind: 'comp-out', m }, transfer ?? []));
+  // The page reads frames and windows without asking (`counters`): a copy.
+  const timer = setInterval(() => self.postMessage({ kind: 'comp-stats', stats: stats.slice() }), 500);
+  return {
+    channel,
+    stats,
+    send,
+    // What `runProgram` calls on a compositor.
+    compositor: {
+      addMemory: (token, memory) => send({ kind: 'memory', token, memory }),
+      stop: () => {
+        clearInterval(timer);
+        send({ kind: 'stop' });
+      },
+    },
+  };
+}
+
 self.onmessage = async (ev) => {
   const m = ev.data;
-  if (m.kind === 'key') term.key(m.data);
+  if (m.kind === 'comp-open') comp = openCompositor(m.width, m.height);
+  else if (m.kind === 'comp') {
+    const c = await comp;
+    // The page's own stats and channel mean nothing here: these are the ones
+    // the guests write.
+    if (m.m.kind === 'init') c.send({ ...m.m, channel: c.channel, stats: c.stats.buffer });
+    else c.send(m.m);
+  } else if (m.kind === 'key') term.key(m.data);
   else if (m.kind === 'resize') term.resized(m.rows, m.cols);
   else if (m.kind === 'run') {
     // The page's switches: `?name=` (read through `GEX_PAGE_SEARCH`, since
@@ -62,6 +103,10 @@ self.onmessage = async (ev) => {
     term.cols = m.cols ?? term.cols;
     try {
       const opts = { ...m.opts };
+      if (opts.wl?.inRealm) {
+        const c = await comp;
+        opts.wl = { inRealm: { channel: c.channel, compositor: c.compositor } };
+      }
       if (opts.networkUrl) {
         const { WispNetwork } = await import('./net.js');
         const net = new WispNetwork(opts.networkUrl, (e) => self.postMessage({ kind: 'net', event: e }));

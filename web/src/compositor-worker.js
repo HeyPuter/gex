@@ -904,7 +904,7 @@ class Compositor {
       this.#canvas.height = d.h;
       this.#directSerial = -1;
       this.#cursorSerial = -1;
-      postMessage({ kind: 'direct', w: d.w, h: d.h });
+      post({ kind: 'direct', w: d.w, h: d.h });
       this.#note(`direct present ${d.w}x${d.h} (${d.k})`);
     }
     this.#direct = { k: d.k, w: d.w, h: d.h, ox: d.ox, oy: d.oy };
@@ -928,7 +928,7 @@ class Compositor {
     this.#canvas.width = this.#outW;
     this.#canvas.height = this.#outH;
     this.#lastSig = null;
-    postMessage({ kind: 'direct', w: 0, h: 0 });
+    post({ kind: 'direct', w: 0, h: 0 });
     this.#note('direct present off: compositing');
   }
 
@@ -939,7 +939,7 @@ class Compositor {
     let found = null;
     for (const [k, win] of this.#windows) if (win.role === ROLE_CURSOR) { found = [k, win]; break; }
     if (!found) {
-      if (this.#cursorSerial !== 0) postMessage({ kind: 'cursor', css: 'none' });
+      if (this.#cursorSerial !== 0) post({ kind: 'cursor', css: 'none' });
       this.#cursorSerial = 0;
       return;
     }
@@ -961,7 +961,7 @@ class Compositor {
     cv.getContext('2d').putImageData(new ImageData(px, s.width, s.height), 0, 0);
     const hx = Math.max(0, win.relX | 0), hy = Math.max(0, win.relY | 0);
     cv.convertToBlob().then((blob) => {
-      postMessage({ kind: 'cursor', css: `url(${URL.createObjectURL(blob)}) ${hx} ${hy}, default` });
+      post({ kind: 'cursor', css: `url(${URL.createObjectURL(blob)}) ${hx} ${hy}, default` });
     }).catch(() => {});
   }
 
@@ -1307,6 +1307,10 @@ class Compositor {
 
 // -- the worker's protocol --------------------------------------------------
 
+/** Where this side's messages go: the page, from this Worker -- or, in the
+ *  single-thread build, whatever `inRealm` was given. */
+let post = (m, transfer) => self.postMessage(m, transfer ?? []);
+
 let comp = null;
 let canvas = null;
 let running = false;
@@ -1322,7 +1326,7 @@ function loop() {
     glDevice?.display?.();
     comp.frame();
   } catch (e) {
-    postMessage({ kind: 'error', error: e?.stack || String(e) });
+    post({ kind: 'error', error: e?.stack || String(e) });
     running = false;
     return;
   }
@@ -1418,7 +1422,7 @@ async function startGl(m, canvas) {
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
   glChannel = m.channel;
-  postMessage({ kind: 'gl-ready', describe: glDevice.describe() });
+  post({ kind: 'gl-ready', describe: glDevice.describe() });
   serveGlRing();
 }
 
@@ -1434,7 +1438,7 @@ async function serveGlRing() {
   serveGl(glDevice, glChannel);
 }
 
-self.onmessage = ({ data: m }) => {
+const onMessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       canvas = m.canvas;
@@ -1446,14 +1450,14 @@ self.onmessage = ({ data: m }) => {
         comp.setDirect(m.direct);
         running = true;
         requestAnimationFrame(loop);
-        postMessage({ kind: 'ready' });
-      }).catch((e) => postMessage({ kind: 'error', error: e?.stack || String(e) }));
+        post({ kind: 'ready' });
+      }).catch((e) => post({ kind: 'error', error: e?.stack || String(e) }));
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its
       // other windows.
       startGl(m, canvas).catch((e) =>
-        postMessage({ kind: 'gl-failed', error: e?.message || String(e) }));
+        post({ kind: 'gl-failed', error: e?.message || String(e) }));
     } else if (m.kind === 'memory') {
       comp?.addMemory(m.token, m.memory);
     } else if (m.kind === 'drop-memory') {
@@ -1476,16 +1480,31 @@ self.onmessage = ({ data: m }) => {
     } else if (m.kind === 'wgsl-cache') {
       // The shader translation cache, for a training run to record.
       const blob = glDevice?.wgslCache?.() ?? null;
-      postMessage({ kind: 'wgsl-cache', id: m.id, blob, stats: glDevice?.wgslStats?.() ?? null }, blob ? [blob] : []);
+      post({ kind: 'wgsl-cache', id: m.id, blob, stats: glDevice?.wgslStats?.() ?? null }, blob ? [blob] : []);
     } else if (m.kind === 'readout') {
       // The composited output, read back (RGBA rows, top first): what a test saves as a picture.
-      Promise.resolve(comp?.readout?.() ?? null).then((r) => postMessage({ kind: 'readout', id: m.id, state: r }, r ? [r.px.buffer] : []));
+      Promise.resolve(comp?.readout?.() ?? null).then((r) => post({ kind: 'readout', id: m.id, state: r }, r ? [r.px.buffer] : []));
     } else if (m.kind === 'describe') {
-      Promise.resolve(comp?.describe() ?? null).then((state) => postMessage({ kind: 'describe', id: m.id, state }));
+      Promise.resolve(comp?.describe() ?? null).then((state) => post({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {
       running = false;
     }
   } catch (e) {
-    postMessage({ kind: 'error', error: e?.stack || String(e) });
+    post({ kind: 'error', error: e?.stack || String(e) });
   }
 };
+
+/**
+ * The single-thread build (docs/single-thread.md): this compositor in the
+ * realm that holds the guests, since their memories are plain ones no other
+ * Worker can read. `send(m, transfer)` carries what this side would post to
+ * the page; the result takes the page's messages, as `onmessage` would.
+ */
+export function inRealm(send) {
+  post = send;
+  return (m) => onMessage({ data: m });
+}
+
+// Imported for `inRealm` (by the system Worker), this module must not take
+// that Worker's own messages.
+if (!globalThis.GEX_COMPOSITOR_IN_REALM) self.onmessage = onMessage;

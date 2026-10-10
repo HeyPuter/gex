@@ -45,9 +45,13 @@ const server = createServer(async (req, res) => {
     // A missing path is answered below, once, rather than here and there.
   }
   const headers = {
-    // What buys `SharedArrayBuffer`. See the note at the top.
-    'Cross-Origin-Opener-Policy': 'same-origin',
-    'Cross-Origin-Embedder-Policy': 'require-corp',
+    // What buys `SharedArrayBuffer`. See the note at the top. `GEX_NO_COI=1`
+    // leaves them off, as any static host would: the page then runs the
+    // single-thread build (docs/single-thread.md).
+    ...(process.env.GEX_NO_COI ? {} : {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    }),
     // The closure is hundreds of MB and not content-hashed, so a cache would
     // serve yesterday's libc against today's shim.
     'Cache-Control': 'no-store',

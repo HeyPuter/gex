@@ -400,8 +400,12 @@ function pageGlobals() {
  */
 async function runInSystemWorker(term, opts) {
   const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
-  if (wl || gl) {
-    term.writeln?.('gex: the single-thread build has no compositor or GL yet; running without the screen');
+  // The compositor: a canvas only (not the DOM desktop), drawn by the system
+  // Worker, which holds every guest memory it reads pixels out of. GL and the
+  // X server need the SharedArrayBuffer bridges still.
+  const canvas = typeof wl?.getContext === 'function' && typeof wl.transferControlToOffscreen === 'function' ? wl : null;
+  if ((wl && !canvas) || gl || hostX) {
+    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && 'GL', hostX && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
   }
   const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
   globalThis.__gexSystemWorker = w;
@@ -410,6 +414,32 @@ async function runInSystemWorker(term, opts) {
     w.addEventListener('error', (e) => reject(new Error(e.message || 'the system Worker failed to start')));
   });
   await ready;
+  // The compositor's page side (listeners, canvas size) talks to its worker
+  // half through the system Worker: `comp` messages in, `comp-out` back.
+  const compListeners = new Set();
+  let compStats = null;
+  const compPort = {
+    postMessage(m, transfer = []) {
+      if (m?.kind === 'init' && m.stats) compStats = new Int32Array(m.stats);
+      w.postMessage({ kind: 'comp', m }, transfer);
+    },
+    addEventListener(type, f) { if (type === 'message') compListeners.add(f); },
+    removeEventListener(type, f) { compListeners.delete(f); },
+    terminate() {},
+  };
+  w.addEventListener('message', (e) => {
+    const m = e.data;
+    if (m?.kind === 'comp-out') for (const f of [...compListeners]) f({ data: m.m });
+    else if (m?.kind === 'comp-stats' && compStats) compStats.set(m.stats.subarray(0, compStats.length));
+  });
+  let compositor = null;
+  if (canvas) {
+    const { Compositor } = await import('./compositor.js');
+    // Before `run`: the Worker takes the canvas first, then starts the guest.
+    w.postMessage({ kind: 'comp-open', width: canvas.width, height: canvas.height });
+    compositor = await Compositor.create(canvas, null, wlInput || canvas, { makeWorker: () => compPort });
+    globalThis.__gexCompositor = compositor;
+  }
   const keys = term.onData((data) => w.postMessage({ kind: 'key', data }));
   const resize = term.onResize(({ rows, cols }) => w.postMessage({ kind: 'resize', rows, cols }));
   term.focus?.();
@@ -427,12 +457,13 @@ async function runInSystemWorker(term, opts) {
         globals: pageGlobals(),
         rows: term.rows,
         cols: term.cols,
-        opts: { ...rest, networkUrl: network?.url ?? null },
+        opts: { ...rest, networkUrl: network?.url ?? null, wl: canvas ? { inRealm: true } : undefined },
       });
     });
   } finally {
     keys.dispose();
     resize.dispose();
+    compositor?.stop();
     w.terminate();
   }
 }
@@ -600,7 +631,11 @@ async function runProgramHere(
   // a shared arena of surface descriptors -- never a frame.
   let wlChannel = null;
   let compositor = null;
-  if (wl) {
+  if (wl?.inRealm) {
+    // The single-thread build: the compositor is in this realm, set up by the
+    // system Worker before this run (system-worker.js).
+    ({ channel: wlChannel, compositor } = wl.inRealm);
+  } else if (wl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the Wayland demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
