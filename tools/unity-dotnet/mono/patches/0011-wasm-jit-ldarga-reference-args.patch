@@ -1,0 +1,33 @@
+wasm jit: ldarga of a reference or byref argument (gex)
+
+MONO_WASM_JIT_LDADDR_ARG covered ref-free scalars only, so a constrained call on
+a generic T (ObjectEqualityComparer<T>.GetHashCode: ldarga x; constrained. T;
+callvirt) refused the method. The argument is homed in its ref-shadow slot, as
+R321 homes a ref local (addrslot -2); the prologue already copies every ref
+argument there. Test: T.RefArg.
+
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 551fc111a..69f04eabb 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -714,6 +714,20 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					for (ai2 = 0; ai2 < nargs; ++ai2)
+ 						if (cfg->args [ai2] && cfg->args [ai2]->dreg == vv)
+ 							break;
++					/* gex: a REFERENCE or byref argument (ldarga before a constrained call on a generic T, as in
++					 * ObjectEqualityComparer<T>.GetHashCode) is homed in its ref-shadow slot exactly as R321 homes a
++					 * ref local (addrslot -2): the prologue already copies every ref argument into its slot, the
++					 * slot is GC-scanned, and wasm_ld/wasm_st go through it once it is the home. */
++					if (mono_wasm_jit_ldaddr_arg && ai2 < nargs && !cfg->header->num_clauses &&
++					    self_ci.args [ai2].kind == WJ_ARG_SCALAR &&
++					    (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype))) {
++						extern int mono_wasm_jit_ldaddr_ref;
++						if (mono_wasm_jit_ldaddr_ref) {
++							addrslot [vv] = -2;
++							wj_count (WJC_LDADDR_ARG);
++							continue;
++						}
++					}
+ 					if (!mono_wasm_jit_ldaddr_arg || ai2 >= nargs || cfg->header->num_clauses ||
+ 					    self_ci.args [ai2].kind != WJ_ARG_SCALAR ||
+ 					    m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype) ||

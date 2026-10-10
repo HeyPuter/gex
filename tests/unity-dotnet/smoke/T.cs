@@ -113,6 +113,10 @@ public static class T {
   [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double ArgDouble(double d, float f) { ref double r = ref d; r *= 2; ref float g = ref f; g += 0.5f; return d + f; }
   [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static long ArgLong(long l, int k) { ref long r = ref l; for (int i = 0; i < k; i++) r = r * 3 + i; return l; }
   [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int Bump(ref int v) { v++; return v; }
+  // ldarga of a REFERENCE argument: a constrained call on a generic T, and a write through the address.
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int HashOf<TK>(TK x) => x.GetHashCode();
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static void SetRef(ref string t, string v) { t = v; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int RefArg(string s, int i) { SetRef(ref s, s + i); GC.Collect(0); return s.Length + HashOf(s).GetHashCode() * 0 + HashOf(i); }
   public static string ArgAddr(int n) {
     long acc = 0;
     for (int i = 0; i < n; i++) {
@@ -121,6 +125,7 @@ public static class T {
       acc += ArgByte((byte)i, (sbyte)i);
       acc += (long)ArgDouble(i, i);
       acc += ArgLong(i, 3);
+      if (i % 8 == 0) acc += RefArg("ref", i);
     }
     return "argaddr " + acc;
   }
