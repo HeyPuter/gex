@@ -27,7 +27,7 @@ PATTERNS=("Compute(50) = 50002" "Hello = hello gex from t ptr=8"
 	"Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest"
 	"Back = callback 806.50; unmanaged 1015" "Work(200) = 24983091"
 	"held across collections: 64 of 64 intact" "worker thread: 0 bad of 640"
-	"clears 643296" "delegates 24660 tag0tag1tag2" "checked .OOO.O.O.O..O.O.O... .OOO.O.O.O..O.O.O..." "argaddr 2106683" "hotshapes 3509709 10437154840.67" "monoicalls 699466" "lcsewide 8531659618475" "native 914124880 caught directly caught directly caught directly" "finally 654888186 505936 334" "reflect 449323311 1225" "localloc 1139912260192 aaaaaaaaaaaaaabpcodhiyunocapbocnjOswdcoacoemgOOwyacoaocmekOOusqocadngkjOOucnqaahjOOOOOOOOOOaiOOOOOOOOOOOayswuuOOeiaysauwyscOOiOOOOandaqnOOaOnaqaoccoqOOyOaOOacoocaOOsOqOO aaaaaaaaaabcdphvwsacegOoqskadgjOOlocapOOOOOOOahoOOOOOOavqlOOzuOawsoOOuOOaskcOOOOO" "usedsize grew stable shrank" "liveness: 301 leaves, 0 reported twice, batched" "gc ok")
+	"clears 643296" "delegates 24660 tag0tag1tag2" "checked .OOO.O.O.O..O.O.O... .OOO.O.O.O..O.O.O..." "argaddr 2106683" "hotshapes 3509709 10437154840.67" "monoicalls 699466" "lcsewide 8531659618475" "readfloats 7507799.7418" "native 914124880 caught directly caught directly caught directly" "finally 654888186 505936 334" "reflect 449323311 1225" "localloc 1139912260192 aaaaaaaaaaaaaabpcodhiyunocapbocnjOswdcoacoemgOOwyacoaocmekOOusqocadngkjOOucnqaahjOOOOOOOOOOaiOOOOOOOOOOOayswuuOOeiaysauwyscOOiOOOOandaqnOOaOnaqaoccoqOOyOaOOacoocaOOsOqOO aaaaaaaaaabcdphvwsacegOoqskadgjOOlocapOOOOOOOahoOOOOOOavqlOOzuOawsoOOuOOaskcOOOOO" "usedsize grew stable shrank" "liveness: 301 leaves, 0 reported twice, batched" "gc ok")
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" out.txt || { echo "FAIL: no '$p'"; exit 1; }; done
 # The same under the function JIT, which must leave the replaced library's own code alone: it once
 # followed the PLT into the stub ("x86 Mono stub ... called"), as it followed Muck's into Boehm's GC.
@@ -37,17 +37,18 @@ if ! grep -q "^gc ok$" fjit.txt; then echo "FAIL (--fjit)"; tail -3 fjit.txt; ex
 # The fork's wasm JIT (GEXMONO_WASM_JIT=1) at threshold 1: every method it accepts runs as a
 # wasm64 module compiled by the host, and the results must be the interpreter's.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" run --mem64 \
-	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=1 \
+	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=1 --env MONO_WASM_JIT_VERBOSE=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit.txt 2>&1 || true
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit.txt || { echo "FAIL (wasm JIT): no '$p'"; exit 1; }; done
+if grep -a -q '^WASM_JIT_INVALID' wasmjit.txt; then echo "FAIL (wasm JIT): a module did not validate"; grep -a '^WASM_JIT_INVALID' wasmjit.txt | head -3 | cut -c1-200; exit 1; fi
 # Threshold 10 compiles in a different order (callees before callers, tier-2 recompiles), which once put
 # a virtual call's i32 result into an i64 register (UTF8Encoding.GetChars). Same results, and every
-# emitted module must validate: the last stats line has to say invalid=0.
+# emitted module must validate (MONO_WASM_JIT_VERBOSE=1 names each one that does not).
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" run --mem64 \
-	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=10 --env MONO_WASM_JIT_STATS=1 --env MONO_WASM_JIT_STATS_EVERY=1 \
+	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=10 --env MONO_WASM_JIT_VERBOSE=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit10.txt 2>&1 || true
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit10.txt || { echo "FAIL (wasm JIT, threshold 10): no '$p'"; exit 1; }; done
-grep -a '^\[wasm-jit stats\]' wasmjit10.txt | tail -1 | grep -q ' invalid=0 ' || { echo "FAIL (wasm JIT, threshold 10): a module did not validate"; grep -a '^\[wasm-jit stats\]' wasmjit10.txt | tail -1; exit 1; }
+if grep -a -q '^WASM_JIT_INVALID' wasmjit10.txt; then echo "FAIL (wasm JIT, threshold 10): a module did not validate"; grep -a '^WASM_JIT_INVALID' wasmjit10.txt | head -3 | cut -c1-200; exit 1; fi
 # The liveness walk as it was before the class shapes (field metadata per object): the same set.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_LV_NOSHAPE=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > noshape.txt 2>&1 || true

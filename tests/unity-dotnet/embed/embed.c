@@ -69,7 +69,12 @@ worker (void *arg)
 		for (int i = 0; i < 32; i++) {
 			int v = 1000 + round * 32 + i;
 			void *a [1] = { &v };
+			exc = NULL;
 			held [i] = mono_runtime_invoke (g_make, NULL, a, &exc);
+			if (exc) {
+				P s = mono_object_to_string (exc, NULL);
+				fprintf (stderr, "worker: Make(%d) threw: %.300s\n", v, s ? mono_string_to_utf8 (s) : "?");
+			}
 		}
 		volatile unsigned long spin = 0;
 		for (unsigned long k = 0; k < 2000000; k++)
@@ -78,8 +83,12 @@ worker (void *arg)
 			int v = 1000 + round * 32 + i;
 			char want [128];
 			snprintf (want, sizeof want, "object %d %.*s", v, v % 50, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-			if (strcmp (mono_string_to_utf8 (held [i]), want))
+			const char *got = held [i] ? mono_string_to_utf8 (held [i]) : "(null)";
+			if (strcmp (got, want)) {
+				if (bad < 4)
+					fprintf (stderr, "worker bad: round %d slot %d obj %p want \"%s\" got \"%.80s\"\n", round, i, held [i], want, got);
 				bad++;
+			}
 		}
 	}
 	worker_bad = bad;
@@ -314,6 +323,12 @@ main (int argc, char **argv)
 	P lwr = mono_runtime_invoke (lw, NULL, lwargs, &exc);
 	check ("LcseWide", exc);
 	printf ("%s\n", mono_string_to_utf8 (lwr));
+	P rdf = mono_class_get_method_from_name (k, "ReadFloats", 1);
+	int rdfn = 20000;
+	void *rdfargs [1] = { &rdfn };
+	P rdfr = mono_runtime_invoke (rdf, NULL, rdfargs, &exc);
+	check ("ReadFloats", exc);
+	printf ("%s\n", mono_string_to_utf8 (rdfr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };
