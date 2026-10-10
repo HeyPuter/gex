@@ -158,6 +158,32 @@ pub struct Context<'a> {
     pub page_bases: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
+    /// Every address some block of `gir` branches back to (a successor at or
+    /// below the branching block's start). A region needs a back edge to its
+    /// entry, so a block not in here grows none and the walk is skipped.
+    /// `None`: no filter.
+    pub loop_heads: Option<&'a std::collections::HashSet<u64>>,
+}
+
+/// The back-edge targets of `gir`, for [`Context::loop_heads`].
+pub fn loop_heads<'b>(blocks: impl Iterator<Item = &'b Block>) -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    for b in blocks {
+        for s in b.successors() {
+            if s <= b.start {
+                out.insert(s);
+            }
+        }
+    }
+    out
+}
+
+/// The region grown at `block`, if any (and regions are on).
+fn region_at(block: &Block, cx: &Context<'_>) -> Option<crate::region::Region> {
+    if region_limit() <= 1 || cx.loop_heads.is_some_and(|h| !h.contains(&block.start)) {
+        return None;
+    }
+    crate::region::grow(block.start, cx.gir, region_limit())
 }
 
 /// `GEX_NO_PAGE_CHECK=1`: blocks do not check their page's directory entry
@@ -381,6 +407,7 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
     // The page check's stale path (and the guard's) dispatch to this block's
@@ -393,12 +420,10 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
-        if region_limit() > 1 {
-            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
-                for a in region.iter() {
-                    if let Some(b) = cx.gir.get(a) {
-                        pages.extend(checked_pages(bases, b.start, b.end));
-                    }
+        if let Some(region) = &region {
+            for a in region.iter() {
+                if let Some(b) = cx.gir.get(a) {
+                    pages.extend(checked_pages(bases, b.start, b.end));
                 }
             }
         }
@@ -430,12 +455,13 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
     }
-    run_one(&mut e, block);
+    run_one(&mut e, block, region);
     e.f.finish_with_relocs()
 }
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
     // The page check's stale path (and the guard's) dispatch to this block's
@@ -448,12 +474,10 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
-        if region_limit() > 1 {
-            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
-                for a in region.iter() {
-                    if let Some(b) = cx.gir.get(a) {
-                        pages.extend(checked_pages(bases, b.start, b.end));
-                    }
+        if let Some(region) = &region {
+            for a in region.iter() {
+                if let Some(b) = cx.gir.get(a) {
+                    pages.extend(checked_pages(bases, b.start, b.end));
                 }
             }
         }
@@ -485,15 +509,15 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
     }
-    run_one(&mut e, block);
+    run_one(&mut e, block, region);
     e.f.finish()
 }
 
 /// The body of both entry points: a region if one can be grown here,
 /// otherwise the block on its own.
-fn run_one(e: &mut Emitter<'_>, block: &Block) {
-    match crate::region::grow(block.start, e.cx.gir, region_limit()) {
-        Some(region) if region_limit() > 1 => {
+fn run_one(e: &mut Emitter<'_>, block: &Block, region: Option<crate::region::Region>) {
+    match region {
+        Some(region) => {
             if std::env::var_os("GEX_REGION_DEBUG").is_some() {
                 let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
                 eprintln!("[region] {}", members.join(" "));

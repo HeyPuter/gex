@@ -903,6 +903,7 @@ impl ModuleBuilder {
                     }
                 }
             }
+            let heads = tier1::loop_heads(self.pending.iter().map(|(b, _)| b));
             let cx = tier1::Context {
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
@@ -920,6 +921,7 @@ impl ModuleBuilder {
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
                 module_id,
+                loop_heads: Some(&heads),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.

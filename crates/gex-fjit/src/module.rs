@@ -130,6 +130,7 @@ pub fn build_module(
         profile: None,
         page_bases: None,
         module_id: 0,
+        loop_heads: None,
     };
     let mcx = ModuleCx {
         cx: &cx,
@@ -417,6 +418,7 @@ pub fn build_runtime(
             profile: None,
             page_bases: None,
             module_id: 0,
+            loop_heads: None,
         };
         let mcx = ModuleCx {
             cx: &cx,
