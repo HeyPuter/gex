@@ -151,16 +151,114 @@ public static class T {
     catch (InvalidOperationException) { log += 11; }
     return 1;
   }
+  static int finCount;
+  // A value chosen inside the try and used after the leave: out-of-SSA puts its phi move between
+  // the CALL_HANDLER and the leave's branch.
+  [MethodImpl(MethodImplOptions.NoInlining)] static string Str(int i) => i.ToString();
+  [MethodImpl(MethodImplOptions.NoInlining)] static string FinMove(int i) {
+    string s = null;
+    try {
+      if (i % 3 == 0) { s = "a" + Str(i); return s; }
+      if (i % 3 == 1) { s = "b"; } else { s = "c" + Str(i * 2); }
+    } finally { finCount++; }
+    return s + Str(i);
+  }
+  static readonly object srLock = new object();
+  static List<string> srLoading;
+  static int srRec;
+  static Dictionary<string, string> srTable = new Dictionary<string, string> { { "k1", "v1" }, { "k2", "v2" } };
+  // SR.InternalGetResourceString's shape: lock + catch-rethrow + finally, leaves carrying a value.
+  [MethodImpl(MethodImplOptions.NoInlining)] static string SrLike(string key) {
+    if (key.Length == 0) return key;
+    bool lockTaken = false;
+    try {
+      System.Threading.Monitor.Enter(srLock, ref lockTaken);
+      if (srLoading != null && srLoading.Count > 0 && srLoading.LastIndexOf(key) >= 0) {
+        if (srRec > 0) return key;
+        srRec++;
+      }
+      srLoading ??= new List<string>();
+      srLoading.Add(key);
+      srTable.TryGetValue(key, out string s);
+      if (key == "boom") throw new InvalidOperationException();
+      srLoading.RemoveAt(srLoading.Count - 1);
+      return s ?? key;
+    } catch {
+      if (lockTaken) { srLoading = null; }
+      throw;
+    } finally {
+      if (lockTaken) System.Threading.Monitor.Exit(srLock);
+    }
+  }
+  static string srOut;
+  [MethodImpl(MethodImplOptions.NoInlining)] static void SrLike2(string key) {
+    if (key.Length == 0) { srOut = key; return; }
+    bool lockTaken = false;
+    try {
+      System.Threading.Monitor.Enter(srLock, ref lockTaken);
+      if (srLoading != null && srLoading.Count > 0 && srLoading.LastIndexOf(key) >= 0) {
+        if (srRec > 0) { srOut = key; return; }
+        srRec++;
+      }
+      srLoading ??= new List<string>();
+      srLoading.Add(key);
+      srTable.TryGetValue(key, out string s);
+      if (key == "boom") throw new InvalidOperationException();
+      srLoading.RemoveAt(srLoading.Count - 1);
+      srOut = s ?? key;
+    } catch {
+      if (lockTaken) { srLoading = null; }
+      throw;
+    } finally {
+      if (lockTaken) System.Threading.Monitor.Exit(srLock);
+    }
+  }
+  public unsafe class UmsLike {
+    long _position, _length = 1 << 20; long _offset = 3; byte[] arr = new byte[64]; public int acq;
+    [MethodImpl(MethodImplOptions.NoInlining)] void Acquire(ref byte* p) { acq++; p = (byte*)0 + 1; }
+    [MethodImpl(MethodImplOptions.NoInlining)] void Release() { acq--; }
+    [MethodImpl(MethodImplOptions.NoInlining)] public int ReadByteU() {
+      long pos = System.Threading.Interlocked.Read(ref _position);
+      long len = System.Threading.Interlocked.Read(ref _length);
+      if (pos >= len) return -1;
+      System.Threading.Interlocked.Exchange(ref _position, pos + 1);
+      int result;
+      byte* pointer = null;
+      try {
+        Acquire(ref pointer);
+        result = arr[(int)((long)(pointer - 1) + pos + _offset) & 63] + (int)pos;
+      } finally {
+        if (pointer != null) Release();
+      }
+      return result;
+    }
+  }
+  static byte[] umsData = new byte[256];
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe int UmsRead(int i) {
+    for (int k = 0; k < 256; k++) umsData[k] = (byte)(k * 7 + 3);
+    fixed (byte* p = umsData) {
+      using var u = new System.IO.UnmanagedMemoryStream(p, 256);
+      u.Position = i % 200;
+      int a = u.ReadByte(), b = u.ReadByte();
+      return a * 3 + b;
+    }
+  }
   public static string NestedFinally(int n) {
-    long acc = 0; int log = 0;
+    long acc = 0; int log = 0; var ums = new UmsLike();
     for (int i = 0; i < n; i++) {
       acc += Fin2(i, ref log);
       acc += Fin3(i, ref log);
       acc += FinThrow(i, ref log);
+      acc += FinMove(i).Length * 7 + FinMove(i)[0];
+      string sk = (i % 4 == 0) ? "k1" : (i % 4 == 1) ? "k2" : (i % 4 == 2) ? "zz" : "boom";
+      try { acc += SrLike(sk)[0]; acc += SrLike(sk).Length; } catch (InvalidOperationException) { acc += 5; }
+      try { SrLike2(sk); acc += srOut.Length; } catch (InvalidOperationException) { acc += 3; }
+      acc += ums.ReadByteU() + ums.acq;
+      acc += UmsRead(i);
       acc = acc * 31 + log;
       acc %= 1000000007;
     }
-    return "finally " + acc + " " + log;
+    return "finally " + acc + " " + log + " " + finCount;
   }
   // Calls into System.Reflection from a hot method (PlayMaker's LoadActionField shape): the wasm JIT once
   // refused every such caller ("residual reflection"), a guard needed only once Reflection.Emit is in use.
