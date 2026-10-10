@@ -1192,6 +1192,27 @@ Chromium timing is still to do. What it took, in start order:
     (`GRAPHICS=null|wayland` sets the driver). `$W/page/pfx4` was built
     from gate-w3boot/pfx-w3install. `run-node.mjs --dir` now carries
     directory symlinks (`dosdevices/c:`) as links.
+- **Bundle file times.** nt-page passes a bundle's symlinks and, with
+  `mtimes=1`, its file times. Without them wineboot saw wine.inf as newer
+  than the install and ran the whole prefix update first (5 extra
+  processes).
+- **Milestone (b): a GUI program on the page compositor.** window.exe
+  draws its window on the page's Wayland compositor (Chromium on gooner,
+  functional only; screenshot `$W/page/tmp/shots/run0.png`).
+  - The bug was a user callback's syscall frame being overwritten.
+    KeUserModeCallback put it below its own C frame. A Unix call from the
+    wasm PE module goes straight to `__wine_unix_call_dispatcher`, with no
+    system-call switch, so it runs on the loader's stack below that frame
+    and wrote over it. Here that call was winewayland.drv's DllMain under
+    the load_driver callback. NtCallbackReturn then found no
+    `prev_frame` and returned STATUS_NO_CALLBACK_ACTIVE (0xc0000258).
+  - The fix: the frame now lives in KeUserModeCallback's own frame
+    (`alloca`). Wine fork 3cad2206edf.
+  - Natively the same build passed, so only the page path wrote there.
+  - `GEX_WL_STUB=1` reproduces it under Node.
+  - The Wayland bundle carries `/usr/share/X11/xkb`. Without it,
+    wayland_keyboard_init failed with "Failed to parse default Xkb
+    ruleset".
 
 ### 3.9 x64 programs (later)
 
@@ -2208,12 +2229,15 @@ Steps:
 **RESUME HERE (2026-10-10, evening): W3.7.** `wine cmd /c echo` runs in
 the page under Node on gooner. See §3.17, "W3.7".
 - **Driver script:** `$W/page/run-w3.sh TAG EXE|cmd [args]`, with
-  `PFX=pfx3` (the installed template) and `TRAPSTACK=1`.
+  `PFX=pfx4` (null) or `pfx-wl` (Wayland; add `GEX_WL_STUB=1`), `DIST=`
+  and `TRAPSTACK=1`. Chromium: `$W/page/w3page.mjs` (W3TAR, W3ARGV,
+  W3WANT, W3SHOT=dir).
 - **Next:**
   1. Chromium timing on edger once the edger reservation ends. Edger was
      reserved for DH on 2026-10-10; no edger jobs until the
      coordinator says so.
-  2. Milestone (b): a GUI program on the page compositor.
+  2. Milestone (b): done functionally (window.exe, see §3.17); edger
+     timing queued (`$W/page/run-w3gui.sh`, `$W/page/w3gui-edger1.txt`).
   3. Milestone (c): Undertale.
   4. The session keeper (design below in §3.17).
 
