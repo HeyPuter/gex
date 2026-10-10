@@ -272,6 +272,8 @@ extern "C" {
     fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
+    fn k_fs_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
+    fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -708,6 +710,12 @@ extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) ->
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
     unsafe { k_fs_touch(handle, secs) }
 }
+extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) }
+}
+extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
+}
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
 }
@@ -1141,6 +1149,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             mksocket: rf_mksocket,
             set_mtime: rf_set_mtime,
             touch: rf_touch,
+            set_times: rf_set_times,
+            set_times_fd: rf_set_times_fd,
         },
     )))
 }
