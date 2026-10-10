@@ -2365,3 +2365,60 @@ Not yet:
     - hp31 repeats hp30 without it.
   - ld.so's unit works in the page: hp29 placed it at 7.7 s with 357 entries. First frame was at 43 s,
     and the menu ran at 42.1 presents/s.
+  - hp31 hung exactly as hp30 did, so libGL is not the cause; 62b38fc2 is. It is reverted (42f09b39).
+    Which half (the arena reserve or per-thread arming) hangs is not known.
+  - hp32 (shim-m5, i.e. 29cbcc4d without 62b38fc2, plus the window pins of 046bec02): all 16 units
+    found, no pin misplaced. First frame at 34 s (hp29: 43 s), 100 presents at 66 s (hp29: 75 s), menu
+    41.4 presents/s at 212 s.
+- **Transition cost (ce395feb: `EMBED_BENCH=N` in `tests/unity-dotnet/embed`, browser, 20M calls a
+  leg, ns per call; "refused" is a callee the JIT will not compile).**
+
+  | leg | interpreter only (cb1) | JIT, threshold 1 (cb2) |
+  |---|---|---|
+  | same tier | 64.8 / 65.5 | 14.2 / 14.2 (JIT to JIT) |
+  | to refused | 67.6 / 64.5 | 508.4 / 472.9 (JIT to interpreter) |
+  | from refused | 51.1 / 50.0 | 207.9 / 187.1 (interpreter to JIT) |
+  | refused to refused | 56.9 / 74.3 | 55.5 / 55.2 |
+
+  A JIT-to-interpreter call costs 7-10 times an interpreter call, and an interpreter-to-JIT call
+  about 3 times.
+- **Steady-gameplay profile (hg13 JIT, hg14 interpreter: King's Pass, the main Worker only, 1 ms
+  sampling, 20 s at 600 s).**
+  - Presents did happen in the window. The "0 presents" the harness printed was a counting bug
+    (it read the count from before the profile); fixed.
+  - About 6 s of each 20 s is `gl_submit` waiting for the page (the minified `Atomics.wait` is not
+    counted as wait). Managed code (under `gexp_mono_runtime_invoke`) is 6.60 s in hg13 and 5.27 s in
+    hg14.
+  - Normalised to the same number of frames (UnityPlayer's own time outside managed code, 3.55 s vs
+    4.94 s, as the frame count), managed code costs 6.60 s under the JIT against 3.79 s on the
+    interpreter: 74% more per frame.
+
+    | bucket (s, same frames) | JIT | interpreter |
+    |---|---|---|
+    | JIT code + interpreter execution | 1.16 + 0.33 = 1.49 | 1.07 |
+    | JIT/interpreter glue (`interp_entry`, `wj_*`, lazy binding, `get_imethod`) | 1.01 | 0.06 |
+    | other mono (call info, hash lookups, mutexes) | 1.02 | 0.50 |
+    | guest-call glue (`gexp_call_guest`, `provider_try`, wasm-to-js) | 0.75 | 0.39 |
+    | GC-mode transitions (`mono_threads_*`) | 0.49 | 0.24 |
+    | UnityPlayer code called from managed | 0.88 | 0.70 |
+    | `major_get_used_size` | 0.73 | 0.64 |
+
+  - The JIT does not make the method bodies faster: emitted code plus what is left on the
+    interpreter takes 0.42 s more than the interpreter alone. The emitted time is flat (the hottest
+    method, `Fsm:UpdateStateChanges`, is 0.06 s self), so no single body is to blame. HK's managed
+    code is thin: PlayMaker FSM steps and Unity binding wrappers.
+  - Most JIT-to-interpreter time is calls into UnityPlayer. Of the 4.22 s under
+    `wj_call_interp_inner`, 3.03 s ends in an icall or P/Invoke. `wj_lazy_refusal` refuses
+    INTERNAL_CALL and PINVOKE_IMPL callees ("shape"), so every binding call from JIT code takes the
+    ~490 ns crossing, then the interpreter's own icall path. On the interpreter that call is an
+    ordinary interpreter call.
+  - Lazy call sites to never-compiled callees resolve on every call:
+    `mono_wasm_jit_lazy_interp` (0.27 s) runs `mono_wasm_get_call_info` each time (0.13 s), and
+    `mono_wasm_jit_pretransform` looks up the InterpMethod by hash each time (0.30 s).
+  - Both tiers spend 0.6-0.9 s per 20 s (3-4.5% of the main Worker) in `major_get_used_size`. Team
+    Cherry's `GCManager:Update` calls `GetMonoHeapUsage` every frame, and sgen answers by walking every
+    object in the major heap.
+  - What it would take for the JIT to pay off: direct icall/P/Invoke calls from emitted code (no
+    interpreter in between), caching what the lazy interpreter path resolves per site, and then better
+    bodies. Even then, the bodies alone are not faster than the interpreter, so HK stays on
+    `GEXMONO_WASM_JIT=0`.
