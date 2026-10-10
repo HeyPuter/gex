@@ -1,41 +1,20 @@
-diff --git a/src/mono/mono/mini/jit-icalls.c b/src/mono/mono/mini/jit-icalls.c
-index 2f18c3115..2c782536b 100644
---- a/src/mono/mono/mini/jit-icalls.c
-+++ b/src/mono/mono/mini/jit-icalls.c
-@@ -157,6 +157,16 @@ mono_ldftn (MonoMethod *method)
- 		}
- 	}
- 
-+#ifdef HOST_GEX
-+	/* gex runs Mono interpreter-only (MONO_AOT_MODE_INTERP_ONLY, not llvm-only); the only mini-compiled code is
-+	 * the wasm JIT's. A function pointer it loads goes to the interpreter (a delegate .ctor the JIT calls through
-+	 * interp_entry, ves_icall_mono_delegate_ctor_interp; the JIT bails on raw calli), which takes function
-+	 * pointers as InterpMethod* (its MINT_LDFTN). create_method_pointer's native entry read as an InterpMethod
-+	 * gave a NULL method there (Hollow Knight, tk2dSpriteAnimator.Start). */
-+	if (mono_use_interpreter && method->wrapper_type != MONO_WRAPPER_NATIVE_TO_MANAGED)
-+		return mini_get_interp_callbacks ()->get_interp_method (method);
-+#endif
-+
- 	/* if we need the address of a native-to-managed wrapper, just compile it now, trampoline needs thread local
- 	 * variables that won't be there if we run on a thread that's not attached yet. */
- 	if (method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED) {
-@@ -211,6 +221,16 @@ ldvirtfn_internal (MonoObject *obj, MonoMethod *method, gboolean gshared)
- 
- 	/* An rgctx wrapper is added by the trampolines no need to do it here */
- 	gboolean need_unbox = m_class_is_valuetype (res->klass) && !m_class_is_valuetype (method->klass);
-+#ifdef HOST_GEX
-+	/* As mono_ldftn: the interpreter's function pointer (its MINT_LDVIRTFTN: the InterpMethod*, bit 0 set when
-+	 * the receiver must be unboxed). */
-+	if (mono_use_interpreter) {
-+		gpointer im = mini_get_interp_callbacks ()->get_interp_method (res);
-+		addr = need_unbox ? (gpointer)((gsize)im | 1) : im;
-+		ldvirtfn_cache_write (cache, method, gshared, addr);
-+		return addr;
-+	}
-+#endif
- 	if (need_unbox) {
- 		/*
- 		 * We can't return a jump trampoline here, because the trampoline code
+wasm jit: a continuation block for every CALL_HANDLER; bail reasons by gate (gex)
+
+The emitter runs a finally as "finally_ind = continuation block; goto handler", so the
+continuation must start a block. Out-of-SSA puts phi moves between a CALL_HANDLER and the
+leave's OP_BR, and branch optimization deletes a BR to the fallthrough block; both were refused
+as "finally: complex call_handler continuation" (tk2dSprite.UpdateMaterial and
+GUILayoutGroup.CalcHeight in Hollow Knight; UnmanagedMemoryStream.ReadByte,
+SR.InternalGetResourceString, the resource readers in the BCL). wj_split_call_handler_blocks
+moves the instructions after a CALL_HANDLER into a new block reached by an OP_BR, with the
+non-handler CFG edges, before any analysis; a CALL_HANDLER that ends its block continues at
+bb->next_bb. cfg->num_bblocks stays as it is: it sizes cfg->bblocks, which mono_free_loop_info
+walks at mono_destroy_compile (bumping it read past the array and crashed at random).
+
+[wasm-jit bails] also lists every non-opcode gate string with its count and the first method
+it refused ("why N gate (first: ...)"), so "synchronized/other" names its reasons.
+Tests: T.NestedFinally (FinMove, SrLike, SrLike2, UmsLike, UmsRead).
+
 diff --git a/src/mono/mono/mini/mini-wasm-diagnostics.inc b/src/mono/mono/mini/mini-wasm-diagnostics.inc
 index 872008171..b42f3330c 100644
 --- a/src/mono/mono/mini/mini-wasm-diagnostics.inc
@@ -63,10 +42,10 @@ index 872008171..b42f3330c 100644
  }
  
 diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
-index 660e37fce..59b648469 100644
+index 660e37fce..f8d248eeb 100644
 --- a/src/mono/mono/mini/mini-wasm-emitter.inc
 +++ b/src/mono/mono/mini/mini-wasm-emitter.inc
-@@ -246,12 +246,97 @@ wj_t2u_census (MonoMethod *root, WjBody *b)
+@@ -246,12 +246,81 @@ wj_t2u_census (MonoMethod *root, WjBody *b)
  }
  #endif
  
@@ -99,11 +78,11 @@ index 660e37fce..59b648469 100644
 +			if (!nx || (nx->opcode == OP_BR && nx->inst_target_bb))
 +				break;   /* already the shape the emitter wants; the rest of bb is skipped after the handler */
 +			handler = ins->inst_target_bb;
-+			if (g_getenv ("WJDBG_FLUSH")) { char *_fn = mono_method_full_name (cfg->method, TRUE); printf ("WJDBG split %s BB%d\n", _fn, bb->block_num); fflush (stdout); g_free (_fn); }
 +			nb = (MonoBasicBlock *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock));
 +			nb->block_num = (int) cfg->max_block_num + 1;
 +			cfg->max_block_num = nb->block_num;
-+			cfg->num_bblocks++;
++			/* NOT cfg->num_bblocks: it sizes cfg->bblocks (the DFN array), which nb is not in, and
++			 * mono_free_loop_info walks bblocks [0, num_bblocks) at mono_destroy_compile. */
 +			nb->region = bb->region;
 +			nb->real_offset = bb->real_offset;
 +			nb->has_call_handler = 1;
@@ -143,28 +122,12 @@ index 660e37fce..59b648469 100644
  #ifdef WJ_RUNTIME
  	if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
  #endif
-+	if (cfg->header && cfg->header->num_clauses > 0 && !g_getenv ("WJDBG_NOSPLIT") &&
-+	    (!g_getenv ("WJDBG_SPLITONLY") || strstr (cfg->method->name, g_getenv ("WJDBG_SPLITONLY"))))
++	if (cfg->header && cfg->header->num_clauses > 0)
 +		wj_split_call_handler_blocks (cfg);
-+	if (g_getenv ("WJDBG_FLUSH")) { printf ("WJDBG %s\n", cfg->method->name); fflush (stdout); }
-+	if (g_getenv ("WJDBG_PRINT") && strstr (cfg->method->name, g_getenv ("WJDBG_PRINT"))) {
-+		MonoBasicBlock *_pb;
-+		for (_pb = cfg->bb_entry; _pb; _pb = _pb->next_bb) {
-+			int _k;
-+			printf ("WJDBG BB%d region=0x%x flags=0x%x in=", _pb->block_num, _pb->region, _pb->flags);
-+			for (_k = 0; _k < _pb->in_count; ++_k) printf ("%d,", _pb->in_bb [_k]->block_num);
-+			printf (" out=");
-+			for (_k = 0; _k < _pb->out_count; ++_k) printf ("%d,", _pb->out_bb [_k]->block_num);
-+			printf ("\n");
-+			fflush (stdout);
-+			mono_print_bb (_pb, "WJDBG");
-+		}
-+		fflush (stdout);
-+	}
  	/* Compile-time accounting (Part 2): wj_gen_t0 = bytecode-GENERATION start (100ns ticks); wj_inst_ms =
  	 * the JS WebAssembly.Module/Instance time for THIS compile (written by mono_wasm_jit_instantiate_local).
  	 * At `done:` we fold (elapsed - instantiate) into WJC_ELAPSED_GENERATION so the two halves don't overlap. */
-@@ -3447,8 +3532,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
+@@ -3447,8 +3516,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
  				 * leave emits multiple OP_CALL_HANDLERs in one bb — not supported yet). */
  				int _cont; MonoInst *_nx = ins->next;
  				while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT)) _nx = _nx->next;
@@ -181,15 +144,7 @@ index 660e37fce..59b648469 100644
  				if (_cont < 0) { fail = "finally: bad continuation"; goto done; }
  				wasm_i32_const (&body, _cont);
  				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
-@@ -7891,6 +7982,7 @@ vcall_cold_miss_emit:
- 	wasm_buf_free (&out);
- 
- done:
-+	if (g_getenv ("WJDBG_FLUSH")) { printf ("WJDBG done %s fail=%s\n", cfg->method->name, fail ? fail : "-"); fflush (stdout); }
- 	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
- 	wj_stored_body = NULL;
- 	wasm_buf_free (&body);
-@@ -7963,6 +8055,8 @@ done:
+@@ -7963,6 +8038,8 @@ done:
  			else cat = WJB_SYNC_OTHER;
  			if (cat >= 0)
  				wj_bail_hist [cat]++;
@@ -228,76 +183,3 @@ index 7413ce493..7d7fd6c8d 100644
  /* Ring buffer of the last 128 residual callees (MonoMethod*), for post-crash diagnosis: a residual's
   * interp_entry can be what trips a failure, and the last ring entries name it.
   * Populated (gated by MONO_WASM_JIT_STATS) in mono_wasm_jit_call_interp; dumped via the export below. */
-diff --git a/src/mono/mono/mini/mini.c b/src/mono/mono/mini/mini.c
-index d997d44e2..4e6d3ffe7 100644
---- a/src/mono/mono/mini/mini.c
-+++ b/src/mono/mono/mini/mini.c
-@@ -2275,15 +2275,38 @@ mono_codegen (MonoCompile *cfg)
- #endif
- }
- 
-+/*
-+ * Mark every block reachable from ROOT, iteratively: the recursive form went one native frame deeper per block on a
-+ * path and overflowed a web worker's stack on a large CFG ("Maximum call stack size exceeded" in compute_reachable at
-+ * boot -- 2026-09-30, and R452's tier dump, where it wedged the run) -- the failure df_visit had (R377). Only the
-+ * visited set is the result, so a worklist in any order computes the same thing. A block is marked when pushed, so
-+ * each is pushed at most once; the stack is sized by the caller from the bb chain and grows if a block lies outside it.
-+ */
- static void
--compute_reachable (MonoBasicBlock *bb)
-+compute_reachable (MonoCompile *cfg, MonoBasicBlock *root, MonoBasicBlock ***stackp, int *capp)
- {
--	int i;
-+	MonoBasicBlock **stack = *stackp;
-+	int sp = 0, i;
- 
--	if (!(bb->flags & BB_VISITED)) {
--		bb->flags |= BB_VISITED;
--		for (i = 0; i < bb->out_count; ++i)
--			compute_reachable (bb->out_bb [i]);
-+	if (root->flags & BB_VISITED)
-+		return;
-+	root->flags |= BB_VISITED;
-+	stack [sp++] = root;
-+	while (sp > 0) {
-+		MonoBasicBlock *bb = stack [--sp];
-+		for (i = 0; i < bb->out_count; ++i) {
-+			MonoBasicBlock *child = bb->out_bb [i];
-+			if (child->flags & BB_VISITED)
-+				continue;
-+			child->flags |= BB_VISITED;
-+			if (sp == *capp) {
-+				MonoBasicBlock **ns = (MonoBasicBlock **)mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * (*capp) * 2);
-+				memcpy (ns, stack, sizeof (MonoBasicBlock *) * (*capp));
-+				stack = *stackp = ns;
-+				*capp *= 2;
-+			}
-+			stack [sp++] = child;
-+		}
- 	}
- }
- 
-@@ -2311,12 +2334,20 @@ static void mono_bb_ordering (MonoCompile *cfg)
- 
- 		/* remove unreachable code, because the code in them may be
- 		 * inconsistent  (access to dead variables for example) */
--		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
-+		MonoBasicBlock **rstack;
-+		int rcap = 2;
-+
-+		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
- 			bb->flags &= ~BB_VISITED;
--		compute_reachable (cfg->bb_entry);
-+			rcap++;
-+		}
-+		rstack = (MonoBasicBlock **)mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock *) * rcap);
-+		if (cfg->verbose_level > 1)
-+			g_print ("compute_reachable: %d blocks, worklist\n", rcap - 2);
-+		compute_reachable (cfg, cfg->bb_entry, &rstack, &rcap);
- 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb)
- 			if (bb->flags & BB_EXCEPTION_HANDLER)
--				compute_reachable (bb);
-+				compute_reachable (cfg, bb, &rstack, &rcap);
- 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
- 			if (!(bb->flags & BB_VISITED)) {
- 				if (cfg->verbose_level > 1)

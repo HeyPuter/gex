@@ -27,7 +27,7 @@ PATTERNS=("Compute(50) = 50002" "Hello = hello gex from t ptr=8"
 	"Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest"
 	"Back = callback 806.50; unmanaged 1015" "Work(200) = 24983091"
 	"held across collections: 64 of 64 intact" "worker thread: 0 bad of 640"
-	"clears 643296" "delegates 24660 tag0tag1tag2" "checked .OOO.O.O.O..O.O.O... .OOO.O.O.O..O.O.O..." "argaddr 2106683" "native 914124880 caught directly caught directly caught directly" "finally 936621693 505936" "reflect 449323311 1225" "usedsize grew stable shrank" "liveness: 301 leaves, 0 reported twice, batched" "gc ok")
+	"clears 643296" "delegates 24660 tag0tag1tag2" "checked .OOO.O.O.O..O.O.O... .OOO.O.O.O..O.O.O..." "argaddr 2106683" "native 914124880 caught directly caught directly caught directly" "finally 996043936 505936 120" "reflect 449323311 1225" "usedsize grew stable shrank" "liveness: 301 leaves, 0 reported twice, batched" "gc ok")
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" out.txt || { echo "FAIL: no '$p'"; exit 1; }; done
 # The same under the function JIT, which must leave the replaced library's own code alone: it once
 # followed the PLT into the stub ("x86 Mono stub ... called"), as it followed Muck's into Boehm's GC.
