@@ -1442,7 +1442,11 @@ pub extern "C" fn k_pipe_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 };
-    let mut buf = vec![0u8; len as usize];
+    // No bigger than what is buffered (at least one byte, so an empty pipe
+    // still answers EOF or EAGAIN): a reader asking for 128 KiB of a pipe
+    // holding a few bytes zeroed the whole request on every call.
+    let want = (len as usize).min(p.buffered().max(1));
+    let mut buf = vec![0u8; want];
     match p.read(&mut buf) {
         Ok(n) => {
             unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
