@@ -218,8 +218,15 @@ pub extern "C" fn gex_elfprov_wanted() -> i32 {
 /// Dispatch slots (table, slot pairs, as `bridges` gives them) JS must point
 /// at the bridge again (`gex_elfprov_rebridge`).
 static REBRIDGE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-/// How many times each address was re-bridged (a loop guard).
-static REBRIDGED: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+/// Each re-bridged address: how many times in a row it lost the bridge
+/// again at once, and the dispatch-miss count when it last did (a loop
+/// guard).
+static REBRIDGED: Mutex<Vec<(u64, u32, u64)>> = Mutex::new(Vec::new());
+
+/// Other misses between two re-bridges of one address that say the bridge
+/// held and something else took it later, rather than a slot that never
+/// keeps it.
+const REBRIDGE_PROGRESS: u64 = 16;
 
 /// A dispatch miss at an address a provider holds: its slot lost the bridge
 /// (a forked child instantiating a module it inherited, which fills the
@@ -232,14 +239,22 @@ pub(crate) fn rebridge(pc: u64) -> bool {
         return false;
     }
     {
+        // Counted only while nothing else happens in between. A long-running
+        // process loses a provider's bridge legitimately every time a new
+        // module for that dispatch page fills its slots; node in the page
+        // did so 64 times in under a minute, the guard gave up, and tier-1
+        // was handed an IFUNC's resolver+1 and panicked ("text base must be
+        // instruction-aligned").
+        let now = crate::MISSES[0].load(Ordering::Relaxed);
         let mut seen = lock(&REBRIDGED);
-        let n = match seen.iter_mut().find(|(a, _)| *a == pc) {
-            Some((_, n)) => {
-                *n += 1;
+        let n = match seen.iter_mut().find(|(a, _, _)| *a == pc) {
+            Some((_, n, at)) => {
+                *n = if now.wrapping_sub(*at) > REBRIDGE_PROGRESS { 1 } else { *n + 1 };
+                *at = now;
                 *n
             }
             None => {
-                seen.push((pc, 1));
+                seen.push((pc, 1, now));
                 1
             }
         };
