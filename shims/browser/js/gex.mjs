@@ -1225,6 +1225,8 @@ export class Gex {
     // How many blocks one dispatch miss lifts (default 2048).
     if (opts.liftMax) this.#shim.exports.gex_set_lift_max?.(opts.liftMax);
     if (opts.inlineDispatch) this.#shim.exports.gex_set_inline_dispatch?.(1);
+    if (opts.xlateReport) this.#shim.exports.gex_set_xlate_report?.(opts.xlateReport);
+    if (opts.discoverSkip) this.#shim.exports.gex_set_discover_skip?.(opts.discoverSkip);
     // Keep what the guest's dynamic linker produces, and start the next process
     // of the same program from it instead of linking again.
     if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
@@ -2127,6 +2129,8 @@ export class Gex {
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
     if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
+    if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
+    if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first
@@ -5028,6 +5032,11 @@ export class Gex {
       throw err;
     }
     this.#compileMs += performance.now() - tc;
+    // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
+    // looking at what a translation is made of (docs/jit-guest.md).
+    if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
+      try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${globalThis.process.env.GEX_DUMP_WASM}/u-${String(this.#compiled.length).padStart(6, '0')}.wasm`, bytes); } catch {}
+    }
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must
     // instantiate all of them. The section is in the bytes; keeping it is a

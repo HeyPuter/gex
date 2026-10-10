@@ -1232,6 +1232,16 @@ fn translate_seeded(
     (module, stats)
 }
 
+/// Edges discovery does not follow (an experiment knob, `set_discover_skip`):
+/// bit 0 call returns, bit 1 call targets folded through memory, bit 2 the
+/// block's own successors.
+static DISCOVER_SKIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See `DISCOVER_SKIP`.
+pub fn set_discover_skip(bits: u32) {
+    DISCOVER_SKIP.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Lift every block reachable from the seeds.
 ///
 /// Separate from encoding because one object's blocks may not fit in one
@@ -1292,8 +1302,12 @@ fn discover(
             // store has not reached yet -- and code that bakes it in is wrong
             // the moment it changes. Discovery can afford a wrong guess (an
             // unneeded block); execution cannot.
-            let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
-            if let Some(t) = folded {
+            let mask = DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed);
+            let mut targets: Vec<u64> = if mask & 4 != 0 { Vec::new() } else { block.successors().collect() };
+            if mask & 1 == 0 {
+                targets.extend(block.call_return);
+            }
+            if let Some(t) = folded.filter(|_| mask & 2 == 0) {
                 stats.discovered_from_data += 1;
                 targets.push(t);
             }

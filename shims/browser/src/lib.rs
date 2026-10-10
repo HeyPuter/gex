@@ -327,6 +327,7 @@ extern "C" {
     fn k_obj_translated(obj: u64, produced: u32);
     fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
+    fn k_mod_ids_for_object(obj: u64, from: u32, out: gex_kernel::PAddr, cap: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
     fn k_mod_dirs_len(id: u32) -> u32;
@@ -1947,9 +1948,28 @@ static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// What the runtime translator did in this process, for `gex_xlate_stat`:
 /// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
 /// that lifted), 3 self-modifying-code page invalidations, 4 pages retired by
-/// unmap/reprotect, 5 retire calls, 6 blocks lifted from writable+executable
-/// memory (a guest JIT's), 7 blocks lifted outside any named object.
-pub(crate) static XLATE_STAT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// unmap/reprotect, 5 retire calls, 6 blocks lifted by misses on a page that
+/// was retired or invalidated before (re-lifts), 7 blocks lifted outside any
+/// named object (a guest JIT's code), 8 wasm bytes of the re-lifts, 9 wasm
+/// bytes of the blocks outside any named object.
+pub(crate) static XLATE_STAT: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// `gex_set_xlate_report(n)` (`?xlatereport=N`, `GEX_XLATE_REPORT=N`): a
+/// progress line every `n` translations (0: none), so a run that never exits
+/// (a game) still says what it translated, from where, and how much again.
+static XLATE_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `gex_set_discover_skip(bits)` (`GEX_DISCOVER_SKIP`): edges the runtime
+/// translator's discovery does not follow (gex-xlate `set_discover_skip`).
+#[no_mangle]
+pub extern "C" fn gex_set_discover_skip(bits: u32) {
+    gex_xlate::set_discover_skip(bits);
+}
+
+#[no_mangle]
+pub extern "C" fn gex_set_xlate_report(n: u32) {
+    XLATE_REPORT.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
 pub(crate) fn xlate_add(i: usize, n: u64) {
     XLATE_STAT[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2589,6 +2609,10 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// Per object, how many of the kernel's modules for it (in its order) are
+    /// all in `installed_mods`: a miss reads the list from there on, not from
+    /// the start. See `shared_modules_of_object`.
+    obj_cursor: std::collections::HashMap<u64, u32>,
     /// The dense base each stored module (by store id) was given here: the
     /// store keeps the bytes as built, and `backfill_registry` must keep
     /// them as installed (`dense`).
@@ -2641,6 +2665,8 @@ struct Jit {
     /// Blocks lifted per object, with the address range: the range says whether
     /// a closure is missing an object or only part of one.
     by_object: std::collections::BTreeMap<String, (u64, u64, u64)>,
+    /// Wasm bytes emitted, by object (as `by_object`). See `xlate_report`.
+    obj_wasm: std::collections::BTreeMap<String, u64>,
     compiles: u64,
     /// Nanoseconds lifting and encoding -- the shim's share of a miss; the
     /// engine's compile of the output is JS's.
@@ -4063,6 +4089,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
+            obj_cursor: Default::default(),
                 dense_base: Default::default(),
                 retired_pages: Default::default(),
                 remiss: Default::default(),
@@ -4080,6 +4107,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 blocks: 0,
                 lift_in_closure: 0,
             by_object: Default::default(),
+            obj_wasm: Default::default(),
                 compiles: 0,
                 nanos: 0,
             },
@@ -7790,6 +7818,7 @@ pub extern "C" fn gex_adopt_child(
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
+            obj_cursor: Default::default(),
             dense_base: Default::default(),
             retired_pages: Default::default(),
             remiss: Default::default(),
@@ -7807,6 +7836,7 @@ pub extern "C" fn gex_adopt_child(
             blocks: 0,
             lift_in_closure: 0,
             by_object: Default::default(),
+            obj_wasm: Default::default(),
             compiles: 0,
             nanos: 0,
         }},
@@ -8844,24 +8874,45 @@ fn shared_modules_of_object(
     obj: u64,
     max_mods: usize,
     max_bytes: u64,
-) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+) -> (Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)>, u32) {
     phase(13);
     let mut out = Vec::new();
     let mut took = 0u64;
     let mut left_behind = 0usize;
     let mut left_bytes = 0u64;
+    let from = h.jit.obj_cursor.get(&obj).copied().unwrap_or(0);
+    let mut lead = 0u32;
     // SAFETY: scalars in, and the readers below size their buffers from the
     // kernel's own answer before asking it to fill them.
     unsafe {
         if k_present() == 0 {
-            return out;
+            return (out, 0);
         }
-        for n in 0.. {
-            let id = k_mod_for_object(obj, n);
-            if id == 0 {
+        // The ids from the first one not known installed, in one call.
+        let mut ids: Vec<u32> = Vec::new();
+        loop {
+            let mut chunk = vec![0u32; 4096];
+            let got = k_mod_ids_for_object(obj, from + ids.len() as u32, chunk.as_mut_ptr() as gex_kernel::PAddr, 4096);
+            ids.extend_from_slice(&chunk[..got as usize]);
+            if got < 4096 {
                 break;
             }
-            if h.jit.installed_mods.contains(&id) || out.iter().any(|(i, ..)| *i == id) {
+        }
+        let mut leading = true;
+        for &id in &ids {
+            if h.jit.installed_mods.contains(&id) {
+                if leading {
+                    lead += 1;
+                }
+                continue;
+            }
+            leading = false;
+            // Full: the rest are the next miss's (only the trace below
+            // counts them).
+            if out.len() >= max_mods && !tracing() {
+                break;
+            }
+            if out.iter().any(|(i, ..)| *i == id) {
                 continue;
             }
             let len = k_mod_len(id) as usize;
@@ -8924,7 +8975,7 @@ fn shared_modules_of_object(
             left_bytes / 1024,
         ));
     }
-    out
+    (out, from + lead)
 }
 
 /// Fill the registry with every module this process has already installed, so
@@ -11602,12 +11653,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // size behind it, and the lot is however many megabytes of wasm
                 // somebody stored: a finished object served 317 MiB in one miss.
                 // What this leaves is taken by the next miss.
-                let ready = shared_modules_of_object(
+                let obj = object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0);
+                let (ready, cursor) = shared_modules_of_object(
                     h,
-                    object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
+                    obj,
                     if whole { usize::MAX } else { per_miss },
                     SERVE_MAX_BYTES,
                 );
+                h.jit.obj_cursor.insert(obj, cursor);
                 // Only modules whose every page base agrees with this process's
                 // numbering (or names a page not numbered here yet). A module is
                 // written at the bases the process that BUILT it gave its pages;
@@ -11920,8 +11973,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let whose = object_name_at(h, pc);
         if whose.is_empty() {
             xlate_add(7, stats.blocks as u64);
+            xlate_add(9, stats.wasm_bytes as u64);
         }
+        if h.jit.retired_pages.contains(&page) {
+            xlate_add(6, stats.blocks as u64);
+            xlate_add(8, stats.wasm_bytes as u64);
+        }
+        *h.jit.obj_wasm.entry(whose.clone()).or_insert(0) += stats.wasm_bytes as u64;
         note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
+        let every = XLATE_REPORT.load(std::sync::atomic::Ordering::Relaxed);
+        if every != 0 && XLATE_STAT[2].load(std::sync::atomic::Ordering::Relaxed) % every == 0 {
+            xlate_report(h);
+        }
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
@@ -12686,6 +12749,27 @@ fn note_process_syscall(base: u64, pc: i64) {
 }
 
 /// Add `n` blocks lifted at `a` to what `whose` has cost so far.
+/// One progress line: the translator's counters and the objects it lifted
+/// most from, by wasm emitted. See `XLATE_REPORT`.
+fn xlate_report(h: &Host) {
+    let x = |i: usize| XLATE_STAT[i].load(std::sync::atomic::Ordering::Relaxed);
+    let mut v: Vec<(&String, &u64)> = h.jit.obj_wasm.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let objs = v
+        .iter()
+        .take(6)
+        .map(|(k, w)| {
+            let n = h.jit.by_object.get(*k).map_or(0, |e| e.0);
+            format!("{}={}blk/{}KiB", if k.is_empty() { "(anon)" } else { k.as_str() }, n, **w >> 10)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    warn_line(&format!(
+        "[gex] xlate: units={} insns={} wasm={}KiB smc={} retiredPages={} relift={}blk/{}KiB anon={}blk/{}KiB [{objs}]\n",
+        x(2), x(0), x(1) >> 10, x(3), x(4), x(6), x(8) >> 10, x(7), x(9) >> 10,
+    ));
+}
+
 fn note_blocks(
     m: &mut std::collections::BTreeMap<String, (u64, u64, u64)>,
     whose: String,

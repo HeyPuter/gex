@@ -640,6 +640,8 @@ async function handle(msg) {
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
           liftMax: msg.liftMax ?? msg.opts?.liftMax,
           inlineDispatch: msg.inlineDispatch ?? msg.opts?.inlineDispatch,
+          xlateReport: msg.xlateReport ?? msg.opts?.xlateReport,
+          discoverSkip: msg.discoverSkip ?? msg.opts?.discoverSkip,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },
@@ -768,7 +770,7 @@ async function handle(msg) {
       // What the translator did: instructions lifted, wasm bytes, translations,
       // SMC page invalidations, pages retired, retire calls, -, anonymous blocks.
       xlate: gex.shim.exports.gex_xlate_stat
-        ? [0, 1, 2, 3, 4, 5, 6, 7].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
+        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
         : undefined,
       // What the engine cost, which `millis` does not: compiling and
       // instantiating every module this process installed.

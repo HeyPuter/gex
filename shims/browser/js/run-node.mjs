@@ -336,6 +336,11 @@ const host = new ProcessHost({
     liftMax: process.env.GEX_LIFT_MAX ? Number(process.env.GEX_LIFT_MAX) : undefined,
     // GEX_INLINE_DISPATCH=1: dispatch inline in every block (gex-emit's old form).
     inlineDispatch: process.env.GEX_INLINE_DISPATCH ? 1 : undefined,
+    // GEX_XLATE_REPORT=N: a translator progress line every N translations.
+    xlateReport: process.env.GEX_XLATE_REPORT ? Number(process.env.GEX_XLATE_REPORT) : undefined,
+    // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
+    // 2 folded call targets, 4 successors).
+    discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
@@ -433,7 +438,7 @@ const host = new ProcessHost({
               ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}`
             : '') +
           (m.byObject ? ` [${m.byObject}]` : '') +
-          (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} anonBlocks=${m.xlate[7]}]` : '') +
+          (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB]` : '') +
           '\n',
       );
     }

@@ -834,6 +834,24 @@ pub extern "C" fn k_mod_for_object(obj: u64, n: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// The modules holding code for this object from the `from`th on, as
+/// little-endian u32 ids into `out` (at most `cap` of them); how many. One
+/// call where walking `k_mod_for_object` took a lock per module, on every
+/// miss: a node start-up's libnode has thousands.
+///
+/// SAFETY: `out` must have room for `cap` u32s.
+#[no_mangle]
+pub unsafe extern "C" fn k_mod_ids_for_object(obj: u64, from: u32, out: gex_kmem::PAddr, cap: u32) -> u32 {
+    let m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(v) = m.by_object.get(&obj) else {
+        return 0;
+    };
+    let ids = v.get(from as usize..).unwrap_or(&[]);
+    let n = ids.len().min(cap as usize);
+    unsafe { gex_kmem::push_checked(out, ids.as_ptr() as *const u8, (n * 4) as u32) };
+    n as u32
+}
+
 /// The `n`th module holding code for this page, or zero past the end. The
 /// caller walks `n` upwards for every unit that touched the page, since one
 /// page accumulates a claim per translation unit.
