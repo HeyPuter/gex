@@ -408,7 +408,23 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   - `21652fb1`: shim glue;
   - `0f9f926d`: page system Worker;
   - `703db0e7`: compositor;
-  - plus this doc.
+  - `e10ec855`: network waits park;
+  - `4fcc6417`: kernel pipe reads.
+- **Merged:**
+  - C's e4779cca, fa8ee5fd, 4f1d86e4 (the execve and provider fixes).
+  - After them, node's `child_process` (`spawnSync` with input, async
+    `spawn`) works in the single page on gooner.
+- **Demo:** https://100.64.0.3:4291/?demo=native-debian, with no
+  COOP/COEP.
+  - Served by `scratch/SP/demo/serve.mjs` (pid in `serve.pid`) from a
+    hard-linked copy of `web/dist`.
+  - Add `&gui=1&rootfs=/rootfs/native-debian-gui.tar.zst` for foot in the
+    compositor.
+- **Next:**
+  - Rerun `cmp.sh TAG single sab` on edger at this head, with
+    `GEX_WALL=900`.
+  - Async call-outs.
+  - Non-pthread Mesa and Xwayland builds for GL and X.
 - **Builds:** `shims/browser/build.sh` (plain and shared), the kernel and
   the seed, then `cd web && npm run build`. web/public has rootfs, cgen and
   xwayland hard-linked from wt/gexcc.
