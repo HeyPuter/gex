@@ -21,6 +21,44 @@ use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT,
 use gex_ir::*;
 use std::collections::HashMap;
 
+/// A multiply-rotate hasher for small keys (registers, addresses): the
+/// standard SipHash was a few percent of translating at run time, and
+/// nothing here hashes keys an adversary chooses.
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(n as u64);
+    }
+    fn write_u16(&mut self, n: u16) {
+        self.write_u64(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7cc1_b727_220a_95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_isize(&mut self, n: isize) {
+        self.write_u64(n as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A `HashMap` with [`FastHasher`].
+pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+
 pub mod fmode;
 
 /// SIMD sub-opcodes (the 0xFD prefix space).
@@ -607,7 +645,7 @@ struct Emitter<'a> {
     free_i64: Vec<u32>,
     free_v128: Vec<u32>,
     /// Guest register cache.
-    regs: HashMap<GuestReg, Cached>,
+    regs: FastMap<GuestReg, Cached>,
     /// Set while emitting a block fused into a `wasm` loop: how many nested
     /// `if`s sit between here and the loop label, so a back-edge knows what
     /// depth to branch to. `None` when the block is not fused.
@@ -619,7 +657,7 @@ struct Emitter<'a> {
     region: Option<RegionState>,
     /// Which registers the region writes, and so has to store on the way out.
     /// The ones it only reads are already correct in the context.
-    region_writes: std::collections::HashSet<GuestReg>,
+    region_writes: std::collections::HashSet<GuestReg, std::hash::BuildHasherDefault<FastHasher>>,
     /// Function mode (`fmode`, the function JIT): every register the
     /// function uses has a local for its whole body, bound up front, and a
     /// clobbering host call reloads them all rather than forgetting them.
@@ -685,7 +723,7 @@ impl<'a> Emitter<'a> {
             free_i32: Vec::new(),
             free_i64: Vec::new(),
             free_v128: Vec::new(),
-            regs: HashMap::new(),
+            regs: FastMap::default(),
             loop_depth: None,
             reenter_local: None,
             region: None,
@@ -885,7 +923,7 @@ impl<'a> Emitter<'a> {
         self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
-            for &v in &dying[i] {
+            for &v in dying[i].iter() {
                 self.release(Value(v));
             }
         }
@@ -979,7 +1017,7 @@ impl<'a> Emitter<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             // Recycle locals whose values are dead after this statement.
-            for &v in &dying[i] {
+            for &v in dying[i].iter() {
                 self.release(Value(v));
             }
         }
@@ -5033,16 +5071,45 @@ impl<'a> Emitter<'a> {
 /// order the releases always ran in). Was a scan of every value after every
 /// statement: quadratic, and most of a Unity start-up's time in Mono's large
 /// JIT-generated blocks.
-fn dying_after(block: &Block) -> Vec<Vec<u32>> {
-    let mut out = vec![Vec::new(); block.stmts.len()];
-    for (v, lu) in compute_last_use(block).into_iter().enumerate() {
+fn dying_after(block: &Block) -> Dying {
+    let last = compute_last_use(block);
+    // Counted, then filled in place: one allocation for every statement's
+    // list, where a `Vec` per statement was the emitter's largest single
+    // source of allocator traffic.
+    let mut start = vec![0u32; block.stmts.len() + 1];
+    for &i in last.iter().flatten() {
+        if let Some(c) = start.get_mut(i + 1) {
+            *c += 1;
+        }
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut fill = start.clone();
+    let mut vals = vec![0u32; *start.last().unwrap_or(&0) as usize];
+    for (v, lu) in last.into_iter().enumerate() {
         if let Some(i) = lu {
-            if let Some(d) = out.get_mut(i) {
-                d.push(v as u32);
+            if let Some(at) = fill.get_mut(i) {
+                vals[*at as usize] = v as u32;
+                *at += 1;
             }
         }
     }
-    out
+    Dying { start, vals }
+}
+
+/// The values whose last use is each statement (see [`dying_after`]), in
+/// value order per statement.
+struct Dying {
+    start: Vec<u32>,
+    vals: Vec<u32>,
+}
+
+impl std::ops::Index<usize> for Dying {
+    type Output = [u32];
+    fn index(&self, i: usize) -> &[u32] {
+        &self.vals[self.start[i] as usize..self.start[i + 1] as usize]
+    }
 }
 
 /// Index of the last statement that reads each value, or `None` when the

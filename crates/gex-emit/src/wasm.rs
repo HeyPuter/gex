@@ -633,36 +633,45 @@ impl FuncBody {
     /// The offsets [`Self::relocs`] holds are into `code`; the encoding puts a
     /// size prefix and the local declarations in front of it, so they all move
     /// by the same amount.
-    pub fn finish_with_relocs(self) -> (Vec<u8>, Vec<u32>) {
-        let relocs = self.relocs.clone();
+    pub fn finish_with_relocs(mut self) -> (Vec<u8>, Vec<u32>) {
+        let mut relocs = std::mem::take(&mut self.relocs);
         let code_len = self.code.len();
         let out = self.finish();
         let shift = (out.len() - code_len - 1) as u32; // -1 for the trailing `end`
-        (out, relocs.into_iter().map(|r| r + shift).collect())
+        for r in &mut relocs {
+            *r += shift;
+        }
+        (out, relocs)
     }
 
     /// Serialise the body into the code-section entry form.
     pub fn finish(self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.code.len() + 16);
         // Run-length encode the local declarations.
-        let mut runs: Vec<(u32, ValType)> = Vec::new();
-        for ty in &self.locals {
-            match runs.last_mut() {
-                Some((n, t)) if *t == *ty => *n += 1,
-                _ => runs.push((1, *ty)),
+        let mut runs = 0u32;
+        let mut decl = Vec::with_capacity(32);
+        let mut i = 0;
+        while i < self.locals.len() {
+            let ty = self.locals[i];
+            let mut j = i + 1;
+            while j < self.locals.len() && self.locals[j] == ty {
+                j += 1;
             }
+            write_u32(&mut decl, (j - i) as u32);
+            decl.push(ty.byte());
+            runs += 1;
+            i = j;
         }
-        write_u32(&mut body, runs.len() as u32);
-        for (n, ty) in runs {
-            write_u32(&mut body, n);
-            body.push(ty.byte());
-        }
-        body.extend_from_slice(&self.code);
-        body.push(op::END);
-
-        let mut out = Vec::with_capacity(body.len() + 5);
-        write_u32(&mut out, body.len() as u32);
-        out.extend_from_slice(&body);
+        let mut head = Vec::with_capacity(5);
+        write_u32(&mut head, runs);
+        // Once, at its final size: the code was copied twice before (into a
+        // body, then behind its length), each a fresh allocation.
+        let body_len = head.len() + decl.len() + self.code.len() + 1;
+        let mut out = Vec::with_capacity(body_len + 5);
+        write_u32(&mut out, body_len as u32);
+        out.extend_from_slice(&head);
+        out.extend_from_slice(&decl);
+        out.extend_from_slice(&self.code);
+        out.push(op::END);
         out
     }
 }
