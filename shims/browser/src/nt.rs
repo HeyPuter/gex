@@ -1162,7 +1162,7 @@ mod imp {
             h.kernel.new_code.clear();
             if !retired.is_empty() {
                 note_retire(&retired);
-                crate::cgen::on_retire(&retired);
+                crate::cgen::on_retire(&retired, &crate::gone_code(h, &retired));
                 if !NO_RETIRE.load(Ordering::Relaxed) {
                     retire(h, &retired);
                 }

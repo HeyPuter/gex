@@ -79,7 +79,7 @@ let probe = null;
 if (args.includes('--probe')) {
   const mem = new WebAssembly.Memory({ initial: 2, maximum: 4, shared: true });
   const inst = await WebAssembly.instantiate(kernel.module, {
-    env: { memory: kernel.memory, process: mem },
+    env: { memory: kernel.memory, process: mem, lazy_fetch: () => -1 },
   });
   const k = inst.exports;
   const bytes = new Uint8Array(mem.buffer);

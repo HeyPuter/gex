@@ -22,20 +22,20 @@
 
 use super::*;
 
-struct Prog {
-    number: u32,
-    wasm: Vec<u8>,
-    relocate: bool,
+pub(super) struct Prog {
+    pub number: u32,
+    pub wasm: Vec<u8>,
+    pub relocate: bool,
 }
 
-static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
+pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
 /// The program to publish (entry, whether its data is fresh, the table base
 /// it must have: a fork's child's, the parent's).
 static STAGED: Mutex<Option<(u64, bool, Option<u32>)>> = Mutex::new(None);
 /// This process's program's entry while it is a wasm32 one, for a fork.
-static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// And its module's `__table_base`.
-static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(super) static CURRENT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
@@ -143,13 +143,24 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         });
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
+    // One that names shared libraries: gex's loader (`dylink`).
+    if let Some(info) = super::dylink::wanted(&wasm) {
+        let n = if relocate {
+            super::dylink::install(wasm, info, mem_base as u32, entry, thread_entry)
+        } else {
+            super::dylink::adopt(wasm, entry, thread_entry)
+        }?;
+        CURRENT.store(entry, Ordering::Relaxed);
+        return Ok(n);
+    }
     let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
     let slot = |n: &str| names.iter().position(|s| s.as_deref() == Some(n)).map(|k| k as u32).ok_or(format!("{n} is not in its table"));
     let pairs = vec![(entry, slot("__gex_start")?), (thread_entry, slot("__gex_thread_start")?)];
+    let len = super::dylink::static_program(&wasm, names.len() as u32);
     let number = lock(&PROVIDERS).len() as u32;
     let install = ftab(|m| match want_base {
         Some(base) => {
-            let (n, ok) = m.publish_at(base, names.len() as u32, PROVIDER | number, Tier::Unit, &pairs);
+            let (n, ok) = m.publish_at(base, len, PROVIDER | number, Tier::Unit, &pairs);
             if !ok {
                 crate::warn_line(&format!(
                     "gex: wasm32 fork child: table base {base} is taken, its function pointers will be wrong\n"
@@ -157,35 +168,48 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
             }
             n
         }
-        None => m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs),
+        None => m.publish(len, PROVIDER | number, Tier::Unit, &pairs),
     });
-    CURRENT_BASE.store(ftab(|m| m.install(install).base), Ordering::Relaxed);
-    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
-    for &a in &addrs {
+    let base = ftab(|m| m.install(install).base);
+    CURRENT_BASE.store(base, Ordering::Relaxed);
+    let (regs, dirs, slots) = entry_bridges(&[entry, thread_entry]);
+    let path = exe_path();
+    super::dylink::static_published(number, &wasm, &path, base, mem_base as u32);
+    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
+    lock(&PROGS).push(Prog { number, wasm, relocate });
+    CURRENT.store(entry, Ordering::Relaxed);
+    Ok(number)
+}
+
+/// The program's path, with the kernel told the process is a wasm32 one
+/// (gex-kernel's wasm32 personality: signal frames stay in the context for
+/// the program's syscall stub).
+pub(super) fn exe_path() -> String {
+    crate::with_host(|h| {
+        h.kernel.wasm32 = true;
+        h.kernel.exe_path.clone()
+    })
+}
+
+/// The bridges for a program's entries (`__gex_start`, `__gex_thread_start`,
+/// whichever module defines them), their pages in the directory.
+pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    for &a in addrs {
         gex_kernel::ftab::fcache_clear(crate::guest_bytes(), a);
     }
-    let (regs, mut dirs, slots) = bridges(&addrs);
+    let (regs, mut dirs, slots) = bridges(addrs);
     // Every entry's page in the directory, not only the pages numbered now: a
     // fork's child has the parent's numbering (`gex_adopt_page`) but may have
     // had its directory rebuilt without it (`gex_reset_directory`).
     crate::with_host(|h| {
-        for &a in &addrs {
+        for &a in addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
             if let Some(b) = h.jit.page_table.lookup(page) {
                 dirs.push((page, b));
             }
         }
     });
-    let path = crate::with_host(|h| {
-        // gex-kernel's wasm32 personality: signal frames stay in the context
-        // for the program's syscall stub.
-        h.kernel.wasm32 = true;
-        h.kernel.exe_path.clone()
-    });
-    lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
-    lock(&PROGS).push(Prog { number, wasm, relocate });
-    CURRENT.store(entry, Ordering::Relaxed);
-    Ok(number)
+    (regs, dirs, slots)
 }
 
 /// Provider module `number`'s bytes when it is a wasm32 program.

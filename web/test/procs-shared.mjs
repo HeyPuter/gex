@@ -40,6 +40,7 @@ const probe = (await WebAssembly.instantiate(
   {
     env: {
       memory: kernel,
+      lazy_fetch: () => -1,
       process: new WebAssembly.Memory({
         initial: GUEST_PAGES, maximum: GUEST_PAGES, shared: true,
       }),
@@ -59,7 +60,7 @@ const WORKER = `
   });
   const k = (await WebAssembly.instantiate(
     await WebAssembly.compile(workerData.bytes),
-    { env: { memory: workerData.kernel, process: proc } },
+    { env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1 } },
   )).exports;
   // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
   // starts every one at the same shared address.

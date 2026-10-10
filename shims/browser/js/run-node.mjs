@@ -18,6 +18,8 @@
 //     --env <KEY=VALUE>         an environment variable (repeatable); none
 //                               leaves the shim's default environment
 //     --strace               narrate every syscall to stderr
+//     --providers            export providers from <web dir>/cgen (the
+//                            page's default), no units
 //     --cgen                 function-tier units from GEX_CGEN_CACHE (default
 //                            ~/.cache/gex/cgen), required for a Windows
 //                            program image; --cgen-prefer: used where found
@@ -63,6 +65,7 @@ const env = [];
 const hard = {};
 const modes = {};
 let cgenMode = 0;
+let providersRoot = false;
 let noJit = false;
 let aotRun = false;
 const dirs = [];
@@ -165,6 +168,8 @@ const rest = [];
     else if (av[i] === '--strace') strace = true;
     else if (av[i] === '--cgen') cgenMode = 2;
     else if (av[i] === '--cgen-prefer') cgenMode = 1;
+    // the page's default: export providers from the dist's gex/cgen, no units
+    else if (av[i] === '--providers') { cgenMode = 8; providersRoot = true; }
     else if (av[i] === '--no-jit') noJit = true;
     else if (av[i] === '--aot') aotRun = true;
     else if (av[i] === '--argv0') argv0 = av[++i];
@@ -290,7 +295,7 @@ const host = new ProcessHost({
   extra: {
     // Function-tier units (--cgen): where their files are, for every Worker.
     cgen: cgenMode
-      ? { mode: cgenMode | (process.env.GEX_CGEN_UNGUARDED === '1' ? 4 : 0), root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
+      ? { mode: cgenMode | (process.env.GEX_CGEN_UNGUARDED === '1' ? 4 : 0), root: providersRoot ? new URL('cgen', PUB).pathname : process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
       : undefined,
     // --no-jit: nothing is translated at run time, in any Worker.
     jit: noJit ? false : undefined,
@@ -417,6 +422,11 @@ const host = new ProcessHost({
         // `guestMillis` is the whole time inside the guest (load, install,
         // run); `millis` is only the translator.
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
+          // Why misses translated rather than being filled, and where: a
+          // Worker whose table lacks an install it should have shows here
+          // as nofill (tests/gexcc/exec-reuse.sh).
+          (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
+          (m.byObject ? ` [${m.byObject}]` : '') +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +

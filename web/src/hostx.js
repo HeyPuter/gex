@@ -27,6 +27,7 @@
 // turn left to do it in.
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
+import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;
@@ -179,7 +180,7 @@ export class HostX {
         ? msg.kernel.module
         : await WebAssembly.compile(msg.kernel.module);
       const inst = await WebAssembly.instantiate(mod, {
-        env: { memory: msg.kernel.memory, process: this.#x.wasmMemory },
+        env: { memory: msg.kernel.memory, process: this.#x.wasmMemory, lazy_fetch: lazyFetch(msg.kernel.memory) },
       });
       // Every Worker in the kernel needs its own stack slice: wasm-ld gives
       // each instance the same `__stack_pointer`, so two Workers sharing one

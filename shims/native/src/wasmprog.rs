@@ -86,6 +86,12 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
         .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
         .to_vec();
+    // A program linked against shared libraries (docs/gexcc.md §7).
+    if let Some(info) = crate::dylink::wanted(&wasm) {
+        let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
+        crate::dylink::install_program(store, memory, &path, wasm, info, mem_base, entry, thread_entry)?;
+        return Ok(true);
+    }
     let slots = gex_cgen::provider::slot_names(&wasm)?;
     let slot = |name: &str| -> Result<u32> {
         slots
@@ -108,7 +114,27 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
     // gex-kernel's wasm32 personality: signal frames and sigreturns stay in
     // the context for the program's syscall stub.
     store.data_mut().with_kernel(|k| k.wasm32 = true);
-    crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base })?;
+    // dlsym on the program's own symbols (a program linked -rdynamic:
+    // GtkBuilder's signal handlers): every exported function gets a table
+    // slot, as a shared library's do (dylink)
+    let info = gex_dylink::Info::parse(&wasm)?;
+    let len = (slots.len() as u32).max(info.slots().0);
+    let n = crate::ftab::publish_stateful(&shared, memory, module, len, &pairs, crate::libprov::Extras { memory_base: mem_base })?;
+    let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
+    {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let inst = s.ftab.map.install(n).clone();
+        let extra = info.extra_slots().into_iter().map(|(k, name)| (inst.base + k, name)).collect();
+        s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports: Vec::new(), extra }));
+        s.ftab.dyproc = Some(crate::dylink::DyProcess {
+            link: gex_dylink::Link {
+                mods: vec![gex_dylink::Loaded { name: path.clone(), path, info, memory_base: mem_base as u32, table_base: inst.base }],
+            },
+            module_of: vec![inst.module],
+            ldpath: Vec::new(),
+            origin: String::new(),
+        });
+    }
     // Instantiate it in this (the first) store now, and apply its data
     // relocations here. libprov applies them once per data address for the
     // whole host (`relocate_once`), which a program exec'd into a fresh

@@ -1,0 +1,23 @@
+# Hollow Knight in the page (browser-linux.mjs --pins): where each library with a
+# function-tier unit (`elfunits=`) loads, so the units built for these bases keep
+# applying when a change elsewhere moves the loader's own choices. The bases are
+# where gex put them unpinned at merge/unity-seed 6158cded (the Debian
+# libraries the page stages); the spans are each object's PT_LOAD extent.
+# libdbus loads twice (unloaded in between); unpinned, libxcb took its first base.
+# BASE        SPAN      PATH
+0x11752000 0x2674000 /game/UnityPlayer.so
+0x1a465000 0x1f4000 /lib/x86_64-linux-gnu/libc.so.6
+0x1a663000 0xf0000 /lib/x86_64-linux-gnu/libm.so.6
+0x1a78e000 0x2b000 /lib/x86_64-linux-gnu/libxcb.so.1
+0x1a7e5000 0x116000 /lib/x86_64-linux-gnu/libsystemd.so.0
+0x1a907000 0x148000 /lib/x86_64-linux-gnu/libX11.so.6
+0x1aa6e000 0x14000 /lib/x86_64-linux-gnu/libXi.so.6
+0x1aa82000 0xd000 /lib/x86_64-linux-gnu/libXrandr.so.2
+0x1aa9b000 0x45000 /lib/x86_64-linux-gnu/libudev.so.1
+0x1ac10000 0x7000 /lib/x86_64-linux-gnu/libpulse-simple.so.0
+0x1b7ce000 0x55000 /lib/x86_64-linux-gnu/libpulse.so.0
+0x20244000 0x87000 /gex/gl/libGL.so.1
+0x242d0000 0x88000 /usr/lib/x86_64-linux-gnu/pulseaudio/libpulsecommon-17.0.so
+0x24358000 0x57000 /lib/x86_64-linux-gnu/libdbus-1.so.3
+0x2498d000 0x121000 /lib/x86_64-linux-gnu/libasound.so.2
+0x24dcd000 0x63a000 /lib/x86_64-linux-gnu/libcrypto.so.3

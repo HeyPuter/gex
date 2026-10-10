@@ -39,6 +39,7 @@ pub(crate) mod elfprov;
 pub(crate) mod libprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
+mod dylink;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).
@@ -198,8 +199,18 @@ pub(crate) fn on() -> bool {
     MODE.load(Ordering::Relaxed) != 0
 }
 
+/// ELF export providers without units (`gex_cgen_set_mode` bit 3): the
+/// provider modules come from the page's dist (docs/gexcc.md §7.9), and no
+/// image looks for a unit.
+static PROVIDERS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn providers_on() -> bool {
+    on() || PROVIDERS_ONLY.load(Ordering::Relaxed)
+}
+
 /// Turn the function tier on (1) or require it for program images (2). Before
-/// the process boots, so the exe and ntdll are seen. Bit 2 (4) selects the
+/// the process boots, so the exe and ntdll are seen. Bit 3 (8): ELF export
+/// providers whether or not units are on. Bit 2 (4) selects the
 /// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
 /// the browser the guarded flavor guards only at the memory's end, as the
 /// unguarded one traps there by itself (docs/browser-units-plan.md).
@@ -207,6 +218,9 @@ pub(crate) fn on() -> bool {
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 4 != 0 {
         gex_cgen::image::set_unguarded(true);
+    }
+    if mode & 8 != 0 {
+        PROVIDERS_ONLY.store(true, Ordering::Relaxed);
     }
     let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
@@ -788,7 +802,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         }
     }
     let (regs, dirs, slots) = bridges(&addrs);
-    crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    crate::trace_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
 }
@@ -1738,11 +1752,28 @@ pub(crate) fn leaves() -> u64 {
 /// Pages that retired: any an installed unit covers whose bytes are no longer
 /// the ones it was built from gets its bit in `gex_abi::PATCHED_PAGES`, and
 /// compiled code stops calling into it (the native `on_retire`).
-pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
-    on_retire_pages(ranges);
+///
+/// `gone` (within `ranges`): pages no longer mapped executable. A unit there
+/// is dead whatever the bytes still hash to -- an unmapped object's bytes
+/// stay until the next mapping overwrites them, and that mapping retires
+/// nothing. Its entries leave the table now: otherwise the object that next
+/// lands there (HK: libxcb where libdbus had been, both with units) clears
+/// the bits for its own unit and every address it does not define runs the
+/// old object's functions.
+pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
+    on_retire_pages(ranges, gone);
+    libprov::forget_gone(gone);
     // After the bits: a lookup once the probe cache is cleared sees them.
     let memory = crate::guest_bytes();
     ftab(|m| {
+        for &(start, end) in gone {
+            for (a, f) in m.range(start, end).collect::<Vec<_>>() {
+                let i = m.install(f.install);
+                if i.tier == Tier::Unit && i.module < PROVIDER {
+                    m.retire(a);
+                }
+            }
+        }
         for &(start, end) in ranges {
             for (a, _) in m.range(start, end).collect::<Vec<_>>() {
                 gex_kernel::ftab::fcache_clear(memory, a);
@@ -1751,14 +1782,41 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
     });
 }
 
-fn on_retire_pages(ranges: &[(u64, u64)]) {
+/// `execve`: the old program's code is all gone, whatever reuses its
+/// addresses next. Before exec reused the dead arena (`do_exec`), nothing new
+/// could land there and stale entries were unreachable; now the old code
+/// ranges are retired as an unmap retires them (every tier: a provider's
+/// address in the old program is nothing in the new one), the providers' own
+/// bookkeeping is cleared, and the replaced libraries' provider installs are
+/// killed (`FuncMap::kill_module`) so a Worker started later does not
+/// instantiate them.
+pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
+    on_retire_pages(old_code, old_code);
+    let dead = libprov::on_exec(old_code);
+    elfprov::on_exec();
+    let memory = crate::guest_bytes();
+    ftab(|m| {
+        for &(start, end) in old_code {
+            for (a, _) in m.retire_range(start, end) {
+                gex_kernel::ftab::fcache_clear(memory, a);
+            }
+        }
+        for n in dead {
+            m.kill_module(PROVIDER | n);
+        }
+    });
+}
+
+fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };
     let memory = crate::guest_bytes();
     for &(start, end) in ranges {
         for page in start / gex_abi::DISPATCH_PAGE..end.div_ceil(gex_abi::DISPATCH_PAGE) {
             let Some(&built) = pages.get(&page) else { continue };
-            if page_hash(memory, page) != built {
+            let at = page * gex_abi::DISPATCH_PAGE;
+            let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
+            if unmapped || page_hash(memory, page) != built {
                 let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
                 if let Some(b) = memory.get_mut(off) {
                     *b |= 1 << (page % 8);

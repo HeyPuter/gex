@@ -21,6 +21,7 @@ gex-gl = { workspace = true, features = ["host"] }
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-cgen.workspace = true
+gex-dylink.workspace = true
 gex-ir.workspace = true
 
 anyhow = "1"

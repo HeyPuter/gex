@@ -376,6 +376,8 @@ export async function runProgram(
     hard = {},
     // Symbolic links, path to target text (`untar`'s `links`), made as links.
     symlinks = {},
+    // Files fetched as they are read, [path, size, url] (`?lazy=`).
+    lazy = [],
     /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
     env = [],
     args,
@@ -677,7 +679,12 @@ export async function runProgram(
       // a program image), read from the server's `/gex-cgen/` (a unit
       // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
       // `?cgenurl=` (an ejected project's build/web/cgen) instead.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' } : undefined,
+      // Otherwise the export providers the dist carries (gex/cgen/providers/,
+      // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
+      // own code translated instead.
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' }
+        : flag('providers') === '0' ? undefined
+        : { mode: 8, url: '/gex/cgen' },
       // `?aot=1`: an ejected project's run, with no run-time translation (a
       // miss stops the run, saying where).
       jit: globalThis.GEX_NO_JIT ? false : undefined,
@@ -817,7 +824,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.

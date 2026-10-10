@@ -23,6 +23,7 @@ pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
 pub mod wasmprog;
+pub(crate) mod dylink;
 pub mod wasmdll;
 mod ready;
 mod sys_waits;
@@ -1108,6 +1109,15 @@ fn run_program_with(
             .bind_host(path, Arc::new(w.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
         w
     }));
+    // The interpreter, placed by gex's loader rather than mapped by the guest,
+    // announced as its `mmap` would have been: its function-tier unit
+    // (`GEX_ELF_UNITS=ld-linux-x86-64.so.2`) is placed after the first syscall.
+    if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
+        if let Some(bytes) = kernel.read_file(path) {
+            let maps = gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base());
+            kernel.new_code.extend(maps);
+        }
+    }
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
 
@@ -5649,6 +5659,28 @@ fn dispatch_tables(
     Ok(out)
 }
 
+/// The pages of `ranges` no longer mapped executable (an unmapped object,
+/// code made non-executable), merged into ranges, as the browser's
+/// `gone_code`.
+fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    use gex_kernel::mem::prot;
+    let page = gex_abi::DISPATCH_PAGE;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in ranges {
+        let mut a = start / page * page;
+        while a < end {
+            if !k.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0) {
+                match out.last_mut() {
+                    Some(last) if last.1 == a => last.1 = a + page,
+                    _ => out.push((a, a + page)),
+                }
+            }
+            a += page;
+        }
+    }
+    out
+}
+
 /// Forget the translations of code the guest has unmapped. A dispatch slot
 /// answers for an address, not the bytes at it, so after a `dlclose`+`dlopen`
 /// reuses the range the guest would run the old library's code.
@@ -5678,9 +5710,12 @@ fn retire_translations(
         .clone()
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
 
+    // Pages no longer mapped executable: a unit there is dead whatever its
+    // bytes still are (`nt_cgen::on_retire`).
+    let gone = caller.as_context_mut().data_mut().with_kernel(|k| gone_code(k, ranges));
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
-    nt_cgen::on_retire(&memory, ranges);
+    nt_cgen::on_retire(&memory, ranges, &gone);
     nt_cgen::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
@@ -5703,7 +5738,7 @@ fn retire_translations(
             }
         }
     }
-    ftab::on_retire(&mut sh, memory.bytes(), ranges);
+    ftab::on_retire(&mut sh, memory.bytes(), ranges, &gone);
     drop(sh);
     refresh_callouts(caller)?;
     if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {

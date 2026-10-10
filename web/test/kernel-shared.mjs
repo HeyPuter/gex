@@ -48,7 +48,7 @@ const WORKER = `
   });
   const mod = await WebAssembly.compile(workerData.bytes);
   const k = (await WebAssembly.instantiate(mod, {
-    env: { memory: workerData.kernel, process: proc },
+    env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1 },
   })).exports;
   const u8 = new Uint8Array(proc.buffer);
 

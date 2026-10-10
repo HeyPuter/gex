@@ -569,6 +569,7 @@ dependencies = [
  "gex-abi",
  "gex-atomic",
  "gex-cgen",
+ "gex-dylink",
  "gex-emit",
  "gex-kernel",
  "gex-key",
@@ -624,6 +625,15 @@ dependencies = [
 [[package]]
 name = "gex-difffuzz-x86"
 version = "0.0.1"
+
+[[package]]
+name = "gex-dylink"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "wasm-encoder 0.219.2",
+ "wasmparser 0.219.2",
+]
 
 [[package]]
 name = "gex-eject"
@@ -794,6 +804,7 @@ dependencies = [
  "gex-atomic",
  "gex-cache",
  "gex-cgen",
+ "gex-dylink",
  "gex-emit",
  "gex-gl",
  "gex-gpu",

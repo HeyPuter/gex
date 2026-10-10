@@ -2162,3 +2162,161 @@ Not yet:
   Natively the JIT seeds only the main image too (gexc's
   FjitTranslator::image); a Translator hook per mapped object would do
   the same there.
+- **Single U head for the gate: merge/unity-seed 0ddc9390** (merge/unity
+  a0f6a8c9 merged into merge/unity-seed; has 64efd78e, 1bf5ba09, 4ed5cad3,
+  1d5b26d9). Gated as integ/2026-10-09b. Master 9e5ac0ff merged in at
+  114b6b69. Master's gex-abi change moves GEX_CGEN_RECOVERY_INPUTS, so the
+  HK/Muck units are rebuilding on gooner for 114b6b69
+  (`scratch/unity/units/build-m1.sh`, gexc copy `units/gexc-114b6b69`,
+  logs `build-{hk,muck}-m1.log`). Runs until then use the pre-merge shim
+  `scratch/unity/shim-lazy` (= 1e9154ad) with `units/cgen-page-rk`.
+- **B5: Hollow Knight in the page past the menu into gameplay (1e9154ad,
+  2ea7e6f2).**
+  - Lazy files: `TmpFs::add_lazy(path, size, url)`, which reads 1 MiB chunks
+    through `env.lazy_fetch`: a synchronous XHR with Range and
+    `Cache-Control: no-store`.
+    - nt-page takes `?lazy=MANIFEST`.
+    - browser-linux.mjs takes `--lazy DIR` (the 4.9 GiB install, 1,754
+      files) and `move`/`click` in `--input`.
+    - The script is `tests/games/hollow-knight-page-input.txt`, the native
+      script timed from present 600.
+  - hg1 failed every read past a file's first chunk. Without no-store,
+    Chromium's cache answered later ranges badly; curl against vite gets
+    206 for every range.
+  - hg2 (fixed fetch, .NET wasm JIT on): no failed reads. It went through
+    the menu, profile, scale and brightness pages and the intro skip into
+    the opening sequence. Then Mono asserted at loader.c:1826 (token table
+    != METHOD) at ~340 s.
+  - hg4 (diagnostic provider) shows the method is NULL: the signature of a
+    NULL MonoMethod under `mono_runtime_invoke`.
+  - **hg3 (`PAGE_ENV=GEXMONO_WASM_JIT=0`, the interpreter): King's Pass,
+    the knight walks and the "X Attack" prompt is shown
+    (`shots/hg3/c029.png`). Gameplay runs at 14.4-14.9 presents/s; the
+    menu ran at ~41.**
+  - Native hk130 (the King's Pass reference) ran before the JIT became the
+    default (d4a9389d, Oct 7 18:45), so it used the interpreter too. The
+    JIT bug is not page-specific.
+  - Open: which JIT path asks for the NULL method's signature. hg5 traps
+    there for a named wasm stack (provider `dnc-gc/provider/mono.wasm.diag2`,
+    staged as edger `page/muck-bcl-diag2`). The staged `muck-bcl/mono.wasm`
+    is unchanged (`mono.wasm.good`). The diagnostic edits in
+    `dnc/src/.../loader.c` and in host/gexmono-adapters.h and
+    gexmono-provider.c (`gexmono_last_api`) are uncommitted.
+- **The .NET JIT's NULL-method assert, located (hg7, provider with a trap
+  at the top of `mono_method_signature_checked_slow`):** JITted
+  `tk2dSpriteAnimator:Start ()` (wasmjit-batch[3]) -> `wj_call_interp_inner`
+  -> `interp_entry` -> interp -> icall `ves_icall_mono_delegate_ctor_interp`
+  -> `interp_delegate_ctor`. There `ftnptr_to_imethod(addr)` gives an
+  InterpMethod whose `method` is NULL, so the ldftn value reaching the
+  delegate ctor is not a live InterpMethod. The diagnostic patches are
+  `scratch/unity/gexdiag-{host,loader}.patch`, and the trap build is
+  `dnc-gc/provider/mono.wasm.diag3`. Both sources are reverted.
+  - hg6 repeats hg3 (interpreter) with no other Chromium on edger: King's
+    Pass, 14.5 presents/s.
+- **Start-up (item 2).**
+  - hp18 profiled every Worker from 5 s to 65 s. The browser-harness now
+    picks up Workers as they start.
+  - The main Worker is active 52.8 of 60.6 s. Of that, `fjit::translate`
+    is 23.6 s: recover_one 8.0, analyze_fn_full 6.6, build_runtime 5.5,
+    emit 5.2 and jump-table resolve_all 5.0.
+  - Mono takes 13 s: the interpreter's transform 7.0 s and class init
+    6.0 s.
+  - `sys_mmap` takes 5.1 s, 4.3 s of it in `zero_dirty`, which scanned
+    bytewise because the shim has no SIMD. The scan is now word-wise
+    (38739efc).
+  - Unity's 20+ other thread Workers are parked; their ~5.8 s each is
+    mostly atomics.wait inside KLock::take.
+  - Translation is almost all system libraries: libc, libasound, libX11,
+    libcrypto, ld.so, libdbus, libudev and libpulse*.
+  - System-library units: edger's libraries (`units/edger-libs`, which
+    differ from gooner's) are built at the page's bases
+    (`build-libs-m1.sh`, `build-libs-m3.sh`) into `units/cgen-page-m1` on
+    edger. That directory also holds the re-keyed HK unit 70db2b08, which
+    is byte-identical to 7bd87731, and Muck's unit. The key is unchanged at
+    7bcb4fbe (master ff69f7e4).
+  - With these units, libdbus-1 unmapped and libxcb mapped at its base
+    exited with status 255 at ~16 s (hp19, hp22). Fixed in 705dc708: a
+    unit on code that is no longer mapped executable is retired whatever
+    its bytes.
+  - Five libraries load at new bases since master 9e5ac0ff, and their
+    units are rebuilt for those bases (build-libs-m3).
+
+    | run | shim | units | first frame | 100 presents | presents/s (212 s) |
+    |---|---|---|---|---|---|
+    | hp16 | 1bf5ba09 | UnityPlayer | 56 s | 85 s | 41.5 (392 s) |
+    | hp20 | 114b6b69 + zero scan | UnityPlayer | 52 s | 70 s | 41.4 |
+    | hp24 | 705dc708 | UnityPlayer | 53 s | 83 s | 41.1 |
+    | hp21 | 114b6b69 + zero scan | + libc, libm | 45 s | 77 s | - |
+    | hp23 | 705dc708 | + 15 libraries (5 at stale bases) | 43 s | 73 s | 40.1 |
+    | hp25, hp26 | 705dc708 | + 15 libraries at current bases | 40 s, 40 s | 71 s, 70 s | 39.8, 41.2 |
+    | hp27 | 87176416 | same | 37 s | 69 s | 40.3 |
+
+  - hp25/hp26 still JIT-translated libasound (3.1 MiB): ALSA dlopens and
+    dlcloses it six times, and the retired unit was never placed again.
+    That is fixed in the commit after 705dc708.
+  - Left to the JIT by the first frame: ld.so 1.8 MiB (the kernel maps it,
+    so `elf_unit_maps` never sees it), Mesa's `/gex/gl/libGL.so.1`
+    0.2 MiB, and UnityPlayer misses 0.1 MiB. The edger system libGL unit
+    is unused.
+  - Library bases are deterministic for a given shim. 5 of 16 moved when
+    master 9e5ac0ff merged in, and a mismatched unit falls back to the JIT
+    (no fault). Pinning them (`?pins=`) would make the cache independent of
+    layout.
+  - Native has the same hash-only retire test (`nt_cgen::on_retire`) and
+    the same placed-once rule.
+- **The .NET wasm JIT's delegate bug, fixed (patch 0005, 3302db70).**
+  - Cause: gex runs Mono interpreter-only, so the wasm JIT's `mono_ldftn`
+    and `ldvirtfn_internal` returned `create_method_pointer`'s native entry.
+    The delegate .ctor it calls runs on the interpreter
+    (`ves_icall_mono_delegate_ctor_interp`), which takes function pointers
+    as `InterpMethod*`. Under `HOST_GEX` both now return
+    `get_interp_method` (bit 0 set for an unboxing receiver, as
+    `MINT_LDVIRTFTN` does), except for native-to-managed wrappers.
+  - The embed test gains `T.Delegates`: ldftn, ldvirtftn, a boxed struct's
+    override and a closure, all made in JIT-compiled code at threshold 1.
+    The provider without the patch dies there (exit 139); with it, every
+    pattern holds.
+  - The provider is `dnc-gc/provider/mono.wasm.jitfix1`, staged on edger as
+    `page/muck-bcl-jit1`.
+  - hg8 (JIT on) and hg9 (`GEXMONO_WASM_JIT=0`), otherwise the same: shim-m4
+    with library units, lazy install, the New Game script. Both reach King's
+    Pass, and their screenshots match (`shots/hg8/c023.png`, `hg9/c023.png`).
+    The JIT is slower in both phases:
+
+    | phase | JIT (hg8) | interpreter (hg9) |
+    |---|---|---|
+    | menu, best minute | 39.9 presents/s | 44.6 presents/s |
+    | King's Pass, 602-692 s | 11.7-12.7, mean 12.0 presents/s | 14.8-15.3, mean 15.1 presents/s |
+
+    In King's Pass the JIT is 21% slower than the interpreter (12.0 vs 15.1
+    presents/s). hg10 profiles the JIT run with its counters on.
+- **Native unit retirement matches the browser (0308e2e0).**
+  - `nt_cgen::on_retire` and `ftab::on_retire` take the gone pages. A unit
+    page that is no longer mapped executable is patched, its non-provider
+    entries leave the table, and its ELF object leaves `ELF_SEEN`, so it is
+    placed again when mapped again.
+  - `ftab::on_retire` clears every entry's probe-cache slot before it
+    retires any. Retiring first left a cached unit entry behind: libb,
+    loaded where liba's re-placed unit had been, ran liba's unit, which
+    bailed to tier-1 and was sent straight back (a spin under `--fjit`).
+  - `tests/elf-units-remap`: liba and libb share one pinned base and each
+    has a unit. Each is loaded and unloaded twice, with and without
+    `--fjit`. The output matches native and the units are placed 4 times.
+    The old rule places them twice, so the second loads ran on tier-1.
+- **Start-up, item 3.**
+  - Pins (1fc1a8dd): `browser-linux.mjs --pins FILE` takes
+    `BASE SPAN PATH` lines. `tests/games/hollow-knight-pins.txt` pins the
+    16 objects that have units at their 6158cded bases. libdbus goes at its
+    second base (libxcb keeps the first). Run: hp28.
+  - ld.so (29cbcc4d): gex's loader places the interpreter, so no guest
+    mmap ever announced it. Both hosts now push `CodeMap::of_placed` for
+    it at load, and its unit (`elfunits=ld-linux-x86-64.so.2`, built at
+    0x4a00000 with `--mem64` from edger's ld.so, key 59660fd8) is placed
+    after the first syscall.
+    - Natively, 18 of 20 ld.so lookups in the remap test hit the unit.
+    - Page run: hp29 (shim-m5).
+  - The interpreter's "transform 7.0 s" (hp18) was mostly not transform.
+    5.07 s of it is static constructors run from inside
+    `mono_interp_transform_method` (`mono_runtime_class_init_full`), and
+    `generate` itself is 1.64 s. The JIT does not remove it: methods are
+    still transformed at tier 0 first.

@@ -38,6 +38,27 @@ public static class T {
     }
     return "clears " + sum;
   }
+  // Delegates made in code the wasm JIT compiled (ldftn, ldvirtftn, a boxed struct's override, a
+  // closure): their constructor runs on the interpreter, which takes the JIT's function pointers as
+  // its own (Hollow Knight's tk2dSpriteAnimator.Start read a NULL method from a native entry).
+  public class DShape { public int k; public virtual int Area(int x) { return x * k; } public int Plain(int x) { return x + k; } }
+  public class DSquare : DShape { public override int Area(int x) { return x * x + k; } }
+  public struct Tag { public int v; public override string ToString() { return "tag" + v; } }
+  static int DSq(int x) { return x * x; }
+  public static string Delegates(int n) {
+    long sum = 0; string tags = "";
+    for (int i = 0; i < n; i++) {
+      Func<int, int> st = DSq;
+      DShape s = i % 2 == 0 ? new DShape { k = i } : new DSquare { k = i };
+      Func<int, int> pl = s.Plain, vi = s.Area;
+      object o = new Tag { v = i };
+      Func<string> ts = o.ToString;
+      int c = i; Func<int, int> cl = x => x + c;
+      sum += st(i) + pl(3) + vi(4) + cl(5);
+      if (i < 3) tags += ts();
+    }
+    return "delegates " + sum + " " + tags;
+  }
   public static object LvGraph(int n) {
     var r = new LvRoot { arr = new object[n], pairs = new Pair[n], list = new List<Leaf>(), s = "not a leaf" };
     for (int i = 0; i < n; i++) r.arr[i] = i % 2 == 0 ? new SubLeaf { id = i } : new Leaf { id = i };

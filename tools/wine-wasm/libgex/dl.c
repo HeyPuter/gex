@@ -1,5 +1,5 @@
 /* libgex: dlopen, dlsym and dlclose over a registry linked into the
- * program.
+ * program, and gex's loader for wasm32 shared libraries.
  *
  * gex runs a closed world (docs/wine-native.md §3.12): every library a
  * program will dlopen -- Wine's Unix libraries -- is linked into it at
@@ -36,13 +36,29 @@ static const char *base(const char *p)
 	return s ? s + 1 : p;
 }
 
+/* gex's loader (shims' dylink): a wasm32 shared library loaded into the
+ * process, for a program linked against shared libraries (docs/gexcc.md
+ * 7.6). Handles from it are GEX_DL_HANDLE and above; 0 with a message in
+ * err when it cannot. A static program's loader has no link map and says
+ * so. */
+__attribute__((__import_module__("gex"), __import_name__("dlopen")))
+unsigned __gex_dlopen(const char *path, char *err, unsigned errlen);
+__attribute__((__import_module__("gex"), __import_name__("dlsym")))
+unsigned __gex_dlsym(unsigned handle, const char *name);
+#define GEX_DL_HANDLE 0xfff00000u
+#define IS_GEX(p) ((unsigned long)(p) >= GEX_DL_HANDLE)
+
 void *dlopen(const char *file, int mode)
 {
 	if (!file) return (void *)&self;
 	const char *b = base(file);
 	for (const struct __gex_dl_lib *const *l = __gex_dl_libs; *l; l++)
 		if (!strcmp((*l)->name, b)) return (void *)*l;
-	__dl_seterr("%s: not linked into this program", file);
+	char err[256];
+	err[0] = 0;
+	unsigned h = __gex_dlopen(file, err, sizeof err);
+	if (h) return (void *)(unsigned long)h;
+	__dl_seterr("%s", err[0] ? err : "not linked into this program");
 	return 0;
 }
 
@@ -62,7 +78,10 @@ static void *find(const struct __gex_dl_lib *l, const char *s)
 __attribute__((__visibility__("hidden")))
 void *__dlsym(void *restrict p, const char *restrict s, void *restrict ra)
 {
-	if (p && p != RTLD_DEFAULT && p != (void *)&self) {
+	if (IS_GEX(p)) {
+		void *a = (void *)(unsigned long)__gex_dlsym((unsigned long)p, s);
+		if (a) return a;
+	} else if (p && p != RTLD_DEFAULT && p != (void *)&self) {
 		void *a = find(p, s);
 		if (a) return a;
 	} else {
@@ -70,6 +89,10 @@ void *__dlsym(void *restrict p, const char *restrict s, void *restrict ra)
 			void *a = find(*l, s);
 			if (a) return a;
 		}
+		/* and the process's global scope (shared libraries, and the
+		 * program's own symbols when it is linked -rdynamic) */
+		void *a = (void *)(unsigned long)__gex_dlsym(0, s);
+		if (a) return a;
 	}
 	__dl_seterr("Symbol not found: %s", s);
 	return 0;
