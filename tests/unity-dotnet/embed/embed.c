@@ -302,6 +302,12 @@ main (int argc, char **argv)
 	P hsr = mono_runtime_invoke (hs, NULL, hsargs, &exc);
 	check ("HotShapes", exc);
 	printf ("%s\n", mono_string_to_utf8 (hsr));
+	P mi = mono_class_get_method_from_name (k, "MonoIcalls", 1);
+	int min = 20000;
+	void *miargs [1] = { &min };
+	P mir = mono_runtime_invoke (mi, NULL, miargs, &exc);
+	check ("MonoIcalls", exc);
+	printf ("%s\n", mono_string_to_utf8 (mir));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };

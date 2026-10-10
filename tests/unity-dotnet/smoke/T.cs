@@ -326,6 +326,31 @@ public static class T {
     }
     return "hotshapes " + lacc + " " + facc.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
   }
+  // The runtime's own InternalCalls called directly from JIT code (handles and raw): GCHandle.InternalGet,
+  // FastAllocateString, Array.GetLowerBoundInternal / FastCopy, RuntimeType.GetName, Enum names (an out
+  // handle), and a pending exception raised inside an icall (Monitor.Exit of an unowned lock).
+  public enum Hue { Red, Green, Blue }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int IcallLeg(int i, GCHandle h, int[] src, int[] dst, object lk) {
+    int acc = ((string)h.Target).Length;
+    acc += new string('x', i % 7).Length;
+    acc += src.GetLowerBound(0) + src.GetUpperBound(0);
+    Array.Copy(src, 0, dst, i % 4, 4);
+    acc += dst[i % 4] + dst[(i % 4) + 3];
+    acc += (i % 3 == 0 ? typeof(Hue) : i % 3 == 1 ? typeof(List<int>) : typeof(T)).Name.Length;
+    acc += Enum.GetNames(typeof(Hue))[i % 3].Length;
+    if (i % 50 == 0) { try { System.Threading.Monitor.Exit(lk); acc += 1000; } catch (System.Threading.SynchronizationLockException) { acc += 7; } }
+    if (i % 2 == 0) { lock (lk) acc += 1; }
+    return acc;
+  }
+  public static string MonoIcalls(int n) {
+    var h = GCHandle.Alloc("handle-target");
+    int[] src = { 3, 1, 4, 1, 5, 9, 2, 6 }, dst = new int[8];
+    object lk = new object();
+    long acc = 0;
+    for (int i = 0; i < n; i++) acc += IcallLeg(i, h, src, dst, lk);
+    h.Free();
+    return "monoicalls " + acc;
+  }
   public static string Localloc(int n) {
     long acc = 0;
     for (int i = 0; i < n; i++) acc += Stack(i);
