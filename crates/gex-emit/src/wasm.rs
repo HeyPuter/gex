@@ -1484,7 +1484,12 @@ impl Module {
         // Where this module names its own functions. A custom section, so it
         // travels with the bytes -- the shared store keeps wasm and nothing
         // else -- and an engine ignores it.
-        if !code_relocs.is_empty() {
+        //
+        // Not in a module with a dense segment (placed by an imported global,
+        // `crate::dense`): `merge` refuses those, so nothing would read it,
+        // and it was 3.5% of what node's start-up translates (340 B a unit).
+        let unmergeable = self.elements.iter().any(|e| e.offset_global.is_some());
+        if !code_relocs.is_empty() && !unmergeable {
             let mut sec = Vec::with_capacity(code_relocs.len() * 4 + 16);
             write_name(&mut sec, RELOC_SECTION);
             write_u32(&mut sec, code_relocs.len() as u32);
