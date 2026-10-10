@@ -1973,6 +1973,22 @@ pub extern "C" fn gex_set_discover_skip(bits: u32) {
     gex_xlate::set_discover_skip(bits);
 }
 
+/// The discovery log's text (`GEX_DISCOVER_SKIP` bit 8), for `gex_dl_text`.
+static DL_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Copy the discovery log's text to `ptr` (at most `cap` bytes) and return its
+/// length; with `cap` 0 only the length.
+#[no_mangle]
+pub extern "C" fn gex_dl_text(ptr: u32, cap: u32) -> u32 {
+    let t = DL_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+    let n = t.len().min(cap as usize);
+    if n > 0 {
+        // SAFETY: the caller allocated `cap` bytes at `ptr` (gex_alloc).
+        unsafe { std::ptr::copy_nonoverlapping(t.as_ptr(), ptr as usize as *mut u8, n) };
+    }
+    t.len() as u32
+}
+
 #[no_mangle]
 pub extern "C" fn gex_set_xlate_report(n: u32) {
     XLATE_REPORT.store(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -11988,6 +12004,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         *h.jit.obj_wasm.entry(whose.clone()).or_insert(0) += stats.wasm_bytes as u64;
         note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
+        // `GEX_DISCOVER_SKIP` bit 8: what discovery lifted and why, one
+        // `address why depth object` line a block, read at exit
+        // (`gex_dl_text`, run-node's GEX_DL_FILE; docs/jit-guest.md).
+        let dlog = gex_xlate::take_discover_log();
+        if !dlog.is_empty() {
+            let mut t = DL_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+            for (a, why, depth) in dlog {
+                t.push_str(&format!("{a:x} {why} {depth} {}\n", object_name_at(h, a)));
+            }
+        }
         let every = XLATE_REPORT.load(std::sync::atomic::Ordering::Relaxed);
         if every != 0 && XLATE_STAT[2].load(std::sync::atomic::Ordering::Relaxed) % every == 0 {
             xlate_report(h);

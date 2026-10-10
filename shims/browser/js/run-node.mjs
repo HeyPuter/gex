@@ -31,7 +31,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -427,6 +427,8 @@ const host = new ProcessHost({
     else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
   },
   onExit: (m, pid) => {
+    // GEX_DL_FILE=PATH: the discovery log (GEX_DISCOVER_SKIP=256), to PATH.PID.
+    if (process.env.GEX_DL_FILE && m.dl) appendFileSync(`${process.env.GEX_DL_FILE}.${pid}`, m.dl);
     // How much of the run was translating vs. running translated code. Per
     // process, because a program that forks pays it again.
     if (process.env.GEX_TIME_JIT) {

@@ -771,6 +771,17 @@ async function handle(msg) {
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // What the translator did: instructions lifted, wasm bytes, translations,
       // SMC page invalidations, pages retired, retire calls, -, anonymous blocks.
+      // The discovery log (GEX_DISCOVER_SKIP bit 8, run-node's GEX_DL_FILE).
+      dl: (() => {
+        const e = gex.shim.exports;
+        const n = e.gex_dl_text?.(0, 0) >>> 0;
+        if (!n) return undefined;
+        const p = e.gex_alloc(n) >>> 0;
+        e.gex_dl_text(p, n);
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, n);
+        return t;
+      })(),
       xlate: gex.shim.exports.gex_xlate_stat
         ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
         : undefined,
