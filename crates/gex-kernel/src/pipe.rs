@@ -479,3 +479,135 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         )
     }
 }
+
+/// One end of a stream `socketpair` whose two ends may be in different
+/// Workers: two global pipes, crossed. This end reads `rx` and writes `tx`;
+/// its peer reads `tx` and writes `rx`.
+///
+/// A local [`crate::unix::UnixSocket`] pair is an `Arc` in one memory, so a
+/// `fork` could not hand it to the child at all, and the child's first
+/// `dup2` of it failed with `EBADF`. libuv makes every spawned child's stdio
+/// this way (`uv_socketpair`), which is how `child_process.spawn` in node and
+/// `system()` / `:!` in neovim all failed before the child could `execve`.
+/// Built from global pipes, each end is two ids, and a fork reopens both for
+/// the child as it does for a pipe end (see `stage_fork_fds` in the browser
+/// shim).
+///
+/// What this does not carry is `SCM_RIGHTS`: descriptors are `Arc`s in this
+/// memory and the bytes cross to another.
+pub struct RemoteSockEnd {
+    pub rx: i32,
+    pub tx: i32,
+    pub remote: Remote,
+    /// `shutdown(SHUT_WR)` closed the write end already; `Drop` must not
+    /// close it a second time.
+    shut_wr: std::sync::atomic::AtomicBool,
+}
+
+impl RemoteSockEnd {
+    pub fn new(rx: i32, tx: i32, remote: Remote) -> RemoteSockEnd {
+        RemoteSockEnd {
+            rx,
+            tx,
+            remote,
+            shut_wr: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The path a descriptor onto this end carries, which is also what a
+    /// fork sends the child to rebuild it from.
+    pub fn path(&self) -> String {
+        format!("sockpair:[{}:{}]", self.rx, self.tx)
+    }
+
+    /// `(rx, tx)` from a path made by [`RemoteSockEnd::path`].
+    pub fn parse(path: &str) -> Option<(i32, i32)> {
+        let inner = path.strip_prefix("sockpair:[")?.strip_suffix(']')?;
+        let (rx, tx) = inner.split_once(':')?;
+        Some((rx.parse().ok()?, tx.parse().ok()?))
+    }
+}
+
+impl std::fmt::Debug for RemoteSockEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RemoteSockEnd(rx {}, tx {})", self.rx, self.tx)
+    }
+}
+
+impl Drop for RemoteSockEnd {
+    fn drop(&mut self) {
+        (self.remote.close_end)(self.rx, 0);
+        if !self.shut_wr.load(std::sync::atomic::Ordering::Relaxed) {
+            (self.remote.close_end)(self.tx, 1);
+        }
+    }
+}
+
+impl crate::vfs::FileHandle for RemoteSockEnd {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        match (self.remote.read)(self.rx, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if self.shut_wr.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Errno::EPIPE);
+        }
+        match (self.remote.write)(self.tx, buf.as_ptr() as crate::PAddr, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        Ok(crate::vfs::Metadata {
+            file_type: crate::vfs::FileType::Socket,
+            size: 0,
+            mode: 0o777,
+            ino: crate::vfs::anon_ino((0x20000 + self.rx as usize) as *const u8),
+            mtime: 0,
+            nlink: 1,
+            rdev: 0,
+            times: Default::default(),
+        })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    fn poll_readable(&self) -> bool {
+        (self.remote.readable)(self.rx) != 0
+    }
+
+    fn poll_writable(&self) -> bool {
+        self.shut_wr.load(std::sync::atomic::Ordering::Relaxed) || (self.remote.writable)(self.tx) != 0
+    }
+
+    fn available(&self) -> Option<u64> {
+        Some((self.remote.buffered)(self.rx).max(0) as u64)
+    }
+
+    fn write_room(&self) -> Option<u64> {
+        None
+    }
+
+    fn shutdown_write(&self) -> bool {
+        if !self.shut_wr.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            (self.remote.close_end)(self.tx, 1);
+        }
+        true
+    }
+
+    fn debug_state(&self) -> String {
+        format!(
+            "shared socketpair end: rx pipe {} ({} buffered), tx pipe {}{}",
+            self.rx,
+            (self.remote.buffered)(self.rx),
+            self.tx,
+            if self.shut_wr.load(std::sync::atomic::Ordering::Relaxed) { " (shut for writing)" } else { "" }
+        )
+    }
+}
