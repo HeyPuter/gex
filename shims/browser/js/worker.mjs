@@ -571,7 +571,9 @@ async function handle(msg) {
   // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
-    gex.useNetwork(new NodeNetwork());
+    const net = new NodeNetwork();
+    if (single.on) net.onActivity = () => sched.wake();
+    gex.useNetwork(net);
   }
   if (msg.wispNet) {
     // The single-thread build: the system's one Wisp connection, the object

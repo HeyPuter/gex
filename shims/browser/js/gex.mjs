@@ -719,6 +719,9 @@ export class Gex {
   // shared kernel memory. Null is a run of one process, which needs none of it.
   #kernelSpec = null;
   #census = null;
+  /** The single-thread build: where this fiber's JS last was, for the census
+   *  (a fiber that waits in JS is otherwise invisible to it). */
+  #where = '';
   #kernel = null;
   // This Worker's shim stack, claimed on the way in. See `#workerStack`.
   #stackTop = null;
@@ -1829,7 +1832,7 @@ export class Gex {
         const text = utf8(this.#bytes().slice(p, p + n));
         // Only when it has stopped changing: a wedged process repeats the same
         // wait forever, which is the signal; a busy one churns through them.
-        if (text === last) console.debug(`[gex] quiet: ${text}`);
+        if (text === last) console.debug(`[gex] quiet: ${text}${single.on ? ` js=${this.#where}/installs=${this.#installs}/pending=${e.gex_jit_pending_len() >>> 0}` : ''}`);
         last = text;
       }
       e.gex_free?.(p, 512);
@@ -1923,11 +1926,13 @@ export class Gex {
       out.k_park = new WebAssembly.Suspending((seq, ns) => {
         if (k.k_wake_seq() !== seq) return 1;
         if (this.#nest.length) nested();
+        this.#where = `park(${ns})`;
         return sched.park(ns);
       });
       out.k_park_futex = new WebAssembly.Suspending((addr, gen, ns) => {
         if ((k.k_futex_gen(addr) >>> 0) !== (gen >>> 0)) return 1;
         if (this.#nest.length) nested();
+        this.#where = `futex(${addr},${ns})`;
         return sched.parkFutex(addr, ns);
       });
       out.k_wake = () => {
@@ -3798,7 +3803,11 @@ export class Gex {
         this.#shim.exports.gex_callout_leave_ok?.(0);
         // The single-thread build enters on a stack of the guest's own
         // (JSPI), which a blocking call suspends; see single.mjs.
-        if (single.on) await this.#enterP(ctx, pc);
+        if (single.on) {
+          this.#where = 'enter';
+          await this.#enterP(ctx, pc);
+          this.#where = 'trap';
+        }
         else this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
@@ -3808,6 +3817,7 @@ export class Gex {
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
         trappedAt = performance.now();
+        this.#where = 'trap';
         // First, before asking the shim anything: was this a handoff or a
         // crash? Every way out is the same `unreachable` to the engine, and
         // treating a crash as a handoff reported a crashed runtime as a clean
@@ -3985,7 +3995,9 @@ export class Gex {
           let answer = quick;
           if (answer === null || answer === undefined) {
             const t0 = performance.now();
+            this.#where = `fillSlot(${want >>> 0})`;
             answer = await this.fillSlot(want >>> 0);
+            this.#where = 'trap';
             this.#slowFills++;
             this.#slowMs += performance.now() - t0;
           }
@@ -3999,7 +4011,9 @@ export class Gex {
           const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
           if (need) this.#growTables(need, 'a2358');
         }
+        this.#where = 'install';
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        this.#where = 'adopt';
         // The parent's modules go in after this Worker's own queue, never
         // between a translation and its install: a module's page assignments
         // are the next one's starting point, so interleaving two orderings
@@ -4010,14 +4024,18 @@ export class Gex {
         // drains it into its own tables and the asker never sees it. `#catchUp`
         // is a no-op comparison when there is nothing to do.
         this.#armCensus();
+        this.#where = 'catchUp';
         await this.#catchUp();
         this.#cgenServe();
+        this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
         // and before the memory is touched again, because what the child gets
         // is a copy of it as `fork` left it.
         await this.#drainFork();
+        this.#where = 'drainThread';
         await this.#drainThread();
+        this.#where = 'resume';
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -4070,7 +4088,11 @@ export class Gex {
               // asleep and the turn below runs that queue. -1 is "no global
               // kernel to sleep on", and a network wait cannot sleep at all --
               // its bytes arrive on this Worker's own event loop.
-              if (e.gex_paused_for_host() || (single.on ? await this.#parkP(20) : e.gex_park(20)) < 0) {
+              // The single-thread build parks for the network as well: the
+              // park is a promise, so the event loop delivers the bytes, and
+              // the network's activity wakes it (`onActivity`). A turn per
+              // waiting fiber instead spins the one thread every fiber shares.
+              if (single.on ? (await this.#parkP(20)) < 0 : (e.gex_paused_for_host() || e.gex_park(20) < 0)) {
                 // A network wait runs on this Worker's event loop, so it cannot
                 // sleep -- but it needs a turn, not a timer: a MessageChannel
                 // turn returns to the loop in microseconds where a nested
@@ -4536,8 +4558,10 @@ export class Gex {
     return new WebAssembly.Suspending((ctx, pc) => {
       if (this.#nest.length) return sync(ctx, pc);
       this.#sysPf ??= WebAssembly.promising(e.gex_syscall);
+      this.#where = 'syscall';
       const p = this.#sysPf(ctx, mark ? BigInt.asIntN(64, BigInt(pc) | mark) : pc);
       return p.then(() => {
+        this.#where = 'syscall-done';
         after?.();
         // A preemption point as well: a program that only makes system
         // calls gives the other fibers a turn here.
@@ -4551,6 +4575,7 @@ export class Gex {
   #singleSafepoint(e) {
     return (this.#safepointS ??= new WebAssembly.Suspending((ctx, pc) => {
       e.gex_safepoint(ctx, pc);
+      this.#where = 'safepoint';
       return this.#nest.length ? 0 : sched.maybeYield();
     }));
   }
