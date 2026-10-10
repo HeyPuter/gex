@@ -343,8 +343,6 @@ const host = new ProcessHost({
     discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
     // GEX_T1_FOLD=1: tier-1's tee folding (gex-emit `set_t1_fold`).
     t1Fold: process.env.GEX_T1_FOLD ? 1 : undefined,
-    // GEX_SHARED_ENTER=1: units import the image module's `enter` (gex-emit `set_shared_enter`).
-    sharedEnter: process.env.GEX_SHARED_ENTER ? 1 : undefined,
     // GEX_UNIT_CACHE=1: compiled translation units shared by every process.
     unitCache: process.env.GEX_UNIT_CACHE ? 1 : undefined,
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.

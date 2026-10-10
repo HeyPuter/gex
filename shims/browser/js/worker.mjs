@@ -644,7 +644,6 @@ async function handle(msg) {
           xlateReport: msg.xlateReport ?? msg.opts?.xlateReport,
           discoverSkip: msg.discoverSkip ?? msg.opts?.discoverSkip,
           t1Fold: msg.t1Fold ?? msg.opts?.t1Fold,
-          sharedEnter: msg.sharedEnter ?? msg.opts?.sharedEnter,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },

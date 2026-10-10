@@ -205,9 +205,6 @@ pub struct Context<'a> {
     /// has one: an indirect dispatch tail-calls it instead of carrying the
     /// whole table selection inline. See [`set_inline_dispatch`].
     pub enter: Option<u32>,
-    /// `enter` is an imported function (the image module's, see
-    /// [`set_shared_enter`]): a plain tail call, no relocation.
-    pub enter_import: bool,
 }
 
 /// `GEX_INLINE_DISPATCH=1` natively, `set_inline_dispatch(true)` in the
@@ -226,22 +223,6 @@ fn inline_dispatch() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
         || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// `GEX_SHARED_ENTER=1` / `set_shared_enter(true)`: a runtime unit imports
-/// the image module's `enter` instead of carrying its own (285 bytes a unit,
-/// 2.9% of node's start-up), at the price of every indirect dispatch
-/// tail-calling an imported function.
-static SHARED_ENTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_shared_enter(on: bool) {
-    SHARED_ENTER.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn shared_enter() -> bool {
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| std::env::var_os("GEX_SHARED_ENTER").is_some())
-        || SHARED_ENTER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Fold `local.set x; local.get x` into `local.tee x` and strip the tees
@@ -263,7 +244,7 @@ fn t1_fold() -> bool {
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
 pub fn knobs() -> u8 {
-    inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (shared_enter() as u8) << 2
+    inline_dispatch() as u8 | (t1_fold() as u8) << 1
 }
 
 /// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
@@ -5064,11 +5045,7 @@ impl<'a> Emitter<'a> {
             }
             self.f.local_get(self.ctx_local);
             self.f.local_get(self.scratch_i64);
-            if self.cx.enter_import {
-                self.f.return_call(enter);
-            } else {
-                self.f.return_call_local(enter);
-            }
+            self.f.return_call_local(enter);
             return;
         }
         if gex_abi::DISPATCH_TABLES <= 1 {

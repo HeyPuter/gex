@@ -1235,7 +1235,7 @@ export class Gex {
       // The translator's knobs, for every process of the run: set only here,
       // a forked child (node under `bash -c`) ran with the defaults.
       perMiss: opts.perMiss, liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
-      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold, sharedEnter: opts.sharedEnter,
+      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
@@ -1253,7 +1253,6 @@ export class Gex {
     if (opts.xlateReport) this.#shim.exports.gex_set_xlate_report?.(opts.xlateReport);
     if (opts.discoverSkip) this.#shim.exports.gex_set_discover_skip?.(opts.discoverSkip);
     if (opts.t1Fold) this.#shim.exports.gex_set_t1_fold?.(1);
-    if (opts.sharedEnter) this.#shim.exports.gex_set_shared_enter?.(1);
     // Keep what the guest's dynamic linker produces, and start the next process
     // of the same program from it instead of linking again.
     if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
@@ -2159,7 +2158,6 @@ export class Gex {
     if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
     if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
     if (o.t1Fold) e.gex_set_t1_fold?.(1);
-    if (o.sharedEnter) e.gex_set_shared_enter?.(1);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first
@@ -5132,9 +5130,6 @@ export class Gex {
     // A runtime module imports its dense base (gex_emit::dense::GLOBAL)
     // whether or not it has dense blocks; set below when it has.
     imports.dense_base = 0;
-    // The image module's `enter`, for a unit built to import it instead of
-    // carrying its own (gex-emit `set_shared_enter`); unused otherwise.
-    if (this.#guest?.exports?.enter) imports.enter = this.#guest.exports.enter;
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {
