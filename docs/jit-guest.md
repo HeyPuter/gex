@@ -116,14 +116,31 @@ are the same mode at the start and end of the run.
 
 ## 2. State / resume
 
-- Done (branch commits, in order): knobs and counters (9e84b3cc); region
-  grown only at back-edge targets, once per block (byte-identical output);
-  no page-table clones per miss, slab-allocated kernel module store,
-  word-wise content key (3e8dab8e); dispatch through the module's `enter`
-  (43fa9fc5: node cold 158.5 -> 78.6 MiB of wasm; `GEX_INLINE_DISPATCH=1`
-  restores the old form byte for byte).
-- Queued on edger: `t2.sh b3` (new vs inline dispatch ABBA, lazy threads,
-  lift cap 64, a profile).
-- Next: profile warm `node -e 0` (stream C: warm 30.2 s tier 1 vs 28.8 s
-  fjit, 0.2 s translating, `--jitless` 26.2-26.9 s): the cost is the speed
-  of translated V8 builtins and interpreter, not translation volume.
+- Branch head bbb7f237. Commits, in order:
+  - 9e84b3cc knobs and per-process counters (`xlate[...]`);
+  - 0f5d120b region grown only at back-edge targets, once per block
+    (byte-identical output);
+  - 3e8dab8e no page-table clones per miss, slab kernel module store,
+    word-wise content key;
+  - 43fa9fc5 dispatch through the module's `enter` (`GEX_INLINE_DISPATCH=1`
+    restores the old form byte for byte);
+  - c15680ca translator progress report (`?xlatereport=N`), re-lift and
+    anonymous-memory counters, served-module cursor;
+  - 6928037b page-wide cache of compiled units (`?unitcache=1`, off by
+    default); dense base as an imported global, so a served unit's bytes are
+    the same in every process;
+  - 64b129ce fewer allocations and no SipHash in tier-1 emission;
+  - bbb7f237 tier-1 tee folding (`GEX_T1_FOLD` / `?t1fold=1`, off by default,
+    loop-safe), emitter switches in the native module cache key.
+- Tests: gate on 64b129ce passed (a64 485, x86 474, nt 85/85 both, glibc,
+  lockstep). Integration ladder with `GEX_T1_FOLD=1` on bbb7f237: 100 passed;
+  the 50 failures all reproduce on the base tree (c47bbff1): the browser
+  comparisons see host.mjs's `console.debug` lines on stdout, vfs segfaults,
+  priority sees the run's nice level, park-across-switch, two-workers and
+  threads-shared fail identically, browser-builds hit the scope's task limit.
+- Queued on edger: `page.sh p1` (base vs new vs new with `unitcache=1`, node
+  in the native-debian page).
+- Next: decide the unit cache and fold defaults from page numbers; HK
+  translation volume with `?xlatereport=500` (needs a coordinator run);
+  per-unit fixed overhead (about 830 B a unit); discovery overshoot (63% of
+  lifted blocks never run).
