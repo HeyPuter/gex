@@ -129,6 +129,39 @@ public static class T {
     }
     return "argaddr " + acc;
   }
+  // A leave that exits two or three try-finally blocks at once (return / break from the innermost try):
+  // mono emits one OP_CALL_HANDLER per finally, which the wasm JIT once refused as a "complex continuation".
+  [MethodImpl(MethodImplOptions.NoInlining)] static int Fin2(int i, ref int log) {
+    try { try { if (i % 3 == 0) return i * 2; log += 1; } finally { log += 10; } log += 100; }
+    finally { log += 1000; }
+    return -1;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int Fin3(int n, ref int log) {
+    int k = 0;
+    for (; k < n; k++) {
+      try { try { try { if (k == 5) break; if (k % 2 == 0) continue; log += k; } finally { log += 2; } }
+        finally { log *= 3; log %= 1000003; } }
+      finally { log ^= k; }
+    }
+    return k;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int FinThrow(int i, ref int log) {
+    try { try { try { if (i % 4 == 1) throw new InvalidOperationException(); if (i % 4 == 2) return 7; } finally { log += 3; } }
+      finally { log += 5; } }
+    catch (InvalidOperationException) { log += 11; }
+    return 1;
+  }
+  public static string NestedFinally(int n) {
+    long acc = 0; int log = 0;
+    for (int i = 0; i < n; i++) {
+      acc += Fin2(i, ref log);
+      acc += Fin3(i, ref log);
+      acc += FinThrow(i, ref log);
+      acc = acc * 31 + log;
+      acc %= 1000000007;
+    }
+    return "finally " + acc + " " + log;
+  }
   public static string Delegates(int n) {
     long sum = 0; string tags = "";
     for (int i = 0; i < n; i++) {

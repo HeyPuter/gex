@@ -278,6 +278,12 @@ main (int argc, char **argv)
 	P aar = mono_runtime_invoke (aa, NULL, aaargs, &exc);
 	check ("ArgAddr", exc);
 	printf ("%s\n", mono_string_to_utf8 (aar));
+	P nf = mono_class_get_method_from_name (k, "NestedFinally", 1);
+	int nfn = 60;
+	void *nfargs [1] = { &nfn };
+	P nfr = mono_runtime_invoke (nf, NULL, nfargs, &exc);
+	check ("NestedFinally", exc);
+	printf ("%s\n", mono_string_to_utf8 (nfr));
 	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
 	int un = 4000;
 	void *uargs [1] = { &un };
