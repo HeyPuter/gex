@@ -71,7 +71,17 @@
 # transport. What the page loads is built by the link at the end of this file.
 set -eu
 
-OUT="${1:-${TMPDIR:-/tmp}/gex-xwl}"
+# GEX_XWL_THREADS=0: the single-thread build's server (docs/single-thread.md).
+# Without -pthread anywhere, so its memory is a plain one: the compositor runs
+# in the same realm there and reads the pixels by reference, not through a
+# SharedArrayBuffer. Its own output directory, published as xwayland-st/.
+THREADS=${GEX_XWL_THREADS:-1}
+if [ "$THREADS" = 0 ]; then
+    PT=""; PTQ=""; DEFAULT_OUT=${TMPDIR:-/tmp}/gex-xwl-st; PUBDIR=xwayland-st
+else
+    PT="-pthread"; PTQ="'-pthread', "; DEFAULT_OUT=${TMPDIR:-/tmp}/gex-xwl; PUBDIR=xwayland
+fi
+OUT="${1:-$DEFAULT_OUT}"
 PREFIX="$OUT/prefix"
 SRC="$OUT/src"
 EMSDK="${EMSDK:-/usr/lib/emsdk}"
@@ -183,8 +193,8 @@ strip = '$EMCC/emstrip'
 pkg-config = 'pkg-config'
 
 [built-in options]
-c_args = ['-pthread', '-I$PREFIX/include', '-Wno-error', '-Wno-pedantic', '-Wno-c23-extensions', '-Wno-unused-command-line-argument']
-c_link_args = ['-pthread', '-L$PREFIX/lib', '-lz']
+c_args = [$PTQ'-I$PREFIX/include', '-Wno-error', '-Wno-pedantic', '-Wno-c23-extensions', '-Wno-unused-command-line-argument']
+c_link_args = [$PTQ'-L$PREFIX/lib', '-lz']
 prefix = '$PREFIX'
 libdir = 'lib'
 
@@ -208,6 +218,17 @@ clone() { # clone <dir> <url> [tag]
     fi
 }
 
+# The single-thread build: meson's dependency('threads') is -pthread on an
+# emscripten target whatever the cross file says, and a library's .pc then
+# carries it into every link after it. Taken out of the generated build and the
+# installed .pc files, so no object is built for, and no link asks for, a
+# shared memory.
+strip_pthread() { # strip_pthread <build dir>
+    [ "$THREADS" = 0 ] || return 0
+    sed -i -e 's/ -pthread\b//g' -e 's/ -sPTHREAD_POOL_SIZE=[0-9]*//g' "$1/build.ninja"
+    sed -i -e 's/ *-pthread\b//g' -e 's/ *-sPTHREAD_POOL_SIZE=[0-9]*//g' "$PREFIX"/lib/pkgconfig/*.pc 2>/dev/null || true
+}
+
 meson_build() { # meson_build <dir> <extra meson args...>
     d=$1; shift
     rm -rf "$OUT/build/$d"
@@ -221,7 +242,9 @@ meson_build() { # meson_build <dir> <extra meson args...>
         --prefix="$PREFIX" --buildtype=release -Ddefault_library=static \
         -Dc_thread_count=0 "$@" \
         > "$OUT/log-$d.txt" 2>&1
+    strip_pthread "$OUT/build/$d"
     ninja -C "$OUT/build/$d" install >> "$OUT/log-$d.txt" 2>&1
+    strip_pthread "$OUT/build/$d"
 }
 
 auto_build() { # auto_build <dir> <extra configure args...>
@@ -231,8 +254,8 @@ auto_build() { # auto_build <dir> <extra configure args...>
                           autoreconf -fiv > "$OUT/log-$d.txt" 2>&1; }
     emconfigure ./configure --host=wasm32-unknown-emscripten --prefix="$PREFIX" \
         --enable-static --disable-shared \
-        CFLAGS="-pthread -O2 -Wno-error -I$PREFIX/include" \
-        LDFLAGS="-pthread -L$PREFIX/lib" "$@" >> "$OUT/log-$d.txt" 2>&1
+        CFLAGS="$PT -O2 -Wno-error -I$PREFIX/include" \
+        LDFLAGS="$PT -L$PREFIX/lib" "$@" >> "$OUT/log-$d.txt" 2>&1
     emmake make -j"$(nproc)" install >> "$OUT/log-$d.txt" 2>&1
     cd "$OUT"
     # xtrans and libXau put their .pc in share/pkgconfig; pkg-config here is
@@ -442,6 +465,7 @@ meson setup "$OUT/build/wayland" "$SRC/wayland" --cross-file "$OUT/emscripten.in
     > "$OUT/log-wayland.txt" 2>&1
 # The client library alone: `ninja install` would also make the server, which
 # wants epoll.
+strip_pthread "$OUT/build/wayland"
 ninja -C "$OUT/build/wayland" src/libwayland-client.a >> "$OUT/log-wayland.txt" 2>&1
 cp "$OUT/build/wayland/src/libwayland-client.a" "$PREFIX/lib/"
 cp "$SRC/wayland/src/wayland-client.h" "$SRC/wayland/src/wayland-client-core.h" \
@@ -559,7 +583,7 @@ void SHA1Final(unsigned char digest[20], SHA1_CTX *ctx)
         digest[i] = (unsigned char) (ctx->state[i / 4] >> (24 - 8 * (i % 4)));
 }
 EOF
-(cd "$SRC/sha1" && "$EMCC/emcc" -O2 -pthread -c sha1.c -o sha1.o && \
+(cd "$SRC/sha1" && "$EMCC/emcc" -O2 $PT -c sha1.c -o sha1.o && \
     "$EMCC/emar" rcs "$PREFIX/lib/libmd.a" sha1.o && cp sha1.h "$PREFIX/include/")
 # A wrong SHA-1 links as happily as a right one, so check the digest natively.
 (cd "$SRC/sha1" && cat > check.c <<'EOF'
@@ -656,7 +680,11 @@ say "Xwayland $XWAYLAND_TAG"
 #   built-ins is libXfont2's built-in `fixed` and `cursor`: the server needs a
 #   default font to start at all, and shipping font files for that would be
 #   silly when the library already carries the two that matter.
-XWL_LINK="-pthread -sPTHREAD_POOL_SIZE=0 -sALLOW_MEMORY_GROWTH=1"
+if [ "$THREADS" = 0 ]; then
+    XWL_LINK="-sALLOW_MEMORY_GROWTH=1"
+else
+    XWL_LINK="-pthread -sPTHREAD_POOL_SIZE=0 -sALLOW_MEMORY_GROWTH=1"
+fi
 XWL_LINK="$XWL_LINK -sINITIAL_MEMORY=134217728 -sMAXIMUM_MEMORY=1610612736"
 XWL_LINK="$XWL_LINK -sSTACK_SIZE=4194304 -sMODULARIZE=1 -sEXPORT_ES6=1"
 XWL_LINK="$XWL_LINK -sENVIRONMENT=web,worker,node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0"
@@ -669,6 +697,7 @@ s = open(p).read()
 if '-sMODULARIZE=1' not in s:
     words = ', '.join(f"'{w}'" for w in extra.split())
     s = s.replace("c_link_args = ['-pthread', ", "c_link_args = [" + words + ", ")
+    s = s.replace("c_link_args = ['-L", "c_link_args = [" + words + ", '-L")
     assert '-sMODULARIZE=1' in s, 'the cross file link args did not match'
     open(p, 'w').write(s)
 PATCH
@@ -683,6 +712,7 @@ meson setup "$OUT/build/xserver" "$SRC/xserver" --cross-file "$OUT/emscripten.in
     -Ddpms=false -Dscreensaver=false -Dxv=false -Dmitshm=false \
     -Ddefault_font_path=built-ins -Dc_thread_count=0 \
     > "$OUT/log-xserver.txt" 2>&1 || { tail -20 "$OUT/log-xserver.txt"; exit 1; }
+strip_pthread "$OUT/build/xserver"
 ninja -C "$OUT/build/xserver" >> "$OUT/log-xserver.txt" 2>&1 || {
     grep -E "error:|undefined symbol" "$OUT/log-xserver.txt" | head -20; exit 1; }
 
@@ -700,7 +730,7 @@ GEX_ROOT="$(cd "$HERE/.." && pwd)"
 HOSTWL="$GEX_ROOT/target/wasm32-unknown-unknown/release/gex_hostwl.wasm"
 
 # -- publish -----------------------------------------------------------------
-PUB="$GEX_ROOT/web/public/gex/xwayland"
+PUB="$GEX_ROOT/web/public/gex/$PUBDIR"
 mkdir -p "$PUB"
 cp "$OUT/build/xserver/hw/xwayland/Xwayland.js" "$PUB/Xwayland.mjs"
 cp "$OUT/build/xserver/hw/xwayland/Xwayland.wasm" "$PUB/"

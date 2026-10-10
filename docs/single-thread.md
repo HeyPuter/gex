@@ -220,6 +220,42 @@ No new poll was added to generated code. The microbenchmark prices one:
 Both are measurable on tight loops. The existing 1024-edge safepoint is the
 better place to yield.
 
+### Wakes wait for the waker to park
+
+Every system call bumps the kernel's wake counter (`k_wake`, after every
+call, so that no wake is ever missed). The SAB build pays for that in
+parallel: each parked Worker wakes on its own core, re-checks and parks
+again. In the single build every guest system call is itself a promise
+(the Suspending path above). Resolving the woken fibers at once queued
+their continuations ahead of the waker's own return from that call. So a
+writer and its reader traded places on every write, and every other parked
+fiber (the shell in `wait4`) re-checked each time.
+
+`Sched` therefore keeps the woken in a ready list, and runs them only when:
+
+- the running fiber parks;
+- it calls `sched_yield` (`Sched#yieldNow`); or
+- the event loop turns.
+
+A turn is posted on every wake. It runs only once the microtask queue is
+empty, i.e. when every fiber is blocked on something other than the
+scheduler, and at once for a wake from a timer, the network or a key.
+
+| `yes \| head -c 20M \| wc -c`, node, single build (counts only, gooner) | parks | wakes |
+|---|---|---|
+| woken at once | 48 877 | 29 341 |
+| woken when the waker parks (0a9b89f3) | 2 528 | 1 809 |
+
+Filling the pipe before the reader ran exposed a kernel bug, in both
+builds:
+
+- `writev` to a full blocking pipe answered `EAGAIN`, and `readv` on an
+  empty one did the same. `blocking_op` knew only `write` and `read`.
+- coreutils' `head` writes with `writev`, and died "Resource temporarily
+  unavailable".
+- Both now park on their first non-empty vector and finish with a short
+  count.
+
 ## 4. Fork
 
 - A **translated** (arm64/x86) process forks as in the SAB build. The child
@@ -405,10 +441,34 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   memory) if they ever wait. In the single build only one fiber runs at a
   time, so a lock is never contended while its holder is suspended inside
   it, except across a suspension. This is not seen so far.
-- **GL and the X server need non-pthread builds.** Mesa and Xwayland would
-  then run in the system realm, with JSPI where they block.
-- **Wakes are wake-all.** Every parked fiber re-checks its word. This is
-  fine for tens of fibers; a node run peaked at 272.
+- **GL and the X server: builds done, not yet wired in.** Both are built
+  without `-pthread`, so each has a plain memory. Built locally from the
+  `wink` pin; nothing pushed.
+  - **Mesa:** `GEX_MESA_THREADS=0 web/build-mesa-wasm.sh`.
+    - Uses `web/mesa-wasm-st-cross.ini` and Wink's `st` Tint.
+    - Mesa's `gex-wasm-threads=auto` follows the cross file: no glthread.
+    - Output: `web/public/gex/st/gex-wgpu-replay.{js,wasm}`. It validates,
+      and its memory is defined unshared (flags 0x1).
+  - **Xwayland:** `GEX_XWL_THREADS=0 web/build-xwayland-wasm.sh`.
+    - Output: `web/public/gex/xwayland-st/`.
+    - meson's `dependency('threads')` adds `-pthread` on emscripten
+      whatever the cross file says, so `strip_pthread` removes it from each
+      `build.ninja` and the installed `.pc` files.
+    - With `SharedArrayBuffer` deleted, `callMain(['-version'])` prints
+      24.1.9 and its memory is an `ArrayBuffer`.
+    - Gooner lacks some host packages: wayland-scanner, wayland-protocols,
+      xwaylandproto, xorg-macros and `X11/xshmfence.h`.
+      `scratch/SP/hostx/build.sh` builds them into a prefix. Run the
+      script with `PKG_CONFIG_PATH`, `PATH` and `ACLOCAL_PATH` pointed
+      there.
+  - **Next:** wire them in.
+    - `gl_submit` becomes a Suspending import that calls a `MesaGlDevice`
+      in the system Worker, on the guest's memory, instead of the SAB ring
+      (`gl-bridge.mjs`).
+    - Xwayland runs in-realm beside the compositor (`hostx=1`).
+- **Wakes are wake-all.** Every parked fiber re-checks its word, though
+  only once the running fiber parks (§3). This is fine for tens of fibers;
+  a node run peaked at 272.
 - **The kernel has 128 stack slots**, which caps the number of fibers alive
   at once.
 - Dead fibers' memories are freed by GC.
@@ -423,7 +483,9 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   - `e10ec855`: network waits park;
   - `4fcc6417`: kernel pipe reads;
   - suspendable call-outs (`call_out`, `ftab_call`) and
-    `tests/single-callout`.
+    `tests/single-callout`;
+  - `0a9b89f3`: woken fibers wait for the waker to park; blocking
+    `writev`/`readv`.
 - **Merged:**
   - C's e4779cca, fa8ee5fd, 4f1d86e4 (the execve and provider fixes).
   - After them, node's `child_process` (`spawnSync` with input, async
@@ -437,8 +499,9 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
 - **Next:**
   - Rerun `cmp.sh TAG single sab` on edger at this head, with
     `GEX_WALL=900`.
-  - Profile the single-mode pipeline (quantum, wakeup latency, copies).
-  - Non-pthread Mesa and Xwayland builds for GL and X.
+  - Time the pipeline change on edger: `scratch/SP/page/pipe.sh TAG single
+    sab` (pipelines and forks only, from `wt/sp-new`).
+  - Wire the non-pthread Mesa and Xwayland into the single build (§7).
 - **Builds:** `shims/browser/build.sh` (plain and shared), the kernel and
   the seed, then `cd web && npm run build`. web/public has rootfs, cgen and
   xwayland hard-linked from wt/gexcc.
