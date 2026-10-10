@@ -341,6 +341,8 @@ const host = new ProcessHost({
     // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
     // 2 folded call targets, 4 successors).
     discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
+    // GEX_T1_FOLD=1: tier-1's tee folding (gex-emit `set_t1_fold`).
+    t1Fold: process.env.GEX_T1_FOLD ? 1 : undefined,
     // GEX_UNIT_CACHE=1: compiled translation units shared by every process.
     unitCache: process.env.GEX_UNIT_CACHE ? 1 : undefined,
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.

@@ -1959,6 +1959,13 @@ pub(crate) static XLATE_STAT: [std::sync::atomic::AtomicU64; 10] = [const { std:
 /// (a game) still says what it translated, from where, and how much again.
 static XLATE_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `gex_set_t1_fold(1)` (`?t1fold=1`, GEX_T1_FOLD): tier-1's tee folding
+/// (gex-emit `set_t1_fold`).
+#[no_mangle]
+pub extern "C" fn gex_set_t1_fold(on: u32) {
+    gex_emit::tier1::set_t1_fold(on != 0);
+}
+
 /// `gex_set_discover_skip(bits)` (`GEX_DISCOVER_SKIP`): edges the runtime
 /// translator's discovery does not follow (gex-xlate `set_discover_skip`).
 #[no_mangle]

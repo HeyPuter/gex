@@ -1235,7 +1235,7 @@ export class Gex {
       // The translator's knobs, for every process of the run: set only here,
       // a forked child (node under `bash -c`) ran with the defaults.
       perMiss: opts.perMiss, liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
-      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip,
+      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
@@ -1252,6 +1252,7 @@ export class Gex {
     if (opts.inlineDispatch) this.#shim.exports.gex_set_inline_dispatch?.(1);
     if (opts.xlateReport) this.#shim.exports.gex_set_xlate_report?.(opts.xlateReport);
     if (opts.discoverSkip) this.#shim.exports.gex_set_discover_skip?.(opts.discoverSkip);
+    if (opts.t1Fold) this.#shim.exports.gex_set_t1_fold?.(1);
     // Keep what the guest's dynamic linker produces, and start the next process
     // of the same program from it instead of linking again.
     if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
@@ -2156,6 +2157,7 @@ export class Gex {
     if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
     if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
     if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
+    if (o.t1Fold) e.gex_set_t1_fold?.(1);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first

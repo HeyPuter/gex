@@ -266,15 +266,33 @@ impl FuncBody {
     /// it (or there is none). Sound for locals that never carry a value
     /// backwards (around a loop) -- a block-local temporary is set before
     /// any read in its block. The value the tee left on the stack stays.
-    pub fn strip_dead_tees(&mut self, temp: &dyn Fn(u32) -> bool) {
+    ///
+    /// `loop_safe`: also keep a tee when a read of its local comes before
+    /// it in code order, which a back-edge could reach with the tee's value
+    /// (tier 1's fused loops keep their iteration counter and member index
+    /// in pooled locals: stripping the counter's tee made a spinning loop
+    /// never reach its signal poll).
+    pub fn strip_dead_tees(&mut self, temp: &dyn Fn(u32) -> bool, loop_safe: bool) {
         if !self.fold {
             return;
         }
         let log = std::mem::take(&mut self.local_log);
+        // First read of each local, in code order (`loop_safe`).
+        let mut first_get: HashMap<u32, u32> = HashMap::new();
+        if loop_safe {
+            for &(at, idx, _) in &log {
+                if self.code[at as usize] == op::LOCAL_GET {
+                    first_get.entry(idx).or_insert(at);
+                }
+            }
+        }
         let mut next_of: HashMap<u32, usize> = HashMap::new();
         let mut dead = vec![false; log.len()];
         for (k, &(at, idx, _)) in log.iter().enumerate().rev() {
-            if self.code[at as usize] == op::LOCAL_TEE && temp(idx) {
+            if self.code[at as usize] == op::LOCAL_TEE
+                && temp(idx)
+                && first_get.get(&idx).is_none_or(|&g| g > at)
+            {
                 dead[k] = match next_of.get(&idx) {
                     None => true,
                     Some(&n) => self.code[log[n].0 as usize] == op::LOCAL_SET,

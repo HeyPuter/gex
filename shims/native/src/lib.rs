@@ -553,6 +553,8 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         // Symbols steer discovery, so two images with the same code but
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
+        // Emitter switches read from the environment.
+        vec![gex_emit::tier1::knobs()],
     ];
     for seg in &image.segments {
         fields.push(seg.vaddr.to_le_bytes().into());

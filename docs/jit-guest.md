@@ -84,6 +84,36 @@ So for node the code V8 generates is not the cost; translating and installing
 libnode (V8 itself, its builtins included) is, and then the speed of the
 translated V8.
 
+### Changes under run-node on edger (b4, 2026-10-10, branch 64b129ce)
+
+Same commands as the baseline. One run per mode, in order; `new` and `new2`
+are the same mode at the start and end of the run.
+
+| mode | `node --version` | `node -e 0` cold | `node -e 0` warm | cold wasm |
+|---|---|---|---|---|
+| baseline (b-base, before any change) | 3.21 s | 32.29 s | 20.76 s | 158.5 MiB |
+| new (all changes, defaults) | 2.23 s | 19.27 s | 13.61 s | 68.5 MiB |
+| new2 (same, last in the run) | 2.32 s | 18.76 s | 12.90 s | 68.5 MiB |
+| `GEX_INLINE_DISPATCH=1` (old dispatch form) | 2.61 s | 24.58 s | 19.62 s | 140.1 MiB |
+| `GEX_LIFT_MAX=64` | 2.14 s | 19.17 s | 14.68 s | 53.6 MiB |
+| `GEX_DISCOVER_SKIP=1` (no call-return discovery) | 3.45 s | 34.41 s | 28.64 s | 68.3 MiB |
+| V8 `--liftoff-only` | 3.35 s | 24.09 s | 14.54 s | 68.5 MiB |
+| V8 `--no-wasm-dynamic-tiering` (TurboFan up front) | 2.19 s | 16.81 s | 11.87 s | 68.5 MiB |
+
+- Cold `node -e 0`: 40% faster than the baseline (19.27 s against 32.29 s);
+  warm 34% faster (13.61 s against 20.76 s).
+- Outlined dispatch alone: cold 22% faster than inline (19.27 s against
+  24.58 s), warm 31% faster (13.61 s against 19.62 s).
+- Not lifting call returns ahead of time costs far more than it saves: 4.5
+  times the modules (39,213 against 8,680 installed) and cold 79% slower
+  (34.41 s against 19.27 s).
+- A lift cap of 64 changes cold little (19.17 s) and makes warm 8% slower
+  (14.68 s against 13.61 s): more, smaller modules to install.
+- V8's tiering matters: compiling with TurboFan from the start is 13% faster
+  cold (16.81 s against 19.27 s) and 13% faster warm (11.87 s against
+  13.61 s); Liftoff only is 25% slower cold. The page cannot set V8 flags, so
+  this only says the translated code's optimised speed is what counts.
+
 ## 2. State / resume
 
 - Done (branch commits, in order): knobs and counters (9e84b3cc); region

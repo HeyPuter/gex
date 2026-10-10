@@ -225,6 +225,42 @@ fn inline_dispatch() -> bool {
         || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Fold `local.set x; local.get x` into `local.tee x` and strip the tees
+/// of temporaries nothing reads (the function JIT's peephole, `fmode`) in
+/// tier-1 blocks too: `set_t1_fold` / GEX_T1_FOLD.
+static T1_FOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_t1_fold(on: bool) {
+    T1_FOLD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn t1_fold() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_T1_FOLD").is_some()) || T1_FOLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The emitter switches that change tier-1's bytes without showing in the
+/// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD):
+/// natively they are read from the environment, which the module cache's key
+/// did not see, so a run with one set served its modules to runs without.
+pub fn knobs() -> u8 {
+    inline_dispatch() as u8 | (t1_fold() as u8) << 1
+}
+
+/// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
+/// of temporaries removed.
+fn strip_tees(e: &mut Emitter) {
+    if !t1_fold() {
+        return;
+    }
+    let n = e.temps.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut temp = vec![false; n];
+    for &t in &e.temps {
+        temp[t as usize] = true;
+    }
+    e.f.strip_dead_tees(&|l| temp.get(l as usize).copied().unwrap_or(false), true);
+}
+
 /// The back-edge targets of `gir`, for [`Context::loop_heads`].
 pub fn loop_heads<'b>(blocks: impl Iterator<Item = &'b Block>) -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
@@ -467,6 +503,9 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    if t1_fold() {
+        e.f.fold_tees();
+    }
     let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
@@ -516,11 +555,15 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
         e.emit_guard(block.start, g);
     }
     run_one(&mut e, block, region);
+    strip_tees(&mut e);
     e.f.finish_with_relocs()
 }
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    if t1_fold() {
+        e.f.fold_tees();
+    }
     let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
@@ -570,6 +613,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
         e.emit_guard(block.start, g);
     }
     run_one(&mut e, block, region);
+    strip_tees(&mut e);
     e.f.finish()
 }
 

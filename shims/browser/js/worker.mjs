@@ -643,6 +643,7 @@ async function handle(msg) {
           inlineDispatch: msg.inlineDispatch ?? msg.opts?.inlineDispatch,
           xlateReport: msg.xlateReport ?? msg.opts?.xlateReport,
           discoverSkip: msg.discoverSkip ?? msg.opts?.discoverSkip,
+          t1Fold: msg.t1Fold ?? msg.opts?.t1Fold,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },
