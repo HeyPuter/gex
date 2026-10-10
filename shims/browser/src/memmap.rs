@@ -223,6 +223,39 @@ pub fn owner_of(addr: u64) -> String {
     "nobody".into()
 }
 
+/// The parts of `[start, end)` that only the guest owns (no shim heap,
+/// stack, thread-local block, foreign growth or fixed runtime region overlaps
+/// them), in order. `None` when the table has overflowed and so cannot say.
+pub fn guest_only(start: u64, end: u64) -> Option<Vec<(u64, u64)>> {
+    let _h = Held::take();
+    if T.full_said.load(Ordering::Relaxed) != 0 {
+        return None;
+    }
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    let mut out = vec![(start, end)];
+    for i in 0..n {
+        if Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32) == Kind::Guest {
+            continue;
+        }
+        let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
+        let mut next = Vec::with_capacity(out.len() + 1);
+        for (a, b) in out {
+            if e <= a || s >= b {
+                next.push((a, b));
+                continue;
+            }
+            if a < s {
+                next.push((a, s));
+            }
+            if e < b {
+                next.push((e, b));
+            }
+        }
+        out = next;
+    }
+    Some(out)
+}
+
 static FIXED: AtomicU32 = AtomicU32::new(0);
 
 /// The fixed layout, once per process (every Worker calls it).

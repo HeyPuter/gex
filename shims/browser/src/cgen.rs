@@ -1764,6 +1764,24 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     });
 }
 
+/// `execve`: the old program's code is all gone, whatever reuses its
+/// addresses next. Before exec reused the dead arena (`do_exec`), nothing new
+/// could land there and stale entries were unreachable; now every table keyed
+/// by a code address forgets them -- the function table (every address, every
+/// install: see `FuncMap::forget_all`), the providers' own bookkeeping, and
+/// the unit pages.
+pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
+    on_retire_pages(old_code, old_code);
+    libprov::on_exec(old_code);
+    elfprov::on_exec();
+    let memory = crate::guest_bytes();
+    ftab(|m| {
+        for (a, _) in m.forget_all() {
+            gex_kernel::ftab::fcache_clear(memory, a);
+        }
+    });
+}
+
 fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };
