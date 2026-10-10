@@ -7921,13 +7921,29 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    // Old code the new program may put something else at: what lies in the
+    // donated arena. Code elsewhere (ld.so at its fixed base) can only come
+    // back as the same object at the same place, and keeps its translations
+    // as it did before exec reused anything -- retiring it made the next
+    // fresh process lift ld.so block by block (33k blocks, nofill 31k).
+    let reused: Vec<(u64, u64)> = match &dead {
+        Some(dead) => old_code
+            .iter()
+            .flat_map(|&(lo, hi)| {
+                dead.iter().filter_map(move |&(a, b)| {
+                    let (s, e) = (lo.max(a), hi.min(b));
+                    (s < e).then_some((s, e))
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     if let Some(dead) = dead {
         h.kernel.mem.donate_arena(&dead);
     }
-    // Everything keyed by a code address of the old program forgets it, now
-    // that the new one may map code there.
-    cgen::on_exec(&old_code);
-    fjit::on_retire(&old_code);
+    // Everything keyed by a code address there forgets it.
+    cgen::on_exec(&reused);
+    fjit::on_retire(&reused);
     {
         // The live memory size, not `guest_bytes().len()` (which is the whole
         // 4 GiB nameable range): the fill must stay inside what actually exists.
