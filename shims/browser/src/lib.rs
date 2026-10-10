@@ -3928,6 +3928,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         named
     } else if args[0].starts_with('/') {
         args[0].clone()
+    } else if args[0].contains('/') {
+        // `./prog` names a path from the working directory, as execve's
+        // argument would (tests/gexcc/longargs: `--argv0 ./longargs
+        // --cwd /t` re-execs `/proc/self/exe`, which was `/longargs`).
+        kernel.vfs.absolute(&args[0])
     } else {
         format!("/{}", args[0])
     };
@@ -7005,6 +7010,12 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
+    // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
+    // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
+        .chain(h.kernel.argv.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\0");
     FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
@@ -7031,6 +7042,28 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 /// The parent's working directory at `fork`, staged for the child to inherit.
 static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's exe path then its argv, NUL-separated, staged at `fork`.
+static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_ptr() -> u32 {
+    FORK_EXE.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_len() -> u32 {
+    FORK_EXE.0.borrow().len() as u32
+}
+
+/// The child's side of `gex_fork_exe_*`, before `gex_adopt_child`.
+static CHILD_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *CHILD_EXE.0.borrow_mut() = s.to_string();
+    }
+}
 
 /// Describe the calling process's descriptors for the child. `child` is who the
 /// reopened pipe ends belong to: opened under the parent's pid instead, the
@@ -7692,6 +7725,15 @@ pub extern "C" fn gex_adopt_child(
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
             let _ = kernel.vfs.set_cwd(&cwd);
+        }
+    }
+    // The parent's program and arguments (`gex_set_child_exe`).
+    {
+        let exe = std::mem::take(&mut *CHILD_EXE.0.borrow_mut());
+        if !exe.is_empty() {
+            let mut parts = exe.split('\0').map(str::to_string);
+            kernel.exe_path = parts.next().unwrap_or_default();
+            kernel.argv = parts.collect();
         }
     }
     kernel.clock = browser_clock;
