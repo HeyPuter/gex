@@ -8,6 +8,7 @@
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
+import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -107,7 +108,9 @@ export { fetchBytes };
  * arrive there as `GEX_*` environment variables.
  */
 function flag(name) {
-  const search = globalThis.location?.search;
+  // The single-thread build's system Worker is handed the page's query: its
+  // own `location` is the script's.
+  const search = globalThis.GEX_PAGE_SEARCH ?? globalThis.location?.search;
   if (search) return new URLSearchParams(search).get(name);
   return globalThis.process?.env?.[`GEX_${name.toUpperCase()}`] ?? null;
 }
@@ -310,8 +313,10 @@ async function loadKernel() {
   if (kernelSpec !== null) return kernelSpec || null;
   // Test for `SharedArrayBuffer` directly, not `crossOriginIsolated`: it is
   // what is actually needed, and asking for the constructor works under Node
-  // too (which lets the terminal test drive this same file).
-  if (typeof SharedArrayBuffer !== 'function') {
+  // too (which lets the terminal test drive this same file). The
+  // single-thread build needs none: its kernel memory is plain, held by
+  // every fiber.
+  if (typeof SharedArrayBuffer !== 'function' && !single.on) {
     kernelSpec = false;
     return null;
   }
@@ -340,6 +345,8 @@ async function loadKernel() {
  * path is kept out of a literal so the bundler leaves it alone.
  */
 async function guestWorkerFactory() {
+  // The single-thread build: a process is a fiber of this realm.
+  if (single.on) return () => new FiberWorker();
   if (typeof Worker === 'function') {
     return () =>
       new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
@@ -360,7 +367,82 @@ async function guestWorkerFactory() {
  * replaced the snapshot switcher. Each process has its own memory; what they
  * share is in the global kernel, instantiated against one shared memory.
  */
-export async function runProgram(
+/**
+ * Whether this page runs the single-thread build (docs/single-thread.md):
+ * `?single=1` asks for it, `?single=0` refuses it, and otherwise a page that
+ * has no SharedArrayBuffer (not cross-origin isolated) gets it when the engine
+ * has JSPI. A cross-origin isolated page keeps the Worker build.
+ */
+export function singleMode() {
+  if (single.on) return true;
+  const want = flag('single');
+  if (want === '0') return false;
+  if (!singleSupported()) return false;
+  return want === '1' || typeof SharedArrayBuffer !== 'function';
+}
+
+/** What of the page's state the system Worker needs: its query and every
+ *  `GEX_*` switch a demo or `main.js` set. */
+function pageGlobals() {
+  const out = { GEX_PAGE_SEARCH: globalThis.location?.search ?? '' };
+  for (const k of Object.keys(globalThis)) {
+    if (!k.startsWith('GEX_')) continue;
+    const v = globalThis[k];
+    if (v === null || ['string', 'number', 'boolean', 'undefined'].includes(typeof v)) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * `runProgram` for the single-thread build, from the page: the whole system
+ * runs in one Worker (web/src/system-worker.js); this side holds the terminal
+ * and forwards keys, sizes and output.
+ */
+async function runInSystemWorker(term, opts) {
+  const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  if (wl || gl) {
+    term.writeln?.('gex: the single-thread build has no compositor or GL yet; running without the screen');
+  }
+  const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
+  globalThis.__gexSystemWorker = w;
+  const ready = new Promise((resolve, reject) => {
+    w.addEventListener('message', (e) => { if (e.data?.kind === 'ready') resolve(); });
+    w.addEventListener('error', (e) => reject(new Error(e.message || 'the system Worker failed to start')));
+  });
+  await ready;
+  const keys = term.onData((data) => w.postMessage({ kind: 'key', data }));
+  const resize = term.onResize(({ rows, cols }) => w.postMessage({ kind: 'resize', rows, cols }));
+  term.focus?.();
+  try {
+    return await new Promise((resolve, reject) => {
+      w.addEventListener('message', (e) => {
+        const m = e.data;
+        if (m.kind === 'write') term.write(m.data);
+        else if (m.kind === 'net') onNetEvent?.(m.event);
+        else if (m.kind === 'done') resolve({ status: m.status, host: null, tenv: null });
+        else if (m.kind === 'failed') reject(Object.assign(new Error(m.message), { workerStack: m.stack }));
+      });
+      w.postMessage({
+        kind: 'run',
+        globals: pageGlobals(),
+        rows: term.rows,
+        cols: term.cols,
+        opts: { ...rest, networkUrl: network?.url ?? null },
+      });
+    });
+  } finally {
+    keys.dispose();
+    resize.dispose();
+    w.terminate();
+  }
+}
+
+export async function runProgram(term, opts) {
+  if (singleMode() && !single.on) return runInSystemWorker(term, opts);
+  return runProgramHere(term, opts);
+}
+
+async function runProgramHere(
   term,
   {
     elf,
@@ -655,7 +737,10 @@ export async function runProgram(
       // The page's network, served to every Worker over shared memory
       // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
       netChannel: netChannel ?? undefined,
-      wispUrl: netChannel ? undefined : network?.url ?? undefined,
+      // The single-thread build's fibers share this realm, and so the one
+      // Wisp connection itself.
+      wispNet: single.on ? network ?? undefined : undefined,
+      wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
       // writes it on startup, so a process forked after a resize would reset the

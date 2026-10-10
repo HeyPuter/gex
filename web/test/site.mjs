@@ -466,10 +466,15 @@ const server = createServer(async (req, res) => {
     if (name === '/index.html') body = Buffer.from(body.toString() + reporter());
     // Cross-origin isolation: the page needs a `SharedArrayBuffer` for the
     // global kernel's memory, and without these headers it is not defined.
+    // `GEX_NO_COI=1` leaves them off, as any static host would: the page then
+    // has no SharedArrayBuffer and runs the single-thread build
+    // (docs/single-thread.md).
     res.writeHead(200, {
       'content-type': TYPES[extname(name)] || 'application/octet-stream',
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
+      ...(process.env.GEX_NO_COI ? {} : {
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+      }),
     });
     res.end(body);
   } catch {

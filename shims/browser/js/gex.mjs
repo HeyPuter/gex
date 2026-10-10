@@ -894,6 +894,12 @@ export class Gex {
    * exited. Closed here rather than `unref`'d so it holds the run while in use.
    */
   close() {
+    // The census timer too: a fiber (the single-thread build) is not a
+    // Worker whose end takes its timers with it.
+    if (this.#census) {
+      clearInterval(this.#census);
+      this.#census = null;
+    }
     if (this.#tick) {
       this.#tick.port1.close();
       this.#tick.port2.close();

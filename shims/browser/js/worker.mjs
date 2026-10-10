@@ -67,7 +67,7 @@ function forkTransfer(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
-import { single, registerWorkerMain } from './single.mjs';
+import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -573,7 +573,12 @@ async function handle(msg) {
     const { NodeNetwork } = await import('./net-node.mjs');
     gex.useNetwork(new NodeNetwork());
   }
-  if (msg.netChannel) {
+  if (msg.wispNet) {
+    // The single-thread build: the system's one Wisp connection, the object
+    // itself (every fiber is in its realm). Its traffic wakes parked fibers.
+    msg.wispNet.onActivity = () => sched.wake();
+    gex.useNetwork(msg.wispNet);
+  } else if (msg.netChannel) {
     // The page's Wisp connection, called across shared memory (net-bridge.mjs):
     // a wasm32 program never hands this Worker's event loop back, so a
     // WebSocket of its own here would never deliver.
@@ -870,6 +875,8 @@ async function handle(msg) {
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
+    // A fiber's timers outlive it unless stopped (single.mjs).
+    if (single.on) gex?.close?.();
     port.post({
       kind: 'threw',
       message: (e?.message ?? String(e)) + where,
