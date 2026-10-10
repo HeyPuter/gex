@@ -114,6 +114,55 @@ are the same mode at the start and end of the run.
   13.61 s); Liftoff only is 25% slower cold. The page cannot set V8 flags, so
   this only says the translated code's optimised speed is what counts.
 
+### Discovery overshoot (gooner, run-node, `exec node -e 0`, counts only)
+
+`GEX_DISCOVER_SKIP=256 GEX_DL_FILE=PATH` logs why and at which breadth-first
+depth each block was lifted. The blocks that run are the ones a
+`GEX_LIFT_MAX=1` run lifts (90,277).
+
+| reason | lifted | of them run | run share |
+|---|---|---|---|
+| seed (the block that missed) | 7,414 | 7,373 | 99.4% |
+| conditional branch, taken side | 69,363 | 18,388 | 26.5% |
+| conditional branch, fall-through | 86,169 | 27,519 | 31.9% |
+| sole successor (goto, direct call, syscall return) | 22,455 | 10,501 | 46.8% |
+| call return address | 61,554 | 25,489 | 41.4% |
+| all | 246,955 | 89,270 | 36.1% |
+
+The run share falls with depth: 78.7% at depth 1, 50.2% at 4, 34.2% at 8,
+22.0% at 19; depth 20 and beyond is 88,927 blocks at 25.9%. No single edge
+kind is the waste. Cutting discovery short trades blocks for units:
+
+| discovery | blocks lifted | units |
+|---|---|---|
+| default | 246,955 | 7,414 |
+| depth at most 16 | 194,737 | 9,482 |
+| depth at most 8 | 157,886 | 13,027 |
+| depth at most 4 | 131,430 | 20,312 |
+| `GEX_LIFT_MAX=64` | 161,028 | 8,946 (11,678 installed) |
+
+`GEX_LIFT_MAX=64` was no faster cold on edger (19.17 s against 19.27 s) and
+8% slower warm, and skipping call returns was 79% slower cold: a unit costs
+about as much as the blocks it saves. Depth limits 8 and 16 are queued (b5).
+
+### Per-unit fixed cost (7,414 units of node's start-up)
+
+| part | bytes a unit | share of the wasm |
+|---|---|---|
+| imports (21, all of them in every unit) | 351 | 3.6% |
+| `gex.reloc` (removed for dense units: 11b1b601) | 340 | 3.5% |
+| `enter` | 285 | 2.9% |
+| `gex.dense` | 153 | 1.6% |
+| types, elem, func, export, `gex.meta` | 227 | 2.3% |
+| miss stub | 53 | 0.5% |
+
+Code is 88.9%. With `gex.reloc` gone (77,397 -> 74,938 KiB for `exec node -e 0`),
+what is left fixed is about 7% of the bytes. The seed module already exports a
+dense-capable `enter`, so units could import it (2.9% more), and unused imports
+could be dropped (most of the 3.6%). Neither is likely to move start-up by
+more than a few percent: compiling is about 1.5 s of a 19 s cold start, and
+the page's unit cache removes the repeat compiles.
+
 ## 2. State / resume
 
 - Branch head bbb7f237. Commits, in order:
