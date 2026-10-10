@@ -964,6 +964,159 @@ base. The first process to map an image no longer computes two SHA-256s
 of it. That was a third of wineboot's host CPU (perf on gooner); edger
 time not measured separately.
 
+**Session start-up, round 2 (2026-10-10).** Three fixes changed which
+services really start, and so the session's shape:
+
+- pelink (bd98b866) binds names that an i386 DLL defines to that DLL when
+  the module's explicit imports list it ahead of the native one
+  (ntoskrnl's `ZwLoadDriver`, `ZwUnloadDriver`, `RtlInitUnicodeString`,
+  `RtlNtStatusToDosError`, `wcscat`). Before, winedevice's drivers never
+  loaded at all. Now nsiproxy and NDIS load. MountMgr, winebus, wineusb
+  and winebth fail with STATUS_DLL_NOT_FOUND: they need Unix libraries
+  that the W3 loader does not have.
+- With drivers loading, the default kit prefix ran 4 winedevice processes
+  and booted in 25-37 s. NDIS hung for 10 s on "wine client error: write:
+  Resource temporarily unavailable". gex-kernel's `blocking_op` parked a
+  full-pipe `write` but not a `writev`, which is what Wine's
+  `send_request` uses. b8f708f7 parks the first non-empty vector as a
+  `WriteStream`.
+- `tools/wine-wasm/w3-session.reg` is now the default for every W3
+  prefix. It makes MountMgr and the Event Log demand-start; Wine's
+  `ReportEventW` is a stub, so nothing calls the Event Log. It also
+  deletes the three root bus devices (`Enum\ROOT\WINE\WINEBUS`,
+  `WINEUSB`, `WINEBTH`).
+  - wineboot's code creates those devices, not wine.inf. Without a fork
+    patch, they can only be deleted after the install.
+  - `tools/wine-wasm/reg-apply.py PFX/system.reg FILE.reg` applies a
+    REGEDIT4 file offline. It is idempotent.
+  - stage-native.sh runs it when the staged prefix has a registry. A
+    prefix that wineboot installs afresh runs it once after the install.
+    The page's W3 prefix template should take it the same way.
+  - Plug and Play, NDIS and the NSI proxy stay on: games need device
+    notifications and adapter information, and nsi.dll does not start
+    nsiproxy on demand. `lean-session.reg` also drops these three. It
+    stays opt-in, for one-shot console programs.
+
+Measured on edger, gexc at b8f708f7 (gamekit `ut36.sh`, `ut37.sh`, warm, units rebuilt for pelink's
+load order):
+
+| Variant | `wine cmd /c echo` | Processes |
+|---|---|---|
+| Before round 2 (kit prefix, gexc-u) | 8.3-8.6 s | 7 |
+| w3-session prefix (default) | 5.6-5.85 s | 5 |
+| no drivers only (w3-no-drivers.reg, Event Log still on) | 5.75-6.6 s | 6 |
+| `lean-session.reg` too | 3.7-4.1 s | 3 |
+| lean, cmd.exe by path (no start.exe) | 3.0-3.4 s | 2 |
+| lean, a second program in the session | +0.3-0.8 s | +1 |
+
+**The gap left to the NT layer's 2.3 s** is mainly the session itself:
+the NT layer runs cmd directly, with no wineboot and no services. In the
+lean, by-path case (3.0-3.4 s) the logs give:
+
+- about 1 s of wineboot's own `--init` work: the registry, hardware keys
+  and its DLL loads;
+- 0.5-0.8 s for services.exe;
+- 0.35-0.5 s for each process creation;
+- gexc's host start.
+
+Trimming the registry further gains little. A reused session removes
+wineboot and services for every program after the first, at about
+0.3-0.8 s per program. In the page, that means the page keeps its kernel
+(wineserver and services) between programs in a tab. Natively it would
+need a gexc server mode.
+
+**Session reuse in the page (design, 2026-10-10; not built).** This needs
+W3 in the page (W3.7) first. Under W3, wineserver is a thread of the first
+Wine process (`server/wasm32_inproc.h`). The session ends when that
+process exits: services, the desktop and the registry flush go with it.
+The page's global kernel already outlives programs (`runtime.js`,
+`globalKernel`), so a session can outlive one program if something keeps
+the server's process alive.
+
+1. **A session keeper.** The first W3 program in a tab for a prefix is not
+   the program itself. It is `gexsession.exe`, a small native Wine program
+   run as pid 1 of the session. It hosts the server thread and the
+   desktop. Wine's normal start runs `wineboot --init`, services and the
+   w3-session.reg set, once. The keeper then listens on a Unix socket in
+   the global kernel: `/run/gex-w3/<prefix>.sock`.
+2. **A program in a running session.** The page's `runProgram` for W3
+   connects to the socket instead of starting a process tree. It sends:
+   - the command line, the working directory and the environment;
+   - the terminal's fds (SCM_RIGHTS, which gex's recvmsg already carries).
+
+   The keeper calls `CreateProcessW` with those as the child's standard
+   handles, waits, and replies with the exit code. The child is a
+   process like any W3 child: it reads the session through requests
+   (`tests/nt` childgui and childcon). It costs one process creation plus
+   the program's own start. Natively that is 0.3-0.8 s (lean session,
+   second program, edger), against 3.0-4.1 s for a fresh session.
+3. **Games stay the server's process.** A child pays for its requests: a
+   full 256-key poll is 1.3 ms a frame in a child, against 0.2 ms in the
+   process hosting the server. So a game launched from the page's game
+   list still starts its own session, as today. Only console programs,
+   tools and installers go through the keeper. A game started from inside
+   a session (a launcher, an installer's "run now") is a child either way.
+4. **Lifetime.**
+   - The keeper holds the session while the tab is open, and ends it
+     after an idle timeout (no child for N minutes) or when asked.
+   - Registry: Wine's server already saves the registry periodically. The
+     page also asks the keeper to flush before `persist.js` snapshots the
+     prefix, and on `pagehide`.
+   - The page holds two resident Workers (the keeper's process and
+     services.exe), each with its own memory, for as long as the session
+     lives.
+5. **Natively** the same keeper works under one long-running gexc, with
+   the socket on the host. That would be the gexc server mode. It is
+   lower priority: the browser is the target.
+
+Pieces to build, in order:
+- `gexsession.exe`: a native PE-side program in pelink, about 200 lines:
+  socket, CreateProcessW with inherited handles, exit codes;
+- the page's W3 `runProgram` path, which tries the socket first;
+- a flush request;
+- tests: a `tests/nt` leg that runs two programs through one keeper and
+  checks the second skips wineboot (no `wineboot` process in a
+  `+process` trace).
+
+**Undertale with these fixes (ut34-ut36).** GEX_PROF of the main thread
+in ut34 put x87 soft-float at the top. Two changes followed:
+
+- 028e7a91: x87.h handles zero operands (signs and rounding as the
+  hardware gives them) and `fist` of 0 < |v| < 1 inline. Both were
+  checked against hardware: 3.16M arithmetic cases and 2M integer
+  conversions, none different.
+- 3d423c45: windowscodecs' movsb/cmp/jne byte-copy loop is lifted as one
+  string copy.
+
+gex.x87 import calls in 240 s fell from 174M to 22M. The rest come from
+tier-1 callers, which have their own `emit_x87` without these paths. The
+largest groups are zero + normal (9.7M) and narrowing a zero to single
+(7.5M). The top back-edge samples are now wined3d's command-stream spin
+and two windowscodecs loops.
+
+| Run (edger, 300 s) | First frame | Steady 30 fps from | Last frame |
+|---|---|---|---|
+| ut34, ut36 w1: gexc-w, w3dist-u, kit prefix | 14.9 s | 120-121 s | 5525 |
+| ut36 z1, z2: b8f708f7, w3dist-x (pelink), no drivers | 12.1-14.4 s | 105-106 s | 5950-6025 |
+
+So steady frames arrive about 15 s earlier than with ut34's setup.
+
+**Units follow the prefix's registry.** On the w3-session prefix (ut37),
+52 of the game's DLL images loaded at bases that no unit had been built
+for. The game process's load order differs from pfx-nodrv's, so it ran
+mostly on tier-1: steady frames only from 215 s. With the x87 work in,
+`ut38` measures again once units for those bases exist
+(`$W/edger-units/build-s.sh`, from `pairs-s.txt`). So a prefix template
+and its units have to be staged together: in the page, each template has
+its own unit set.
+
+9fe3e898 adds the same zero paths to tier-1's `emit_x87`:
+- a zero with a zero or a normal operand, in add, subtract and multiply;
+- a zero stored narrow.
+
+`tests/x86-programs/x87-zeros.c` checks every sign rule and rounding
+mode against native.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -1976,7 +2129,43 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
-**RESUME HERE (2026-10-09, late; the safepoint fix for Wine's thread loop is §3.17).** merge/w3-audio has master 9e5ac0ff
+**RESUME HERE (2026-10-10).** merge/w3-audio, on top of d63ceee2 (all in
+§3.17, "round 2"):
+
+- 3d423c45: copy-loop idiom;
+- 028e7a91: x87 zero and `fist` paths;
+- c9579c74: content-hash memo;
+- bd98b866: pelink i386 binding and native-only eager delay imports;
+- b8f708f7: blocking writev;
+- 2f26cf99 and the commit after it: w3-session.reg, reg-apply.py, and
+  stage-native.sh applying them.
+
+The gate on 2f26cf99 (`$W/gate-z.sh`, gate-z.txt) shows the baseline
+failure lists: W3 null 40 of 53, Wayland+GL 38 of 49; install as children,
+audio and x86-programs (86) ok.
+
+- **Edger state.**
+  - The units for pelink's load order are in `boot-xdg`, built on gooner
+    as `$W/edger-units/xdg-x` (build-x.sh and build-y.sh, from pairs.txt
+    and pairs-y.txt).
+  - The dist is `$W/w3dist-x`: w3dist-u plus pelink-x's winepe.wasm.
+  - gamekit `pfx` is now pfx-full plus w3-session.reg. Also there:
+    pfx-full (the old default), pfx-nodrv and pfx-lean2 (lean too).
+  - `run-game-g.sh` takes `PFX=`; `boot3.sh` takes `BOOT_PROG` and
+    `BOOT_CMD`.
+- **A new pelink load order changes DLL bases.** Units must then be
+  rebuilt for the new pairs:
+  1. on edger, run with `GEX_W3_UNITS=all GEX_W3_TRACE=1`;
+  2. on gooner, build every "no function-tier unit" pair with
+     `GEX_CGEN_PRECOMPILE=1`;
+  3. rsync the units to edger's `boot-xdg/gex/cgen`.
+- **Next.**
+  1. Tier-1's `emit_x87` (gex-emit/src/tier1.rs) lacks x87.h's zero
+     paths; 22M of the remaining import calls come from there.
+  2. wined3d's command-stream spin is the top back-edge sample.
+  3. A reused session (page-side) for console one-shots.
+
+**Earlier (2026-10-09, late; the safepoint fix for Wine's thread loop is §3.17).** merge/w3-audio has master 9e5ac0ff
 merged (8230816d). Since the morning (§3.17):
 
 - f43fba88 inet without a network stack; it landed in master.
