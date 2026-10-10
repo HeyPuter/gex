@@ -346,6 +346,9 @@ const host = new ProcessHost({
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).
     providers: process.env.GEX_PROVIDERS === '0' ? 0 : undefined,
+    // GEX_ELF_UNITS=name,...: shared objects that get their function-tier
+    // unit from the cache at the bias they map at (the page's `?elfunits=`).
+    elfUnits: process.env.GEX_ELF_UNITS || undefined,
     // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,

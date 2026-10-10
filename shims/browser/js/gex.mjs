@@ -1079,10 +1079,20 @@ export class Gex {
         // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
         // runs nested until the guest returns to the function body that
         // called it.
-        call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        call_out: single.on
+          ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
+            ? this.#callOut(ctx >>> 0, target, ret, spWant)
+            : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
+          : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
-        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+        ftab_call: single.on
+          // On a stack of its own, so the body (and guest code it calls) can block.
+          ? new WebAssembly.Suspending((idx, ctx, depth, need, ret) => {
+            const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+            return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
+          })
+          : (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -1925,13 +1935,13 @@ export class Gex {
       };
       out.k_park = new WebAssembly.Suspending((seq, ns) => {
         if (k.k_wake_seq() !== seq) return 1;
-        if (this.#nest.length) nested();
+        if (this.#hardNested()) nested();
         this.#where = `park(${ns})`;
         return sched.park(ns);
       });
       out.k_park_futex = new WebAssembly.Suspending((addr, gen, ns) => {
         if ((k.k_futex_gen(addr) >>> 0) !== (gen >>> 0)) return 1;
-        if (this.#nest.length) nested();
+        if (this.#hardNested()) nested();
         this.#where = `futex(${addr},${ns})`;
         return sched.parkFutex(addr, ns);
       });
@@ -4556,7 +4566,7 @@ export class Gex {
   #suspendingSyscall(sync, after, mark = 0n) {
     const e = this.#shim.exports;
     return new WebAssembly.Suspending((ctx, pc) => {
-      if (this.#nest.length) return sync(ctx, pc);
+      if (this.#hardNested()) return sync(ctx, pc);
       this.#sysPf ??= WebAssembly.promising(e.gex_syscall);
       this.#where = 'syscall';
       const p = this.#sysPf(ctx, mark ? BigInt.asIntN(64, BigInt(pc) | mark) : pc);
@@ -4576,7 +4586,7 @@ export class Gex {
     return (this.#safepointS ??= new WebAssembly.Suspending((ctx, pc) => {
       e.gex_safepoint(ctx, pc);
       this.#where = 'safepoint';
-      return this.#nest.length ? 0 : sched.maybeYield();
+      return this.#hardNested() ? 0 : sched.maybeYield();
     }));
   }
   #watchStub = null;
@@ -4680,6 +4690,70 @@ export class Gex {
    * `#ntCallback`: a shim frame is below this one.
    */
   #callOut(ctx, target, ret, spWant) {
+    return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false));
+  }
+
+  /**
+   * The single-thread build's call-out: the same loop, with the guest on a
+   * stack of its own (`WebAssembly.promising`), so guest code the call-out
+   * runs can block -- the import that asked is a `Suspending`, and the
+   * whole fiber waits (docs/single-thread.md §7).
+   */
+  #callOutAsync(ctx, target, ret, spWant) {
+    return this.#driveAsync(this.#callOutSteps(ctx, target, ret, spWant, true));
+  }
+
+  /** Run a nested loop's steps (`['enter', ctx, pc]` / `['call', f, ...args]`)
+   *  synchronously: an exception goes back into the loop at its step. */
+  #drive(g) {
+    let r = g.next();
+    while (!r.done) {
+      let v;
+      try {
+        const [op, a, b, c, d, x] = r.value;
+        v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
+      } catch (err) {
+        r = g.throw(err);
+        continue;
+      }
+      r = g.next(v);
+    }
+    return r.value;
+  }
+
+  /** The same, each step on a JSPI stack of its own that may suspend. */
+  async #driveAsync(g) {
+    let r = g.next();
+    while (!r.done) {
+      let v;
+      try {
+        const [op, a, b, c, d, x] = r.value;
+        v = op === 'enter' ? await this.#enterP(a, b) : await this.#promisingOf(a)(b, c, d, x);
+      } catch (err) {
+        r = g.throw(err);
+        continue;
+      }
+      r = g.next(v);
+    }
+    return r.value;
+  }
+
+  /** `WebAssembly.promising` of a wasm function, made once per function. */
+  #promising = new WeakMap();
+  #promisingOf(f) {
+    let p = this.#promising.get(f);
+    if (!p) this.#promising.set(f, (p = WebAssembly.promising(f)));
+    return p;
+  }
+
+  /** Whether a JS frame that cannot suspend is open (a nested loop run
+   *  synchronously); `~` marks one that can (single.mjs). */
+  #hardNested() {
+    for (const n of this.#nest) if (!n.endsWith('~')) return true;
+    return false;
+  }
+
+  *#callOutSteps(ctx, target, ret, spWant, suspendable) {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
@@ -4689,7 +4763,7 @@ export class Gex {
     // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
     c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
-    this.#nest.push('callout');
+    this.#nest.push(suspendable ? 'callout~' : 'callout');
     this.#calloutsMade++;
     if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
       console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
@@ -4704,10 +4778,10 @@ export class Gex {
             const f = next;
             next = null;
             e.gex_callout_leave_ok?.(me + 1);
-            f(ctx);
+            yield ['call', f, ctx];
           } else {
             e.gex_callout_leave_ok?.(me + 1);
-            this.#guest.exports.enter(ctx, pc);
+            yield ['enter', ctx, pc];
           }
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).

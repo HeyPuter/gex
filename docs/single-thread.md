@@ -373,20 +373,32 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
 
 ## 7. Limitations and next steps
 
-- **Provider bug (C), both builds, page only.** In node, the panic goes:
-  - "provider address 0x71dc1a1 keeps losing its bridge";
-  - then `gex-emit/src/module.rs:661` "text base must be
-    instruction-aligned".
+- **Provider bug (C), both builds, page only: fixed.** The panic was
+  "provider address 0x71dc1a1 keeps losing its bridge", then
+  `gex-emit/src/module.rs:661`. C's fe08c546/bc679c69/4f1d86e4 fix it, and
+  they are merged here. While it lasted, a dead fiber holding the process's
+  lock made its siblings trap in `memory.atomic.wait32` in the single build
+  (and hang in the SAB build).
 
-  In the single build the dead fiber held the process's lock, so its
-  siblings then trap in `memory.atomic.wait32` ("Atomics.wait cannot be
-  called in this context"). In the SAB build they hang instead.
+- **Blocking inside a nested call-out suspends.** A function-tier unit's
+  call to code that no unit holds (the `call_out` and `ftab_call` imports)
+  is a Suspending import in the single build:
+  - `#callOutSteps` is a generator holding the old `#callOut` loop.
+  - `#drive` runs it synchronously (SAB build, or under a frame that cannot
+    suspend).
+  - `#driveAsync` runs it with `enter` and each guest function as
+    `WebAssembly.promising`, so the nested guest has its own stack.
+  - Its `#nest` entry ends in `~`. `#hardNested()` ignores those, so a park,
+    futex wait or syscall inside it suspends the whole chain.
 
-- **Blocking inside a nested JS frame cannot suspend.** This covers a
-  call-out (`#nest`: `call_out`, `nt_callback`, `exc_dispatch`,
-  `provider_try`), i.e. a guest callback called from JS called from wasm.
-  The single build throws an explicit error there rather than hang. A fix
-  makes those JS loops async. None of the runs above hit it.
+  Test: `tests/single-callout/run.sh`. The unit `libcb_run` calls `cb`,
+  which reads a pipe a forked child fills 100 ms later and sleeps 2 ms per
+  call. Before the change it trapped with "trying to suspend JS frames …
+  inside syscall 101".
+
+  Still synchronous: `nt_callback`, `exc_dispatch` and `provider_try`. A
+  block under one of those throws an explicit error in the single build.
+  None of the runs here hit them.
 - **Provider atomic waits on contention.** These are the `crt_heap` /
   `glibc_malloc` `heap_lock_slow` and `gp_wait` waits, and the libprov
   `wait_epoch`. They would trap (`memory.atomic.wait32` on an unshared
@@ -409,7 +421,9 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
   - `0f9f926d`: page system Worker;
   - `703db0e7`: compositor;
   - `e10ec855`: network waits park;
-  - `4fcc6417`: kernel pipe reads.
+  - `4fcc6417`: kernel pipe reads;
+  - suspendable call-outs (`call_out`, `ftab_call`) and
+    `tests/single-callout`.
 - **Merged:**
   - C's e4779cca, fa8ee5fd, 4f1d86e4 (the execve and provider fixes).
   - After them, node's `child_process` (`spawnSync` with input, async
@@ -423,12 +437,14 @@ Node harness, edger (whole harness run, ms; `scratch/SP/prof`):
 - **Next:**
   - Rerun `cmp.sh TAG single sab` on edger at this head, with
     `GEX_WALL=900`.
-  - Async call-outs.
+  - Profile the single-mode pipeline (quantum, wakeup latency, copies).
   - Non-pthread Mesa and Xwayland builds for GL and X.
 - **Builds:** `shims/browser/build.sh` (plain and shared), the kernel and
   the seed, then `cd web && npm run build`. web/public has rootfs, cgen and
   xwayland hard-linked from wt/gexcc.
 - **Tests:**
+  - `tests/single-callout/run.sh` (blocking in a nested call-out, single
+    and SAB);
   - node: `GEX_SINGLE=1 [GEX_NETWORK=1] scratch/SP/nrun.sh 'cmd'`;
   - page: `scratch/SP/page/t1.sh` (apt and tools);
   - page: `scratch/SP/page/gui.sh DIR single|sab` (foot);
