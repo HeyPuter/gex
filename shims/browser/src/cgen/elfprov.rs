@@ -237,6 +237,7 @@ static REBRIDGED: Mutex<Vec<(u64, u32, u64)>> = Mutex::new(Vec::new());
 /// held and something else took it later, rather than a slot that never
 /// keeps it.
 const REBRIDGE_PROGRESS: u64 = 16;
+use gex_kernel::ftab::REBRIDGE_LIMIT;
 
 /// A dispatch miss at an address a provider holds: its slot lost the bridge
 /// (a forked child instantiating a module it inherited, which fills the
@@ -268,16 +269,12 @@ pub(crate) fn rebridge(pc: u64) -> bool {
                 1
             }
         };
-        if n > 64 {
-            // Tier-1 can only take an address it can lift. An IFUNC's
-            // resolver+1 (odd) it cannot: handed one, it panicked ("text
-            // base must be instruction-aligned", node --build-snapshot in
-            // the page). Such an address keeps its bridge whatever the count.
-            if pc % gex_abi::INST_ALIGN == 0 {
-                crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
-                return false;
-            }
-            if n == 65 {
+        if gex_kernel::ftab::rebridge_gives_up(pc, n) {
+            crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
+            return false;
+        }
+        if n > REBRIDGE_LIMIT {
+            if n == REBRIDGE_LIMIT + 1 {
                 crate::trace_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; not liftable, bridging it again\n"));
             }
         }

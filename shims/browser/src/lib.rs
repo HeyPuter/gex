@@ -11475,6 +11475,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
             return false;
         }
+        // Nothing can be lifted at a misaligned pc (the emitter asserts a
+        // block's base is instruction-aligned, and a panic there takes the
+        // whole runtime down). On arm64 it is a PC alignment fault; here
+        // the process ends as for code that is not there. A provider's
+        // IFUNC resolver+1 used to get here once the re-bridge guard gave
+        // up on it (see `ftab::rebridge_gives_up`).
+        if pc % gex_abi::INST_ALIGN != 0 {
+            crate::warn_line(&format!("gex: pid {} jumped to a misaligned pc {pc:#x}; not translating it\n", h.kernel.pid));
+            return false;
+        }
         // Before anything is translated: if this page's code has been
         // translated already, by another process or by this one before an
         // `execve`, point the page at those slots instead of claiming more.
