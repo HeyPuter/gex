@@ -34,6 +34,20 @@ pub enum Tier {
     Region,
 }
 
+/// Losses of its bridge in a row after which a provider address is left to
+/// tier-1 (`elfprov::rebridge`'s loop guard).
+pub const REBRIDGE_LIMIT: u32 = 64;
+
+/// Whether the re-bridge loop guard gives a provider address up to tier-1
+/// after `losses` losses in a row: only past [`REBRIDGE_LIMIT`], and only an
+/// address tier-1 can lift. An IFUNC's resolver+1 is odd, and handed one the
+/// emitter panicked ("text base must be instruction-aligned": node
+/// --build-snapshot and `node -e` in the page), so such an address keeps
+/// its bridge whatever the count.
+pub fn rebridge_gives_up(pc: u64, losses: u32) -> bool {
+    losses > REBRIDGE_LIMIT && pc % gex_abi::INST_ALIGN == 0
+}
+
 /// An install's module once its program is gone ([`FuncMap::kill_module`]):
 /// a table catching up skips it.
 pub const DEAD_MODULE: u32 = u32::MAX;
@@ -407,6 +421,19 @@ fn leb(b: &[u8]) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rebridge_guard_never_gives_up_an_unliftable_address() {
+        // SP's page crash: provider address 0x71dc1a1 (libc +0x9c1a1).
+        for pc in [0x71dc1a1u64, 0xa12c1a1, 0xa12cac1] {
+            for n in [1, REBRIDGE_LIMIT, REBRIDGE_LIMIT + 1, 1000, u32::MAX] {
+                assert!(!rebridge_gives_up(pc, n), "{pc:#x} after {n}");
+            }
+        }
+        let aligned = 0x71dc1a0u64;
+        assert!(!rebridge_gives_up(aligned, REBRIDGE_LIMIT));
+        assert!(rebridge_gives_up(aligned, REBRIDGE_LIMIT + 1));
+    }
 
     #[test]
     fn kill_module_marks_only_that_modules_installs() {
