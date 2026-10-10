@@ -158,13 +158,19 @@ pub(crate) fn bound(addr: u64) -> bool {
 }
 
 /// A dispatch miss in a replaced library's own text that no binding
-/// explains: its x86 code was never meant to run (said once per address).
+/// explains (said once per address, on the debug console). Expected ones are
+/// the object's own startup and teardown, which ld.so still runs: `.init`,
+/// its PLT stubs, crtbegin's `frame_dummy`/`__do_global_dtors_aux` and
+/// `.fini` -- libz.so.1 at +0x2340/+0x2360/+0x272c/+0x2780/+0x14f3c in every
+/// node child_process spawns. They touch only the library's own data, so
+/// tier-1 running them is right; as console errors they failed every page
+/// run that spawned a node.
 pub(crate) fn note_stray(pc: u64) {
     static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let mut seen = lock(&SEEN);
     if seen.len() < 64 && !seen.contains(&pc) {
         seen.push(pc);
-        crate::warn_line(&format!("gex: the guest reached {pc:#x}, the replaced library's own code (not a bound export): tier-1 runs it\n"));
+        crate::trace_line(&format!("gex: the guest reached {pc:#x}, the replaced library's own code (not a bound export): tier-1 runs it\n"));
     }
 }
 
