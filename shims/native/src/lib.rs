@@ -1512,6 +1512,33 @@ fn time_left(deadline: std::time::Duration, elapsed: std::time::Duration) -> Opt
 }
 
 #[cfg(test)]
+mod cache_key_tests {
+    use super::{cache_key, Options};
+
+    /// GEX_INLINE_DISPATCH and GEX_T1_FOLD change tier-1's bytes without
+    /// showing in `Options`: a key that ignored them served one setting's
+    /// modules to the other (a GEX_T1_FOLD=1 run's modules, which then hung
+    /// signal-kill, to default runs).
+    #[test]
+    fn emitter_switches_change_the_key() {
+        let image = gex_ld::elf::headers_only(0x40, 56, 1, 0x1000);
+        let o = Options::default();
+        let base = cache_key(&image, &o, "b");
+        assert_eq!(base, cache_key(&image, &o, "b"));
+        gex_emit::tier1::set_t1_fold(true);
+        let fold = cache_key(&image, &o, "b");
+        gex_emit::tier1::set_t1_fold(false);
+        gex_emit::tier1::set_inline_dispatch(true);
+        let inline = cache_key(&image, &o, "b");
+        gex_emit::tier1::set_inline_dispatch(false);
+        assert_ne!(base, fold);
+        assert_ne!(base, inline);
+        assert_ne!(fold, inline);
+        assert_eq!(base, cache_key(&image, &o, "b"));
+    }
+}
+
+#[cfg(test)]
 mod time_left_tests {
     use super::time_left;
     use std::time::Duration;
