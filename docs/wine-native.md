@@ -1188,8 +1188,9 @@ Chromium timing is still to do. What it took, in start order:
   - The template takes w3-session.reg via `reg-apply.py`.
   - `.update-timestamp` is the dist's wine.inf mtime, so wineboot does
     not update again.
-  - For now this is built by hand (`$W/page/pfx3`, from
-    gate-w3boot/pfx-w3install). `run-node.mjs --dir` now carries
+  - `tools/wine-wasm/page-prefix.sh INSTALLED_PFX DIST OUT` builds it
+    (`GRAPHICS=null|wayland` sets the driver). `$W/page/pfx4` was built
+    from gate-w3boot/pfx-w3install. `run-node.mjs --dir` now carries
     directory symlinks (`dosdevices/c:`) as links.
 
 ### 3.9 x64 programs (later)
@@ -2212,10 +2213,9 @@ the page under Node on gooner. See §3.17, "W3.7".
   1. Chromium timing on edger once the edger reservation ends. Edger was
      reserved for DH on 2026-10-10; no edger jobs until the
      coordinator says so.
-  2. A script for the page template.
-  3. Milestone (b): a GUI program on the page compositor.
-  4. Milestone (c): Undertale.
-  5. The session keeper (design below in §3.17).
+  2. Milestone (b): a GUI program on the page compositor.
+  3. Milestone (c): Undertale.
+  4. The session keeper (design below in §3.17).
 
 **Earlier (2026-10-10).** merge/w3-audio, on top of d63ceee2 (all in
 §3.17, "round 2"):
