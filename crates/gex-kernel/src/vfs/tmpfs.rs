@@ -38,6 +38,9 @@ pub struct FileNode {
     /// a rename or a link and an open descriptor's `fstat` sees it -- `gzip`
     /// records its input's time from `fstat` of the open file.
     mtime: AtomicI64,
+    /// Access and change times and the nanoseconds (`Times`), once
+    /// `utimensat` set any; until then every time is `mtime`.
+    times: Mutex<super::Times>,
 }
 
 impl FileNode {
@@ -47,10 +50,44 @@ impl FileNode {
             lazy: Mutex::new(None),
             ino,
             mtime: AtomicI64::new(now()),
+            times: Mutex::new(Default::default()),
         }
     }
     fn touch(&self) {
-        self.mtime.store(now(), Ordering::Relaxed);
+        self.stamp(now());
+    }
+    /// Modified at `secs`: the change time with it, once the times are kept.
+    fn stamp(&self, secs: i64) {
+        self.mtime.store(secs, Ordering::Relaxed);
+        let mut t = self.times.lock().unwrap();
+        if *t != super::Times::default() {
+            t.mtime_ns = 0;
+            t.ctime = secs;
+            t.ctime_ns = 0;
+        }
+    }
+    /// `utimensat`/`futimens`: either time (`None`: leave it), and the
+    /// change time is `now`.
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) {
+        let mut t = self.times.lock().unwrap();
+        if *t == super::Times::default() {
+            let m = self.mtime.load(Ordering::Relaxed);
+            t.atime = m;
+            t.ctime = m;
+        }
+        if let Some((s, ns)) = atime {
+            t.atime = s;
+            t.atime_ns = ns;
+        }
+        if let Some((s, ns)) = mtime {
+            self.mtime.store(s, Ordering::Relaxed);
+            t.mtime_ns = ns;
+        }
+        t.ctime = now;
+        t.ctime_ns = 0;
+    }
+    fn times(&self) -> super::Times {
+        *self.times.lock().unwrap()
     }
 
     /// The size, lazy or not.
@@ -197,6 +234,26 @@ pub struct TmpFs {
 }
 
 impl TmpFs {
+    /// `utimensat` with the change time given (see
+    /// [`FileHandle::set_times_now`]). A file keeps both times to the
+    /// nanosecond; anything else keeps whole-second modification times.
+    pub fn set_times_now(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.nodes.get(path) {
+            None => Err(Errno::ENOENT),
+            Some(Node::File(f)) => {
+                f.set_times(atime, mtime, now);
+                Ok(())
+            }
+            Some(_) => {
+                if let Some((s, _)) = mtime {
+                    inner.mtimes.insert(path.to_string(), s);
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn new() -> TmpFs {
         let mut inner = Inner {
             next_ino: 2,
@@ -382,7 +439,7 @@ impl FileHandle for TmpHandle {
                 mtime: file.mtime.load(Ordering::Relaxed),
                 nlink: 1,
                 rdev: 0,
-                times: Default::default(),
+                times: file.times(),
             });
         }
         let inner = self.inner.lock().unwrap();
@@ -398,7 +455,7 @@ impl FileHandle for TmpHandle {
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
                 rdev: 0,
-                times: Default::default(),
+                times: f.times(),
             }),
             Some(Node::Dir) => {
                 let d = Metadata::dir();
@@ -481,10 +538,24 @@ impl FileHandle for TmpHandle {
     fn set_mtime(&self, secs: i64) -> Result<(), Errno> {
         match &self.file {
             Some(f) => {
-                f.mtime.store(secs, Ordering::Relaxed);
+                f.stamp(secs);
                 Ok(())
             }
             None => FileSystem::set_mtime(&TmpFs { inner: Arc::clone(&self.inner) }, &self.path, secs),
+        }
+    }
+
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        self.set_times_now(atime, mtime, now())
+    }
+
+    fn set_times_now(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) -> Result<(), Errno> {
+        match &self.file {
+            Some(f) => {
+                f.set_times(atime, mtime, now);
+                Ok(())
+            }
+            None => TmpFs { inner: Arc::clone(&self.inner) }.set_times_now(&self.path, atime, mtime, now),
         }
     }
 
@@ -591,13 +662,17 @@ impl FileSystem for TmpFs {
         match inner.nodes.get(path) {
             None => return Err(Errno::ENOENT),
             Some(Node::File(f)) => {
-                f.mtime.store(secs, Ordering::Relaxed);
+                f.stamp(secs);
                 return Ok(());
             }
             Some(_) => {}
         }
         inner.mtimes.insert(path.to_string(), secs);
         Ok(())
+    }
+
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        self.set_times_now(path, atime, mtime, now())
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {

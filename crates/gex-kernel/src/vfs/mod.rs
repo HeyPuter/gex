@@ -173,6 +173,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
             None => Ok(()),
         }
     }
+    /// [`FileHandle::set_times`] with the change time given (`now`, whole
+    /// seconds): for a module with no clock of its own -- the global kernel,
+    /// told the time by the process that asked.
+    fn set_times_now(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, now: i64) -> Result<(), Errno> {
+        let _ = now;
+        self.set_times(atime, mtime)
+    }
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let _ = len;
         Err(Errno::EINVAL)
