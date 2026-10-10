@@ -3048,8 +3048,9 @@ impl<'a> Emitter<'a> {
     ///
     /// The fast paths: a double or single whose result is normal and cannot
     /// overflow even when rounding carries -- rounded by RC in a dozen
-    /// instructions -- and an integer from a value of magnitude at least one
-    /// that fits (out of range gives the indefinite with IE), or zero.
+    /// instructions -- or a zero, narrowed to its sign; and an integer from
+    /// a value of magnitude at least one that fits (out of range gives the
+    /// indefinite with IE), or zero.
     fn emit_x87(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
         use code::*;
         if matches!(op, X87Op::Arith(_) | X87Op::Compare { .. }) {
@@ -3136,7 +3137,23 @@ impl<'a> Emitter<'a> {
                 self.emit_x87_inexact_sw(rem, up);
                 self.f.local_set(sw);
                 self.f.else_();
+                // A zero: its sign alone, exact.
+                self.f.local_get(sig);
+                self.f.byte(I64_EQZ);
+                self.f.local_get(e);
+                self.f.byte(I32_EQZ);
+                self.f.byte(I32_AND);
+                self.f.if_void();
+                self.f.local_get(sign);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.i64_const(total - 1);
+                self.f.byte(I64_SHL);
+                self.f.local_set(res);
+                self.f.i32_const(0);
+                self.f.local_set(sw);
+                self.f.else_();
                 self.emit_x87_call(op, sig, se, cw, res, sw);
+                self.f.end();
                 self.f.end();
             }
             X87Op::ToInt { bits, trunc } => {
@@ -3374,8 +3391,10 @@ impl<'a> Emitter<'a> {
     /// stays finite after -- for addition and subtraction also exponents
     /// at most 63 apart, and for an effective subtraction at least 2 apart,
     /// so at most one bit cancels -- then rounded by the control word's
-    /// precision and rounding control exactly as gex_f80 rounds. Everything
-    /// else (and every division) goes to the import.
+    /// precision and rounding control exactly as gex_f80 rounds. A zero
+    /// operand with a zero or normal one is inline too, as in x87.h: a sum
+    /// is the normal operand, rounded the same way. Everything else (and
+    /// every division) goes to the import.
     fn emit_x87_arith_fast(&mut self, op: X87Op, k: X87Arith, args: &[Value], outs: &[Value]) {
         use code::*;
         const I64_MUL: u8 = 0x7e;
@@ -3406,6 +3425,127 @@ impl<'a> Emitter<'a> {
         }
         self.f.block_void(); // $out
         self.f.block_void(); // $slow
+        self.f.block_void(); // $round: hi, lo, e and sign set
+        // Zeros (rb = a is zero, st = b is zero, for now), as x87.h's
+        // gex_x87_arith: two zeros give a zero; a product with a zero is a
+        // zero of the signs' exclusive or; a sum with a zero is the other,
+        // normal operand, rounded to the precision control below.
+        for (sig, ex, z) in [(asig, ae, rb), (bsig, be, st)] {
+            self.f.local_get(sig);
+            self.f.byte(I64_EQZ);
+            self.f.local_get(ex);
+            self.f.byte(I32_EQZ);
+            self.f.byte(I32_AND);
+            self.f.local_set(z);
+        }
+        // up = b's sign as the operation sees it (flipped for 0 - b).
+        self.f.local_get(bse);
+        if k == X87Arith::Sub {
+            self.f.i32_const(0x8000);
+            self.f.byte(I32_XOR);
+        }
+        self.f.i32_const(15);
+        self.f.byte(I32_SHR_U);
+        self.f.i32_const(1);
+        self.f.byte(I32_AND);
+        self.f.local_set(up);
+        self.f.local_get(rb);
+        self.f.local_get(st);
+        self.f.byte(I32_OR);
+        self.f.if_void();
+        {
+            self.f.local_get(rb);
+            self.f.local_get(st);
+            self.f.byte(I32_AND);
+            self.f.if_void();
+            {
+                // Two zeros: the product's sign is the exclusive or; a sum
+                // is -0 only if both are (or, rounding down, either is).
+                self.f.local_get(ase);
+                self.f.i32_const(15);
+                self.f.byte(I32_SHR_U);
+                self.f.i32_const(1);
+                self.f.byte(I32_AND);
+                self.f.local_get(up);
+                if k == X87Arith::Mul {
+                    self.f.byte(I32_XOR);
+                } else {
+                    self.f.local_set(sign);
+                    self.f.local_set(e);
+                    self.f.local_get(e);
+                    self.f.local_get(sign);
+                    self.f.byte(code::I32_OR);
+                    self.f.local_get(e);
+                    self.f.local_get(sign);
+                    self.f.byte(I32_AND);
+                    self.f.local_get(cw);
+                    self.f.i32_const(0xc00);
+                    self.f.byte(I32_AND);
+                    self.f.i32_const(0x400);
+                    self.f.byte(I32_EQ);
+                    self.f.select();
+                }
+                self.f.i32_const(15);
+                self.f.byte(code::I32_SHL);
+                self.f.local_set(se);
+                self.f.i64_const(0);
+                self.f.local_set(res);
+                self.f.i32_const(0);
+                self.f.local_set(sw);
+                self.f.br(4); // $out (past both ifs, $round and $slow)
+            }
+            self.f.end();
+            // One zero; the other must be normal.
+            self.f.local_get(bsig);
+            self.f.local_get(asig);
+            self.f.local_get(rb);
+            self.f.select();
+            self.f.local_set(hi); // the other operand
+            self.f.local_get(be);
+            self.f.local_get(ae);
+            self.f.local_get(rb);
+            self.f.select();
+            self.f.local_set(e);
+            self.f.local_get(hi);
+            self.f.i64_const(0);
+            self.f.byte(I64_LT_S);
+            self.f.local_get(e);
+            self.f.i32_const(1);
+            self.f.byte(I32_SUB);
+            self.f.i32_const(0x7ffd);
+            self.f.byte(I32_LE_U);
+            self.f.byte(I32_AND);
+            self.f.byte(I32_EQZ);
+            self.f.br_if(2); // $slow
+            if k == X87Arith::Mul {
+                self.f.local_get(ase);
+                self.f.local_get(bse);
+                self.f.byte(I32_XOR);
+                self.f.i32_const(0x8000);
+                self.f.byte(I32_AND);
+                self.f.local_set(se);
+                self.f.i64_const(0);
+                self.f.local_set(res);
+                self.f.i32_const(0);
+                self.f.local_set(sw);
+                self.f.br(3); // $out
+            } else {
+                // sign = a zero ? b's (as seen) : a's.
+                self.f.local_get(up);
+                self.f.local_get(ase);
+                self.f.i32_const(15);
+                self.f.byte(I32_SHR_U);
+                self.f.i32_const(1);
+                self.f.byte(I32_AND);
+                self.f.local_get(rb);
+                self.f.select();
+                self.f.local_set(sign);
+                self.f.i64_const(0);
+                self.f.local_set(lo);
+                self.f.br(1); // $round
+            }
+        }
+        self.f.end();
         // Both normal: J set and 1 <= e <= 0x7ffe.
         for (sig, ex) in [(asig, ae), (bsig, be)] {
             self.f.local_get(sig);
@@ -3420,7 +3560,7 @@ impl<'a> Emitter<'a> {
         }
         self.f.byte(I32_AND);
         self.f.byte(I32_EQZ);
-        self.f.br_if(0);
+        self.f.br_if(1); // $slow
         if k == X87Arith::Mul {
             // sign = sa ^ sb.
             self.f.local_get(ase);
@@ -3579,7 +3719,7 @@ impl<'a> Emitter<'a> {
             self.f.byte(I64_LT_U);
             self.f.byte(I32_AND);
             self.f.byte(I32_OR);
-            self.f.br_if(0);
+            self.f.br_if(1); // $slow
             // yhi = sigY >> d; ylo = d ? sigY << (64 - d) : 0.
             self.f.local_get(t2);
             self.f.local_get(dd);
@@ -3684,6 +3824,7 @@ impl<'a> Emitter<'a> {
             }
             self.f.end();
         }
+        self.f.end(); // $round
         // Normal before rounding and finite after: 1 <= e <= 0x7ffd.
         self.f.local_get(e);
         self.f.i32_const(1);
