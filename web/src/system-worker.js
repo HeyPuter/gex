@@ -106,7 +106,20 @@ self.onmessage = async (ev) => {
       if (opts.wl?.inRealm) {
         const c = await comp;
         opts.wl = { inRealm: { channel: c.channel, compositor: c.compositor } };
-      }
+        // The guest's GL, in the compositor (its frames are textures in the
+        // scene's device): the non-pthread Mesa, with no ring to serve.
+        if (opts.gl === 'compositor') {
+          const q = new URLSearchParams(globalThis.GEX_PAGE_SEARCH ?? '');
+          c.send({
+            kind: 'gl',
+            channel: null,
+            api: 'core',
+            url: q.get('glurl') || '/gex/st/gex-wgpu-replay.js',
+            ...(q.get('mesaenv') ? { mesaEnv: q.get('mesaenv') } : {}),
+            ...(q.get('wgslcache') ? { wgslCache: q.get('wgslcache') } : {}),
+          });
+        }
+      } else delete opts.gl;
       if (opts.networkUrl) {
         const { WispNetwork } = await import('./net.js');
         const net = new WispNetwork(opts.networkUrl, (e) => self.postMessage({ kind: 'net', event: e }));

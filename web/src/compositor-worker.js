@@ -1423,8 +1423,47 @@ async function startGl(m, canvas) {
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
   glChannel = m.channel;
   post({ kind: 'gl-ready', describe: glDevice.describe() });
+  // The single-thread build (docs/single-thread.md): no ring and no
+  // SharedArrayBuffer. The guests are fibers of this same realm, and their
+  // `gl_submit` calls `glInRealm.submit` on their own memory (gex.mjs).
+  if (!glChannel) {
+    glInRealm.resolve?.(glInRealm);
+    return;
+  }
   serveGlRing();
 }
+
+/**
+ * The single-thread build's GL service: `submit(memory, ring, client)` runs
+ * a guest's ring straight out of its memory, one submission at a time (the
+ * device is one wasm module, and a JSPI submit that suspends must not be
+ * re-entered: see `serveGl`). Resolves to the device's answer. Submissions
+ * made before the device is up wait for it.
+ */
+export const glInRealm = {
+  resolve: null,
+  ready: null,
+  tail: Promise.resolve(),
+  submit(memory, ring, client) {
+    const run = async () => {
+      await glInRealm.ready;
+      if (!glDevice?.ok) return -1;
+      try {
+        return await glDevice.submit(memory, ring, client);
+      } catch (e) {
+        console.error('[gl] the device threw', e);
+        return -1;
+      }
+    };
+    const r = glInRealm.tail.then(run);
+    glInRealm.tail = r.then(() => {}, () => {});
+    return r;
+  },
+};
+glInRealm.ready = new Promise((resolve) => (glInRealm.resolve = resolve));
+// Where the fibers find it (shims/browser/js/worker.mjs), without importing
+// the page's sources.
+if (globalThis.GEX_COMPOSITOR_IN_REALM) globalThis.__gexGlInRealm = glInRealm;
 
 /** Run the guest's submissions as they arrive.
  *

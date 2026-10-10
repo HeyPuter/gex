@@ -1130,17 +1130,27 @@ export class Gex {
         // The token as well as the ring: the host keeps a GL context per
         // process, because the object names in the stream are this process's
         // own and another process hands out the same ones.
-        gl_submit: (ring) =>
+        // In the single build a promise (the compositor's Mesa runs in this
+        // realm), so the import suspends; never from a nested call-out.
+        gl_submit: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
             ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
-            : -1),
+            : -1))
+          : (ring) =>
+            (this.#gl
+              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
+              : -1),
         // The same, not waited for (a frame's last batch): the copy is taken
         // and the guest draws on; the next submit waits for this one, and
         // says how long through `gex_gl_note_wait_ns`.
-        gl_submit_async: (ring) =>
+        gl_submit_async: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
             ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
-            : -1),
+            : -1))
+          : (ring) =>
+            (this.#gl
+              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
+              : -1),
         // This pump's scene: `count` surface records at `ptr` in this memory,
         // saying where each surface's pixels are rather than carrying them. The
         // compositor reads those addresses out of this same memory, so a frame

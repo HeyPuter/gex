@@ -1,7 +1,7 @@
 // The demos. Each has an `enter(ctx)` that owns the terminal until the next is
 // chosen; `ctx` carries the page's chrome so a demo never touches the DOM.
 
-import { archAsset, multiarch, elfMachine, guestArch } from './runtime.js';
+import { archAsset, multiarch, elfMachine, guestArch, singleMode } from './runtime.js';
 
 const running = (on) => window.dispatchEvent(new CustomEvent('gex:running', { detail: on }));
 
@@ -559,9 +559,16 @@ const gears = {
 
     // st/mesa and the gex_wgpu Gallium driver below the decoder: the only
     // browser GL backend (there is no WebGL path).
-    const gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
+    //
+    // The single-thread build (docs/single-thread.md) has no device on the
+    // page: the canvas becomes the compositor's output, and the non-pthread
+    // Mesa runs beside the compositor in the system Worker (`gl: 'compositor'`).
+    // The guest reports its own verdict from a readback, so a run is checked
+    // whether or not a frame reaches this canvas.
+    const singleGl = singleMode();
+    const gl = singleGl ? null : await (await import('./mesa-gl.js')).MesaGlDevice.create(
       canvas, mesaBackend(query, 'es', 'wgpu'));
-    if (!gl.ok) {
+    if (gl && !gl.ok) {
       ctx.term.writeln(ctx.ansi.red(gl.error || 'This browser has no usable GPU API.'));
       ctx.status('no GPU', 'bad');
       return;
@@ -569,7 +576,7 @@ const gears = {
 
     ctx.term.writeln('Three interlocking gears, drawn by an aarch64 binary.');
     ctx.term.writeln('');
-    ctx.term.writeln(ctx.ansi.dim(`  ${gl.describe()}`));
+    ctx.term.writeln(ctx.ansi.dim(`  ${gl ? gl.describe() : 'Mesa (gex_wgpu, single-thread build) in the system Worker'}`));
     ctx.term.writeln('');
     ctx.term.writeln(
       ctx.ansi.dim('The guest runs no graphics driver. Mesa would cost tens of thousands of'),
@@ -596,7 +603,7 @@ const gears = {
     // so nothing noticed.
     let displayRaf = 0;
     const pump = () => {
-      gl.display?.();
+      gl?.display?.();
       displayRaf = requestAnimationFrame(pump);
     };
     const stopPump = () => {
@@ -667,13 +674,13 @@ const gears = {
           env: guestEnv,
           cwd: '/',
           tty: true,
-          gl,
+          ...(gl ? { gl } : { gl: 'compositor', wl: canvas, wlInput: canvas }),
         });
         // Once more now the guest has exited: its last swapped frame is
         // produced but not yet copied, and the loop above stops with it. A
         // short run would otherwise leave the canvas on an earlier frame, or
         // on nothing at all.
-        gl.display?.();
+        gl?.display?.();
         stopPump();
         const ms = (performance.now() - t0).toFixed(0);
         ctx.term.writeln('');

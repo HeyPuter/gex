@@ -447,7 +447,16 @@ async function handle(msg) {
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
-  if (msg.glChannel) {
+  if (msg.glChannel?.inRealm) {
+    // The single-thread build: the compositor's Mesa is in this realm
+    // (web/src/compositor-worker.js `glInRealm`), and a submit is a promise
+    // the Suspending `gl_submit` waits on. A batch is run straight out of
+    // this process's memory: no copy, and no batch in flight unwaited.
+    gex.useGl({
+      submit: (memory, ring, client) =>
+        globalThis.__gexGlInRealm ? globalThis.__gexGlInRealm.submit(memory, ring, client) : -1,
+    });
+  } else if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
     gex.useGl(new GlProxy(msg.glChannel, () => {
       // An OffscreenCanvas renderer waits on the control word directly. Keep

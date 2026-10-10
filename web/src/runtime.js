@@ -404,8 +404,12 @@ async function runInSystemWorker(term, opts) {
   // Worker, which holds every guest memory it reads pixels out of. GL and the
   // X server need the SharedArrayBuffer bridges still.
   const canvas = typeof wl?.getContext === 'function' && typeof wl.transferControlToOffscreen === 'function' ? wl : null;
-  if ((wl && !canvas) || gl || hostX) {
-    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && 'GL', hostX && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
+  // GL: the compositor's own (`gl: 'compositor'`) runs in the system Worker
+  // beside it, the non-pthread Mesa (web/public/gex/st/); a page-side device
+  // does not exist there.
+  const glHere = gl === 'compositor' && !!canvas;
+  if ((wl && !canvas) || (gl && !glHere) || hostX) {
+    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
   }
   const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
   globalThis.__gexSystemWorker = w;
@@ -457,7 +461,12 @@ async function runInSystemWorker(term, opts) {
         globals: pageGlobals(),
         rows: term.rows,
         cols: term.cols,
-        opts: { ...rest, networkUrl: network?.url ?? null, wl: canvas ? { inRealm: true } : undefined },
+        opts: {
+          ...rest,
+          networkUrl: network?.url ?? null,
+          wl: canvas ? { inRealm: true } : undefined,
+          gl: glHere ? 'compositor' : undefined,
+        },
       });
     });
   } finally {
@@ -595,7 +604,12 @@ async function runProgramHere(
   // gated on `have_gl()`) and gles-gears died at `eglInitialize`/`ring_open`.
   let glChannel = null;
   let glServe = null;
-  if (gl) {
+  if (gl && single.on) {
+    // The single-thread build: no ring. Each process's `gl_submit` calls the
+    // compositor's Mesa in this realm on its own memory (compositor-worker.js
+    // `glInRealm`), started by the system Worker.
+    glChannel = { inRealm: true };
+  } else if (gl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the GL demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
