@@ -269,8 +269,17 @@ pub(crate) fn rebridge(pc: u64) -> bool {
             }
         };
         if n > 64 {
-            crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
-            return false;
+            // Tier-1 can only take an address it can lift. An IFUNC's
+            // resolver+1 (odd) it cannot: handed one, it panicked ("text
+            // base must be instruction-aligned", node --build-snapshot in
+            // the page). Such an address keeps its bridge whatever the count.
+            if pc % gex_abi::INST_ALIGN == 0 {
+                crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
+                return false;
+            }
+            if n == 65 {
+                crate::trace_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; not liftable, bridging it again\n"));
+            }
         }
     }
     let (regs, _, slots) = super::bridges(&[pc]);
