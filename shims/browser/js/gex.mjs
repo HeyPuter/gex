@@ -1849,7 +1849,44 @@ export class Gex {
   #processImage() {
     const t0 = performance.now();
     const e = this.#shim.exports;
-    const out = [{ at: 0, bytes: this.#bytes().slice(0, LOW_END) }];
+    // Only the runs of pages that are not all zero, scanned in place: a
+    // child's memory starts zeroed, so a zero page needs no bytes, and
+    // slicing it whole first (637 MiB of zeros for a node child) was most of
+    // the cost of a fork, paid again by the child scanning the copy for
+    // zeros (`writeSparse`). Each mapped region also goes as an entry of its
+    // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
+    // left out); runs are `dense`, written without a scan.
+    const u8 = this.#bytes();
+    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    const blank = (a, b) => {
+      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      return true;
+    };
+    const out = [];
+    const runs = (start, end) => {
+      const PAGE = 4096;
+      let zeros = 0;
+      let i = start;
+      while (i < end) {
+        const pe = Math.min(i + PAGE, end);
+        if (blank(i, pe)) {
+          zeros += pe - i;
+          i = pe;
+          continue;
+        }
+        let run = pe;
+        while (run < end) {
+          const next = Math.min(run + PAGE, end);
+          if (blank(run, next)) break;
+          run = next;
+        }
+        out.push({ at: i, bytes: u8.slice(i, run), dense: true });
+        i = run;
+      }
+      return zeros;
+    };
+    out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
     const n = e.gex_vma_count();
@@ -1860,7 +1897,11 @@ export class Gex {
       const prot = Number(dv.getBigUint64(scratch + 16, true));
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
-      if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
+      if (end > start) {
+        const r = { at: start, end, prot, bytes: new Uint8Array(0), zeros: 0 };
+        out.push(r);
+        r.zeros = runs(start, end);
+      }
     }
     e.gex_free?.(scratch, 24);
     // A checksum per region, so the child can say whether what it runs on is
@@ -2162,7 +2203,7 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + r.bytes.byteLength), 0));
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -2185,6 +2226,12 @@ export class Gex {
       const n = r.bytes.byteLength;
       if (n > skipOver) {
         skipped += n;
+        continue;
+      }
+      zeros += r.zeros ?? 0;
+      if (r.dense) {
+        u8.set(new Uint8Array(r.bytes), r.at);
+        copied += n;
         continue;
       }
       const [wrote, blank] = writeSparse(u8, new Uint8Array(r.bytes), r.at);
@@ -2708,7 +2755,7 @@ export class Gex {
       // `WebAssembly.Module` (same registry bytes -> same module) rather than
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       // Or one the page's unit cache has (another process's).
       const cached = (key ? this.#sharedModules.get(key) : undefined) ?? this.#unitGet(this.#unitKey(bytes)) ?? undefined;
       let who = 'jit2049';
@@ -2779,7 +2826,7 @@ export class Gex {
       // No metadata means nothing to key a later fill on -- install it eagerly,
       // as the fork path does (`#adoptModule`), reusing a sibling's compile.
       if (!meta || !meta.length) {
-        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
@@ -2788,14 +2835,14 @@ export class Gex {
       const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
       e.gex_free?.(gp, meta.length);
       if (!got) {
-        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
       // Keep a sibling's compiled Module when we have it, so the on-demand
       // instantiate skips the compile too; otherwise the raw bytes. The push
       // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta });
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(this.#registryKey(i, bytes)) ?? bytes, need, inst: null, meta });
       lazy++;
     }
     if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
@@ -5199,6 +5246,17 @@ export class Gex {
   #moduleStore = null;
 
   /** Registry module `i`'s bytes (a copy), wherever they are kept; null if none. */
+  /** Registry module `i`'s content key: as the store's writer recorded it
+   *  when the module is in the store, so a catching-up Worker does not hash
+   *  bytes a sibling already hashed; computed from `bytes` otherwise. */
+  #registryKey(i, bytes) {
+    const e = this.#shim.exports;
+    if (e.gex_module_key && e.gex_module_ext && Number(e.gex_module_ext(i))) {
+      return `${bytes.length}:${e.gex_module_key(i, 0) >>> 0}:${e.gex_module_key(i, 1) >>> 0}`;
+    }
+    return moduleContentKey(bytes);
+  }
+
   #registryBytes(i) {
     const e = this.#shim.exports;
     const len = e.gex_module_len(i) >>> 0;
@@ -5310,7 +5368,7 @@ export class Gex {
       const i = this.#installed;
       const bytes = this.#registryBytes(i);
       if (!bytes) continue;
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
       this.#installModule(bytes, need, 64, null, 'nt-catchup', cached, true);
       if (cached) continue;
@@ -6049,7 +6107,7 @@ export class Gex {
     if (i < 0) return;
     const bytes = this.#registryBytes(i);
     if (!bytes) return;
-    const key = moduleContentKey(bytes);
+    const key = this.#registryKey(i, bytes);
     const cached = key ? this.#sharedModules.get(key) : undefined;
     this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
     this.#denseCatchUps++;

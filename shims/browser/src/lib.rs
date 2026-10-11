@@ -2709,7 +2709,7 @@ struct Jit {
     /// `registry` itself. An entry kept there holds no bytes in this module's
     /// heap: the registry grew without bound in a long fjit run (980 MiB of
     /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
-    registry_ext: Vec<Option<(u64, u32)>>,
+    registry_ext: Vec<Option<(u64, u32, u64)>>,
     /// The bytes of the last modules kept in the JS-side store, still alive:
     /// a sibling Worker that read the pending queue's front just before this
     /// one popped it is copying them out (`gex_jit_pending_refresh`).
@@ -6787,7 +6787,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 if frames_stay(h) {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
                 // The stack goes back so the host can see the record and
@@ -6914,12 +6914,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                    do_fork(h, pid, pc as u64, child_stack, tls);
-                    FORK[1].store(start, std::sync::atomic::Ordering::Relaxed);
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
-                do_fork(h, pid, pc as u64, child_stack, tls);
+                do_fork(h, pid, pc as u64, child_stack, tls, None);
                 // Give the stack back though the parent carries on: the child
                 // is a copy of this memory that must be taken now, when the
                 // stack comes back. Letting the parent run on first copied it
@@ -7171,13 +7170,20 @@ fn frames_stay(h: &Host) -> bool {
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
-static WASM32_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// Per Worker: the Worker whose syscall staged it is the one that must start
+/// it (a fork's child is a copy of memory as the call left it; see
+/// `gex_fork_pending`). Shared, a sibling thread's syscall took the flag and
+/// the forking Worker never drained its child.
+thread_local! {
+    static WASM32_STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether a wasm32 program's last syscall staged a thread or a child for
 /// the host (and forget it).
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_staged() -> i32 {
-    WASM32_STAGED.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
+    WASM32_STAGED.with(|c| c.replace(false)) as i32
 }
 
 /// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
@@ -7213,7 +7219,7 @@ fn wasm32_wait(pc: u64) -> i32 {
     }
 }
 
-fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
+fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
@@ -7238,11 +7244,13 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join("\0");
-    FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
+    FORK[1].store(start.unwrap_or(pc + gex_abi::SYSCALL_INST_BYTES), std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     FORK[5].store(h.kernel.mem.brk_current(), std::sync::atomic::Ordering::Relaxed);
+    // Only the forking thread's Worker may claim it (`gex_fork_pending`).
+    FORK_BY.store(cur() as u64 + 1, std::sync::atomic::Ordering::Relaxed);
     // Last, because it is what the host tests: the rest must be readable by
     // the time a non-zero pid appears.
     FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
@@ -7587,10 +7595,28 @@ pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
 static FORK: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// The thread (index + 1) whose `fork` is in `FORK`.
+static FORK_BY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The pid of a child needing a Worker, or zero -- and claiming it, so a `fork`
 /// several Workers can see is not started twice (see `gex_thread_pending`).
+///
+/// Only on the Worker running the thread that forked: the child is a copy of
+/// memory as `fork` left it, and only that Worker copies it before the parent
+/// runs on (synchronously after a wasm32 program's syscall, before the run
+/// loop resumes tier-1's). A sibling thread's Worker that drained it instead
+/// copied memory while the parent ran on -- for a wasm32 program, after
+/// `__gex_fork` had unmapped the record the child starts on, so the child
+/// read its thread pointer from a zero page and trapped (the aarch64 browser
+/// flake in tests/wasm32 fork: "vfork child exit 137" with a parked thread
+/// in the parent, 6 in 750 vforks; tests/wasm32/vforkthreads).
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
+    if FORK[0].load(std::sync::atomic::Ordering::Acquire) == 0
+        || FORK_BY.load(std::sync::atomic::Ordering::Relaxed) != cur() as u64 + 1
+    {
+        return 0;
+    }
     let pid = FORK[0].swap(0, std::sync::atomic::Ordering::AcqRel) as i32;
     if pid != 0 {
         CLAIMED_FORK.with(|c| {
@@ -8442,6 +8468,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     FILL_ASKED.0.borrow_mut().clear();
     FILL_FAILED.0.borrow_mut().clear();
     SERVED_PAGE.0.borrow_mut().clear();
+    // And the bases blocks were installed under: the page table starts over
+    // below, and a page of the new program has nothing installed yet.
+    LIVE_BASE.0.borrow_mut().clear();
     // And the modules inherited from the parent: they cover the PARENT's pages.
     // The new program's image sits at the same PIE base, so a page number the
     // parent's image had is now another program's code; a fill answered from
@@ -8518,6 +8547,16 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         ));
     }
     drop(closure);
+    // And the store modules this Worker installed before the exec: they are
+    // still in its tables, but nothing points at them now -- the page table
+    // and directory start over above -- so counting them installed made the
+    // serve path refuse every one of them, and the new program lifted what
+    // it could have been served. A program exec'd from a fork of node (the
+    // child had taken libc and libnode whole before its exec) lifted 66,079
+    // blocks, against 4,188 for a fresh `node -e 0`. Served again, a module
+    // writes the same blocks into the same slots, and its compile is shared
+    // by content key.
+    h.jit.installed_mods.clear();
 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     let c = ctx_addr as usize;
@@ -13724,11 +13763,11 @@ pub extern "C" fn gex_jit_installed() {
             // take the front of the shared queue between this Worker's read and
             // this pop, so the note is checked against what was popped): keep
             // only where it is.
-            if let Some((off, len, _)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+            if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 h.jit.registry_sums.push(Vec::new());
                 h.jit.registry.push(Vec::new());
-                h.jit.registry_ext.push(Some((off, len)));
+                h.jit.registry_ext.push(Some((off, len, key)));
                 h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
                 h.jit.store_grace.push_back(done.wasm);
                 if h.jit.store_grace.len() > STORE_GRACE {
@@ -14066,7 +14105,17 @@ pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo:
 /// bytes are in this module's memory (`gex_module_ptr`).
 #[no_mangle]
 pub extern "C" fn gex_module_ext(i: u32) -> u64 {
-    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _)| off + 1))
+    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _, _)| off + 1))
+}
+
+/// Registry module `i`'s content key, high half (`which` 0) or low (1), when
+/// it is in the JS-side store (whose writer gave it); 0 and 0 otherwise. So a
+/// Worker catching up names the module without hashing its bytes.
+#[no_mangle]
+pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
+    with_host(|h| {
+        h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(_, _, k)| if which == 0 { (k >> 32) as u32 } else { k as u32 })
+    })
 }
 
 /// MiB of registry modules kept in the JS-side store (1) and in this heap (0).
@@ -14108,7 +14157,7 @@ pub extern "C" fn gex_jit_slots_total() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
     with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
-        Some((_, len)) => len,
+        Some((_, len, _)) => len,
         None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
     })
 }

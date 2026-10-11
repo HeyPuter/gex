@@ -1296,12 +1296,12 @@ impl<'a> Lifter<'a> {
                         double,
                         a,
                     }),
-                    // Wasm's `nearest` breaks ties to even. FRINTA breaks
-                    // them away from zero, and FRINTX/FRINTI follow the FPCR
-                    // mode, which gex does not track in fast mode — so all
-                    // four agree except exactly on halfway values.
+                    // FRINTA breaks ties away from zero; wasm's `nearest`
+                    // breaks them to even, so it is built (`round_away`).
+                    FpOp1::RoundAway => self.round_away(double, a),
+                    // FRINTX/FRINTI follow the FPCR mode, which gex does not
+                    // track in fast mode: to nearest, ties to even, as FRINTN.
                     FpOp1::RoundNearest
-                    | FpOp1::RoundAway
                     | FpOp1::RoundExact
                     | FpOp1::RoundCurrent => self.b.def(Expr::FpUn {
                         op: FpUnOp::RoundNearest,
@@ -3087,10 +3087,16 @@ impl<'a> Lifter<'a> {
             VOp2::FrintP => Some(VLaneUnOp::Ceil),
             VOp2::FrintM => Some(VLaneUnOp::Floor),
             VOp2::FrintZ => Some(VLaneUnOp::Trunc),
-            // Ties-to-even stands in for every nearest variant (PLAN §5.7).
-            VOp2::FrintN | VOp2::FrintA | VOp2::FrintX | VOp2::FrintI => Some(VLaneUnOp::Nearest),
+            // Ties to even for FRINTN, and for FRINTX/FRINTI (the FPCR mode,
+            // not tracked; PLAN §5.7). FRINTA is built below.
+            VOp2::FrintN | VOp2::FrintX | VOp2::FrintI => Some(VLaneUnOp::Nearest),
             _ => None,
         };
+        if op == VOp2::FrintA && matches!(lane, VLane::F32 | VLane::F64) {
+            let r = self.round_away_lanes(lane, a);
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
         if let Some(un) = un {
             let r = self.b.def(Expr::VLaneUn { op: un, lane, a });
             self.commit_vector(vd, arr, r);
@@ -4173,6 +4179,58 @@ impl<'a> Lifter<'a> {
         let one = self.b.const_i32(1);
         let not_lt = self.b.bin(BinOp::Xor, Ty::I32, lt, one);
         (lt, eq, not_lt, unordered)
+    }
+
+    /// FRINTA: to nearest, ties away from zero. `t = trunc(a)`, and one
+    /// more step away from zero when `|a - t| >= 0.5`. `a - t` is exact (the
+    /// fraction of `a`), so no value near a half is misjudged, unlike
+    /// `trunc(a + copysign(0.5, a))`, which rounds 0.49999999999999994 up.
+    /// A NaN or an infinity compares false and stays itself; -0.3 stays -0.
+    fn round_away(&mut self, double: bool, a: Value) -> Value {
+        let (half, one, ty) = if double {
+            (self.b.const_i64(0.5f64.to_bits()), self.b.const_i64(1.0f64.to_bits()), Ty::I64)
+        } else {
+            (self.b.const_i32(0.5f32.to_bits()), self.b.const_i32(1.0f32.to_bits()), Ty::I32)
+        };
+        let t = self.b.def(Expr::FpUn { op: FpUnOp::Trunc, double, a });
+        let frac = self.fp_bin(FpBinOp::Sub, double, a, t);
+        let mag = self.b.def(Expr::FpUn { op: FpUnOp::Abs, double, a: frac });
+        let up = self.b.def(Expr::FpCmp { op: FpCmpOp::Ge, double, a: mag, b: half });
+        let step = self.fp_bin(FpBinOp::Copysign, double, one, a);
+        let away = self.fp_bin(FpBinOp::Add, double, t, step);
+        self.b.def(Expr::Select { cond: up, a: away, b: t, ty })
+    }
+
+    /// [`Self::round_away`] lane-wise, for the vector FRINTA.
+    fn round_away_lanes(&mut self, lane: VLane, a: Value) -> Value {
+        let splat = |bits: u64| -> Box<[u8; 16]> {
+            let mut v = [0u8; 16];
+            if lane == VLane::F64 {
+                for c in v.chunks_exact_mut(8) {
+                    c.copy_from_slice(&bits.to_le_bytes());
+                }
+            } else {
+                for c in v.chunks_exact_mut(4) {
+                    c.copy_from_slice(&(bits as u32).to_le_bytes());
+                }
+            }
+            Box::new(v)
+        };
+        let (half, one, sign) = if lane == VLane::F64 {
+            (0.5f64.to_bits(), 1.0f64.to_bits(), 1u64 << 63)
+        } else {
+            (0.5f32.to_bits() as u64, 1.0f32.to_bits() as u64, 1u64 << 31)
+        };
+        let half = self.b.def(Expr::VConst(splat(half)));
+        let one = self.b.def(Expr::VConst(splat(one)));
+        let sign = self.b.def(Expr::VConst(splat(sign)));
+        let t = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Trunc, lane, a });
+        let frac = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Sub, lane, a, b: t });
+        let mag = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a: frac });
+        let up = self.b.def(Expr::VLaneBin { op: VLaneBinOp::GeS, lane, a: mag, b: half });
+        let step = self.b.def(Expr::VBitSelect { mask: sign, a, b: one });
+        let away = self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane, a: t, b: step });
+        self.b.def(Expr::VBitSelect { mask: up, a: away, b: t })
     }
 
     fn fp_bin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {

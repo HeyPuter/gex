@@ -135,8 +135,29 @@ fn flags() -> RegSet {
     RegSet::of(cf::FLAG_REGS)
 }
 
+/// V8's limit on one wasm function's body (`kV8MaxWasmFunctionSize`): a
+/// module holding a bigger one does not compile at all. amd64 python3.13's
+/// eval loop came to 8.3 MB as one function, and the browser crashed on it.
+pub const V8_MAX_FUNCTION_BYTES: usize = 7_654_321;
+
+/// The largest body [`emit`] keeps: V8's limit less room for what the
+/// splice and the merger may add to a body's immediates.
+/// `GEX_FJIT_MAX_BODY=<bytes>` lowers it natively, to exercise the fallback.
+pub fn max_body_bytes() -> usize {
+    let cap = V8_MAX_FUNCTION_BYTES - (64 << 10);
+    std::env::var("GEX_FJIT_MAX_BODY").ok().and_then(|v| v.parse().ok()).map_or(cap, |v: usize| v.min(cap))
+}
+
+/// Whether an emitted function and its outlined loops all fit
+/// ([`max_body_bytes`]).
+pub fn fits(body: usize, loops: &[usize], max: usize) -> bool {
+    body <= max && loops.iter().all(|&l| l <= max)
+}
+
 /// Emit `f` (memory form, verified, `loops` = `outer_loops(f)` when
-/// outlining). `None` when a loop function's CFG is irreducible.
+/// outlining). `None` when a loop function's CFG is irreducible, or when
+/// the function or one of its loops is over V8's size limit: the caller
+/// leaves it to tier-1, block by block.
 /// Blocks above which a function is laid out flat in the browser (see `emit`).
 const FLAT_ABOVE: usize = 1500;
 
@@ -329,7 +350,20 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     e.top(0);
     e.b.f().unreachable();
     let body = e.b.finish();
-    e.stats.code_bytes += body.len() + lfns.iter().map(|l| l.len()).sum::<usize>();
+    let loop_lens: Vec<usize> = lfns.iter().map(|l| l.len()).collect();
+    if !fits(body.len(), &loop_lens, max_body_bytes()) {
+        if std::env::var_os("GEX_FJIT_STATS").is_some() {
+            eprintln!(
+                "[fjit] {:#x}{}: {} bytes (loops {:?}), over V8's function size limit; left to tier-1",
+                f.entry,
+                f.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default(),
+                body.len(),
+                loop_lens
+            );
+        }
+        return None;
+    }
+    e.stats.code_bytes += body.len() + loop_lens.iter().sum::<usize>();
     Some(Emitted { body, loops: lfns })
 }
 
@@ -1637,5 +1671,22 @@ impl E<'_, '_> {
                 self.b.f().ret();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn a_function_over_v8s_size_limit_is_left_to_tier1() {
+        let max = V8_MAX_FUNCTION_BYTES - (64 << 10);
+        assert!(fits(1000, &[], max));
+        assert!(fits(max, &[max], max));
+        // amd64 python3.13's eval loop: 8.3 MB as one function.
+        assert!(!fits(8_300_000, &[], max));
+        // A small body whose outlined loop is too big goes too.
+        assert!(!fits(1000, &[10, V8_MAX_FUNCTION_BYTES], max));
+        assert!(max_body_bytes() <= max);
     }
 }

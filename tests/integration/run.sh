@@ -534,6 +534,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
 "$CC" -static -O2 -o "$WORK/fma" "$HERE/programs/fma.c"
+"$CC" -static -O2 -o "$WORK/frinta" "$HERE/programs/frinta.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 "$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
@@ -921,6 +922,7 @@ compare "brk-zero" "$WORK/brk-zero"
 # value is compared as a bit pattern, over ordinary magnitudes, random bit
 # patterns, the exponent band's edges and zeros.
 compare "fma" "$WORK/fma"
+compare "frinta" "$WORK/frinta"
 compare "signal-kill" "$WORK/signal-kill"
 compare "signal-alarm" "$WORK/signal-alarm"
 compare "signal-sigchld" "$WORK/signal-sigchld"
