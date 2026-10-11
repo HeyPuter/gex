@@ -7,6 +7,14 @@
 // than a message back through here. This file starts pid 1, makes a Worker per
 // fork, relays I/O, and holds the run open until pid 1 exits.
 
+// Narration under node goes to stderr: node's console.debug is stdout, the
+// guest's own output there. In a page it stays on the debug console.
+function narrate(text) {
+  const stderr = typeof process !== 'undefined' ? process.stderr : null;
+  if (stderr?.write) stderr.write(`${text}\n`);
+  else console.debug(text);
+}
+
 /**
  * Announce a crash to an automated watcher. These failures are caught (the
  * spawn promise is rejected and handled), so no `error` event fires and a test
@@ -46,6 +54,13 @@ function forkTransfer(child) {
 
 /// Where a pooled Worker's early messages are kept until somebody owns it.
 const EARLY = Symbol('gex.early');
+/** How many content-keyed modules (`wasm:`) the page keeps for every
+ *  process, and how many bytes of wasm they may add up to (their compiled
+ *  code is larger still; python3.13 alone is 24 MiB of wasm). */
+const PAGE_MODULES = 64;
+const PAGE_MODULE_BYTES = 192 << 20;
+/** A `wasm:` key's module size: the key is `wasm:LENGTH:HASH:HASH`. */
+const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
@@ -75,6 +90,18 @@ export class ProcessHost {
   // a separate memory, so they do NOT share this -- the fork path carries the
   // parent's compiled modules itself. See `Gex#sharedModules`.
   #moduleCache = new Map();
+  // Modules whose compiled code depends on their bytes alone (`wasm:` keys:
+  // native wasm32 programs, by content), for every process of the page: an
+  // exec'd program another process already ran is not compiled again. Kept
+  // to the most recent PAGE_MODULES and PAGE_MODULE_BYTES. A hit is by
+  // content (length plus two 32-bit hashes of every byte), never by path, so
+  // a file apt replaced in place is compiled afresh.
+  #pageModules = new Map();
+  /** What a starting Worker gets: its process's modules and the page's. */
+  #sharedFor(pid, withProcess) {
+    const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
+    return [...own, ...this.#pageModules.entries()];
+  }
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
   #threads = 0;
@@ -225,7 +252,7 @@ export class ProcessHost {
       // One line per process, to `debug`: a process that never starts leaves
       // no other trace -- the fork is logged by the parent, the exit by the
       // child. #137.
-      console.debug(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
+      narrate(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
       // And now whatever it said while it was still in the pool.
       const held = w[EARLY];
       if (held) {
@@ -304,7 +331,7 @@ export class ProcessHost {
           if (!res.ok) throw new Error(`${entry.url}: ${res.status} ${res.statusText}`);
           const bytes = new Uint8Array(await res.arrayBuffer());
           const mod = await WebAssembly.compile(bytes);
-          console.debug(
+          narrate(
             `[gex] closure library ${i}: ${(bytes.length / 1048576).toFixed(1)} MiB `
             + `fetched and compiled in ${Math.round(performance.now() - t0)}ms`,
           );
@@ -371,7 +398,7 @@ export class ProcessHost {
         }
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
-        console.debug(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
+        narrate(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
           // Awaited: compiling the shim cannot be synchronous in a browser.
           this.#shimModule().then((shimMod) => {
@@ -398,9 +425,7 @@ export class ProcessHost {
             // other, at start-up). The `start` closure above meant to send
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
-            ...(msg.kind === 'thread'
-              ? { sharedModules: [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] }
-              : {}),
+            sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
           }, forkTransfer(msg.child));
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
@@ -443,6 +468,17 @@ export class ProcessHost {
         const proc = String(pid).split(':')[0];
         let cache = this.#moduleCache.get(proc);
         if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
+        if (typeof m.key === 'string' && m.key.startsWith('wasm:')) {
+          this.#pageModules.delete(m.key);
+          this.#pageModules.set(m.key, m.mod);
+          let bytes = 0;
+          for (const k of this.#pageModules.keys()) bytes += keyBytes(k);
+          while (this.#pageModules.size > 1 && (this.#pageModules.size > PAGE_MODULES || bytes > PAGE_MODULE_BYTES)) {
+            const oldest = this.#pageModules.keys().next().value;
+            bytes -= keyBytes(oldest);
+            this.#pageModules.delete(oldest);
+          }
+        }
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
           if (this.#extra?.shareTrace) console.warn(`[share] host cached ${m.key.slice(0, 30)} from ${pid} (${cache.size} for process ${proc})`);
@@ -522,6 +558,7 @@ export class ProcessHost {
             ctx: m.thread.ctx,
             pc: m.thread.pc,
             memory: m.thread.memory,
+            moduleStore: m.thread.moduleStore,
             kernelStack: this.#nextKernelStack(key),
             shim: shimMod,
             guest: this.#guest,
@@ -530,7 +567,7 @@ export class ProcessHost {
             // thread reuses them instead of recompiling from bytes in its own
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
             // references, not a byte copy. See `#moduleCache`.
-            sharedModules: [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])],
+            sharedModules: this.#sharedFor(pid, true),
           }),
           );
         };

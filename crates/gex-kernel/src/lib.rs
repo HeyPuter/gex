@@ -21,6 +21,24 @@ pub type PAddr = u64;
 #[cfg(not(any(target_arch = "wasm64", feature = "process64")))]
 pub type PAddr = u32;
 
+/// `GEX_MEM_TRACE`: say where a guest memory fill or copy of 8 MiB or more
+/// came from (what a process start spends its memset on).
+#[track_caller]
+#[inline]
+pub fn big_op(what: &str, len: usize) {
+    if len >= 8 << 20 {
+        big_op_slow(what, len, std::panic::Location::caller());
+    }
+}
+
+#[cold]
+fn big_op_slow(what: &str, len: usize, at: &std::panic::Location<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("GEX_MEM_TRACE").is_some()) {
+        eprintln!("gex-mem: {what} {} MiB at {at}", len >> 20);
+    }
+}
+
 pub mod errno;
 pub mod eventfd;
 pub mod file;
@@ -153,7 +171,9 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    #[track_caller]
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        big_op("zero", len);
         let r = self.range(addr, len)?;
         self.view_mut()[r].fill(0);
         Ok(())
@@ -162,7 +182,9 @@ impl<'a> GuestMem<'a> {
     /// `len` bytes from `src` to `dst`, both guest addresses, overlap allowed:
     /// no host buffer in between (in the browser every host buffer is shim
     /// heap, and a frame-sized one per frame fragmented it to exhaustion).
+    #[track_caller]
     pub fn copy_within(&mut self, src: u64, dst: u64, len: usize) -> Result<(), Errno> {
+        big_op("copy_within", len);
         let s = self.range(src, len)?;
         let d = self.range(dst, len)?;
         self.view_mut().copy_within(s, d.start);
@@ -174,7 +196,9 @@ impl<'a> GuestMem<'a> {
     /// touched costs no memory, writing it commits it, so a large
     /// reservation zeroed with `zero` cost its whole size in resident memory
     /// (a 1 GiB `PROT_NONE` mmap took ~1 GiB of RSS natively).
+    #[track_caller]
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
         for page in self.view_mut()[r].chunks_mut(4096) {
             if !page_is_zero(page) {

@@ -25,7 +25,7 @@ TRIPLE=wasm32-unknown-linux-musl
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 
 # the sysroot (musl, libgex, compiler-rt, UAPI headers, binaryen)
-GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
+GEX_WASM_EXTRA_CFLAGS=-fvisibility=default GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
 # the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,
@@ -190,6 +190,15 @@ if [ -n "${BUSYBOX_TAR:-}" ]; then
     { echo "busybox failed: $BB/build.log"; exit 1; }
   cp "$BB/busybox" "$L/busybox"
   GEXCC_BUSYBOX= "$B/gexcc-exec" run "$L/busybox" --list | tr '\n' ',' | sed 's/,$//' > "$L/busybox.applets"
+fi
+# shared libraries (GEXCC_SHARED=1, docs/gexcc.md 7): gex-dylink (cargo
+# build -p gex-dylink) and libc.so
+DL=${GEX_DYLINK:-$ROOT/target/release/gex-dylink}
+if [ -x "$DL" ]; then
+  cp "$DL" "$L/gex-dylink"
+  "$HERE/shared/mklibc.sh" "$PREFIX"
+else
+  echo "gexcc: no $DL: GEXCC_SHARED unavailable (cargo build --release -p gex-dylink)"
 fi
 echo "gexcc: $B/gexcc (sysroot $PREFIX/sysroot, runner $R)"
 # C++ (LLVM_SRC: an LLVM source tree of clang's version)

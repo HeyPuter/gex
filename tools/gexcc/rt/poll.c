@@ -5,12 +5,12 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
-void __gex_poll_rearm(int);
+__attribute__((visibility("hidden"))) void __gex_poll_rearm(int);
 
 /* back-edges between polls: about 65k loop iterations */
 #define GEX_POLL_INTERVAL 65536
 
-__attribute__((cold, noinline)) void __gex_poll(void)
+__attribute__((cold, noinline, visibility("hidden"))) void __gex_poll(void)
 {
 	__gex_poll_rearm(GEX_POLL_INTERVAL);
 	syscall(SYS_getpid);

@@ -39,6 +39,7 @@ pub(crate) mod elfprov;
 pub(crate) mod libprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
+mod dylink;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).
@@ -198,8 +199,18 @@ pub(crate) fn on() -> bool {
     MODE.load(Ordering::Relaxed) != 0
 }
 
+/// ELF export providers without units (`gex_cgen_set_mode` bit 3): the
+/// provider modules come from the page's dist (docs/gexcc.md §7.9), and no
+/// image looks for a unit.
+static PROVIDERS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn providers_on() -> bool {
+    on() || PROVIDERS_ONLY.load(Ordering::Relaxed)
+}
+
 /// Turn the function tier on (1) or require it for program images (2). Before
-/// the process boots, so the exe and ntdll are seen. Bit 2 (4) selects the
+/// the process boots, so the exe and ntdll are seen. Bit 3 (8): ELF export
+/// providers whether or not units are on. Bit 2 (4) selects the
 /// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
 /// the browser the guarded flavor guards only at the memory's end, as the
 /// unguarded one traps there by itself (docs/browser-units-plan.md).
@@ -207,6 +218,9 @@ pub(crate) fn on() -> bool {
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 4 != 0 {
         gex_cgen::image::set_unguarded(true);
+    }
+    if mode & 8 != 0 {
+        PROVIDERS_ONLY.store(true, Ordering::Relaxed);
     }
     let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
@@ -788,7 +802,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         }
     }
     let (regs, dirs, slots) = bridges(&addrs);
-    crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    crate::trace_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
     lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
 }

@@ -2481,6 +2481,14 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let t0 = std::time::Instant::now();
     let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
     eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+    // `GEX_CGEN_PRECOMPILE=1`: compile it for this host's engine too
+    // (`c.cwasm`), which the first process to map it would otherwise do
+    // while the guest waits (wined3d's unit: minutes).
+    if std::env::var("GEX_CGEN_PRECOMPILE").as_deref() == Ok("1") {
+        let t1 = std::time::Instant::now();
+        gex_native::nt_cgen::precompile_unit(&out)?;
+        eprintln!("{path} at {base:#x}: compiled in {:.1}s", t1.elapsed().as_secs_f64());
+    }
     Ok(())
 }
 

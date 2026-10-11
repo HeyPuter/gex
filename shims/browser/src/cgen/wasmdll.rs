@@ -202,7 +202,7 @@ fn clear(addrs: &[u64]) {
 
 /// Map `pairs` to slots of `install` and queue their bridges for every
 /// Worker.
-fn bind(install: u32, pairs: &[(u64, u32)]) {
+pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
     if pairs.is_empty() {
         return;
     }
@@ -360,9 +360,9 @@ fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
     out
 }
 
-/// Exported i32 globals with constant initialisers: a PIC module's data
-/// symbols, as offsets from `__memory_base`.
-fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, String> {
+/// Exported globals with constant initialisers: a PIC module's data
+/// symbols, as offsets from `__memory_base` (i64 in a wasm64 module).
+pub(super) fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, String> {
     let e = |e: wasmparser::BinaryReaderError| e.to_string();
     let mut imported_globals = 0u32;
     let mut inits: Vec<Option<u32>> = Vec::new();
@@ -382,6 +382,7 @@ fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, String> {
                     let mut ops = g.init_expr.get_operators_reader();
                     inits.push(match ops.read().map_err(e)? {
                         wasmparser::Operator::I32Const { value } => Some(value as u32),
+                        wasmparser::Operator::I64Const { value } => u32::try_from(value).ok(),
                         _ => None,
                     });
                 }

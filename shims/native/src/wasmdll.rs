@@ -209,6 +209,78 @@ fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
 
 /// Exported i32 globals with constant initialisers: a PIC module's data
 /// symbols, as offsets from `__memory_base`.
+/// Wine's PE module, read, parsed and loaded: what every process that
+/// installs it shares (all but its data's address). Kept for the host
+/// process by path, size and modification time, so a Wine child does not
+/// read, hash and parse the 8.6 MB module again (0.3 s of each child's
+/// start on edger).
+struct ParsedModule {
+    size: u32,
+    align: u32,
+    n_names: u32,
+    slots: std::collections::HashMap<String, u32>,
+    any_dll: std::collections::HashMap<String, u32>,
+    data_exports: std::collections::HashMap<String, u32>,
+    module: wasmtime::Module,
+}
+
+fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::time::Instant) -> Result<Arc<ParsedModule>> {
+    type Memo = Vec<((std::path::PathBuf, u64, Option<std::time::SystemTime>), wasmtime::Engine, Arc<ParsedModule>)>;
+    static MEMO: Mutex<Memo> = Mutex::new(Vec::new());
+    let md = std::fs::metadata(file).with_context(|| format!("reading Wine's PE module {}", file.display()))?;
+    let id = (file.to_path_buf(), md.len(), md.modified().ok());
+    if let Some((_, _, pm)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, e, _)| *i == id && wasmtime::Engine::same(e, engine)) {
+        return Ok(Arc::clone(pm));
+    }
+    let wasm = std::fs::read(file).with_context(|| format!("reading Wine's PE module {}", file.display()))?;
+    let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+    let names = gex_cgen::provider::slot_names(&wasm)?;
+    let mut slots = std::collections::HashMap::new();
+    let mut any_dll = std::collections::HashMap::new();
+    for (k, n) in names.iter().enumerate() {
+        if let Some(n) = n {
+            if let Some((_, export)) = n.split_once("!gexp_") {
+                any_dll.entry(export.to_string()).or_insert(k as u32);
+            }
+            slots.insert(n.clone(), k as u32);
+        }
+    }
+    // Forwarded names (pelink's `gexw.forwards`): a re-export of one
+    // binds to the adapter of what the forward reaches.
+    for (name, target) in forwards(&wasm) {
+        if let Some((dll, fname)) = target.split_once('!') {
+            if let Some(&k) = slots.get(&format!("{dll}!gexp_{fname}")) {
+                any_dll.entry(name).or_insert(k);
+            }
+        }
+    }
+    let t1 = std::time::Instant::now();
+    let cwasm = crate::libprov::cwasm_path(file, &wasm);
+    let t2 = std::time::Instant::now();
+    let module = gex_cache::load_or_compile_at(engine, &cwasm, &wasm).with_context(|| format!("compiling {}", file.display()))?;
+    crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
+    if crate::wasm_trace() {
+        eprintln!(
+            "gex: wine PE: {} KiB module: read and parsed in {:.3}s, keyed in {:.3}s, loaded in {:.3}s",
+            wasm.len() >> 10,
+            (t1 - t0).as_secs_f64(),
+            (t2 - t1).as_secs_f64(),
+            t2.elapsed().as_secs_f64()
+        );
+    }
+    let pm = Arc::new(ParsedModule {
+        size: size as u32,
+        align: align as u32,
+        n_names: names.len() as u32,
+        slots,
+        any_dll,
+        data_exports: exported_offsets(&wasm)?,
+        module,
+    });
+    MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
+    Ok(pm)
+}
+
 fn exported_offsets(wasm: &[u8]) -> Result<std::collections::HashMap<String, u32>> {
     let mut imported_globals = 0u32;
     let mut inits: Vec<Option<u32>> = Vec::new();
@@ -288,37 +360,17 @@ fn install_shared(
     let (wp, first) = match existing {
         Some(wp) => (wp, None),
         None => {
+            let t0 = std::time::Instant::now();
             let file = std::path::Path::new(path).with_file_name(&module_name);
-            let wasm = std::fs::read(&file).with_context(|| format!("reading Wine's PE module {}", file.display()))?;
-            let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+            let pm = parsed_module(&file, engine, t0)?;
+            let (size, align) = (pm.size, pm.align);
             let a = 1u64 << align;
             let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?;
             let data = (data + a - 1) & !(a - 1);
-            let names = gex_cgen::provider::slot_names(&wasm)?;
-            let mut slots = std::collections::HashMap::new();
-            let mut any_dll = std::collections::HashMap::new();
-            for (k, n) in names.iter().enumerate() {
-                if let Some(n) = n {
-                    if let Some((_, export)) = n.split_once("!gexp_") {
-                        any_dll.entry(export.to_string()).or_insert(k as u32);
-                    }
-                    slots.insert(n.clone(), k as u32);
-                }
-            }
-            // Forwarded names (pelink's `gexw.forwards`): a re-export of one
-            // binds to the adapter of what the forward reaches.
-            for (name, target) in forwards(&wasm) {
-                if let Some((dll, fname)) = target.split_once('!') {
-                    if let Some(&k) = slots.get(&format!("{dll}!gexp_{fname}")) {
-                        any_dll.entry(name).or_insert(k);
-                    }
-                }
-            }
-            let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(&file, &wasm), &wasm)
-                .with_context(|| format!("compiling {}", file.display()))?;
-            crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()), entries_bound: Default::default(), mapped: Default::default() };
-            (Arc::new(wp), Some((module, names.len() as u32)))
+            let (slots, any_dll, module, n_names) = (pm.slots.clone(), pm.any_dll.clone(), pm.module.clone(), pm.n_names);
+            let data_exports_map = pm.data_exports.clone();
+            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: data_exports_map, pending: Mutex::new(Vec::new()), entries_bound: Default::default(), mapped: Default::default() };
+            (Arc::new(wp), Some((module, n_names)))
         }
     };
 

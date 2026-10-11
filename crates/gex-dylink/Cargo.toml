@@ -1,0 +1,15 @@
+[package]
+name = "gex-dylink"
+description = "Shared libraries for native wasm32 programs: dylink.0 side modules, their load plan, and the build-time self-binding of weak definitions (docs/gexcc.md §7)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wasmparser = "0.219.2"
+wasm-encoder = { version = "0.219.2", features = ["wasmparser"] }
+anyhow = "1"
+
+[[bin]]
+name = "gex-dylink"
+path = "src/main.rs"

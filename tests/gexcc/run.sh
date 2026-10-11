@@ -10,6 +10,11 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$(mktemp -d)}
 command -v gexcc > /dev/null || { echo "gexcc not on PATH (tools/gexcc/install.sh)"; exit 2; }
+# GEXCC_SHARED=1: every program linked against libc.so (docs/gexcc.md 7),
+# found through LD_LIBRARY_PATH (the host's root is the guest's here)
+if [ "${GEXCC_SHARED:-0}" != 0 ]; then
+    export LD_LIBRARY_PATH="$(gexcc --print-sysroot)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 fail=0
 for src in "$HERE"/*.c "$HERE"/*.cpp; do
     case $src in
@@ -18,6 +23,8 @@ for src in "$HERE"/*.c "$HERE"/*.cpp; do
     esac
     $hcc -O1 -w -o "$WORK/$name.native" "$src" -lpthread || { echo "FAIL $name: $hcc"; fail=1; continue; }
     extra=; case $name in fpcast*) extra=-fgex-fpcast-emu ;; esac
+    # (function pointer cast emulation is static-only)
+    case $name in fpcast*) [ "${GEXCC_SHARED:-0}" != 0 ] && extra="$extra -static" ;; esac
     $gcc_ -O2 -w $extra -o "$WORK/$name" "$src" || { echo "FAIL $name: $gcc_"; fail=1; continue; }
     if [ -f "$HERE/$name.sh" ]; then
         native=$(cd "$WORK" && sh "$HERE/$name.sh" "./$name.native" 2>&1); ns=$?

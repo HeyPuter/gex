@@ -9,7 +9,9 @@
 # Steps (each cached; rerunning rebuilds what changed):
 #   1. tools/gexcc/debian/build.sh TIER   sources fetched and verified
 #      (debsrc.py), Debian's patches applied, built with gexcc
-#   2. mkdebs.py per built package        .debs into $GEXCC_DEB/pool
+#   2. mkdebs.py per built package        .debs into $GEXCC_DEB/pool,
+#      and item3/mkdeb.sh                  gex-providers-arm64 (zlib, zstd,
+#                                          sqlite3 as wasm for arm64 programs)
 #   3. mkrootfs.py                        Debian's arm64 closure (verified,
 #      debfetch.py) + ours, dpkg database, apt sources and pins
 #   4. zstd -19                           web/public/rootfs/native-debian.tar.zst
@@ -38,6 +40,7 @@ while read -r n v r; do
   u=${v#*:}
   python3 -I "$D/mkdebs.py" --src "$GEXCC_DEB/src/$n-$u" --stage "$GEXCC_DEB/stage/$n" --out "$GEXCC_DEB/pool" "$n" "$v"
 done < "$GEXCC_DEB/built.txt"
+"$TOP/tools/gexcc/item3/mkdeb.sh" "$GEXCC_DEB/pool"
 mkdir -p "$OUT" "$WORK"
 python3 -I "$D/mkrootfs.py" --pool "$GEXCC_DEB/pool" --out "$WORK/tree" --tar "$WORK/native-debian.tar"
 zstd -19 -T0 -q -f "$WORK/native-debian.tar" -o "$OUT/native-debian.tar.zst"

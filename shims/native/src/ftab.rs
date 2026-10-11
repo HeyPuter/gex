@@ -43,6 +43,10 @@ pub(crate) struct Shared {
     /// Stateful providers' installs (`libprov`), by module: their data's
     /// guest address.
     pub stateful: HashMap<u32, crate::libprov::Extras>,
+    /// Shared-library modules (`dylink`): how each binds its imports.
+    pub dylink: HashMap<u32, Arc<crate::dylink::Binds>>,
+    /// The process's link map, when its program uses shared libraries.
+    pub dyproc: Option<crate::dylink::DyProcess>,
     /// Installs that are export providers (`publish_pairs`): native code in
     /// place of a library's, so a rewrite of the library's bytes there does
     /// not retire them (the bytes are not what runs). Noita's mod sandbox
@@ -89,6 +93,12 @@ pub(crate) struct Store {
     pub provider_stack_lo: u64,
     /// The wasm exception tag of `gex.provider_throw` (wasm64 providers; [`crate::libprov::tag`]).
     pub provider_tag: Option<wasmtime::Tag>,
+    /// This store's instance of each shared-library module (`dylink`), by
+    /// module: what later modules' imports are bound to.
+    pub dyl: HashMap<u32, wasmtime::Instance>,
+    /// asyncify's state and data pointer, shared by this store's modules
+    /// (binaryen's `asyncify-relocatable`: a fork unwinds through all).
+    pub asyncify: Option<(wasmtime::Global, wasmtime::Global)>,
     /// How far through the map's log this table is.
     replayed: usize,
 }
@@ -252,7 +262,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_stack_lo: 0, provider_tag: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_stack_lo: 0, provider_tag: None, dyl: HashMap::new(), asyncify: None, replayed: 0 });
     Ok(())
 }
 
@@ -263,13 +273,20 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
     let Some(st) = jit.ftab.as_ref() else { return Ok(()) };
     let (sh, from, table, resolve) = (Arc::clone(&jit.shared), st.replayed, st.table, st.resolve.clone());
     #[allow(clippy::type_complexity)]
-    let (events, size, installs, modules, stateful): (Vec<Event>, u32, Vec<gex_kernel::ftab::Install>, Vec<Module>, HashMap<u32, crate::libprov::Extras>) = {
+    let (events, size, installs, modules, stateful, dylink): (
+        Vec<Event>,
+        u32,
+        Vec<gex_kernel::ftab::Install>,
+        Vec<Module>,
+        HashMap<u32, crate::libprov::Extras>,
+        HashMap<u32, Arc<crate::dylink::Binds>>,
+    ) = {
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
         let ev = s.ftab.map.log_from(from).to_vec();
         if ev.is_empty() {
             return Ok(());
         }
-        (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone(), s.ftab.stateful.clone())
+        (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone(), s.ftab.stateful.clone(), s.ftab.dylink.clone())
     };
     let have = table.size(cx.as_context_mut());
     if (size as u64) > have {
@@ -280,7 +297,15 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
             Event::Install(i) => {
                 let inst = &installs[i as usize];
                 let module = &modules[inst.module as usize];
-                instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied())?;
+                let t0 = std::time::Instant::now();
+                let dy = dylink.get(&inst.module).cloned();
+                let inst_i = instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied(), dy.as_deref())?;
+                if let Some(dy) = dy {
+                    crate::dylink::after_instantiate(cx.as_context_mut(), table, inst.module, &inst_i, &dy)?;
+                }
+                if crate::wasm_trace() && t0.elapsed().as_millis() >= 10 {
+                    eprintln!("gex: instantiated install {i} (base {}) in {:.3}s", inst.base, t0.elapsed().as_secs_f64());
+                }
             }
             Event::Retire(idx) => {
                 table.set(cx.as_context_mut(), idx as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
@@ -300,6 +325,7 @@ fn instantiate(
     base: u32,
     module: &Module,
     stateful: Option<crate::libprov::Extras>,
+    dy: Option<&crate::dylink::Binds>,
 ) -> Result<wasmtime::Instance> {
     use gex_abi::ftab as f;
     let (linker, memory) = {
@@ -366,7 +392,13 @@ fn instantiate(
             l.define(&mut c, m, name, func)?;
         }
     }
-    let inst = l.instantiate(&mut c, module).context("instantiating a function-table module")?;
+    if let Some(dy) = dy {
+        crate::dylink::define_imports(&mut c, &mut l, table, module, dy)?;
+    }
+    let inst = l.instantiate(&mut c, module).with_context(|| match dy {
+        Some(d) => format!("instantiating {}", d.path),
+        None => "instantiating a function-table module".to_string(),
+    })?;
     if let Some(x) = stateful {
         crate::libprov::relocate_once(&mut c, &inst, x)?;
     }
