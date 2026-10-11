@@ -137,13 +137,17 @@ if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['gexNoColdPrefetch']) {
     var cache = gexMesaCold();
     if (cache[file]) return;
     cache[file] = 'pending';
+    var t0 = performance.now(), size = 0;
     fetch(file).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.arrayBuffer();
     }).then(function (bytes) {
+      size = bytes.byteLength;
       return WebAssembly.compile(bytes);
     }).then(function (module) {
       if (!(cache[file] instanceof WebAssembly.Module)) cache[file] = module;
+      console.warn('[gex-wgpu] cold part prefetched (' + size + ' bytes) in ' +
+                   (performance.now() - t0).toFixed(1) + ' ms');
     }, function (e) {
       if (cache[file] === 'pending') delete cache[file];
       console.warn('[gex-wgpu] cold part prefetch failed: ' + e);

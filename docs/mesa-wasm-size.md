@@ -104,7 +104,7 @@ Hence the split (section 4), not deletion.
 
 Sizes are of the module as a dist ships it (names and DWARF stripped by
 web/build-all.sh), mt unless said; zstd at -19. Mesa CPU ms per frame is
-the replay's `submit_ms` (scratch/GL/replay-run.mjs on edger, Chromium on
+the replay's `submit_ms` (scratch/M/edger/replay-run.mjs on edger, Chromium on
 its GPU, the last 600 frames of Noita's world trace and of HK's menu
 trace, counters off), two passes in ABBA order; lower is faster.
 
@@ -112,14 +112,15 @@ trace, counters off), two passes in ABBA order; lower is faster.
 
 ASSERTIONS=2 implies STACK_OVERFLOW_CHECK=2: a call to a limit check at
 each of the 15,695 places the stack pointer moves, and a cookie at address
-0. Nothing in gex relied on it to catch a bug: the one stack overflow a
-long Unity run hit (a 16 MB pthread stack) is in a pthread, which the check
-did not watch either. In its place the replay links with
-`-Wl,--stack-first`: the main stack sits at the bottom of memory, and
-overflowing it wraps below address 0, where the next store traps instead of
-silently overwriting data. A pthread's stack has no such guard, as before.
-(With STACK_FIRST, emcc also stops passing Binaryen `--low-memory-unused`;
-no measurable cost below.)
+0; the rest of it is checks in the JS glue. What it caught that matters is a
+stack overflow (a long Unity run hit one). Mesa runs on the module's main
+stack in every realm (nothing here uses glthread or another pthread), and
+the replay now links with `-Wl,--stack-first`: that stack sits at the bottom
+of memory, so overflowing it wraps below address 0 and the next store traps,
+as the check did, instead of silently overwriting data -- without a call per
+function. (A pthread's stack would have no such guard; none runs Mesa.
+With STACK_FIRST, emcc also stops passing Binaryen `--low-memory-unused`; no
+measurable cost below.)
 
 | build | stripped | zstd -19 | Noita world, ms/frame | HK menu, ms/frame |
 | --- | --- | --- | --- | --- |
@@ -275,12 +276,18 @@ Chromium on its GPU, unless said:
 | Muck menu trace replay (3,000 frames) | 4,479 | 5.95 MB |
 | **union** | **4,865 (19.7%)** | **6.22 MB (39.4%)** |
 | margin: direct callees up to 1 KB, of callers of up to 64 | +1,047 | +0.34 MB |
-| **kept** | **5,912 (23.9%)** | **6.56 MB (41.5%)** |
+| first list | 5,912 (23.9%) | 6.56 MB (41.5%) |
+| HK and Muck pages again, printed in full (4,036 and 4,303 run) | +1 (`_dispatch_stub_GetObjectLabelEXT`) | |
+| margin over the new union | +229 | +0.07 MB |
+| **kept** | **6,143 (24.8%)** | **6.63 MB (42.0%)** |
 
 The page harnesses cut console lines at about 4,000 characters, and a set
-of 24,721 functions is 4,120 in base64, so the page rows above miss the last
-937 functions (0.98 MB: dispatch stubs, part of Tint's IR); the trace
-replays of the same games, which print in full, cover them. The glue now
+of 24,721 functions is 4,120 in base64, so the first page rows above miss
+the last 937 functions (0.98 MB: dispatch stubs, part of Tint's IR); the
+trace replays of the same games, which print in full, covered all but one:
+the HK and Muck pages, run again with the profile printed in pieces, each
+ran exactly one function outside the first list, the GL_EXT_debug_label
+dispatch stub, which was each page's one miss. The glue now
 prints the set in 2 KiB pieces (`mesa-profile N HITS @OFFSET BASE64`), and
 tools/mesa-hot.py reads both forms (and as much of a cut line as there is).
 
@@ -295,15 +302,84 @@ As the dists ship them (stripped), zstd at -19:
 | flavour | file | raw | zstd -19 |
 | --- | --- | --- | --- |
 | MP | master, whole | 18,898,007 | 3,305,617 |
-| MP | M3: gex-wgpu-replay.wasm | 9,959,418 | 2,017,052 |
-| MP | M3: gex-wgpu-replay.deferred.wasm | 9,577,387 | 1,509,353 |
+| MP | M3: gex-wgpu-replay.wasm | 10,031,571 | 2,032,243 |
+| MP | M3: gex-wgpu-replay.deferred.wasm | 9,503,551 | 1,493,059 |
 | SP | master, whole | 18,669,577 | 3,300,261 |
-| SP | M3: gex-wgpu-replay.wasm | 9,730,808 | 2,017,572 |
-| SP | M3: gex-wgpu-replay.deferred.wasm | 9,606,743 | 1,507,155 |
+| SP | M3: gex-wgpu-replay.wasm | 9,800,101 | 2,029,473 |
+| SP | M3: gex-wgpu-replay.deferred.wasm | 9,535,967 | 1,492,115 |
 
-What a page fetches and compiles before Mesa starts is 47.3% smaller raw
-than master's (9.96 against 18.90 MB) and 39.0% smaller compressed (2.02
-against 3.31 MB) in MP; 47.9% and 38.9% in SP. The two parts together are
-0.88 MB more raw than the unsplit M2 build (19,536,805 against 18,655,830: the
-17,425 trampolines, and the
-exports the cold part imports through).
+What a page fetches and compiles before Mesa starts is 46.9% smaller raw
+than master's (10.03 against 18.90 MB) and 38.5% smaller compressed (2.03
+against 3.31 MB) in MP; 47.5% and 38.5% in SP. The two parts together are
+0.88 MB more raw than the unsplit M2 build (19,535,122 against 18,655,830):
+the 17,267 trampolines and the exports the cold part imports through.
+Binaryen at -Oz on the cold part alone takes it to 8,640,842 bytes but
+makes it 15 KB bigger compressed, so it is left at -O3.
+
+### Speed and misses (M3, edger)
+
+Mesa CPU per frame, by trace replay (the last 600 frames, page main thread,
+so the cold part is loaded with the module), ms/frame, runs in alternating
+order:
+
+| trace | unsplit (M2 build) | split | split, every function kept |
+| --- | --- | --- | --- |
+| Noita world | 5.144 5.102 5.207 5.066 | 4.884 4.955 4.905 4.796 | 4.906 4.978 |
+| HK menu | 4.857 5.078 6.5 5.066 5.088 5.049 4.949 4.815 6.322 6.109 | 6.191 6.237 6.345 5.249 5.491 5.112 6.284 5.159 5.488 4.89 | 5.068 5.106 |
+
+The split is 4.8% faster on Noita's trace (mean 4.885 against 5.130) and
+4.9% slower on HK's (mean 5.645 against 5.383). The HK trace's runs fall
+into two groups, about 5.0 and about 6.2 ms, in every build; three of the
+ten unsplit runs land high and four of the ten split ones. A V8 CPU profile
+of the split's measured HK window has no sample in the cold part (fin
+5.583, split 5.503 ms/frame with the profiler on), so the difference is
+not cold code running: it is where the code sits, about the size of the
+spread.
+
+Pages (last-minute presents/s, each minute of the last four):
+
+| page | build | presents/s | cold part |
+| --- | --- | --- | --- |
+| Muck | master's Mesa | 10.8 11.0 11.1 10.4 | none |
+| Muck | split | 11.2 11.2 11.1 10.5 | one miss, prefetched: 5.7 ms |
+| HK (j4) | split, then master's | 13.6 12.8 12.9 13.3 / 14.9 14.9 14.8 14.6 | one miss, prefetched: 9.4 ms |
+| HK (j5, ABBA) | master's | 15.0 14.9 15.1 15.3 | none |
+| | split | 13.6 13.2 13.3 13.5 | one miss, prefetched: 8.9 ms |
+| | split | 14.6 14.7 14.8 14.7 | one miss, prefetched: 6.2 ms |
+| | master's | 14.0 13.7 13.6 13.9 | none |
+
+Muck's split is 1.6% faster (11.0 against 10.8). HK's ABBA is 2.7% slower
+split (14.05 against 14.44), inside the spread of master's own two runs
+(15.08 and 13.80).
+
+A miss's stall, edger:
+
+| where | how | stall |
+| --- | --- | --- |
+| Muck and HK pages, compositor Worker | prefetched, then instantiated | 5.7 to 9.4 ms |
+| Muck page, compositor Worker, forced early miss (`_mesa_Viewport` cold) | synchronous fetch and compile, 9,577,491 bytes | 304.5 ms |
+| HK trace replay, main thread (lazy), forced late miss, no prefetch | synchronous fetch and compile | 261.7 ms |
+| the same, early miss | synchronous fetch and compile | 239.9 ms |
+| the same, late miss, prefetch still compiling | synchronous fetch and compile | 306.9 ms |
+
+A miss while the prefetch is still compiling does not wait for it (a
+synchronous call cannot): it fetches and compiles again.
+
+### Testing it
+
+`node tests/mesa-cold/run.mjs [TARGET_DIR]` (GEX_WEBGPU_SOFTWARE=1 on a host
+without a GPU) replays the gears trace through the build's Mesa whole, split,
+and with glReadPixels forced cold (`web/mesa-split.py --cold`) and missed,
+with and without the prefetch, and checks every read-back hashes the same.
+On gooner, mt and st, all four legs pass with digest 9e7d5cb9/307200.
+
+The realms, on gooner (SwiftShader; correctness only):
+
+| realm | test | result |
+| --- | --- | --- |
+| MP page main thread | tests/mesa-cold (split leg) | cold part loaded with the module |
+| MP compositor Worker | tests/nt/browser-gui.mjs --arch x86 --gl, x64 --gl | 12/12 ok each, no miss |
+| MP compositor Worker, direct present | the same with GEX_NT_PAGE_FLAGS='&direct=1' | 12/12 ok each, no miss |
+| MP compositor Worker, forced miss | browser-gui x86 --gl with a hot list missing glwindow's functions | 12/12 ok, one synchronous load |
+| SP system Worker | web/test/site.mjs gears on web/dist-sp | ok |
+| eject page | web/build-eject-page.sh | carries gex-wgpu-replay.deferred.wasm beside the module; Mesa runs in the same compositor Worker |
