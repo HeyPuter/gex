@@ -206,7 +206,9 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 /// native host's `image_mapped` does. The module number when this is the
 /// first skeleton (the host instantiates it, then `gex_cgen_pmod_installed`
 /// and `gex_wasmdll_installed`), -2 when bound into the install (bridges
-/// to write), -1 for anything else (an i386 image stays on tier-1).
+/// to write), -3 for an i386 image with a function-tier unit to serve
+/// (`super::w3_mapped`), -1 for anything else (an i386 image stays on
+/// tier-1).
 #[no_mangle]
 pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     let base = base as u64;
@@ -229,8 +231,8 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     let Ok(pe) = gex_ld::pe::parse(&bytes) else { return -1 };
     if !is_skeleton(&pe) {
         // An i386 image (the program's, a game's DLL): its function-tier
-        // unit, when units are on; -2 tells JS to serve it.
-        return if super::w3_mapped(&path, base, &pe) { -2 } else { -1 };
+        // unit, when units are on; -3 tells JS to serve it.
+        return if super::w3_mapped(&path, base, &pe) { -3 } else { -1 };
     }
     match publish(&path, base, &pe) {
         Ok(n) => n,
