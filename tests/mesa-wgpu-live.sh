@@ -34,6 +34,9 @@ BUILD=${GEX_MESA_WASM_OUT:-${TMPDIR:-/tmp}/gex-mesa-wasm}/build/src/gallium/targ
 mkdir -p "$WORK" "$ROOT/web/public/gex" "$ROOT/web/dist/gex"
 for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     cp "$BUILD/gex-wgpu-replay.js" "$BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
+    # The cold part, when the build split one off (docs/mesa-wasm-size.md).
+    rm -f "$tree/gex/gex-wgpu-replay.deferred.wasm"
+    [ ! -f "$BUILD/gex-wgpu-replay.deferred.wasm" ] || cp "$BUILD/gex-wgpu-replay.deferred.wasm" "$tree/gex/"
 done
 
 GEX_CHROME_PORT=${GEX_CHROME_PORT:-9335} \

@@ -32,6 +32,9 @@ case ${GEX_CTS_BACKEND:-mesa} in
             mkdir -p "$tree/gex"
             cp "$MESA_BUILD/gex-wgpu-replay.js" \
                "$MESA_BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
+            rm -f "$tree/gex/gex-wgpu-replay.deferred.wasm"
+            [ ! -f "$MESA_BUILD/gex-wgpu-replay.deferred.wasm" ] ||
+                cp "$MESA_BUILD/gex-wgpu-replay.deferred.wasm" "$tree/gex/"
         done
         ;;
     *) echo "unknown GEX_CTS_BACKEND: ${GEX_CTS_BACKEND}" >&2; exit 2 ;;
