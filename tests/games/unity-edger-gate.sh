@@ -12,7 +12,8 @@
 #             "Initializing packets" and presents a non-black frame after it;
 #   hk        Hollow Knight reaches its menu (the unload after Menu_Title) and presents a
 #             non-black frame after it.
-# The game legs run with the .NET wasm JIT on (the default; JIT=0 for the interpreter only).
+# Muck runs with the .NET wasm JIT on (JIT=0 for the interpreter only). Hollow Knight runs on the
+# interpreter, its default since q81 (docs/unity-dotnet.md section 13; HK_JIT=1 for the JIT).
 # Each game leg keeps its summary and its last frame as PNG in OUT. Runs go through
 # scratch/bench/bench.sh (BENCH_HOST, edger by default), one at a time under its lock, with
 # tests/games/unity-bench.sh. Takes about 25 min with a warm GEX_FJIT_CACHE, 40 cold.
@@ -45,10 +46,10 @@ rc=0
 if grep -q "^test result: ok" "$OUT/gex-gl.txt"; then echo "gex-gl: PASS ($(grep -o '[0-9]* passed' "$OUT/gex-gl.txt"))"
 else echo "gex-gl: FAIL"; grep -E "FAILED|panicked" "$OUT/gex-gl.txt" | head -5; rc=1; fi
 # 2. and 3. the games
-leg() { # NAME GAME SECS MARKER
-	local name=$1 game=$2 secs=$3 marker=$4 run=$HOME/gex-sandbox/scratch/unity/edger-gate/run-$HEAD-$1
+leg() { # NAME GAME SECS MARKER JIT
+	local name=$1 game=$2 secs=$3 marker=$4 jit=$5 run=$HOME/gex-sandbox/scratch/unity/edger-gate/run-$HEAD-$1
 	"$B" -- env GEXC="$ST/gexc" DNC="$ST/dnc" GEX_FJIT_CACHE=1 EVERY=600 \
-		bash "$TREE/tests/games/unity-bench.sh" "$game" "$run" "$secs" --fjit --env GEXMONO_WASM_JIT="${JIT:-1}" > "$OUT/$name.txt" 2>&1
+		bash "$TREE/tests/games/unity-bench.sh" "$game" "$run" "$secs" --fjit --env GEXMONO_WASM_JIT="$jit" > "$OUT/$name.txt" 2>&1
 	mkdir -p "$OUT/$name-frames"
 	rsync -a --include='f-*.ppm' --include=plog-t.txt --exclude='*' "${BENCH_HOST_SSH:-claude@edger}:$run/" "$OUT/$name-frames/"
 	python3 - "$OUT/$name-frames" "$OUT/$name.png" "$marker" "$OUT/$name.txt" <<-'EOF'
@@ -69,6 +70,6 @@ leg() { # NAME GAME SECS MARKER
 	sys.exit(0 if ok else 1)
 	EOF
 }
-r=$(leg muck muck 600 "Muck packets"); echo "muck: $r"; case $r in PASS*) ;; *) rc=1;; esac
-r=$(leg hk hk 660 "HK menu ready (post-unload)"); echo "hk: $r"; case $r in PASS*) ;; *) rc=1;; esac
+r=$(leg muck muck 600 "Muck packets" "${JIT:-1}"); echo "muck: $r"; case $r in PASS*) ;; *) rc=1;; esac
+r=$(leg hk hk 660 "HK menu ready (post-unload)" "${HK_JIT:-0}"); echo "hk: $r"; case $r in PASS*) ;; *) rc=1;; esac
 exit $rc
