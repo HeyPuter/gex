@@ -201,9 +201,10 @@ pub struct Context<'a> {
     /// entry, so a block not in here grows none and the walk is skipped.
     /// `None`: no filter.
     pub loop_heads: Option<&'a std::collections::HashSet<u64>>,
-    /// The module's `enter(ctx, pc)` (a local function, relocated), when it
-    /// has one: an indirect dispatch tail-calls it instead of carrying the
-    /// whole table selection inline. See [`set_inline_dispatch`].
+    /// The module's `dispatch(ctx, pc)` (a local function, relocated: `enter`
+    /// without its context stores), when it has one: an indirect dispatch
+    /// tail-calls it instead of carrying the whole table selection inline.
+    /// See [`set_inline_dispatch`].
     pub enter: Option<u32>,
 }
 
@@ -5033,10 +5034,14 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_dispatch_tail_call_inner(&mut self) {
-        // Outlined: `enter(ctx, target)` records the PC and `LAST_TARGET` and
-        // does the same lookup and selection. Every caller has stored the PC
-        // already (a dispatch miss reads it), so the second store writes the
-        // value that is there.
+        // Outlined: the module's `dispatch(ctx, target)` stores `LAST_TARGET`
+        // and does the same lookup and selection, so the context is left
+        // exactly as the inline form leaves it, `ctx::PC` as the caller left
+        // it. (Re-storing the PC as `enter` does is not the
+        // same: after an indirect branch's safepoint the PC is the branch
+        // itself, to be re-executed, and a provider's IFUNC address then
+        // reached the miss path, lost its bridge in a loop and panicked
+        // tier-1 in the native-debian page.)
         if let Some(enter) = self.cx.enter.filter(|_| !inline_dispatch() && gex_abi::DISPATCH_TABLES > 1) {
             if gex_abi::X86 {
                 self.ctx_base();

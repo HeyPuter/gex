@@ -565,6 +565,11 @@ pub struct ModuleBuilder {
     miss_stub: u32,
     /// `enter(ctx, pc)`, which the miss stub re-dispatches through.
     enter: u32,
+    /// `dispatch(ctx, pc)`: `enter`'s lookup and tail call without its stores
+    /// of `ctx::PC` and `ctx::LAST_TARGET`, which is what a block's indirect
+    /// dispatch tail-calls (tier-1's inline dispatch never stored them on
+    /// A64, and a cgen bridge reads `LAST_TARGET`).
+    dispatch: u32,
     /// Guest block address -> wasm function index.
     blocks: HashMap<u64, u32>,
     /// Blocks awaiting code generation, paired with their function index.
@@ -752,6 +757,7 @@ impl ModuleBuilder {
         // their indices are known before any block is declared.
         let miss_stub = m.declare_func(block_ty);
         let enter = m.declare_func(t_syscall);
+        let dispatch = m.declare_func(t_syscall);
 
         let mut b = ModuleBuilder {
             m,
@@ -762,6 +768,7 @@ impl ModuleBuilder {
             block_ty,
             miss_stub,
             enter,
+            dispatch,
             blocks: HashMap::new(),
             pending: Vec::new(),
             imports,
@@ -799,7 +806,9 @@ impl ModuleBuilder {
         let stub_body = b.build_miss_stub();
         b.m.define_func(miss_stub, stub_body);
         let enter_body = b.build_enter();
-        b.m.define_func(enter, enter_body);
+        b.m.define_func_with_relocs(enter, enter_body.0, enter_body.1);
+        let dispatch_body = b.build_dispatch();
+        b.m.define_func(dispatch, dispatch_body);
 
         if linkage == Linkage::Own {
             // Re-export the imported memory (index 0, imports coming first),
@@ -932,7 +941,7 @@ impl ModuleBuilder {
                 page_bases: Some(&page_bases),
                 module_id,
                 loop_heads: Some(&heads),
-                enter: Some(self.enter),
+                enter: Some(self.dispatch),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
@@ -1335,11 +1344,10 @@ impl ModuleBuilder {
         f.finish()
     }
 
-    /// `(ctx, pc) -> ()`: the host's entry point into translated code.
-    fn build_enter(&self) -> Vec<u8> {
+    /// `(ctx, pc) -> ()`: the host's entry point into translated code:
+    /// record the PC and the target, then [`Self::build_dispatch`]'s lookup.
+    fn build_enter(&self) -> (Vec<u8>, Vec<u32>) {
         let mut f = FuncBody::new(2);
-        let page = f.add_local(ValType::I64);
-
         // Record the entry PC so a miss inside `enter` reports it correctly,
         // and the exact target: for a shared slot's trampoline (x86-64), and
         // for the function table's bridge (merge-plan §9.8.1), which serves
@@ -1348,6 +1356,18 @@ impl ModuleBuilder {
         f.addr_i32();
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
+        f.local_get(0);
+        f.local_get(1);
+        f.return_call_local(self.dispatch);
+        f.finish_with_relocs()
+    }
+
+    /// `(ctx, pc) -> ()`: record the target in `ctx::LAST_TARGET`, then the
+    /// two-level lookup and the tail call to the block -- what tier-1's inline
+    /// dispatch does, leaving `ctx::PC` alone.
+    fn build_dispatch(&self) -> Vec<u8> {
+        let mut f = FuncBody::new(2);
+        let page = f.add_local(ValType::I64);
         f.local_get(0);
         f.addr_i32();
         f.local_get(1);
