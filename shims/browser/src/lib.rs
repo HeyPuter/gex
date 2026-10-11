@@ -6226,6 +6226,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     }
+    // The clock calls, answered without the kernel lock (see `clock_fast_path`).
+    if !IN_PROVIDER.with(|c| c.get()) && clock_fast_path(ctx) {
+        return;
+    }
     fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
@@ -6235,8 +6239,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         cgen::libprov::syscall_enter(tracked_tid);
     }
     // Which syscall is running, so the allocator can name who was asking (wasm
-    // has no backtrace). See `HEAP_BY_CALL`.
-    {
+    // has no backtrace). See `HEAP_BY_CALL`. Kept here too: `SYSCALL_NR` is
+    // shared by every Worker of the process.
+    let this_nr = {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
@@ -6267,7 +6272,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         } else {
             SELECT_ARGS[0].store(0, std::sync::atomic::Ordering::Relaxed);
         }
-    }
+        n
+    };
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
@@ -6522,7 +6528,18 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
         let slot = sys_note(nr, a0, a1);
+        // The signals this call will see, read before it takes them: a fast
+        // clock call after it is safe only while no newer one was sent.
+        let sig_seen = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
+        FAST_ABI.store(
+            if h.kernel.compat { 1 } else { 2 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        FAST_STARTED.store(h.kernel.started as u64, std::sync::atomic::Ordering::Relaxed);
+        FAST_SIG.with(|c| c.set(sig_seen));
+        FAST_RUN.with(|c| c.set(0));
+        CANON_NR.with(|c| c.set(h.kernel.syscall_nr));
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
         // A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
@@ -6969,7 +6986,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // every syscall, not a hand-picked list: the list is long and not obviously
     // closed, and a missed entry is a process that sleeps through its wake. The
     // notify costs nothing when nobody is parked.
-    if unsafe { k_present() } != 0 {
+    // The kernel's own (canonical) number: `this_nr` is the raw one, which
+    // for an i386-ABI process -- W3's Wine -- is in i386 numbering.
+    let _ = this_nr;
+    let canon = CANON_NR.with(|c| c.replace(u64::MAX));
+    if unsafe { k_present() } != 0 && !wakes_nobody(canon) {
         unsafe { k_wake() };
     }
     // Objects the guest just mapped, recompiled in bulk before it can branch in.
@@ -7151,6 +7172,101 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 // save or restore: `fork` asks the host for a Worker with a copy of the
 // parent's regions, `wait4`/`kill`/`exit` route through the kernel's table, and
 // each process is a Worker the engine schedules.
+
+/// Whether syscall `nr` (canonical) can never be what another Worker waits
+/// for: it reads a clock or an identity, or changes only the caller's own
+/// state. The wake after every syscall wakes every Worker parked on the global
+/// counter -- a W3 game's idle Wine threads, ~25 of them -- and each takes the
+/// host lock to re-check. A game thread that reads the clock and yields
+/// thousands of times a second (Wine's NtYieldExecution is getrusage,
+/// sched_yield, getrusage) kept them all cycling, and the game thread then
+/// spent ~40 ms of every Undertale frame in KLock::take. A list of what
+/// cannot wake, not of what can: a call missing here costs a wake, never a
+/// lost one.
+fn wakes_nobody(nr: u64) -> bool {
+    use gex_kernel::syscalls::nr;
+    matches!(
+        nr,
+        nr::CLOCK_GETTIME
+            | nr::CLOCK_GETRES
+            | nr::GETTIMEOFDAY
+            | nr::TIMES
+            | nr::GETRUSAGE
+            | nr::GETPID
+            | nr::GETPPID
+            | nr::GETTID
+            | nr::GETUID
+            | nr::GETEUID
+            | nr::GETGID
+            | nr::GETEGID
+            | nr::SCHED_YIELD
+            | nr::SCHED_GETAFFINITY
+            | nr::RT_SIGPROCMASK
+            | nr::SIGALTSTACK
+            | nr::NANOSLEEP
+            | nr::CLOCK_NANOSLEEP
+    )
+}
+
+/// What `clock_fast_path` needs to know about this process without taking
+/// the kernel: its ABI (0 not yet known, 1 i386, 2 native) and when it
+/// started (`Kernel::started`), both refreshed by every full syscall.
+static FAST_ABI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static FAST_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Clock calls answered by `clock_fast_path`.
+static FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// `k_signal_seq` as this thread's last full syscall read it.
+    static FAST_SIG: Cell<i32> = const { Cell::new(i32::MIN) };
+    /// Fast calls since this thread's last full syscall.
+    static FAST_RUN: Cell<u32> = const { Cell::new(0) };
+    /// The canonical number of the syscall this thread just made, for
+    /// `wakes_nobody`; `u64::MAX` when the kernel did not run it.
+    static CANON_NR: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// `clock_gettime`, `gettimeofday`, `getrusage` and `sched_yield` served
+/// lock-free (`gex_kernel::syscalls::clock_call`), with no proc snapshot and
+/// no wake. Every other syscall takes the host lock several times
+/// (`with_host`), and a W3 process's ~25 idle Wine Workers contend for it:
+/// Undertale's game thread asks the time ~2,000 times a second (Wine's
+/// `NtDelayExecution` calls `NtYieldExecution`, which is getrusage,
+/// sched_yield, getrusage) and spent ~25 ms of an 87 ms frame in `KLock::take`
+/// for these alone.
+///
+/// The kernel delivers pending signals at every syscall boundary, which this
+/// skips; so it stands down -- the full call runs -- while a signal may be
+/// waiting: whenever `k_signal_seq` has moved since this thread's last full
+/// call, and on every 64th call in a row (a signal raised inside the process
+/// does not move the sequence).
+fn clock_fast_path(ctx: i32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let abi = FAST_ABI.load(Relaxed);
+    if abi == 0 || tracing() || EXITED.load(Relaxed) || cgen::libprov::any_registered() {
+        return false;
+    }
+    if unsafe { k_present() } != 0 && FAST_SIG.with(|c| c.get()) != unsafe { k_signal_seq() } {
+        return false;
+    }
+    if FAST_RUN.with(|c| c.get()) >= 63 {
+        return false;
+    }
+    let mut gm = GuestMem::new(guest_bytes());
+    let started = FAST_STARTED.load(Relaxed) as u128;
+    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started) {
+        return false;
+    }
+    FAST_RUN.with(|c| c.set(c.get() + 1));
+    SYS_CALLS.fetch_add(1, Relaxed);
+    if FAST_CALLS.fetch_add(1, Relaxed) == 0 {
+        warn_line(&format!(
+            "[gex] pid {}: clock calls served without the kernel lock\n",
+            MY_PID.load(Relaxed)
+        ));
+    }
+    true
+}
 
 /// The mark the page's glue puts on a stateful provider's syscalls (as gexrt's
 /// `NATIVE_SYSCALL` on native Wine's, `nt.rs`).
