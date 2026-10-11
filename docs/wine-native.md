@@ -1281,6 +1281,63 @@ unixlib ran through the dlopen registry (§3.12).
 | W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
 | W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
 
+**W3.6 design: `/dev/ntsync` in gex-kernel (2026-10-10, before building).**
+Wine 11's in-process sync (`server/inproc_sync.c`, `dlls/ntdll/unix/sync.c`)
+is the client of Linux's ntsync driver: wineserver opens `/dev/ntsync`, makes
+one ntsync object per event, mutex and semaphore (`NTSYNC_IOC_CREATE_*`),
+and hands each object's fd to a client process once
+(`get_inproc_sync_fd`, cached by handle). From then on, set, reset, pulse,
+release, read and wait-any/all are ioctls on those fds. They never reach
+wineserver. The client's alert fd is an ntsync event too. Its wake goes
+through one `server_wait` for the APC.
+
+- **One object table, shared by every process of a session.** Natively it
+  lives in gex-kernel, process-global like its pipes. In the page it lives in
+  the global kernel (`shims/kernel`, as `k_sock_*` do), and a process's
+  ntsync fds are remote handles to it, as `RemoteUnix` is for sockets.
+  SCM_RIGHTS describes one as a token (`ntsync:id`) beside `sock:id`. Its
+  reference keeps the object alive in flight, and the receiver rebuilds the
+  fd (`scm_rebuild`), as for sockets.
+- **The state machine is one module** (`gex-kernel/src/ntsync.rs`):
+  - objects (semaphore count and max; mutex owner, count and abandoned;
+    event manual and signaled);
+  - wait-any and wait-all with the driver's rules: wait-all acquires every
+    object at once or none, and a mutex is recursive by owner tid;
+  - `MUTEX_KILL` abandons a mutex (`EOWNERDEAD`);
+  - the alert object;
+  - absolute timeouts on CLOCK_MONOTONIC, or CLOCK_REALTIME with
+    `NTSYNC_WAIT_REALTIME`.
+  It has no host types, so it is unit-tested on its own and is the same code
+  natively and in the page.
+- **Waiting is the futex machinery's.** A wait that cannot be satisfied
+  registers its thread on each object it waits on and parks on a per-waiter
+  word:
+  - natively, a `FutexTable` queue, a real host wait (`Parked`, as
+    `FUTEX_WAIT`);
+  - in the page with SharedArrayBuffer, the global kernel's
+    `k_park_futex`/`k_futex_wake` on that word;
+  - in SP's single-thread no-SAB build, the same park through its JSPI
+    scheduler, which already parks futex waits.
+  A signal (set, release, unlock, kill) walks the object's waiters, grants
+  what it can under the driver's rules, and wakes exactly those words. A
+  woken waiter rechecks its grant, so spurious wakes are harmless and no
+  neutral choice assumes SAB.
+- **Device and ABI.** `/dev/ntsync` is a character device in gex-kernel's
+  devfs, with the Linux UAPI ioctl numbers and structs (`linux/ntsync.h`
+  added to the W3 sysroot, so Wine's configure finds it and builds the
+  ntsync path). The i386 personality keeps the structs' 64-bit fields
+  (`timeout`, `objs`) as the UAPI lays them out. `objs` is a guest pointer
+  to an int array of fds.
+- **What it does not remove.** `read_session_data` (a child process's read
+  of the session block it cannot map, §3.17 table) and every other request
+  stay server round trips. The measurement before building
+  (`WINEGEX_REQSTATS=1`, `$W/tools/reqstats.py`) gives the split per
+  process.
+- **Gate.** tests/nt sync, sync2, mutex/event/semaphore and APC tests under
+  W3 natively and in the page (both builds). Then Undertale and Noita.
+  Measured: server requests per second before and after, and the frame
+  numbers.
+
 **W3.1 progress (2026-10-06, merge/w3 + fork `wasm32-w3`):**
 - **Fault delivery (done natively):** `gex.fault_hook(idx)`; a memory
   access past the guest memory under a call-out, an illegal instruction,
