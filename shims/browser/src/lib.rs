@@ -6588,7 +6588,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 if frames_stay(h) {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
                 // The stack goes back so the host can see the record and
@@ -6715,12 +6715,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                    do_fork(h, pid, pc as u64, child_stack, tls);
-                    FORK[1].store(start, std::sync::atomic::Ordering::Relaxed);
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
-                do_fork(h, pid, pc as u64, child_stack, tls);
+                do_fork(h, pid, pc as u64, child_stack, tls, None);
                 // Give the stack back though the parent carries on: the child
                 // is a copy of this memory that must be taken now, when the
                 // stack comes back. Letting the parent run on first copied it
@@ -6972,13 +6971,20 @@ fn frames_stay(h: &Host) -> bool {
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
-static WASM32_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// Per Worker: the Worker whose syscall staged it is the one that must start
+/// it (a fork's child is a copy of memory as the call left it; see
+/// `gex_fork_pending`). Shared, a sibling thread's syscall took the flag and
+/// the forking Worker never drained its child.
+thread_local! {
+    static WASM32_STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether a wasm32 program's last syscall staged a thread or a child for
 /// the host (and forget it).
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_staged() -> i32 {
-    WASM32_STAGED.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
+    WASM32_STAGED.with(|c| c.replace(false)) as i32
 }
 
 /// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
@@ -7014,7 +7020,7 @@ fn wasm32_wait(pc: u64) -> i32 {
     }
 }
 
-fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
+fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
@@ -7039,11 +7045,13 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join("\0");
-    FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
+    FORK[1].store(start.unwrap_or(pc + gex_abi::SYSCALL_INST_BYTES), std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     FORK[5].store(h.kernel.mem.brk_current(), std::sync::atomic::Ordering::Relaxed);
+    // Only the forking thread's Worker may claim it (`gex_fork_pending`).
+    FORK_BY.store(cur() as u64 + 1, std::sync::atomic::Ordering::Relaxed);
     // Last, because it is what the host tests: the rest must be readable by
     // the time a non-zero pid appears.
     FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
@@ -7325,10 +7333,28 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
 static FORK: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// The thread (index + 1) whose `fork` is in `FORK`.
+static FORK_BY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The pid of a child needing a Worker, or zero -- and claiming it, so a `fork`
 /// several Workers can see is not started twice (see `gex_thread_pending`).
+///
+/// Only on the Worker running the thread that forked: the child is a copy of
+/// memory as `fork` left it, and only that Worker copies it before the parent
+/// runs on (synchronously after a wasm32 program's syscall, before the run
+/// loop resumes tier-1's). A sibling thread's Worker that drained it instead
+/// copied memory while the parent ran on -- for a wasm32 program, after
+/// `__gex_fork` had unmapped the record the child starts on, so the child
+/// read its thread pointer from a zero page and trapped (the aarch64 browser
+/// flake in tests/wasm32 fork: "vfork child exit 137" with a parked thread
+/// in the parent, 6 in 750 vforks; tests/wasm32/vforkthreads).
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
+    if FORK[0].load(std::sync::atomic::Ordering::Acquire) == 0
+        || FORK_BY.load(std::sync::atomic::Ordering::Relaxed) != cur() as u64 + 1
+    {
+        return 0;
+    }
     let pid = FORK[0].swap(0, std::sync::atomic::Ordering::AcqRel) as i32;
     if pid != 0 {
         CLAIMED_FORK.with(|c| {
