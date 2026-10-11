@@ -61,7 +61,14 @@ static inline void gexp_enter_(int ctx, int32_t depth)
 	}
 	gexp_ctx = ctx;
 	gexp_depth = depth;
+	/* The runtime's hook may wait out a collection in a syscall, which puts
+	 * its own number and arguments in rax, rdi, rsi, rdx, r10, r8 and r9 and
+	 * keeps the guest's values in wasm locals, where a collector scanning the
+	 * context cannot see them. These copies on the C stack it does see. */
+	volatile uint64_t keep[7] = { GEXP_X(ctx, 0), GEXP_X(ctx, 7), GEXP_X(ctx, 6), GEXP_X(ctx, 2), GEXP_X(ctx, 1), GEXP_X(ctx, 8), GEXP_X(ctx, 9) };
 	gexp_from_guest();
+	__asm__ volatile("" : : "r"(keep) : "memory");
+	GEXP_X(ctx, 0) = keep[0];
 }
 
 #define GEXP_SYSV(name) int name(int ctx, int32_t depth, uint32_t need, uint64_t ret)
@@ -98,11 +105,14 @@ static inline int gexp_return(int ctx, uint64_t ret)
 	 * may make a syscall through this context (a GC-safe transition that
 	 * waits on a futex while a collection runs), and a syscall's result
 	 * lands in rax. Without this, a worker returning while another thread
-	 * collected saw 0 for its call's result. */
-	uint64_t rax = GEXP_X(ctx, 0), rdx = GEXP_X(ctx, 2);
+	 * collected saw 0 for its call's result. The copy is in memory (the C
+	 * stack, which the collector scans), not a wasm local: while the hook
+	 * waits, it is the result's only reference. */
+	volatile uint64_t keep[2] = { GEXP_X(ctx, 0), GEXP_X(ctx, 2) };
 	gexp_to_guest();
-	GEXP_X(ctx, 0) = rax;
-	GEXP_X(ctx, 2) = rdx;
+	__asm__ volatile("" : : "r"(keep) : "memory");
+	GEXP_X(ctx, 0) = keep[0];
+	GEXP_X(ctx, 2) = keep[1];
 	uint64_t sp = GEXP_X(ctx, 4);
 	uint64_t ra = GEXP_MEM64(sp);
 	GEXP_X(ctx, 4) = sp + 8;
