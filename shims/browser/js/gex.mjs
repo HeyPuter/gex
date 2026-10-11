@@ -1857,10 +1857,15 @@ export class Gex {
     // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
     // left out); runs are `dense`, written without a scan.
     const u8 = this.#bytes();
-    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    // Division, not `>> 2` or `& ~3`: those are int32 operations, and a W3
+    // process's memory reaches past 2 GiB (Wine's Windows address space), where
+    // they turn negative -- `b & ~3` then started the tail loop near -2^31, and
+    // a fork (Wine starting wineserver) scanned for hours.
+    const words = new Int32Array(this.#memory.buffer, 0, Math.floor(u8.length / 4));
     const blank = (a, b) => {
-      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
-      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      const tail = b - (b % 4);
+      for (let i = Math.floor(a / 4); i < tail / 4; i++) if (words[i] !== 0) return false;
+      for (let i = tail; i < b; i++) if (u8[i] !== 0) return false;
       return true;
     };
     const out = [];
