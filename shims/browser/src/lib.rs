@@ -2830,11 +2830,10 @@ struct Host {
 /// Check the canary, and say so loudly once if it has gone. Reported not
 /// trapped (a trap would replace the crash being diagnosed); once, because a
 /// corrupted `Host` fails every later syscall and a flood is not a diagnosis.
-fn check_host_magic(where_: &str) {
-    if gex_has_host() == 0 {
-        return;
-    }
-    let (head, tail) = with_host(|h| (h.magic_head, h.magic_tail));
+/// Whether the host structure is intact (its guard words), checked with the
+/// host held.
+fn check_host_magic_in(h: &Host, where_: &str) {
+    let (head, tail) = (h.magic_head, h.magic_tail);
     if head == HOST_MAGIC && tail == HOST_MAGIC {
         return;
     }
@@ -4280,14 +4279,13 @@ static PINS_SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// Say where any newly reserved pin landed. A misplacement is loud whatever the
 /// tracing settings -- the guest is about to branch into code built for another
 /// address -- but a pin that took is only worth a line when tracing.
-fn report_new_pins() {
+fn report_new_pins_in(h: &Host) {
     let said = PINS_SAID.load(std::sync::atomic::Ordering::Relaxed);
-    let fresh = with_host(|h| {
-        if h.kernel.pin_landed.len() <= said {
-            return Vec::new();
-        }
+    let fresh = if h.kernel.pin_landed.len() <= said {
+        Vec::new()
+    } else {
         h.kernel.pin_landed[said..].to_vec()
-    });
+    };
     if fresh.is_empty() {
         return;
     }
@@ -6243,9 +6241,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // shared by every Worker of the process.
     let this_nr = {
         let gm = GuestMem::new(guest_bytes());
-        let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        // `ctx` is this thread's context (the locked section below checks it
+        // against the thread's own and says so if not): no lock to find it.
+        let base = ctx as u32 as u64;
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
-        let n = if gex_abi::X86 {
+        // An i386-ABI process (W3's Wine): its number, in `x(0)`, is i386's.
+        let compat = FAST_ABI.load(std::sync::atomic::Ordering::Relaxed) == 1;
+        let n = if compat && !gex_abi::PPC {
+            let raw = gm.read_u64(base + ctx::x(0) as u64).unwrap_or(u64::MAX);
+            gex_kernel::i386::canonical_number(raw)
+        } else if gex_abi::X86 {
             gex_kernel::x86::canonical_number(n)
         } else if gex_abi::PPC {
             gex_kernel::ppc::canonical_number(n)
@@ -6385,19 +6390,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if !tracing() {
         note_process_syscall(ctx as u32 as u64, pc);
     }
-    // And whether the kernel this call is about to run against is still
-    // intact. A load and a compare, once per syscall.
-    check_host_magic("a syscall");
-    // Whose process this is, for the calls that name it. Set here, not at
-    // `load`/`adopt`/`execve`, so it cannot be missed -- it is one store.
-    MY_PID.store(
-        with_host(|h| h.kernel.pid),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    // And whether a pinned library landed where the closure built it: the
-    // misplacement report is otherwise invisible in a shell demo, where
-    // process 1 never exits to call `gex_pin_report`.
-    report_new_pins();
+    // The host's integrity check, the process's pid and the pin report are
+    // done inside the locked section below: each took the host lock on its
+    // own, and with a W3 game's ~25 Wine Workers contending for it every take
+    // costs (Undertale's game thread spent ~14 ms a frame on this path).
     // Time every syscall, always: a blocking call parks the Worker here, so
     // this covers waiting as well as work, and `guest` is the majority of a
     // warm process. The per-number census above stays behind the heartbeat.
@@ -6405,7 +6401,17 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
+    let mut mapped = Vec::new();
     let stop = with_host(|h| {
+        let stop = (|h: &mut Host| -> i32 {
+        // Whether the kernel this call is about to run against is still
+        // intact; whose process this is, for the calls that name it (set
+        // here so it cannot be missed); and whether a pinned library landed
+        // where the closure built it (otherwise invisible in a shell demo,
+        // where process 1 never exits to call `gex_pin_report`).
+        check_host_magic_in(h, "a syscall");
+        MY_PID.store(h.kernel.pid, std::sync::atomic::Ordering::Relaxed);
+        report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
         if ctx as u32 as u64 != kstate.ctx_addr {
@@ -6425,7 +6431,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             .unwrap_or(!0);
         // The raw number: `SNAP_SYSCALL` is compared raw; the proc-snapshot
         // question wants the canonical one.
-        let canonical = if gex_abi::X86 {
+        // An i386-ABI process (W3's Wine) numbers its calls the i386 way, with
+        // the number in `x(0)` in every build.
+        let canonical = if h.kernel.compat && !gex_abi::PPC {
+            let raw = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(!0);
+            gex_kernel::i386::canonical_number(raw)
+        } else if gex_abi::X86 {
             gex_kernel::x86::canonical_number(nr)
         } else if gex_abi::PPC {
             gex_kernel::ppc::canonical_number(nr)
@@ -6969,6 +6980,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 2
             }
         }
+        })(h);
+        // Objects the call unmapped are retired, and those it mapped taken
+        // for recompiling, under this same lock: each was a lock take of its
+        // own after every syscall.
+        retire_unmapped_code_in(h);
+        mapped = std::mem::take(&mut h.kernel.new_code);
+        stop
     });
     gl::DEFER.with(|d| d.set(false));
     gl::submit_pending(ctx as u32 as u64);
@@ -6993,14 +7011,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if unsafe { k_present() } != 0 && !wakes_nobody(canon) {
         unsafe { k_wake() };
     }
-    // Objects the guest just mapped, recompiled in bulk before it can branch in.
-    // Here rather than inside `with_host` because recompiling takes the host
-    // lock, and it must run after the mapping syscall finishes. Only queued --
-    // nothing is instantiated and the guest is not interrupted, because a page's
-    // directory entry is not published until its module installs, so every
-    // branch still finds the miss stub; JS picks the queue up at the next miss.
-    retire_unmapped_code();
-    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    // Objects the guest just mapped (`mapped`, taken in the locked section),
+    // recompiled in bulk before it can branch in: queued below, after the
+    // lock. Nothing is instantiated and the guest is not interrupted, because
+    // a page's directory entry is not published until its module installs,
+    // so every branch still finds the miss stub; JS picks the queue up at the
+    // next miss.
+    //
     // Libraries some of whose exports a provider serves (glibc's mem*,
     // docs/elf-providers.md): JS binds them before the guest goes on, as the
     // native host does after the same syscall.
@@ -12676,15 +12693,13 @@ fn fault_pc(pc: i64) -> i64 {
 /// now. Without this a `dlclose` and a `dlopen` that reuses the address ran
 /// the old library's blocks (Half-Life: SDL's libudev landing where an
 /// earlier library had been, entered in the middle of an instruction).
-fn retire_unmapped_code() {
-    with_host(|h| {
-        let retired = std::mem::take(&mut h.kernel.retired_code);
-        if !retired.is_empty() {
-            crate::cgen::on_retire(&retired, &gone_code(h, &retired));
-            crate::fjit::on_retire(&retired);
-            retire_code(h, &retired);
-        }
-    });
+fn retire_unmapped_code_in(h: &mut Host) {
+    let retired = std::mem::take(&mut h.kernel.retired_code);
+    if !retired.is_empty() {
+        crate::cgen::on_retire(&retired, &gone_code(h, &retired));
+        crate::fjit::on_retire(&retired);
+        retire_code(h, &retired);
+    }
 }
 
 /// The pages of `ranges` no longer mapped executable (an unmapped object,
@@ -12742,7 +12757,7 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
 /// `recompile_object`) is what `--recompile-objects` does natively; without it
 /// a page meets a library one dispatch miss at a time.
 fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
-    if unsafe { RECOMPILE_OBJECTS } == 0 {
+    if unsafe { RECOMPILE_OBJECTS } == 0 || mapped.is_empty() {
         return;
     }
     with_host(|h| {
