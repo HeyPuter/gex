@@ -2051,6 +2051,21 @@ impl Kernel {
         } else {
             self.dispatch(m, n, a)
         };
+        // A blocking write that still found no room: the check in
+        // `blocking_op` and the write are not one step, and with a pipe in
+        // the global kernel another Worker's writer can fill it in between
+        // (SP: `yes | head -c 20M | wc -c` once counted 65536, head having
+        // been told EAGAIN). `writev` has no check at all. Park instead, as
+        // Linux would; a `writev` parks on its first non-empty segment and
+        // returns that short count, which its callers loop on.
+        // A blocking read can lose the same race to another reader of the
+        // pipe (two readers of one pipe: tests/browser-pipe-eagain.sh).
+        if let Ok(Err(Errno::EAGAIN)) = &outcome {
+            if let Some(op) = self.eagain_park(m, n, a) {
+                self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
+                return SyscallOutcome::Blocking(op);
+            }
+        }
         if let Ok(Err(Errno::EPIPE)) = &outcome {
             if raises_sigpipe(n, &a) {
                 self.signals.raise_from(
@@ -2116,6 +2131,38 @@ impl Kernel {
             Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
             Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
         }
+    }
+
+    /// The park for a `read`/`readv` or `write`/`writev` that returned
+    /// `EAGAIN` on a stream descriptor that should block (see the call in
+    /// `syscall`): the same [`BlockOp`] `blocking_op` would have chosen, on
+    /// the first non-empty vector of a vectored call.
+    fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let file = self.fds.get(a[0] as i32).ok()?;
+        let (buf, len) = match n {
+            nr::READ | nr::WRITE => (a[1], a[2]),
+            nr::READV | nr::WRITEV => self.first_iovec(m, a)?,
+            _ => return None,
+        };
+        let handle = Arc::clone(&file.handle);
+        let len = len.min(1 << 24) as usize;
+        match n {
+            nr::READ | nr::READV
+                if file.readable
+                    && file.flags() & crate::fs::oflags::O_NONBLOCK == 0
+                    && file.handle.is_stream() =>
+            {
+                Some(BlockOp::ReadStream { handle, buf, len })
+            }
+            nr::WRITE | nr::WRITEV if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len }),
+            _ => None,
+        }
+    }
+
+    /// A vectored call's first non-empty vector (`a[1]`, `a[2]`), where a
+    /// blocked `readv`/`writev` parks.
+    fn first_iovec(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<(u64, u64)> {
+        Self::read_iovecs(m, a[1], a[2], self.compat).ok()?.into_iter().find(|v| v.1 > 0)
     }
 
     /// The blocking half of a syscall, if it has one.
@@ -2269,24 +2316,43 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
-            // A `writev` to a full stream that should block waits as a
-            // `write` of its first non-empty vector does: the call returns
-            // that vector's count, a short write the caller retries. (It
-            // went straight to `EAGAIN`, and Wine's `send_request` writes
-            // its requests to the server with `writev`: a thread that found
-            // the request pipe full died with "wine client error: write:
-            // Resource temporarily unavailable", hanging NDIS's start.)
+            // `writev` and `readv` on a stream block as `write` and `read` do,
+            // on their first non-empty vector: the parked call is finished
+            // with that vector alone, a short count the caller already loops
+            // on. Without this a full pipe answered `writev` with `EAGAIN` on
+            // a blocking descriptor: coreutils' `head` writes with it and died
+            // "Resource temporarily unavailable" once its reader was slower
+            // than it, and Wine's `send_request` writes the server's requests
+            // with it (a thread that found the request pipe full died with
+            // "wine client error: write: Resource temporarily unavailable").
             nr::WRITEV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.write_is_atomic() || !file.write_would_block() {
+                if !file.write_is_atomic() {
                     return None;
                 }
-                let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
-                let (buf, len) = vecs.into_iter().find(|&(_, len)| len != 0)?;
+                let (buf, len) = self.first_iovec(m, a)?;
+                match file.handle.write_room() {
+                    Some(room) if len <= room => return None,
+                    Some(_) => {}
+                    None if !file.write_would_block() => return None,
+                    None => {}
+                }
                 Some(BlockOp::WriteStream {
                     handle: Arc::clone(&file.handle),
                     buf,
-                    len: (len as usize).min(1 << 24),
+                    len: len.min(1 << 24) as usize,
+                })
+            }
+            nr::READV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.would_block() {
+                    return None;
+                }
+                let (buf, len) = self.first_iovec(m, a)?;
+                Some(BlockOp::ReadStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: len.min(1 << 24) as usize,
                 })
             }
             nr::ACCEPT | nr::ACCEPT4 => {
@@ -7649,6 +7715,76 @@ mod tests {
             let other = read(&mut k, &mut mem, clk);
             assert!(other.abs_diff(mono) <= 1, "clock {clk}: {other} vs {mono}");
         }
+    }
+
+    /// `writev` to a full blocking pipe parks on its first non-empty vector,
+    /// as `write` does, and `readv` on an empty one parks as `read` does --
+    /// they had answered `EAGAIN` on a blocking descriptor.
+    #[test]
+    fn vectored_io_on_a_blocked_pipe_parks() {
+        let (mut mem, mut k) = setup();
+        let p = Arc::new(Pipe::new());
+        let end = |write| OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: Arc::clone(&p), write }), "pipe".into(), 0, !write, write);
+        let rfd = k.fds.insert(end(false), false).unwrap() as u64;
+        let wfd = k.fds.insert(end(true), false).unwrap() as u64;
+        // Two vectors, the first empty: 0x3000 (len 0) and 0x3100 (len 100).
+        let iov = 0x2000usize;
+        for (i, (b, l)) in [(0x3000u64, 0u64), (0x3100, 100)].into_iter().enumerate() {
+            mem[iov + 16 * i..iov + 16 * i + 8].copy_from_slice(&b.to_le_bytes());
+            mem[iov + 16 * i + 8..iov + 16 * i + 16].copy_from_slice(&l.to_le_bytes());
+        }
+        let op = |k: &mut Kernel, mem: &mut Vec<u8>, n| k.blocking_op(&GuestMem::new(mem), n, [if n == nr::READV { rfd } else { wfd }, iov as u64, 2, 0, 0, 0]);
+        match op(&mut k, &mut mem, nr::READV) {
+            Some(BlockOp::ReadStream { buf: 0x3100, len: 100, .. }) => {}
+            other => panic!("readv on an empty pipe: {other:?}"),
+        }
+        assert!(op(&mut k, &mut mem, nr::WRITEV).is_none(), "writev to an empty pipe goes straight through");
+        p.write(&vec![0u8; crate::pipe::PIPE_BUF]).unwrap();
+        match op(&mut k, &mut mem, nr::WRITEV) {
+            Some(BlockOp::WriteStream { buf: 0x3100, len: 100, .. }) => {}
+            other => panic!("writev to a full pipe: {other:?}"),
+        }
+        assert!(op(&mut k, &mut mem, nr::READV).is_none(), "readv on a full pipe goes straight through");
+    }
+
+    /// A read or write that met `EAGAIN` on a blocking stream after all
+    /// (the room check and the operation are not one step across Workers)
+    /// parks as `blocking_op` would have; on a non-blocking descriptor it
+    /// does not, and a vectored call parks on its first non-empty vector.
+    #[test]
+    fn eagain_on_a_blocking_pipe_parks_instead() {
+        let (mut mem, mut k) = setup();
+        let p = Arc::new(Pipe::new());
+        let end = |write, nb: bool| {
+            let f = OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: Arc::clone(&p), write }), "pipe".into(), 0, !write, write);
+            if nb {
+                f.set_flags(crate::fs::oflags::O_NONBLOCK);
+            }
+            f
+        };
+        let rfd = k.fds.insert(end(false, false), false).unwrap() as u64;
+        let wfd = k.fds.insert(end(true, false), false).unwrap() as u64;
+        let nbr = k.fds.insert(end(false, true), false).unwrap() as u64;
+        let iov = 0x2000usize;
+        for (i, (b, l)) in [(0x3000u64, 0u64), (0x3100, 100)].into_iter().enumerate() {
+            mem[iov + 16 * i..iov + 16 * i + 8].copy_from_slice(&b.to_le_bytes());
+            mem[iov + 16 * i + 8..iov + 16 * i + 16].copy_from_slice(&l.to_le_bytes());
+        }
+        let park = |k: &Kernel, mem: &mut Vec<u8>, n, a| k.eagain_park(&GuestMem::new(mem), n, a);
+        match park(&k, &mut mem, nr::READ, [rfd, 0x4000, 7, 0, 0, 0]) {
+            Some(BlockOp::ReadStream { buf: 0x4000, len: 7, .. }) => {}
+            other => panic!("read: {other:?}"),
+        }
+        match park(&k, &mut mem, nr::WRITE, [wfd, 0x4000, 9, 0, 0, 0]) {
+            Some(BlockOp::WriteStream { buf: 0x4000, len: 9, .. }) => {}
+            other => panic!("write: {other:?}"),
+        }
+        match park(&k, &mut mem, nr::WRITEV, [wfd, iov as u64, 2, 0, 0, 0]) {
+            Some(BlockOp::WriteStream { buf: 0x3100, len: 100, .. }) => {}
+            other => panic!("writev: {other:?}"),
+        }
+        assert!(park(&k, &mut mem, nr::READ, [nbr, 0x4000, 7, 0, 0, 0]).is_none(), "O_NONBLOCK keeps its EAGAIN");
+        assert!(park(&k, &mut mem, nr::WRITE, [rfd, 0x4000, 7, 0, 0, 0]).is_none(), "not a write end");
     }
 
     #[test]

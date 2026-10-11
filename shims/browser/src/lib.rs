@@ -272,6 +272,8 @@ extern "C" {
     fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
+    fn k_fs_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
+    fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -722,6 +724,12 @@ extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) ->
 }
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
     unsafe { k_fs_touch(handle, secs) }
+}
+extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) }
+}
+extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
@@ -1221,6 +1229,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             mksocket: rf_mksocket,
             set_mtime: rf_set_mtime,
             touch: rf_touch,
+            set_times: rf_set_times,
+            set_times_fd: rf_set_times_fd,
         },
     )))
 }
@@ -4016,6 +4026,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         named
     } else if args[0].starts_with('/') {
         args[0].clone()
+    } else if args[0].contains('/') {
+        // `./prog` names a path from the working directory, as execve's
+        // argument would (tests/gexcc/longargs: `--argv0 ./longargs
+        // --cwd /t` re-execs `/proc/self/exe`, which was `/longargs`).
+        kernel.vfs.absolute(&args[0])
     } else {
         format!("/{}", args[0])
     };
@@ -5295,6 +5310,19 @@ static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
 /// process tree here. Serving a page once and then falling through to translate
 /// bounds it: the wasted serve is one turn, and the translate produces the
 /// block that was missing.
+/// Each page's base under which this process has installed blocks: lifted
+/// here, or taken from the store. A stored module numbering such a page
+/// otherwise is not served (see the serve filter in `gex_dispatch_miss`).
+static LIVE_BASE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+
+fn note_live(dirs: &[(u64, u32)]) {
+    let mut m = LIVE_BASE.0.borrow_mut();
+    for (p, b) in dirs {
+        m.insert(*p, *b);
+    }
+}
+
 static SERVED_PAGE: SingleThreaded<std::collections::BTreeSet<u64>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
@@ -7111,6 +7139,12 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
+    // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
+    // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
+        .chain(h.kernel.argv.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\0");
     FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
@@ -7137,6 +7171,28 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 /// The parent's working directory at `fork`, staged for the child to inherit.
 static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's exe path then its argv, NUL-separated, staged at `fork`.
+static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_ptr() -> u32 {
+    FORK_EXE.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_len() -> u32 {
+    FORK_EXE.0.borrow().len() as u32
+}
+
+/// The child's side of `gex_fork_exe_*`, before `gex_adopt_child`.
+static CHILD_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *CHILD_EXE.0.borrow_mut() = s.to_string();
+    }
+}
 
 /// Describe the calling process's descriptors for the child. `child` is who the
 /// reopened pipe ends belong to: opened under the parent's pid instead, the
@@ -7866,6 +7922,15 @@ pub extern "C" fn gex_adopt_child(
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
             let _ = kernel.vfs.set_cwd(&cwd);
+        }
+    }
+    // The parent's program and arguments (`gex_set_child_exe`).
+    {
+        let exe = std::mem::take(&mut *CHILD_EXE.0.borrow_mut());
+        if !exe.is_empty() {
+            let mut parts = exe.split('\0').map(str::to_string);
+            kernel.exe_path = parts.next().unwrap_or_default();
+            kernel.argv = parts.collect();
         }
     }
     kernel.clock = browser_clock;
@@ -10125,14 +10190,25 @@ fn finish_parked(
             // flight put almost all of them in nr 63. `sys_read` had the same
             // shape and was fixed with it. See task 140.
             let dst = gm.read_mut(*buf, *len)?;
-            handle.read_at(0, dst)
+            match handle.read_at(0, dst) {
+                // Another reader of the same pipe took what woke this one:
+                // the syscall again, which parks once more.
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
             // the reader has drained.
+            // Still no room (another writer got there first): the syscall
+            // again, which parks once more, rather than EAGAIN on a
+            // descriptor that is not non-blocking.
             let data = gm.read(*buf, *len)?.to_vec();
-            handle.write_at(0, &data)
+            match handle.write_at(0, &data) {
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         // `accept` is finished by the kernel, which is the only thing with a
         // descriptor table; the wait here is only for a connection to arrive.
@@ -11831,9 +11907,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // been built from the code before the change (a
                         // translation of noita.exe before Detours patched it),
                         // and serving it would run that code again.
-                        !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
-                            Some(have) => have == *b,
-                            None => !h.jit.retired_pages.contains(p),
+                        //
+                        // AArch64 too. Its numberings diverge across an
+                        // `execve` from a fork: the exec'd program keeps the
+                        // page bases it inherited for ld.so (outside the
+                        // arena), which are not the ones the registry has, and
+                        // stores its modules under them. Served to a fresh
+                        // process numbering ld.so by the registry, their calls
+                        // into ld.so landed on empty slots, missed, and lifted
+                        // the callee again at the registry's base, once per
+                        // call: 32,997 ld.so blocks (30,371 at
+                        // `_dl_lookup_symbol_x` alone) in a `node -e 0` after
+                        // `spawnSync(node)`, 62 s against 30 in the page.
+                        d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
+                            Some(have) if gex_abi::X86 => have == *b,
+                            // On AArch64 only against blocks this process has
+                            // installed: a page numbered here with nothing
+                            // installed under the number loses nothing by
+                            // taking the module's, and refusing those cost a
+                            // second `node -e 0` its libc (4,979 blocks lifted
+                            // became 15,975).
+                            Some(have) => have == *b || LIVE_BASE.0.borrow().get(p) != Some(&have),
+                            None => !gex_abi::X86 || !h.jit.retired_pages.contains(p),
                         })
                     })
                     .collect();
@@ -11900,6 +11995,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                             }
                             keep.push((*p, *b));
                         }
+                        note_live(&keep);
                         dirs.extend_from_slice(&keep);
                         h.jit.reuse_served += 1;
                     }
@@ -12103,6 +12199,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // module), so the block at `pc` misses, re-translates, and misses
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
+        note_live(&unit.covered);
         push_pending(h, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
         publish_pending(h);
         // Point the guest directory at the slot this unit's block actually

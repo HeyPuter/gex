@@ -2163,6 +2163,19 @@ pub extern "C" fn k_fs_set_mtime(path: gex_kmem::PAddr, path_len: u32, secs: i64
     as_unit(rootfs().set_mtime(&path_of(path, path_len), secs))
 }
 
+/// `utimensat` with nanoseconds (`remote::Remote::set_times`).
+#[no_mangle]
+pub extern "C" fn k_fs_set_times(path: gex_kmem::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    as_unit(rootfs().set_times_now(&path_of(path, path_len), remote::time_of(a_s, a_ns), remote::time_of(m_s, m_ns), now))
+}
+
+/// `futimens` (`remote::Remote::set_times_fd`).
+#[no_mangle]
+pub extern "C" fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.set_times_now(remote::time_of(a_s, a_ns), remote::time_of(m_s, m_ns), now))
+}
+
 /// An open file's modification time. This module has no clock, so a process
 /// that writes stamps the file with its own (see `vfs::remote::Remote::touch`).
 #[no_mangle]

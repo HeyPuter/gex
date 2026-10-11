@@ -2103,6 +2103,14 @@ export class Gex {
     // The parent's working directory, so a child inherits it as it does on
     // Linux. `gex_adopt_child` reads the CWD global as it builds its kernel,
     // so this has to be set first -- same ordering as the identity above.
+    // The parent's program and argv (`/proc/self/exe`, `cmdline`), likewise.
+    if (child.exe && e.gex_set_child_exe) {
+      const c = new TextEncoder().encode(child.exe);
+      const cp = e.gex_alloc(Math.max(1, c.length)) >>> 0;
+      this.#bytes().set(c, cp);
+      e.gex_set_child_exe(cp, c.length);
+      e.gex_free?.(cp, Math.max(1, c.length));
+    }
     if (child.cwd && e.gex_set_cwd) {
       const c = new TextEncoder().encode(child.cwd);
       const cp = e.gex_alloc(c.length) >>> 0;
@@ -2453,6 +2461,16 @@ export class Gex {
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
           )
         : null,
+      // The parent's exe path and argv, NUL-separated.
+      exe:
+        e.gex_fork_exe_len && e.gex_fork_exe_len() > 0
+          ? new TextDecoder().decode(
+              this.#bytes().slice(
+                e.gex_fork_exe_ptr() >>> 0,
+                (e.gex_fork_exe_ptr() >>> 0) + (e.gex_fork_exe_len() >>> 0),
+              ),
+            )
+          : null,
       // The parent's working directory, so the child resolves relative paths
       // where the parent stood. Decoded to a string; the child restages it.
       cwd:
