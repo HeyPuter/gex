@@ -490,6 +490,10 @@ in the compositor Worker), during a shader translation with no WGSL cache
 entry; three more runs of it (j11, j12) and the final build's profiles did
 not show it again, so which function it was is not known.
 
+The final build on the pages (j14, edger): Muck 11.4 11.2 11.3 10.7
+presents/s, HK 14.5 14.6 14.7 14.6; each prefetched the cold part (83.6 and
+84.6 ms) and never missed.
+
 ### Testing it
 
 The gate leg, after `web/build-all.sh --both`, on any host (SwiftShader):
