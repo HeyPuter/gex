@@ -53,7 +53,7 @@ awk -v out="$OUT" '
     if (n0 < 3 || ci == "") { print "exec-reuse: FAIL: missing exit lines (" n0 " node -e 0, child " (ci == "" ? "none" : "seen") "), log " out; exit 1 }
     printf "exec-reuse: A (warm fresh) installs %d nofill %d; C (exec child) %d nofill %d; B (fresh after) %d nofill %d\n", ai, an, ci, cn, bi, bn
     bad = 0
-    if (ci > 2 * ai) { print "exec-reuse: FAIL: the exec'd child installs more than 2x a fresh start"; bad = 1 }
+    if (ci > 2 * ai) { print "exec-reuse: FAIL: the exec-ed child installs more than 2x a fresh start"; bad = 1 }
     if (bi > 1.5 * ai) { print "exec-reuse: FAIL: a fresh start after it installs more than 1.5x"; bad = 1 }
     if (bn > 3 * an + 500) { print "exec-reuse: FAIL: a fresh start after it misses unfilled more than 3x"; bad = 1 }
     if (!bad) print "exec-reuse: PASS"
