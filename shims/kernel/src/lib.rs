@@ -1026,9 +1026,10 @@ pub extern "C" fn k_key_path(key: u64, path: gex_kmem::PAddr, len: u32, size: u6
                 if named.contains(&id) {
                     continue;
                 }
+                // Its bytes stay in the slab, unreachable (nothing is freed there).
                 let Some(sm) = m.mods.get_mut((id as usize).wrapping_sub(1)) else { continue };
-                let n = sm.wasm.len();
-                sm.wasm = Vec::new();
+                let n = sm.at.2 as usize;
+                sm.at = (u32::MAX, 0, 0);
                 m.total -= n;
             }
         }
@@ -1097,7 +1098,7 @@ pub extern "C" fn k_store_save(min_bytes: u32) -> u32 {
     if x.saving || m.mods.len() <= x.saved_mods {
         return 0;
     }
-    let fresh: usize = m.mods[x.saved_mods.max(1)..].iter().map(|sm| sm.wasm.len()).sum();
+    let fresh: usize = m.mods[x.saved_mods.max(1)..].iter().map(|sm| sm.at.2 as usize).sum();
     if fresh < min_bytes as usize {
         return 0;
     }
@@ -1133,9 +1134,10 @@ pub extern "C" fn k_store_save(min_bytes: u32) -> u32 {
             w.u64(*page);
             w.u32(*base);
         }
-        if sm.wasm.len() <= budget {
-            budget -= sm.wasm.len();
-            w.bytes(&sm.wasm);
+        let wasm = m.bytes(sm);
+        if wasm.len() <= budget {
+            budget -= wasm.len();
+            w.bytes(wasm);
         } else {
             w.bytes(&[]);
         }
@@ -1281,8 +1283,11 @@ pub extern "C" fn k_store_restore() -> i32 {
                 let base = r.u32()?;
                 dirs.push((page, base));
             }
-            let wasm = r.bytes()?;
-            mods.push(SharedModule { wasm, slots, dirs });
+            // Where its bytes are in the saved file, copied into the slab below.
+            let n = r.u32()? as usize;
+            let at = r.1;
+            r.take(n)?;
+            mods.push((slots, dirs, at, n));
         }
         let mut wanted: BTreeSet<u32> = BTreeSet::new();
         let mut by_page = BTreeMap::new();
@@ -1320,15 +1325,17 @@ pub extern "C" fn k_store_restore() -> i32 {
             }
         }
         let mut kept = 0;
-        for (i, mut sm) in mods.into_iter().enumerate() {
-            // Store ids are one past the index (index zero is "none").
-            if !wanted.contains(&(i as u32 + 2)) {
-                sm.wasm = Vec::new();
-            }
-            if !sm.wasm.is_empty() {
+        for (i, (slots, dirs, at, n)) in mods.into_iter().enumerate() {
+            // Store ids are one past the index (index zero is "none"); a module
+            // no kept claim names comes back without bytes.
+            let mut sm = SharedModule { at: (u32::MAX, 0, 0), slots, dirs };
+            if n > 0 && wanted.contains(&(i as u32 + 2)) && m.total + n <= MOD_BUDGET {
+                let (c, off) = m.reserve(n);
+                m.slab[c as usize][off as usize..off as usize + n].copy_from_slice(&inbuf[at..at + n]);
+                sm.at = (c, off, n as u32);
+                m.total += n;
                 kept += 1;
             }
-            m.total += sm.wasm.len();
             m.mods.push(sm);
         }
         m.by_page = by_page;
@@ -1343,6 +1350,7 @@ pub extern "C" fn k_store_restore() -> i32 {
         None => {
             // A torn file: start empty rather than half-restored.
             m.mods.truncate(1);
+            m.slab.clear();
             m.by_page.clear();
             m.by_object.clear();
             m.translated.clear();
