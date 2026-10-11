@@ -2422,3 +2422,244 @@ Not yet:
     interpreter in between), caching what the lazy interpreter path resolves per site, and then better
     bodies. Even then, the bodies alone are not faster than the interpreter, so HK stays on
     `GEXMONO_WASM_JIT=0`.
+- **Making the hot residual callees compile (patches 0007-0020, 2026-10-10).**
+  The rule: rank callees by how many interpreter legs they cost, then make the emitter handle each
+  bail reason, with a test for each. Leg counts are over a whole 12-minute King's Pass run, from the
+  `iroute top` / `iroute kinds` tables. hg10 is the baseline (0001-0006). hg17 is p9 = 0005-0008
+  plus LDADDR_ARG. hg22 (p25, through 0019) and hg25 (p29, every knob at its default) are queued as
+  q77/q78.
+
+  | reason | example callee (hg10 legs) | fix | after | test |
+  |---|---|---|---|---|
+  | ldarga of a scalar argument | Unmarshal.FromIntPtrUnsafe (3,005,829) | LDADDR_ARG on in the provider | gone in hg17 | T.ArgAddr |
+  | ldaddr (same gate) | KeyCombo.GetInclude (432,402) | same | gone in hg17 | T.HotShapes (Combo) |
+  | OP_IADDCC in shared generic code | List\<DelayedEvent\>.AddRange (707,514) | 0008 checked arithmetic | gone in hg17 | T.Checked, T.HotShapes |
+  | int_conv_to_r_un | InputStateBlock.ReadFloat (571,200) | 0008 | the bail is gone; still 624,382 legs in hg17, now as retries of an invalid module (next row) | T.HotShapes (ReadFloatLike) |
+  | invalid module (a reused 32-bit load in an i64 register) | hg17: invalid=1322; embed: AssemblyName.FillName re-emitted 106 times | 0019 | embed invalid 106 -> 0 | T.LcseWide |
+  | guest icall / P/Invoke | Component.get_gameObject_Injected (1,617,846) and 438 others (13.2M legs in all) | 0009 direct guest calls | hg22 | T.NativeDirect, CallBench |
+  | the runtime's own icalls, handles included | GCHandle.InternalGet (3.84M in hg17), RuntimeType.GetName, Array.GetLowerBoundInternal, FastAllocateString (3.8M "icall-handles" in all) | 0018 | embed residual 70,359 -> 236 | T.MonoIcalls |
+  | string ctors | string(char,int) via the wrapper | 0018 (managed String.Ctor) | embed: 0 | T.MonoIcalls |
+  | nested finally / call_handler continuations | tk2dSprite.UpdateMaterial (99,952), GUILayoutGroup.CalcHeight (42,961) | 0012, 0014 | hg22 | T.NestedFinally |
+  | ldarga of a reference argument | ObjectEqualityComparer\<Type\>.GetHashCode (69,029) | 0011 | hg22 | T.ArgAddr (RefArg) |
+  | "residual reflection" gate | ActionData.LoadActionField (144,905) | 0013: only once a Reflection.Emit image exists | hg22 | T.Reflect |
+  | ldarga in EH methods | - | 0015 | - | T.FinArg |
+  | localloc, 64-bit checked multiply | Number.FormatFloat, BinaryReader.ReadInt32 | 0016 | - | T.Localloc |
+  | vtype call arg lost its variable | BinaryReader.ReadString, NumberToString\<char\>, ResourceManager..ctor | 0017 | embed: compile | T.Localloc (ReadString) |
+
+  Bails left in the embed suite: managed-to-native and runtime-invoke wrappers (marshalling
+  wrappers, deliberately refused), REQSECOBJ methods and their callers (correct: they need a stack
+  walk), and one EH filter clause.
+- **Knob re-enable pass (p25 -> p29).** The wasm64 provider shipped with every JIT fast path that does
+  its own pointer arithmetic set to 0. Each one alone on the embed suite at threshold 1:
+  - Clean as-is: GUARDED_INLINE, DELEGATE_DEVIRT, IC_MID, PRED_MID, LAZY_COLD, INLINE_COLD_THROW,
+    VCALL_AOT_WAYS, LAZY_NOGC, PROF_ORIGIN, PROF_INLINEE.
+  - Emitted modules that do not validate ("expected i64, found i32"): INLINE_ALLOC (55), T2 (688),
+    EH_REC (43), FAST_TLS (7). Patch 0020 ports the inline TLAB bump, the fast thread read, the EH
+    record and the tier-2 poll to pointer width; all four now give invalid=0.
+  - DIRECT_DEPS in the off-list was a no-op: "0" is outside its range [1, 512], so the runtime's 512
+    was kept.
+  - All of them together, at the runtime's own defaults (DELEGATE_DEVIRT=15), pass the suite on both
+    legs: invalid=0, 3-4 tier-2 compiles, 10 guarded inlines. The provider's off-list is removed.
+- **The worker-thread NULL (fixed, 1846e66a).** The embed test's worker thread sometimes saw NULL from `Make`
+  or from `mono_string_to_utf8` ("worker thread: N bad of 640", about 1 run in 20 on either tier; every run
+  under `EMBED_WORKER_STRESS`). The object was intact and a second conversion of it succeeded; the provider
+  never produced a NULL. The cause was the provider ABI:
+  - An adapter puts its result in the guest context's rax, then `gexp_return` runs `gexp_to_guest`.
+  - Mono's hook there (the GC-safe transition) can wait out another thread's collection on a futex.
+  - musl-wasm64's syscalls go through the same context and leave their result (0) in rax.
+
+  The fix:
+  - `gexp_return` keeps rax and rdx across the hook.
+  - `gexp_call_guest` runs its hook before loading the argument registers and reads the callee's results
+    before its return hook.
+  - `gexp_call_guest_catching` restores the guest's registers after the unwind hook.
+
+  The same lost result could hit any provider call that returns while another thread collects, in the page
+  as well as natively.
+
+  Keeping the value in a wasm local was not enough. The repeat runs (299 of 300 clean) and
+  `EMBED_WORKER_STRESS=20` (about 1 run in 8, on the interpreter and on the JIT, and 4 in 16 with
+  `MONO_GC_PARAMS=no-lazy-sweep,no-concurrent-sweep`) still showed held strings turning into other
+  strings or into "". Allocation in the provider goes straight to the major heap (no nursery). While the
+  hook waits out the collection, the result is referenced only from that local, so the collector
+  freed it, and the next allocation reused its slot.
+  - Diagnostics ruled out three other causes:
+    - the guest-stack scan (it covered `held[]` on every collection);
+    - the pin phase (no allocated held object was left unmarked);
+    - the sweep of marked objects.
+  - The fix: `gexp_return`, and `gexp_enter` for the argument registers, keep their copies in a
+    volatile array on the C stack, which the collector scans conservatively.
+  - Result: 24 of 24 clean under stress with synchronous sweep, against 4 of 16 failing before.
+  - Validation is listed in section 13.
+
+## 13. Final state (stream U, 2026-10-10)
+
+Stream U stops here. Branch `merge/unity-seed`; the head is in the commit that adds this section.
+
+### Default
+
+**Hollow Knight runs on the interpreter (`GEXMONO_WASM_JIT=0`). Muck and the provider in general keep
+the JIT on.** The rule was: JIT on only if it beats the interpreter in the browser. q81 (edger,
+Chromium, provider p31, King's Pass with scripted input, 12 minutes each; hg26 JIT, hg24 interpreter)
+gave these numbers:
+
+| | JIT (hg26) | interpreter (hg24) |
+|---|---|---|
+| presents/s, 602-692 s | 13.78 | 15.62 |
+| presents/s, 482-692 s | 13.85 | 14.64 |
+| presents in the 20 s main-Worker profile at 700 s | 276 | 324 |
+| managed time in that profile (under `gexp_mono_runtime_invoke`) | 3.94 s | 5.04 s |
+| managed time per present | 14.3 ms | 15.6 ms |
+| main-Worker time per present | 71.5 ms | 61.2 ms |
+
+- **Frame rate:** the interpreter gives 13% more presents/s over 602-692 s (15.62 against 13.78), and
+  6% more over 482-692 s.
+- **Managed code:** the JIT's managed code is now cheaper per frame than the interpreter's: 8% less
+  per present (14.3 ms against 15.6 ms). In hg13/hg14 (patches 0001-0006) it cost 74% more.
+- **Outside managed code:** the JIT run spends 10 ms more per present (71.5 ms against 61.2 ms).
+  That is the "other" bucket (1.24 s against 1.08 s) plus UnityPlayer code outside managed code
+  (4.98 s against 5.08 s, over fewer frames). It is not attributed yet; JIT compiles and module
+  instantiation still running at 700 s are the first suspect.
+- So the JIT does not beat the interpreter, and HK defaults to the interpreter.
+  - `tools/unity-dotnet/page/hk-page.sh` passes `GEXMONO_WASM_JIT=${JIT:-0}`.
+  - `tests/games/unity-edger-gate.sh` runs its hk leg with `HK_JIT` (default 0).
+- **Caveat:** p31 predates both provider fixes (1846e66a, 352a2737). In p31, a provider call that
+  returns while another thread collects can lose its result or have its object freed. Both runs ended
+  normally (rc 0, no fatal errors in the logs), so the numbers stand. HK was not rerun on p33.
+
+### Mono patches (`tools/unity-dotnet/mono/patches`, on r58Playz `wasm-jspi-jit-10.0.3` at 6812ea26)
+
+| patch | what it fixes |
+|---|---|
+| 0001 wasm64 | Mono builds for wasm64 under gex: the provider's target, threads (`mono-threads-gex.c`), mmap and dl on gex, guest-root scanning in sgen, the stop of guest threads after Mono's own stop-the-world |
+| 0002 wasm-jit-gex | the fork's wasm JIT inside the gex provider: modules compiled by the host, the JIT_CALL table, GCHandle in CoreLib |
+| 0003 gex-thread-diagnostics | stop-the-world diagnostics for threads that never reach a safepoint |
+| 0004 negative-iconst | a negative OP_ICONST is an i64 local with `i64.const` (Hollow Knight's `Array.Clear` fault: 0xffffffff pointers) |
+| 0005 interp-function-pointers | `ldftn`/`ldvirtftn` from JIT code give the interpreter's InterpMethod (tk2dSpriteAnimator.Start NULL method) |
+| 0006 compute-reachable-worklist | upstream a0f2c7b9c: `compute_reachable` as a worklist (a Worker's stack overflowed) |
+| 0007 sgen-cache-major-used-size | `mono_gc_get_used_size` cached between collections (HK asks every frame: 3-4.5% of the main Worker) |
+| 0008 checked-arithmetic | ADDCC/SUBCC/MUL_OVF and unsigned-to-double (List.AddRange, InputStateBlock.ReadFloat) |
+| 0009 direct-guest-native-calls | JIT code calls UnityPlayer's InternalCalls and P/Invokes directly (13.2M interpreter legs in hg10) |
+| 0010 lazy-interp-leg-cost | a lazy stub caches its call shape and InterpMethod instead of deriving them per call |
+| 0011 ldarga-reference-args | ldarga of a reference or byref argument (constrained calls on generic T) |
+| 0012 split-nested-finally-leave | one continuation block per finally on a leave out of several |
+| 0013 reflection-callers-and-stack-walks | callers of System.Reflection compile unless a Reflection.Emit image exists (PlayMaker LoadActionField) |
+| 0014 call-handler-continuation-blocks | a continuation block for every CALL_HANDLER; bail reasons per gate |
+| 0015 ldarga-in-eh-methods | ldarga in methods with EH clauses |
+| 0016 localloc-and-checked-long-multiply | stackalloc and 64-bit checked multiply |
+| 0017 vtype-call-args-keep-their-variable | a by-address vtype argument keeps INDIRECT through alias analysis |
+| 0018 direct-runtime-icalls-and-string-ctors | direct calls to the runtime's own InternalCalls (handles included) and the string ctors (3.8M "icall-handles" legs in hg10) |
+| 0019 lcse-reuse-widens, invalid-is-final | a reused 32-bit load widened into an i64 register; a module that fails validation is never retried |
+| 0020 wasm64-fast-paths | INLINE_ALLOC, T2, FAST_TLS, EH_REC at pointer width; the provider's knob off-list removed |
+| 0021 call-results-take-the-register-width | call results stored at the destination register's width (UTF8Encoding.GetChars at threshold 10) |
+| 0022 integer-ops-at-register-width | INEG/INOT/LNOT/LNEG/LDIV, conversions, switch index and SAT_CONV at the register's width (InputStateBlock.ReadFloat, 597k legs in hg25); V8's "Compiling function" text counts as final |
+
+Outside the Mono patches, the provider ABI fixes above (1846e66a, 352a2737) are in
+`tools/unity-dotnet/provider`. Provider p33 is 0001-0022 plus both of them. The q81 runs used p31,
+which predates them.
+
+### Interpreter legs by reason, hg10 -> hg25
+
+Legs are calls from JIT code that ran on the interpreter instead, over a 12-minute King's Pass run
+(`MONO_WASM_JIT_STATS=1`, `iroute kinds`).
+
+| kind | hg10 (0001-0006) | hg17 (p9: 0005-0008) | hg25 (p29: 0001-0020) |
+|---|---|---|---|
+| managed callee not compiled | 5,615,739 | 1,637,578 | 896,090 |
+| guest icall / P/Invoke | 13,229,779 | 15,036,093 | 86,073 |
+| runtime icall with handles | 3,820,554 | 4,679,486 | 0 |
+| total | 22.67M | 21.36M | 1.02M |
+
+There is no q81 column. q81's counter run (hg27, p31, JIT with `MONO_WASM_JIT_STATS=1` and
+`VERBOSE=1`) died at 23 s in start-up: SIGSEGV, a wild branch from libc +0x67042 into the provider's
+code page +0x2. The rerun on p33 (hg28) ran the full 12 minutes, rc 0, about 14 presents/s at
+632-693 s with the counters on, so the crash did not reproduce. The page log, however, does not keep
+the `iroute` tables (printf to stdout), so the counts after 0021/0022 are not measured.
+
+hg25's managed legs include InputStateBlock.ReadFloat (597k; fixed by 0022). What is left after it
+(hg25's top callees):
+
+- InputManager.UpdateWithAxes (63k) and UpdateMouse (13k): the "vcall2 delegate" gate.
+- Canvas.WillRenderCanvases.Invoke (25k).
+- Reflection paths that throw (24k).
+- ContactFilter2D.CheckConsistency (85k): an instance InternalCall on a struct. 0009's gate
+  (`sig->hasthis && (pinvoke || valuetype)`) refuses it, because the `this` of a struct
+  icall is passed by address.
+
+### Building
+
+On gooner, from the worktree, after `source scratch/env.sh`:
+
+```
+# the fork at 6812ea26 with patches/ applied, into OUT/src (once, or after a new patch)
+tools/unity-dotnet/mono/build.sh OUT src
+# runtime and provider (the provider step relinks mono.wasm; "runtime" alone does not)
+nice -n 10 systemd-run --user --scope -q -p TasksMax=4096 env PATH=$PATH \
+  tools/unity-dotnet/mono/build.sh OUT runtime provider
+# -> OUT/provider/mono.wasm, OUT/lib/System.Private.CoreLib.dll
+cargo build --release -p gexc --features gexc/x86 --target-dir target/x86
+```
+
+### Tests
+
+```
+nice -n 10 systemd-run --user --scope -q -p TasksMax=256 env PATH=$PATH tests/unity-dotnet/embed/run.sh OUT
+rm -rf tests/unity-dotnet/smoke/obj
+# one JIT leg with extra knobs (PROV=, THR= threshold): tests/unity-dotnet/embed/jitknob.sh NAME K=V...
+# 100 JIT legs at thresholds 1, 2 and 10, 4 at a time: tests/unity-dotnet/embed/repeat.sh
+```
+
+### Hollow Knight and Muck in the page
+
+Edger only, through the bench lock (`scratch/bench/bench.sh`, `BENCH_TIMEOUT` bounds the run inside
+the lock). The scripts are in `tools/unity-dotnet/page`. They expect edger's layout: the worktree is
+synced to `~/gex-sandbox/wt/unity`, and the staging is in `~/gex-sandbox/scratch/unity/page`.
+
+- **BCL directory** (`page/muck-bcl-NAME`): copy `muck-bcl`, which holds .NET 10's shared framework
+  assemblies and the native `libSystem.*` libraries. Then put this build's `OUT/lib/System.Private.CoreLib.dll`
+  and `OUT/provider/mono.wasm` into the copy. CoreLib must match the build, because 0002 patches GCHandle.
+- **Muck:** `BCL=... bash tools/unity-dotnet/page/muck-page.sh NAME MINUTES --fjit`. This needs
+  `muck-files.txt`, the host files from a native `--strace` run.
+- **Hollow Knight:**
+  - Stage it once with `hk-stage.py STRACE_RUN page/hk`. This writes `hk/game` (the 115 files HK opens)
+    and `hk/files.txt`.
+  - Then run, as `hk-jit-vs-interp.sh` does:
+
+```
+U=~/gex-sandbox/scratch/unity/units/cgen-page-m1
+LIBS=libc.so.6,libX11.so.6,libdbus-1.so.3,libudev.so.1,libasound.so.2,libcrypto.so.3,libpulsecommon-17.0.so,libpulse.so.0,libm.so.6,libxcb.so.1,libpulse-simple.so.0,libXrandr.so.2,libXi.so.6,libsystemd.so.0
+Q="cgen=1&elfunits=UnityPlayer.so,$LIBS&pins=UnityPlayer.so@11752000%2B2674000&fjitlibs=byobj=1"
+BENCH_TIMEOUT=50m scratch/bench/bench.sh -- env GEX_CGEN_CACHE=$U GL64=~/gex-sandbox/scratch/unity/gl64q2 \
+  BCL=~/gex-sandbox/scratch/unity/page/muck-bcl-NAME \
+  bash tools/unity-dotnet/page/hk-page.sh NAME 12 --fjit --query "$Q" \
+  --lazy "$HOME/gex-sandbox/games-linux/Hollow Knight" --input tests/games/hollow-knight-page-input.txt
+```
+
+  - This runs the interpreter, HK's default. `JIT=1` runs the JIT, and `PAGE_ENV=K=V,...` adds
+    guest environment. Add `--profile 700,20,/worker-` for a main-Worker profile.
+  - `hkpres.sh LOG` gives presents/s over 602-692 s. `hkbuckets.py SHOTDIR` gives managed time at
+    equal frames.
+
+### Open items
+
+- **The JIT's non-managed overhead in Hollow Knight (top item).** q81, provider p31:
+  - presents/s: JIT 13.78, interpreter 15.62;
+  - managed time per present: JIT 14.3 ms, interpreter 15.6 ms;
+  - main-Worker time per present: JIT 71.5 ms, interpreter 61.2 ms.
+
+  The JIT already wins on managed code. It loses about 10 ms per frame outside it, in the "other"
+  bucket and in UnityPlayer time. The suspect is compiles still running on the main Worker (module
+  compilation and instantiation, tier-2 recompiles) at 700 s. A profile split by those frames
+  (`mono_wasm_jit_*` compile and instantiate under the host's wasm compile) would settle it. Once that
+  is fixed, the JIT should beat the interpreter on HK, and the default can flip back.
+- About 300k interpreter legs a run are left: the vcall2-delegate gate, WillRenderCanvases, throwing
+  reflection paths, and ContactFilter2D (the struct-instance icall, above).
+- **62b38fc2** (`MemoryMap::reserve`, pins armed per thread) hung HK in the page (hp30, hp31). It is
+  reverted (42f09b39). The hang itself is not understood.
+- Tier-1's safepoint slow path writes cached guest registers back only inside fused loops. A thread
+  parked there for a provider's collection can leave a stale RSP and stale registers in its context.
+  The worker bug did not need this fix, so it is not applied. Writing back at every slow path
+  (`flush_conditional` unconditionally) is correct, but it adds code to every safepoint. It is left
+  for a decision on code size.
+- **Rebase onto r58Playz's tip** (6812ea26..2f86e2c9, see "Upstream review" above): the decision is
+  still with the user.

@@ -1,0 +1,350 @@
+wasm jit: direct calls from JIT code to guest InternalCalls and P/Invokes (gex)
+
+A wasm-JIT body reached an InternalCall or P/Invoke only through the residual
+(call_interp -> interp_entry -> the managed-to-native wrapper in the
+interpreter), ~490 ns a crossing in the browser. Hollow Knight makes ~220k
+such calls a second into UnityPlayer (13.2M interpreter-routed icall
+residuals a minute in hg10). mono_wasm_jit_gex_native_site resolves the
+guest target at compile time for identity-marshalled signatures, and the
+residual site calls mono_wasm_jit_gex_native_call on the same scratch
+layout instead: null check of this, GC-safe transition for foreign
+InternalCalls and P/Invokes, SetLastError, the interruption checkpoint.
+GEXMONO_WASM_JIT_NATIVE=0 turns it off. Counters: [wasm-jit gex-native].
+Also MONO_WASM_JIT_STATS_TOPN sizes the stats top-N tables.
+
+Tests: tests/unity-dotnet T.NativeDirect, CallBench icall legs.
+
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index f4746f8a4..7b657f37d 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -3059,6 +3059,7 @@ EMSCRIPTEN_KEEPALIVE void
+ mono_wasm_jit_dump_blockers (int topn)
+ {
+ 	int shown = 0;
++	if (topn <= 0) topn = g_getenv ("MONO_WASM_JIT_STATS_TOPN") ? atoi (g_getenv ("MONO_WASM_JIT_STATS_TOPN")) : 40;   /* gex */
+ 	if (topn <= 0) topn = 40;
+ 	/* weighted perm-vcall top-N: `weight | reason | bail | exact emitter gate | method` */
+ 	printf ("[wasm-jit vperm top] perm-unjittable vcall-residual callees by executed residual count:\n");
+@@ -7122,6 +7123,230 @@ mono_wasm_jit_pretransform (MonoMethod *method)
+  * else 0. This is the residual's exception path: real code throws (null checks, class init, ...), and
+  * without it the JITted caller would read the stale scratch slot as a garbage object -> OOB.
+  */
++/*
++ * gex: DIRECT NATIVE CALLS from wasm-JIT code to guest code (UnityPlayer's InternalCalls and P/Invokes).
++ *
++ * A wasm-JIT body reaches an InternalCall or P/Invoke only through the residual (call_interp -> interp_entry ->
++ * the managed-to-native wrapper's IL -> ves_pinvoke_method -> gex_interp_call_guest): ~490 ns a call in the
++ * browser, against ~60 ns for the interpreter's own call, and Hollow Knight makes ~220k such calls a second
++ * (Component.get_gameObject_Injected, Transform.get_position_Injected, ...). mono_wasm_jit_gex_native_site
++ * decides at compile time whether a callee can instead be called straight from the residual's scratch: the
++ * target is resolved once (it is a guest function), and the wrapper's work is redone here with no interpreter
++ * frame -- the null check of `this`, the GC-safe transition (foreign InternalCalls and P/Invokes, as
++ * gc_safe_transition_builder_init decides on wasm), SetLastError, and the interruption checkpoint the wrapper
++ * ends with, which is what turns an exception the guest raised into a managed throw. Only signatures whose
++ * marshalling is the identity qualify: integers, pointers, byrefs, floats, and, for an InternalCall only,
++ * object references (a P/Invoke would marshal those). By-value structs, struct returns, handles-style
++ * InternalCalls, generic and vararg methods take the residual as before.
++ */
++typedef struct {
++	MonoMethodSignature *sig;
++	gpointer addr;
++	guint8 gc_safe, save_last_error, null_check, pinvoke;
++} WjGexNativeSite;
++
++static gboolean
++wj_gex_native_type_ok (MonoType *t, gboolean pinvoke, gboolean ret)
++{
++	if (m_type_is_byref (t))
++		return !ret;
++	t = mini_get_underlying_type (t);
++	switch (t->type) {
++	case MONO_TYPE_VOID: return ret;
++	case MONO_TYPE_I1: case MONO_TYPE_U1: case MONO_TYPE_I2: case MONO_TYPE_U2: case MONO_TYPE_I4: case MONO_TYPE_U4:
++	case MONO_TYPE_I8: case MONO_TYPE_U8: case MONO_TYPE_I: case MONO_TYPE_U: case MONO_TYPE_PTR: case MONO_TYPE_FNPTR:
++	case MONO_TYPE_R4: case MONO_TYPE_R8:
++		return TRUE;
++	case MONO_TYPE_BOOLEAN: case MONO_TYPE_CHAR:
++		return !pinvoke;   /* a P/Invoke marshals bool as a 4-byte BOOL and char by charset */
++	case MONO_TYPE_OBJECT: case MONO_TYPE_STRING: case MONO_TYPE_CLASS: case MONO_TYPE_SZARRAY: case MONO_TYPE_ARRAY:
++		return !pinvoke;
++	default:
++		return FALSE;
++	}
++}
++
++static GHashTable *wj_gex_native_sites;   /* MonoMethod* -> WjGexNativeSite* (or the miss marker); compile section */
++static WjGexNativeSite wj_gex_native_miss;
++
++gpointer
++mono_wasm_jit_gex_native_site (MonoMethod *m)
++{
++#ifdef HOST_GEX
++	static int enabled = -1;
++	WjGexNativeSite *site;
++	MonoMethod *target = m;
++	MonoMethodSignature *sig;
++	gpointer addr = NULL;
++	gboolean pinvoke, gc_safe = TRUE, last_error = FALSE;
++	if (enabled < 0)
++		enabled = !g_getenv ("GEXMONO_WASM_JIT_NATIVE") || atoi (g_getenv ("GEXMONO_WASM_JIT_NATIVE")) != 0;
++	if (!enabled || !m)
++		return NULL;
++	if (!wj_gex_native_sites)
++		wj_gex_native_sites = g_hash_table_new (NULL, NULL);
++	site = (WjGexNativeSite *) g_hash_table_lookup (wj_gex_native_sites, m);
++	if (site)
++		return site == &wj_gex_native_miss ? NULL : site;
++	site = &wj_gex_native_miss;
++	if (m->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++		WrapperInfo *info = mono_marshal_get_wrapper_info (m);
++		target = info && info->subtype == WRAPPER_SUBTYPE_NONE ? info->d.managed_to_native.method : NULL;
++	} else if (m->wrapper_type != MONO_WRAPPER_NONE)
++		target = NULL;
++	if (!target || target->is_generic || target->is_inflated || mono_class_is_gtd (target->klass) || mono_class_is_ginst (target->klass))
++		goto out;
++	pinvoke = (target->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) != 0;
++	if (!pinvoke && !(target->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL))
++		goto out;
++	if ((target->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED) || target->string_ctor)
++		goto out;
++	sig = mono_method_signature_internal (target);
++	if (!sig || sig->call_convention == MONO_CALL_VARARG || sig->param_count > 16)
++		goto out;
++	if (sig->hasthis && (pinvoke || m_class_is_valuetype (target->klass)))
++		goto out;
++	if (pinvoke && sig->marshalling_disabled)
++		pinvoke = FALSE;   /* DisableRuntimeMarshalling: the identity for everything the type check admits */
++	if (!wj_gex_native_type_ok (sig->ret, pinvoke, TRUE))
++		goto out;
++	for (int i = 0; i < sig->param_count; ++i) {
++		MonoType *t = sig->params [i];
++		if (!wj_gex_native_type_ok (t, pinvoke, FALSE))
++			goto out;
++		/* a P/Invoke copies a non-blittable struct behind a byref; an InternalCall passes the address as is */
++		if (pinvoke && m_type_is_byref (t)) {
++			MonoClass *k = mono_class_from_mono_type_internal (t);
++			if (!m_class_is_valuetype (k) || !m_class_is_blittable (k))
++				goto out;
++		}
++	}
++	if (pinvoke) {
++		ERROR_DECL (error);
++		MonoMethodPInvoke *piinfo = (MonoMethodPInvoke *) target;
++		addr = mono_lookup_pinvoke_call_internal (target, error);
++		if (!is_ok (error)) {
++			mono_error_cleanup (error);
++			goto out;
++		}
++		last_error = (piinfo->piflags & PINVOKE_ATTRIBUTE_SUPPORTS_LAST_ERROR) != 0;
++	} else {
++		gboolean uses_handles = FALSE, foreign = FALSE;
++		addr = (gpointer) mono_lookup_internal_call_full (target, FALSE, &uses_handles, &foreign);
++		if (uses_handles)
++			goto out;
++		gc_safe = foreign;
++	}
++	if (!addr || !gexp_is_guest_fn ((guint64)(gsize) addr))
++		goto out;
++	site = g_new0 (WjGexNativeSite, 1);
++	site->sig = sig;
++	site->addr = addr;
++	site->gc_safe = gc_safe;
++	site->save_last_error = last_error;
++	site->null_check = sig->hasthis;
++	site->pinvoke = pinvoke;
++	{
++		extern int mono_wasm_jit_verbose;
++		if (mono_wasm_jit_verbose >= 1) {
++			char *fn = mono_method_get_full_name (target);
++			printf ("WASM_JIT_GEX_NATIVE %s (%s%s)\n", fn, pinvoke ? "pinvoke" : "icall", gc_safe ? ", gc-safe" : "");
++			g_free (fn);
++		}
++	}
++out:
++	g_hash_table_insert (wj_gex_native_sites, m, site);
++	return site == &wj_gex_native_miss ? NULL : site;
++#else
++	return NULL;
++#endif
++}
++
++#ifdef HOST_GEX
++/* Its own frame, so that the GexArgs in the caller's frame lies above the GC-safe stack mark and is scanned:
++ * the arguments may be the only references left to their objects while the guest runs. */
++static MONO_NEVER_INLINE guint64
++wj_gex_native_safe (gpointer addr, GexGuestCall *c)
++{
++	MONO_STACKDATA (stack_data);
++	gpointer cookie = mono_threads_enter_gc_safe_region_internal (&stack_data);
++	guint64 raised = gexp_call_guest_catching ((guint64)(gsize) addr, c);
++	mono_threads_exit_gc_safe_region_internal (cookie, &stack_data);
++	return raised;
++}
++#endif
++
++/* The call itself: the residual's scratch layout (this, then the arguments, 8 bytes a slot; the result at +192),
++ * and its result convention (1 = the callee threw). */
++int
++mono_wasm_jit_gex_native_call (gpointer psite, guint8 *buf)
++{
++#ifdef HOST_GEX
++	extern void mono_wasm_jit_throw (MonoObject *exc);
++	WjGexNativeSite *site = (WjGexNativeSite *) psite;
++	MonoMethodSignature *sig = site->sig;
++	GexArgs a;
++	int idx = 0;
++	guint64 raised;
++	memset (&a, 0, sizeof (a));
++	a.c.win64 = gex_guest_abi_win64;
++	a.c.stack = a.stack;
++	if (G_UNLIKELY (mono_wasm_jit_stats))
++		mono_wasm_jit_count (WJC_GEX_NATIVE_CALL);
++	if (site->null_check) {
++		gpointer self = *(gpointer *) buf;
++		if (G_UNLIKELY (!self)) {
++			mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
++			return 1;
++		}
++		gex_add_int (&a, (guint64)(gsize) self);
++		idx = 1;
++	}
++	for (int i = 0; i < sig->param_count; ++i)
++		gex_add_arg (&a, sig->params [i], sig, (stackval *) (buf + (idx + i) * 8));
++	if (site->save_last_error)
++		mono_marshal_clear_last_error ();
++	if (site->gc_safe)
++		raised = wj_gex_native_safe (site->addr, &a.c);
++	else
++		raised = gexp_call_guest_catching ((guint64)(gsize) site->addr, &a.c);
++	if (site->save_last_error)
++		mono_marshal_set_last_error ();
++	if (raised) {
++		if (raised != 1)
++			mono_set_pending_exception ((MonoException *)(gsize) raised);
++	} else if (!MONO_TYPE_IS_VOID (sig->ret)) {
++		guint8 *r = buf + WJ_SCRATCH_RET_OFF;
++		MonoType *rt = m_type_is_byref (sig->ret) ? NULL : mini_get_underlying_type (sig->ret);
++		memset (r, 0, 8);
++		if (rt && rt->type == MONO_TYPE_R4) {
++			guint32 bits = (guint32) a.c.xmm0;
++			memcpy (r, &bits, 4);
++		} else if (rt && rt->type == MONO_TYPE_R8) {
++			memcpy (r, &a.c.xmm0, 8);
++		} else {
++			stackval sv;
++			guint64 rax = a.c.rax;
++			stackval_from_data (sig->ret, &sv, &rax, site->pinvoke);
++			memcpy (r, &sv.data.l, 8);
++		}
++	}
++	/* The wrapper's last act (emit_thread_interrupt_checkpoint), and the interpreter's EXCEPTION_CHECKPOINT after a
++	 * native call: a pending exception -- the guest's own, or an abort -- is thrown here. */
++	if (G_UNLIKELY (mono_thread_interruption_request_flag)) {
++		MonoException *exc = mono_thread_interruption_checkpoint ();
++		if (exc) {
++			mono_wasm_jit_throw ((MonoObject *) exc);
++			return 1;
++		}
++	}
++	return 0;
++#else
++	(void) psite; (void) buf;
++	return 1;
++#endif
++}
++
+ static int wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imethod);
+ 
+ int
+diff --git a/src/mono/mono/mini/mini-wasm-diagnostics.inc b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+index 4d492cde8..872008171 100644
+--- a/src/mono/mono/mini/mini-wasm-diagnostics.inc
++++ b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+@@ -39,7 +39,7 @@ static gint32 wj_stack_probe_hits = 0;
+  * because the stats dump below prints it. */
+ #define WJ_ADMIT_DEPTH_WARN 64
+ 
+-g_static_assert (WJC_MAX == 470);   /* + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
++g_static_assert (WJC_MAX == 472);   /* + the R377 ldaddr-arg count, + the J1a icall site count, + the J1e value-type vcall pair, + the R376 aggressive-inline cap, + the R376 valuetype-target refusal, + the J1c 64-bit atomic count, + the R371 cold-block census (8), + the Phase 5 lazy-slot census (32), + the R360 atomic lowering count, + the R358 tier-2 unit census (14), + the R355 loop-credit trio, + the R353 EH-record census (6), + the R349 tier-2 body cap, + the R346 math-intrinsic count, + the R341 branch-hint pair, + the R338 co-location skip, + the R332 re-arm count, + the R329 static-prediction pair, + the R327 tier-2 retry pair, + the R322 hazard probe, + the R323 lowering pair, + the R322 validate-only re-emit count, + the R321 ldaddr-ref count, + the R320 torn-payload catch, + the R316k root/inlinee split, + the R316j split-profile probe, + the R319 BFI admit, + the R316i tier-2 GI split, + the R318 cold-throw admit, + the R316c tier-2 trio, + the R317 fast-TLS site count, + the R316b profile-origin pair, + the R316 tier-2 census (5), + the R315 inline-policy census (7), + the R314 retired-InterpMethod census (7), + the R311 method-identity census (9), + the R310 profile-delivery census (8 GI-gate + 7 IC-miss), + replacement give-ups, + the retire/reclaim census, + the install walk's GC-pending probe, + the per-retainer dead-MonoMethod catch, + the malformed-EH-clause decline, + the spin census, + the carry-list drop census, + the safepoint re-raise high-water, + the perm-unjittable pointer set, + the canon-substitution discriminator, + the two deterministic-compile-failure refusals, + the two LAZY_COLD reach counters, + the three VCALL_MEMO counters, + the leaf-inline admit, + the six freed-method-set counters, + the fixed-index JIT-slot census, + the island-entry stack/TLS probe, + the five worker-reuse counters, + the LAZY_COLD doomed-block reach, + the FRAME_ZERO skip census, + the slow-entry-while-live probe, + the two LAZY_COLD=2 reach splits, + the entry-adoption pair, + the six edge-sampler counters, + the placeholder-stray catch, + the late-sample drop */
+ 
+ /* Census counters — see the long note above mono_wasm_jit_liveness.
+  *
+@@ -902,6 +902,7 @@ mono_wasm_jit_dump_stats (void)
+ 				  printf ("[wasm-jit vcall-vret] byaddr=%lld scalar=%lld (vcall_vret=%d)\n", WJC_(WJC_VCALL2_BYADDR), WJC_(WJC_VCALL2_SCALAR), mono_wasm_jit_vcall_vret); }
+ 				{ extern int mono_wasm_jit_icall_aot, mono_wasm_jit_direct_deps;
+ 				  printf ("[wasm-jit icall-aot] sites=%lld (icall_aot=%d direct_deps=%d)\n", WJC_(WJC_ICALL_AOT_SITE), mono_wasm_jit_icall_aot, mono_wasm_jit_direct_deps); }
++				printf ("[wasm-jit gex-native] sites=%lld calls=%lld\n", WJC_(WJC_GEX_NATIVE_SITE), WJC_(WJC_GEX_NATIVE_CALL));
+ 				{ extern int mono_wasm_jit_ldaddr_arg;
+ 				  printf ("[wasm-jit ldaddr-arg] homed=%lld (ldaddr_arg=%d)\n", WJC_(WJC_LDADDR_ARG), mono_wasm_jit_ldaddr_arg); }
+ 				{ extern int mono_wasm_jit_t2_max_body;
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index b5c9e4ed2..551fc111a 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -5209,6 +5209,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					 * these to the interpreter; keep the rest. */
+ 					{ const char *_ns = m_class_get_name_space (call->method->klass);
+ 					  if (_ns && !strncmp (_ns, "System.Reflection", 17)) { fail = "residual reflection"; goto done; } }
++					/* gex: an InternalCall / P/Invoke into guest code is called from the scratch directly
++					 * (mono_wasm_jit_gex_native_call, interp.c), not through the interpreter: no self-healing
++					 * block (it never gets an f-slot), no pretransform, the same spill and result protocol. */
++					gpointer gex_native = NULL;
++					{
++						extern gpointer mono_wasm_jit_gex_native_site (MonoMethod *m);
++						if (!((MonoCallInst *) ins)->rgctx_reg && !cci.vret_byaddr && cci.ret.kind != WJ_ARG_VTYPE_SCALAR)
++							gex_native = mono_wasm_jit_gex_native_site (call_method);
++						if (gex_native)
++							wj_count (WJC_GEX_NATIVE_SITE);
++					}
+ 					/* Diagnostic: list the params+non-void residual sites. Only reached in modes 1/4 (mode 5
+ 					 * bails this shape above). Lets a =1/=4 run name a suspect caller->callee. */
+ 					if (mono_wasm_jit_verbose >= 3 && csig->param_count > 0 && ct.ret != WASM_VOID) {
+@@ -5229,7 +5240,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						extern int mono_wasm_jit_late_fslot (gpointer imethod);
+ 						extern int mono_wasm_jit_callee_perm_unjittable (MonoMethod *m);
+ 						extern gboolean mono_interp_jit_call_supported (MonoMethod *method, MonoMethodSignature *sig);
+-						gpointer late_im = mono_wasm_jit_get_callee_imethod (call_method);
++						gpointer late_im = gex_native ? NULL : mono_wasm_jit_get_callee_imethod (call_method);
+ 						gboolean can_heal = late_im && !mono_wasm_jit_callee_perm_unjittable (call_method)
+ 							&& !mono_interp_jit_call_supported (call_method, csig);
+ 						if (can_heal) {
+@@ -5295,7 +5306,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					 * unread spilled args). Doing it now — while the ref args still live in the GC-scanned ref
+ 					 * shadow stack and the scratch is free — closes both windows; call_interp then finds the
+ 					 * imethod already transformed and only does the GC-free marshal. (i32)->void. */
+-					{
++					if (!gex_native) {
+ 						extern void mono_wasm_jit_pretransform (MonoMethod *method);
+ 						WasmFuncType tp; int tpi = -1, tpk;
+ 						memset (&tp, 0, sizeof (tp)); tp.params [0] = WASM_PTR; tp.nparams = 1; tp.ret = WASM_VOID;
+@@ -5347,9 +5358,16 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					}
+ 					/* mono_wasm_jit_call_interp(method, $scratch): bake call_method (the synchronized wrapper for a
+ 					 * synchronized callee) so the interp runs it WITH the monitor; plain callees pass through. */
++					if (gex_native) {
++						extern int mono_wasm_jit_gex_native_call (gpointer site, guint8 *buf);
++						wasm_ptr_const (&body, (gint64) (intptr_t) gex_native);
++						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
++						wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_gex_native_call, tii);
++					} else {
+ 					wasm_ptr_const (&body, (gint64) (intptr_t) call_method);
+ 					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+ 					wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_call_interp, tii);
++					}
+ 					/* call_interp returns 1 if the callee threw: the result slot is stale AND an exception
+ 					 * is armed. Continue the native unwind (never a normal return -- that skipped this
+ 					 * frame's own landing pad and delivered the exception late; FINDINGS Finding 15). */
+diff --git a/src/mono/mono/mini/mini-wasm.h b/src/mono/mono/mini/mini-wasm.h
+index ecc44a99a..b0c69d026 100644
+--- a/src/mono/mono/mini/mini-wasm.h
++++ b/src/mono/mono/mini/mini-wasm.h
+@@ -1339,6 +1339,8 @@ enum {
+ 	WJC_VCALL2_SCALAR,         /* J1e: an OP_VCALL2_MEMBASE site lowered with a single-field (scalar) value-type result */
+ 	WJC_ICALL_AOT_SITE,        /* J1a: a direct InternalCall site emitted as an inline-AOT call of its native wrapper (MONO_WASM_JIT_ICALL_AOT) */
+ 	WJC_LDADDR_ARG,            /* R377: an address-taken scalar argument homed in an addr-frame slot (MONO_WASM_JIT_LDADDR_ARG) */
++	WJC_GEX_NATIVE_SITE,       /* gex: a direct InternalCall/P-Invoke site into guest code (mono_wasm_jit_gex_native_site) */
++	WJC_GEX_NATIVE_CALL,       /* gex: executions of those sites (counted only with MONO_WASM_JIT_STATS) */
+ 	WJC_MAX
+ };
+ 
