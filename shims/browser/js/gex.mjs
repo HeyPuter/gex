@@ -2914,6 +2914,13 @@ export class Gex {
           image_mapped: (base, fd) => {
             const number = e.gex_image_mapped?.(base, fd) ?? -1;
             if (number === -1) return;
+            // An i386 image with a function-tier unit to fetch (cgen.rs
+            // `w3_mapped`): served here, before Wine's loader goes on. (-2
+            // is a later skeleton bound into the install.)
+            if (number === -3) {
+              this.#cgenServe();
+              return;
+            }
             this.#cgenCatchUp();
             if (number >= 0) {
               e.gex_cgen_pmod_installed(number);

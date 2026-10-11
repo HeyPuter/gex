@@ -209,11 +209,14 @@ The plan does the same with **wasm32 as Wine's host architecture**:
     points (server requests, waits) for the state that tolerates it (the
     clock), which does not cover win32u's lock-free reads. A direct-call
     transport in place of the socket is a separate, later optimisation.
-- **Sync through ntsync.** Wine 11 supports the ntsync driver
-  (`dlls/ntdll/unix/sync.c`). gex-kernel implements `/dev/ntsync`, and its
-  ioctls (semaphores, mutexes, events, wait-any/all) go to the kernel's
-  futex machinery. Waits, mutexes and events then never reach wineserver,
-  which matters for Noita's job chain. The server round trip that is left
+- **Sync through ntsync (planned, W3.6; not implemented yet).** Wine 11
+  supports the ntsync driver (`dlls/ntdll/unix/sync.c`). The plan: gex-kernel
+  implements `/dev/ntsync`, its ioctls (semaphores, mutexes, events,
+  wait-any/all) going to the kernel's futex machinery, natively and in the
+  page (including the single-thread no-SAB build, whose waits park on the
+  JSPI scheduler). Waits, mutexes and events would then never reach
+  wineserver, which matters for Noita's job chain. Today every one of them
+  is a server request. The server round trip that is left
   (W0(a): 1.07 ms, from the native host's 1 ms fd polling) needs
   event-driven fd wakeups in gex-kernel before W3.
 
@@ -1192,6 +1195,27 @@ Chromium timing is still to do. What it took, in start order:
     (`GRAPHICS=null|wayland` sets the driver). `$W/page/pfx4` was built
     from gate-w3boot/pfx-w3install. `run-node.mjs --dir` now carries
     directory symlinks (`dosdevices/c:`) as links.
+- **Bundle file times.** nt-page passes a bundle's symlinks and, with
+  `mtimes=1`, its file times. Without them wineboot saw wine.inf as newer
+  than the install and ran the whole prefix update first (5 extra
+  processes).
+- **Milestone (b): a GUI program on the page compositor.** window.exe
+  draws its window on the page's Wayland compositor (Chromium on gooner,
+  functional only; screenshot `$W/page/tmp/shots/run0.png`).
+  - The bug was a user callback's syscall frame being overwritten.
+    KeUserModeCallback put it below its own C frame. A Unix call from the
+    wasm PE module goes straight to `__wine_unix_call_dispatcher`, with no
+    system-call switch, so it runs on the loader's stack below that frame
+    and wrote over it. Here that call was winewayland.drv's DllMain under
+    the load_driver callback. NtCallbackReturn then found no
+    `prev_frame` and returned STATUS_NO_CALLBACK_ACTIVE (0xc0000258).
+  - The fix: the frame now lives in KeUserModeCallback's own frame
+    (`alloca`). Wine fork 3cad2206edf.
+  - Natively the same build passed, so only the page path wrote there.
+  - `GEX_WL_STUB=1` reproduces it under Node.
+  - The Wayland bundle carries `/usr/share/X11/xkb`. Without it,
+    wayland_keyboard_init failed with "Failed to parse default Xkb
+    ruleset".
 
 ### 3.9 x64 programs (later)
 
@@ -1256,6 +1280,63 @@ unixlib ran through the dlopen registry (§3.12).
 | W3.5 audio, sockets, crypto | a gex audio driver behind winmm/dsound (Web Audio in the page; first a null device so games start), ws2_32 and crypt32/secur32 unixlibs | Undertale to gameplay with sound | 2–3 d |
 | W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
 | W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
+
+**W3.6 design: `/dev/ntsync` in gex-kernel (2026-10-10, before building).**
+Wine 11's in-process sync (`server/inproc_sync.c`, `dlls/ntdll/unix/sync.c`)
+is the client of Linux's ntsync driver: wineserver opens `/dev/ntsync`, makes
+one ntsync object per event, mutex and semaphore (`NTSYNC_IOC_CREATE_*`),
+and hands each object's fd to a client process once
+(`get_inproc_sync_fd`, cached by handle). From then on, set, reset, pulse,
+release, read and wait-any/all are ioctls on those fds. They never reach
+wineserver. The client's alert fd is an ntsync event too. Its wake goes
+through one `server_wait` for the APC.
+
+- **One object table, shared by every process of a session.** Natively it
+  lives in gex-kernel, process-global like its pipes. In the page it lives in
+  the global kernel (`shims/kernel`, as `k_sock_*` do), and a process's
+  ntsync fds are remote handles to it, as `RemoteUnix` is for sockets.
+  SCM_RIGHTS describes one as a token (`ntsync:id`) beside `sock:id`. Its
+  reference keeps the object alive in flight, and the receiver rebuilds the
+  fd (`scm_rebuild`), as for sockets.
+- **The state machine is one module** (`gex-kernel/src/ntsync.rs`):
+  - objects (semaphore count and max; mutex owner, count and abandoned;
+    event manual and signaled);
+  - wait-any and wait-all with the driver's rules: wait-all acquires every
+    object at once or none, and a mutex is recursive by owner tid;
+  - `MUTEX_KILL` abandons a mutex (`EOWNERDEAD`);
+  - the alert object;
+  - absolute timeouts on CLOCK_MONOTONIC, or CLOCK_REALTIME with
+    `NTSYNC_WAIT_REALTIME`.
+  It has no host types, so it is unit-tested on its own and is the same code
+  natively and in the page.
+- **Waiting is the futex machinery's.** A wait that cannot be satisfied
+  registers its thread on each object it waits on and parks on a per-waiter
+  word:
+  - natively, a `FutexTable` queue, a real host wait (`Parked`, as
+    `FUTEX_WAIT`);
+  - in the page with SharedArrayBuffer, the global kernel's
+    `k_park_futex`/`k_futex_wake` on that word;
+  - in SP's single-thread no-SAB build, the same park through its JSPI
+    scheduler, which already parks futex waits.
+  A signal (set, release, unlock, kill) walks the object's waiters, grants
+  what it can under the driver's rules, and wakes exactly those words. A
+  woken waiter rechecks its grant, so spurious wakes are harmless and no
+  neutral choice assumes SAB.
+- **Device and ABI.** `/dev/ntsync` is a character device in gex-kernel's
+  devfs, with the Linux UAPI ioctl numbers and structs (`linux/ntsync.h`
+  added to the W3 sysroot, so Wine's configure finds it and builds the
+  ntsync path). The i386 personality keeps the structs' 64-bit fields
+  (`timeout`, `objs`) as the UAPI lays them out. `objs` is a guest pointer
+  to an int array of fds.
+- **What it does not remove.** `read_session_data` (a child process's read
+  of the session block it cannot map, §3.17 table) and every other request
+  stay server round trips. The measurement before building
+  (`WINEGEX_REQSTATS=1`, `$W/tools/reqstats.py`) gives the split per
+  process.
+- **Gate.** tests/nt sync, sync2, mutex/event/semaphore and APC tests under
+  W3 natively and in the page (both builds). Then Undertale and Noita.
+  Measured: server requests per second before and after, and the frame
+  numbers.
 
 **W3.1 progress (2026-10-06, merge/w3 + fork `wasm32-w3`):**
 - **Fault delivery (done natively):** `gex.fault_hook(idx)`; a memory
@@ -2208,12 +2289,15 @@ Steps:
 **RESUME HERE (2026-10-10, evening): W3.7.** `wine cmd /c echo` runs in
 the page under Node on gooner. See §3.17, "W3.7".
 - **Driver script:** `$W/page/run-w3.sh TAG EXE|cmd [args]`, with
-  `PFX=pfx3` (the installed template) and `TRAPSTACK=1`.
+  `PFX=pfx4` (null) or `pfx-wl` (Wayland; add `GEX_WL_STUB=1`), `DIST=`
+  and `TRAPSTACK=1`. Chromium: `$W/page/w3page.mjs` (W3TAR, W3ARGV,
+  W3WANT, W3SHOT=dir).
 - **Next:**
   1. Chromium timing on edger once the edger reservation ends. Edger was
      reserved for DH on 2026-10-10; no edger jobs until the
      coordinator says so.
-  2. Milestone (b): a GUI program on the page compositor.
+  2. Milestone (b): done functionally (window.exe, see §3.17); edger
+     timing queued (`$W/page/run-w3gui.sh`, `$W/page/w3gui-edger1.txt`).
   3. Milestone (c): Undertale.
   4. The session keeper (design below in §3.17).
 

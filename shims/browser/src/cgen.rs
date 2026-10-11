@@ -290,6 +290,65 @@ pub(crate) fn drain() -> bool {
     !lock(&WANTED).is_empty()
 }
 
+/// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
+/// (`gex.image_mapped`, not a wasm32 skeleton), placed as the NT layer's
+/// are (the native host's `nt_cgen::w3_image` with `GEX_W3_UNITS=all`).
+/// Never fatal: an image with no unit stays on tier-1, and one whose mapped
+/// code is not yet its bytes (Wine relocates a moved image after mapping it)
+/// waits for its first miss ([`w3_miss`]), as natively. Returns whether a
+/// unit now waits for JavaScript.
+pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
+    if !on() {
+        return false;
+    }
+    let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
+    if !w3_matches(&image) {
+        lock(&W3_DEFERRED).push(Pending { path: path.to_string(), base, pe: Arc::new(pe.clone()) });
+        W3_ANY_DEFERRED.store(true, Ordering::Release);
+        return false;
+    }
+    place(&image, path, base, true, Some(pe));
+    !lock(&WANTED).is_empty()
+}
+
+/// Images [`w3_mapped`] left for their first miss.
+static W3_DEFERRED: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+static W3_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the mapped code is `image`'s.
+fn w3_matches(image: &gex_ld::Image) -> bool {
+    let memory = crate::guest_bytes();
+    image.segments.iter().filter(|s| s.executable).all(|seg| {
+        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+        memory.get(lo..lo + n).is_some_and(|live| live == &seg.bytes[..])
+    })
+}
+
+/// A tier-1 miss at `pc`: if it is inside an image [`w3_mapped`] deferred,
+/// place that image's unit now (an image whose code still differs stays on
+/// tier-1). Returns whether a unit now waits for JavaScript.
+pub(crate) fn w3_miss(pc: u64) -> bool {
+    if !W3_ANY_DEFERRED.load(Ordering::Acquire) {
+        return false;
+    }
+    let p = {
+        let mut d = lock(&W3_DEFERRED);
+        let Some(i) = d.iter().position(|p| pc >= p.base && pc < p.base + p.pe.image_size as u64) else { return false };
+        let p = d.swap_remove(i);
+        if d.is_empty() {
+            W3_ANY_DEFERRED.store(false, Ordering::Release);
+        }
+        p
+    };
+    let Ok((image, _)) = gex_xlate::func::pe_input(&p.pe, p.base) else { return false };
+    if !w3_matches(&image) {
+        crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", p.path, p.base));
+        return false;
+    }
+    place(&image, &p.path, p.base, true, Some(&p.pe));
+    !lock(&WANTED).is_empty()
+}
+
 /// Want the unit for `image`, mapped at `base`: its key, and the check that
 /// the mapped code is what the unit was built from (a mismatch ends the run,
 /// as natively: a unit over different code is wrong code). `optional`: a
