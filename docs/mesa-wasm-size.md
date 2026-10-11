@@ -347,7 +347,8 @@ Chromium on its GPU, unless said:
 | SPIR-V validator off in both places: `--drop 'spvtools::val::'` and its entry points | -475 | -0.51 MB |
 | margin over the new union | +64 | +0.02 MB |
 | names matched without Binaryen's `_N` suffix (twins of listed functions, and three the Tint rebuild renamed) | +86 | +0.05 MB |
-| **kept** | **5,824 (23.6%)** | **6.19 MB (39.2%)** |
+| final build profiled again (trace replays with no WGSL cache, gears, Muck and HK pages): nothing outside the list; margin over it | +20 | +0.01 MB |
+| **kept** | **5,844 (23.6%)** | **6.20 MB (39.2%)** |
 
 The page harnesses cut console lines at about 4,000 characters, and a set
 of 24,721 functions is 4,120 in base64, so the first page rows above miss
@@ -370,17 +371,17 @@ As the dists ship them (stripped), zstd at -19:
 | flavour | file | raw | zstd -19 |
 | --- | --- | --- | --- |
 | MP | master, whole | 18,898,007 | 3,305,617 |
-| MP | M3: gex-wgpu-replay.wasm | 9,589,918 | 1,927,277 |
-| MP | M3: gex-wgpu-replay.deferred.wasm | 9,960,411 | 1,588,712 |
+| MP | M3: gex-wgpu-replay.wasm | 9,593,437 | 1,929,678 |
+| MP | M3: gex-wgpu-replay.deferred.wasm | 9,953,763 | 1,586,817 |
 | SP | master, whole | 18,669,577 | 3,300,261 |
-| SP | M3: gex-wgpu-replay.wasm | 9,389,548 | 1,929,865 |
-| SP | M3: gex-wgpu-replay.deferred.wasm | 9,954,080 | 1,583,371 |
+| SP | M3: gex-wgpu-replay.wasm | 9,392,394 | 1,929,097 |
+| SP | M3: gex-wgpu-replay.deferred.wasm | 9,948,024 | 1,580,830 |
 
-What a page fetches and compiles before Mesa starts is 49.3% smaller raw
-than master's (9.59 against 18.90 MB) and 41.7% smaller compressed (1.93
+What a page fetches and compiles before Mesa starts is 49.2% smaller raw
+than master's (9.59 against 18.90 MB) and 41.6% smaller compressed (1.93
 against 3.31 MB) in MP; 49.7% and 41.5% in SP. The two parts together are
-0.89 MB more raw than the unsplit M2 build (19,550,329 against 18,655,830):
-the 17,184 trampolines and the exports the cold part imports through.
+0.89 MB more raw than the unsplit M2 build (19,547,200 against 18,655,830):
+the 17,173 trampolines and the exports the cold part imports through.
 (With the second list, before the validator went cold: MP 10,031,571 /
 2,032,243 and 9,503,551 / 1,493,059.)
 Binaryen at -Oz on the cold part alone takes it to 8,640,842 bytes but
@@ -481,6 +482,13 @@ pthreads.
 
 A miss while the prefetch is still compiling does not wait for it (a
 synchronous call cannot): it fetches and compiles again.
+
+A miss now says where it came from (`..., from CALLER <- ...`, the wasm
+frames under the trampoline). One Muck page run of the build before the
+last list (j10) missed once before its first frame (241.0 ms, synchronous,
+in the compositor Worker), during a shader translation with no WGSL cache
+entry; three more runs of it (j11, j12) and the final build's profiles did
+not show it again, so which function it was is not known.
 
 ### Testing it
 

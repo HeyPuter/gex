@@ -284,6 +284,7 @@ __pthread_mutex_trylock_owner
 __pthread_mutex_unlock
 __pthread_once
 __pthread_once_full
+__pthread_timedjoin_np
 __qsort_r
 __rem_pio2f
 __shgetc
@@ -300,6 +301,8 @@ __strchrnul
 __subtf3
 __timedwait
 __timedwait_cp
+__tl_lock
+__tl_unlock
 __toread
 __towrite
 __trunctfdf2
@@ -352,6 +355,7 @@ _emscripten_init_main_thread
 _emscripten_next_timer
 _emscripten_thread_init
 _emscripten_thread_mailbox_init
+_emscripten_timeout
 _emscripten_tls_init
 _emscripten_yield
 _equivalent_size_pname
@@ -1342,6 +1346,7 @@ draw_pipeline_destroy
 dxil_nir_lower_int_cubemaps
 dxt135_decode_imageblock
 em_task_queue_create
+em_task_queue_execute
 em_task_queue_free
 emit_alu
 emit_block
@@ -1515,6 +1520,7 @@ get_shader_program_completion_status
 get_shaderiv
 get_shared_block
 get_src_float
+get_tasks_for_thread
 get_tex_level_parameteriv
 get_tex_parameteriv
 get_texture_image
@@ -2780,6 +2786,7 @@ pthread_mutex_init
 pthread_sigmask
 push_fp_query
 puts
+raise_pending_signals
 ralloc_array_size
 ralloc_asprintf
 ralloc_asprintf_append
@@ -3215,6 +3222,7 @@ spvtools::opt::analysis::TensorViewNV::TensorViewNV\28unsigned\20int\2c\20unsign
 spvtools::opt::analysis::Type::ComputeHashValue\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
 spvtools::opt::analysis::Type::HasSameDecorations\28spvtools::opt::analysis::Type\20const*\29\20const
 spvtools::opt::analysis::Type::HashValue\28\29\20const
+spvtools::opt::analysis::Type::IsSame\28spvtools::opt::analysis::Type\20const*\29\20const
 spvtools::opt::analysis::Type::operator==\28spvtools::opt::analysis::Type\20const&\29\20const
 spvtools::opt::analysis::TypeManager::AnalyzeTypes\28spvtools::opt::Module\20const&\29
 spvtools::opt::analysis::TypeManager::AttachDecoration\28spvtools::opt::Instruction\20const&\2c\20spvtools::opt::analysis::Type*\29
@@ -3245,6 +3253,7 @@ spvtools::utils::SmallVector<unsigned\20int\2c\202ul>::MoveToLargeData\28\29
 spvtools::utils::SmallVector<unsigned\20int\2c\202ul>::operator=\28spvtools::utils::SmallVector<unsigned\20int\2c\202ul>&&\29
 spvtools::utils::SmallVector<unsigned\20int\2c\202ul>::operator=\28spvtools::utils::SmallVector<unsigned\20int\2c\202ul>\20const&\29
 src_divergent
+src_is_invariant
 sscanf
 st_AllocTextureImageBuffer
 st_ChooseTextureFormat
@@ -3608,6 +3617,7 @@ std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allo
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::ToString<tint::core::Access>\28tint::core::Access\20const&\29
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::ToString<tint::core::AddressSpace>\28tint::core::AddressSpace\20const&\29
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::ToString<tint::core::BuiltinType>\28tint::core::BuiltinType\20const&\29
+std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::ToString<tint::core::TexelFormat>\28tint::core::TexelFormat\20const&\29
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::ToString<tint::wgsl::BuiltinFn>\28tint::wgsl::BuiltinFn\20const&\29
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::core::constant::\28anonymous\20namespace\29::OverflowErrorMessage<tint::core::Number<double>>\28tint::core::Number<double>\2c\20std::__2::basic_string_view<char\2c\20std::__2::char_traits<char>>\29
 std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20tint::core::constant::\28anonymous\20namespace\29::OverflowErrorMessage<tint::core::Number<float>>\28tint::core::Number<float>\2c\20std::__2::basic_string_view<char\2c\20std::__2::char_traits<char>>\29
@@ -3887,6 +3897,7 @@ tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::Clear\28\29
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::EditIndex\20tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::EditAt<tint::ast::Statement\20const*&>\28tint::ast::Statement\20const*&\29
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::Move\28tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>&&\29
+tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::Rehash\28\29
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>\2c\204ul>::~HashmapBase\28\29
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::core::constant::Value\20const*\2c\20tint::Hasher<tint::core::constant::Value\20const*>\2c\20tint::EqualTo<tint::core::constant::Value\20const*>>\2c\20tint::core::ir::Constant*>\2c\2016ul>::EditIndex\20tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::core::constant::Value\20const*\2c\20tint::Hasher<tint::core::constant::Value\20const*>\2c\20tint::EqualTo<tint::core::constant::Value\20const*>>\2c\20tint::core::ir::Constant*>\2c\2016ul>::EditAt<tint::core::constant::Value\20const*&>\28tint::core::constant::Value\20const*&\29
 tint::HashmapBase<tint::HashmapEntry<tint::HashmapKey<tint::core::constant::Value\20const*\2c\20tint::Hasher<tint::core::constant::Value\20const*>\2c\20tint::EqualTo<tint::core::constant::Value\20const*>>\2c\20tint::core::ir::Constant*>\2c\2016ul>::Rehash\28\29
@@ -3938,6 +3949,7 @@ tint::HashmapEntry<tint::HashmapKey<tint::ast::Function\20const*\2c\20tint::Hash
 tint::HashmapEntry<tint::HashmapKey<tint::ast::Node\20const*\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>>&\20tint::Hashmap<tint::ast::Node\20const*\2c\20tint::Vector<std::__2::function<tint::ast::Node\20const*\20\28\29>\2c\204ul>\2c\204ul\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20tint::EqualTo<tint::ast::Node\20const*>>::GetOrAddZeroEntry<tint::ast::Statement\20const*&>\28tint::ast::Statement\20const*&\29
 tint::HashmapEntry<tint::HashmapKey<tint::core::type::Array\20const*\2c\20tint::Hasher<tint::core::type::Array\20const*>\2c\20tint::EqualTo<tint::core::type::Array\20const*>>\2c\20tint::Symbol>&\20tint::Hashmap<tint::core::type::Array\20const*\2c\20tint::Symbol\2c\204ul\2c\20tint::Hasher<tint::core::type::Array\20const*>\2c\20tint::EqualTo<tint::core::type::Array\20const*>>::GetOrAddEntry<tint::core::type::Array\20const*&\2c\20tint::spirv::reader::TransposeRowMajor::State::TransposeArrayHelper\28tint::core::type::Array\20const*\2c\20tint::spirv::reader::TransposeRowMajor::State::MatrixLayout\29::'lambda'\28\29>\28tint::core::type::Array\20const*&\2c\20tint::spirv::reader::TransposeRowMajor::State::TransposeArrayHelper\28tint::core::type::Array\20const*\2c\20tint::spirv::reader::TransposeRowMajor::State::MatrixLayout\29::'lambda'\28\29&&\29
 tint::HashmapEntry<tint::HashmapKey<tint::core::type::Type\20const*\2c\20tint::Hasher<tint::core::type::Type\20const*>\2c\20tint::EqualTo<tint::core::type::Type\20const*>>\2c\20bool>&\20tint::Hashmap<tint::core::type::Type\20const*\2c\20bool\2c\2016ul\2c\20tint::Hasher<tint::core::type::Type\20const*>\2c\20tint::EqualTo<tint::core::type::Type\20const*>>::GetOrAddEntry<tint::core::type::Type\20const*&\2c\20tint::resolver::\28anonymous\20namespace\29::UniformityGraph::ContainsSubgroupMatrix\28tint::core::type::Type\20const*\29::'lambda'\28\29>\28tint::core::type::Type\20const*&\2c\20tint::resolver::\28anonymous\20namespace\29::UniformityGraph::ContainsSubgroupMatrix\28tint::core::type::Type\20const*\29::'lambda'\28\29&&\29
+tint::HashmapEntry<tint::HashmapKey<tint::core::type::Type\20const*\2c\20tint::Hasher<tint::core::type::Type\20const*>\2c\20tint::EqualTo<tint::core::type::Type\20const*>>\2c\20tint::Symbol>&\20tint::Hashmap<tint::core::type::Type\20const*\2c\20tint::Symbol\2c\204ul\2c\20tint::Hasher<tint::core::type::Type\20const*>\2c\20tint::EqualTo<tint::core::type::Type\20const*>>::GetOrAddEntry<tint::core::type::Reference\20const*&\2c\20tint::spirv::reader::TransposeRowMajor::State::LoadColumnHelper\28tint::core::type::Type\20const*\29::'lambda'\28\29>\28tint::core::type::Reference\20const*&\2c\20tint::spirv::reader::TransposeRowMajor::State::LoadColumnHelper\28tint::core::type::Type\20const*\29::'lambda'\28\29&&\29
 tint::HashmapEntry<tint::HashmapKey<void\20const*\2c\20tint::Hasher<void\20const*>\2c\20tint::EqualTo<void\20const*>>\2c\20tint::ast::CloneContext::ListTransforms>&\20tint::Hashmap<void\20const*\2c\20tint::ast::CloneContext::ListTransforms\2c\204ul\2c\20tint::Hasher<void\20const*>\2c\20tint::EqualTo<void\20const*>>::GetOrAddZeroEntry<tint::Vector<tint::ast::Parameter\20const*\2c\208ul>\20const*>\28tint::Vector<tint::ast::Parameter\20const*\2c\208ul>\20const*&&\29
 tint::HashmapEntry<tint::HashmapKey<void\20const*\2c\20tint::Hasher<void\20const*>\2c\20tint::EqualTo<void\20const*>>\2c\20tint::ast::CloneContext::ListTransforms>&\20tint::Hashmap<void\20const*\2c\20tint::ast::CloneContext::ListTransforms\2c\204ul\2c\20tint::Hasher<void\20const*>\2c\20tint::EqualTo<void\20const*>>::GetOrAddZeroEntry<tint::Vector<tint::ast::Statement\20const*\2c\208ul>\20const*>\28tint::Vector<tint::ast::Statement\20const*\2c\208ul>\20const*&&\29
 tint::InternalCompilerError&\20tint::InternalCompilerError::operator<<<char\20const*>\28char\20const*&&\29
@@ -4196,6 +4208,7 @@ tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<std::__2::basic_st
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20const&\2c\20void>\28tint::Source\20const&\2c\20std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20const&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::Symbol&\2c\20tint::ast::Expression\20const*\2c\20void\2c\20void>\28tint::Symbol&\2c\20tint::ast::Expression\20const*&&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::Symbol\20const&\2c\20tint::Vector<tint::ast::Expression\20const*\2c\208ul>\2c\20void\2c\20void>\28tint::Symbol\20const&\2c\20tint::Vector<tint::ast::Expression\20const*\2c\208ul>&&\29
+tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::Symbol\2c\20tint::ast::UnaryOpExpression\20const*&\2c\20tint::ast::CallExpression\20const*&\2c\20tint::ast::Expression\20const*&\2c\20void\2c\20void>\28tint::Symbol&&\2c\20tint::ast::UnaryOpExpression\20const*&\2c\20tint::ast::CallExpression\20const*&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::Symbol\2c\20tint::ast::UnaryOpExpression\20const*&\2c\20tint::ast::CallExpression\20const*&\2c\20void\2c\20void>\28tint::Symbol&&\2c\20tint::ast::UnaryOpExpression\20const*&\2c\20tint::ast::CallExpression\20const*&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::ast::IdentifierExpression\20const*\2c\20tint::Vector<tint::ast::Expression\20const*\2c\201ul>\2c\20void>\28tint::Source\20const&\2c\20tint::ast::IdentifierExpression\20const*&&\2c\20tint::Vector<tint::ast::Expression\20const*\2c\201ul>&&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<tint::ast::IdentifierExpression\20const*\2c\20tint::Vector<tint::ast::Expression\20const*\2c\202ul>\2c\20void>\28tint::Source\20const&\2c\20tint::ast::IdentifierExpression\20const*&&\2c\20tint::Vector<tint::ast::Expression\20const*\2c\202ul>&&\29
@@ -4224,6 +4237,7 @@ tint::ast::CloneContext&\20tint::ast::CloneContext::Remove<tint::ast::Attribute\
 tint::ast::CloneContext&\20tint::ast::CloneContext::Remove<tint::ast::Node\20const*\2c\2064ul\2c\20tint::ast::Enable\20const>\28tint::Vector<tint::ast::Node\20const*\2c\2064ul>\20const&\2c\20tint::ast::Enable\20const*\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::Remove<tint::ast::Node\20const*\2c\2064ul\2c\20tint::ast::Function\20const>\28tint::Vector<tint::ast::Node\20const*\2c\2064ul>\20const&\2c\20tint::ast::Function\20const*\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::Remove<tint::ast::Statement\20const*\2c\208ul\2c\20tint::ast::VariableDeclStatement\20const>\28tint::Vector<tint::ast::Statement\20const*\2c\208ul>\20const&\2c\20tint::ast::VariableDeclStatement\20const*\29
+tint::ast::CloneContext&\20tint::ast::CloneContext::Replace<tint::ast::AssignmentStatement\2c\20tint::ast::CallStatement>\28tint::ast::AssignmentStatement\20const*\2c\20T0\20const*\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::Replace<tint::ast::Expression\2c\20tint::ast::CallExpression>\28tint::ast::Expression\20const*\2c\20T0\20const*\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::Replace<tint::ast::Expression\2c\20tint::ast::Expression>\28tint::ast::Expression\20const*\2c\20T0\20const*\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::Replace<tint::ast::Expression\2c\20tint::spirv::reader::Atomics::State::ReplaceLoadsAndStores\28\29::'lambda'\28\29\2c\20tint::ast::CallExpression\20const*>\28tint::ast::Expression\20const*\2c\20tint::spirv::reader::Atomics::State::ReplaceLoadsAndStores\28\29::'lambda'\28\29&&\29
@@ -4395,6 +4409,7 @@ tint::ast::Module::~Module\28\29
 tint::ast::Module::~Module\28\29_5282
 tint::ast::Node::Node\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\29
 tint::ast::Override*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::Override\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\2c\20tint::ast::Type&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>&&\29
+tint::ast::Override::Override\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type\2c\20tint::ast::Expression\20const*\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Override\20const*\20tint::ast::Builder::Override<tint::Symbol&\2c\20tint::ast::Type\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\208ul>>\28tint::Source\20const&\2c\20tint::Symbol&\2c\20tint::ast::Type&&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\208ul>&&\29
 tint::ast::Parameter*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::Parameter\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\202ul>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\202ul>&&\29
 tint::ast::Parameter*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::Parameter\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\2c\20tint::ast::Type&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>&&\29
@@ -4404,6 +4419,7 @@ tint::ast::Parameter\20const*\20tint::ast::Builder::Param<std::__2::basic_string
 tint::ast::Parameter\20const*\20tint::ast::Builder::Param<tint::Symbol&>\28tint::Symbol&\2c\20tint::ast::Type\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Parameter\20const*\20tint::ast::CloneContext::Clone<tint::ast::Parameter>\28tint::ast::Parameter\20const*\29
 tint::ast::Requires*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::Requires\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::UniqueVector<tint::wgsl::LanguageFeature\2c\204ul\2c\20tint::Hasher<tint::wgsl::LanguageFeature>\2c\20std::__2::equal_to<tint::wgsl::LanguageFeature>>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::UniqueVector<tint::wgsl::LanguageFeature\2c\204ul\2c\20tint::Hasher<tint::wgsl::LanguageFeature>\2c\20std::__2::equal_to<tint::wgsl::LanguageFeature>>&&\29
+tint::ast::Requires::Requires\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::UniqueVector<tint::wgsl::LanguageFeature\2c\204ul\2c\20tint::Hasher<tint::wgsl::LanguageFeature>\2c\20std::__2::equal_to<tint::wgsl::LanguageFeature>>\29
 tint::ast::ReturnStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::ReturnStatement\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\29
 tint::ast::ReturnStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::ReturnStatement\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::ReturnStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::ReturnStatement\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&&\29
@@ -4689,6 +4705,7 @@ tint::core::type::Invalid::Equals\28tint::core::type::UniqueNode\20const&\29\20c
 tint::core::type::Invalid::Invalid\28\29
 tint::core::type::Manager::Manager\28\29
 tint::core::type::Manager::Manager\28tint::core::type::Manager&&\29
+tint::core::type::Manager::Struct\28tint::Symbol\2c\20bool\2c\20tint::VectorRef<tint::core::type::Manager::StructMemberDesc>\29
 tint::core::type::Manager::WgslInternalStruct\28tint::Symbol\2c\20std::initializer_list<tint::core::type::Manager::StructMemberDesc>\29
 tint::core::type::Manager::atomic\28tint::core::type::Type\20const*\29
 tint::core::type::Manager::depth_multisampled_texture\28tint::core::type::TextureDimension\29
@@ -4745,7 +4762,9 @@ tint::core::type::StructMember::StructMember\28tint::Symbol\2c\20tint::core::typ
 tint::core::type::SubgroupMatrix*\20tint::BlockAllocator<tint::core::type::Type\2c\2065536ul\2c\2016ul>::Create<tint::core::type::SubgroupMatrix\2c\20tint::core::SubgroupMatrixKind&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int\2c\20unsigned\20int>\28tint::core::SubgroupMatrixKind&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\29
 tint::core::type::SubgroupMatrix*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hasher<tint::core::type::Type>\2c\20std::__2::equal_to<tint::core::type::Type>>::Get<tint::core::type::SubgroupMatrix\2c\20tint::core::SubgroupMatrixKind&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int\2c\20unsigned\20int>\28tint::core::SubgroupMatrixKind&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\29
 tint::core::type::SubgroupMatrix::SubgroupMatrix\28tint::core::SubgroupMatrixKind\2c\20tint::core::type::Type\20const*\2c\20unsigned\20int\2c\20unsigned\20int\29
+tint::core::type::TexelBuffer*\20tint::BlockAllocator<tint::core::type::Type\2c\2065536ul\2c\2016ul>::Create<tint::core::type::TexelBuffer\2c\20tint::core::TexelFormat&\2c\20tint::core::Access&\2c\20tint::core::type::Type\20const*&>\28tint::core::TexelFormat&\2c\20tint::core::Access&\2c\20tint::core::type::Type\20const*&\29
 tint::core::type::TexelBuffer*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hasher<tint::core::type::Type>\2c\20std::__2::equal_to<tint::core::type::Type>>::Get<tint::core::type::TexelBuffer\2c\20tint::core::TexelFormat&\2c\20tint::core::Access&\2c\20tint::core::type::Type\20const*&>\28tint::core::TexelFormat&\2c\20tint::core::Access&\2c\20tint::core::type::Type\20const*&\29
+tint::core::type::TexelBuffer::TexelBuffer\28tint::core::TexelFormat\2c\20tint::core::Access\2c\20tint::core::type::Type\20const*\29
 tint::core::type::Texture::Texture\28unsigned\20long\2c\20tint::core::type::TextureDimension\29
 tint::core::type::ToString\28tint::core::type::SamplerKind\29
 tint::core::type::ToString\28tint::core::type::TextureDimension\29
@@ -5176,6 +5195,7 @@ tint::spirv::reader::TransposeRowMajor::State::ReplaceAssignment\28tint::ast::As
 tint::spirv::reader::TransposeRowMajor::State::ReplaceLoad\28tint::sem::Load\20const*\29::'lambda'\28tint::core::type::Vector\20const*\29::operator\28\29\28tint::core::type::Vector\20const*\29\20const
 tint::spirv::reader::TransposeRowMajor::State::Run\28\29
 tint::spirv::reader::TransposeRowMajor::State::State\28tint::Program\20const&\29
+tint::spirv::reader::TransposeRowMajor::State::StoreColumnHelper\28tint::core::type::Type\20const*\29
 tint::spirv::reader::TransposeRowMajor::State::TransposeAccessIndices\28tint::sem::ValueExpression\20const*\29
 tint::spirv::reader::TransposeRowMajor::State::TransposeType\28tint::core::type::Type\20const*\29
 tint::spirv::reader::TransposeRowMajor::State::~State\28\29

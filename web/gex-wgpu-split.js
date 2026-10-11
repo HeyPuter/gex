@@ -61,8 +61,12 @@ var gexMesaColdLoad = function () {
     how = 'fetched and compiled now, ' + buf.length + ' bytes';
   }
   gexMesaColdInstance = new WebAssembly.Instance(module, { primary: wasmRawExports });
+  // Who missed: the frames under the trampoline, for web/mesa-hot.txt.
+  var where = String(new Error().stack).split('\n').filter(function (l) {
+    return l.indexOf('.wasm') >= 0 && l.indexOf('gexcoldtramp') < 0;
+  }).slice(0, 4).map(function (l) { return l.trim().replace(/^at /, '').replace(/ \(.*$/, ''); });
   console.warn('[gex-wgpu] cold part loaded on a miss (' + how + ') in ' +
-               (performance.now() - t0).toFixed(1) + ' ms');
+               (performance.now() - t0).toFixed(1) + ' ms, from ' + (where.join(' <- ') || '?'));
 };
 
 if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['instantiateWasm']) {
