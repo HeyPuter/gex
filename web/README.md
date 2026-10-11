@@ -26,44 +26,40 @@ substantially slower than subsequent incremental builds.
 
 ## The two builds: multi-process (default) and single-thread
 
-The page has two builds:
+The page has two builds, each with its own dist:
 
-- **MP**, the multi-process build, is the default. Every guest thread is its
-  own Worker on a shared memory. It needs SharedArrayBuffer, so it needs
-  COOP/COEP.
-- **SP**, the single-thread build (`docs/single-thread.md`), runs on any
-  static host. Every guest thread is a JSPI fiber in one Worker.
+- **MP** (`web/dist`), the multi-process build, is the default. Every guest
+  thread is its own Worker on a shared memory. It needs SharedArrayBuffer, so
+  it needs COOP/COEP.
+- **SP** (`web/dist-sp`), the single-thread build
+  (`docs/single-thread.md`), runs on any static host. Every guest thread is
+  a JSPI fiber in one Worker.
 
-Both run the same shim, kernel and seed, and the same `web/dist`. A page picks
-SP when it has no SharedArrayBuffer, or when asked with `?single=1`. Only Mesa
-and Xwayland differ: they are compiled with or without `-pthread`, and each
-flavour has its own build and published directories. One command builds
-either flavour or both, incrementally:
+Both load the same shim, kernel and seed, which are built once and copied
+into both dists. Mesa and Xwayland are built per flavour, with or without
+`-pthread`, and each dist carries only its own. The dists strip DWARF and
+name sections from the large wasm files. The unstripped copies are in
+`target/web-debug/<mp|sp>/`, and `--debug` ships them.
 
 ```sh
 web/build-all.sh            # MP (the default)
 web/build-all.sh --sp       # SP
-web/build-all.sh --both     # both, side by side
+web/build-all.sh --both     # both
 ```
 
-| | MP | SP |
-|---|---|---|
-| shim, kernel, seeds, rootfs | `web/public/gex/`, `web/public/rootfs/` (shared) | same files |
-| Mesa | `target/web-build/mesa-mt` → `web/public/gex/` | `target/web-build/mesa-st` → `web/public/gex/st/` |
-| Xwayland | `target/web-build/xwl-mt` → `web/public/gex/xwayland/` | `target/web-build/xwl-st` → `web/public/gex/xwayland-st/` |
-| bundle | `web/dist` (shared) | same |
-
-`--no-assets`, `--no-gl` and `--no-x` skip the shared runtime, Mesa and
-Xwayland. `GEX_WEB_BUILD` moves `target/web-build`. To serve both at once,
-MP with COOP/COEP on one port and SP without on another:
+Serve both at once:
 
 ```sh
 node web/serve-dist.mjs 8088 --sp-port 8089
 ```
 
-Tests: the default page smoke test is `node web/test/site.mjs`. The SP leg is
-`tests/single/run.sh`, which runs `tests/single-callout` and then the same
-demos without COOP/COEP.
+This serves MP on 8088 and SP on 8089. Directory layout, sizes and flags are
+in `docs/single-thread.md` §9.
+
+Tests:
+- the MP page smoke test: `node web/test/site.mjs`;
+- the SP leg: `tests/single/run.sh`, which runs `tests/single-callout` and then
+  the same demos against `web/dist-sp` without COOP/COEP.
 
 ## OpenGL 4.4 validation
 

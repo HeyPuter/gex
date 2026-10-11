@@ -14,7 +14,8 @@ import { Cdp, browserWsUrl } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
-const DIST = join(WEB, 'dist');
+// `GEX_DIST=web/dist-sp` tests the single-thread build's dist.
+const DIST = process.env.GEX_DIST || join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 // A site to test other than the built one; requests are passed through and
 // only the HTML is touched, to add the reporter.
@@ -201,8 +202,8 @@ if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
 // A stale `dist` proves nothing: `vite build` copies `web/public` into `dist`,
 // so refuse to run if the dist shim is older than the one in public.
 if (!UPSTREAM) {
-  const distShim = join(DIST, 'gex/gex_browser.wasm');
-  const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.wasm', import.meta.url));
+  const distShim = join(DIST, 'gex/gex_browser.shared.wasm');
+  const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.shared.wasm', import.meta.url));
   const [d, p] = await Promise.all([
     stat(distShim).catch(() => null),
     stat(pubShim).catch(() => null),
@@ -211,7 +212,7 @@ if (!UPSTREAM) {
     skip(
       `${DIST} is older than the runtime it should contain `
       + `(dist ${new Date(d.mtimeMs).toISOString()}, `
-      + `public ${new Date(p.mtimeMs).toISOString()}) -- run \`npm run build\`, `
+      + `public ${new Date(p.mtimeMs).toISOString()}) -- run web/build-all.sh, `
       + 'or point this at a dev server with GEX_SITE=http://localhost:5173',
     );
   }

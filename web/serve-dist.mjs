@@ -2,10 +2,10 @@
 //
 //     node web/serve-dist.mjs [port] [--sp-port N]
 //
-// `--sp-port N` serves the same site a second time on N without the
-// isolation headers. That page has no SharedArrayBuffer, so it runs the
-// single-thread build (docs/single-thread.md): MP on [port], SP on N, side
-// by side. `GEX_NO_COI=1` drops the headers on [port] too.
+// `--sp-port N` also serves web/dist-sp, the single-thread build's dist
+// (web/build-all.sh --sp; docs/single-thread.md), on N without the isolation
+// headers: MP on [port], SP on N, side by side. `GEX_NO_COI=1` drops the
+// headers on [port] too.
 //
 // Not `vite dev`/`preview`: the dev server has served stale JavaScript against
 // a freshly built shim, so a measurement against it means nothing. `web/dist`
@@ -17,11 +17,14 @@
 // `[gex] pid N: lived Xms (guest Yms)` -- guest-side timing reads zero (#134).
 
 import { createServer } from 'node:http';
+import { appendFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = join(fileURLToPath(new URL('.', import.meta.url)), 'dist');
+const web = fileURLToPath(new URL('.', import.meta.url));
+const root = join(web, 'dist');
+const spRoot = join(web, 'dist-sp');
 const args = process.argv.slice(2);
 const spAt = args.indexOf('--sp-port');
 const spPort = spAt >= 0 ? Number(args.splice(spAt, 2)[1]) : 0;
@@ -41,7 +44,7 @@ const TYPES = {
   '.ico': 'image/x-icon',
 };
 
-const serve = (coi) => async (req, res) => {
+const serve = (root, coi) => async (req, res) => {
   const url = new URL(req.url, 'http://x');
   // `normalize` and then reject anything that climbs out: this serves a
   // directory, not the filesystem.
@@ -72,13 +75,16 @@ const serve = (coi) => async (req, res) => {
       'content-length': body.length,
     });
     res.end(body);
+    // GEX_SERVE_LOG=FILE: one line per file served, `<dist> <path> <bytes>`,
+    // to account for what a page fetches.
+    if (process.env.GEX_SERVE_LOG) appendFileSync(process.env.GEX_SERVE_LOG, `${root} ${rel} ${body.length}\n`);
   } catch {
     res.writeHead(404, { ...headers, 'content-type': 'text/plain' }).end(`no ${rel}\n`);
   }
 };
 
 const coi = !process.env.GEX_NO_COI;
-createServer(serve(coi)).listen(port, '0.0.0.0', () => {
+createServer(serve(root, coi)).listen(port, '0.0.0.0', () => {
   console.log(`serving ${root}`);
   console.log(`  http://127.0.0.1:${port}/  ${coi ? 'multi-process (cross-origin isolated, SharedArrayBuffer)' : 'single-thread (no COOP/COEP)'}`);
   if (!spPort) {
@@ -87,7 +93,8 @@ createServer(serve(coi)).listen(port, '0.0.0.0', () => {
   }
 });
 if (spPort) {
-  createServer(serve(false)).listen(spPort, '0.0.0.0', () => {
+  createServer(serve(spRoot, false)).listen(spPort, '0.0.0.0', () => {
+    console.log(`serving ${spRoot}`);
     console.log(`  http://127.0.0.1:${spPort}/  single-thread (no COOP/COEP)`);
   });
 }

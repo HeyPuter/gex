@@ -3,6 +3,7 @@ target/
 tests/corpus/bin/
 web/node_modules/
 web/dist/
+web/dist-sp/
 web/public/gex/
 web/public/rootfs/
 web/public/closure/

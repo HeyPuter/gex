@@ -9,8 +9,8 @@
 #
 #   tests/single/run.sh [gexc]          # demos: SP_DEMOS (default busybox debian gears)
 #
-# Needs web/build-all.sh --sp (or --both) first: the shared shim and seed,
-# web/dist, and web/public/gex/st/ for gears. The gears demo also needs a
+# Needs web/build-all.sh --sp (or --both) first: web/dist-sp, served
+# without COOP/COEP from its own dist. The gears demo also needs a
 # WebGPU adapter; on a host without a GPU set GEX_WEBGPU_SOFTWARE=1.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -21,9 +21,9 @@ fail=0
 
 out=${WORK:-$root/target/single-test}
 mkdir -p "$out"
-[ -d "$root/web/dist" ] || { echo "FAIL single-page (no web/dist: run web/build-all.sh --sp)"; exit 1; }
+[ -d "$root/web/dist-sp" ] || { echo "FAIL single-page (no web/dist-sp: run web/build-all.sh --sp)"; exit 1; }
 for d in ${SP_DEMOS:-busybox debian gears}; do
-	(cd "$root" && GEX_NO_COI=1 GEX_TAIL=0 GEX_STDERR=all node web/test/site.mjs "$d") > "$out/site-$d.txt" 2>&1; rc=$?
+	(cd "$root" && GEX_DIST="$root/web/dist-sp" GEX_NO_COI=1 GEX_TAIL=0 GEX_STDERR=all node web/test/site.mjs "$d") > "$out/site-$d.txt" 2>&1; rc=$?
 	if [ $rc = 0 ] && grep -aq 'single-thread build (no SharedArrayBuffer)' "$out/site-$d.txt"; then
 		echo "ok   single-page $d"
 	else

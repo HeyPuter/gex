@@ -495,9 +495,10 @@ timed rerun is pending (see §8).
 
 The stream is stopped and will not be restarted. merge/singleproc lands in
 master with the multi-process build (MP) the default everywhere. The single
-build (SP) stays available behind its option: a page without
-SharedArrayBuffer, or `?single=1`, and `web/build-all.sh --sp` for its Mesa
-and Xwayland (§9).
+build (SP) stays available behind its option. `web/build-all.sh --sp` (or
+`--both`) builds its own dist, `web/dist-sp`, and serves it without
+COOP/COEP (§9). Any page without SharedArrayBuffer, or with `?single=1`,
+runs SP.
 
 ### What works in SP
 
@@ -580,23 +581,69 @@ thread.
 
 ### Layout
 
-SP runs the same shim, kernel, seeds and rootfs as MP. It loads the
-*shared* binaries and clears their memories' `shared` flag at compile time
-(§2). The same `web/dist` serves both, and a page picks SP when it has no
-SharedArrayBuffer or is given `?single=1`. Those files are built once, so
-neither build can overwrite the other's.
-
-Only native code built with or without `-pthread` differs:
+Each flavour has its own dist, and neither holds the other's Mesa or
+Xwayland:
 
 | | MP (default) | SP |
 |---|---|---|
-| shim, kernel, seeds, providers, rootfs | `web/public/gex/`, `web/public/rootfs/` | the same files |
+| dist | `web/dist`, served with COOP/COEP | `web/dist-sp`, served without |
+| shim, kernel, seed | `gex/gex_browser.shared.wasm`, `gex/gex_kernel.wasm`, `gex/seed.shared.wasm` | the same three files |
 | Mesa build tree | `target/web-build/mesa-mt` | `target/web-build/mesa-st` |
-| Mesa published | `web/public/gex/gex-wgpu-replay.*` | `web/public/gex/st/gex-wgpu-replay.*` |
+| Mesa in the dist | `gex/gex-wgpu-replay.*` | `gex/st/gex-wgpu-replay.*` |
 | Xwayland build tree | `target/web-build/xwl-mt` | `target/web-build/xwl-st` |
-| Xwayland published | `web/public/gex/xwayland/` | `web/public/gex/xwayland-st/` |
-| Xwayland host tools | `target/web-build/xwl-host` (shared, only if the distro lacks them) | same |
-| page bundle | `web/dist` | the same |
+| Xwayland in the dist | `gex/xwayland/` | `gex/xwayland-st/` |
+| unstripped wasm | `target/web-debug/mp/` | `target/web-debug/sp/` |
+| rootfs, `fs/`, providers | copied into both | copied into both |
+
+The shim, kernel and seed are built once (`web/build-assets.sh`) and copied
+into both dists. SP loads the shared binaries and clears their memories'
+`shared` flag at compile time (§2).
+
+An SP-only shim would not be smaller by much:
+- Its fibers need per-instance stacks and TLS. In Rust on wasm those come
+  only from the `+atomics` build-std build that MP uses.
+- Without the `shared-memory` feature that build does not compile: talc's
+  `TalcSyncCell` refuses a threaded target with no heap lock. The heap's
+  spinlock is what the feature adds.
+- The atomic instructions are the rest. There are 15 738 of them in the
+  stripped shim, about 2 bytes each over a plain access, so at most about
+  31 KB (0.6% of 5 159 727 bytes). They sit mostly in std's TLS and locks,
+  which SP needs anyway.
+
+So there is one build.
+
+No page loads these, so neither dist ships them:
+- the plain `gex_browser.wasm`;
+- `seed.wasm`;
+- `gex_kernel.plain.wasm`.
+
+`run-node.mjs` and the check scripts use them from `web/public`.
+
+### Sizes
+
+Measured on gooner from this tree. "Runtime" is the dist without `rootfs/`
+and `fs/` (177.6 MB and 7.6 MB, the same in both).
+
+| | MP `web/dist` | SP `web/dist-sp` |
+|---|---:|---:|
+| whole dist | 213 377 145 B | 213 094 572 B |
+| runtime, raw (tar) | 28 200 960 B | 27 914 240 B |
+| runtime, zstd -19 | 5 369 300 B | 5 400 608 B |
+
+These are the large files, stripped:
+
+| file | raw | zstd -19 |
+|---|---:|---:|
+| `gex_browser.shared.wasm` (52 107 296 B with DWARF) | 5 159 727 B | 1 153 655 B |
+| `gex_kernel.wasm` (14 815 564 B with DWARF) | 259 673 B | 69 140 B |
+| Mesa `gex-wgpu-replay.wasm` (20 599 167 B with its name section) | 18 891 407 B | 3 305 586 B |
+| `Xwayland.wasm` | 2 064 538 B | 573 528 B |
+| `gexhostwl.wasm` (12 265 903 B with DWARF) | 144 639 B | 42 643 B |
+
+Keeping the name section would add 712 183 B to the shim (5 871 910 B).
+Nothing in the runtime reads it, so the dists strip every custom section
+(`wasm-tools strip -a`), except on the seed and the providers, whose `gex.*`
+sections are read. `--debug` ships them unstripped.
 
 ### Build
 
@@ -609,11 +656,12 @@ web/build-all.sh --both          # or --mp (the default) / --sp
 `build-all.sh` runs these steps:
 
 1. `web/build-assets.sh`: shim (plain and shared), kernel, seeds, providers,
-   busybox rootfs and guest GL libraries. Cargo makes this step incremental.
+   busybox rootfs and guest GL libraries, into `web/public`. Cargo makes this
+   step incremental.
 2. Mesa for each flavour asked for:
    `GEX_MESA_THREADS=1|0 web/build-mesa-wasm.sh target/web-build/mesa-mt|st`.
    - Incremental through meson and ninja.
-   - Wink caches its Tint per variant (`--variant=mt|st`).
+   - Wink caches its Tint per variant.
 3. Xwayland for each flavour:
    `GEX_XWL_THREADS=1|0 web/build-xwayland-wasm.sh target/web-build/xwl-mt|st`.
    - The script always builds from scratch, so build-all skips it while a
@@ -622,18 +670,40 @@ web/build-all.sh --both          # or --mp (the default) / --sp
      - `web/xwayland/`;
      - `shims/hostwl/`;
      - the tags.
-   - If `pkg-config` cannot find wayland-scanner, wayland-protocols or
-     xwaylandproto, or xorg-macros or `X11/xshmfence.h` is missing, it first
-     runs `web/build-xwayland-host-tools.sh target/web-build/xwl-host` and
-     passes that prefix as `GEX_XWL_HOST_TOOLS`. That script is cached by a
-     `.done` stamp.
-4. `npm run build`, once.
+   - If the distro lacks a piece, it first runs
+     `web/build-xwayland-host-tools.sh target/web-build/xwl-host` and passes
+     that prefix as `GEX_XWL_HOST_TOOLS`. The pieces it checks:
+     - wayland-scanner, wayland-protocols or xwaylandproto (through
+       `pkg-config`);
+     - xorg-macros;
+     - `X11/xshmfence.h`.
+
+     The host-tools build is cached by a `.done` stamp.
+4. For each flavour, the dist:
+   - a hard-linked copy of `web/public` in `target/web-build/public-<f>`,
+     pruned to that flavour;
+   - the large wasm files replaced by stripped copies, with the unstripped
+     ones linked into `target/web-debug/<f>/`;
+   - `vite build` from that tree (`GEX_PUBLIC_DIR`) into `web/dist` or
+     `web/dist-sp` (`GEX_OUT_DIR`).
 
 Flags:
-- `--no-assets`, `--no-gl` and `--no-x` skip steps 1, 2 and 3.
+- `--no-assets`, `--no-gl` and `--no-x` skip steps 1-3 one by one.
+- `--dist-only` skips all three.
+- `--debug` keeps the debug sections.
 - `GEX_WEB_BUILD=DIR` moves `target/web-build`.
-- The native Debian rootfs and its GUI variant come from their own scripts
-  (`web/build-native-debian.sh`), shared by both builds.
+
+`web/refresh-dist.sh`, which every shim and kernel build calls, rebuilds
+whichever of the two dists exist the same way (`build-all.sh --<f>
+--dist-only`). After any source change, `web/build-all.sh --both` rebuilds:
+- the runtime, through cargo;
+- Mesa, through ninja;
+- Xwayland, when its stamp changes;
+- both dists.
+
+The native Debian rootfs and its GUI variant come from their own scripts
+(`web/build-native-debian.sh`) into `web/public/rootfs`, and so into both
+dists.
 
 ### Serve
 
@@ -641,13 +711,14 @@ Flags:
 node web/serve-dist.mjs 8088 --sp-port 8089
 ```
 
-This serves MP with COOP/COEP on 8088 and SP without them on 8089, from the
-same `web/dist`. `GEX_NO_COI=1 node web/serve-dist.mjs 8088` serves SP alone.
+This serves `web/dist` (MP, with COOP/COEP) on 8088 and `web/dist-sp` (SP,
+without them) on 8089, at the same time. `GEX_SERVE_LOG=FILE` logs each file
+served with its size.
 
 ### Test
 
 - MP: the default page smoke test, `node web/test/site.mjs` (busybox,
-  debian, gears).
+  debian, gears), against `web/dist`.
 - SP leg, for the gate:
 
   ```sh
@@ -655,9 +726,10 @@ same `web/dist`. `GEX_NO_COI=1 node web/serve-dist.mjs 8088` serves SP alone.
   ```
 
   It runs these:
-  1. `tests/single-callout/run.sh` (single and SAB under node).
-  2. `GEX_NO_COI=1 node web/test/site.mjs <demo>` for each of `SP_DEMOS`
-     (default: busybox, debian, gears).
+  1. `tests/single-callout/run.sh` (single and SAB under node; it adds
+     `--experimental-wasm-jspi` on a node that needs it).
+  2. `GEX_DIST=web/dist-sp GEX_NO_COI=1 node web/test/site.mjs <demo>` for
+     each of `SP_DEMOS` (default: busybox, debian, gears).
 
   Each demo must pass, and its terminal must contain "single-thread build
   (no SharedArrayBuffer)", so a silent fallback cannot pass.
