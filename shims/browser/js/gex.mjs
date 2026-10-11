@@ -1903,8 +1903,8 @@ export class Gex {
   async #xcacheRestore(name) {
     const e = this.#shim.exports;
     const k = this.#kernel;
-    e.gex_set_xcache?.(1);
     if (!k?.k_store_restore_buf || !e.gex_xcache_restore) return;
+    k.k_xcache_enable();
     const t0 = performance.now();
     const bytes = await xcRead(name);
     if (!bytes) {
@@ -2223,7 +2223,6 @@ export class Gex {
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     e.gex_set_dense?.(this.#dense ? ((child.opts ?? {}).dense === 2 ? 2 : 1) : 0);
-    e.gex_set_xcache?.((child.opts ?? {}).xcache ? 1 : 0);
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};

@@ -329,7 +329,7 @@ extern "C" {
     fn k_obj_translated(obj: u64, produced: u32);
     /// The translation cache across page loads (docs/gexcc.md §8).
     fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64) -> i32;
-    fn k_xcache_restored() -> u32;
+    fn k_xcache_on() -> u32;
     fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
@@ -9204,35 +9204,29 @@ fn shared_module_at(
     }
 }
 
-/// `?xcache=`: tie each identity key to its file for the kernel's saved store
-/// (docs/gexcc.md §8).
-static XCACHE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[no_mangle]
-pub extern "C" fn gex_set_xcache(on: u32) {
-    XCACHE_ON.store(on != 0, std::sync::atomic::Ordering::Relaxed);
-}
-
+// `?xcache=`: tie each identity key to its file for the kernel's saved store
+// (docs/gexcc.md §8).
 thread_local! {
     /// Keys this Worker has told the kernel about, each path's size and mtime
-    /// (`u64::MAX`: no such file here), and whether the kernel holds a
-    /// restored store.
+    /// (`u64::MAX`: no such file here), and whether this load keeps a cache
+    /// (`k_xcache_on`).
     static XKEYS: std::cell::RefCell<(std::collections::HashSet<u64>, std::collections::HashMap<String, (u64, i64)>, Option<bool>)> =
         std::cell::RefCell::new(Default::default());
 }
 
 /// Tell the kernel which file `key` was computed from, once per key per
-/// Worker: for a save under `?xcache=`, and to check a restored key against
-/// its file before this process uses it (in every process once a load
-/// restored, whatever its own options).
+/// Worker, in every process of a load that keeps a cache (`?xcache=`,
+/// whatever the process's own options: a forked child's save must name its
+/// keys' files too): for the save, and to check a restored key against its
+/// file before this process uses it.
 fn note_key(h: &Host, key: u64, path: &str) {
     if unsafe { k_present() } == 0 {
         return;
     }
     XKEYS.with(|x| {
         let mut x = x.borrow_mut();
-        // Asked once per Worker: a load restores in pid 1 before anything runs.
-        if !XCACHE_ON.load(std::sync::atomic::Ordering::Relaxed) && !*x.2.get_or_insert_with(|| unsafe { k_xcache_restored() } != 0) {
+        // Asked once per Worker: the host enables it before pid 1 runs.
+        if !*x.2.get_or_insert_with(|| unsafe { k_xcache_on() } != 0) {
             return;
         }
         if !x.0.insert(key) {

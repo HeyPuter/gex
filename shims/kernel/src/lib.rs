@@ -902,6 +902,9 @@ struct XCache {
     /// its packages after pid 1 starts.
     pending: BTreeSet<u64>,
     restored: bool,
+    /// This load keeps a cache (`k_xcache_enable`): every process notes its
+    /// keys' files, whichever process saves.
+    enabled: bool,
 }
 
 fn xcache() -> &'static Mutex<XCache> {
@@ -1134,10 +1137,18 @@ pub extern "C" fn k_store_restore_buf(len: u32) -> u32 {
     x.inbuf.as_ptr() as u32
 }
 
-/// Whether this load restored a store (its keys are then checked on first use).
+/// This load keeps a cache: set by the host before its first process runs.
 #[no_mangle]
-pub extern "C" fn k_xcache_restored() -> u32 {
-    xcache().lock().unwrap_or_else(|e| e.into_inner()).restored as u32
+pub extern "C" fn k_xcache_enable() {
+    xcache().lock().unwrap_or_else(|e| e.into_inner()).enabled = true;
+}
+
+/// Whether processes note their keys' files (`k_key_path`): the load keeps a
+/// cache, or restored one (whose keys are then checked on first use).
+#[no_mangle]
+pub extern "C" fn k_xcache_on() -> u32 {
+    let x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    (x.enabled || x.restored) as u32
 }
 
 /// Lay the saved store in: slot map, mark, modules, claims, every key pending
