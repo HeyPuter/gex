@@ -43,9 +43,11 @@ export class Compositor {
   #next = 1;
   #stats;
 
-  static async create(canvas, channel, inputTarget = canvas) {
+  /** `makeWorker`: what stands in for compositor-worker.js's Worker (the
+   *  single-thread build's system Worker hosts it; see runtime.js). */
+  static async create(canvas, channel, inputTarget = canvas, { makeWorker = null } = {}) {
     const c = new Compositor();
-    await c.#start(canvas, channel, inputTarget);
+    await c.#start(canvas, channel, inputTarget, makeWorker);
     return c;
   }
 
@@ -82,7 +84,7 @@ export class Compositor {
     });
   }
 
-  async #start(canvas, channel, inputTarget) {
+  async #start(canvas, channel, inputTarget, makeWorker) {
     const sameTarget = inputTarget === canvas;
     // A canvas can be handed to a worker once and never again, and a page
     // that runs a session twice hands over the same element the second time:
@@ -99,10 +101,12 @@ export class Compositor {
       offscreen = canvas.transferControlToOffscreen();
     }
     this.#canvas = canvas;
-    this.#stats = new SharedArrayBuffer(16);
-    const worker = new Worker(new URL('./compositor-worker.js', import.meta.url), {
-      type: 'module',
-    });
+    // Without a SharedArrayBuffer (the single-thread build) the counters are
+    // a copy `makeWorker`'s stand-in keeps current.
+    this.#stats = typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(16) : new ArrayBuffer(16);
+    const worker = makeWorker
+      ? makeWorker()
+      : new Worker(new URL('./compositor-worker.js', import.meta.url), { type: 'module' });
     this.#worker = worker;
     const ready = new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {

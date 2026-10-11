@@ -440,6 +440,11 @@ export class MesaGlDevice {
     if (tail) this.#module.HEAPU8.set(src, ptr);
 
     const finish = (rc) => {
+      // Taken again: a JSPI submit suspends, and a plain guest memory (the
+      // single-thread build's) that another thread grew meanwhile has a new
+      // buffer -- the old view is detached and writes into it are lost.
+      // eslint-disable-next-line no-shadow
+      const words = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
       const elapsed = performance.now() - started;
       this.#submitMs += elapsed;
       // A frame's readback (the NT host reads every frame back to blit it

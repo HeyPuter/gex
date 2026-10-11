@@ -205,7 +205,9 @@ async function serverHealthy(port) {
     });
     // The isolation header is the thing that actually matters: without it there
     // is no SharedArrayBuffer and threads/the global kernel vanish silently.
-    return r.ok && r.headers.get('cross-origin-opener-policy') === 'same-origin';
+    // With `GEX_NO_COI=1` (the single-thread build) it is the header's absence.
+    const coi = r.headers.get('cross-origin-opener-policy') === 'same-origin';
+    return r.ok && coi === !process.env.GEX_NO_COI;
   } catch {
     return false;
   }

@@ -103,9 +103,13 @@ impl Pipe {
         loop {
             if !s.buf.is_empty() {
                 let n = buf.len().min(s.buf.len());
-                for slot in buf.iter_mut().take(n) {
-                    *slot = s.buf.pop_front().unwrap();
-                }
+                // Two slice copies, not a pop per byte: a pipeline moves
+                // megabytes through here.
+                let (front, back) = s.buf.as_slices();
+                let k = n.min(front.len());
+                buf[..k].copy_from_slice(&front[..k]);
+                buf[k..n].copy_from_slice(&back[..n - k]);
+                s.buf.drain(..n);
                 self.ready.notify_all();
                 return Ok(n as u64);
             }

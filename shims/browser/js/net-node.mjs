@@ -17,6 +17,9 @@ const CLOSED = 3;
 export class NodeNetwork {
   #sockets = new Map();
   #next = 1;
+  /** Called on every socket event: the single-thread build wakes its parked
+   *  fibers with it (as web/src/net.js's WispNetwork does). */
+  onActivity = () => {};
 
   /** A fresh identifier; the guest connects it next. */
   open() {
@@ -30,20 +33,27 @@ export class NodeNetwork {
     if (!s) return;
     const sock = createConnection({ host, port }, () => {
       s.status = OPEN;
+      this.onActivity();
     });
-    sock.on('data', (d) => s.rx.push(d));
+    sock.on('data', (d) => {
+      s.rx.push(d);
+      this.onActivity();
+    });
     sock.on('end', () => {
       s.eof = true;
+      this.onActivity();
     });
     // A refusal and a reset are the same to the guest: the connection is not
     // there. Distinguishing them would only matter if anything asked.
     sock.on('error', () => {
       s.status = s.status === CONNECTING ? REFUSED : CLOSED;
       s.eof = true;
+      this.onActivity();
     });
     sock.on('close', () => {
       if (s.status === CONNECTING) s.status = REFUSED;
       s.eof = true;
+      this.onActivity();
     });
     s.sock = sock;
   }

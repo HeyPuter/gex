@@ -492,7 +492,7 @@ impl<'a> FnBody<'a> {
     pub fn finish(mut self) -> Vec<u8> {
         if std::env::var("GEX_FJIT_TEES").as_deref() != Ok("0") {
             let temps: std::collections::HashSet<u32> = self.e.temps.iter().copied().collect();
-            self.e.f.strip_dead_tees(&|l| temps.contains(&l));
+            self.e.f.strip_dead_tees(&|l| temps.contains(&l), false);
         }
         self.e.f.finish()
     }

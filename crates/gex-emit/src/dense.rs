@@ -73,6 +73,11 @@ pub const TABLE_INDEX: u32 = gex_abi::DISPATCH_TABLES as u32;
 /// [`set_base`].
 pub const SECTION: &str = "gex.dense";
 
+/// The imported i32 global a runtime module's dense element segment is
+/// placed at, when it has one (rather than a constant offset): its value is
+/// the section's `base`, which the host passes at instantiation.
+pub const GLOBAL: &str = "dense_base";
+
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// Emit dense dispatch and dense element segments from now on.
@@ -125,7 +130,9 @@ impl Section {
 #[derive(Clone, Copy, Debug)]
 pub struct Located {
     pub section: (usize, usize),
-    pub offset_imm: usize,
+    /// The segment's constant offset, or `None` where it is
+    /// [`GLOBAL`]'s value.
+    pub offset_imm: Option<usize>,
 }
 
 fn leb(b: &[u8], p: &mut usize) -> Option<u32> {
@@ -156,8 +163,10 @@ pub fn has_section(wasm: &[u8]) -> bool {
     locate_parts(wasm).is_none_or(|(s, _)| s.is_some())
 }
 
+/// The dense section's payload range, and the dense segment's constant
+/// offset (`Some(None)` for one at [`GLOBAL`]), each `None` when absent.
 #[allow(clippy::type_complexity)]
-fn locate_parts(wasm: &[u8]) -> Option<(Option<(usize, usize)>, Option<usize>)> {
+fn locate_parts(wasm: &[u8]) -> Option<(Option<(usize, usize)>, Option<Option<usize>>)> {
     if wasm.len() < 8 || &wasm[..4] != b"\0asm" {
         return None;
     }
@@ -216,7 +225,7 @@ fn locate_parts(wasm: &[u8]) -> Option<(Option<(usize, usize)>, Option<usize>)> 
                     leb(wasm, &mut q)?;
                 }
                 if flags == 2 && table == TABLE_INDEX {
-                    offset_imm = imm;
+                    offset_imm = Some(imm);
                 }
             }
         }
@@ -229,7 +238,10 @@ fn locate_parts(wasm: &[u8]) -> Option<(Option<(usize, usize)>, Option<usize>)> 
 /// and the segment's offset.
 pub fn set_base(wasm: &mut [u8], at: &Located, base: u32) {
     wasm[at.section.0..at.section.0 + 4].copy_from_slice(&base.to_le_bytes());
-    let imm = &mut wasm[at.offset_imm..at.offset_imm + 5];
+    let Some(imm) = at.offset_imm else {
+        return;
+    };
+    let imm = &mut wasm[imm..imm + 5];
     let mut v = base as i32;
     for (i, b) in imm.iter_mut().enumerate() {
         let byte = (v & 0x7f) as u8;
@@ -355,7 +367,7 @@ mod tests {
         }
         let f = m.declare_func(t);
         m.define_func(f, vec![2, 0, 0x0b]);
-        let seg = |table, offset, padded| ElementSegment { table, offset, page_base: 0, funcs: vec![f], passive: false, guest_page: 0, padded };
+        let seg = |table, offset, padded| ElementSegment { table, offset, page_base: 0, funcs: vec![f], passive: false, guest_page: 0, padded, offset_global: None };
         m.element(seg(0, 11, false));
         m.element(seg(4, 0x0b0b, false));
         m.element(seg(TABLE_INDEX, 0, true));
@@ -364,7 +376,7 @@ mod tests {
         set_base(&mut wasm, &at, 0x1234_567);
         let again = locate(&wasm).expect("located again");
         assert_eq!(section(&wasm, &again).unwrap().base, 0x1234_567);
-        let mut q = again.offset_imm;
+        let mut q = again.offset_imm.expect("a constant offset");
         let mut v = 0u32;
         let mut shift = 0;
         loop {
