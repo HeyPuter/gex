@@ -132,7 +132,7 @@ pub const WEB_NT_DIR: &str = "runtime/web/nt";
 /// The files of [`WEB_NT_DIR`] besides `js/`.
 pub const WEB_NT_WASM: [&str; 3] = ["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
 /// The host JavaScript a Windows program's web run needs (shims/browser/js).
-pub const WEB_NT_JS: [(&str, &str); 9] = [
+pub const WEB_NT_JS: [(&str, &str); 10] = [
     ("run-node.mjs", include_str!("../../../shims/browser/js/run-node.mjs")),
     ("host.mjs", include_str!("../../../shims/browser/js/host.mjs")),
     ("worker.mjs", include_str!("../../../shims/browser/js/worker.mjs")),
@@ -142,6 +142,7 @@ pub const WEB_NT_JS: [(&str, &str); 9] = [
     ("net-node.mjs", include_str!("../../../shims/browser/js/net-node.mjs")),
     ("net-bridge.mjs", include_str!("../../../shims/browser/js/net-bridge.mjs")),
     ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
+    ("single.mjs", include_str!("../../../shims/browser/js/single.mjs")),
 ];
 /// `run.mjs` of a Windows program's project: the web build under Node, on
 /// the browser runtime a page loads (run-node.mjs), AOT-only.
@@ -855,4 +856,27 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
     };
     let (exit, _) = gex_native::nt::run_nt_program(&opts, &gex_xlate::Options::default(), &setup)?;
     Ok(exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WEB_NT_JS;
+
+    /// Every module the vendored runtime imports (`'./x.mjs'`) is vendored
+    /// too: a new import the list missed broke every ejected web run.
+    #[test]
+    fn the_web_runtime_vendors_every_module_it_imports() {
+        let have: Vec<&str> = WEB_NT_JS.iter().map(|(f, _)| *f).collect();
+        for (f, text) in WEB_NT_JS {
+            for q in ['\'', '"'] {
+                for part in text.split(&format!("{q}./")).skip(1) {
+                    let Some(end) = part.find(q) else { continue };
+                    let m = &part[..end];
+                    if m.ends_with(".mjs") {
+                        assert!(have.contains(&m), "{f} imports ./{m}, which WEB_NT_JS leaves out");
+                    }
+                }
+            }
+        }
+    }
 }
