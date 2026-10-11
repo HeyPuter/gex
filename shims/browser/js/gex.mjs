@@ -361,11 +361,12 @@ function writeSparse(dst, src, at) {
   // Word-at-a-time when the source is aligned, which it is: the regions are
   // `slice`d, so each owns its buffer from offset zero.
   const words = src.byteOffset % 4 === 0 && src.byteLength % 4 === 0
-    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength >> 2)
+    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength / 4)
     : null;
+  // Division, not `>> 2`: a region can pass 2 GiB (see `#processImage`).
   const blank = (from, to) => {
     if (words) {
-      for (let i = from >> 2; i < to >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = from / 4; i < to / 4; i++) if (words[i] !== 0) return false;
       return true;
     }
     for (let i = from; i < to; i++) if (src[i] !== 0) return false;
@@ -406,7 +407,7 @@ const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
  * words, not bytes: only ever answers same-or-different.
  */
 function sum32(buf) {
-  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, (buf.byteLength / 4) | 0);
+  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, Math.floor(buf.byteLength / 4));
   let h = 0x811c9dc5;
   for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193);
   return h >>> 0;
