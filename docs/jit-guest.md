@@ -203,10 +203,16 @@ Stream T ends here (coordinator, 2026-10-10).
 - The dense base comes from an imported global (`gex.dense_base`), so a unit's
   bytes are the same in every process.
 
+- The page-wide unit cache (merge/unitcache-default): on in the page and
+  under run-node; `?unitcache=0` / `GEX_UNIT_CACHE=0` turn it off. A second
+  `node -e 0` in one page: 15.8 s against 30.9 s without it (edger, traced);
+  95,188 lazy wasm compiles become 2,365. A module taken from the cache keeps
+  this process's dense base with it (`#compiled[].dense`), so a fork child
+  never takes the base from another process's compile.
+
 **Off by default (knobs kept, not proven faster in the browser):**
 
 - Tier-1 tee folding: `GEX_T1_FOLD` / `?t1fold=1`. Loop-safe; 8% less wasm.
-- The page-wide unit cache: `?unitcache=1` / `GEX_UNIT_CACHE`.
 - Lift cap `?liftmax=` / `GEX_LIFT_MAX`.
 - `GEX_DISCOVER_SKIP`: bit 8 is the discovery log (`GEX_DL_FILE`); bits 16-23
   are a depth limit.

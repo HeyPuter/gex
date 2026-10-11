@@ -148,7 +148,8 @@ async function main() {
   if (q.get('strace')) globalThis.GEX_STRACE = 1;
   // The translator's switches, as main.js reads them (docs/jit-guest.md).
   if (q.get('liftmax')) globalThis.GEX_LIFT_MAX = Number(q.get('liftmax'));
-  if (q.get('unitcache')) globalThis.GEX_UNIT_CACHE = Number(q.get('unitcache'));
+  // The page-wide unit cache is on unless `?unitcache=0`.
+  globalThis.GEX_UNIT_CACHE = q.get('unitcache') !== null ? Number(q.get('unitcache')) : 1;
   if (q.get('t1fold')) globalThis.GEX_T1_FOLD = Number(q.get('t1fold'));
   if (q.get('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(q.get('xlatereport'));
   if (q.get('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(q.get('inlinedispatch'));

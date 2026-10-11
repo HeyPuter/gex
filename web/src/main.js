@@ -292,7 +292,8 @@ for (const [event, describe] of [
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
   if (params.has('liftmax')) globalThis.GEX_LIFT_MAX = Number(params.get('liftmax'));
-  if (params.has('unitcache')) globalThis.GEX_UNIT_CACHE = Number(params.get('unitcache'));
+  // The page-wide unit cache is on unless `?unitcache=0`.
+  globalThis.GEX_UNIT_CACHE = params.has('unitcache') ? Number(params.get('unitcache')) : 1;
   if (params.has('t1fold')) globalThis.GEX_T1_FOLD = Number(params.get('t1fold'));
   if (params.has('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(params.get('xlatereport'));
   if (params.has('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(params.get('inlinedispatch'));
