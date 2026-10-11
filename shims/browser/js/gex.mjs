@@ -2585,6 +2585,10 @@ export class Gex {
       moduleStore: this.#moduleStore ?? undefined,
       // A thread of a 32-bit process decodes in compatibility mode too.
       compat: e.gex_compat?.() ?? 0,
+      // The process's run options, so a fork from this thread hands its
+      // child the same ones (the fork record's `opts`): a thread Worker had
+      // none, and a child of a thread lost dense numbering and the rest.
+      procOpts: this.#opts,
     };
     if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] #drainThread posting tid ${tid} (t=${Date.now()})`);
     e.gex_thread_taken();
@@ -2626,6 +2630,7 @@ export class Gex {
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    if (thread.procOpts) this.#opts = thread.procOpts;
     if (thread.compat) this.#shim.exports.gex_set_compat?.(1);
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
     // A spawned thread runs almost none of the process's modules, so registering
