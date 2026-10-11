@@ -160,22 +160,33 @@ function isShared(buf) {
 // unrelated functions into otherwise-correct dispatch slots. Two independent
 // 32-bit accumulators plus the exact length make a cheap content key; this is
 // validation against an index race, not a persistent content-addressed cache.
-/** The most the module store (`Gex#moduleStore`) may grow to. */
-const MODULE_STORE_MAX = 4 * 1024 * 1024 * 1024;
+/** The most the module store (`Gex#moduleStore`) may grow to, tried in turn:
+ *  the first a runtime accepts. 4 GiB filled up in 22 minutes of Hollow Knight
+ *  on Unity's own Mono (the translations of Mono's JIT output), after which
+ *  the registry kept its bytes in the shim's heap again and that ran out.
+ *  A growable SharedArrayBuffer only commits what it has grown to. */
+const MODULE_STORE_MAX = [32, 16, 8, 4].map((g) => g * 1024 * 1024 * 1024);
 /** A new module store: a growable SharedArrayBuffer whose first eight bytes
  *  are the bump cursor. Null where SharedArrayBuffer cannot grow. */
 function makeModuleStore() {
   if (typeof SharedArrayBuffer === 'undefined' || typeof SharedArrayBuffer.prototype.grow !== 'function') return null;
   // Off, for comparing against the registry keeping its own bytes.
   if (globalThis.GEX_NO_MODULE_STORE || globalThis.process?.env?.GEX_NO_MODULE_STORE) return null;
-  try {
-    const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: MODULE_STORE_MAX });
-    Atomics.store(new BigInt64Array(sab, 0, 1), 0, 8n);
-    return sab;
-  } catch {
-    return null;
+  for (const max of MODULE_STORE_MAX) {
+    try {
+      const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: max });
+      Atomics.store(new BigInt64Array(sab, 0, 1), 0, 8n);
+      if (globalThis.GEX_REGISTRY_TRACE || globalThis.process?.env?.GEX_REGISTRY_TRACE) {
+        globalThis.process?.getBuiltinModule?.('fs')?.writeSync(2, `[gex] module store max ${max / 2 ** 30} GiB\n`);
+      }
+      return sab;
+    } catch {
+      // Too big for this runtime: the next.
+    }
   }
+  return null;
 }
+let storeFullSaid = false;
 /** Append `bytes` to a module store: their offset, or -1 when it is full.
  *  Any Worker of the process may append at once: the cursor is atomic and a
  *  grow that loses a race to a bigger one is simply retried. */
@@ -183,7 +194,15 @@ function storeAppend(sab, bytes) {
   const len = bytes.length;
   const off = Number(Atomics.add(new BigInt64Array(sab, 0, 1), 0, BigInt((len + 7) & ~7)));
   const end = off + len;
-  if (end > sab.maxByteLength) return -1;
+  if (end > sab.maxByteLength) {
+    // Said once: from here the registry keeps bytes in the shim's heap, which
+    // shares the guest's 2 GiB arena and will run out in a long run.
+    if (!storeFullSaid) {
+      storeFullSaid = true;
+      console.error(`[gex] module store full at ${(sab.maxByteLength / 2 ** 30).toFixed(0)} GiB: the translated-module registry keeps its bytes in the shim heap from here`);
+    }
+    return -1;
+  }
   while (sab.byteLength < end) {
     try {
       sab.grow(Math.min(sab.maxByteLength, Math.max(end, sab.byteLength * 2)));

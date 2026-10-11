@@ -101,4 +101,10 @@ fi
 if [ -z "$store" ] || [ "$store" -lt 2 ] || [ "$heap" -gt 2 ]; then
     echo "FAIL browser-registry: module store ${store:-none} MiB, registry in the shim heap ${heap:-?} MiB"; tail -5 "$WORK/err"; exit 1
 fi
-echo "ok   browser-registry ($out; module store $store MiB, registry in the shim heap $heap MiB)"
+# Room past 4 GiB: Hollow Knight on Unity's own Mono filled a 4 GiB store in
+# 22 minutes, and the shim's heap ran out once the registry fell back to it.
+max=$(sed -n 's/.*module store max \([0-9]*\) GiB.*/\1/p' "$WORK/err" | head -1)
+if [ -z "$max" ] || [ "$max" -le 4 ]; then
+    echo "FAIL browser-registry: the module store may grow to ${max:-?} GiB, not past 4"; exit 1
+fi
+echo "ok   browser-registry ($out; module store $store MiB of at most $max GiB, registry in the shim heap $heap MiB)"
