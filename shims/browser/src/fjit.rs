@@ -444,7 +444,9 @@ fn translate_root(addr: u64) -> Option<u32> {
     // ranges taken once, and the range checks kept by 4 KiB page (exec,
     // replaced and object ranges are pages; `?fjitlibs=` ranges are not).
     let provided = crate::cgen::elfprov::provided_set();
-    let replaced = crate::cgen::libprov::replaced_ranges();
+    // Native wasm32 Wine DLLs' skeletons as replaced: no x86 code there.
+    let mut replaced = crate::cgen::libprov::replaced_ranges();
+    replaced.extend(crate::cgen::skeleton_code());
     let page_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
     let ranged = rules && lock(&LIBS).iter().any(|r| r.range.is_some());
     let executable = |a: u64| {
@@ -579,7 +581,10 @@ static LIBS: Mutex<Vec<Rule>> = Mutex::new(Vec::new());
 
 #[no_mangle]
 pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
-    let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
+    // The string is in the shim's heap (`gex_alloc`), above the guest's
+    // slice (`GUEST_LIMIT`): read it directly, not through `guest_bytes`.
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
     let mut v = lock(&LIBS);
     v.clear();
     for w in spec.split(',').map(str::trim).filter(|w| !w.is_empty()) {

@@ -81,7 +81,9 @@ const REVERSE_STRIDE: u64 = 16;
 /// `?wasmdlls=`), before the program starts.
 #[no_mangle]
 pub extern "C" fn gex_libprov_config(ptr: u32, len: u32) {
-    let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
+    // In the shim's heap (`gex_alloc`), above a wasm32 shim's guest slice.
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
     let mut v = lock(&DLLS);
     for item in spec.split(',') {
         if item.trim() == "noauto" {
@@ -943,7 +945,9 @@ pub(crate) fn forget_gone(gone: &[(u64, u64)]) {
 /// `name,name,...` (the page's `?elfunits=`), before the program starts.
 #[no_mangle]
 pub extern "C" fn gex_cgen_elf_units(ptr: u32, len: u32) {
-    let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
+    // In the shim's heap (`gex_alloc`), above a wasm32 shim's guest slice.
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
     let mut v = lock(&ELF_UNITS);
     for n in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
         if !v.iter().any(|x| x == n) {
