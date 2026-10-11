@@ -1,8 +1,9 @@
 #!/bin/bash
 # The translation cache across loads (docs/gexcc.md §8) in the browser runtime
 # under Node (run-node.mjs, GEX_XCACHE): a run restores what the last one
-# saved, and a library replaced at the same path between runs is not served
-# from the cache -- its new code runs.
+# saved, and a library replaced at the same path -- between runs, or during
+# one after the restore and before any process uses it -- is not served from
+# the cache: its new code runs.
 #
 #   tests/gexcc/xcache/run.sh      (web/public/gex has the aarch64 shared
 #                                   shim, kernel and seed; the aarch64 musl
@@ -18,13 +19,15 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/root/lib" "$W/root/bin" "$W/xc"
 cp "$TC/aarch64-linux-musl/lib/libc.so" "$W/root/lib/ld-musl-aarch64.so.1"
-lib() { "$CC" -O1 -shared -fPIC -DVALUE=$1 -o "$W/root/lib/libt.so" "$HERE/libt.c"; }
+lib() { "$CC" -O1 -shared -fPIC -DVALUE=$1 -o "$W/root/lib/${2:-libt.so}" "$HERE/libt.c"; }
 lib 1
 "$CC" -O1 -o "$W/root/bin/t" "$HERE/main.c" -L"$W/root/lib" -lt || exit 2
-run() {
+"$CC" -O1 -o "$W/root/bin/swap" "$HERE/swap.c" || exit 2
+run() { # [PROGRAM]
+  p=${1:-/bin/t}
   GEX_XCACHE=gate GEX_XCACHE_DIR="$W/xc" GEX_XCACHE_MIN=0 GEX_WEB_DIR="$WEB" GEX_SHARED=1 \
-    timeout 300 node "$ROOT/shims/browser/js/run-node.mjs" --dir /="$W/root" --argv0 /bin/t \
-    "$WEB/seed.shared.wasm" "$W/root/bin/t" 2>&1
+    timeout 300 node "$ROOT/shims/browser/js/run-node.mjs" --dir /="$W/root" --argv0 "$p" \
+    "$WEB/seed.shared.wasm" "$W/root$p" 2>&1
 }
 fail=0
 check() { # NAME WANT-VALUE WANT-RESTORE(regex) OUTPUT
@@ -40,5 +43,12 @@ sleep 1.1
 lib 2
 c=$(run); check "a replaced library is not served stale" "$(expect 2)" 'libt.so changed since the save' "$c"
 d=$(run); check "and the next run restores the new one" "$(expect 2)" 'restored [1-9][0-9]* modules' "$d"
+sleep 1.1
+lib 3 libt.new
+e=$(run /bin/swap); check "a library replaced after the restore is not served stale" "$(expect 3)" 'libt.so changed since the save' "$e"
+# The guest's rename stays in that run's filesystem (run-node copies --dir),
+# so the next run has the old libt.so again, which the cache (saved with the
+# new one) must not serve either.
+f=$(run); check "and the next run, back on the old one, is not served the new" "$(expect 2)" 'libt.so changed since the save' "$f"
 [ $fail = 0 ] && echo "xcache: PASS" || echo "xcache: FAIL"
 exit $fail
