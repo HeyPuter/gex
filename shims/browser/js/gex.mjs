@@ -5618,7 +5618,10 @@ export class Gex {
         const dv = new DataView(ds.buffer, ds.byteOffset, ds.byteLength);
         const base = dv.getUint32(0, true);
         if (globalThis.GEX_DENSE_DEBUG) {
-          console.error(`[dense] ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`);
+          const theirs = bytes instanceof Uint8Array ? denseSection(mod) : null;
+          const tb = theirs ? new DataView(theirs.buffer, theirs.byteOffset).getUint32(0, true) : base;
+          console.error(`[dense] pid ${e.gex_my_pid?.() ?? '?'} ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`
+            + (tb !== base ? ` (a module compiled elsewhere, at base ${tb})` : ''));
         }
         // Base 0 is a module nobody numbered: its blocks would land on the
         // miss stub and its neighbours.
