@@ -2536,7 +2536,7 @@ struct Jit {
     /// `registry` itself. An entry kept there holds no bytes in this module's
     /// heap: the registry grew without bound in a long fjit run (980 MiB of
     /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
-    registry_ext: Vec<Option<(u64, u32)>>,
+    registry_ext: Vec<Option<(u64, u32, u64)>>,
     /// The bytes of the last modules kept in the JS-side store, still alive:
     /// a sibling Worker that read the pending queue's front just before this
     /// one popped it is copying them out (`gex_jit_pending_refresh`).
@@ -13352,11 +13352,11 @@ pub extern "C" fn gex_jit_installed() {
             // take the front of the shared queue between this Worker's read and
             // this pop, so the note is checked against what was popped): keep
             // only where it is.
-            if let Some((off, len, _)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+            if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 h.jit.registry_sums.push(Vec::new());
                 h.jit.registry.push(Vec::new());
-                h.jit.registry_ext.push(Some((off, len)));
+                h.jit.registry_ext.push(Some((off, len, key)));
                 h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
                 h.jit.store_grace.push_back(done.wasm);
                 if h.jit.store_grace.len() > STORE_GRACE {
@@ -13653,13 +13653,25 @@ static EXTERNAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// `moduleContentKey` in gex.mjs, as one u64 (`a` high, `b` low): what a
 /// module's store slot is checked against.
 fn content_key(bytes: &[u8]) -> u64 {
+    // gex.mjs `moduleContentKey`, exactly: little-endian words, then the
+    // tail bytes, then a final mix of `a`.
     let mut a: u32 = 0x811c_9dc5;
     let mut b: u32 = 0x9e37_79b9;
-    for (i, &x) in bytes.iter().enumerate() {
-        a = (a ^ x as u32).wrapping_mul(0x0100_0193);
-        b = (b ^ (x as u32).wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+    let mut step = |i: u32, x: u32| {
+        a = (a ^ x).wrapping_mul(0x0100_0193);
+        b = (b ^ x.wrapping_add(i)).wrapping_mul(0x85eb_ca6b);
         b ^= b >> 13;
+    };
+    let words = bytes.chunks_exact(4);
+    let tail = words.remainder();
+    for (i, w) in words.enumerate() {
+        step(i as u32, u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
     }
+    let base = (bytes.len() & !3) as u32;
+    for (j, &x) in tail.iter().enumerate() {
+        step(base + j as u32, x as u32);
+    }
+    a ^= a >> 16;
     ((a as u64) << 32) | b as u64
 }
 
@@ -13684,7 +13696,17 @@ pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo:
 /// bytes are in this module's memory (`gex_module_ptr`).
 #[no_mangle]
 pub extern "C" fn gex_module_ext(i: u32) -> u64 {
-    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _)| off + 1))
+    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _, _)| off + 1))
+}
+
+/// Registry module `i`'s content key, high half (`which` 0) or low (1), when
+/// it is in the JS-side store (whose writer gave it); 0 and 0 otherwise. So a
+/// Worker catching up names the module without hashing its bytes.
+#[no_mangle]
+pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
+    with_host(|h| {
+        h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(_, _, k)| if which == 0 { (k >> 32) as u32 } else { k as u32 })
+    })
 }
 
 /// MiB of registry modules kept in the JS-side store (1) and in this heap (0).
@@ -13726,7 +13748,7 @@ pub extern "C" fn gex_jit_slots_total() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
     with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
-        Some((_, len)) => len,
+        Some((_, len, _)) => len,
         None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
     })
 }

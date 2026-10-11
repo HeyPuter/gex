@@ -186,17 +186,35 @@ function storeAppend(sab, bytes) {
   new Uint8Array(sab, off, len).set(bytes);
   return off;
 }
+/** A module's content key, `LENGTH:HASH:HASH` (host.mjs reads the length).
+ *  Four bytes a step: the byte-at-a-time loop was 16% of the samples of an
+ *  `apt-get install` in the page, every exec and every catch-up hashing each
+ *  module it installs. Two 32-bit lanes over the words, then the tail. */
 function moduleContentKey(bytes) {
   if (!(bytes instanceof Uint8Array)) return null;
+  const n = bytes.length;
+  const w = n >>> 2;
   let a = 0x811c9dc5;
   let b = 0x9e3779b9;
-  for (let i = 0; i < bytes.length; i++) {
+  if (w) {
+    const words = bytes.byteOffset % 4 === 0
+      ? new Int32Array(bytes.buffer, bytes.byteOffset, w)
+      : new Int32Array(bytes.slice(0, w * 4).buffer);
+    for (let i = 0; i < w; i++) {
+      const x = words[i];
+      a = Math.imul(a ^ x, 0x01000193);
+      b = Math.imul(b ^ (x + i), 0x85ebca6b);
+      b ^= b >>> 13;
+    }
+  }
+  for (let i = w * 4; i < n; i++) {
     const x = bytes[i];
     a = Math.imul(a ^ x, 0x01000193);
     b = Math.imul(b ^ (x + i), 0x85ebca6b);
     b ^= b >>> 13;
   }
-  return `${bytes.length}:${a >>> 0}:${b >>> 0}`;
+  a ^= a >>> 16;
+  return `${n}:${a >>> 0}:${b >>> 0}`;
 }
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
@@ -2523,7 +2541,7 @@ export class Gex {
       // `WebAssembly.Module` (same registry bytes -> same module) rather than
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
       let who = 'jit2049';
       if (globalThis.GEX_DUMP_WHERE ?? true) who = `jit2049-${i}-at-${ptr.toString(16)}`;
@@ -2593,7 +2611,7 @@ export class Gex {
       // No metadata means nothing to key a later fill on -- install it eagerly,
       // as the fork path does (`#adoptModule`), reusing a sibling's compile.
       if (!meta || !meta.length) {
-        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
@@ -2602,14 +2620,14 @@ export class Gex {
       const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
       e.gex_free?.(gp, meta.length);
       if (!got) {
-        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
       // Keep a sibling's compiled Module when we have it, so the on-demand
       // instantiate skips the compile too; otherwise the raw bytes. The push
       // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta });
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(this.#registryKey(i, bytes)) ?? bytes, need, inst: null, meta });
       lazy++;
     }
     if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
@@ -4820,6 +4838,17 @@ export class Gex {
   #moduleStore = null;
 
   /** Registry module `i`'s bytes (a copy), wherever they are kept; null if none. */
+  /** Registry module `i`'s content key: as the store's writer recorded it
+   *  when the module is in the store, so a catching-up Worker does not hash
+   *  bytes a sibling already hashed; computed from `bytes` otherwise. */
+  #registryKey(i, bytes) {
+    const e = this.#shim.exports;
+    if (e.gex_module_key && e.gex_module_ext && Number(e.gex_module_ext(i))) {
+      return `${bytes.length}:${e.gex_module_key(i, 0) >>> 0}:${e.gex_module_key(i, 1) >>> 0}`;
+    }
+    return moduleContentKey(bytes);
+  }
+
   #registryBytes(i) {
     const e = this.#shim.exports;
     const len = e.gex_module_len(i) >>> 0;
@@ -4893,7 +4922,7 @@ export class Gex {
       const i = this.#installed;
       const bytes = this.#registryBytes(i);
       if (!bytes) continue;
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
       this.#installModule(bytes, need, 64, null, 'nt-catchup', cached, true);
       if (cached) continue;
@@ -5608,7 +5637,7 @@ export class Gex {
     if (i < 0) return;
     const bytes = this.#registryBytes(i);
     if (!bytes) return;
-    const key = moduleContentKey(bytes);
+    const key = this.#registryKey(i, bytes);
     const cached = key ? this.#sharedModules.get(key) : undefined;
     this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
     this.#denseCatchUps++;
