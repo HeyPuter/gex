@@ -209,11 +209,14 @@ The plan does the same with **wasm32 as Wine's host architecture**:
     points (server requests, waits) for the state that tolerates it (the
     clock), which does not cover win32u's lock-free reads. A direct-call
     transport in place of the socket is a separate, later optimisation.
-- **Sync through ntsync.** Wine 11 supports the ntsync driver
-  (`dlls/ntdll/unix/sync.c`). gex-kernel implements `/dev/ntsync`, and its
-  ioctls (semaphores, mutexes, events, wait-any/all) go to the kernel's
-  futex machinery. Waits, mutexes and events then never reach wineserver,
-  which matters for Noita's job chain. The server round trip that is left
+- **Sync through ntsync (planned, W3.6; not implemented yet).** Wine 11
+  supports the ntsync driver (`dlls/ntdll/unix/sync.c`). The plan: gex-kernel
+  implements `/dev/ntsync`, its ioctls (semaphores, mutexes, events,
+  wait-any/all) going to the kernel's futex machinery, natively and in the
+  page (including the single-thread no-SAB build, whose waits park on the
+  JSPI scheduler). Waits, mutexes and events would then never reach
+  wineserver, which matters for Noita's job chain. Today every one of them
+  is a server request. The server round trip that is left
   (W0(a): 1.07 ms, from the native host's 1 ms fd polling) needs
   event-driven fd wakeups in gex-kernel before W3.
 
