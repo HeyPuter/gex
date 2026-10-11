@@ -6551,6 +6551,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         FAST_SIG.with(|c| c.set(sig_seen));
         FAST_RUN.with(|c| c.set(0));
         CANON_NR.with(|c| c.set(h.kernel.syscall_nr));
+        FD_ACTIVITY.with(|c| c.set(h.kernel.take_fd_activity()));
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
         // A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
@@ -7008,7 +7009,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // for an i386-ABI process -- W3's Wine -- is in i386 numbering.
     let _ = this_nr;
     let canon = CANON_NR.with(|c| c.replace(u64::MAX));
-    if unsafe { k_present() } != 0 && !wakes_nobody(canon) {
+    let fd_activity = FD_ACTIVITY.with(|c| c.replace(false));
+    if unsafe { k_present() } != 0 && wakes_waiters(canon, fd_activity) {
         unsafe { k_wake() };
     }
     // Objects the guest just mapped (`mapped`, taken in the locked section),
@@ -7200,6 +7202,43 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 /// spent ~40 ms of every Undertale frame in KLock::take. A list of what
 /// cannot wake, not of what can: a call missing here costs a wake, never a
 /// lost one.
+/// Whether the syscall just made (canonical `nr`, `u64::MAX` if the kernel
+/// did not run it) can have ended another Worker's wait, so the global
+/// counter every non-futex park sleeps on is bumped: as natively
+/// (`shims/native`, `ready::notify`), only a call that may have changed a
+/// descriptor's readiness, sent a signal or ended a thread or process
+/// (`gex_kernel::syscalls::wakes_fd_waiters`, as `fd_activity`), plus the few
+/// the page's own waits add. A futex wake needs none of this: it is relayed
+/// per address (`k_futex_wake`, which bumps the counter as well).
+fn wakes_waiters(nr: u64, fd_activity: bool) -> bool {
+    use gex_kernel::syscalls::nr;
+    if nr == u64::MAX || fd_activity {
+        return true;
+    }
+    if wakes_nobody(nr) {
+        return false;
+    }
+    matches!(
+        nr,
+        // A child's exec ends a vfork parent's wait; a session or group
+        // change, or a terminal ioctl, can end a terminal reader's.
+        nr::EXECVE
+            | nr::IOCTL
+            | nr::SETSID
+            | nr::SETPGID
+            // A new thread or process the page schedules.
+            | nr::CLONE
+            | nr::CLONE3
+            // Descriptor changes `wakes_fd_waiters` does not name.
+            | nr::DUP
+            | nr::PIPE2
+            | nr::SOCKETPAIR
+            | nr::EPOLL_CTL
+            | nr::EVENTFD2
+            | nr::FCNTL
+    )
+}
+
 fn wakes_nobody(nr: u64) -> bool {
     use gex_kernel::syscalls::nr;
     matches!(
@@ -7263,6 +7302,9 @@ thread_local! {
     /// The canonical number of the syscall this thread just made, for
     /// `wakes_nobody`; `u64::MAX` when the kernel did not run it.
     static CANON_NR: Cell<u64> = const { Cell::new(u64::MAX) };
+    /// Whether that call may have changed a descriptor's readiness
+    /// (`Kernel::take_fd_activity`).
+    static FD_ACTIVITY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// `clock_gettime`, `gettimeofday`, `getrusage` and `sched_yield` served
