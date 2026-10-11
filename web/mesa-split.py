@@ -30,6 +30,14 @@ import sys
 import tempfile
 
 LLVM_SUFFIX = re.compile(r'\.llvm\.\d+')
+# Binaryen tells functions of the same name apart with a `_N` suffix whose N
+# moves whenever the module gains or loses one, so a list is matched with
+# those suffixes off too (a duplicate kept with its twin costs little).
+DUP_SUFFIX = re.compile(r'_\d+$')
+
+
+def stable(name):
+    return DUP_SUFFIX.sub('', LLVM_SUFFIX.sub('', name))
 # The features the link used. The module carries no target_features section
 # for Binaryen to detect them from, and `-all` is not a substitute: with it,
 # wasm-split writes the cold part's imports in newer encodings (exact
@@ -238,7 +246,9 @@ def main():
                           capture_output=True, text=True, check=True).stdout
     # `index:name`, imports included (wasm-split never moves those).
     names = [l.split(':', 1)[1] for l in fmap.splitlines() if ':' in l]
-    keep = [n for n in names if (hot is None or LLVM_SUFFIX.sub('', n) in hot)
+    if hot is not None:
+        hot = {stable(n) for n in hot}
+    keep = [n for n in names if (hot is None or stable(n) in hot)
             and not (cold_re and cold_re.search(n))]
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
         f.write(''.join(n + '\n' for n in keep))
@@ -257,6 +267,12 @@ def main():
     size = os.path.getsize(cold)
     print(f'mesa-split: {len(keep)} of {len(names)} functions kept; '
           f'{os.path.getsize(primary)} bytes + {size} cold; {slots} trampolines')
+    if hot is not None:
+        gone = hot - {stable(n) for n in names}
+        if gone:
+            # A listed function this build no longer has under that name (a
+            # rename leaves the new one cold): re-run tools/mesa-hot.py.
+            print(f'mesa-split: {len(gone)} listed names not in this build, e.g. {sorted(gone)[0][:120]}')
     if max_cold is not None and size >= max_cold:
         sys.exit(f'mesa-split: the cold part is {size} bytes, not under {max_cold}')
 

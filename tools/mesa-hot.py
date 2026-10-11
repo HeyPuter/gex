@@ -34,6 +34,14 @@ import subprocess
 import sys
 
 LLVM_SUFFIX = re.compile(r'\.llvm\.\d+')
+# Binaryen tells functions of the same name apart with a `_N` suffix whose N
+# moves whenever the module gains or loses one, so a list is matched with
+# those suffixes off too (a duplicate kept with its twin costs little).
+DUP_SUFFIX = re.compile(r'_\d+$')
+
+
+def stable(name):
+    return DUP_SUFFIX.sub('', LLVM_SUFFIX.sub('', name))
 PROFILE = re.compile(r'mesa-profile (\d+) (\d+) (?:@(\d+) )?([A-Za-z0-9+/=]+)')
 
 
@@ -139,11 +147,11 @@ def main():
         union |= seen
     by_name = {}
     for i, n in enumerate(defined):
-        by_name.setdefault(LLVM_SUFFIX.sub('', n), []).append(i)
+        by_name.setdefault(stable(n), []).append(i)
     for path in also:
         names = {l.strip() for l in open(path) if l.strip() and not l.startswith('#')}
-        seen = {i for n in names for i in by_name.get(n, ())}
-        report(f'{os.path.basename(path)} ({len(names)} names, {len(names) - len({n for n in names if n in by_name})} not in this build)', seen)
+        seen = {i for n in names for i in by_name.get(stable(n), ())}
+        report(f'{os.path.basename(path)} ({len(names)} names, {len({n for n in names if stable(n) not in by_name})} not in this build)', seen)
         union |= seen
     unescape = lambda n: re.sub(r'\\([0-9a-f]{2})', lambda m: chr(int(m.group(1), 16)), n)
     dropped = {i for i in range(len(defined))

@@ -8,6 +8,7 @@ XXH_INLINE_XXH32
 XXH_INLINE_XXH32_29592
 \28anonymous\20namespace\29::EventManager::EventManager\28\29\20\28\29
 \28anonymous\20namespace\29::MapAsyncEvent::Complete\28unsigned\20long\20long\2c\20\28anonymous\20namespace\29::EventCompletionType\29
+\28anonymous\20namespace\29::MapAsyncEvent::~MapAsyncEvent\28\29
 \28anonymous\20namespace\29::MapAsyncEvent::~MapAsyncEvent\28\29_13230
 \28anonymous\20namespace\29::Parser::State::operator=\28\28anonymous\20namespace\29::Parser::State&&\29
 \28anonymous\20namespace\29::Parser::State::~State\28\29
@@ -967,8 +968,16 @@ _nir_build_quad_vote_all
 _nir_build_quad_vote_any
 _nir_select_from_array_helper
 _nir_select_from_array_helper\28nir_builder*\2c\20nir_def**\2c\20nir_def*\2c\20unsigned\20int\2c\20unsigned\20int\29
+_nir_select_from_array_helper_24893
 _nir_select_from_array_helper_25619
 _nir_select_from_array_helper_25677
+_nir_select_from_array_helper_25780
+_nir_select_from_array_helper_27618
+_nir_select_from_array_helper_28562
+_nir_select_from_array_helper_28653
+_nir_select_from_array_helper_28683
+_nir_select_from_array_helper_28705
+_nir_select_from_array_helper_28740
 _nir_select_from_array_helper_29116
 _reference_shader
 _set_default_response
@@ -1192,6 +1201,7 @@ check_level
 check_location_aliasing
 check_region_bounds
 check_samples
+checkint
 checkint_29745
 choose_format_with_bindings
 classify_identifier\28_mesa_glsl_parse_state*\2c\20char\20const*\2c\20unsigned\20int\2c\20YYSTYPE*\29
@@ -1225,6 +1235,7 @@ const_hash
 constant_one_for_inc_dec\28linear_ctx*\2c\20glsl_type\20const*\29
 constant_referenced\28linear_ctx*\2c\20ir_dereference\20const*\2c\20hash_table*\2c\20ir_constant*&\2c\20int&\29
 construct_value
+contains_other_jump
 contains_other_jump_25015
 contains_other_jump_25106
 convert_block_to_lcssa
@@ -2062,6 +2073,7 @@ infer_nir_alu_type_from_uses_ssa
 init_linkage
 init_mparams
 initialize_texture_fields
+initialize_texture_fields_24128
 inline_function_impl
 input_var_init
 inst_is_vector_alu
@@ -2247,13 +2259,19 @@ is_only_used_as_float
 is_only_used_as_float_impl
 is_only_used_as_float_impl_25556
 is_only_used_as_float_nsz
+is_only_used_by_fadd
 is_only_used_by_fadd_24909
 is_only_used_by_fadd_25042
 is_pos_power_of_two
 is_reduction\28ir_instruction*\2c\20void*\29
 is_trivial_bcsel
 is_uniform_expression
+is_unsigned_multiple_of_16
+is_unsigned_multiple_of_2
+is_unsigned_multiple_of_32
 is_unsigned_multiple_of_4
+is_unsigned_multiple_of_64
+is_unsigned_multiple_of_8
 is_used_by_non_fsat
 is_used_once
 is_vector_bitcast_deref
@@ -2287,6 +2305,7 @@ linker_warning
 literal_integer\28char*\2c\20int\2c\20_mesa_glsl_parse_state*\2c\20YYSTYPE*\2c\20YYLTYPE*\2c\20int\29
 load_input
 load_input_23574
+load_input_25796
 load_may_tear
 load_state_var
 load_state_var_23575
@@ -2383,6 +2402,7 @@ nir_build_convert_address_format
 nir_build_deref_array
 nir_build_deref_array_imm
 nir_build_deref_array_imm_18966
+nir_build_deref_array_imm_29101
 nir_build_deref_struct
 nir_build_deref_var\28nir_builder*\2c\20nir_variable*\29
 nir_build_imm
@@ -2418,9 +2438,11 @@ nir_convert_from_ssa
 nir_convert_loop_to_lcssa
 nir_convert_to_lcssa
 nir_copysign
+nir_copysign_28694
 nir_custom_divergence_analysis
 nir_def_components_read
 nir_def_init_for_type
+nir_def_init_for_type_28720
 nir_def_is_live_at
 nir_def_rewrite_uses_after_instr
 nir_def_rewrite_uses_with_alu_src
@@ -2435,6 +2457,7 @@ nir_deref_path_finish
 nir_deref_path_init
 nir_deserialize
 nir_eval_const_opcode
+nir_fadd_imm
 nir_fadd_imm_29134
 nir_fast_length
 nir_fdot\28nir_builder*\2c\20nir_def*\2c\20nir_def*\29
@@ -2446,6 +2469,7 @@ nir_fmul_imm
 nir_fmul_imm\28nir_builder*\2c\20nir_def*\2c\20double\29
 nir_foreach_src
 nir_foreach_src_27519
+nir_foreach_src_27521
 nir_format_unorm_to_float
 nir_function_clone
 nir_function_create
@@ -2457,7 +2481,13 @@ nir_get_explicit_deref_align
 nir_get_io_data_src_number
 nir_handle_add_jump
 nir_iadd_imm
+nir_iand_imm
+nir_iand_imm_19077
 nir_iand_imm_24889
+nir_iand_imm_25021
+nir_iand_imm_27472
+nir_iand_imm_29199
+nir_iand_imm_29321
 nir_if_create
 nir_if_phi
 nir_imm_bool
@@ -2475,6 +2505,7 @@ nir_imm_vec4
 nir_imm_zero
 nir_imm_zero_25631
 nir_imul_imm
+nir_imul_imm_29200
 nir_index_blocks
 nir_index_instrs
 nir_index_ssa_defs
@@ -2506,8 +2537,15 @@ nir_load_deref
 nir_load_deref_27590
 nir_load_deref_29098
 nir_load_system_value
+nir_load_var
+nir_load_var_25712
+nir_load_var_25716
+nir_load_var_25788
+nir_load_var_25800
 nir_load_var_27626
+nir_load_var_28712
 nir_load_var_29033
+nir_load_var_29195
 nir_load_var_29294
 nir_load_var_29322
 nir_local_variable_create
@@ -2629,9 +2667,15 @@ nir_steal_tex_src
 nir_store_deref
 nir_store_var
 nir_store_var_25545
+nir_store_var_25789
 nir_sweep
 nir_swizzle
 nir_swizzle_18967
+nir_swizzle_23576
+nir_swizzle_25038
+nir_swizzle_25717
+nir_swizzle_27624
+nir_swizzle_28682
 nir_swizzle_29319
 nir_system_value_from_instr
 nir_tex_instr_add_src
@@ -2640,7 +2684,11 @@ nir_tex_instr_remove_src
 nir_tex_instr_result_size
 nir_tex_instr_src_size
 nir_to_spirv
+nir_trim_vector
+nir_trim_vector_25099
 nir_trim_vector_25673
+nir_trim_vector_28586
+nir_trim_vector_29181
 nir_try_constant_fold_alu
 nir_type_conversion_op
 nir_type_convert
@@ -2661,8 +2709,11 @@ nir_variable_set_name
 nir_variable_set_namef
 nir_variable_steal_name
 nir_vec_scalars
+nir_vector_extract
 nir_vector_extract\28nir_builder*\2c\20nir_def*\2c\20nir_def*\29
+nir_vector_extract_25606
 nir_vector_extract_25660
+nir_vector_extract_28700
 nir_vector_extract_29112
 no_signed_wrap
 node_for_deref
@@ -2821,6 +2872,7 @@ shader_image_load_store\28_mesa_glsl_parse_state\20const*\29
 shader_packing_or_es3\28_mesa_glsl_parse_state\20const*\29
 shading_language_version
 shared_type_info
+shared_type_info_29465
 shift_result_type\28glsl_type\20const*\2c\20glsl_type\20const*\2c\20ast_operators\2c\20_mesa_glsl_parse_state*\2c\20YYLTYPE*\29
 shl
 should_lower_double_instr
@@ -3094,6 +3146,7 @@ spvtools::opt::SplitCombinedImageSamplerPass::~SplitCombinedImageSamplerPass\28\
 spvtools::opt::analysis::Array::Array\28spvtools::opt::analysis::Type\20const*\2c\20spvtools::opt::analysis::Array::LengthInfo\20const&\29
 spvtools::opt::analysis::Array::ComputeExtraStateHash\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
 spvtools::opt::analysis::Array::IsSameImpl\28spvtools::opt::analysis::Type\20const*\2c\20std::__2::set<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>\2c\20std::__2::less<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>\2c\20std::__2::allocator<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>>*\29\20const
+spvtools::opt::analysis::Array::~Array\28\29
 spvtools::opt::analysis::Array::~Array\28\29_10357
 spvtools::opt::analysis::Bool::IsSameImpl\28spvtools::opt::analysis::Type\20const*\2c\20std::__2::set<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>\2c\20std::__2::less<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>\2c\20std::__2::allocator<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>>*\29\20const
 spvtools::opt::analysis::BoolConstant::~BoolConstant\28\29
@@ -3140,6 +3193,7 @@ spvtools::opt::analysis::Float::ComputeExtraStateHash\28unsigned\20long\2c\20spv
 spvtools::opt::analysis::Float::IsSameImpl\28spvtools::opt::analysis::Type\20const*\2c\20std::__2::set<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>\2c\20std::__2::less<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>\2c\20std::__2::allocator<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>>*\29\20const
 spvtools::opt::analysis::Function::ComputeExtraStateHash\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
 spvtools::opt::analysis::Function::Function\28spvtools::opt::analysis::Type\20const*\2c\20std::__2::vector<spvtools::opt::analysis::Type\20const*\2c\20std::__2::allocator<spvtools::opt::analysis::Type\20const*>>&\29
+spvtools::opt::analysis::Function::~Function\28\29
 spvtools::opt::analysis::Function::~Function\28\29_10376
 spvtools::opt::analysis::Image::ComputeExtraStateHash\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
 spvtools::opt::analysis::Image::Image\28spvtools::opt::analysis::Type*\2c\20spv::Dim\2c\20unsigned\20int\2c\20bool\2c\20bool\2c\20unsigned\20int\2c\20spv::ImageFormat\2c\20spv::AccessQualifier\29
@@ -3155,6 +3209,7 @@ spvtools::opt::analysis::Struct::AddMemberDecoration\28unsigned\20int\2c\20std::
 spvtools::opt::analysis::Struct::ComputeExtraStateHash\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
 spvtools::opt::analysis::Struct::IsSameImpl\28spvtools::opt::analysis::Type\20const*\2c\20std::__2::set<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>\2c\20std::__2::less<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>\2c\20std::__2::allocator<std::__2::pair<spvtools::opt::analysis::Pointer\20const*\2c\20spvtools::opt::analysis::Pointer\20const*>>>*\29\20const
 spvtools::opt::analysis::Struct::Struct\28std::__2::vector<spvtools::opt::analysis::Type\20const*\2c\20std::__2::allocator<spvtools::opt::analysis::Type\20const*>>\20const&\29
+spvtools::opt::analysis::Struct::~Struct\28\29
 spvtools::opt::analysis::Struct::~Struct\28\29_10367
 spvtools::opt::analysis::TensorViewNV::TensorViewNV\28unsigned\20int\2c\20unsigned\20int\2c\20std::__2::vector<unsigned\20int\2c\20std::__2::allocator<unsigned\20int>>\20const&\29
 spvtools::opt::analysis::Type::ComputeHashValue\28unsigned\20long\2c\20spvtools::utils::SmallVector<spvtools::opt::analysis::Type\20const*\2c\208ul>*\29\20const
@@ -3360,6 +3415,8 @@ std::__2::__function::__func<spvtools::GetTrivialNameMapper\28\29::$_0\2c\20std:
 std::__2::__function::__func<spvtools::UseDiagnosticAsMessageConsumer\28spv_context_t*\2c\20spv_diagnostic_t**\29::$_0\2c\20void\20\28spv_message_level_t\2c\20char\20const*\2c\20spv_position_t\20const&\2c\20char\20const*\29>::__clone\28std::__2::__function::__base<void\20\28spv_message_level_t\2c\20char\20const*\2c\20spv_position_t\20const&\2c\20char\20const*\29>*\29\20const
 std::__2::__function::__func<spvtools::opt::BasicBlock::ForEachInst\28std::__2::function<void\20\28spvtools::opt::Instruction*\29>\20const&\2c\20bool\29::'lambda'\28spvtools::opt::Instruction*\29\2c\20bool\20\28spvtools::opt::Instruction*\29>::operator\28\29\28spvtools::opt::Instruction*&&\29
 std::__2::__function::__func<spvtools::opt::BasicBlock::ForEachSuccessorLabel\28std::__2::function<void\20\28unsigned\20int\29>\20const&\29\20const::$_0\2c\20bool\20\28unsigned\20int\29>::operator\28\29\28unsigned\20int&&\29
+std::__2::__function::__func<spvtools::opt::BasicBlock::ForEachSuccessorLabel\28std::__2::function<void\20\28unsigned\20int\29>\20const&\29\20const::$_0\2c\20bool\20\28unsigned\20int\29>::~__func\28\29
+std::__2::__function::__func<spvtools::opt::BasicBlock::ForEachSuccessorLabel\28std::__2::function<void\20\28unsigned\20int\29>\20const&\29\20const::$_0\2c\20bool\20\28unsigned\20int\29>::~__func\28\29_9439
 std::__2::__function::__func<spvtools::opt::BasicBlock::WhileEachSuccessorLabel\28std::__2::function<bool\20\28unsigned\20int\29>\20const&\29\20const::$_0\2c\20bool\20\28unsigned\20int\20const*\29>::operator\28\29\28unsigned\20int\20const*&&\29
 std::__2::__function::__func<spvtools::opt::IRContext::BuildInstrToBlockMapping\28\29::'lambda'\28spvtools::opt::Instruction*\29\2c\20void\20\28spvtools::opt::Instruction*\29>::operator\28\29\28spvtools::opt::Instruction*&&\29
 std::__2::__function::__func<spvtools::opt::Module::ToBinary\28std::__2::vector<unsigned\20int\2c\20std::__2::allocator<unsigned\20int>>*\2c\20bool\29\20const::$_0\2c\20void\20\28spvtools::opt::Instruction\20const*\29>::operator\28\29\28spvtools::opt::Instruction\20const*&&\29
@@ -3592,6 +3649,7 @@ std::__2::ios_base::imbue\28std::__2::locale\20const&\29
 std::__2::ios_base::init\28void*\29
 std::__2::ios_base::setstate\5babi:nn210108\5d\28unsigned\20int\29
 std::__2::ios_base::~ios_base\28\29
+std::__2::ios_base::~ios_base\28\29_30181
 std::__2::istreambuf_iterator<char\2c\20std::__2::char_traits<char>>::__test_for_eof\5babi:nn210108\5d\28\29\20const
 std::__2::istreambuf_iterator<char\2c\20std::__2::char_traits<char>>::equal\5babi:nn210108\5d\28std::__2::istreambuf_iterator<char\2c\20std::__2::char_traits<char>>\20const&\29\20const
 std::__2::locale::__global\28\29
@@ -4005,6 +4063,7 @@ tint::TextGenerator::TextBuffer::String\28unsigned\20int\29\20const
 tint::TextGenerator::TextBuffer::~TextBuffer\28\29
 tint::TextGenerator::TextGenerator\28\29
 tint::TextGenerator::~TextGenerator\28\29
+tint::TextGenerator::~TextGenerator\28\29_866
 tint::UniqueVector<tint::ast::Node\20const*\2c\2064ul\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20std::__2::equal_to<tint::ast::Node\20const*>>::Add\28tint::ast::Node\20const*\20const&\29
 tint::UniqueVector<tint::ast::Node\20const*\2c\2064ul\2c\20tint::Hasher<tint::ast::Node\20const*>\2c\20std::__2::equal_to<tint::ast::Node\20const*>>::Reserve\28unsigned\20long\29
 tint::UniqueVector<tint::resolver::\28anonymous\20namespace\29::Global\20const*\2c\208ul\2c\20tint::Hasher<tint::resolver::\28anonymous\20namespace\29::Global\20const*>\2c\20std::__2::equal_to<tint::resolver::\28anonymous\20namespace\29::Global\20const*>>::Pop\28\29
@@ -4075,6 +4134,7 @@ tint::ast::BlockStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2
 tint::ast::BlockStatement::BlockStatement\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::VectorRef<tint::ast::Statement\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::BlockStatement::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::BlockStatement::~BlockStatement\28\29
+tint::ast::BlockStatement::~BlockStatement\28\29_5028
 tint::ast::BlockStatement\20const*\20tint::ast::CloneContext::Clone<tint::ast::BlockStatement>\28tint::ast::BlockStatement\20const*\29
 tint::ast::BoolLiteralExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::BoolLiteralExpression\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20bool>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20bool&&\29
 tint::ast::BoolLiteralExpression::BoolLiteralExpression\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20bool\29
@@ -4123,6 +4183,7 @@ tint::ast::CallExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2
 tint::ast::CallExpression::CallExpression\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::IdentifierExpression\20const*\2c\20tint::VectorRef<tint::ast::Expression\20const*>\29
 tint::ast::CallExpression::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::CallExpression::~CallExpression\28\29
+tint::ast::CallExpression::~CallExpression\28\29_5066
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Bitcast<tint::ast::Expression\20const*>\28tint::Source\20const&\2c\20tint::ast::Type\2c\20tint::ast::Expression\20const*&&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<char\20const\20\28&\29\20\5b17\5d\2c\20tint::ast::Expression\20const*\2c\20void\2c\20void>\28char\20const\20\28&\29\20\5b17\5d\2c\20tint::ast::Expression\20const*&&\29
 tint::ast::CallExpression\20const*\20tint::ast::Builder::Call<char\20const\20\28&\29\20\5b17\5d\2c\20void\2c\20void>\28char\20const\20\28&\29\20\5b17\5d\29
@@ -4154,6 +4215,7 @@ tint::ast::CallStatement::CallStatement\28tint::GenerationID\2c\20tint::ast::Nod
 tint::ast::CallStatement::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::CaseStatement::ContainsDefault\28\29\20const
 tint::ast::CaseStatement::~CaseStatement\28\29
+tint::ast::CaseStatement::~CaseStatement\28\29_5083
 tint::ast::CloneContext&\20tint::ast::CloneContext::InsertBack<tint::ast::Expression\20const*\2c\208ul\2c\20tint::ast::CloneContext&\20tint::ast::CloneContext::InsertBack<tint::ast::Expression\20const*\2c\208ul\2c\20tint::ast::IdentifierExpression\20const>\28tint::Vector<tint::ast::Expression\20const*\2c\208ul>\20const&\2c\20tint::ast::IdentifierExpression\20const*\29::'lambda'\28\29>\28tint::Vector<tint::ast::Expression\20const*\2c\208ul>\20const&\2c\20tint::ast::IdentifierExpression\20const&&\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::InsertBack<tint::ast::Parameter\20const*\2c\208ul\2c\20tint::ast::CloneContext&\20tint::ast::CloneContext::InsertBack<tint::ast::Parameter\20const*\2c\208ul\2c\20tint::ast::Parameter\20const>\28tint::Vector<tint::ast::Parameter\20const*\2c\208ul>\20const&\2c\20tint::ast::Parameter\20const*\29::'lambda'\28\29>\28tint::Vector<tint::ast::Parameter\20const*\2c\208ul>\20const&\2c\20tint::ast::Parameter\20const&&\29
 tint::ast::CloneContext&\20tint::ast::CloneContext::InsertBefore<tint::ast::Statement\20const*\2c\208ul\2c\20tint::ast::AssignmentStatement\2c\20tint::ast::VariableDeclStatement>\28tint::Vector<tint::ast::Statement\20const*\2c\208ul>\20const&\2c\20tint::ast::AssignmentStatement\20const*\2c\20tint::ast::VariableDeclStatement\20const*\29
@@ -4187,6 +4249,7 @@ tint::ast::Const*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>
 tint::ast::Const::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::Const::Const\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type\2c\20tint::ast::Expression\20const*\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Const::~Const\28\29
+tint::ast::Const::~Const\28\29_5115
 tint::ast::Const\20const*\20tint::ast::Builder::Const<std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::ast::Expression\20const*&>\28tint::Source\20const&\2c\20std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::Const\20const*\20tint::ast::Builder::GlobalConst<std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::ast::Expression\20const*&\2c\20void>\28std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::ContinueStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::ContinueStatement\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\29
@@ -4208,6 +4271,7 @@ tint::ast::DisableValidationAttribute*\20tint::BlockAllocator<tint::ast::Node\2c
 tint::ast::DisableValidationAttribute::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::DisableValidationAttribute::DisableValidationAttribute\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::ast::DisabledValidation\29
 tint::ast::DisableValidationAttribute::~DisableValidationAttribute\28\29
+tint::ast::DisableValidationAttribute::~DisableValidationAttribute\28\29_5148
 tint::ast::DiscardStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::DiscardStatement\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\29
 tint::ast::DiscardStatement::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::DiscardStatement::DiscardStatement\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\29
@@ -4234,6 +4298,7 @@ tint::ast::Function::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::Function::Function\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::VectorRef<tint::ast::Parameter\20const*>\2c\20tint::ast::Type\2c\20tint::ast::BlockStatement\20const*\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Function::PipelineStage\28\29\20const
 tint::ast::Function::~Function\28\29
+tint::ast::Function::~Function\28\29_5187
 tint::ast::Function\20const*\20tint::ast::Builder::Func<std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::ast::BlockStatement\20const*&>\28tint::Source\20const&\2c\20std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>&\2c\20tint::VectorRef<tint::ast::Parameter\20const*>\2c\20tint::ast::Type\2c\20tint::ast::BlockStatement\20const*&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Function\20const*\20tint::ast::Builder::Func<std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20const&\2c\20tint::Vector<tint::ast::Statement\20const*\2c\208ul>>\28tint::Source\20const&\2c\20std::__2::basic_string<char\2c\20std::__2::char_traits<char>\2c\20std::__2::allocator<char>>\20const&\2c\20tint::VectorRef<tint::ast::Parameter\20const*>\2c\20tint::ast::Type\2c\20tint::Vector<tint::ast::Statement\20const*\2c\208ul>&&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Function\20const*\20tint::ast::Builder::Func<tint::Symbol\2c\20std::nullptr_t>\28tint::Source\20const&\2c\20tint::Symbol&&\2c\20tint::VectorRef<tint::ast::Parameter\20const*>\2c\20tint::ast::Type\2c\20std::nullptr_t&&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
@@ -4247,6 +4312,7 @@ tint::ast::Identifier*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\20
 tint::ast::Identifier::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::Identifier::Identifier\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::Symbol\29
 tint::ast::Identifier::~Identifier\28\29
+tint::ast::Identifier::~Identifier\28\29_5205
 tint::ast::IdentifierExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::IdentifierExpression\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\29
 tint::ast::IdentifierExpression::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::IdentifierExpression::IdentifierExpression\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\29
@@ -4270,6 +4336,7 @@ tint::ast::IfStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2
 tint::ast::IfStatement::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::IfStatement::IfStatement\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*\2c\20tint::ast::BlockStatement\20const*\2c\20tint::ast::Statement\20const*\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::IfStatement::~IfStatement\28\29
+tint::ast::IfStatement::~IfStatement\28\29_5215
 tint::ast::IndexAccessorExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::IndexAccessorExpression\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Expression\20const*&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::IndexAccessorExpression*\20tint::spirv::reader::ast_parser::FunctionEmitter::create<tint::ast::IndexAccessorExpression\2c\20tint::Source\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Expression\20const*>\28tint::Source&&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Expression\20const*&&\29\20const
 tint::ast::IndexAccessorExpression::Clone\28tint::ast::CloneContext&\29\20const
@@ -4303,6 +4370,7 @@ tint::ast::LoopStatement*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c
 tint::ast::LoopStatement::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::LoopStatement::LoopStatement\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::BlockStatement\20const*\2c\20tint::ast::BlockStatement\20const*\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::LoopStatement::~LoopStatement\28\29
+tint::ast::LoopStatement::~LoopStatement\28\29_5271
 tint::ast::MemberAccessorExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::MemberAccessorExpression\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Identifier\20const*&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Identifier\20const*&\29
 tint::ast::MemberAccessorExpression*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::MemberAccessorExpression\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*\2c\20tint::ast::Identifier\20const*>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&&\2c\20tint::ast::Identifier\20const*&&\29
 tint::ast::MemberAccessorExpression*\20tint::spirv::reader::ast_parser::FunctionEmitter::create<tint::ast::MemberAccessorExpression\2c\20tint::Source\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Identifier\20const*>\28tint::Source&&\2c\20tint::ast::Expression\20const*&\2c\20tint::ast::Identifier\20const*&&\29\20const
@@ -4324,6 +4392,7 @@ tint::ast::Module::BinGlobalDeclaration\28tint::ast::Node\20const*\29
 tint::ast::Module::Copy\28tint::ast::CloneContext&\2c\20tint::ast::Module\20const*\29
 tint::ast::Module::Module\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\29
 tint::ast::Module::~Module\28\29
+tint::ast::Module::~Module\28\29_5282
 tint::ast::Node::Node\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\29
 tint::ast::Override*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::Override\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\2c\20tint::ast::Type&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>&&\29
 tint::ast::Override\20const*\20tint::ast::Builder::Override<tint::Symbol&\2c\20tint::ast::Type\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\208ul>>\28tint::Source\20const&\2c\20tint::Symbol&\2c\20tint::ast::Type&&\2c\20tint::ast::Expression\20const*&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\208ul>&&\29
@@ -4359,12 +4428,14 @@ tint::ast::Struct*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul
 tint::ast::Struct::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::Struct::Struct\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::VectorRef<tint::ast::StructMember\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::Struct::~Struct\28\29
+tint::ast::Struct::~Struct\28\29_5354
 tint::ast::StructMember*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::StructMember\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\204ul>&&\29
 tint::ast::StructMember*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::StructMember\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\201ul>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\2c\20tint::ast::Type&\2c\20tint::Vector<tint::ast::Attribute\20const*\2c\201ul>&&\29
 tint::ast::StructMember*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::StructMember\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*&&\2c\20tint::ast::Type&\2c\20tint::VectorRef<tint::ast::Attribute\20const*>&&\29
 tint::ast::StructMember::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::StructMember::StructMember\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Identifier\20const*\2c\20tint::ast::Type\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::StructMember::~StructMember\28\29
+tint::ast::StructMember::~StructMember\28\29_5361
 tint::ast::StructMemberOffsetAttribute*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::StructMemberOffsetAttribute\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::Expression\20const*&\29
 tint::ast::StructMemberOffsetAttribute*\20tint::BlockAllocator<tint::ast::Node\2c\2065536ul\2c\2016ul>::Create<tint::ast::StructMemberOffsetAttribute\2c\20tint::GenerationID&\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::ast::IntLiteralExpression\20const*>\28tint::GenerationID&\2c\20tint::ast::NodeID&&\2c\20tint::Source\20const&\2c\20tint::ast::IntLiteralExpression\20const*&&\29
 tint::ast::StructMemberOffsetAttribute::Clone\28tint::ast::CloneContext&\29\20const
@@ -4385,6 +4456,7 @@ tint::ast::TemplatedIdentifier*\20tint::BlockAllocator<tint::ast::Node\2c\206553
 tint::ast::TemplatedIdentifier::Clone\28tint::ast::CloneContext&\29\20const
 tint::ast::TemplatedIdentifier::TemplatedIdentifier\28tint::GenerationID\2c\20tint::ast::NodeID\2c\20tint::Source\20const&\2c\20tint::Symbol\20const&\2c\20tint::VectorRef<tint::ast::Expression\20const*>\2c\20tint::VectorRef<tint::ast::Attribute\20const*>\29
 tint::ast::TemplatedIdentifier::~TemplatedIdentifier\28\29
+tint::ast::TemplatedIdentifier::~TemplatedIdentifier\28\29_5393
 tint::ast::ToString\28tint::ast::FloatLiteralExpression::Suffix\29
 tint::ast::ToString\28tint::ast::IntLiteralExpression::Suffix\29
 tint::ast::ToString\28tint::ast::PipelineStage\29
@@ -4451,6 +4523,7 @@ tint::core::constant::Composite::Composite\28tint::core::type::Type\20const*\2c\
 tint::core::constant::Composite::Hash\28\29\20const
 tint::core::constant::Composite::Index\28unsigned\20long\29\20const
 tint::core::constant::Composite::~Composite\28\29
+tint::core::constant::Composite::~Composite\28\29_5718
 tint::core::constant::Eval::And\28tint::core::type::Type\20const*\2c\20tint::VectorRef<tint::core::constant::Value\20const*>\2c\20tint::Source\20const&\29
 tint::core::constant::Eval::ArrayOrStructCtor\28tint::core::type::Type\20const*\2c\20tint::VectorRef<tint::core::constant::Value\20const*>\29
 tint::core::constant::Eval::Conv\28tint::core::type::Type\20const*\2c\20tint::VectorRef<tint::core::constant::Value\20const*>\2c\20tint::Source\20const&\29
@@ -4557,6 +4630,7 @@ tint::core::type::AbstractFloat*\20tint::BlockAllocator<tint::core::type::Type\2
 tint::core::type::AbstractFloat*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hasher<tint::core::type::Type>\2c\20std::__2::equal_to<tint::core::type::Type>>::Get<tint::core::type::AbstractFloat>\28\29
 tint::core::type::AbstractFloat::AbstractFloat\28\29
 tint::core::type::AbstractFloat::~AbstractFloat\28\29
+tint::core::type::AbstractFloat::~AbstractFloat\28\29_4582
 tint::core::type::AbstractInt*\20tint::BlockAllocator<tint::core::type::Type\2c\2065536ul\2c\2016ul>::Create<tint::core::type::AbstractInt>\28\29
 tint::core::type::AbstractInt*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hasher<tint::core::type::Type>\2c\20std::__2::equal_to<tint::core::type::Type>>::Get<tint::core::type::AbstractInt>\28\29
 tint::core::type::AbstractInt::AbstractInt\28\29
@@ -4942,6 +5016,7 @@ tint::sem::Array*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hash
 tint::sem::Array::AddTransitivelyReferencedOverride\28tint::sem::GlobalVariable\20const*\29
 tint::sem::Array::Array\28tint::core::type::Type\20const*\2c\20tint::core::type::ArrayCount\20const*\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\29
 tint::sem::Array::~Array\28\29
+tint::sem::Array::~Array\28\29_970
 tint::sem::BlockStatement*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::BlockStatement\2c\20tint::ast::BlockStatement\20const*\2c\20tint::sem::CompoundStatement*&\2c\20tint::sem::Function*&>\28tint::ast::BlockStatement\20const*&&\2c\20tint::sem::CompoundStatement*&\2c\20tint::sem::Function*&\29
 tint::sem::BlockStatement*\20tint::resolver::Resolver::StatementScope<tint::sem::BlockStatement\2c\20tint::resolver::Resolver::BlockStatement\28tint::ast::BlockStatement\20const*\29::$_0>\28tint::ast::Statement\20const*\2c\20tint::sem::BlockStatement*\2c\20tint::resolver::Resolver::BlockStatement\28tint::ast::BlockStatement\20const*\29::$_0&&\29
 tint::sem::BlockStatement::BlockStatement\28tint::ast::BlockStatement\20const*\2c\20tint::sem::CompoundStatement\20const*\2c\20tint::sem::Function\20const*\29
@@ -4954,12 +5029,14 @@ tint::sem::BuiltinFn*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\201
 tint::sem::BuiltinFn::BuiltinFn\28tint::wgsl::BuiltinFn\2c\20tint::core::type::Type\20const*\2c\20tint::VectorRef<tint::sem::Parameter*>\2c\20tint::core::EvaluationStage\2c\20tint::EnumSet<tint::ast::PipelineStage>\2c\20tint::core::intrinsic::OverloadInfo\20const&\29
 tint::sem::BuiltinFn::RequiredLanguageFeature\28\29\20const
 tint::sem::BuiltinFn::~BuiltinFn\28\29
+tint::sem::BuiltinFn::~BuiltinFn\28\29_661
 tint::sem::Call*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::Call\2c\20tint::ast::CallExpression\20const*&\2c\20tint::sem::CallTarget*&\2c\20tint::core::EvaluationStage&\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20bool&>\28tint::ast::CallExpression\20const*&\2c\20tint::sem::CallTarget*&\2c\20tint::core::EvaluationStage&\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>&&\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20bool&\29
 tint::sem::Call*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::Call\2c\20tint::ast::CallExpression\20const*&\2c\20tint::sem::Function*&\2c\20tint::core::EvaluationStage&\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>\2c\20tint::sem::Statement*&\2c\20std::nullptr_t\2c\20bool&>\28tint::ast::CallExpression\20const*&\2c\20tint::sem::Function*&\2c\20tint::core::EvaluationStage&\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>&&\2c\20tint::sem::Statement*&\2c\20std::nullptr_t&&\2c\20bool&\29
 tint::sem::Call*\20tint::resolver::Resolver::BuiltinCall<8ul>\28tint::ast::CallExpression\20const*\2c\20tint::wgsl::BuiltinFn\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>&\29
 tint::sem::Call*\20tint::resolver::Resolver::BuiltinCall<8ul>\28tint::ast::CallExpression\20const*\2c\20tint::wgsl::BuiltinFn\2c\20tint::Vector<tint::sem::ValueExpression\20const*\2c\208ul>&\29::'lambda'\28\29::operator\28\29\28\29\20const
 tint::sem::Call::Call\28tint::ast::CallExpression\20const*\2c\20tint::sem::CallTarget\20const*\2c\20tint::core::EvaluationStage\2c\20tint::VectorRef<tint::sem::ValueExpression\20const*>\2c\20tint::sem::Statement\20const*\2c\20tint::core::constant::Value\20const*\2c\20bool\29
 tint::sem::Call::~Call\28\29
+tint::sem::Call::~Call\28\29_674
 tint::sem::CallTarget::CallTarget\28tint::core::EvaluationStage\2c\20bool\29
 tint::sem::CallTarget::CallTarget\28tint::core::type::Type\20const*\2c\20tint::VectorRef<tint::sem::Parameter*>\2c\20tint::core::EvaluationStage\2c\20bool\29
 tint::sem::CallTarget::~CallTarget\28\29
@@ -4976,6 +5053,7 @@ tint::sem::Function::AddTransitivelyReferencedGlobal\28tint::sem::GlobalVariable
 tint::sem::Function::Function\28tint::ast::Function\20const*\29
 tint::sem::Function::SetDiagnosticSeverity\28std::__2::variant<tint::wgsl::CoreDiagnosticRule\2c\20tint::wgsl::ChromiumDiagnosticRule>\2c\20tint::wgsl::DiagnosticSeverity\29
 tint::sem::Function::~Function\28\29
+tint::sem::Function::~Function\28\29_685
 tint::sem::FunctionBlockStatement*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::FunctionBlockStatement\2c\20tint::sem::Function*&>\28tint::sem::Function*&\29
 tint::sem::FunctionBlockStatement::FunctionBlockStatement\28tint::sem::Function\20const*\29
 tint::sem::FunctionBlockStatement::~FunctionBlockStatement\28\29
@@ -4984,6 +5062,7 @@ tint::sem::FunctionExpression::FunctionExpression\28tint::ast::IdentifierExpress
 tint::sem::GlobalVariable*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::GlobalVariable\2c\20tint::ast::Override\20const*&>\28tint::ast::Override\20const*&\29
 tint::sem::GlobalVariable::GlobalVariable\28tint::ast::Variable\20const*\29
 tint::sem::GlobalVariable::~GlobalVariable\28\29
+tint::sem::GlobalVariable::~GlobalVariable\28\29_761
 tint::sem::IfStatement*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::IfStatement\2c\20tint::ast::IfStatement\20const*&\2c\20tint::sem::CompoundStatement*&\2c\20tint::sem::Function*&>\28tint::ast::IfStatement\20const*&\2c\20tint::sem::CompoundStatement*&\2c\20tint::sem::Function*&\29
 tint::sem::IfStatement*\20tint::resolver::Resolver::StatementScope<tint::sem::IfStatement\2c\20tint::resolver::Resolver::IfStatement\28tint::ast::IfStatement\20const*\29::$_0>\28tint::ast::Statement\20const*\2c\20tint::sem::IfStatement*\2c\20tint::resolver::Resolver::IfStatement\28tint::ast::IfStatement\20const*\29::$_0&&\29
 tint::sem::IfStatement::IfStatement\28tint::ast::IfStatement\20const*\2c\20tint::sem::CompoundStatement\20const*\2c\20tint::sem::Function\20const*\29
@@ -5012,6 +5091,7 @@ tint::sem::Module*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul
 tint::sem::Module::Module\28tint::VectorRef<tint::ast::Node\20const*>\2c\20tint::UniqueVector<tint::wgsl::Extension\2c\204ul\2c\20tint::Hasher<tint::wgsl::Extension>\2c\20std::__2::equal_to<tint::wgsl::Extension>>\29
 tint::sem::Module::SetDiagnosticSeverity\28std::__2::variant<tint::wgsl::CoreDiagnosticRule\2c\20tint::wgsl::ChromiumDiagnosticRule>\2c\20tint::wgsl::DiagnosticSeverity\29
 tint::sem::Module::~Module\28\29
+tint::sem::Module::~Module\28\29_966
 tint::sem::NamedOverrideArrayCount*\20tint::BlockAllocator<tint::core::type::UniqueNode\2c\2065536ul\2c\2016ul>::Create<tint::sem::NamedOverrideArrayCount\2c\20tint::sem::GlobalVariable\20const*&>\28tint::sem::GlobalVariable\20const*&\29
 tint::sem::NamedOverrideArrayCount*\20tint::UniqueAllocator<tint::core::type::UniqueNode\2c\20tint::Hasher<tint::core::type::UniqueNode>\2c\20std::__2::equal_to<tint::core::type::UniqueNode>>::Get<tint::sem::NamedOverrideArrayCount\2c\20tint::sem::GlobalVariable\20const*&>\28tint::sem::GlobalVariable\20const*&\29
 tint::sem::NamedOverrideArrayCount::NamedOverrideArrayCount\28tint::sem::GlobalVariable\20const*\29
@@ -5023,19 +5103,23 @@ tint::sem::Statement*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\201
 tint::sem::Statement::Block\28\29\20const
 tint::sem::Statement::SetDiagnosticSeverity\28std::__2::variant<tint::wgsl::CoreDiagnosticRule\2c\20tint::wgsl::ChromiumDiagnosticRule>\2c\20tint::wgsl::DiagnosticSeverity\29
 tint::sem::Statement::Statement\28tint::ast::Statement\20const*\2c\20tint::sem::CompoundStatement\20const*\2c\20tint::sem::Function\20const*\29
+tint::sem::Statement::~Statement\28\29
 tint::sem::Statement::~Statement\28\29_727
 tint::sem::Struct*\20tint::BlockAllocator<tint::core::type::Type\2c\2065536ul\2c\2016ul>::Create<tint::sem::Struct\2c\20tint::ast::Struct\20const*&\2c\20tint::Symbol\20const&\2c\20tint::Vector<tint::sem::StructMember\20const*\2c\208ul>\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int>\28tint::ast::Struct\20const*&\2c\20tint::Symbol\20const&\2c\20tint::Vector<tint::sem::StructMember\20const*\2c\208ul>&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\29
 tint::sem::Struct*\20tint::UniqueAllocator<tint::core::type::Type\2c\20tint::Hasher<tint::core::type::Type>\2c\20std::__2::equal_to<tint::core::type::Type>>::Get<tint::sem::Struct\2c\20tint::ast::Struct\20const*&\2c\20tint::Symbol\20const&\2c\20tint::Vector<tint::sem::StructMember\20const*\2c\208ul>\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int>\28tint::ast::Struct\20const*&\2c\20tint::Symbol\20const&\2c\20tint::Vector<tint::sem::StructMember\20const*\2c\208ul>&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\29
 tint::sem::Struct::Struct\28tint::ast::Struct\20const*\2c\20tint::Symbol\2c\20tint::VectorRef<tint::sem::StructMember\20const*>\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\29
 tint::sem::Struct::~Struct\28\29
+tint::sem::Struct::~Struct\28\29_801
 tint::sem::StructMember*\20tint::BlockAllocator<tint::core::type::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::StructMember\2c\20tint::ast::StructMember\20const*&\2c\20tint::Symbol\20const&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\2c\20tint::core::IOAttributes&>\28tint::ast::StructMember\20const*&\2c\20tint::Symbol\20const&\2c\20tint::core::type::Type\20const*&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\2c\20unsigned\20int&&\2c\20tint::core::IOAttributes&\29
 tint::sem::StructMember::StructMember\28tint::ast::StructMember\20const*\2c\20tint::Symbol\2c\20tint::core::type::Type\20const*\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\2c\20unsigned\20int\2c\20tint::core::IOAttributes\20const&\29
 tint::sem::StructMember::~StructMember\28\29
+tint::sem::StructMember::~StructMember\28\29_804
 tint::sem::StructMemberAccess*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::StructMemberAccess\2c\20tint::ast::MemberAccessorExpression\20const*&\2c\20tint::core::type::Type\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20tint::sem::ValueExpression*&\2c\20tint::core::type::StructMember\20const*&\2c\20bool&\2c\20tint::sem::Variable\20const*&>\28tint::ast::MemberAccessorExpression\20const*&\2c\20tint::core::type::Type\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20tint::sem::ValueExpression*&\2c\20tint::core::type::StructMember\20const*&\2c\20bool&\2c\20tint::sem::Variable\20const*&\29
 tint::sem::StructMemberAccess::StructMemberAccess\28tint::ast::MemberAccessorExpression\20const*\2c\20tint::core::type::Type\20const*\2c\20tint::sem::Statement\20const*\2c\20tint::core::constant::Value\20const*\2c\20tint::sem::ValueExpression\20const*\2c\20tint::core::type::StructMember\20const*\2c\20bool\2c\20tint::sem::Variable\20const*\29
 tint::sem::Swizzle*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::Swizzle\2c\20tint::ast::MemberAccessorExpression\20const*&\2c\20tint::core::type::Type\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20tint::sem::ValueExpression\20const*&\2c\20tint::Vector<unsigned\20int\2c\204ul>\2c\20bool&\2c\20tint::sem::Variable\20const*&>\28tint::ast::MemberAccessorExpression\20const*&\2c\20tint::core::type::Type\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::constant::Value\20const*&\2c\20tint::sem::ValueExpression\20const*&\2c\20tint::Vector<unsigned\20int\2c\204ul>&&\2c\20bool&\2c\20tint::sem::Variable\20const*&\29
 tint::sem::Swizzle::Swizzle\28tint::ast::MemberAccessorExpression\20const*\2c\20tint::core::type::Type\20const*\2c\20tint::sem::Statement\20const*\2c\20tint::core::constant::Value\20const*\2c\20tint::sem::ValueExpression\20const*\2c\20tint::VectorRef<unsigned\20int>\2c\20bool\2c\20tint::sem::Variable\20const*\29
 tint::sem::Swizzle::~Swizzle\28\29
+tint::sem::Swizzle::~Swizzle\28\29_714
 tint::sem::ToString\28tint::sem::Behavior\29
 tint::sem::TypeExpression*\20tint::BlockAllocator<tint::sem::Node\2c\2065536ul\2c\2016ul>::Create<tint::sem::TypeExpression\2c\20tint::ast::IdentifierExpression\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::type::Type\20const*&>\28tint::ast::IdentifierExpression\20const*&\2c\20tint::sem::Statement*&\2c\20tint::core::type::Type\20const*&\29
 tint::sem::TypeExpression::TypeExpression\28tint::ast::Expression\20const*\2c\20tint::sem::Statement\20const*\2c\20tint::core::type::Type\20const*\29
@@ -5313,6 +5397,7 @@ tint::spirv::reader::ast_parser::Sampler::Build\28tint::ProgramBuilder&\29\20con
 tint::spirv::reader::ast_parser::Struct*\20tint::BlockAllocator<tint::spirv::reader::ast_parser::Struct\2c\2065536ul\2c\2016ul>::Create<tint::spirv::reader::ast_parser::Struct\2c\20tint::Symbol&\2c\20std::__2::vector<tint::spirv::reader::ast_parser::Type\20const*\2c\20std::__2::allocator<tint::spirv::reader::ast_parser::Type\20const*>>>\28tint::Symbol&\2c\20std::__2::vector<tint::spirv::reader::ast_parser::Type\20const*\2c\20std::__2::allocator<tint::spirv::reader::ast_parser::Type\20const*>>&&\29
 tint::spirv::reader::ast_parser::Struct::Struct\28tint::Symbol\2c\20std::__2::vector<tint::spirv::reader::ast_parser::Type\20const*\2c\20std::__2::allocator<tint::spirv::reader::ast_parser::Type\20const*>>\29
 tint::spirv::reader::ast_parser::Struct::~Struct\28\29
+tint::spirv::reader::ast_parser::Struct::~Struct\28\29_3651
 tint::spirv::reader::ast_parser::Type::IsFloatScalarOrVector\28\29\20const
 tint::spirv::reader::ast_parser::Type::IsFloatScalar\28\29\20const
 tint::spirv::reader::ast_parser::Type::IsIntegerScalarOrVector\28\29\20const
@@ -5728,6 +5813,7 @@ xfb_decl_num_components
 y_is_zero
 yy_fatal_error
 yy_get_previous_state\28void*\29
+yysyntax_error
 yysyntax_error\28long*\2c\20char**\2c\20yypcontext_t\20const*\29
 yysyntax_error_28452
 z_is_zero

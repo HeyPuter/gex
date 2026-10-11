@@ -229,8 +229,23 @@ time and 16.0% of Noita's. `spvtools::Optimizer::Run`, which Tint's reader
 uses right after to split combined image-samplers, validates its input
 first, the same check again. The patch now turns that one off too
 (`OptimizerOptions::set_run_validator`, under the same switch), and the
-validator, 465 functions of the hot list (`spvtools::val::`), moves to the
-cold part (`tools/mesa-hot.py --drop`). The sampling cannot cut the time
+validator, 475 functions of the hot list (`spvtools::val::`), moves to the
+cold part (`tools/mesa-hot.py --drop`). With that build (cp3, same method):
+
+| trace | run | in translation, ms | of it in the validator, ms | per translation, ms |
+| --- | --- | --- | --- | --- |
+| HK menu (49 translations) | validation off | 379.2, 339.6 | 0.0, 0.0 | 7.33 |
+| | validation on | 514.2, 485.6 | 138.4, 135.8 | 10.20 |
+| Noita world (54) | validation off | 490.3, 529.3 | 0.0, 0.0 | 9.44 |
+| | validation on | 725.3, 650.5 | 165.4, 162.8 | 12.74 |
+
+Off is now 28.1% less translation time on HK (359.4 against 499.9 ms, 2.9
+ms less per translation) and 25.9% less on Noita (509.8 against 687.9 ms,
+3.3 ms less per translation): the hitch a mid-frame shader compile costs.
+Over the whole trace it stays inside the noise (Mesa CPU, ms/frame, off
+then on: HK 5.041, 5.019 against 5.020, 4.750; Noita 4.452, 4.762 against
+4.950, 4.428), since translation is under 0.5 s of about 15 s of Mesa CPU.
+The sampling cannot cut the time
 into single translations (a translation's samples are not contiguous
 enough), so there is no per-translation maximum; the largest contiguous
 run under `translate_here` was 47.25 ms with validation on and 36.47 ms
@@ -329,9 +344,10 @@ Chromium on its GPU, unless said:
 | HK and Muck pages again, printed in full (4,036 and 4,303 run) | +1 (`_dispatch_stub_GetObjectLabelEXT`) | |
 | margin over the new union | +229 | +0.07 MB |
 | second list | 6,143 (24.8%) | 6.63 MB (42.0%) |
-| SPIR-V validator off in both places: `--drop 'spvtools::val::'` and its entry points | -459 | -0.51 MB |
-| margin over the new union | +65 | +0.02 MB |
-| **kept** | **5,738 (23.2%)** | **6.14 MB (38.9%)** |
+| SPIR-V validator off in both places: `--drop 'spvtools::val::'` and its entry points | -475 | -0.51 MB |
+| margin over the new union | +64 | +0.02 MB |
+| names matched without Binaryen's `_N` suffix (twins of listed functions, and three the Tint rebuild renamed) | +86 | +0.05 MB |
+| **kept** | **5,824 (23.6%)** | **6.19 MB (39.2%)** |
 
 The page harnesses cut console lines at about 4,000 characters, and a set
 of 24,721 functions is 4,120 in base64, so the first page rows above miss
@@ -354,17 +370,17 @@ As the dists ship them (stripped), zstd at -19:
 | flavour | file | raw | zstd -19 |
 | --- | --- | --- | --- |
 | MP | master, whole | 18,898,007 | 3,305,617 |
-| MP | M3: gex-wgpu-replay.wasm | 9,543,153 | 1,925,010 |
-| MP | M3: gex-wgpu-replay.deferred.wasm | 10,009,210 | 1,593,506 |
+| MP | M3: gex-wgpu-replay.wasm | 9,589,918 | 1,927,277 |
+| MP | M3: gex-wgpu-replay.deferred.wasm | 9,960,411 | 1,588,712 |
 | SP | master, whole | 18,669,577 | 3,300,261 |
-| SP | M3: gex-wgpu-replay.wasm | 9,316,228 | 1,923,583 |
-| SP | M3: gex-wgpu-replay.deferred.wasm | 10,040,453 | 1,592,313 |
+| SP | M3: gex-wgpu-replay.wasm | 9,389,548 | 1,929,865 |
+| SP | M3: gex-wgpu-replay.deferred.wasm | 9,954,080 | 1,583,371 |
 
-What a page fetches and compiles before Mesa starts is 49.5% smaller raw
-than master's (9.54 against 18.90 MB) and 41.8% smaller compressed (1.93
-against 3.31 MB) in MP; 50.1% and 41.7% in SP. The two parts together are
-0.90 MB more raw than the unsplit M2 build (19,552,363 against 18,655,830):
-the 17,253 trampolines and the exports the cold part imports through.
+What a page fetches and compiles before Mesa starts is 49.3% smaller raw
+than master's (9.59 against 18.90 MB) and 41.7% smaller compressed (1.93
+against 3.31 MB) in MP; 49.7% and 41.5% in SP. The two parts together are
+0.89 MB more raw than the unsplit M2 build (19,550,329 against 18,655,830):
+the 17,184 trampolines and the exports the cold part imports through.
 (With the second list, before the validator went cold: MP 10,031,571 /
 2,032,243 and 9,503,551 / 1,493,059.)
 Binaryen at -Oz on the cold part alone takes it to 8,640,842 bytes but
