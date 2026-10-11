@@ -2,7 +2,7 @@
 """Make web/mesa-hot.txt, the functions Mesa's replay keeps out of its cold part.
 
     tools/mesa-hot.py PLAIN.wasm LOG... [-o web/mesa-hot.txt] [--callee-max BYTES]
-                      [--fanout-max N] [--also NAMES.txt]...
+                      [--fanout-max N] [--also NAMES.txt]... [--drop REGEX]...
 
 PLAIN.wasm is the profiling build's module before instrumentation; each LOG
 holds the `[gex-wgpu] mesa-profile N HITS BASE64` lines the instrumented one
@@ -17,6 +17,10 @@ decoders, and its callees are as cold as the profiles say.
 --also adds the names in a list this script wrote before, for another build
 of the same sources (a page run's profile outlives a change elsewhere in
 Mesa: names are matched, not indices). --callee-max 0 leaves the margin out.
+--drop leaves out every function whose name matches REGEX (Python, searched),
+from the profiles and the margin both: code a workload ran that a later
+change keeps from running (`spvtools::val::`, the SPIR-V validator, which
+runs only with TINT_SPIRV_VALIDATE=1).
 
 Prints the hot set per log, the union and the margin, in functions and code
 bytes. The list holds Binaryen's names without ThinLTO's `.llvm.<hash>`
@@ -76,7 +80,11 @@ def body_sizes(path):
 
 def main():
     args = sys.argv[1:]
-    out, callee_max, fanout_max, also = None, 1024, 64, []
+    out, callee_max, fanout_max, also, drop = None, 1024, 64, [], []
+    while '--drop' in args:
+        k = args.index('--drop')
+        drop.append(re.compile(args[k + 1]))
+        del args[k:k + 2]
     while '--also' in args:
         k = args.index('--also')
         also.append(args[k + 1])
@@ -137,6 +145,12 @@ def main():
         seen = {i for n in names for i in by_name.get(n, ())}
         report(f'{os.path.basename(path)} ({len(names)} names, {len(names) - len({n for n in names if n in by_name})} not in this build)', seen)
         union |= seen
+    unescape = lambda n: re.sub(r'\\([0-9a-f]{2})', lambda m: chr(int(m.group(1), 16)), n)
+    dropped = {i for i in range(len(defined))
+               if any(r.search(defined[i]) or r.search(unescape(defined[i])) for r in drop)}
+    if drop:
+        report('dropped (--drop)', union & dropped)
+        union -= dropped
     report('union', union)
 
     # Direct calls, from Binaryen's text: `(func $name` opens a body.
@@ -157,7 +171,7 @@ def main():
                     calls.setdefault(cur, set()).add(j)
     dis.wait()
     margin = {j for i in union if len(calls.get(i, ())) <= fanout_max
-              for j in calls.get(i, ()) if j not in union and sizes[j] <= callee_max}
+              for j in calls.get(i, ()) if j not in union and j not in dropped and sizes[j] <= callee_max}
     report(f'margin (callees up to {callee_max} bytes of callers of up to {fanout_max})', margin)
     keep = union | margin
     report('kept', keep)

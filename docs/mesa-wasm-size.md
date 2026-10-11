@@ -213,6 +213,29 @@ dilutes. The switch stays (it costs nothing and keeps a debug check), but it
 is not a measured CPU win. The code stays linked, so the size does not
 change.
 
+Per translation, from V8 CPU profiles of the same whole-trace replays
+(cp2: 200 us sampling, both orders, time under `translate_here` and under
+SPIRV-Tools' `spvValidateWithOptions`):
+
+| trace | run | in translation, ms | of it in the validator, ms |
+| --- | --- | --- | --- |
+| HK menu | validation off | 414.3, 461.9 | 73.4, 80.2 |
+| | validation on | 514.3, 465.4 | 136.5, 124.0 |
+| Noita world | validation off | 682.9, 640.2 | 102.5, 109.7 |
+| | validation on | 709.9, 689.3 | 177.6, 170.7 |
+
+So with the switch off the validator still ran: 17.5% of HK's translation
+time and 16.0% of Noita's. `spvtools::Optimizer::Run`, which Tint's reader
+uses right after to split combined image-samplers, validates its input
+first, the same check again. The patch now turns that one off too
+(`OptimizerOptions::set_run_validator`, under the same switch), and the
+validator, 465 functions of the hot list (`spvtools::val::`), moves to the
+cold part (`tools/mesa-hot.py --drop`). The sampling cannot cut the time
+into single translations (a translation's samples are not contiguous
+enough), so there is no per-translation maximum; the largest contiguous
+run under `translate_here` was 47.25 ms with validation on and 36.47 ms
+off, on Noita.
+
 ### Tint and SPIRV-Tools behind a warm WGSL cache
 
 With every translation in the WGSL cache (`_gex_wgsl_cache_load` of the blob
@@ -305,7 +328,10 @@ Chromium on its GPU, unless said:
 | first list | 5,912 (23.9%) | 6.56 MB (41.5%) |
 | HK and Muck pages again, printed in full (4,036 and 4,303 run) | +1 (`_dispatch_stub_GetObjectLabelEXT`) | |
 | margin over the new union | +229 | +0.07 MB |
-| **kept** | **6,143 (24.8%)** | **6.63 MB (42.0%)** |
+| second list | 6,143 (24.8%) | 6.63 MB (42.0%) |
+| SPIR-V validator off in both places: `--drop 'spvtools::val::'` and its entry points | -459 | -0.51 MB |
+| margin over the new union | +65 | +0.02 MB |
+| **kept** | **5,738 (23.2%)** | **6.14 MB (38.9%)** |
 
 The page harnesses cut console lines at about 4,000 characters, and a set
 of 24,721 functions is 4,120 in base64, so the first page rows above miss
@@ -328,17 +354,19 @@ As the dists ship them (stripped), zstd at -19:
 | flavour | file | raw | zstd -19 |
 | --- | --- | --- | --- |
 | MP | master, whole | 18,898,007 | 3,305,617 |
-| MP | M3: gex-wgpu-replay.wasm | 10,031,571 | 2,032,243 |
-| MP | M3: gex-wgpu-replay.deferred.wasm | 9,503,551 | 1,493,059 |
+| MP | M3: gex-wgpu-replay.wasm | 9,543,153 | 1,925,046 |
+| MP | M3: gex-wgpu-replay.deferred.wasm | 10,009,210 | 1,593,492 |
 | SP | master, whole | 18,669,577 | 3,300,261 |
-| SP | M3: gex-wgpu-replay.wasm | 9,800,101 | 2,029,473 |
-| SP | M3: gex-wgpu-replay.deferred.wasm | 9,535,967 | 1,492,115 |
+| SP | M3: gex-wgpu-replay.wasm | 9,316,228 | 1,923,712 |
+| SP | M3: gex-wgpu-replay.deferred.wasm | 10,040,453 | 1,592,344 |
 
-What a page fetches and compiles before Mesa starts is 46.9% smaller raw
-than master's (10.03 against 18.90 MB) and 38.5% smaller compressed (2.03
-against 3.31 MB) in MP; 47.5% and 38.5% in SP. The two parts together are
-0.88 MB more raw than the unsplit M2 build (19,535,122 against 18,655,830):
-the 17,267 trampolines and the exports the cold part imports through.
+What a page fetches and compiles before Mesa starts is 49.5% smaller raw
+than master's (9.54 against 18.90 MB) and 41.8% smaller compressed (1.93
+against 3.31 MB) in MP; 50.1% and 41.7% in SP. The two parts together are
+0.90 MB more raw than the unsplit M2 build (19,552,363 against 18,655,830):
+the 17,253 trampolines and the exports the cold part imports through.
+(With the second list, before the validator went cold: MP 10,031,571 /
+2,032,243 and 9,503,551 / 1,493,059.)
 Binaryen at -Oz on the cold part alone takes it to 8,640,842 bytes but
 makes it 15 KB bigger compressed, so it is left at -O3.
 
