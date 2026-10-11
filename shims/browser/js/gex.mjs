@@ -1908,7 +1908,7 @@ export class Gex {
     const t0 = performance.now();
     const bytes = await xcRead(name);
     if (!bytes) {
-      console.error(`[gex] xcache ${name}: nothing saved`);
+      console.log(`[gex] xcache ${name}: nothing saved`);
       return;
     }
     const t1 = performance.now();
@@ -1916,7 +1916,7 @@ export class Gex {
     new Uint8Array(this.#kernelSpec.memory.buffer).set(bytes, at);
     const r = e.gex_xcache_restore();
     const t2 = performance.now();
-    console.error(`[gex] xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB read in ${Math.round(t1 - t0)} ms, `
+    console.log(`[gex] xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB read in ${Math.round(t1 - t0)} ms, `
       + `restored ${r} modules in ${Math.round(t2 - t1)} ms`);
   }
 
@@ -1935,10 +1935,10 @@ export class Gex {
       const bytes = new Uint8Array(this.#kernelSpec.memory.buffer, at, n).slice();
       k.k_store_save_done();
       await xcWrite(String(name), bytes);
-      console.error(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+      console.log(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
     } catch (err) {
       k.k_store_save_done();
-      console.error(`[gex] xcache ${name}: not saved: ${err?.message ?? err}`);
+      console.log(`[gex] xcache ${name}: not saved: ${err?.message ?? err}`);
     }
   }
 

@@ -476,7 +476,8 @@ const server = createServer(async (req, res) => {
     res.writeHead(404).end();
   }
 });
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
+// `GEX_SITE_PORT`: a fixed port, so a second visit is the same origin (its OPFS).
+await new Promise((r) => server.listen(Number(process.env.GEX_SITE_PORT ?? 0), '127.0.0.1', r));
 const port = server.address().port;
 
 let failures = 0;
