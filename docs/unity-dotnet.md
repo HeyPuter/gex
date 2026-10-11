@@ -2320,3 +2320,105 @@ Not yet:
     `mono_interp_transform_method` (`mono_runtime_class_init_full`), and
     `generate` itself is 1.64 s. The JIT does not remove it: methods are
     still transformed at tier 0 first.
+- **Where the JIT run's time goes (hg10: hg8 with `MONO_WASM_JIT_STATS=1`, counters every 60 s, and a
+  20 s profile at 520 s).**
+  - Delegates are not the cause, and neither is patch 0005.
+    - A delegate built by JIT code now goes through `interp_delegate_ctor` with an `InterpMethod*`,
+      exactly like one the interpreter builds.
+    - Emitted code has 93 delegate sites, and `call_delegate` exits to the interpreter 601 times in the
+      whole run.
+  - The JIT calls back into the interpreter far more often than the interpreter calls into it. In King's
+    Pass, `residual` (JIT to interpreter) grows by ~67k/s and `invoked` (interpreter to JIT) by ~18k/s.
+    - 2,954 methods are registered.
+    - Of 58,493 callee sites in emitted code, 30,488 are "untried": the callee was never compiled.
+  - The threshold is 500, tuned upstream on Minecraft/IKVM. Re-emission is off; the counters say it
+    could reach a further 52.1% of callee sites.
+  - The profile is not representative: the game made 0 presents during the window.
+  - hg11 (threshold 100) and hg12 (threshold 100 plus `MONO_WASM_JIT_REEMIT=1`) test both knobs.
+- **Upstream review (r58Playz wasm-jspi-jit-10.0.3, 6812ea26..2f86e2c9: 21 commits, +8.4k lines).**
+  - The new work is Minecraft tuning:
+    - B4 hot-set modules
+    - S2 profile-guided inlining
+    - C1 compact virtual sites
+    - tier-2 caps
+    - J1 eager list
+  - Unchanged: the tier-1 threshold, re-emission and the call_interp handoff.
+  - Applying 0001-0005 to the tip gives 15 small conflict hunks in 5 files.
+  - The real rebase cost is auditing the new emitters for wasm64.
+  - Upstream's CLAUDE.md records an open module-corruption bug.
+  - Patch 0006 takes only a0f2c7b9c (compute_reachable as a worklist), which applies cleanly. The
+    rebase decision is with the user.
+- **Pins in the page.**
+  - Pinned at their old arena bases, the pins did not hold:
+    - hp28: 8 of 16 landed.
+      - 4 slid because the arena had already given part of their span away.
+      - 4 loaded unpinned; all 4 were dlopened while other threads run.
+    - hp29: 9 were misplaced. The shim's own heap takes from the same arena cursor and grew earlier.
+  - 62b38fc2: `MemoryMap::reserve`, and pins armed per thread.
+  - 046bec02: the system libraries are pinned in the placement window (0x7000000-0xb000000), with
+    their units rebuilt there (`units/build-libs-m6.sh`).
+  - hp30 (shim-m6, window pins, ld.so unit):
+    - Every pin landed, and every unit was found.
+    - The game then hung before its first present. GL was set up: 361 submits, then nothing.
+    - The Mesa libGL unit (`/gex/gl/libGL.so.1`) was placed for the first time in this run; earlier
+      runs' libGL unit was built from the system libGL and never matched. That makes it the suspect.
+    - hp31 repeats hp30 without it.
+  - ld.so's unit works in the page: hp29 placed it at 7.7 s with 357 entries. First frame was at 43 s,
+    and the menu ran at 42.1 presents/s.
+  - hp31 hung exactly as hp30 did, so libGL is not the cause; 62b38fc2 is. It is reverted (42f09b39).
+    Which half (the arena reserve or per-thread arming) hangs is not known.
+  - hp32 (shim-m5, i.e. 29cbcc4d without 62b38fc2, plus the window pins of 046bec02): all 16 units
+    found, no pin misplaced. First frame at 34 s (hp29: 43 s), 100 presents at 66 s (hp29: 75 s), menu
+    41.4 presents/s at 212 s.
+- **Transition cost (ce395feb: `EMBED_BENCH=N` in `tests/unity-dotnet/embed`, browser, 20M calls a
+  leg, ns per call; "refused" is a callee the JIT will not compile).**
+
+  | leg | interpreter only (cb1) | JIT, threshold 1 (cb2) |
+  |---|---|---|
+  | same tier | 64.8 / 65.5 | 14.2 / 14.2 (JIT to JIT) |
+  | to refused | 67.6 / 64.5 | 508.4 / 472.9 (JIT to interpreter) |
+  | from refused | 51.1 / 50.0 | 207.9 / 187.1 (interpreter to JIT) |
+  | refused to refused | 56.9 / 74.3 | 55.5 / 55.2 |
+
+  A JIT-to-interpreter call costs 7-10 times an interpreter call, and an interpreter-to-JIT call
+  about 3 times.
+- **Steady-gameplay profile (hg13 JIT, hg14 interpreter: King's Pass, the main Worker only, 1 ms
+  sampling, 20 s at 600 s).**
+  - Presents did happen in the window. The "0 presents" the harness printed was a counting bug
+    (it read the count from before the profile); fixed.
+  - About 6 s of each 20 s is `gl_submit` waiting for the page (the minified `Atomics.wait` is not
+    counted as wait). Managed code (under `gexp_mono_runtime_invoke`) is 6.60 s in hg13 and 5.27 s in
+    hg14.
+  - Normalised to the same number of frames (UnityPlayer's own time outside managed code, 3.55 s vs
+    4.94 s, as the frame count), managed code costs 6.60 s under the JIT against 3.79 s on the
+    interpreter: 74% more per frame.
+
+    | bucket (s, same frames) | JIT | interpreter |
+    |---|---|---|
+    | JIT code + interpreter execution | 1.16 + 0.33 = 1.49 | 1.07 |
+    | JIT/interpreter glue (`interp_entry`, `wj_*`, lazy binding, `get_imethod`) | 1.01 | 0.06 |
+    | other mono (call info, hash lookups, mutexes) | 1.02 | 0.50 |
+    | guest-call glue (`gexp_call_guest`, `provider_try`, wasm-to-js) | 0.75 | 0.39 |
+    | GC-mode transitions (`mono_threads_*`) | 0.49 | 0.24 |
+    | UnityPlayer code called from managed | 0.88 | 0.70 |
+    | `major_get_used_size` | 0.73 | 0.64 |
+
+  - The JIT does not make the method bodies faster: emitted code plus what is left on the
+    interpreter takes 0.42 s more than the interpreter alone. The emitted time is flat (the hottest
+    method, `Fsm:UpdateStateChanges`, is 0.06 s self), so no single body is to blame. HK's managed
+    code is thin: PlayMaker FSM steps and Unity binding wrappers.
+  - Most JIT-to-interpreter time is calls into UnityPlayer. Of the 4.22 s under
+    `wj_call_interp_inner`, 3.03 s ends in an icall or P/Invoke. `wj_lazy_refusal` refuses
+    INTERNAL_CALL and PINVOKE_IMPL callees ("shape"), so every binding call from JIT code takes the
+    ~490 ns crossing, then the interpreter's own icall path. On the interpreter that call is an
+    ordinary interpreter call.
+  - Lazy call sites to never-compiled callees resolve on every call:
+    `mono_wasm_jit_lazy_interp` (0.27 s) runs `mono_wasm_get_call_info` each time (0.13 s), and
+    `mono_wasm_jit_pretransform` looks up the InterpMethod by hash each time (0.30 s).
+  - Both tiers spend 0.6-0.9 s per 20 s (3-4.5% of the main Worker) in `major_get_used_size`. Team
+    Cherry's `GCManager:Update` calls `GetMonoHeapUsage` every frame, and sgen answers by walking every
+    object in the major heap.
+  - What it would take for the JIT to pay off: direct icall/P/Invoke calls from emitted code (no
+    interpreter in between), caching what the lazy interpreter path resolves per site, and then better
+    bodies. Even then, the bodies alone are not faster than the interpreter, so HK stays on
+    `GEXMONO_WASM_JIT=0`.

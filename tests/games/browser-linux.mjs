@@ -304,7 +304,7 @@ async function main() {
         if (b.busy >= 0.05 * b.span) log(`profile of ${file}:\n${summariseProfile(prof, 15)}`);
       }
       rows.sort((a, b) => b.busy - a.busy);
-      console.log(`ok   profile over ${profSpec.secs} s (${n - n0} presents): ` + rows.slice(0, 12).map((r) => `${r.file} busy ${(100 * r.busy / Math.max(r.span, 1)).toFixed(0)}% wait ${(100 * r.wait / Math.max(r.span, 1)).toFixed(0)}%`).join('; '));
+      console.log(`ok   profile over ${profSpec.secs} s (${(await presents()) - n0} presents): ` + rows.slice(0, 12).map((r) => `${r.file} busy ${(100 * r.busy / Math.max(r.span, 1)).toFixed(0)}% wait ${(100 * r.wait / Math.max(r.span, 1)).toFixed(0)}%`).join('; '));
     }
     if (Date.now() >= nextShot) {
       nextShot += 30000;

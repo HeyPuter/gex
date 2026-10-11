@@ -268,7 +268,16 @@ function debugLine(text) {
       }
     } catch {}
   }
-  console.debug(text);
+  narrate(text);
+}
+
+// Narration under node goes to stderr: node's console.debug is stdout, which
+// is the guest's own output there (an ejected program's, a test's compared
+// output). In a page it stays on the debug console.
+export function narrate(text) {
+  const stderr = typeof process !== 'undefined' ? process.stderr : null;
+  if (stderr?.write) stderr.write(`${text}\n`);
+  else console.debug(text);
 }
 
 // Dispatch slots one 4 KiB guest page covers (`gex_abi::SLOTS_PER_PAGE`) and
@@ -1853,7 +1862,7 @@ export class Gex {
         const text = utf8(this.#bytes().slice(p, p + n));
         // Only when it has stopped changing: a wedged process repeats the same
         // wait forever, which is the signal; a busy one churns through them.
-        if (text === last) console.debug(`[gex] quiet: ${text}`);
+        if (text === last) narrate(`[gex] quiet: ${text}`);
         last = text;
       }
       e.gex_free?.(p, 512);
@@ -4916,7 +4925,7 @@ export class Gex {
       const fs = trace ? globalThis.process?.getBuiltinModule?.('fs') : null;
       if (fs) fs.writeSync(2, `${line}\n`);
       // A size report, not an error (a console error fails a page test).
-      else console.debug(line);
+      else narrate(line);
     }
     const [, a, b] = key.split(':');
     e.gex_jit_note_external(BigInt(off), bytes.length, Number(a) | 0, Number(b) | 0);

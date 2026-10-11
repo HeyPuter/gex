@@ -323,13 +323,23 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     // Workers that start during the window (a game's threads) are profiled
     // from when they attach.
     const sids = [];
+    // GEX_NT_PROFILE_US: the sampling interval (default 250 us). GEX_NT_PROFILE_FIRST=N: only the
+    // first N matching Workers (a game's main Worker is the first), none that attach later --
+    // sampling thirty Workers at once stalls a game's frames.
+    const interval = Number(process.env.GEX_NT_PROFILE_US || 250);
+    const first = Number(process.env.GEX_NT_PROFILE_FIRST || 0);
     const start = async () => {
-      for (const s of [...(withPage ? [page] : []), ...[...targets].filter(([, u]) => u.includes(match)).map(([x]) => x)]) {
+      let picked = [...targets].filter(([, u]) => u.includes(match)).map(([x]) => x);
+      if (first) {
+        if (sids.length) return;
+        picked = picked.slice(0, first);
+      }
+      for (const s of [...(withPage ? [page] : []), ...picked]) {
         if (sids.includes(s)) continue;
         sids.push(s);
         try {
           await browser.send('Profiler.enable', {}, s);
-          await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
+          await browser.send('Profiler.setSamplingInterval', { interval }, s);
           await browser.send('Profiler.start', {}, s);
         } catch { /* gone already */ }
       }
