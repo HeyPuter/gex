@@ -2393,6 +2393,14 @@ pub extern "C" fn k_sock_readable(id: i32) -> i32 {
     sock_at(id).is_some_and(|s| s.poll_readable()) as i32
 }
 
+/// Hang-ups on an end: bit 0 `POLLHUP`, bit 1 `POLLRDHUP` (see
+/// `gex_kernel::unix::Remote::hup`).
+#[no_mangle]
+pub extern "C" fn k_sock_hup(id: i32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    sock_at(id).map_or(0, |s| s.poll_hup() as i32 | (s.poll_rdhup() as i32) << 1)
+}
+
 #[no_mangle]
 pub extern "C" fn k_sock_writable(id: i32) -> i32 {
     use gex_kernel::vfs::FileHandle;

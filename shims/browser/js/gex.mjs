@@ -1898,7 +1898,7 @@ export class Gex {
       'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
       'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
-      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
+      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable', 'k_sock_hup',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
       'k_wake_seq', 'k_wake', 'k_park',
       // Which dispatch slots an identity's code is in, system-wide rather than

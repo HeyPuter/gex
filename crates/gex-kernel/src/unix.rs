@@ -418,6 +418,13 @@ impl FileHandle for UnixSocket {
         }
     }
 
+    fn poll_rdhup(&self) -> bool {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, .. } => rx.is_closed(),
+            _ => false,
+        }
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
@@ -1093,6 +1100,9 @@ pub struct Remote {
     pub writable: extern "C" fn(id: i32) -> i32,
     pub available: extern "C" fn(id: i32) -> i32,
     pub close: extern "C" fn(id: i32),
+    /// Hang-ups on a connected end: bit 0 both directions shut (`POLLHUP`),
+    /// bit 1 the peer's sending side shut (`POLLRDHUP`).
+    pub hup: extern "C" fn(id: i32) -> i32,
     /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
     pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
@@ -1313,6 +1323,16 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn poll_writable(&self) -> bool {
         self.listening || (self.remote.writable)(self.id) != 0
+    }
+
+    // Without these a peer's close showed in `poll` and `epoll` only as
+    // readable: no `POLLHUP`, no `EPOLLRDHUP`.
+    fn poll_hup(&self) -> bool {
+        !self.listening && (self.remote.hup)(self.id) & 1 != 0
+    }
+
+    fn poll_rdhup(&self) -> bool {
+        !self.listening && (self.remote.hup)(self.id) & 2 != 0
     }
 
     fn available(&self) -> Option<u64> {

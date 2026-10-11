@@ -227,6 +227,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether the peer has shut its sending side, so reading ends at EOF
+    /// once the buffer is empty: `POLLRDHUP` / `EPOLLRDHUP`, reported only
+    /// when asked for.
+    fn poll_rdhup(&self) -> bool {
+        false
+    }
+
     /// This handle as a unix socket, when it is one: the syscalls that need
     /// the concrete type (descriptor passing, `listen`, `accept`) recover it
     /// from the handle, whichever process made it.

@@ -550,7 +550,14 @@ pub struct Kernel {
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
     /// ones the two kinds do not share.
-    pub remote_sockets: std::collections::HashMap<usize, Arc<unix::RemoteUnix>>,
+    ///
+    /// Weak: the descriptors own the socket. A strong reference here kept
+    /// every end alive after its last `close`, so the global kernel never
+    /// heard of it and the peer never read EOF or got `EPIPE` (a libuv
+    /// child's stdout socketpair, which a parent reads to EOF). A dead
+    /// entry still pins its allocation, so its address is not reused while
+    /// the entry stands; [`Kernel::note_remote_unix`] prunes them.
+    pub remote_sockets: std::collections::HashMap<usize, std::sync::Weak<unix::RemoteUnix>>,
     /// And for epoll sets.
     pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// And for anonymous shared files, which have seals.
@@ -941,6 +948,12 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     const POLLHUP: u16 = 0x010;
     if h.poll_hup() {
         r |= POLLHUP;
+    }
+    // Asked for, unlike `POLLHUP`: the peer shut its sending side (or
+    // closed), so what is left to read ends in EOF.
+    const POLLRDHUP: u16 = 0x2000;
+    if p.events & POLLRDHUP != 0 && h.poll_rdhup() {
+        r |= POLLRDHUP;
     }
     r
 }
@@ -5876,7 +5889,7 @@ impl Kernel {
     fn remote_unix_of(&self, fd: i32) -> Result<Arc<unix::RemoteUnix>, Errno> {
         let file = self.fds.get(fd)?;
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.remote_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        self.remote_sockets.get(&key).and_then(std::sync::Weak::upgrade).ok_or(Errno::ENOTSOCK)
     }
 
     /// Put a socket that lives in the global kernel at `fd`, replacing
@@ -5897,7 +5910,7 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         self.fds.install(fd, file, cloexec)?;
-        self.remote_sockets.insert(key, sock);
+        self.note_remote_unix(key, &sock);
         Ok(())
     }
 
@@ -5908,14 +5921,23 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         let fd = self.fds.insert(file, cloexec)? as i32;
-        self.remote_sockets.insert(key, sock);
+        self.note_remote_unix(key, &sock);
         Ok(fd)
+    }
+
+    /// Remember that the handle at `key` is `sock`, a socket in the global
+    /// kernel; entries whose socket has closed go.
+    pub fn note_remote_unix(&mut self, key: usize, sock: &Arc<unix::RemoteUnix>) {
+        if self.remote_sockets.len() >= 64 {
+            self.remote_sockets.retain(|_, w| w.strong_count() > 0);
+        }
+        self.remote_sockets.insert(key, Arc::downgrade(sock));
     }
 
     /// The global-kernel socket behind an open file, if that is what it is.
     pub fn remote_unix_of_file(&self, file: &OpenFile) -> Option<Arc<unix::RemoteUnix>> {
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.remote_sockets.get(&key).cloned()
+        self.remote_sockets.get(&key).and_then(std::sync::Weak::upgrade)
     }
 
     /// Put a unix socket in the descriptor table.
@@ -6402,7 +6424,7 @@ impl Kernel {
             let key = Arc::as_ptr(&handle) as *const () as usize;
             let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
             let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-            self.remote_sockets.insert(key, session);
+            self.note_remote_unix(key, &session);
             return Ok(new_fd);
         }
         let listener = self.unix_of(fd)?;
@@ -6574,7 +6596,16 @@ impl Kernel {
             return Ok(0);
         }
         let err = if name == SO_ERROR {
-            match self.socket_of(fd)?.status() {
+            // A unix socket (local or the global kernel's) has no connect
+            // in progress to report: zero, as for a socketpair end on Linux.
+            let Ok(sock) = self.socket_of(fd) else {
+                self.socket_family_type(fd)?;
+                if val != 0 {
+                    m.write_u32(val, 0)?;
+                }
+                return Ok(0);
+            };
+            match sock.status() {
                 net::Status::Refused => Errno::ECONNREFUSED.0,
                 // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
                 // *finished*, and Linux leaves it zero until one has; a

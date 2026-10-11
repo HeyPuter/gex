@@ -402,6 +402,7 @@ extern "C" {
     fn k_sock_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_readable(id: i32) -> i32;
+    fn k_sock_hup(id: i32) -> i32;
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
     fn k_sock_close(id: i32);
@@ -1100,6 +1101,9 @@ extern "C" fn rs_writable(id: i32) -> i32 {
 extern "C" fn rs_available(id: i32) -> i32 {
     unsafe { k_sock_available(id) }
 }
+extern "C" fn rs_hup(id: i32) -> i32 {
+    unsafe { k_sock_hup(id) }
+}
 extern "C" fn rs_close(id: i32) {
     unsafe { k_sock_close(id) }
 }
@@ -1186,6 +1190,7 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         writable: rs_writable,
         available: rs_available,
         close: rs_close,
+        hup: rs_hup,
         shutdown: rs_shutdown,
         exists: rs_exists,
         pair: rs_pair,
@@ -5624,7 +5629,7 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         kernel
             .remote_sockets
             .values()
-            .any(|r| Arc::as_ptr(r) as *const () == p)
+            .any(|r| r.as_ptr() as *const () == p && r.strong_count() > 0)
     };
     match &t.waiting {
         // A terminal: nobody but the page can type into it. Nor a socket
@@ -7404,7 +7409,7 @@ fn rebuild_carried(
         sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
         let handle: Arc<dyn FileHandle> = sock.clone();
         let key = Arc::as_ptr(&handle) as *const () as usize;
-        k.remote_sockets.insert(key, sock);
+        k.note_remote_unix(key, &sock);
         OpenFile::new(handle, "socket".to_string(), flags, true, true)
     } else if let Some(rest) = path.strip_prefix("local:") {
         let (pid, n) = rest.split_once(':').ok_or("bad local name")?;
