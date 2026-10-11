@@ -362,11 +362,12 @@ function writeSparse(dst, src, at) {
   // Word-at-a-time when the source is aligned, which it is: the regions are
   // `slice`d, so each owns its buffer from offset zero.
   const words = src.byteOffset % 4 === 0 && src.byteLength % 4 === 0
-    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength >> 2)
+    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength / 4)
     : null;
+  // Division, not `>> 2`: a region can pass 2 GiB (see `#processImage`).
   const blank = (from, to) => {
     if (words) {
-      for (let i = from >> 2; i < to >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = from / 4; i < to / 4; i++) if (words[i] !== 0) return false;
       return true;
     }
     for (let i = from; i < to; i++) if (src[i] !== 0) return false;
@@ -407,7 +408,7 @@ const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
  * words, not bytes: only ever answers same-or-different.
  */
 function sum32(buf) {
-  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, (buf.byteLength / 4) | 0);
+  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, Math.floor(buf.byteLength / 4));
   let h = 0x811c9dc5;
   for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193);
   return h >>> 0;
@@ -1862,10 +1863,15 @@ export class Gex {
     // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
     // left out); runs are `dense`, written without a scan.
     const u8 = this.#bytes();
-    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    // Division, not `>> 2` or `& ~3`: those are int32 operations, and a W3
+    // process's memory reaches past 2 GiB (Wine's Windows address space), where
+    // they turn negative -- `b & ~3` then started the tail loop near -2^31, and
+    // a fork (Wine starting wineserver) scanned for hours.
+    const words = new Int32Array(this.#memory.buffer, 0, Math.floor(u8.length / 4));
     const blank = (a, b) => {
-      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
-      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      const tail = b - (b % 4);
+      for (let i = Math.floor(a / 4); i < tail / 4; i++) if (words[i] !== 0) return false;
+      for (let i = tail; i < b; i++) if (u8[i] !== 0) return false;
       return true;
     };
     const out = [];
