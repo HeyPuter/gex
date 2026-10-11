@@ -525,7 +525,12 @@ fn translate_root(addr: u64) -> Option<u32> {
     }
     modules.push(Module { wasm, regs, dirs, slots });
     drop(modules);
-    TRANSLATED.fetch_add(1, Ordering::Relaxed);
+    let n = TRANSLATED.fetch_add(1, Ordering::Relaxed) + 1;
+    // The translator's line at 1024, 2048, ... translations: a process that
+    // never exits (a game) reports too.
+    if n >= 1024 && n.is_power_of_two() {
+        gex_fjit_report();
+    }
     let idx = crate::cgen::index_of(addr);
     if TRACE.load(Ordering::Relaxed) {
         let names: Vec<String> = crate::with_host(|h| funcs.iter().map(|&a| format!("{a:#x} {}", crate::object_off_at(h, a))).collect());

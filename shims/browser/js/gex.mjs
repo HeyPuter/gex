@@ -12,6 +12,7 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { lazyFetch } from "./lazy-fetch.mjs";
+import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
@@ -1561,6 +1562,10 @@ export class Gex {
     }
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
+    // `?xcache=`: the store the last load saved, laid in before anything runs
+    // (docs/gexcc.md §8). After `gex_load`, which unpacked the bundle the
+    // saved paths are checked against.
+    if (opts.xcache) await this.#xcacheRestore(String(opts.xcache));
     if (globalThis.GEX_DEBUG_EXIT) {
       console.error(`[gex] load: program at ${entry}, `
         + `${(opts.closure ?? []).length} closure modules to install`);
@@ -2027,6 +2032,49 @@ export class Gex {
 
   /** The global kernel's exports, or null. */
   get kernel() { return this.#kernel; }
+
+  /** The saved store, into the kernel and checked (docs/gexcc.md §8). */
+  async #xcacheRestore(name) {
+    const e = this.#shim.exports;
+    const k = this.#kernel;
+    if (!k?.k_store_restore_buf || !e.gex_xcache_restore) return;
+    k.k_xcache_enable();
+    const t0 = performance.now();
+    const bytes = await xcRead(name);
+    if (!bytes) {
+      console.log(`[gex] xcache ${name}: nothing saved`);
+      return;
+    }
+    const t1 = performance.now();
+    const at = k.k_store_restore_buf(bytes.length) >>> 0;
+    new Uint8Array(this.#kernelSpec.memory.buffer).set(bytes, at);
+    const r = e.gex_xcache_restore();
+    const t2 = performance.now();
+    console.log(`[gex] xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB read in ${Math.round(t1 - t0)} ms, `
+      + `restored ${r} modules in ${Math.round(t2 - t1)} ms`);
+  }
+
+  /**
+   * Save the kernel's store for the next load if it grew by `minBytes` since
+   * the last save (docs/gexcc.md §8). The kernel lets one save run at a time.
+   */
+  async xcacheSave(name, minBytes = 1 << 20) {
+    const k = this.#kernel;
+    if (!name || !k?.k_store_save) return;
+    const t0 = performance.now();
+    const n = k.k_store_save(minBytes) >>> 0;
+    if (!n) return;
+    try {
+      const at = k.k_store_save_ptr() >>> 0;
+      const bytes = new Uint8Array(this.#kernelSpec.memory.buffer, at, n).slice();
+      k.k_store_save_done();
+      await xcWrite(String(name), bytes);
+      console.log(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+    } catch (err) {
+      k.k_store_save_done();
+      console.log(`[gex] xcache ${name}: not saved: ${err?.message ?? err}`);
+    }
+  }
 
   /**
    * What the shim calls to reach the process table every process shares.
