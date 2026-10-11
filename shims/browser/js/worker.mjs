@@ -744,7 +744,8 @@ async function handle(msg) {
     // (docs/gexcc.md §8). After the exit is published, so a parent's wait does
     // not wait for it.
     const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
-    if (msg.kind !== 'thread' && xcache) await gex.xcacheSave?.(xcache);
+    const xcacheMin = msg.xcacheMin ?? msg.opts?.xcacheMin ?? msg.child?.opts?.xcacheMin;
+    if (msg.kind !== 'thread' && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();

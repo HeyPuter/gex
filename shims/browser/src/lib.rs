@@ -9256,6 +9256,7 @@ pub extern "C" fn gex_xcache_restore() -> i32 {
             return -1;
         }
         let mut buf = vec![0u8; 4096];
+        let mut changed = 0usize;
         for i in 0..n as u32 {
             let len = unsafe { k_store_path(i, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) } as usize;
             let path = String::from_utf8_lossy(&buf[..len]).into_owned();
@@ -9264,7 +9265,14 @@ pub extern "C" fn gex_xcache_restore() -> i32 {
                 && size != u64::MAX
                 && matches!(h.kernel.vfs.metadata(&path), Ok(m) if m.size == size && m.mtime == mtime);
             unsafe { k_store_path_ok(i, ok as u32) };
+            if !ok {
+                changed += 1;
+                if changed <= 4 {
+                    warn_line(&format!("[gex] xcache: {path} changed since the save; its translations are left out\n"));
+                }
+            }
         }
+        warn_line(&format!("[gex] xcache: {} of {n} files unchanged\n", n as usize - changed));
         unsafe { k_store_restore() }
     })
 }
