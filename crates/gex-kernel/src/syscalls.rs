@@ -812,6 +812,144 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     (secs.saturating_sub(base), nanos)
 }
 
+/// Answer one of the calls that only read the clock -- `clock_gettime`,
+/// `gettimeofday`, `getrusage`, `sched_yield` -- straight from the context at
+/// `ctx_addr`, without a [`Kernel`], and say whether it was one.
+///
+/// A host takes its kernel lock for every syscall, and Wine asks the time
+/// several times per sleep: Undertale's game thread made ~2,000 of these
+/// calls a second in the page and spent about 25 ms of each 87 ms frame
+/// queueing for the lock behind the process's other Workers. None of them
+/// needs the kernel: the answer is the clock, and `started` (the process's
+/// [`Kernel::started`], which the processor-time clocks count from).
+///
+/// Returns false, writing nothing that matters, for any other call, for a
+/// processor-time question before `started` is known (0), and for a buffer
+/// the guest cannot be written at: the host then makes the call as usual, so
+/// the answer and any `EFAULT` are the kernel's. `compat` is
+/// [`Kernel::compat`] (the i386 numbering, number in `eax`, 32-bit layouts).
+/// The result goes where [`set_result`] puts it. Signal delivery, which the
+/// kernel does at every syscall boundary, is the host's to arrange: it falls
+/// back to the full call whenever a signal may be pending.
+pub fn clock_call(
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    compat: bool,
+    clock: ClockFn,
+    started: u128,
+) -> bool {
+    if gex_abi::PPC {
+        return false;
+    }
+    let (raw, a0, a1) = if compat {
+        let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
+        (
+            r(ctx::x(0)),
+            r(crate::i386::ARG_SLOTS[0]),
+            r(crate::i386::ARG_SLOTS[1]),
+        )
+    } else {
+        let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0);
+        (r(ctx::SYSCALL_NR), r(ctx::SYSCALL_ARGS[0]), r(ctx::SYSCALL_ARGS[1]))
+    };
+    enum Call {
+        // (clock id, buffer, 32-bit timespec)
+        Clock(u64, u64, bool),
+        // (buffer, 32-bit timeval)
+        Tod(u64, bool),
+        Rusage(u64),
+        Yield,
+    }
+    let call = if compat {
+        use crate::i386::raw as x;
+        match raw {
+            x::CLOCK_GETTIME => Call::Clock(a0, a1, true),
+            x::CLOCK_GETTIME64 => Call::Clock(a0, a1, false),
+            x::GETTIMEOFDAY => Call::Tod(a0, true),
+            x::GETRUSAGE => Call::Rusage(a1),
+            x::SCHED_YIELD => Call::Yield,
+            _ => return false,
+        }
+    } else if gex_abi::X86 {
+        // x86-64's own numbers: these four pass through `x86::translate`
+        // unchanged but for the number.
+        match raw {
+            228 => Call::Clock(a0, a1, false),
+            96 => Call::Tod(a0, false),
+            98 => Call::Rusage(a1),
+            24 => Call::Yield,
+            _ => return false,
+        }
+    } else {
+        match raw {
+            nr::CLOCK_GETTIME => Call::Clock(a0, a1, false),
+            nr::GETTIMEOFDAY => Call::Tod(a0, false),
+            nr::GETRUSAGE => Call::Rusage(a1),
+            nr::SCHED_YIELD => Call::Yield,
+            _ => return false,
+        }
+    };
+    let cpu = || {
+        let (s, n) = clock();
+        (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started)
+    };
+    let pair = |m: &mut GuestMem<'_>, at: u64, hi: u64, lo: u64, w32: bool| {
+        if w32 {
+            m.write_u32(at, hi as u32).and_then(|_| m.write_u32(at + 4, lo as u32))
+        } else {
+            m.write_u64(at, hi).and_then(|_| m.write_u64(at + 8, lo))
+        }
+    };
+    let ok = match call {
+        Call::Clock(clk, buf, w32) => {
+            // As `sys_clock_gettime`, which a null buffer faults in.
+            if buf == 0 || (matches!(clk, 2 | 3) && started == 0) {
+                return false;
+            }
+            let (secs, nanos) = match clk {
+                2 | 3 => {
+                    let t = cpu();
+                    ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
+                }
+                c if is_monotonic_clock(c) => monotonic_from(clock()),
+                _ => clock(),
+            };
+            pair(m, buf, secs, nanos as u64, w32).is_ok()
+        }
+        Call::Tod(buf, w32) => {
+            if buf == 0 {
+                true
+            } else {
+                let (secs, nanos) = clock();
+                pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
+            }
+        }
+        Call::Rusage(buf) => {
+            if started == 0 {
+                return false;
+            }
+            if buf == 0 {
+                true
+            } else {
+                let ns = cpu();
+                let (s, us) = ((ns / 1_000_000_000) as u64, (ns % 1_000_000_000 / 1000) as u64);
+                let size = if compat { 72 } else { 144 };
+                m.zero(buf, size).is_ok() && pair(m, buf, s, us, compat).is_ok()
+            }
+        }
+        // A pure yield: the caller's Worker is its own OS thread, and the
+        // browser schedules those without being asked.
+        Call::Yield => true,
+    };
+    if !ok {
+        return false;
+    }
+    if gex_abi::X86 {
+        let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+    }
+    set_result(m, ctx_addr, 0).is_ok()
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -7736,6 +7874,80 @@ mod tests {
             )
             .unwrap() as i32;
         assert_eq!(k.unix_of(pfd).err(), Some(Errno::ENOTSOCK));
+    }
+
+    /// `clock_call`, the lock-free answer, writes what the full call writes,
+    /// in both numberings and layouts, and declines what it cannot answer.
+    #[test]
+    fn clock_call_answers_as_the_kernel_does() {
+        fn fixed() -> (u64, u32) {
+            (1_700_000_000, 123_456_789)
+        }
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut mem, mut k) = setup();
+        k.clock = fixed;
+        let buf = 0x3000u64;
+        let at = k.ctx_addr;
+        // Native numbering: each call made both ways into a cleared buffer.
+        for (n, args) in [
+            (nr::CLOCK_GETTIME, [0u64, buf]),
+            (nr::CLOCK_GETTIME, [1, buf]),
+            (nr::CLOCK_GETTIME, [3, buf]),
+            (nr::GETTIMEOFDAY, [buf, 0]),
+            (nr::GETRUSAGE, [0, buf]),
+            (nr::SCHED_YIELD, [0, 0]),
+        ] {
+            let mut m = GuestMem::new(&mut mem);
+            m.zero(buf, 160).unwrap();
+            set_args(&mut m, at, n, &args);
+            k.syscall(&mut m, 0);
+            let want = m.read(buf, 160).unwrap().to_vec();
+            let want_ret = ret(&m, at);
+            m.zero(buf, 160).unwrap();
+            m.write_u64(at + ctx::x(0) as u64, 0x5555).unwrap();
+            set_args(&mut m, at, n, &args);
+            assert!(clock_call(&mut m, at, false, fixed, k.started), "call {n}");
+            assert_eq!(m.read(buf, 160).unwrap(), &want[..], "call {n} {args:?}");
+            assert_eq!(ret(&m, at), want_ret, "call {n}");
+        }
+        // Declined: another call, a null clock buffer, the processor clock
+        // before the process's start is known.
+        let mut m = GuestMem::new(&mut mem);
+        set_args(&mut m, at, nr::GETPID, &[]);
+        assert!(!clock_call(&mut m, at, false, fixed, k.started));
+        set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0]);
+        assert!(!clock_call(&mut m, at, false, fixed, k.started));
+        set_args(&mut m, at, nr::GETRUSAGE, &[0, buf]);
+        assert!(!clock_call(&mut m, at, false, fixed, 0));
+        // i386: the number in eax, arguments in ebx/ecx, 32-bit layouts.
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 2]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            m.write_u64(at + crate::i386::ARG_SLOTS[0] as u64, a[0]).unwrap();
+            m.write_u64(at + crate::i386::ARG_SLOTS[1] as u64, a[1]).unwrap();
+        };
+        let started = 1_699_999_990u128 * 1_000_000_000;
+        set32(&mut m, crate::i386::raw::CLOCK_GETTIME, [0, buf]);
+        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert_eq!(m.read_u32(buf).unwrap(), 1_700_000_000);
+        assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456_789);
+        set32(&mut m, crate::i386::raw::GETTIMEOFDAY, [buf, 0]);
+        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
+        m.write_u64(buf + 64, !0).unwrap();
+        m.write_u64(buf + 72, !0).unwrap();
+        set32(&mut m, crate::i386::raw::GETRUSAGE, [0, buf]);
+        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert_eq!(m.read_u32(buf).unwrap(), 10);
+        assert_eq!(m.read_u32(buf + 4).unwrap(), 123_456);
+        assert_eq!(m.read_u64(buf + 64).unwrap(), 0, "the 72-byte i386 rusage is cleared");
+        assert_eq!(m.read_u64(buf + 72).unwrap(), !0, "and nothing past it");
+        set32(&mut m, crate::i386::raw::SCHED_YIELD, [0, 0]);
+        assert!(clock_call(&mut m, at, true, fixed, started));
+        assert_eq!(m.read_u64(at + ctx::x(0) as u64).unwrap(), 0);
+        set32(&mut m, crate::i386::raw::GETPID, [0, 0]);
+        assert!(!clock_call(&mut m, at, true, fixed, started));
     }
 
     /// What `clock_nanosleep` turns into: a sleep of the time left for an
