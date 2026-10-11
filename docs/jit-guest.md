@@ -157,42 +157,86 @@ about as much as the blocks it saves. Depth limits 8 and 16 are queued (b5).
 | miss stub | 53 | 0.5% |
 
 Code is 88.9%. With `gex.reloc` gone (77,397 -> 74,938 KiB for `exec node -e 0`),
-what is left fixed is about 7% of the bytes. The seed module already exports a
-dense-capable `enter`, so units could import it (2.9% more), and unused imports
-could be dropped (most of the 3.6%). Neither is likely to move start-up by
-more than a few percent: compiling is about 1.5 s of a 19 s cold start, and
-the page's unit cache removes the repeat compiles.
+about 7% of the bytes are still fixed per unit. Since f469c15a, `enter` is
+split: a store-free `dispatch` that blocks tail-call, plus a small `enter`
+(75,050 KiB). Importing the seed's `enter` instead was tried (34cf5db9) and
+reverted (4ca3b163): the seed's `enter` stores `ctx::PC`, which blocks must not
+do (see f469c15a). Dropping unused imports would save most of the 3.6% they
+take. Neither is likely to move start-up by more than a few percent, because
+compiling is about 1.5 s of a 19 s cold start.
 
-## 2. State / resume
+### Node in the native-debian page (p1, edger, 2026-10-10)
 
-- Commits since 64b129ce, in order:
-  - bbb7f237: tier-1 tee folding (`GEX_T1_FOLD` / `?t1fold=1`), off by
-    default and loop-safe; the emitter switches are now in the native module
-    cache key;
-  - 60cf5cd8: a test that those switches change the key;
-  - 130bdf20: the nt page reads `?liftmax`, `?unitcache`, `?t1fold`,
-    `?xlatereport` and `?inlinedispatch`;
-  - 5fe9525e: discovery log and depth limit (experiment knobs);
-  - 11b1b601: no `gex.reloc` section in dense units (3.5% of the wasm);
-  - 34cf5db9: units may import the seed's `enter` (`GEX_SHARED_ENTER` /
-    `?sharedenter=1`), off by default.
-- Tests:
-  - The gate on 64b129ce passed.
-  - Integration ladder with `GEX_T1_FOLD=1` on bbb7f237: every failure also
-    fails on the base tree (c47bbff1). The browser comparisons fail on
-    host.mjs's `console.debug` lines on stdout; the coordinator is fixing that
-    in the integ branch, and this branch rebases after it lands.
-  - Unit tests pass: gex-emit (17), gex-xlate (22 + 3) and the gex-native
-    cache-key test.
-- Queued on edger, in order:
-  - `page.sh p1`: node in the native-debian page, three legs: base, new, and
-    new with `unitcache=1`.
-  - `hk1.sh`: Hollow Knight as U ships it (provider p30, .NET wasm JIT,
-    `?xlatereport=500`), on stream T's own edger tree `wt/unity-T`. Two legs:
-    tk1, and tk2 (tk1 with `unitcache=1`).
-  - `b5.sh`: node under run-node, with legs for the unit cache, fold, the
-    depth limits, a lift cap of 512 and the shared `enter`.
-- Dropped: Hollow Knight and Muck on their own Mono JIT (the coordinator ruled
-  them not worth testing).
-- Next: choose the defaults for the unit cache, fold and shared `enter` from
-  p1 and b5; get Hollow Knight's translation volume from tk1.
+`apt-get install nodejs`, then `node --version` and `node -e 0` three times,
+in the page (`web/test/site.mjs native-debian-run`).
+
+| leg | `node --version` | `node -e 0` #1 (cold) | #2 | #3 |
+|---|---|---|---|---|
+| base (c47bbff1) | 3.48 s | 38.87 s | 27.79 s | 26.14 s |
+| base again | 3.85 s | 38.73 s | 27.55 s | 26.00 s |
+| branch at 64b129ce | 2.63 s | crashed | - | - |
+| branch at 64b129ce, `unitcache=1` | 2.79 s | 23.15 s | crashed | - |
+
+- With `unitcache=1`, the branch started node cold 40% faster than base
+  (23.15 s against 38.80 s, the mean of the two base legs).
+- The plain branch leg crashed before it finished a cold start, so p1 has no
+  number for the unit cache on its own, and no warm number at all.
+- The crash was the outlined `enter`, fixed in f469c15a. On gooner the page
+  run reproduced it in 3 of 6 runs before the fix and 0 of 4 after (inline
+  dispatch: 0 of 3).
+- The branch has not been timed in the page since the fix.
+
+## 2. Final state
+
+Stream T ends here (coordinator, 2026-10-10).
+
+**On by default:**
+
+- Dispatch through the module's `dispatch` instead of inline (43fa9fc5,
+  f469c15a). Under run-node on edger, node's cold start went from 24.58 s
+  inline to 19.27 s, and warm from 19.62 s to 13.61 s (b4).
+- Region grown at back-edge targets only; no page-table clones per miss; the
+  slab module store; word-wise content keys; fewer allocations in tier-1
+  emission. Together with the dispatch change: cold `node -e 0` from 32.29 s to
+  19.27 s, and warm from 20.76 s to 13.61 s (b4).
+- No `gex.reloc` in dense units.
+- The dense base comes from an imported global (`gex.dense_base`), so a unit's
+  bytes are the same in every process.
+
+**Off by default (knobs kept, not proven faster in the browser):**
+
+- Tier-1 tee folding: `GEX_T1_FOLD` / `?t1fold=1`. Loop-safe; 8% less wasm.
+- The page-wide unit cache: `?unitcache=1` / `GEX_UNIT_CACHE`.
+- Lift cap `?liftmax=` / `GEX_LIFT_MAX`.
+- `GEX_DISCOVER_SKIP`: bit 8 is the discovery log (`GEX_DL_FILE`); bits 16-23
+  are a depth limit.
+- Inline dispatch: `GEX_INLINE_DISPATCH` / `?inlinedispatch=1`.
+- `?xlatereport=N`.
+- The emitter switches are in the native module cache key, with a test
+  (`cache_key_tests`).
+
+**Tests at the final head:**
+
+- gex-emit 17, gex-xlate 22 + 3, `cache_key_tests` 1: all pass.
+- Integration ladder (bbb7f237, folding on): no failure that the base tree
+  does not also have.
+- The page reproduction on gooner: 4 runs, no crash.
+
+**Open items:**
+
+- **Discovery overshoot.** 63% of the blocks lifted for node never run.
+  Shallower discovery only trades blocks for units (§1).
+- **Per-unit overhead.** About 7% of the bytes. Options: imports a unit uses
+  only; a store-free `dispatch` shared from the seed.
+- **Warm translated-code speed.** Warm `node -e 0` spends 0.1 s translating
+  out of 13.6 s. The main Worker's profile: guest code about 42%, compiling
+  served modules about 1.4 s (what the unit cache removes), futex waits about
+  2 s.
+- **Hollow Knight translation volume** on U's .NET provider path is
+  unmeasured. `hk1.sh` (`?xlatereport=500`) was cancelled before it ran.
+- **A persistent translation cache** across page loads (compiled units
+  surviving a reload) is not started.
+- **The unit cache's default** needs a page timing at f469c15a or later. One
+  thing to check before turning it on: for a cached Module, the dense base has
+  to come from this process's bytes, never from the cached Module's custom
+  section (catch-up and fork adopt instantiate from `mod`).
