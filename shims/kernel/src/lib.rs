@@ -126,7 +126,19 @@ fn futex_slot(addr: u64) -> usize {
 /// of them.
 #[no_mangle]
 pub extern "C" fn k_futex_wake(addr: u64) {
-    FUTEX_GENS[futex_slot(addr)].fetch_add(1, std::sync::atomic::Ordering::Release);
+    let slot = &FUTEX_GENS[futex_slot(addr)];
+    slot.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // The Workers parked on this futex wait on its slot (`k_park_futex`), not
+    // on `WAKE`: without this notify they slept out their whole bound (20 ms
+    // in W3's `gex_park`) on every wake. That was Undertale's page regression
+    // once d761d4d4 stopped other threads' deadlines from cutting it short.
+    // SAFETY: the address of a static in this module's own shared memory.
+    unsafe {
+        core::arch::wasm32::memory_atomic_notify(
+            slot as *const std::sync::atomic::AtomicU32 as *mut i32,
+            u32::MAX,
+        );
+    }
     k_wake();
 }
 
