@@ -8,6 +8,7 @@
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
+import { xcHash } from '../../shims/browser/js/xcache.mjs';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -90,6 +91,25 @@ async function fetchBytes(url, onProgress) {
     at += c.length;
   }
   return checkWasm(url, res, out);
+}
+
+/** The kernel's bytes, for `?xcache=`'s fingerprint. */
+let kernelBytes = null;
+
+/**
+ * `?xcache=1`: the name the translation cache is saved under (docs/gexcc.md
+ * §8), a fingerprint of everything a saved module depends on: the shim and
+ * kernel this page loaded (an SP dist and an MP dist load different ones),
+ * the dist's own flavour if it says, and the switches that change emission.
+ * A different build never reads another's cache.
+ */
+function xcacheName() {
+  if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
+  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'pins', 'sp']
+    .map((n) => `${n}=${flag(n) ?? ''}`)
+    .join('&');
+  const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
+  return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
 }
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */
@@ -317,6 +337,7 @@ async function loadKernel() {
   }
   try {
     const bytes = await fetchBytes(KERNEL_URL());
+    kernelBytes = bytes;
     kernelSpec = {
       // The maximum must match `--max-memory` in `shims/kernel/build.sh`
       // exactly: a shared memory carries its maximum in its type, so a host
@@ -694,6 +715,8 @@ export async function runProgram(
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
       // `?fjit=1`: the function JIT in every process.
       fjit: globalThis.GEX_FJIT || undefined,
+      // `?xcache=1`: the translation cache across page loads (docs/gexcc.md §8).
+      xcache: xcacheName(),
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).

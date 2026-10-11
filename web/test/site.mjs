@@ -604,6 +604,9 @@ for (const id of list) {
       // the JS heap from a Worker here, and the only account of the V8 OOM (#145).
       '--enable-precise-memory-info',
       ...(debugPort ? [`--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*'] : []),
+      // `GEX_USER_DATA_DIR=<dir>`: a profile that outlives this launch, so a
+      // second run is a second visit (OPFS kept: `?xcache=1`).
+      ...(process.env.GEX_USER_DATA_DIR ? [`--user-data-dir=${process.env.GEX_USER_DATA_DIR}`] : []),
       url,
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },

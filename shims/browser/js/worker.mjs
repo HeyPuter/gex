@@ -639,6 +639,7 @@ async function handle(msg) {
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
           providers: msg.providers ?? msg.opts?.providers,
+          xcache: msg.xcache ?? msg.opts?.xcache,
           wantLibrary,
         },
       );
@@ -739,6 +740,11 @@ async function handle(msg) {
     // `?fjit=`: what the function JIT did, and how often its lock was held.
     if (msg.kind !== 'thread') ex.gex_fjit_report?.();
     if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
+    // `?xcache=`: what this process added to the store, kept for the next load
+    // (docs/gexcc.md §8). After the exit is published, so a parent's wait does
+    // not wait for it.
+    const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
+    if (msg.kind !== 'thread' && xcache) await gex.xcacheSave?.(xcache);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();

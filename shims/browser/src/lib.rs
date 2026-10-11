@@ -327,6 +327,14 @@ extern "C" {
     fn k_mod_claim_object(obj: u64, id: u32);
     fn k_obj_translating(obj: u64, pid: u32) -> u32;
     fn k_obj_translated(obj: u64, produced: u32);
+    /// The translation cache across page loads (docs/gexcc.md §8).
+    fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64);
+    fn k_store_path_count() -> i32;
+    fn k_store_path(i: u32, at: gex_kernel::PAddr, cap: u32) -> u32;
+    fn k_store_path_size(i: u32) -> u64;
+    fn k_store_path_mtime(i: u32) -> i64;
+    fn k_store_path_ok(i: u32, ok: u32);
+    fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
@@ -8931,7 +8939,9 @@ fn object_identity(h: &Host, addr: u64) -> Option<u64> {
     let (id, _) = v.code.as_ref()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    Some(hasher.finish())
+    let key = hasher.finish();
+    note_key(h, key, id);
+    Some(key)
 }
 
 /// Whether the object covering this page has been translated whole.
@@ -9198,6 +9208,67 @@ fn shared_module_at(
     }
 }
 
+/// `?xcache=`: tie each identity key to its file for the kernel's saved store
+/// (docs/gexcc.md §8).
+static XCACHE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_xcache(on: u32) {
+    XCACHE_ON.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Keys this Worker has told the kernel about, and each path's size and
+    /// mtime (`u64::MAX`: no such file here).
+    static XKEYS: std::cell::RefCell<(std::collections::HashSet<u64>, std::collections::HashMap<String, (u64, i64)>)> =
+        std::cell::RefCell::new(Default::default());
+}
+
+/// Tell the kernel which file `key` was computed from, once per key.
+fn note_key(h: &Host, key: u64, path: &str) {
+    if !XCACHE_ON.load(std::sync::atomic::Ordering::Relaxed) || unsafe { k_present() } == 0 {
+        return;
+    }
+    XKEYS.with(|x| {
+        let mut x = x.borrow_mut();
+        if !x.0.insert(key) {
+            return;
+        }
+        let (size, mtime) = *x.1.entry(path.to_string()).or_insert_with(|| match h.kernel.vfs.metadata(path) {
+            Ok(m) => (m.size, m.mtime),
+            Err(_) => (u64::MAX, 0),
+        });
+        unsafe { k_key_path(key, path.as_ptr() as gex_kernel::PAddr, path.len() as u32, size, mtime) };
+    });
+}
+
+/// The saved store a load's host put in the kernel (`k_store_restore_buf`):
+/// each path it names checked against this filesystem (size and mtime), then
+/// laid in. Returns `k_store_restore`'s answer, or -1 for bytes it cannot read.
+#[no_mangle]
+pub extern "C" fn gex_xcache_restore() -> i32 {
+    if unsafe { k_present() } == 0 {
+        return -1;
+    }
+    with_host(|h| {
+        let n = unsafe { k_store_path_count() };
+        if n < 0 {
+            return -1;
+        }
+        let mut buf = vec![0u8; 4096];
+        for i in 0..n as u32 {
+            let len = unsafe { k_store_path(i, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) } as usize;
+            let path = String::from_utf8_lossy(&buf[..len]).into_owned();
+            let (size, mtime) = unsafe { (k_store_path_size(i), k_store_path_mtime(i)) };
+            let ok = len > 0
+                && size != u64::MAX
+                && matches!(h.kernel.vfs.metadata(&path), Ok(m) if m.size == size && m.mtime == mtime);
+            unsafe { k_store_path_ok(i, ok as u32) };
+        }
+        unsafe { k_store_restore() }
+    })
+}
+
 fn page_identity(h: &Host, page: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let v = h
@@ -9239,7 +9310,9 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     (off + (page - v.start)).hash(&mut hasher);
-    Some(hasher.finish())
+    let key = hasher.finish();
+    note_key(h, key, id);
+    Some(key)
 }
 
 /// Nanoseconds on the host clock.

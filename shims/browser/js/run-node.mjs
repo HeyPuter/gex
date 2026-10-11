@@ -333,6 +333,9 @@ const host = new ProcessHost({
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
+    // runs (docs/gexcc.md §8), saved under that name.
+    xcache: process.env.GEX_XCACHE || undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).
