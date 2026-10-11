@@ -7174,10 +7174,10 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 // each process is a Worker the engine schedules.
 
 /// Whether syscall `nr` (canonical) can never be what another Worker waits
-/// for: it reads a clock or an identity, or changes only the caller's own
-/// state. The wake after every syscall wakes every Worker parked on the global
-/// counter -- a W3 game's idle Wine threads, ~25 of them -- and each takes the
-/// host lock to re-check. A game thread that reads the clock and yields
+/// for: it reads a clock, an identity or metadata, waits, or changes only the
+/// caller's own state. The wake after every syscall wakes every Worker parked
+/// on the global counter -- a W3 game's idle Wine threads, ~25 of them -- and
+/// each takes the host lock to re-check. A game thread that reads the clock and yields
 /// thousands of times a second (Wine's NtYieldExecution is getrusage,
 /// sched_yield, getrusage) kept them all cycling, and the game thread then
 /// spent ~40 ms of every Undertale frame in KLock::take. A list of what
@@ -7205,6 +7205,28 @@ fn wakes_nobody(nr: u64) -> bool {
             | nr::SIGALTSTACK
             | nr::NANOSLEEP
             | nr::CLOCK_NANOSLEEP
+            // Waiting changes nothing another waiter waits for. A futex wake
+            // is relayed per address (`k_futex_wake`, which also bumps the
+            // global counter), so the call itself need not wake everyone.
+            | nr::FUTEX
+            | nr::PSELECT6
+            | nr::PPOLL
+            | nr::EPOLL_PWAIT
+            | nr::EPOLL_PWAIT2
+            // Reading metadata.
+            | nr::STATX
+            | nr::NEWFSTATAT
+            | nr::FSTAT
+            | nr::LSEEK
+            | nr::GETDENTS64
+            | nr::READLINKAT
+            | nr::FACCESSAT
+            | nr::FACCESSAT2
+            | nr::GETCWD
+            | nr::UNAME
+            | nr::GETRANDOM
+            | nr::SYSINFO
+            | nr::GETCPU
     )
 }
 
