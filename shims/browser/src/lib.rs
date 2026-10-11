@@ -11232,6 +11232,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if cgen::libprov::replaced(pc) {
         cgen::libprov::note_stray(pc);
     }
+    // W3: the first miss in an image Wine relocated after mapping it, whose
+    // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
+    // guest goes on at this pc.
+    if cgen::w3_miss(pc) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
