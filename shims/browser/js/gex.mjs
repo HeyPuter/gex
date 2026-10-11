@@ -12,6 +12,7 @@ const GUEST_BYTES = 0xffff0000;
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { lazyFetch } from "./lazy-fetch.mjs";
+import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
@@ -361,11 +362,12 @@ function writeSparse(dst, src, at) {
   // Word-at-a-time when the source is aligned, which it is: the regions are
   // `slice`d, so each owns its buffer from offset zero.
   const words = src.byteOffset % 4 === 0 && src.byteLength % 4 === 0
-    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength >> 2)
+    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength / 4)
     : null;
+  // Division, not `>> 2`: a region can pass 2 GiB (see `#processImage`).
   const blank = (from, to) => {
     if (words) {
-      for (let i = from >> 2; i < to >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = from / 4; i < to / 4; i++) if (words[i] !== 0) return false;
       return true;
     }
     for (let i = from; i < to; i++) if (src[i] !== 0) return false;
@@ -406,7 +408,7 @@ const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
  * words, not bytes: only ever answers same-or-different.
  */
 function sum32(buf) {
-  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, (buf.byteLength / 4) | 0);
+  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, Math.floor(buf.byteLength / 4));
   let h = 0x811c9dc5;
   for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193);
   return h >>> 0;
@@ -1561,6 +1563,10 @@ export class Gex {
     }
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
+    // `?xcache=`: the store the last load saved, laid in before anything runs
+    // (docs/gexcc.md §8). After `gex_load`, which unpacked the bundle the
+    // saved paths are checked against.
+    if (opts.xcache) await this.#xcacheRestore(String(opts.xcache));
     if (globalThis.GEX_DEBUG_EXIT) {
       console.error(`[gex] load: program at ${entry}, `
         + `${(opts.closure ?? []).length} closure modules to install`);
@@ -1857,10 +1863,15 @@ export class Gex {
     // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
     // left out); runs are `dense`, written without a scan.
     const u8 = this.#bytes();
-    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    // Division, not `>> 2` or `& ~3`: those are int32 operations, and a W3
+    // process's memory reaches past 2 GiB (Wine's Windows address space), where
+    // they turn negative -- `b & ~3` then started the tail loop near -2^31, and
+    // a fork (Wine starting wineserver) scanned for hours.
+    const words = new Int32Array(this.#memory.buffer, 0, Math.floor(u8.length / 4));
     const blank = (a, b) => {
-      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
-      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      const tail = b - (b % 4);
+      for (let i = Math.floor(a / 4); i < tail / 4; i++) if (words[i] !== 0) return false;
+      for (let i = tail; i < b; i++) if (u8[i] !== 0) return false;
       return true;
     };
     const out = [];
@@ -2019,6 +2030,49 @@ export class Gex {
 
   /** The global kernel's exports, or null. */
   get kernel() { return this.#kernel; }
+
+  /** The saved store, into the kernel and checked (docs/gexcc.md §8). */
+  async #xcacheRestore(name) {
+    const e = this.#shim.exports;
+    const k = this.#kernel;
+    if (!k?.k_store_restore_buf || !e.gex_xcache_restore) return;
+    k.k_xcache_enable();
+    const t0 = performance.now();
+    const bytes = await xcRead(name);
+    if (!bytes) {
+      console.log(`[gex] xcache ${name}: nothing saved`);
+      return;
+    }
+    const t1 = performance.now();
+    const at = k.k_store_restore_buf(bytes.length) >>> 0;
+    new Uint8Array(this.#kernelSpec.memory.buffer).set(bytes, at);
+    const r = e.gex_xcache_restore();
+    const t2 = performance.now();
+    console.log(`[gex] xcache ${name}: ${(bytes.length / 1048576).toFixed(1)} MiB read in ${Math.round(t1 - t0)} ms, `
+      + `restored ${r} modules in ${Math.round(t2 - t1)} ms`);
+  }
+
+  /**
+   * Save the kernel's store for the next load if it grew by `minBytes` since
+   * the last save (docs/gexcc.md §8). The kernel lets one save run at a time.
+   */
+  async xcacheSave(name, minBytes = 1 << 20) {
+    const k = this.#kernel;
+    if (!name || !k?.k_store_save) return;
+    const t0 = performance.now();
+    const n = k.k_store_save(minBytes) >>> 0;
+    if (!n) return;
+    try {
+      const at = k.k_store_save_ptr() >>> 0;
+      const bytes = new Uint8Array(this.#kernelSpec.memory.buffer, at, n).slice();
+      k.k_store_save_done();
+      await xcWrite(String(name), bytes);
+      console.log(`[gex] xcache ${name}: saved ${(n / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+    } catch (err) {
+      k.k_store_save_done();
+      console.log(`[gex] xcache ${name}: not saved: ${err?.message ?? err}`);
+    }
+  }
 
   /**
    * What the shim calls to reach the process table every process shares.

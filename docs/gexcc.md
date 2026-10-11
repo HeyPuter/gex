@@ -1562,9 +1562,10 @@ The cache saves the **global kernel's module store** and the slot numbering its 
   If the fingerprint differs, the whole cache is dropped. This also covers Rust's `DefaultHasher`, which the object and page identities use and whose output is not promised to stay the same across toolchains.
 - **The content of each object.** Today an object's identity is SipHash of its file path, and a page's identity is SipHash of path plus offset (`object_identity` and `page_identity` in shims/browser/src/lib.rs). Neither depends on the file's bytes, so a library that apt replaced at the same path would keep its old translations.
 
-  The cache therefore stores, per object, its path and a hash of the file's bytes as they were when saved. To make that possible, the shim tells the kernel once per object which path each key it uses belongs to (a new `k_obj_name(key, path)`).
+  The cache therefore stores, per key, its path, and per path the file's size and mtime as they were when saved; nothing is hashed. The shim tells the kernel once per key per Worker which path the key belongs to (`k_key_path(key, path, size, mtime)`, from `note_key`).
 
-  On restore, the kernel hashes the file now at that path in this page's filesystem. If the hash differs, or the file is gone, it drops that object's modules, claims and slot-map entries. Those slots are then left unused, which wastes them but is safe.
+  A restored key is checked the first time a process computes it, not at restore: in the page, pid 1 restores before apt has installed anything, so at restore most files are not there yet (dpkg keeps the package's mtimes, so a reinstalled file matches). The same size and mtime confirm every restored key of that path. Anything else, or the file gone, drops those keys' modules, claims, `translated` marks and slot-map entries, and the path's record takes the file as it is now. The dropped slots are left unused, which wastes them but is safe.
+
 - **Placement.** Keys include absolute dispatch pages. A library loaded at a different address simply misses; nothing is relocated.
 
 ### Renumber on install

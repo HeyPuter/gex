@@ -920,6 +920,452 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> 
     b.len() as u32
 }
 
+// ---- The translation cache across page loads (docs/gexcc.md §8) ----
+//
+// The store above, its claims and the slot map, written out for the page to
+// keep (`k_store_save`) and laid back in by the next load's first process
+// before anything allocates a slot (`k_store_restore`). Keys are SipHash of a
+// file path (and offset); each key is tied to its path, and each path to the
+// size and mtime the file had, so what belongs to a file that is no longer
+// the same is dropped: checked when a process first computes one of its keys
+// (`k_key_path`), not at restore, when the file may not be there yet.
+
+/// A path some key was computed from, as the file was then.
+struct XPath {
+    path: String,
+    size: u64,
+    mtime: i64,
+}
+
+#[derive(Default)]
+struct XCache {
+    paths: Vec<XPath>,
+    path_ix: BTreeMap<String, u32>,
+    keys: BTreeMap<u64, u32>,
+    /// Modules in the store when it was last saved or restored: a save with
+    /// nothing new since writes nothing.
+    saved_mods: usize,
+    saving: bool,
+    out: Vec<u8>,
+    /// A load's saved bytes.
+    inbuf: Vec<u8>,
+    /// Restored keys whose file no process has looked at yet: each is checked
+    /// (size and mtime) the first time a process computes it (`k_key_path`),
+    /// since the files are often not there at restore -- the page installs
+    /// its packages after pid 1 starts.
+    pending: BTreeSet<u64>,
+    restored: bool,
+    /// This load keeps a cache (`k_xcache_enable`): every process notes its
+    /// keys' files, whichever process saves.
+    enabled: bool,
+}
+
+fn xcache() -> &'static Mutex<XCache> {
+    note_panics();
+    static X: OnceLock<Mutex<XCache>> = OnceLock::new();
+    X.get_or_init(|| Mutex::new(XCache::default()))
+}
+
+const XC_MAGIC: &[u8; 8] = b"GEXXC\x00\x00\x01";
+/// Module bytes a save writes at most; past it, modules go as empty records
+/// (ids stay positions).
+const XC_MAX_BYTES: usize = MOD_BUDGET;
+
+/// Key `key` was computed from `path`, whose file has `size` and `mtime`
+/// (`size` `u64::MAX`: no file to check, so the key is never restored).
+///
+/// For a restored key not yet checked, also the check: the same size and
+/// mtime confirm every restored key of that path (returns 1); anything else
+/// drops their translations, claims and slots (returns -1, the path's
+/// record then takes the file as it is now). Otherwise 0.
+#[no_mangle]
+pub extern "C" fn k_key_path(key: u64, path: gex_kmem::PAddr, len: u32, size: u64, mtime: i64) -> i32 {
+    let p = path_of_raw(path, len);
+    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    if x.pending.contains(&key) {
+        // Again in `k_store_restore`'s order (modules, xcache, slots), which
+        // only a check needs; another Worker may have done it meanwhile.
+        drop(x);
+        let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+        x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+        if !x.pending.contains(&key) {
+            return 0;
+        }
+        let ix = x.keys[&key];
+        let same = {
+            let r = &x.paths[ix as usize];
+            size != u64::MAX && r.path == p && r.size == size && r.mtime == mtime
+        };
+        let of_path: Vec<u64> = x.keys.iter().filter(|&(k, &i)| i == ix && x.pending.contains(k)).map(|(k, _)| *k).collect();
+        for k in &of_path {
+            x.pending.remove(k);
+        }
+        if same {
+            return 1;
+        }
+        let mut sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+        let gone: BTreeSet<u64> = of_path.into_iter().collect();
+        sl.retain(|(_, k), _| !gone.contains(k));
+        let mut freed: Vec<u32> = Vec::new();
+        m.by_page.retain(|(_, k), ids| {
+            let keep = !gone.contains(k);
+            if !keep {
+                freed.extend(ids.iter().copied());
+            }
+            keep
+        });
+        for k in &gone {
+            if let Some(ids) = m.by_object.remove(k) {
+                freed.extend(ids);
+            }
+            m.translated.remove(k);
+        }
+        if !freed.is_empty() {
+            let named: BTreeSet<u32> = m.by_page.values().chain(m.by_object.values()).flatten().copied().collect();
+            for id in freed {
+                if named.contains(&id) {
+                    continue;
+                }
+                // Its bytes stay in the slab, unreachable (nothing is freed there).
+                let Some(sm) = m.mods.get_mut((id as usize).wrapping_sub(1)) else { continue };
+                let n = sm.at.2 as usize;
+                sm.at = (u32::MAX, 0, 0);
+                m.total -= n;
+            }
+        }
+        let r = &mut x.paths[ix as usize];
+        r.size = size;
+        r.mtime = mtime;
+        return -1;
+    }
+    if x.keys.contains_key(&key) {
+        return 0;
+    }
+    let ix = match x.path_ix.get(&p) {
+        Some(&i) => i,
+        None => {
+            let i = x.paths.len() as u32;
+            x.paths.push(XPath { path: p.clone(), size, mtime });
+            x.path_ix.insert(p, i);
+            i
+        }
+    };
+    x.keys.insert(key, ix);
+    0
+}
+
+struct W(Vec<u8>);
+impl W {
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes())
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes())
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b)
+    }
+}
+
+struct R<'a>(&'a [u8], usize);
+impl R<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let b = self.0.get(self.1..self.1.checked_add(n)?)?;
+        self.1 += n;
+        Some(b)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.u32()? as usize;
+        Some(self.take(n)?.to_vec())
+    }
+}
+
+/// Write the store out, if it has grown by `min_bytes` of modules since the
+/// last save or restore; the length (read it at `k_store_save_ptr`, then
+/// `k_store_save_done`), or zero for nothing to write or a save already
+/// under way.
+#[no_mangle]
+pub extern "C" fn k_store_save(min_bytes: u32) -> u32 {
+    let m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    if x.saving || m.mods.len() <= x.saved_mods {
+        return 0;
+    }
+    let fresh: usize = m.mods[x.saved_mods.max(1)..].iter().map(|sm| sm.at.2 as usize).sum();
+    if fresh < min_bytes as usize {
+        return 0;
+    }
+    let mut w = W(Vec::with_capacity(m.total.min(XC_MAX_BYTES) + (1 << 20)));
+    w.0.extend_from_slice(XC_MAGIC);
+    w.u32(x.paths.len() as u32);
+    for p in &x.paths {
+        w.bytes(p.path.as_bytes());
+        w.u64(p.size);
+        w.u64(p.mtime as u64);
+    }
+    w.u32(x.keys.len() as u32);
+    for (k, i) in &x.keys {
+        w.u64(*k);
+        w.u32(*i);
+    }
+    {
+        let sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+        w.u32(sl.len() as u32);
+        for ((page, key), base) in sl.iter() {
+            w.u64(*page);
+            w.u64(*key);
+            w.u32(*base);
+        }
+    }
+    w.u64(slot_mark().load(core::sync::atomic::Ordering::SeqCst));
+    w.u32((m.mods.len() - 1) as u32);
+    let mut budget = XC_MAX_BYTES;
+    for sm in &m.mods[1..] {
+        w.u64(sm.slots);
+        w.u32(sm.dirs.len() as u32);
+        for (page, base) in &sm.dirs {
+            w.u64(*page);
+            w.u32(*base);
+        }
+        let wasm = m.bytes(sm);
+        if wasm.len() <= budget {
+            budget -= wasm.len();
+            w.bytes(wasm);
+        } else {
+            w.bytes(&[]);
+        }
+    }
+    w.u32(m.by_page.len() as u32);
+    for ((page, key), ids) in &m.by_page {
+        w.u64(*page);
+        w.u64(*key);
+        w.u32(ids.len() as u32);
+        for id in ids {
+            w.u32(*id);
+        }
+    }
+    w.u32(m.by_object.len() as u32);
+    for (obj, ids) in &m.by_object {
+        w.u64(*obj);
+        w.u32(ids.len() as u32);
+        for id in ids {
+            w.u32(*id);
+        }
+    }
+    w.u32(m.translated.len() as u32);
+    for obj in &m.translated {
+        w.u64(*obj);
+    }
+    x.saved_mods = m.mods.len();
+    x.saving = true;
+    x.out = w.0;
+    x.out.len() as u32
+}
+
+/// Where the bytes `k_store_save` wrote are, in this memory.
+#[no_mangle]
+pub extern "C" fn k_store_save_ptr() -> u32 {
+    xcache().lock().unwrap_or_else(|e| e.into_inner()).out.as_ptr() as u32
+}
+
+/// The host has them.
+#[no_mangle]
+pub extern "C" fn k_store_save_done() {
+    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    x.out = Vec::new();
+    x.saving = false;
+}
+
+/// Room for a load's saved bytes, in this memory: the host copies them to the
+/// address returned, then the first process restores (`k_store_restore`).
+#[no_mangle]
+pub extern "C" fn k_store_restore_buf(len: u32) -> u32 {
+    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    x.inbuf = vec![0u8; len as usize];
+    x.inbuf.as_ptr() as u32
+}
+
+/// This load keeps a cache: set by the host before its first process runs.
+#[no_mangle]
+pub extern "C" fn k_xcache_enable() {
+    xcache().lock().unwrap_or_else(|e| e.into_inner()).enabled = true;
+}
+
+/// Whether processes note their keys' files (`k_key_path`): the load keeps a
+/// cache, or restored one (whose keys are then checked on first use).
+#[no_mangle]
+pub extern "C" fn k_xcache_on() -> u32 {
+    let x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    (x.enabled || x.restored) as u32
+}
+
+/// Lay the saved store in: slot map, mark, modules, claims, every key pending
+/// its file's check (`k_key_path`). Only into an empty store with nothing
+/// allocated, once. Returns the modules restored with bytes, or negative: -1
+/// not a cache, -2 too late (something is in the store or the slot map, or a
+/// slot was handed out), -3 restored before.
+#[no_mangle]
+pub extern "C" fn k_store_restore() -> i32 {
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    if x.restored {
+        return -3;
+    }
+    let mut sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+    if m.mods.len() > 1 || !sl.is_empty() || slot_mark().load(core::sync::atomic::Ordering::SeqCst) != RUNTIME_SLOT_BASE {
+        return -2;
+    }
+    x.restored = true;
+    let inbuf = std::mem::take(&mut x.inbuf);
+    let mut r = R(&inbuf, 0);
+    let res = (|| -> Option<i32> {
+        if r.take(8)? != XC_MAGIC {
+            return None;
+        }
+        let n = r.u32()?;
+        let mut in_paths = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let path = String::from_utf8(r.bytes()?).ok()?;
+            let size = r.u64()?;
+            let mtime = r.u64()? as i64;
+            in_paths.push(XPath { path, size, mtime });
+        }
+        // Every key with a file to check (keys saved without one are left
+        // out), pending that check.
+        let mut good: BTreeSet<u64> = BTreeSet::new();
+        let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
+        for _ in 0..r.u32()? {
+            let k = r.u64()?;
+            let i = r.u32()?;
+            let p = in_paths.get(i as usize)?;
+            if p.size == u64::MAX {
+                continue;
+            }
+            good.insert(k);
+            let ix = match remap.get(&i) {
+                Some(&j) => j,
+                None => {
+                    let j = x.paths.len() as u32;
+                    x.paths.push(XPath { path: p.path.clone(), size: p.size, mtime: p.mtime });
+                    x.path_ix.insert(p.path.clone(), j);
+                    remap.insert(i, j);
+                    j
+                }
+            };
+            x.keys.insert(k, ix);
+            x.pending.insert(k);
+        }
+        for _ in 0..r.u32()? {
+            let page = r.u64()?;
+            let key = r.u64()?;
+            let base = r.u32()?;
+            if good.contains(&key) {
+                sl.insert((page, key), base);
+            }
+        }
+        let mark = r.u64()?;
+        // Read the modules, then keep the bytes only of those a kept claim names.
+        let nm = r.u32()?;
+        let mut mods = Vec::with_capacity(nm as usize);
+        for _ in 0..nm {
+            let slots = r.u64()?;
+            let nd = r.u32()?;
+            let mut dirs = Vec::with_capacity(nd as usize);
+            for _ in 0..nd {
+                let page = r.u64()?;
+                let base = r.u32()?;
+                dirs.push((page, base));
+            }
+            // Where its bytes are in the saved file, copied into the slab below.
+            let n = r.u32()? as usize;
+            let at = r.1;
+            r.take(n)?;
+            mods.push((slots, dirs, at, n));
+        }
+        let mut wanted: BTreeSet<u32> = BTreeSet::new();
+        let mut by_page = BTreeMap::new();
+        for _ in 0..r.u32()? {
+            let page = r.u64()?;
+            let key = r.u64()?;
+            let k = r.u32()?;
+            let mut ids = Vec::with_capacity(k as usize);
+            for _ in 0..k {
+                ids.push(r.u32()?);
+            }
+            if good.contains(&key) {
+                wanted.extend(ids.iter().copied());
+                by_page.insert((page, key), ids);
+            }
+        }
+        let mut by_object = BTreeMap::new();
+        for _ in 0..r.u32()? {
+            let obj = r.u64()?;
+            let k = r.u32()?;
+            let mut ids = Vec::with_capacity(k as usize);
+            for _ in 0..k {
+                ids.push(r.u32()?);
+            }
+            if good.contains(&obj) {
+                wanted.extend(ids.iter().copied());
+                by_object.insert(obj, ids);
+            }
+        }
+        let mut translated = BTreeSet::new();
+        for _ in 0..r.u32()? {
+            let obj = r.u64()?;
+            if good.contains(&obj) {
+                translated.insert(obj);
+            }
+        }
+        let mut kept = 0;
+        for (i, (slots, dirs, at, n)) in mods.into_iter().enumerate() {
+            // Store ids are one past the index (index zero is "none"); a module
+            // no kept claim names comes back without bytes.
+            let mut sm = SharedModule { at: (u32::MAX, 0, 0), slots, dirs };
+            if n > 0 && wanted.contains(&(i as u32 + 2)) && m.total + n <= MOD_BUDGET {
+                let (c, off) = m.reserve(n);
+                m.slab[c as usize][off as usize..off as usize + n].copy_from_slice(&inbuf[at..at + n]);
+                sm.at = (c, off, n as u32);
+                m.total += n;
+                kept += 1;
+            }
+            m.mods.push(sm);
+        }
+        m.by_page = by_page;
+        m.by_object = by_object;
+        m.translated = translated;
+        slot_mark().fetch_max(mark, core::sync::atomic::Ordering::SeqCst);
+        Some(kept)
+    })();
+    x.saved_mods = m.mods.len();
+    match res {
+        Some(k) => k,
+        None => {
+            // A torn file: start empty rather than half-restored.
+            m.mods.truncate(1);
+            m.slab.clear();
+            m.by_page.clear();
+            m.by_object.clear();
+            m.translated.clear();
+            m.total = 0;
+            sl.clear();
+            x.keys.clear();
+            x.paths.clear();
+            x.path_ix.clear();
+            x.pending.clear();
+            x.saved_mods = 1;
+            -1
+        }
+    }
+}
+
 /// And the `dirs`, in the same twelve-byte encoding they arrived in.
 ///
 /// SAFETY: as above.

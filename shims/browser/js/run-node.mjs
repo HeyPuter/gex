@@ -360,6 +360,11 @@ const host = new ProcessHost({
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
+    // runs (docs/gexcc.md §8), saved under that name.
+    xcache: process.env.GEX_XCACHE || undefined,
+    // GEX_XCACHE_MIN=bytes: save when the store grew by this much (default 1 MiB).
+    xcacheMin: process.env.GEX_XCACHE_MIN ? Number(process.env.GEX_XCACHE_MIN) : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).
