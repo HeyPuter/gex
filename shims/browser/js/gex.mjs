@@ -4341,6 +4341,9 @@ export class Gex {
         this.#where = 'drainThread';
         await this.#drainThread();
         this.#where = 'resume';
+        // A guest fault the shim staged for the process's hook (W3): run
+        // it, and go on where it left the context.
+        const faulted = this.#deliverFault(ctx);
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -4348,7 +4351,7 @@ export class Gex {
         // read as bugs anywhere but here.
         const next = e.gex_exited?.() ? 0n : e.gex_resume_pc();
         if (next !== 0n) {
-          pc = next;
+          pc = faulted ?? next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
@@ -5156,7 +5159,9 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const nextPc = e.gex_resume_pc();
+          const faulted = this.#deliverFault(ctx);
+          const resumed = e.gex_resume_pc();
+          const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
           // business, down through every frame.
           if (nextPc === 0n) {
@@ -5194,6 +5199,45 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /**
+   * A guest fault the shim staged (`gex_fault_take`: a W3 process's branch
+   * to non-executable memory) given to the process's fault hook, Wine's
+   * ntdll.so, as shims/native's `deliver_guest_fault_kind` does: the hook
+   * builds the guest's exception frame and points the context at the
+   * dispatcher. Returns where the guest goes on, or null with none staged.
+   */
+  #deliverFault(ctx) {
+    const e = this.#shim.exports;
+    if (!e.gex_fault_take) return null;
+    const buf = e.gex_alloc(16) >>> 0;
+    let hook, code, addr, kind;
+    try {
+      hook = e.gex_fault_take(buf) >>> 0;
+      if (!hook) return null;
+      const dv = new DataView(this.#memory.buffer);
+      code = dv.getUint32(buf, true);
+      addr = dv.getBigUint64(buf + 4, true);
+      kind = dv.getUint32(buf + 12, true);
+    } finally {
+      e.gex_free?.(buf, 16);
+    }
+    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
+    // The hook's C frames go below the guest's stack pointer, as a signal
+    // frame does, with room for the exception frame it builds there.
+    const spG = this.#wasmprogStack();
+    const cur = spG.value;
+    const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
+    const low = Math.min(Number(cur) >>> 0, esp);
+    spG.value = m64() ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
+    try {
+      f(ctx, code | 0, Number(BigInt.asUintN(32, addr)) | 0, kind | 0);
+    } finally {
+      spG.value = cur;
+    }
+    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+  }
 
   /**
    * An exception dispatched nested (nt.rs `raise_nested`, ffa2cec9's browser
@@ -5261,7 +5305,9 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const nextPc = e.gex_resume_pc();
+          const faulted = this.#deliverFault(ctx);
+          const resumed = e.gex_resume_pc();
+          const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
           // business, down through every frame.
           if (nextPc === 0n) {

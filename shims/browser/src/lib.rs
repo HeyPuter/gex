@@ -11702,6 +11702,23 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
     }
+    // A process with a guest fault hook (Wine's ntdll.so, W3): an access
+    // violation, executing, handed to the hook by the host, which resumes
+    // where the hook leaves the context (shims/native's
+    // `deliver_guest_fault_kind`). Without it a W3 program's own null call
+    // (Windows 7's comctl32 calls LpkEditControl's table, null without
+    // lpk.dll, and expects the exception to be caught) ended the thread.
+    if wild && cgen::fault_hook() != 0 {
+        with_host(|h| {
+            let mut gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let _ = gm.write_u64(c + ctx::PC as u64, pc);
+            cgen::fault_stage(0xc000_0005, pc, 8);
+            set_resume(pc);
+            set_resume_ctx(c);
+        });
+        trap();
+    }
     if wild {
         with_host(|h| {
             let gm = GuestMem::new(guest_bytes());
