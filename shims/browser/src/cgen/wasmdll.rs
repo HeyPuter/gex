@@ -82,7 +82,14 @@ pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
         (x.path.clone(), x.base, pe)
     };
     match publish(&path, base, &pe) {
-        Ok(n) => n,
+        Ok(n) => {
+            let mut r = lock(&SKELETON_CODE);
+            for sec in pe.sections.iter().filter(|s| s.executable() && s.vsize.max(s.raw_size) > 0) {
+                let lo = base + sec.rva as u64;
+                r.push((lo, lo + sec.vsize.max(sec.raw_size) as u64));
+            }
+            n
+        }
         Err(e) => {
             crate::warn_line(&format!("gex-nt: {path}: native wasm32 DLL: {e}\n"));
             crate::nt::end_process(0xc000_0135);
@@ -200,6 +207,20 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     }
 }
 
+/// The executable sections of every skeleton mapped: `ud2` stubs, never
+/// x86 code -- Wine's PE module serves their exports through the table.
+/// The function JIT reads no code there (`fjit::translate_root`): an
+/// import thunk's `jmp [iat]`, its slot read-only once Wine's loader filled
+/// it, resolves to a one-case jump table whose target is the stub, and the
+/// thunk's translation then ran the `ud2` (imm32's call of user32's
+/// `User32InitializeImmEntryTable`: SIGILL in every W3 page process with
+/// `?fjit=1`).
+static SKELETON_CODE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+pub(crate) fn skeleton_code() -> Vec<(u64, u64)> {
+    lock(&SKELETON_CODE).clone()
+}
+
 /// `gex.image_mapped(base, fd)` (W3, docs/wine-native.md §3.17): Wine's
 /// own PE loader mapped the image open at `fd` at `base`, relocated. A
 /// native DLL's skeleton gets Wine's PE module bound at its exports, as the
@@ -235,7 +256,14 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
         return if super::w3_mapped(&path, base, &pe) { -3 } else { -1 };
     }
     match publish(&path, base, &pe) {
-        Ok(n) => n,
+        Ok(n) => {
+            let mut r = lock(&SKELETON_CODE);
+            for sec in pe.sections.iter().filter(|s| s.executable() && s.vsize.max(s.raw_size) > 0) {
+                let lo = base + sec.rva as u64;
+                r.push((lo, lo + sec.vsize.max(sec.raw_size) as u64));
+            }
+            n
+        }
         Err(e) => {
             crate::warn_line(&format!("gex-w3: {path}: native wasm32 DLL: {e}\n"));
             -1

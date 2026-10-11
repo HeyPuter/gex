@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub(crate) mod elfprov;
 pub(crate) mod libprov;
 mod wasmdll;
+pub(crate) use wasmdll::skeleton_code;
 pub(crate) mod wasmprog;
 mod dylink;
 
