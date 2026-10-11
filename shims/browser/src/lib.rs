@@ -8250,6 +8250,16 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         ));
     }
     drop(closure);
+    // And the store modules this Worker installed before the exec: they are
+    // still in its tables, but nothing points at them now -- the page table
+    // and directory start over above -- so counting them installed made the
+    // serve path refuse every one of them, and the new program lifted what
+    // it could have been served. A program exec'd from a fork of node (the
+    // child had taken libc and libnode whole before its exec) lifted 66,079
+    // blocks, against 4,188 for a fresh `node -e 0`. Served again, a module
+    // writes the same blocks into the same slots, and its compile is shared
+    // by content key.
+    h.jit.installed_mods.clear();
 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     let c = ctx_addr as usize;
