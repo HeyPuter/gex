@@ -626,6 +626,10 @@ for (const id of list) {
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
   );
+  // Never leave the browser behind: a run that throws (a trace too big to
+  // write, say) once left one holding the profile, and the next launch on
+  // that profile handed its URL to the old browser.
+  process.on('exit', () => child.kill('SIGKILL'));
   let err = '';
   child.stderr.on('data', (d) => (err += d));
 
