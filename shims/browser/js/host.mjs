@@ -522,7 +522,7 @@ export class ProcessHost {
         const c = m.child?.forkCost;
         if (c) {
           const hop1 = Math.round(performance.timeOrigin + performance.now() - c.sentAt);
-          console.log(
+          narrate(
             `[gex] fork -> pid ${m.child.pid}: image ${(c.bytes / 1048576).toFixed(1)} MiB`
               + ` in ${c.regions} regions, built ${c.buildMs}ms,`
               + ` ${hop1}ms to reach the host`,

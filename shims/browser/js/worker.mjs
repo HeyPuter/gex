@@ -66,7 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { Gex, Env, utf8 } from './gex.mjs';
+import { Gex, Env, utf8, narrate } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
@@ -622,7 +622,7 @@ async function handle(msg) {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
-    console.debug(`[worker] pid ${msg.child?.pid}: adopt arrived`);
+      narrate(`[worker] pid ${msg.child?.pid}: adopt arrived`);
       // With the closure, as a fresh process gets it: a child inherits its
       // parent's code through the fork record but no record that those pages
       // are a closure's, so without this an exec'd `apt-get` throws every
