@@ -92,6 +92,16 @@ WAYLAND_TAG="${WAYLAND_TAG:-}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATH="$HOME/.local/bin:$PATH"
+# GEX_XWL_HOST_TOOLS=<prefix>: the host pieces web/build-xwayland-host-tools.sh
+# builds when the distro lacks them (wayland-scanner, wayland-protocols,
+# xorgproto, xorg-macros, X11/xshmfence.h).
+HT="${GEX_XWL_HOST_TOOLS:-}"
+if [ -n "$HT" ]; then
+    PATH="$HT/bin:$PATH"
+    PKG_CONFIG_PATH="$HT/lib/x86_64-linux-gnu/pkgconfig:$HT/share/pkgconfig:$HT/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    ACLOCAL_PATH="$HT/share/aclocal:/usr/share/aclocal${ACLOCAL_PATH:+:$ACLOCAL_PATH}"
+    export PKG_CONFIG_PATH ACLOCAL_PATH
+fi
 command -v meson >/dev/null 2>&1 || { echo "need meson (pip install meson ninja)"; exit 1; }
 command -v ninja >/dev/null 2>&1 || { echo "need ninja"; exit 1; }
 [ -d "$EMSDK/upstream/emscripten" ] || { echo "no emscripten at $EMSDK"; exit 1; }
@@ -112,6 +122,8 @@ say() { printf '\n== %s\n' "$*"; }
 # and the .pc files re-pointed at the copy.
 say "staging the X protocol headers"
 [ -d "$PREFIX/include/X11" ] || cp -r /usr/include/X11 "$PREFIX/include/"
+# And the host tools' newer protocol headers over the distro's.
+[ -z "$HT" ] || [ ! -d "$HT/include/X11" ] || cp -r "$HT/include/X11/." "$PREFIX/include/X11/"
 mkdir -p "$PREFIX/include/linux"
 cp /usr/include/linux/input-event-codes.h "$PREFIX/include/linux/"
 for p in xproto randrproto renderproto xextproto inputproto kbproto fontsproto \

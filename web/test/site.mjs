@@ -601,6 +601,11 @@ for (const id of list) {
       '--no-sandbox',
       '--disable-gpu-sandbox',
       '--enable-unsafe-swiftshader',
+      // GEX_WEBGPU_SOFTWARE=1: WebGPU on SwiftShader, as drive.mjs does, so
+      // gears runs on a host with no GPU.
+      ...(process.env.GEX_WEBGPU_SOFTWARE === '1'
+        ? ['--enable-unsafe-webgpu', '--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader']
+        : []),
       // Without this the page's console goes nowhere, so a demo that throws
       // before running a byte fails as "timeout, last status: (none)".
       '--enable-logging=stderr',

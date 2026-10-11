@@ -1,6 +1,11 @@
 // Serve the built site, cross-origin isolated, on a fixed port.
 //
-//     node web/serve-dist.mjs [port]
+//     node web/serve-dist.mjs [port] [--sp-port N]
+//
+// `--sp-port N` serves the same site a second time on N without the
+// isolation headers. That page has no SharedArrayBuffer, so it runs the
+// single-thread build (docs/single-thread.md): MP on [port], SP on N, side
+// by side. `GEX_NO_COI=1` drops the headers on [port] too.
 //
 // Not `vite dev`/`preview`: the dev server has served stale JavaScript against
 // a freshly built shim, so a measurement against it means nothing. `web/dist`
@@ -17,7 +22,10 @@ import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(fileURLToPath(new URL('.', import.meta.url)), 'dist');
-const port = Number(process.argv[2] ?? 8088);
+const args = process.argv.slice(2);
+const spAt = args.indexOf('--sp-port');
+const spPort = spAt >= 0 ? Number(args.splice(spAt, 2)[1]) : 0;
+const port = Number(args[0] ?? 8088);
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -33,7 +41,7 @@ const TYPES = {
   '.ico': 'image/x-icon',
 };
 
-const server = createServer(async (req, res) => {
+const serve = (coi) => async (req, res) => {
   const url = new URL(req.url, 'http://x');
   // `normalize` and then reject anything that climbs out: this serves a
   // directory, not the filesystem.
@@ -48,7 +56,7 @@ const server = createServer(async (req, res) => {
     // What buys `SharedArrayBuffer`. See the note at the top. `GEX_NO_COI=1`
     // leaves them off, as any static host would: the page then runs the
     // single-thread build (docs/single-thread.md).
-    ...(process.env.GEX_NO_COI ? {} : {
+    ...(!coi ? {} : {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     }),
@@ -67,12 +75,19 @@ const server = createServer(async (req, res) => {
   } catch {
     res.writeHead(404, { ...headers, 'content-type': 'text/plain' }).end(`no ${rel}\n`);
   }
-});
+};
 
-server.listen(port, '0.0.0.0', () => {
+const coi = !process.env.GEX_NO_COI;
+createServer(serve(coi)).listen(port, '0.0.0.0', () => {
   console.log(`serving ${root}`);
-  console.log(`  http://127.0.0.1:${port}/`);
-  console.log('');
-  console.log('  cross-origin isolated, so SharedArrayBuffer works');
-  console.log('  open the console for `[gex] pid N: lived Xms (guest Yms)`');
+  console.log(`  http://127.0.0.1:${port}/  ${coi ? 'multi-process (cross-origin isolated, SharedArrayBuffer)' : 'single-thread (no COOP/COEP)'}`);
+  if (!spPort) {
+    console.log('');
+    console.log('  open the console for `[gex] pid N: lived Xms (guest Yms)`');
+  }
 });
+if (spPort) {
+  createServer(serve(false)).listen(spPort, '0.0.0.0', () => {
+    console.log(`  http://127.0.0.1:${spPort}/  single-thread (no COOP/COEP)`);
+  });
+}

@@ -400,9 +400,10 @@ function pageGlobals() {
  */
 async function runInSystemWorker(term, opts) {
   const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // Said once, so a person (and tests/single/run.sh) can tell which build ran.
+  term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system
-  // Worker, which holds every guest memory it reads pixels out of. GL and the
-  // X server need the SharedArrayBuffer bridges still.
+  // Worker, which holds every guest memory it reads pixels out of.
   const canvas = typeof wl?.getContext === 'function' && typeof wl.transferControlToOffscreen === 'function' ? wl : null;
   // GL: the compositor's own (`gl: 'compositor'`) runs in the system Worker
   // beside it, the non-pthread Mesa (web/public/gex/st/); a page-side device
