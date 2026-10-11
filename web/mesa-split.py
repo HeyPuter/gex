@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Split Mesa's replay module into what the page runs and a cold part.
 
-    web/mesa-split.py ORIG.wasm HOT.txt OUTDIR [--max-cold BYTES]
+    web/mesa-split.py ORIG.wasm HOT.txt OUTDIR [--max-cold BYTES] [--cold REGEX]
 
 ORIG.wasm is the link's plain module (gex-wgpu-replay.wasm.orig: the target
 links with -sSPLIT_MODULE=1, so the .wasm beside it is wasm-split's
@@ -12,6 +12,10 @@ over, OUTDIR/gex-wgpu-replay.deferred.wasm (names stripped). --max-cold
 fails the split when the cold part is that big or bigger (default: no
 limit; a Worker compiles it synchronously at any size, and a page's main
 thread loads it with the module, web/gex-wgpu-split.js).
+
+HOT.txt `-` keeps every function. --cold moves the functions whose names
+match REGEX to the cold part whatever HOT.txt says: a forced miss, for
+tests/mesa-cold.
 
 Names are matched as Binaryen prints them, without ThinLTO's `.llvm.<hash>`
 suffixes, which change whenever their translation unit does. A name in the
@@ -207,6 +211,11 @@ def trampolines(primary, out_path, tmp):
 def main():
     args = sys.argv[1:]
     max_cold = None
+    cold_re = None
+    if '--cold' in args:
+        i = args.index('--cold')
+        cold_re = re.compile(args[i + 1])
+        del args[i:i + 2]
     if '--max-cold' in args:
         i = args.index('--max-cold')
         max_cold = int(args[i + 1])
@@ -219,17 +228,18 @@ def main():
     cold = os.path.join(out, 'gex-wgpu-replay.deferred.wasm')
     if os.path.exists(cold):
         os.remove(cold)
-    if not os.path.exists(hot_path):
+    if hot_path != '-' and not os.path.exists(hot_path):
         shutil.copyfile(orig, primary)
         print(f'mesa-split: no {hot_path}; not split')
         return
 
-    hot = {l.strip() for l in open(hot_path) if l.strip() and not l.startswith('#')}
+    hot = None if hot_path == '-' else {l.strip() for l in open(hot_path) if l.strip() and not l.startswith('#')}
     fmap = subprocess.run([binaryen('wasm-opt'), *FEATURES, orig, '--print-function-map', '-o', os.devnull],
                           capture_output=True, text=True, check=True).stdout
     # `index:name`, imports included (wasm-split never moves those).
     names = [l.split(':', 1)[1] for l in fmap.splitlines() if ':' in l]
-    keep = [n for n in names if LLVM_SUFFIX.sub('', n) in hot]
+    keep = [n for n in names if (hot is None or LLVM_SUFFIX.sub('', n) in hot)
+            and not (cold_re and cold_re.search(n))]
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
         f.write(''.join(n + '\n' for n in keep))
         keep_file = f.name
