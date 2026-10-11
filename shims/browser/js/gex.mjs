@@ -1723,7 +1723,44 @@ export class Gex {
   #processImage() {
     const t0 = performance.now();
     const e = this.#shim.exports;
-    const out = [{ at: 0, bytes: this.#bytes().slice(0, LOW_END) }];
+    // Only the runs of pages that are not all zero, scanned in place: a
+    // child's memory starts zeroed, so a zero page needs no bytes, and
+    // slicing it whole first (637 MiB of zeros for a node child) was most of
+    // the cost of a fork, paid again by the child scanning the copy for
+    // zeros (`writeSparse`). Each mapped region also goes as an entry of its
+    // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
+    // left out); runs are `dense`, written without a scan.
+    const u8 = this.#bytes();
+    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    const blank = (a, b) => {
+      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      return true;
+    };
+    const out = [];
+    const runs = (start, end) => {
+      const PAGE = 4096;
+      let zeros = 0;
+      let i = start;
+      while (i < end) {
+        const pe = Math.min(i + PAGE, end);
+        if (blank(i, pe)) {
+          zeros += pe - i;
+          i = pe;
+          continue;
+        }
+        let run = pe;
+        while (run < end) {
+          const next = Math.min(run + PAGE, end);
+          if (blank(run, next)) break;
+          run = next;
+        }
+        out.push({ at: i, bytes: u8.slice(i, run), dense: true });
+        i = run;
+      }
+      return zeros;
+    };
+    out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
     const n = e.gex_vma_count();
@@ -1734,7 +1771,11 @@ export class Gex {
       const prot = Number(dv.getBigUint64(scratch + 16, true));
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
-      if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
+      if (end > start) {
+        const r = { at: start, end, prot, bytes: new Uint8Array(0), zeros: 0 };
+        out.push(r);
+        r.zeros = runs(start, end);
+      }
     }
     e.gex_free?.(scratch, 24);
     // A checksum per region, so the child can say whether what it runs on is
@@ -2006,7 +2047,7 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + r.bytes.byteLength), 0));
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -2029,6 +2070,12 @@ export class Gex {
       const n = r.bytes.byteLength;
       if (n > skipOver) {
         skipped += n;
+        continue;
+      }
+      zeros += r.zeros ?? 0;
+      if (r.dense) {
+        u8.set(new Uint8Array(r.bytes), r.at);
+        copied += n;
         continue;
       }
       const [wrote, blank] = writeSparse(u8, new Uint8Array(r.bytes), r.at);
