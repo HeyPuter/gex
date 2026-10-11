@@ -65,6 +65,14 @@ fn wake_addr() -> *mut i32 {
     &WAKE as *const std::sync::atomic::AtomicI32 as *mut i32
 }
 
+/// Where the counter is in this module's memory: a Worker that must keep
+/// its event loop running (a network wait) waits on it with
+/// `Atomics.waitAsync` instead of polling (gex.mjs `#netWait`).
+#[no_mangle]
+pub extern "C" fn k_wake_addr() -> u32 {
+    wake_addr() as u32
+}
+
 /// What the counter reads now. Sampled before a Worker decides to park.
 #[no_mangle]
 pub extern "C" fn k_wake_seq() -> i32 {

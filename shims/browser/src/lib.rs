@@ -5908,6 +5908,25 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     }
 }
 
+/// How long, at most `max_ms`, this Worker's waiting thread may sleep before
+/// its own deadline (a timed `poll`, a `sleep`) is due; at least 1 ms. For a
+/// wait the page's event loop must keep turning through (`gex.mjs`
+/// `#netWait`), which cannot use [`gex_park`].
+#[no_mangle]
+pub extern "C" fn gex_wait_bound_ms(max_ms: u32) -> u32 {
+    let now = now_ns();
+    let soonest = with_host(|h| {
+        h.threads.get(cur()).and_then(|t| match &t.waiting {
+            Waiting::Sleep(at) => Some(*at),
+            Waiting::Futex { deadline, .. } => *deadline,
+            Waiting::Net(deadline) => *deadline,
+            _ => None,
+        })
+    });
+    let ms = soonest.map_or(max_ms as u64, |at| (at.saturating_sub(now) / 1_000_000).min(max_ms as u64));
+    ms.max(1) as u32
+}
+
 #[no_mangle]
 pub extern "C" fn gex_wake() -> i32 {
     // Counted, because a park/wake/park cycle making no progress costs no CPU
