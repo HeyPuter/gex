@@ -718,8 +718,9 @@ async function startTrace(port) {
     traceConfig: {
       recordMode: 'recordContinuously',
       includedCategories: [
-        'v8', 'v8.wasm', 'v8.execute', 'devtools.timeline', 'blink.worker', 'toplevel',
-        'disabled-by-default-v8.cpu_profiler', 'disabled-by-default-v8.gc', 'disabled-by-default-devtools.timeline',
+        // Not devtools.timeline, toplevel or v8.execute: a task event per
+        // message slowed node -e 0 by two thirds.
+        ...(process.env.GEX_TRACE_CATEGORIES?.split(',') ?? ['v8', 'v8.wasm', 'blink.worker', 'disabled-by-default-v8.cpu_profiler']),
       ],
     },
   });
@@ -733,8 +734,17 @@ async function startTrace(port) {
       t.done = (async () => {
         await b.send('Tracing.end');
         await complete;
-        const { writeFile } = await import('node:fs/promises');
-        await writeFile(file, JSON.stringify(events));
+        // One event per line: a long trace is past V8's longest string.
+        const { createWriteStream } = await import('node:fs');
+        const out = createWriteStream(file);
+        out.write('[\n');
+        for (let i = 0; i < events.length; i++) {
+          if (!out.write(`${JSON.stringify(events[i])}${i + 1 < events.length ? ',' : ''}\n`)) {
+            await new Promise((r) => out.once('drain', r));
+          }
+        }
+        out.write(']\n');
+        await new Promise((r) => out.end(r));
         b.close();
         return events.length;
       })();
