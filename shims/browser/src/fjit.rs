@@ -712,3 +712,13 @@ pub extern "C" fn gex_fjit_installed(n: u32) {
     let dirs = lock(&MODULES).get(n as usize).map(|m| m.dirs.clone()).unwrap_or_default();
     crate::cgen::write_dirs(dirs);
 }
+
+/// The translator's line (`gex_xlate::fjit::Jit::stats`: modules, time,
+/// and how often its lock was found held), for the host to print as the
+/// process ends.
+#[no_mangle]
+pub extern "C" fn gex_fjit_report() {
+    if let (true, Some(jit)) = (on(), JIT.get()) {
+        crate::warn_line(&format!("[gex] fjit: {} (translated {}, declined {})\n", jit.stats(), TRANSLATED.load(Ordering::Relaxed), DECLINED.load(Ordering::Relaxed)));
+    }
+}

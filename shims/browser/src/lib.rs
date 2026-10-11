@@ -5844,7 +5844,7 @@ fn tracing() -> bool {
 
 /// Something a person must see whatever the tracing settings, on the host's
 /// console at error level rather than in the guest's output.
-fn warn_line(s: &str) {
+pub(crate) fn warn_line(s: &str) {
     unsafe { warn(s.as_ptr() as u32, s.len() as u32) };
 }
 
