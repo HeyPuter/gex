@@ -8171,6 +8171,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     FILL_ASKED.0.borrow_mut().clear();
     FILL_FAILED.0.borrow_mut().clear();
     SERVED_PAGE.0.borrow_mut().clear();
+    // And the bases blocks were installed under: the page table starts over
+    // below, and a page of the new program has nothing installed yet.
+    LIVE_BASE.0.borrow_mut().clear();
     // And the modules inherited from the parent: they cover the PARENT's pages.
     // The new program's image sits at the same PIE base, so a page number the
     // parent's image had is now another program's code; a fill answered from
