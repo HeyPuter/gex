@@ -41,6 +41,12 @@ struct WinePe {
     pending: Vec<(u64, Vec<u8>)>,
     wasm: Vec<u8>,
     installed: bool,
+    /// The DLLs whose skeleton has been mapped. A later mapping of one (an
+    /// image view: wineboot's install maps DLLs so) binds its exports but
+    /// writes none of the variables, which are the loaded DLL's -- under W3
+    /// rewriting them reset ntdll's `__wine_unixlib_handle`, which Wine's
+    /// own loader had set (as the native host found).
+    mapped: std::collections::HashSet<String>,
 }
 
 static WINE_PE: Mutex<Option<WinePe>> = Mutex::new(None);
@@ -119,7 +125,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
         let data_exports = exported_offsets(&wasm)?;
         let number = lock(&PROVIDERS).len() as u32;
-        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, installed: false });
+        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, installed: false, mapped: Default::default() });
     }
     let wp = g.as_mut().expect("Wine's PE module");
     let slot = |n: &str| wp.slots.get(n).copied();
@@ -160,7 +166,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     }
     // winecrt0's base of this DLL: the skeleton's (after the module's data
     // initialisation: at its install for the first DLL, now for later ones)
-    if let Some(off) = wp.data_exports.get(&format!("{dll}!__gexw_image_base")) {
+    let first_mapping = wp.mapped.insert(dll.clone());
+    if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         let at = wp.data + *off as u64;
         if first {
             wp.pending.push((at, (base as u32).to_le_bytes().to_vec()));
@@ -168,7 +175,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             let _ = GuestMem::new(crate::guest_bytes()).write_u32(at, base as u32);
         }
     }
-    if dll == "ntdll.dll" {
+    if first_mapping && dll == "ntdll.dll" {
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {
                 wp.pending.push((wp.data + *off as u64, bytes));
@@ -190,6 +197,49 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         drop(g);
         bind(install, &pairs);
         Ok(-2)
+    }
+}
+
+/// `gex.image_mapped(base, fd)` (W3, docs/wine-native.md §3.17): Wine's
+/// own PE loader mapped the image open at `fd` at `base`, relocated. A
+/// native DLL's skeleton gets Wine's PE module bound at its exports, as the
+/// native host's `image_mapped` does. The module number when this is the
+/// first skeleton (the host instantiates it, then `gex_cgen_pmod_installed`
+/// and `gex_wasmdll_installed`), -2 when bound into the install (bridges
+/// to write), -3 for an i386 image with a function-tier unit to serve
+/// (`super::w3_mapped`), -1 for anything else (an i386 image stays on
+/// tier-1).
+#[no_mangle]
+pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
+    let base = base as u64;
+    let Some((path, bytes)) = crate::with_host(|h| {
+        let f = h.kernel.fds.get(fd).ok()?;
+        let size = f.handle.metadata().ok()?.size as usize;
+        let mut b = vec![0u8; size];
+        let mut at = 0;
+        while at < size {
+            match f.handle.read_at(at as u64, &mut b[at..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => at += n as usize,
+            }
+        }
+        b.truncate(at);
+        Some((f.path.clone(), b))
+    }) else {
+        return -1;
+    };
+    let Ok(pe) = gex_ld::pe::parse(&bytes) else { return -1 };
+    if !is_skeleton(&pe) {
+        // An i386 image (the program's, a game's DLL): its function-tier
+        // unit, when units are on; -3 tells JS to serve it.
+        return if super::w3_mapped(&path, base, &pe) { -3 } else { -1 };
+    }
+    match publish(&path, base, &pe) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::warn_line(&format!("gex-w3: {path}: native wasm32 DLL: {e}\n"));
+            -1
+        }
     }
 }
 
@@ -241,7 +291,9 @@ pub extern "C" fn gex_wasmdll_installed() {
         let Some(wp) = g.as_mut() else { return };
         let pending = std::mem::take(&mut wp.pending);
         let first = !std::mem::replace(&mut wp.installed, true);
-        (wp.install, wp.data, first.then(|| wp.data_exports.get("__gexw_entries").copied()).flatten(), pending)
+        let entries = first.then(|| wp.data_exports.get("__gexw_entries").copied()).flatten();
+        let decl = wp.data_exports.get("__gexw_entries_decl").copied();
+        (wp.install, wp.data, entries.map(|e| (e, decl)), pending)
     };
     let mem = crate::guest_bytes();
     for (at, bytes) in pending {
@@ -249,25 +301,38 @@ pub extern "C" fn gex_wasmdll_installed() {
             dst.copy_from_slice(&bytes);
         }
     }
-    let Some(off) = entries else { return };
+    let Some((off, decl)) = entries else { return };
     // The ICALL pass's {function, thunk} pairs (table indices): each thunk
-    // at its function's index as a guest address.
+    // at its function's index as a guest address (as the native
+    // `bind_entry_thunks`).
     let gm = GuestMem::new(crate::guest_bytes());
-    let at = data + off as u64;
-    let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + 4).unwrap_or(0) as u64);
-    if start == 0 || stop <= start {
-        return;
-    }
     let base = ftab(|m| m.install(install).base);
-    let mut pairs = Vec::new();
-    let mut a = start;
-    while a + 8 <= stop {
-        let (f, t) = (gm.read_u32(a).unwrap_or(0), gm.read_u32(a + 4).unwrap_or(0));
-        a += 8;
-        if f < base || t < base || f as u64 >= 0x3f0000 {
-            continue;
+    let read = |off: u32| -> Vec<(u64, u32)> {
+        let at = data + off as u64;
+        let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + 4).unwrap_or(0) as u64);
+        let mut out = Vec::new();
+        let mut a = start;
+        while start != 0 && a + 8 <= stop {
+            let (f, t) = (gm.read_u32(a).unwrap_or(0), gm.read_u32(a + 4).unwrap_or(0));
+            a += 8;
+            if f < base || t < base || f as u64 >= 0x3f0000 {
+                continue;
+            }
+            out.push((f as u64, t - base));
         }
-        pairs.push((f as u64, t - base));
+        out
+    };
+    let mut pairs = read(off);
+    // Thunks made where a function is handed out but not defined: only for
+    // functions no defining object gave one (it knows the convention).
+    if let Some(off) = decl {
+        let strong: std::collections::HashSet<u64> = pairs.iter().map(|&(f, _)| f).collect();
+        let mut seen = std::collections::HashSet::new();
+        for (f, t) in read(off) {
+            if !strong.contains(&f) && seen.insert(f) {
+                pairs.push((f, t));
+            }
+        }
     }
     bind(install, &pairs);
 }
@@ -401,4 +466,33 @@ pub(super) fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, Stri
         }
     }
     Ok(out)
+}
+
+/// `gex.wine_pe_slot(name)` (W3): the function-table index of a named
+/// function of Wine's PE module (win32u.so starts explorer's desktop thread
+/// by it), or 0 when the module is not installed or has no such function.
+#[no_mangle]
+pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
+    let mem = crate::guest_bytes();
+    let Some(b) = mem.get(ptr as usize..(ptr as usize).saturating_add(len as usize)) else { return 0 };
+    let name = String::from_utf8_lossy(b).into_owned();
+    let (install, k) = {
+        let g = lock(&WINE_PE);
+        let Some(wp) = g.as_ref() else { return 0 };
+        let Some(&k) = wp.slots.get(&name) else { return 0 };
+        (wp.install, k)
+    };
+    ftab(|m| m.install(install).base) + k
+}
+
+/// `gex.code_changed(addr, len)` (W3: Wine's NtFlushInstructionCache): the
+/// translations of `[addr, addr + len)` are retired, as natively.
+#[no_mangle]
+pub extern "C" fn gex_code_changed(addr: u32, len: u32) {
+    let (addr, len) = (addr as u64, len as u64);
+    let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+    if end > start {
+        crate::with_host(|h| h.kernel.retired_code.push((start, end)));
+    }
+    gex_kernel::note_code_change();
 }

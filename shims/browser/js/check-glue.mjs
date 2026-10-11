@@ -124,8 +124,10 @@ function suppliedArities(source) {
   }
   const body = source.slice(at, end);
   const out = new Map();
-  // `name: (a, b) => ...` and `name: () => ...`, at any indentation.
-  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\(([^)]*)\)\s*=>/g)) {
+  // `name: (a, b) => ...` and `name: () => ...`, at any indentation, and the
+  // single-thread build's `name: single.on ? new WebAssembly.Suspending((a, b)
+  // => ...) : (a, b) => ...`, read by its first arrow (both take the same).
+  for (const m of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:single\.on\s*\?\s*new WebAssembly\.Suspending\(\s*)?\(([^)]*)\)\s*=>/g)) {
     const params = m[2].trim();
     out.set(m[1], params ? params.split(',').length : 0);
   }

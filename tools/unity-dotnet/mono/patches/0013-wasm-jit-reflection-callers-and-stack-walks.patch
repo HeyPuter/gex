@@ -1,0 +1,116 @@
+wasm jit: compile callers of System.Reflection; keep stack walkers right (gex)
+
+The "residual reflection" refusal kept every method with a residual call into
+System.Reflection in the interpreter (PlayMaker LoadActionField in Hollow Knight). It
+guards a re-entry into a dynamic type mid-Finish, so it now applies only once a
+Reflection.Emit image exists (mono_dynamic_images_exist).
+
+Lifting it exposed what the namespace check had been hiding: JIT frames are invisible
+to stack walks. Now, as llvm_only does:
+- MethodBase.GetCurrentMethod and Assembly.GetExecutingAssembly are intrinsics under
+  COMPILE_WASM (intrinsics.c);
+- a method calling a stack-walking callee (REQSECOBJ, Type.GetType) is refused;
+- a REQSECOBJ method itself is refused (GetExecutingAssembly compiled by the JIT
+  answered System.Private.CoreLib to an interpreted caller).
+Test: T.Reflect (ReflGet, StackWalkers).
+
+diff --git a/src/mono/mono/metadata/dynamic-image.c b/src/mono/mono/metadata/dynamic-image.c
+index b4405d78c..8d2c01762 100644
+--- a/src/mono/mono/metadata/dynamic-image.c
++++ b/src/mono/mono/metadata/dynamic-image.c
+@@ -46,6 +46,16 @@ dynamic_images_unlock (void)
+ 	mono_os_mutex_unlock (&dynamic_images_mutex);
+ }
+ 
++/* gex: whether any System.Reflection.Emit image was ever created. The wasm JIT keeps its
++ * "residual reflection" refusal only then (mini-wasm-emitter.inc). An unlocked read: the
++ * array is created once and only grows. */
++gboolean
++mono_dynamic_images_exist (void)
++{
++	GPtrArray *a = dynamic_images;
++	return a && a->len;
++}
++
+ void
+ mono_dynamic_images_init (void)
+ {
+diff --git a/src/mono/mono/mini/intrinsics.c b/src/mono/mono/mini/intrinsics.c
+index 39c93f8dd..87176286f 100644
+--- a/src/mono/mono/mini/intrinsics.c
++++ b/src/mono/mono/mini/intrinsics.c
+@@ -2081,7 +2081,9 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
+ 	} else if (in_corlib &&
+ 			(strcmp (cmethod_klass_name_space, "System.Reflection") == 0) &&
+ 			(strcmp (cmethod_klass_name, "Assembly") == 0)) {
+-		if (cfg->llvm_only && !strcmp (cmethod->name, "GetExecutingAssembly")) {
++		/* gex: the wasm JIT too. Its frames are invisible to the stack walk the icall does, so from a
++		 * JIT-compiled caller the walk would answer for some interpreter frame below it. */
++		if ((cfg->llvm_only || COMPILE_WASM (cfg)) && !strcmp (cmethod->name, "GetExecutingAssembly")) {
+ 			/* No stack walks are currently available, so implement this as an intrinsic */
+ 			MonoInst *assembly_ins;
+ 
+@@ -2099,7 +2101,9 @@ mini_emit_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSign
+ 	} else if (in_corlib &&
+ 			   (strcmp (cmethod_klass_name_space, "System.Reflection") == 0) &&
+ 			   (strcmp (cmethod_klass_name, "MethodBase") == 0)) {
+-		if (cfg->llvm_only && !strcmp (cmethod->name, "GetCurrentMethod")) {
++		/* gex: the wasm JIT too. Its frames are invisible to the stack walk the icall does, so from a
++		 * JIT-compiled caller the walk would answer for some interpreter frame below it. */
++		if ((cfg->llvm_only || COMPILE_WASM (cfg)) && !strcmp (cmethod->name, "GetCurrentMethod")) {
+ 			/* No stack walks are currently available, so implement this as an intrinsic */
+ 			MonoInst *method_ins;
+ 			MonoMethod *declaring = cfg->method;
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 69f04eabb..660e37fce 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -475,6 +475,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		}
+ 	}
+ 	if (cfg->gshared) { fail = "gshared method"; goto done; }
++	/* gex: a [DynamicSecurityMethod] (StackCrawlMark) method finds its caller by walking the stack, and
++	 * a JIT-compiled frame is invisible to that walk: Assembly.GetExecutingAssembly compiled here answered
++	 * System.Private.CoreLib. The interpreter keeps these, as transform.c keeps them out of inlining. */
++	if (cfg->method->flags & METHOD_ATTRIBUTE_REQSECOBJ) { fail = "stack-walking method (REQSECOBJ)"; goto done; }
+ 	/* save_lmf methods (synchronized bodies, some wrappers) lower emit_push_lmf/emit_pop_lmf IR:
+ 	 * the LMF struct lives behind a VARLOADA'd local (a fixed 8-byte addr-frame slot here — smaller
+ 	 * than MonoLMF) and its address is PUBLISHED into the thread's LMF chain; an exceptional unwind
+@@ -3412,6 +3416,19 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			    !(lazy_ref_frame && terminal_vcall_handoff && ins == terminal_vcall_ins))
+ 				ENSURE_REF_FRAME ();
+ #endif
++			/* gex: a callee that walks the stack to find its caller ([DynamicSecurityMethod] / StackCrawlMark:
++			 * Assembly.GetCallingAssembly, Assembly.Load, Type.GetType(string), ...) cannot see a JIT-compiled
++			 * frame, so it would answer for the interpreter frame below. method_needs_stack_walk's rule, as
++			 * llvm_only + interp applies it (method-to-ir.c): keep such a caller in the interpreter.
++			 * MethodBase.GetCurrentMethod and Assembly.GetExecutingAssembly are intrinsics instead
++			 * (intrinsics.c), so they never reach here as calls. */
++			if (MONO_IS_CALL (ins)) {
++				MonoMethod *_swm = ((MonoCallInst *) ins)->method;
++				if (_swm && ((_swm->flags & METHOD_ATTRIBUTE_REQSECOBJ) ||
++				             (_swm->klass == mono_defaults.systemtype_class && !strcmp (_swm->name, "GetType")))) {
++					fail = "callee needs a stack walk"; goto done;
++				}
++			}
+ 			switch (ins->opcode) {
+ 			case OP_NOP: case OP_IL_SEQ_POINT: case OP_SEQ_POINT:
+ 			case OP_DUMMY_USE: case OP_NOT_REACHED: case OP_START_HANDLER:
+@@ -5221,8 +5238,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					/* Don't residual reflection methods: running e.g. MonoMethodInfo:get_parameter_info via
+ 					 * interp_entry while a dynamic type is mid-Finish can re-enter that type's Finish. Bail
+ 					 * these to the interpreter; keep the rest. */
+-					{ const char *_ns = m_class_get_name_space (call->method->klass);
+-					  if (_ns && !strncmp (_ns, "System.Reflection", 17)) { fail = "residual reflection"; goto done; } }
++					/* gex: only once a Reflection.Emit image exists. That re-entry needs a dynamic type to
++					 * be mid-Finish, so a process that never made one (Unity games: PlayMaker's
++					 * LoadActionField calls FieldInfo through here 145k times a minute in Hollow Knight)
++					 * kept the interpreter for every such caller for nothing. A method compiled before the
++					 * first dynamic image keeps its residual; IKVM, the workload the refusal was written
++					 * for, creates its dynamic assembly at startup, before anything is hot. */
++					{ extern gboolean mono_dynamic_images_exist (void);
++					  const char *_ns = m_class_get_name_space (call->method->klass);
++					  if (_ns && !strncmp (_ns, "System.Reflection", 17) && mono_dynamic_images_exist ()) { fail = "residual reflection"; goto done; } }
+ 					/* gex: an InternalCall / P/Invoke into guest code is called from the scratch directly
+ 					 * (mono_wasm_jit_gex_native_call, interp.c), not through the interpreter: no self-healing
+ 					 * block (it never gets an f-slot), no pretransform, the same spill and result protocol. */

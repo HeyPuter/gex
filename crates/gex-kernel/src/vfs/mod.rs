@@ -227,18 +227,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether the peer has shut its sending side, so reading ends at EOF
+    /// once the buffer is empty: `POLLRDHUP` / `EPOLLRDHUP`, reported only
+    /// when asked for.
+    fn poll_rdhup(&self) -> bool {
+        false
+    }
+
     /// This handle as a unix socket, when it is one: the syscalls that need
     /// the concrete type (descriptor passing, `listen`, `accept`) recover it
     /// from the handle, whichever process made it.
     fn as_unix_socket(self: Arc<Self>) -> Option<Arc<crate::unix::UnixSocket>> {
         None
-    }
-
-    /// `shutdown(SHUT_WR)` on a socket that is not a [`crate::unix::UnixSocket`]
-    /// but can still close its sending direction (a shared socketpair end).
-    /// False: not such a handle, and `shutdown` carries on as before.
-    fn shutdown_write(&self) -> bool {
-        false
     }
 
     /// A short description of this handle's state, for a diagnostic: the

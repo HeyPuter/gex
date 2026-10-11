@@ -333,6 +333,7 @@ extern "C" {
     fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
+    fn k_mod_ids_for_object(obj: u64, from: u32, out: gex_kernel::PAddr, cap: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
     fn k_mod_dirs_len(id: u32) -> u32;
@@ -406,11 +407,27 @@ extern "C" {
     fn k_sock_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_readable(id: i32) -> i32;
+    fn k_sock_hup(id: i32) -> i32;
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
     fn k_sock_close(id: i32);
-    fn k_sock_shutdown(id: i32);
+    fn k_sock_shutdown(id: i32, how: u32) -> i32;
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
+    fn k_sock_dup(id: i32) -> i32;
+    fn k_boot_secs(want: u32) -> u32;
+    fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn k_sock_read_fds(
+        id: i32,
+        at: gex_kernel::PAddr,
+        len: u32,
+        max_fds: u32,
+        peek: i32,
+        pid: i32,
+        out: gex_kernel::PAddr,
+        out_cap: u32,
+    ) -> i32;
 
 }
 
@@ -1089,14 +1106,74 @@ extern "C" fn rs_writable(id: i32) -> i32 {
 extern "C" fn rs_available(id: i32) -> i32 {
     unsafe { k_sock_available(id) }
 }
+extern "C" fn rs_hup(id: i32) -> i32 {
+    unsafe { k_sock_hup(id) }
+}
 extern "C" fn rs_close(id: i32) {
     unsafe { k_sock_close(id) }
 }
-extern "C" fn rs_shutdown(id: i32) {
-    unsafe { k_sock_shutdown(id) }
+extern "C" fn rs_shutdown(id: i32, how: u32) -> i32 {
+    unsafe { k_sock_shutdown(id, how) }
 }
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
+}
+extern "C" fn rs_pair(out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_pair(out) }
+}
+extern "C" fn rs_dup(id: i32) -> i32 {
+    unsafe { k_sock_dup(id) }
+}
+extern "C" fn rs_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32 {
+    unsafe { k_sock_write_fds(id, at, len, descs, descs_len) }
+}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn rs_read_fds(
+    id: i32,
+    at: gex_kernel::PAddr,
+    len: u32,
+    max_fds: u32,
+    peek: i32,
+    pid: i32,
+    out: gex_kernel::PAddr,
+    out_cap: u32,
+) -> i32 {
+    unsafe { k_sock_read_fds(id, at, len, max_fds, peek, pid, out, out_cap) }
+}
+
+/// Descriptors for `SCM_RIGHTS` that cannot leave this process -- an epoll
+/// set, a memfd, a local socket -- parked by number for a receiver that turns
+/// out to be this same process (a wineserver thread hearing from its own
+/// process's client). Another process finds no entry and gets nothing.
+static LOCAL_FDS: std::sync::Mutex<(u32, Vec<(u32, Arc<gex_kernel::file::OpenFile>)>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+
+/// A descriptor as a line another process can rebuild it from. See
+/// [`carry_name`]; what has no name to travel by is parked in [`LOCAL_FDS`].
+fn scm_describe(k: &gex_kernel::syscalls::Kernel, file: &Arc<gex_kernel::file::OpenFile>) -> Option<String> {
+    const IN_FLIGHT: i32 = -1;
+    let name = carry_name(k, file, IN_FLIGHT).unwrap_or_else(|| {
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        t.0 += 1;
+        let n = t.0;
+        t.1.push((n, Arc::clone(file)));
+        format!("local:{}:{n}", my_pid())
+    });
+    Some(format!("{} {} {}", file.flags(), file.offset(), name))
+}
+
+fn scm_rebuild(k: &mut gex_kernel::syscalls::Kernel, desc: &str) -> Option<Arc<gex_kernel::file::OpenFile>> {
+    let mut p = desc.splitn(3, ' ');
+    let flags = p.next()?.parse::<u64>().ok()?;
+    let offset = p.next()?.parse::<u64>().ok()?;
+    let name = p.next()?;
+    match rebuild_carried(k, name, flags, offset) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn_line(&format!("gex: SCM_RIGHTS lost '{name}': {e}\n"));
+            None
+        }
+    }
 }
 
 /// Where a unix socket's two ends live, when there is a global kernel to put
@@ -1105,6 +1182,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    // And one boot instant for every process's monotonic clocks.
+    gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
     Some(gex_kernel::unix::Remote {
         bind: rs_bind,
         connect: rs_connect,
@@ -1116,8 +1195,15 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         writable: rs_writable,
         available: rs_available,
         close: rs_close,
+        hup: rs_hup,
         shutdown: rs_shutdown,
         exists: rs_exists,
+        pair: rs_pair,
+        dup: rs_dup,
+        write_fds: rs_write_fds,
+        read_fds: rs_read_fds,
+        describe: scm_describe,
+        rebuild: scm_rebuild,
     })
 }
 
@@ -1953,6 +2039,85 @@ pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
 static PER_MISS_N: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(16);
 
+/// The most blocks one dispatch miss lifts (discovery follows successors,
+/// call returns and folded call targets breadth-first up to this). 1 lifts
+/// only the block that missed, so the blocks lifted are the blocks run.
+static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+
+/// What the runtime translator did in this process, for `gex_xlate_stat`:
+/// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
+/// that lifted), 3 self-modifying-code page invalidations, 4 pages retired by
+/// unmap/reprotect, 5 retire calls, 6 blocks lifted by misses on a page that
+/// was retired or invalidated before (re-lifts), 7 blocks lifted outside any
+/// named object (a guest JIT's code), 8 wasm bytes of the re-lifts, 9 wasm
+/// bytes of the blocks outside any named object.
+pub(crate) static XLATE_STAT: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// `gex_set_xlate_report(n)` (`?xlatereport=N`, `GEX_XLATE_REPORT=N`): a
+/// progress line every `n` translations (0: none), so a run that never exits
+/// (a game) still says what it translated, from where, and how much again.
+static XLATE_REPORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `gex_set_t1_fold(1)` (`?t1fold=1`, GEX_T1_FOLD): tier-1's tee folding
+/// (gex-emit `set_t1_fold`).
+#[no_mangle]
+pub extern "C" fn gex_set_t1_fold(on: u32) {
+    gex_emit::tier1::set_t1_fold(on != 0);
+}
+
+/// `gex_set_discover_skip(bits)` (`GEX_DISCOVER_SKIP`): edges the runtime
+/// translator's discovery does not follow (gex-xlate `set_discover_skip`).
+#[no_mangle]
+pub extern "C" fn gex_set_discover_skip(bits: u32) {
+    gex_xlate::set_discover_skip(bits);
+}
+
+/// The discovery log's text (`GEX_DISCOVER_SKIP` bit 8), for `gex_dl_text`.
+static DL_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Copy the discovery log's text to `ptr` (at most `cap` bytes) and return its
+/// length; with `cap` 0 only the length.
+#[no_mangle]
+pub extern "C" fn gex_dl_text(ptr: u32, cap: u32) -> u32 {
+    let t = DL_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+    let n = t.len().min(cap as usize);
+    if n > 0 {
+        // SAFETY: the caller allocated `cap` bytes at `ptr` (gex_alloc).
+        unsafe { std::ptr::copy_nonoverlapping(t.as_ptr(), ptr as usize as *mut u8, n) };
+    }
+    t.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_set_xlate_report(n: u32) {
+    XLATE_REPORT.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn xlate_add(i: usize, n: u64) {
+    XLATE_STAT[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "C" fn gex_xlate_stat(i: u32) -> i64 {
+    XLATE_STAT.get(i as usize).map_or(-1, |c| c.load(std::sync::atomic::Ordering::Relaxed) as i64)
+}
+
+/// `gex_set_inline_dispatch(1)` (`?inlinedispatch=1`, `GEX_INLINE_DISPATCH=1`
+/// under run-node): blocks translated after this carry their dispatch inline
+/// instead of tail-calling their module's `enter` (gex-emit
+/// `set_inline_dispatch`).
+#[no_mangle]
+pub extern "C" fn gex_set_inline_dispatch(on: i32) {
+    gex_emit::tier1::set_inline_dispatch(on != 0);
+}
+
+/// Set that, from the host (`?liftmax=N`, `GEX_LIFT_MAX`).
+#[no_mangle]
+pub extern "C" fn gex_set_lift_max(n: u32) {
+    if n > 0 {
+        LIFT_MAX.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Set that, from the host.
 #[no_mangle]
 pub extern "C" fn gex_set_per_miss(n: u32) {
@@ -2245,6 +2410,14 @@ fn arena_back(end: u64) -> Option<u64> {
             memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest mapping (high arena)");
         }
         return Some(prev);
+    }
+    // Nothing past the guest's slice (`GUEST_LIMIT`): the kernel could map
+    // it, but every access to it (an anonymous mapping's zeroing first)
+    // faults. Wine's reservation of everything above 0x7ffe0000 (W3) then
+    // shrinks to what the guest can name, as reserve_area halves on a
+    // failure.
+    if end > GUEST_LIMIT {
+        return None;
     }
     if !grow_memory_to(end) {
         return None;
@@ -2566,6 +2739,10 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// Per object, how many of the kernel's modules for it (in its order) are
+    /// all in `installed_mods`: a miss reads the list from there on, not from
+    /// the start. See `shared_modules_of_object`.
+    obj_cursor: std::collections::HashMap<u64, u32>,
     /// The dense base each stored module (by store id) was given here: the
     /// store keeps the bytes as built, and `backfill_registry` must keep
     /// them as installed (`dense`).
@@ -2618,6 +2795,8 @@ struct Jit {
     /// Blocks lifted per object, with the address range: the range says whether
     /// a closure is missing an object or only part of one.
     by_object: std::collections::BTreeMap<String, (u64, u64, u64)>,
+    /// Wasm bytes emitted, by object (as `by_object`). See `xlate_report`.
+    obj_wasm: std::collections::BTreeMap<String, u64>,
     compiles: u64,
     /// Nanoseconds lifting and encoding -- the shim's share of a miss; the
     /// engine's compile of the output is JS's.
@@ -4045,6 +4224,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
+            obj_cursor: Default::default(),
                 dense_base: Default::default(),
                 retired_pages: Default::default(),
                 remiss: Default::default(),
@@ -4062,6 +4242,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 blocks: 0,
                 lift_in_closure: 0,
             by_object: Default::default(),
+            obj_wasm: Default::default(),
                 compiles: 0,
                 nanos: 0,
             },
@@ -5540,7 +5721,7 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         kernel
             .remote_sockets
             .values()
-            .any(|r| Arc::as_ptr(r) as *const () == p)
+            .any(|r| r.as_ptr() as *const () == p && r.strong_count() > 0)
     };
     match &t.waiting {
         // A terminal: nobody but the page can type into it. Nor a socket
@@ -6031,6 +6212,24 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    // A Unix call from guest code under Wine's own Unix side (W3): `int 0x80`
+    // with EAX = UNIX_CALL from the trampoline page. ntdll.so's handler takes
+    // it, nested, and sets EAX; the guest goes on after the syscall.
+    // And native Wine's NATIVE_LEFT (gexrt), served as for an NT process.
+    if IN_PROVIDER.with(|c| c.get()) {
+        nt::native_left(ctx, pc);
+    } else {
+        let hook = cgen::guest_unix_call_hook();
+        if hook != 0 {
+            let gm = GuestMem::new(guest_bytes());
+            let eax = gm.read_u64(ctx as u32 as u64 + ctx::x(0) as u64).unwrap_or(0) as u32;
+            if eax == gex_kernel::nt::gex_nr::UNIX_CALL {
+                // SAFETY: a host import taking scalars; no lock is held.
+                unsafe { cgen::ftab_call_vi(hook as i32, ctx) };
+                return;
+            }
+        }
+    }
     fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
@@ -7107,41 +7306,9 @@ pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
 fn stage_fork_fds(h: &Host, child: i32) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
-        // A pipe end is re-opened in the global kernel, or the parent closing
-        // its copy looks like the last reference and the reader sees a false
-        // EOF. What the child reopens: a path by default, an id when the kernel
-        // holds the open file, since an id survives the unlink of a file a
-        // child would otherwise fail to reopen by name.
-        let mut name = file.path.clone();
-        if let Some(id) = pipe_id(&file.path) {
-            let write = file.writable;
-            unsafe { k_pipe_open_end(id, write as i32, child) };
-        } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(&file.path) {
-            // A socketpair end is two pipe ends, both the child's to hold.
-            unsafe {
-                k_pipe_open_end(rx, 0, child);
-                k_pipe_open_end(tx, 1, child);
-            }
-        } else if let Some((id, master)) = pty_ref(&file.path) {
-            // The child inherits this pty end; open it on the child's behalf so
-            // the parent's copy closing is not the last reference.
-            unsafe { k_pty_open_end(id, master as i32, child) };
-            pty_note("hands on", id, master as i32, child);
-        } else if let Some(id) = file.handle.remote_id() {
-            let dup = unsafe { k_fs_dup(id) };
-            if dup < 0 {
-                warn_line(&format!(
-                    "gex: fork could not hand fd {fd} ({}) to pid {child}\n",
-                    file.path
-                ));
-                continue;
-            }
-            name = format!("#{dup}");
-        } else if !file.path.starts_with('/') {
-            // Not a path, not a pipe, and not the terminal: a socket. Nothing
-            // here can rebuild that from a name.
+        let Some(name) = carry_name(&h.kernel, &file, child) else {
             continue;
-        }
+        };
         out.push_str(&format!(
             "{} {} {} {} {}\n",
             fd,
@@ -7152,6 +7319,45 @@ fn stage_fork_fds(h: &Host, child: i32) {
         ));
     }
     *FORK_FDS.0.borrow_mut() = out;
+}
+
+/// The name a descriptor travels to another process by -- a fork's child, or
+/// the far end of `SCM_RIGHTS` -- taking whatever reference keeps it open on
+/// the way. `holder` is who a pipe or pty end is opened for: the child, or no
+/// one yet (the global kernel moves it to the receiver).
+///
+/// A pipe end is re-opened in the global kernel, or the sender closing its
+/// copy looks like the last reference and the reader sees a false EOF. A file
+/// the global kernel holds goes as a duplicated id, which survives the unlink
+/// of a file the receiver would otherwise fail to reopen by name; anything
+/// else with a path, by path. `None`: nothing with a name -- a local socket,
+/// an epoll set.
+fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
+    if let Some(id) = pipe_id(&file.path) {
+        unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
+        return Some(file.path.clone());
+    }
+    if let Some((id, master)) = pty_ref(&file.path) {
+        unsafe { k_pty_open_end(id, master as i32, holder) };
+        pty_note("hands on", id, master as i32, holder);
+        return Some(file.path.clone());
+    }
+    if let Some(id) = file.handle.remote_id() {
+        let dup = unsafe { k_fs_dup(id) };
+        if dup < 0 {
+            warn_line(&format!("gex: could not hand {} to another process\n", file.path));
+            return None;
+        }
+        // With its path after a colon, for what reads it back (`/proc`,
+        // W3's image hook finding the module beside a DLL).
+        return Some(format!("#{dup}:{}", file.path));
+    }
+    if let Some(sock) = k.remote_unix_of_file(file) {
+        // A socket in the global kernel: another id on the same end.
+        let dup = sock.dup_id()?;
+        return Some(format!("sock:{dup}:{}", sock.listening as i32));
+    }
+    file.path.starts_with('/').then(|| file.path.clone())
 }
 
 /// The console descriptors, rebuilt in a child from the name alone. A fork
@@ -7233,95 +7439,14 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = if let Some(id) = pipe_id(path) {
-                let Some(r) = global_pipes() else { continue };
-                // The parent already opened this end on the child's behalf,
-                // before the copy was taken; nothing to open here.
-                let write = flags & gex_kernel::fs::oflags::ACCMODE
-                    != gex_kernel::fs::oflags::O_RDONLY;
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemotePipeEnd {
-                        id,
-                        write,
-                        remote: r,
-                    }),
-                    path.to_string(),
-                    flags,
-                    !write,
-                    write,
-                )
-            } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(path) {
-                // Both pipe ends were opened for the child by the parent.
-                let Some(r) = global_pipes() else { continue };
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemoteSockEnd::new(rx, tx, r)),
-                    path.to_string(),
-                    flags,
-                    true,
-                    true,
-                )
-            } else if let Some((id, master)) = pty_ref(path) {
-                // Same as a pipe end: the parent already opened it for the child.
-                let Some(r) = global_ptys() else { continue };
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
-                    path.to_string(),
-                    flags,
-                    true,
-                    true,
-                )
-            } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
-                // An id the parent already asked the global kernel to
-                // duplicate, so this file is the parent's file whatever has
-                // happened to its name since.
-                let Some(root) = global_root() else { continue };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    gex_kernel::vfs::remote::adopt(root.remote(), id),
-                    String::new(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
-            } else if let Some((handle, readable, writable)) = console_handle(path) {
-                // The terminal, which is this Worker's and not a file. A dup
-                // of it in the parent has to be a dup of it here.
-                gex_kernel::file::OpenFile::new(handle, path.to_string(), flags, readable, writable)
-            } else {
-                // Through the child's own mounts, not the bare root: `/dev` and
-                // `/proc` are per-process, so `/dev/null` is not in the shared
-                // filesystem by name.
-                use gex_kernel::vfs::FileSystem;
-                let handle = h.kernel.vfs.open(path, flags, 0).or_else(|e| {
-                    match global_root() {
-                        Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
-                        None => Err(e),
-                    }
-                });
-                let handle = match handle {
-                    Ok(h) => h,
-                    Err(e) => {
-                        // Never quietly: a missing descriptor is an `EBADF` at
-                        // the child's first use, far from here.
-                        warn_line(&format!(
-                            "gex: fork left fd {fd} ({path}) behind: errno {}\n",
-                            e.0
-                        ));
-                        continue;
-                    }
-                };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    handle,
-                    path.to_string(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
+            let file = match rebuild_carried(&mut h.kernel, path, flags, offset) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Never quietly: a missing descriptor is an `EBADF` at
+                    // the child's first use, far from here.
+                    warn_line(&format!("gex: fork left fd {fd} ({path}) behind: {e}\n"));
+                    continue;
+                }
             };
             if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
                 n += 1;
@@ -7329,6 +7454,143 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
         }
         n
     })
+}
+
+/// The other half of [`carry_name`]: the open file a name stands for, in
+/// this process. The reference the sender took is this one now; nothing more
+/// is opened for a pipe, pty, file id or socket id.
+fn rebuild_carried(
+    k: &mut gex_kernel::syscalls::Kernel,
+    path: &str,
+    flags: u64,
+    offset: u64,
+) -> Result<Arc<gex_kernel::file::OpenFile>, String> {
+    use gex_kernel::file::OpenFile;
+    use gex_kernel::fs::oflags;
+    let acc = flags & oflags::ACCMODE;
+    let file = if let Some(id) = pipe_id(path) {
+        let r = global_pipes().ok_or("no global kernel")?;
+        let write = acc != oflags::O_RDONLY;
+        OpenFile::new(
+            Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write, remote: r }),
+            path.to_string(),
+            flags,
+            !write,
+            write,
+        )
+    } else if let Some((id, master)) = pty_ref(path) {
+        let r = global_ptys().ok_or("no global kernel")?;
+        OpenFile::new(
+            Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
+            path.to_string(),
+            flags,
+            true,
+            true,
+        )
+    } else if let Some((id, name)) = path.strip_prefix('#').and_then(|v| {
+        let (id, name) = v.split_once(':').unwrap_or((v, ""));
+        Some((id.parse::<i32>().ok()?, name))
+    }) {
+        let root = global_root().ok_or("no global kernel")?;
+        let f = OpenFile::new(
+            gex_kernel::vfs::remote::adopt(root.remote(), id),
+            name.to_string(),
+            flags,
+            acc != oflags::O_WRONLY,
+            acc != oflags::O_RDONLY,
+        );
+        f.set_offset(offset);
+        f
+    } else if let Some(rest) = path.strip_prefix("sock:") {
+        let r = global_sockets().ok_or("no global kernel")?;
+        let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
+        let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
+        let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
+        let handle: Arc<dyn FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        k.note_remote_unix(key, &sock);
+        OpenFile::new(handle, "socket".to_string(), flags, true, true)
+    } else if let Some(rest) = path.strip_prefix("local:") {
+        let (pid, n) = rest.split_once(':').ok_or("bad local name")?;
+        if pid.parse::<i32>().ok() != Some(my_pid()) {
+            return Err(format!("parked in pid {pid}, not here"));
+        }
+        let n = n.parse::<u32>().map_err(|_| "bad local number")?;
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = t.1.iter().position(|e| e.0 == n).ok_or("already taken")?;
+        return Ok(t.1.swap_remove(i).1);
+    } else if let Some((handle, readable, writable)) = console_handle(path) {
+        // The terminal, which is this Worker's and not a file.
+        OpenFile::new(handle, path.to_string(), flags, readable, writable)
+    } else {
+        // Through this process's own mounts, not the bare root: `/dev` and
+        // `/proc` are per-process, so `/dev/null` is not in the shared
+        // filesystem by name.
+        use gex_kernel::vfs::FileSystem;
+        let handle = k
+            .vfs
+            .open(path, flags, 0)
+            .or_else(|e| match global_root() {
+                Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
+                None => Err(e),
+            })
+            .map_err(|e| format!("errno {}", e.0))?;
+        let f = OpenFile::new(handle, path.to_string(), flags, acc != oflags::O_WRONLY, acc != oflags::O_RDONLY);
+        f.set_offset(offset);
+        f
+    };
+    Ok(file)
+}
+
+/// The kernel's half of W3's address-space split (see
+/// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
+/// for there, what the host left below 2 GiB the process's own arena, and the
+/// i386 code kept off the shim's heap above it.
+pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
+    mem.set_mmap_top(0x7ffe_0000);
+    mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    // And the low space a wasm32 program leaves free, between the dispatch
+    // directory and its stack (its image and break are above, in the
+    // placement window): where a Windows executable's 0x400000 is.
+    mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
+    // An access there faults, as in the NT layer.
+    gex_xlate::set_guard_limit(0x8000_0000);
+}
+
+/// Where this process's Windows address space starts (W3), or 0: what a fork
+/// hands its child to split at the same line.
+#[no_mangle]
+pub extern "C" fn gex_windows_space() -> u32 {
+    nt::windows_space() as u32
+}
+
+/// A fresh W3 process (the host saw the program's i386 flag before loading
+/// it): the split, first thing after instantiation, so the line sits at the
+/// bottom of the arena rather than above the startup heap. Where the Windows
+/// space starts, or 0 on failure.
+#[no_mangle]
+pub extern "C" fn gex_split_windows_space() -> u32 {
+    match nt::split_windows_space() {
+        Ok(lo) => lo as u32,
+        Err(e) => {
+            warn_line(&format!("gex: W3: {e}\n"));
+            0
+        }
+    }
+}
+
+/// A forked child of a W3 process: the split, first thing after
+/// instantiation, before the heap takes a span. Zero, or -1 on failure.
+#[no_mangle]
+pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
+    match nt::adopt_windows_space(lo as u64) {
+        Ok(()) => 0,
+        Err(e) => {
+            warn_line(&format!("gex: W3 child: {e}\n"));
+            -1
+        }
+    }
 }
 
 /// A child `fork` has made that the host has not built a Worker for: pid, entry
@@ -7698,6 +7960,8 @@ pub extern "C" fn gex_adopt_child(
     phase(1);
     // The slot maps the copied low region names are the parent's.
     dense::child();
+    // So is the probe cache, which names the parent's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -7731,6 +7995,9 @@ pub extern "C" fn gex_adopt_child(
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
     kernel.mem.grows_on_demand(arena_grow, arena_back);
+    if nt::windows_space() != 0 {
+        w3_address_space(&mut kernel.mem, nt::windows_space());
+    }
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
     // into, and the parent parked on exactly that.
@@ -7848,6 +8115,7 @@ pub extern "C" fn gex_adopt_child(
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
+            obj_cursor: Default::default(),
             dense_base: Default::default(),
             retired_pages: Default::default(),
             remiss: Default::default(),
@@ -7865,6 +8133,7 @@ pub extern "C" fn gex_adopt_child(
             blocks: 0,
             lift_in_closure: 0,
             by_object: Default::default(),
+            obj_wasm: Default::default(),
             compiles: 0,
             nanos: 0,
         }},
@@ -8066,6 +8335,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
         }
     }
+    // The probe cache names the old program's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
@@ -8962,24 +9233,45 @@ fn shared_modules_of_object(
     obj: u64,
     max_mods: usize,
     max_bytes: u64,
-) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+) -> (Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)>, u32) {
     phase(13);
     let mut out = Vec::new();
     let mut took = 0u64;
     let mut left_behind = 0usize;
     let mut left_bytes = 0u64;
+    let from = h.jit.obj_cursor.get(&obj).copied().unwrap_or(0);
+    let mut lead = 0u32;
     // SAFETY: scalars in, and the readers below size their buffers from the
     // kernel's own answer before asking it to fill them.
     unsafe {
         if k_present() == 0 {
-            return out;
+            return (out, 0);
         }
-        for n in 0.. {
-            let id = k_mod_for_object(obj, n);
-            if id == 0 {
+        // The ids from the first one not known installed, in one call.
+        let mut ids: Vec<u32> = Vec::new();
+        loop {
+            let mut chunk = vec![0u32; 4096];
+            let got = k_mod_ids_for_object(obj, from + ids.len() as u32, chunk.as_mut_ptr() as gex_kernel::PAddr, 4096);
+            ids.extend_from_slice(&chunk[..got as usize]);
+            if got < 4096 {
                 break;
             }
-            if h.jit.installed_mods.contains(&id) || out.iter().any(|(i, ..)| *i == id) {
+        }
+        let mut leading = true;
+        for &id in &ids {
+            if h.jit.installed_mods.contains(&id) {
+                if leading {
+                    lead += 1;
+                }
+                continue;
+            }
+            leading = false;
+            // Full: the rest are the next miss's (only the trace below
+            // counts them).
+            if out.len() >= max_mods && !tracing() {
+                break;
+            }
+            if out.iter().any(|(i, ..)| *i == id) {
                 continue;
             }
             let len = k_mod_len(id) as usize;
@@ -9042,7 +9334,7 @@ fn shared_modules_of_object(
             left_bytes / 1024,
         ));
     }
-    out
+    (out, from + lead)
 }
 
 /// Fill the registry with every module this process has already installed, so
@@ -10435,9 +10727,22 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
+    // Which process and what is mapped there: with a Worker per process the
+    // console interleaves them all.
+    let vma = with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
+            .map(|v| format!("{:#x}-{:#x} {}", v.start, v.end, v.name))
+            .unwrap_or_else(|| "unmapped".into())
+    });
     trace_line(&format!(
-        "gex: illegal instruction {:#010x} at pc={:#x}\n",
-        raw as u32, pc
+        "gex: pid {}: illegal instruction {:#010x} at pc={:#x} ({vma})\n",
+        my_pid(),
+        raw as u32,
+        pc
     ));
     with_host(|h| set_exit(h, 128 + 4));
     trap();
@@ -10869,6 +11174,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
             h.jit.translated.retain(|&a| a < lo || a >= hi);
+            xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
             // time and this is the runtime keeping up, not a fault.
@@ -11320,6 +11626,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     if cgen::libprov::replaced(pc) {
         cgen::libprov::note_stray(pc);
+    }
+    // W3: the first miss in an image Wine relocated after mapping it, whose
+    // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
+    // guest goes on at this pc.
+    if cgen::w3_miss(pc) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
     }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
@@ -11791,12 +12107,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // size behind it, and the lot is however many megabytes of wasm
                 // somebody stored: a finished object served 317 MiB in one miss.
                 // What this leaves is taken by the next miss.
-                let ready = shared_modules_of_object(
+                let obj = object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0);
+                let (ready, cursor) = shared_modules_of_object(
                     h,
-                    object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
+                    obj,
                     if whole { usize::MAX } else { per_miss },
                     SERVE_MAX_BYTES,
                 );
+                h.jit.obj_cursor.insert(obj, cursor);
                 // Only modules whose every page base agrees with this process's
                 // numbering (or names a page not numbered here yet). A module is
                 // written at the bases the process that BUILT it gave its pages;
@@ -11989,16 +12307,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         }
         phase(11);
-    let (unit, stats) = gex_xlate::translate_runtime(
+    // The page table moves in and back out: cloning it (a BTreeMap of every
+    // page the process has numbered) on each miss, twice, was a second of a
+    // node start-up's 7,400 misses.
+    let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
-            h.jit.page_table.clone(),
+            std::mem::take(&mut h.jit.page_table),
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            2048,
+            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -12006,6 +12327,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             &h.jit.intrinsics,
         );
         h.jit.translated = known;
+        h.jit.page_table = std::mem::take(&mut unit.page_table);
         if pc == 0x10f6d24 {
             let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
@@ -12017,7 +12339,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if stats.blocks == 0 {
             return false;
         }
-        h.jit.page_table = unit.page_table.clone();
+        xlate_add(0, stats.instructions as u64);
+        xlate_add(1, stats.wasm_bytes as u64);
+        xlate_add(2, 1);
         // Into the system-wide store, so a sibling installs it rather than
         // re-lifting. Published by what the unit *covers*, not what it allocated
         // (handed the allocation list, nine of ten units published nothing); the
@@ -12122,7 +12446,30 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         h.jit.blocks += stats.blocks as u64;
         let whose = object_name_at(h, pc);
+        if whose.is_empty() {
+            xlate_add(7, stats.blocks as u64);
+            xlate_add(9, stats.wasm_bytes as u64);
+        }
+        if h.jit.retired_pages.contains(&page) {
+            xlate_add(6, stats.blocks as u64);
+            xlate_add(8, stats.wasm_bytes as u64);
+        }
+        *h.jit.obj_wasm.entry(whose.clone()).or_insert(0) += stats.wasm_bytes as u64;
         note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
+        // `GEX_DISCOVER_SKIP` bit 8: what discovery lifted and why, one
+        // `address why depth object` line a block, read at exit
+        // (`gex_dl_text`, run-node's GEX_DL_FILE; docs/jit-guest.md).
+        let dlog = gex_xlate::take_discover_log();
+        if !dlog.is_empty() {
+            let mut t = DL_TEXT.lock().unwrap_or_else(|e| e.into_inner());
+            for (a, why, depth) in dlog {
+                t.push_str(&format!("{a:x} {why} {depth} {}\n", object_name_at(h, a)));
+            }
+        }
+        let every = XLATE_REPORT.load(std::sync::atomic::Ordering::Relaxed);
+        if every != 0 && XLATE_STAT[2].load(std::sync::atomic::Ordering::Relaxed) % every == 0 {
+            xlate_report(h);
+        }
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
@@ -12291,9 +12638,13 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
             continue;
         }
         h.jit.translated.retain(|a| *a < start || *a >= end);
+        xlate_add(5, 1);
         for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 break;
+            }
+            if h.jit.page_table.lookup(page).is_some() {
+                xlate_add(4, 1);
             }
             h.jit.page_table.forget(page);
             h.jit.retired_pages.insert(page);
@@ -12883,6 +13234,27 @@ fn note_process_syscall(base: u64, pc: i64) {
 }
 
 /// Add `n` blocks lifted at `a` to what `whose` has cost so far.
+/// One progress line: the translator's counters and the objects it lifted
+/// most from, by wasm emitted. See `XLATE_REPORT`.
+fn xlate_report(h: &Host) {
+    let x = |i: usize| XLATE_STAT[i].load(std::sync::atomic::Ordering::Relaxed);
+    let mut v: Vec<(&String, &u64)> = h.jit.obj_wasm.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let objs = v
+        .iter()
+        .take(6)
+        .map(|(k, w)| {
+            let n = h.jit.by_object.get(*k).map_or(0, |e| e.0);
+            format!("{}={}blk/{}KiB", if k.is_empty() { "(anon)" } else { k.as_str() }, n, **w >> 10)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    warn_line(&format!(
+        "[gex] xlate: units={} insns={} wasm={}KiB smc={} retiredPages={} relift={}blk/{}KiB anon={}blk/{}KiB [{objs}]\n",
+        x(2), x(0), x(1) >> 10, x(3), x(4), x(6), x(8) >> 10, x(7), x(9) >> 10,
+    ));
+}
+
 fn note_blocks(
     m: &mut std::collections::BTreeMap<String, (u64, u64, u64)>,
     whose: String,
@@ -13749,25 +14121,23 @@ static EXTERNAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// `moduleContentKey` in gex.mjs, as one u64 (`a` high, `b` low): what a
 /// module's store slot is checked against.
 fn content_key(bytes: &[u8]) -> u64 {
-    // gex.mjs `moduleContentKey`, exactly: little-endian words, then the
-    // tail bytes, then a final mix of `a`.
+    // A word at a time (little-endian), then the tail bytes: the same as
+    // gex.mjs `moduleContentKey`, which hashes every module a Worker installs
+    // and spent 0.65 s of a node start-up doing it a byte at a time.
     let mut a: u32 = 0x811c_9dc5;
     let mut b: u32 = 0x9e37_79b9;
-    let mut step = |i: u32, x: u32| {
+    let mut step = |i: usize, x: u32| {
         a = (a ^ x).wrapping_mul(0x0100_0193);
-        b = (b ^ x.wrapping_add(i)).wrapping_mul(0x85eb_ca6b);
+        b = (b ^ x.wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
         b ^= b >> 13;
     };
-    let words = bytes.chunks_exact(4);
-    let tail = words.remainder();
-    for (i, w) in words.enumerate() {
-        step(i as u32, u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+    let words = bytes.len() / 4;
+    for i in 0..words {
+        step(i, u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()));
     }
-    let base = (bytes.len() & !3) as u32;
-    for (j, &x) in tail.iter().enumerate() {
-        step(base + j as u32, x as u32);
+    for (i, &x) in bytes[4 * words..].iter().enumerate() {
+        step(words + i, x as u32);
     }
-    a ^= a >> 16;
     ((a as u64) << 32) | b as u64
 }
 

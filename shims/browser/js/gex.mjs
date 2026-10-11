@@ -13,6 +13,7 @@ const GUEST_BYTES = 0xffff0000;
 // the memory's type and the i64 globals of a wasm64 module differ.
 import { lazyFetch } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
+import { single, sched } from "./single.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -144,7 +145,14 @@ const tIdx = (v) => (m64() ? BigInt(v) : v);
  */
 const DECODER = new TextDecoder();
 export function utf8(view) {
-  return DECODER.decode(view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
+  return DECODER.decode(isShared(view.buffer) ? view.slice() : view);
+}
+
+/** Whether `buf` is a SharedArrayBuffer -- asked without naming the global,
+ *  which a page that is not cross-origin isolated does not have. */
+const SAB = globalThis.SharedArrayBuffer;
+function isShared(buf) {
+  return typeof SAB === 'function' && buf instanceof SAB;
 }
 
 // Registry indices describe a shared queue, not module identity: two Workers
@@ -153,22 +161,33 @@ export function utf8(view) {
 // unrelated functions into otherwise-correct dispatch slots. Two independent
 // 32-bit accumulators plus the exact length make a cheap content key; this is
 // validation against an index race, not a persistent content-addressed cache.
-/** The most the module store (`Gex#moduleStore`) may grow to. */
-const MODULE_STORE_MAX = 4 * 1024 * 1024 * 1024;
+/** The most the module store (`Gex#moduleStore`) may grow to, tried in turn:
+ *  the first a runtime accepts. 4 GiB filled up in 22 minutes of Hollow Knight
+ *  on Unity's own Mono (the translations of Mono's JIT output), after which
+ *  the registry kept its bytes in the shim's heap again and that ran out.
+ *  A growable SharedArrayBuffer only commits what it has grown to. */
+const MODULE_STORE_MAX = [32, 16, 8, 4].map((g) => g * 1024 * 1024 * 1024);
 /** A new module store: a growable SharedArrayBuffer whose first eight bytes
  *  are the bump cursor. Null where SharedArrayBuffer cannot grow. */
 function makeModuleStore() {
   if (typeof SharedArrayBuffer === 'undefined' || typeof SharedArrayBuffer.prototype.grow !== 'function') return null;
   // Off, for comparing against the registry keeping its own bytes.
   if (globalThis.GEX_NO_MODULE_STORE || globalThis.process?.env?.GEX_NO_MODULE_STORE) return null;
-  try {
-    const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: MODULE_STORE_MAX });
-    Atomics.store(new BigInt64Array(sab, 0, 1), 0, 8n);
-    return sab;
-  } catch {
-    return null;
+  for (const max of MODULE_STORE_MAX) {
+    try {
+      const sab = new SharedArrayBuffer(1 << 20, { maxByteLength: max });
+      Atomics.store(new BigInt64Array(sab, 0, 1), 0, 8n);
+      if (globalThis.GEX_REGISTRY_TRACE || globalThis.process?.env?.GEX_REGISTRY_TRACE) {
+        globalThis.process?.getBuiltinModule?.('fs')?.writeSync(2, `[gex] module store max ${max / 2 ** 30} GiB\n`);
+      }
+      return sab;
+    } catch {
+      // Too big for this runtime: the next.
+    }
   }
+  return null;
 }
+let storeFullSaid = false;
 /** Append `bytes` to a module store: their offset, or -1 when it is full.
  *  Any Worker of the process may append at once: the cursor is atomic and a
  *  grow that loses a race to a bigger one is simply retried. */
@@ -176,7 +195,15 @@ function storeAppend(sab, bytes) {
   const len = bytes.length;
   const off = Number(Atomics.add(new BigInt64Array(sab, 0, 1), 0, BigInt((len + 7) & ~7)));
   const end = off + len;
-  if (end > sab.maxByteLength) return -1;
+  if (end > sab.maxByteLength) {
+    // Said once: from here the registry keeps bytes in the shim's heap, which
+    // shares the guest's 2 GiB arena and will run out in a long run.
+    if (!storeFullSaid) {
+      storeFullSaid = true;
+      console.error(`[gex] module store full at ${(sab.maxByteLength / 2 ** 30).toFixed(0)} GiB: the translated-module registry keeps its bytes in the shim heap from here`);
+    }
+    return -1;
+  }
   while (sab.byteLength < end) {
     try {
       sab.grow(Math.min(sab.maxByteLength, Math.max(end, sab.byteLength * 2)));
@@ -187,35 +214,31 @@ function storeAppend(sab, bytes) {
   new Uint8Array(sab, off, len).set(bytes);
   return off;
 }
-/** A module's content key, `LENGTH:HASH:HASH` (host.mjs reads the length).
- *  Four bytes a step: the byte-at-a-time loop was 16% of the samples of an
- *  `apt-get install` in the page, every exec and every catch-up hashing each
- *  module it installs. Two 32-bit lanes over the words, then the tail. */
 function moduleContentKey(bytes) {
   if (!(bytes instanceof Uint8Array)) return null;
-  const n = bytes.length;
-  const w = n >>> 2;
+  // A little-endian word at a time, then the tail bytes (the shim's
+  // `content_key` is the same function): a byte at a time was 0.65 s of a
+  // node start-up per Worker.
   let a = 0x811c9dc5;
   let b = 0x9e3779b9;
-  if (w) {
-    const words = bytes.byteOffset % 4 === 0
-      ? new Int32Array(bytes.buffer, bytes.byteOffset, w)
-      : new Int32Array(bytes.slice(0, w * 4).buffer);
-    for (let i = 0; i < w; i++) {
-      const x = words[i];
-      a = Math.imul(a ^ x, 0x01000193);
-      b = Math.imul(b ^ (x + i), 0x85ebca6b);
-      b ^= b >>> 13;
-    }
-  }
-  for (let i = w * 4; i < n; i++) {
-    const x = bytes[i];
+  const n = bytes.length >>> 2;
+  const words = (bytes.byteOffset & 3) === 0 && !isShared(bytes.buffer)
+    ? new Uint32Array(bytes.buffer, bytes.byteOffset, n)
+    : null;
+  for (let i = 0; i < n; i++) {
+    const x = words ? words[i]
+      : (bytes[4 * i] | (bytes[4 * i + 1] << 8) | (bytes[4 * i + 2] << 16) | (bytes[4 * i + 3] << 24)) >>> 0;
     a = Math.imul(a ^ x, 0x01000193);
-    b = Math.imul(b ^ (x + i), 0x85ebca6b);
+    b = Math.imul(b ^ ((x + i) | 0), 0x85ebca6b);
     b ^= b >>> 13;
   }
-  a ^= a >>> 16;
-  return `${n}:${a >>> 0}:${b >>> 0}`;
+  for (let i = 4 * n; i < bytes.length; i++) {
+    const x = bytes[i];
+    a = Math.imul(a ^ x, 0x01000193);
+    b = Math.imul(b ^ (x + (n + i - 4 * n)), 0x85ebca6b);
+    b ^= b >>> 13;
+  }
+  return `${bytes.length}:${a >>> 0}:${b >>> 0}`;
 }
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
@@ -405,6 +428,31 @@ function slotsNeeded(meta) {
 }
 
 
+/**
+ * Whether `elf` is a wasm32 program flagged as running i386 code (native
+ * Wine's loader, W3): its GEXWASM header sits 0x40 bytes before the entry
+ * point (cgen/wasmprog.rs), with the flags at offset 36.
+ */
+/** clang's names for a C main (see the PE module's instantiation). */
+const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
+
+function isW3Program(elf) {
+  if (!(elf instanceof Uint8Array) || elf.length < 52 || elf[0] !== 0x7f || elf[4] !== 1) return false;
+  const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
+  const at = dv.getUint32(24, true) - 0x40;
+  const phoff = dv.getUint32(28, true), phent = dv.getUint16(42, true), phnum = dv.getUint16(44, true);
+  for (let i = 0; i < phnum; i++) {
+    const p = phoff + i * phent;
+    if (p + 32 > elf.length || dv.getUint32(p, true) !== 1) continue;
+    const off = dv.getUint32(p + 4, true), vaddr = dv.getUint32(p + 8, true), filesz = dv.getUint32(p + 16, true);
+    if (at < vaddr || at + 40 > vaddr + filesz) continue;
+    const h = off + (at - vaddr);
+    const magic = String.fromCharCode(...elf.subarray(h, h + 7));
+    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 1) !== 0;
+  }
+  return false;
+}
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -524,6 +572,27 @@ export function elementTableNeeds(wasm) {
     return needs;
   }
   return needs;
+}
+
+/** Where a module's `gex.dense` section payload (its base word) starts, or -1. */
+function denseBaseAt(wasm) {
+  let i = 8;
+  const leb = () => {
+    let n = 0, shift = 0, b;
+    do { b = wasm[i++]; n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return n >>> 0;
+  };
+  while (i < wasm.length) {
+    const id = wasm[i++];
+    const size = leb();
+    const end = i + size;
+    if (id === 0) {
+      const n = leb();
+      if (n === 9 && utf8(wasm.subarray(i, i + n)) === 'gex.dense') return i + n;
+    }
+    i = end;
+  }
+  return -1;
 }
 
 /** A module's `gex.dense` section (gex_emit::dense::SECTION), or null. */
@@ -717,6 +786,9 @@ export class Gex {
   #forkCopied = 0;
   #forkSkipped = 0;
   #forkZeros = 0;
+  /** A W3 process's Windows address-space line: a forked child's from its
+   *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
+  #windowsSpace = 0;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -739,6 +811,9 @@ export class Gex {
   // shared kernel memory. Null is a run of one process, which needs none of it.
   #kernelSpec = null;
   #census = null;
+  /** The single-thread build: where this fiber's JS last was, for the census
+   *  (a fiber that waits in JS is otherwise invisible to it). */
+  #where = '';
   #kernel = null;
   // This Worker's shim stack, claimed on the way in. See `#workerStack`.
   #stackTop = null;
@@ -813,10 +888,18 @@ export class Gex {
       // bootstrap slice of the shim's own stack band below SHIM_STACK_TOP,
       // one of 32 handed out round-robin through a counter in the reserved
       // low region -- Workers starting together get different ones.
-      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && this.#memory.buffer instanceof SharedArrayBuffer) {
+      // The single-thread build runs the shared build's shim on a plain
+      // memory: one memory, several instances (threads), so the same claim.
+      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && (isShared(this.#memory.buffer) || single.on)) {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
+      // A forked child of a W3 process splits its memory at its parent's
+      // line before anything claims arena -- this stack is the first claim,
+      // and a fresh instance's would otherwise go above the inherited image,
+      // which there is the top of the 2 GiB.
+      if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
+      else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }
@@ -912,6 +995,12 @@ export class Gex {
    * exited. Closed here rather than `unref`'d so it holds the run while in use.
    */
   close() {
+    // The census timer too: a fiber (the single-thread build) is not a
+    // Worker whose end takes its timers with it.
+    if (this.#census) {
+      clearInterval(this.#census);
+      this.#census = null;
+    }
     if (this.#tick) {
       this.#tick.port1.close();
       this.#tick.port2.close();
@@ -1088,10 +1177,23 @@ export class Gex {
         // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
         // runs nested until the guest returns to the function body that
         // called it.
-        call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        call_out: single.on
+          ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
+            ? this.#callOut(ctx >>> 0, target, ret, spWant)
+            : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
+          : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
-        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+        // In the single build, on a stack of its own, so the body (and guest
+        // code it calls) can block.
+        ftab_call: single.on
+          ? new WebAssembly.Suspending((idx, ctx, depth, need, ret) => {
+            const f = this.#cgen.ftab.get(tIdx(idx >>> 0));
+            return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
+          })
+          : (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+        // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
+        ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -1128,17 +1230,27 @@ export class Gex {
         // The token as well as the ring: the host keeps a GL context per
         // process, because the object names in the stream are this process's
         // own and another process hands out the same ones.
-        gl_submit: (ring) =>
+        // In the single build a promise (the compositor's Mesa runs in this
+        // realm), so the import suspends; never from a nested call-out.
+        gl_submit: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
             ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
-            : -1),
+            : -1))
+          : (ring) =>
+            (this.#gl
+              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
+              : -1),
         // The same, not waited for (a frame's last batch): the copy is taken
         // and the guest draws on; the next submit waits for this one, and
         // says how long through `gex_gl_note_wait_ns`.
-        gl_submit_async: (ring) =>
+        gl_submit_async: single.on ? new WebAssembly.Suspending((ring) =>
           (this.#gl
             ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
-            : -1),
+            : -1))
+          : (ring) =>
+            (this.#gl
+              ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
+              : -1),
         // This pump's scene: `count` surface records at `ptr` in this memory,
         // saying where each surface's pixels are rather than carrying them. The
         // compositor reads those addresses out of this same memory, so a frame
@@ -1161,6 +1273,10 @@ export class Gex {
    * pass through to, so whatever the program needs to read is bundled here.
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
+    // A W3 program (native Wine's loader) splits the memory with Windows
+    // before the runtime's startup heap is taken, or that heap sits where
+    // Windows DLLs load (0x10000000).
+    if (isW3Program(elf)) this.#windowsSpace = -1;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
@@ -1225,6 +1341,10 @@ export class Gex {
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
+      // The translator's knobs, for every process of the run: set only here,
+      // a forked child (node under `bash -c`) ran with the defaults.
+      perMiss: opts.perMiss, liftMax: opts.liftMax, inlineDispatch: opts.inlineDispatch,
+      xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
@@ -1236,6 +1356,12 @@ export class Gex {
     }
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
+    // How many blocks one dispatch miss lifts (default 2048).
+    if (opts.liftMax) this.#shim.exports.gex_set_lift_max?.(opts.liftMax);
+    if (opts.inlineDispatch) this.#shim.exports.gex_set_inline_dispatch?.(1);
+    if (opts.xlateReport) this.#shim.exports.gex_set_xlate_report?.(opts.xlateReport);
+    if (opts.discoverSkip) this.#shim.exports.gex_set_discover_skip?.(opts.discoverSkip);
+    if (opts.t1Fold) this.#shim.exports.gex_set_t1_fold?.(1);
     // Keep what the guest's dynamic linker produces, and start the next process
     // of the same program from it instead of linking again.
     if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
@@ -1476,7 +1602,7 @@ export class Gex {
           : e.gex_sysreg_write(ctx, pc, reg, v))
         : e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
-      safepoint: e.gex_safepoint,
+      safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
     };
@@ -1694,7 +1820,7 @@ export class Gex {
       sysreg_read: e.gex_sysreg_read,
       sysreg_write: e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
-      safepoint: e.gex_safepoint,
+      safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
     };
@@ -1886,7 +2012,7 @@ export class Gex {
         const text = utf8(this.#bytes().slice(p, p + n));
         // Only when it has stopped changing: a wedged process repeats the same
         // wait forever, which is the signal; a busy one churns through them.
-        if (text === last) narrate(`[gex] quiet: ${text}`);
+        if (text === last) narrate(`[gex] quiet: ${text}${single.on ? ` js=${this.#where}/installs=${this.#installs}/pending=${e.gex_jit_pending_len() >>> 0}` : ''}`);
         last = text;
       }
       e.gex_free?.(p, 512);
@@ -1974,7 +2100,7 @@ export class Gex {
       'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
       'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
-      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
+      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable', 'k_sock_hup',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
       'k_wake_seq', 'k_wake', 'k_park',
       // Which dispatch slots an identity's code is in, system-wide rather than
@@ -2011,6 +2137,36 @@ export class Gex {
     }
     // Nobody has asked for a halt, rather than "halt with status 0".
     if (!k) out.k_halt_code = () => -1;
+    // The single-thread build: the wait words are promises (single.mjs
+    // `Sched`). A park that need not wait answers at once, as
+    // `memory.atomic.wait32` does when the value has moved; one that must
+    // suspends this fiber's stack. Every wake also wakes the fibers.
+    if (k && single.on) {
+      const nested = () => {
+        throw new Error('gex (single-thread build): a blocking call inside a nested guest call '
+          + `(${this.#nest.join(' > ')}) cannot suspend`);
+      };
+      out.k_park = new WebAssembly.Suspending((seq, ns) => {
+        if (k.k_wake_seq() !== seq) return 1;
+        if (this.#hardNested()) nested();
+        this.#where = `park(${ns})`;
+        return sched.park(ns);
+      });
+      out.k_park_futex = new WebAssembly.Suspending((addr, gen, ns) => {
+        if ((k.k_futex_gen(addr) >>> 0) !== (gen >>> 0)) return 1;
+        if (this.#hardNested()) nested();
+        this.#where = `futex(${addr},${ns})`;
+        return sched.parkFutex(addr, ns);
+      });
+      out.k_wake = () => {
+        k.k_wake();
+        sched.wake();
+      };
+      out.k_futex_wake = (addr) => {
+        k.k_futex_wake(addr);
+        sched.wakeFutex(addr);
+      };
+    }
     return out;
   }
 
@@ -2158,6 +2314,7 @@ export class Gex {
       return n;
     };
     step(`image copied, ${live()} non-zero bytes in the context`);
+    this.#windowsSpace = child.windowsSpace ?? 0;
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -2238,6 +2395,11 @@ export class Gex {
     if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
     if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
+    if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
+    if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
+    if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
+    if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
+    if (o.t1Fold) e.gex_set_t1_fold?.(1);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first
@@ -2421,7 +2583,9 @@ export class Gex {
     // A thread needs a memory two Workers can both hold. Posting a non-shared
     // memory does not fail -- the structured clone copies it, and the thread
     // runs on a private image nothing else can see -- so it is refused here.
-    if (!(this.#memory?.buffer instanceof SharedArrayBuffer)) {
+    // In the single-thread build a thread is a fiber of this realm, handed
+    // the memory object itself.
+    if (!isShared(this.#memory?.buffer) && !single.on) {
       throw new Error(
         `the guest started thread ${tid} on a memory that is not shared. ` +
           'A guest thread is a Worker and a Worker needs a SharedArrayBuffer: ' +
@@ -2498,6 +2662,9 @@ export class Gex {
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
+      // A W3 process's Windows address space starts here (0: none); the
+      // child splits its memory at the same line before its heap takes any.
+      windowsSpace: e.gex_windows_space?.() ?? 0,
       image: (() => {
         const t0 = performance.now();
         const img = this.#processImage();
@@ -2637,7 +2804,8 @@ export class Gex {
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
       const key = this.#registryKey(i, bytes);
-      const cached = key ? this.#sharedModules.get(key) : undefined;
+      // Or one the page's unit cache has (another process's).
+      const cached = (key ? this.#sharedModules.get(key) : undefined) ?? this.#unitGet(this.#unitKey(bytes)) ?? undefined;
       let who = 'jit2049';
       if (globalThis.GEX_DUMP_WHERE ?? true) who = `jit2049-${i}-at-${ptr.toString(16)}`;
       try {
@@ -2960,7 +3128,13 @@ export class Gex {
         __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+        // clang's three names for a C main: Wine's crt_main references all
+        // of them weakly and a position-independent module (W3's PE module)
+        // keeps the undefined ones as imports. Null through `GOT.func`, as a
+        // static link leaves them, and a trap behind the null check.
+        ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
         // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
@@ -2977,6 +3151,29 @@ export class Gex {
           signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
+          // W3.7: Wine's Unix side runs the program's code nested
+          // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
+          // that never returns for a thread's loop), and reports each image
+          // it maps (natively for unit placement; the page's units path
+          // takes it once `gex_image_mapped` exists).
+          call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          image_mapped: (base, fd) => {
+            const number = e.gex_image_mapped?.(base, fd) ?? -1;
+            if (number === -1) return;
+            // An i386 image with a function-tier unit to fetch (cgen.rs
+            // `w3_mapped`): served here, before Wine's loader goes on. (-2
+            // is a later skeleton bound into the install.)
+            if (number === -3) {
+              this.#cgenServe();
+              return;
+            }
+            this.#cgenCatchUp();
+            if (number >= 0) {
+              e.gex_cgen_pmod_installed(number);
+              e.gex_wasmdll_installed();
+            }
+            this.#wasmdllCatchUp();
+          },
           // libgex's dlopen past its static registry (Wine's Unix side links
           // it): no shared libraries here
           dlopen: () => 0,
@@ -3545,14 +3742,18 @@ export class Gex {
       else f();
       return 0;
     };
+    const staged = () => {
+      if (e.gex_wasmprog_staged()) {
+        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+      }
+    };
+    const sync = (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      staged();
+    };
     return {
-      syscall: (ctx, pc) => {
-        e.gex_syscall(ctx, pc);
-        if (e.gex_wasmprog_staged()) {
-          this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-          this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
-        }
-      },
+      syscall: single.on ? this.#suspendingSyscall(sync, staged) : sync,
       asyncify,
       fork_point: (rec) => {
         const st = asyncify(0, 0);
@@ -3598,26 +3799,40 @@ export class Gex {
    *  thread or a child rather than trapping, and the host starts it here. */
   #guestSyscall(e) {
     if (!Gex.wasmDlls) return e.gex_syscall;
-    return (ctx, pc) => {
-      e.gex_syscall(ctx, pc);
+    const staged = () => {
       if (e.gex_wasmprog_staged()) {
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
       }
     };
+    const sync = (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      staged();
+    };
+    return single.on ? this.#suspendingSyscall(sync, staged) : sync;
   }
 
   /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
    *  serves it without leaving the provider's frames (a blocking call waits in place, a
    *  thread is staged); the host then starts what it staged, and the call returns. */
-  #providerSyscall = (ctx, pc) => {
+  #providerSyscallSync = (ctx, pc) => {
     const e = this.#shim.exports;
     e.gex_syscall(ctx, BigInt.asIntN(64, BigInt(pc) | (1n << 61n)));
+    this.#providerStaged();
+  };
+  #providerStaged = () => {
+    const e = this.#shim.exports;
     if (e.gex_wasmprog_staged()) {
       this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
       this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
     }
   };
+  #providerSyscallS = null;
+  /** The single-thread build's: see `#suspendingSyscall`. */
+  get #providerSyscall() {
+    if (!single.on) return this.#providerSyscallSync;
+    return (this.#providerSyscallS ??= this.#suspendingSyscall(this.#providerSyscallSync, this.#providerStaged, 1n << 61n));
+  }
 
   #nativeSyscall = (ctx, pc) => {
     const e = this.#shim.exports;
@@ -3872,7 +4087,14 @@ export class Gex {
           );
         }
         this.#shim.exports.gex_callout_leave_ok?.(0);
-        this.#guest.exports.enter(ctx, pc);
+        // The single-thread build enters on a stack of the guest's own
+        // (JSPI), which a blocking call suspends; see single.mjs.
+        if (single.on) {
+          this.#where = 'enter';
+          await this.#enterP(ctx, pc);
+          this.#where = 'trap';
+        }
+        else this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
         if (globalThis.GEX_DEBUG_EXIT) {
@@ -3881,6 +4103,7 @@ export class Gex {
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
         trappedAt = performance.now();
+        this.#where = 'trap';
         // First, before asking the shim anything: was this a handoff or a
         // crash? Every way out is the same `unreachable` to the engine, and
         // treating a crash as a handoff reported a crashed runtime as a clean
@@ -4058,7 +4281,9 @@ export class Gex {
           let answer = quick;
           if (answer === null || answer === undefined) {
             const t0 = performance.now();
+            this.#where = `fillSlot(${want >>> 0})`;
             answer = await this.fillSlot(want >>> 0);
+            this.#where = 'trap';
             this.#slowFills++;
             this.#slowMs += performance.now() - t0;
           }
@@ -4072,7 +4297,9 @@ export class Gex {
           const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
           if (need) this.#growTables(need, 'a2358');
         }
+        this.#where = 'install';
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        this.#where = 'adopt';
         // The parent's modules go in after this Worker's own queue, never
         // between a translation and its install: a module's page assignments
         // are the next one's starting point, so interleaving two orderings
@@ -4083,14 +4310,18 @@ export class Gex {
         // drains it into its own tables and the asker never sees it. `#catchUp`
         // is a no-op comparison when there is nothing to do.
         this.#armCensus();
+        this.#where = 'catchUp';
         await this.#catchUp();
         this.#cgenServe();
+        this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
         // and before the memory is touched again, because what the child gets
         // is a copy of it as `fork` left it.
         await this.#drainFork();
+        this.#where = 'drainThread';
         await this.#drainThread();
+        this.#where = 'resume';
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -4143,7 +4374,11 @@ export class Gex {
               // asleep and the turn below runs that queue. -1 is "no global
               // kernel to sleep on", and a network wait cannot sleep at all --
               // its bytes arrive on this Worker's own event loop.
-              if (e.gex_paused_for_host() || e.gex_park(20) < 0) {
+              // The single-thread build parks for the network as well: the
+              // park is a promise, so the event loop delivers the bytes, and
+              // the network's activity wakes it (`onActivity`). A turn per
+              // waiting fiber instead spins the one thread every fiber shares.
+              if (single.on ? (await this.#parkP(20)) < 0 : (e.gex_paused_for_host() || e.gex_park(20) < 0)) {
                 // A network wait runs on this Worker's event loop, so it cannot
                 // sleep -- but it needs a turn, not a timer: a MessageChannel
                 // turn returns to the loop in microseconds where a nested
@@ -4570,6 +4805,68 @@ export class Gex {
    *  'callback'): a watch stub reached inside an NT callback is not its
    *  call-out's business. */
   #nest = [];
+
+  // --- The single-thread build (single.mjs, docs/single-thread.md) ---------
+  //
+  // Every guest thread is a fiber of one realm, its guest on a JSPI stack. A
+  // blocking call suspends that stack (`k_park`, below) where the default
+  // build waits in `Atomics.wait`, so wherever JS calls into wasm that may
+  // block it calls through `WebAssembly.promising`, and wherever wasm calls
+  // JS that calls back into wasm that may block, that JS is a
+  // `WebAssembly.Suspending` returning the inner call's promise.
+  #enterPf = null;
+  #enterPOf = null;
+  /** `enter`, on a stack of its own. */
+  #enterP(ctx, pc) {
+    if (this.#enterPOf !== this.#guest) {
+      this.#enterPf = WebAssembly.promising(this.#guest.exports.enter);
+      this.#enterPOf = this.#guest;
+    }
+    return this.#enterPf(ctx, pc);
+  }
+  #parkPf = null;
+  /** `gex_park`, on a stack of its own (it suspends in `k_park`). */
+  #parkP(ms) {
+    this.#parkPf ??= WebAssembly.promising(this.#shim.exports.gex_park);
+    return this.#parkPf(ms);
+  }
+  #sysPf = null;
+  /**
+   * A system call made from JS that wasm called (a wasm32 program's, a
+   * provider's): the shim runs on a stack of its own, so a wait inside it
+   * suspends that stack, and the returned promise suspends the caller's.
+   * `after` runs when it is done, before the caller goes on (a fork's image
+   * is taken there). Nested inside a call-out (JS frames below), nothing can
+   * suspend, so it runs as the default build's does.
+   */
+  #suspendingSyscall(sync, after, mark = 0n) {
+    const e = this.#shim.exports;
+    return new WebAssembly.Suspending((ctx, pc) => {
+      if (this.#hardNested()) return sync(ctx, pc);
+      this.#sysPf ??= WebAssembly.promising(e.gex_syscall);
+      this.#where = 'syscall';
+      const p = this.#sysPf(ctx, mark ? BigInt.asIntN(64, BigInt(pc) | mark) : pc);
+      return p.then(() => {
+        this.#where = 'syscall-done';
+        after?.();
+        // A preemption point as well: a program that only makes system
+        // calls gives the other fibers a turn here, and `sched_yield` gives
+        // the woken one at once (single.mjs `Sched#settle`).
+        if (e.gex_last_syscall() === (globalThis.GEX_ARCH === 'x86' ? 24 : 124)) return sched.yieldNow();
+        return sched.maybeYield();
+      });
+    });
+  }
+  /** A safepoint (every 1024 back edges of translated code): the shim's,
+   *  then a turn for the other fibers if the slice is over. */
+  #safepointS = null;
+  #singleSafepoint(e) {
+    return (this.#safepointS ??= new WebAssembly.Suspending((ctx, pc) => {
+      e.gex_safepoint(ctx, pc);
+      this.#where = 'safepoint';
+      return this.#hardNested() ? 0 : sched.maybeYield();
+    }));
+  }
   #watchStub = null;
 
   /** The function a watched table entry holds: it tells JS (`hit`) and
@@ -4671,6 +4968,70 @@ export class Gex {
    * `#ntCallback`: a shim frame is below this one.
    */
   #callOut(ctx, target, ret, spWant) {
+    return this.#drive(this.#callOutSteps(ctx, target, ret, spWant, false));
+  }
+
+  /**
+   * The single-thread build's call-out: the same loop, with the guest on a
+   * stack of its own (`WebAssembly.promising`), so guest code the call-out
+   * runs can block -- the import that asked is a `Suspending`, and the
+   * whole fiber waits (docs/single-thread.md §7).
+   */
+  #callOutAsync(ctx, target, ret, spWant) {
+    return this.#driveAsync(this.#callOutSteps(ctx, target, ret, spWant, true));
+  }
+
+  /** Run a nested loop's steps (`['enter', ctx, pc]` / `['call', f, ...args]`)
+   *  synchronously: an exception goes back into the loop at its step. */
+  #drive(g) {
+    let r = g.next();
+    while (!r.done) {
+      let v;
+      try {
+        const [op, a, b, c, d, x] = r.value;
+        v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
+      } catch (err) {
+        r = g.throw(err);
+        continue;
+      }
+      r = g.next(v);
+    }
+    return r.value;
+  }
+
+  /** The same, each step on a JSPI stack of its own that may suspend. */
+  async #driveAsync(g) {
+    let r = g.next();
+    while (!r.done) {
+      let v;
+      try {
+        const [op, a, b, c, d, x] = r.value;
+        v = op === 'enter' ? await this.#enterP(a, b) : await this.#promisingOf(a)(b, c, d, x);
+      } catch (err) {
+        r = g.throw(err);
+        continue;
+      }
+      r = g.next(v);
+    }
+    return r.value;
+  }
+
+  /** `WebAssembly.promising` of a wasm function, made once per function. */
+  #promising = new WeakMap();
+  #promisingOf(f) {
+    let p = this.#promising.get(f);
+    if (!p) this.#promising.set(f, (p = WebAssembly.promising(f)));
+    return p;
+  }
+
+  /** Whether a JS frame that cannot suspend is open (a nested loop run
+   *  synchronously); `~` marks one that can (single.mjs). */
+  #hardNested() {
+    for (const n of this.#nest) if (!n.endsWith('~')) return true;
+    return false;
+  }
+
+  *#callOutSteps(ctx, target, ret, spWant, suspendable) {
     const e = this.#shim.exports;
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
@@ -4680,7 +5041,7 @@ export class Gex {
     // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
     c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
-    this.#nest.push('callout');
+    this.#nest.push(suspendable ? 'callout~' : 'callout');
     this.#calloutsMade++;
     if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
       console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
@@ -4695,10 +5056,10 @@ export class Gex {
             const f = next;
             next = null;
             e.gex_callout_leave_ok?.(me + 1);
-            f(ctx);
+            yield ['call', f, ctx];
           } else {
             e.gex_callout_leave_ok?.(me + 1);
-            this.#guest.exports.enter(ctx, pc);
+            yield ['enter', ctx, pc];
           }
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
@@ -4993,7 +5354,9 @@ export class Gex {
     if (len === 0) return;
     const bytes = this.#bytes().slice(ptr, ptr + len);
     const key = moduleContentKey(bytes);
-    this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', null, true);
+    const ukey = this.#unitKey(bytes);
+    this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', this.#unitGet(ukey), true);
+    this.#unitShare(ukey);
     this.#noteExternal(bytes, key);
     e.gex_jit_installed();
     const count = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
@@ -5005,6 +5368,42 @@ export class Gex {
         this.#env.shareModule?.(key, mod);
       }
     }
+  }
+
+  /**
+   * With the page's unit cache (`?unitcache=1`, GEX_UNIT_CACHE): a
+   * translation's key in it, `u:` and its content key with the dense base
+   * word zeroed -- the one part of a unit's bytes that differs between the
+   * processes it is installed in (gex_emit::dense::GLOBAL) -- else null.
+   * `bytes` is a private copy; the word is put back.
+   */
+  #unitKey(bytes) {
+    if (!globalThis.GEX_UNIT_CACHE || !(bytes instanceof Uint8Array)) return null;
+    const at = denseBaseAt(bytes);
+    if (at < 0) return `u:${moduleContentKey(bytes)}`;
+    const w = bytes.slice(at, at + 4);
+    bytes.fill(0, at, at + 4);
+    const k = moduleContentKey(bytes);
+    bytes.set(w, at);
+    return `u:${k}`;
+  }
+
+  /** The compiled module for `ukey`, counted (`unitHits`), or null. */
+  #unitGet(ukey) {
+    const m = (ukey && this.#sharedModules.get(ukey)) || null;
+    if (m) this.#unitHits++;
+    return m;
+  }
+  #unitHits = 0;
+  get unitHits() { return this.#unitHits; }
+
+  /** The module just installed, to the page's unit cache under `ukey`. */
+  #unitShare(ukey) {
+    if (!ukey || this.#sharedModules.has(ukey)) return;
+    const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+    if (!mod) return;
+    this.#sharedModules.set(ukey, mod);
+    this.#env.shareModule?.(ukey, mod);
   }
 
   /** `#catchUp` (eager) without yielding, for `#ntCallback`. */
@@ -5054,7 +5453,11 @@ export class Gex {
     const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
     const bytes = this.#bytes().slice(ptr, ptr + len);
     const key = moduleContentKey(bytes);
-    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
+    // A module another process compiled (a served unit) comes from the
+    // page's unit cache: instantiated, not compiled again.
+    const ukey = this.#unitKey(bytes);
+    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878', this.#unitGet(ukey));
+    this.#unitShare(ukey);
     this.#noteExternal(bytes, key);
     e.gex_jit_installed();
     if (check && e.gex_miss_pc && e.gex_dispatch_slot && (e.gex_jit_pending_len() >>> 0) === 0) {
@@ -5102,6 +5505,15 @@ export class Gex {
   async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
     const t0 = performance.now();
     this.#installs++;
+    if (sync) {
+      // Timed here: the inner call has done all its work when it returns,
+      // and a `finally` after an `await` would run only once the guest
+      // next yields, counting everything it ran meanwhile (a node start-up
+      // reported hours of "installing").
+      const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync);
+      this.#installMs += performance.now() - t0;
+      return done;
+    }
     try {
       // With `sync` the inner call never awaits, so the install is complete
       // when this returns its promise -- what a nested loop inside an import
@@ -5164,6 +5576,11 @@ export class Gex {
       throw err;
     }
     this.#compileMs += performance.now() - tc;
+    // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
+    // looking at what a translation is made of (docs/jit-guest.md).
+    if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
+      try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${globalThis.process.env.GEX_DUMP_WASM}/u-${this.#shim.exports.gex_my_pid?.() ?? 0}-${moduleContentKey(bytes).replaceAll(':', '-')}.wasm`, bytes); } catch {}
+    }
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must
     // instantiate all of them. The section is in the bytes; keeping it is a
@@ -5175,6 +5592,9 @@ export class Gex {
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
+    // A runtime module imports its dense base (gex_emit::dense::GLOBAL)
+    // whether or not it has dense blocks; set below when it has.
+    imports.dense_base = 0;
     // Dense: the module's blocks go to `blocks` at the base its bytes name,
     // within what the process has numbered.
     if (this.#guest?.exports?.blocks) {
@@ -5190,6 +5610,9 @@ export class Gex {
         // Base 0 is a module nobody numbered: its blocks would land on the
         // miss stub and its neighbours.
         if (base === 0) throw new Error(`gex: a translation with unnumbered dense blocks reached the install (${who})`);
+        // Where a module places its dense segment by import rather than by a
+        // constant in its bytes (gex_emit::dense::GLOBAL).
+        imports.dense_base = base;
       }
     }
     // What this module's own entries need per table, where known. `need` alone

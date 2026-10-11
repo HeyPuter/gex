@@ -9,6 +9,7 @@ import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
+import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -105,11 +106,18 @@ let kernelBytes = null;
  */
 function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
-  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'pins', 'sp']
+  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
   return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
+}
+
+/** The page's copies, handed to the system Worker so the single build does
+ *  not fetch the 5 MB shim a second time. */
+export function primeRuntime(r) {
+  if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
+  if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
 }
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */
@@ -127,7 +135,9 @@ export { fetchBytes };
  * arrive there as `GEX_*` environment variables.
  */
 function flag(name) {
-  const search = globalThis.location?.search;
+  // The single-thread build's system Worker is handed the page's query: its
+  // own `location` is the script's.
+  const search = globalThis.GEX_PAGE_SEARCH ?? globalThis.location?.search;
   if (search) return new URLSearchParams(search).get(name);
   return globalThis.process?.env?.[`GEX_${name.toUpperCase()}`] ?? null;
 }
@@ -330,8 +340,10 @@ async function loadKernel() {
   if (kernelSpec !== null) return kernelSpec || null;
   // Test for `SharedArrayBuffer` directly, not `crossOriginIsolated`: it is
   // what is actually needed, and asking for the constructor works under Node
-  // too (which lets the terminal test drive this same file).
-  if (typeof SharedArrayBuffer !== 'function') {
+  // too (which lets the terminal test drive this same file). The
+  // single-thread build needs none: its kernel memory is plain, held by
+  // every fiber.
+  if (typeof SharedArrayBuffer !== 'function' && !single.on) {
     kernelSpec = false;
     return null;
   }
@@ -361,6 +373,8 @@ async function loadKernel() {
  * path is kept out of a literal so the bundler leaves it alone.
  */
 async function guestWorkerFactory() {
+  // The single-thread build: a process is a fiber of this realm.
+  if (single.on) return () => new FiberWorker();
   if (typeof Worker === 'function') {
     return () =>
       new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
@@ -381,7 +395,129 @@ async function guestWorkerFactory() {
  * replaced the snapshot switcher. Each process has its own memory; what they
  * share is in the global kernel, instantiated against one shared memory.
  */
-export async function runProgram(
+/**
+ * Whether this page runs the single-thread build (docs/single-thread.md):
+ * `?single=1` asks for it, `?single=0` refuses it, and otherwise a page that
+ * has no SharedArrayBuffer (not cross-origin isolated) gets it when the engine
+ * has JSPI. A cross-origin isolated page keeps the Worker build.
+ */
+export function singleMode() {
+  if (single.on) return true;
+  const want = flag('single');
+  if (want === '0') return false;
+  if (!singleSupported()) return false;
+  return want === '1' || typeof SharedArrayBuffer !== 'function';
+}
+
+/** What of the page's state the system Worker needs: its query and every
+ *  `GEX_*` switch a demo or `main.js` set. */
+function pageGlobals() {
+  const out = { GEX_PAGE_SEARCH: globalThis.location?.search ?? '' };
+  for (const k of Object.keys(globalThis)) {
+    if (!k.startsWith('GEX_')) continue;
+    const v = globalThis[k];
+    if (v === null || ['string', 'number', 'boolean', 'undefined'].includes(typeof v)) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * `runProgram` for the single-thread build, from the page: the whole system
+ * runs in one Worker (web/src/system-worker.js); this side holds the terminal
+ * and forwards keys, sizes and output.
+ */
+async function runInSystemWorker(term, opts) {
+  const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // Said once, so a person (and tests/single/run.sh) can tell which build ran.
+  term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
+  // The compositor: a canvas only (not the DOM desktop), drawn by the system
+  // Worker, which holds every guest memory it reads pixels out of.
+  const canvas = typeof wl?.getContext === 'function' && typeof wl.transferControlToOffscreen === 'function' ? wl : null;
+  // GL: the compositor's own (`gl: 'compositor'`) runs in the system Worker
+  // beside it, the non-pthread Mesa (web/public/gex/st/); a page-side device
+  // does not exist there.
+  const glHere = gl === 'compositor' && !!canvas;
+  // The X server too: in the system Worker, beside the compositor.
+  const xHere = !!hostX && !!canvas;
+  if ((wl && !canvas) || (gl && !glHere) || (hostX && !xHere)) {
+    term.writeln?.(`gex: the single-thread build has no ${[wl && !canvas && 'DOM desktop', gl && !glHere && 'GL', hostX && !xHere && 'X server'].filter(Boolean).join(', ')} yet${canvas ? '' : '; running without the screen'}`);
+  }
+  const w = new Worker(new URL('./system-worker.js', import.meta.url), { type: 'module' });
+  globalThis.__gexSystemWorker = w;
+  const ready = new Promise((resolve, reject) => {
+    w.addEventListener('message', (e) => { if (e.data?.kind === 'ready') resolve(); });
+    w.addEventListener('error', (e) => reject(new Error(e.message || 'the system Worker failed to start')));
+  });
+  await ready;
+  // The compositor's page side (listeners, canvas size) talks to its worker
+  // half through the system Worker: `comp` messages in, `comp-out` back.
+  const compListeners = new Set();
+  let compStats = null;
+  const compPort = {
+    postMessage(m, transfer = []) {
+      if (m?.kind === 'init' && m.stats) compStats = new Int32Array(m.stats);
+      w.postMessage({ kind: 'comp', m }, transfer);
+    },
+    addEventListener(type, f) { if (type === 'message') compListeners.add(f); },
+    removeEventListener(type, f) { compListeners.delete(f); },
+    terminate() {},
+  };
+  w.addEventListener('message', (e) => {
+    const m = e.data;
+    if (m?.kind === 'comp-out') for (const f of [...compListeners]) f({ data: m.m });
+    else if (m?.kind === 'comp-stats' && compStats) compStats.set(m.stats.subarray(0, compStats.length));
+  });
+  let compositor = null;
+  if (canvas) {
+    const { Compositor } = await import('./compositor.js');
+    // Before `run`: the Worker takes the canvas first, then starts the guest.
+    w.postMessage({ kind: 'comp-open', width: canvas.width, height: canvas.height });
+    compositor = await Compositor.create(canvas, null, wlInput || canvas, { makeWorker: () => compPort });
+    globalThis.__gexCompositor = compositor;
+  }
+  const keys = term.onData((data) => w.postMessage({ kind: 'key', data }));
+  const resize = term.onResize(({ rows, cols }) => w.postMessage({ kind: 'resize', rows, cols }));
+  term.focus?.();
+  try {
+    return await new Promise((resolve, reject) => {
+      w.addEventListener('message', (e) => {
+        const m = e.data;
+        if (m.kind === 'write') term.write(m.data);
+        else if (m.kind === 'net') onNetEvent?.(m.event);
+        else if (m.kind === 'done') resolve({ status: m.status, host: null, tenv: null });
+        else if (m.kind === 'failed') reject(Object.assign(new Error(m.message), { workerStack: m.stack }));
+      });
+      w.postMessage({
+        kind: 'run',
+        globals: pageGlobals(),
+        // Already fetched by the page (main.js loadRuntime): copied, not
+        // fetched again by the Worker.
+        runtime: shimBytes ? { shimBytes, seedBytes } : undefined,
+        rows: term.rows,
+        cols: term.cols,
+        opts: {
+          ...rest,
+          networkUrl: network?.url ?? null,
+          wl: canvas ? { inRealm: true } : undefined,
+          gl: glHere ? 'compositor' : undefined,
+          hostX: xHere || undefined,
+        },
+      });
+    });
+  } finally {
+    keys.dispose();
+    resize.dispose();
+    compositor?.stop();
+    w.terminate();
+  }
+}
+
+export async function runProgram(term, opts) {
+  if (singleMode() && !single.on) return runInSystemWorker(term, opts);
+  return runProgramHere(term, opts);
+}
+
+async function runProgramHere(
   term,
   {
     elf,
@@ -399,6 +535,8 @@ export async function runProgram(
     symlinks = {},
     // Files fetched as they are read, [path, size, url] (`?lazy=`).
     lazy = [],
+    // File times, path to seconds (`untar`'s `mtimes`), when they matter.
+    mtimes = undefined,
     /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
     env = [],
     args,
@@ -503,7 +641,12 @@ export async function runProgram(
   // gated on `have_gl()`) and gles-gears died at `eglInitialize`/`ring_open`.
   let glChannel = null;
   let glServe = null;
-  if (gl) {
+  if (gl && single.on) {
+    // The single-thread build: no ring. Each process's `gl_submit` calls the
+    // compositor's Mesa in this realm on its own memory (compositor-worker.js
+    // `glInRealm`), started by the system Worker.
+    glChannel = { inRealm: true };
+  } else if (gl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the GL demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
@@ -539,7 +682,11 @@ export async function runProgram(
   // a shared arena of surface descriptors -- never a frame.
   let wlChannel = null;
   let compositor = null;
-  if (wl) {
+  if (wl?.inRealm) {
+    // The single-thread build: the compositor is in this realm, set up by the
+    // system Worker before this run (system-worker.js).
+    ({ channel: wlChannel, compositor } = wl.inRealm);
+  } else if (wl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the Wayland demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
@@ -587,7 +734,23 @@ export async function runProgram(
   let xServer = null;
   if (hostX && wlChannel) {
     if (!kernel) throw new Error('the host X server needs the global kernel');
-    xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
+    // The single-thread build (docs/single-thread.md): the server is a fiber of
+    // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
+    // waits suspend. The same messages, without a Worker between.
+    const xDir = single.on ? '/gex/xwayland-st/' : '/gex/xwayland/';
+    if (single.on) {
+      const { HostX } = await import('./hostx.js');
+      let deliver = null;
+      const hx = new HostX((m) => deliver?.({ data: m }));
+      xServer = {
+        set onmessage(f) { deliver = f; },
+        postMessage: (m) => hx.start(m).catch((err) => {
+          hx.log(`[hostx] ${err?.stack || err}`);
+          deliver?.({ data: { kind: 'failed', why: String(err?.message || err) } });
+        }),
+        terminate() {},
+      };
+    } else xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
     // Waited for below: a guest that starts before the display is listening
     // gets "Can't open display" and dies, and the display here is a name in the
     // global kernel that only exists once the server has bound it.
@@ -605,9 +768,9 @@ export async function runProgram(
     };
     xServer.postMessage({
       kind: 'start',
-      xwaylandUrl: new URL('/gex/xwayland/Xwayland.mjs', location.href).href,
-      hostwlUrl: new URL('/gex/xwayland/gexhostwl.wasm', location.href).href,
-      keymapUrl: new URL('/gex/xwayland/gex.xkm', location.href).href,
+      xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
+      hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
+      keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
       // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
       // wasm32 build of the kernel (same kernel memory, other process-memory type).
       kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(`/gex/gex_kernel${archInfix()}.wasm`)) : kernel.module, memory: kernel.memory },
@@ -676,7 +839,10 @@ export async function runProgram(
       // The page's network, served to every Worker over shared memory
       // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
       netChannel: netChannel ?? undefined,
-      wispUrl: netChannel ? undefined : network?.url ?? undefined,
+      // The single-thread build's fibers share this realm, and so the one
+      // Wisp connection itself.
+      wispNet: single.on ? network ?? undefined : undefined,
+      wispUrl: netChannel || single.on ? undefined : network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
       // writes it on startup, so a process forked after a resize would reset the
@@ -717,6 +883,16 @@ export async function runProgram(
       fjit: globalThis.GEX_FJIT || undefined,
       // `?xcache=1`: the translation cache across page loads (docs/gexcc.md §8).
       xcache: xcacheName(),
+      // `?liftmax=N`: blocks one dispatch miss may lift (default 2048).
+      liftMax: globalThis.GEX_LIFT_MAX || undefined,
+      // `?inlinedispatch=1`: dispatch inline in every block, as before.
+      inlineDispatch: globalThis.GEX_INLINE_DISPATCH || undefined,
+      // `?xlatereport=N`: a translator progress line every N translations.
+      xlateReport: globalThis.GEX_XLATE_REPORT || undefined,
+      // `?t1fold=1`: tier-1's tee folding (gex-emit `set_t1_fold`).
+      t1Fold: globalThis.GEX_T1_FOLD || undefined,
+      // `?unitcache=1`: compiled translation units shared by every process.
+      unitCache: globalThis.GEX_UNIT_CACHE || undefined,
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
@@ -847,7 +1023,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, mtimes, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.

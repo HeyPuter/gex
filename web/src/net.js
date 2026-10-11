@@ -58,6 +58,11 @@ export class WispNetwork {
   /** `[id, host, port]` of connects made while redialling. */
   #waiting = [];
 
+  /** Called when a stream opens, receives or closes. The single-thread
+   *  build wakes its parked fibers here (a guest waiting on a socket sleeps
+   *  on the scheduler, not on this thread's event loop). */
+  onActivity = () => {};
+
   constructor(wispUrl, onEvent = () => {}) {
     this.#url = wispUrl.endsWith('/') ? wispUrl : `${wispUrl}/`;
     this.#onEvent = onEvent;
@@ -151,6 +156,7 @@ export class WispNetwork {
     // The Wisp client reports the connection as open once the proxy has it.
     w.onopen = () => {
       s.state = OPEN;
+      this.onActivity();
     };
     w.onmessage = (data) => {
       const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -181,12 +187,15 @@ export class WispNetwork {
       }
       s.chunks.push(bytes);
       s.buffered += bytes.length;
+      this.onActivity();
     };
     w.onclose = () => {
       s.state = s.state === CONNECTING ? REFUSED : CLOSED;
+      this.onActivity();
     };
     w.onerror = () => {
       s.state = s.state === CONNECTING ? REFUSED : CLOSED;
+      this.onActivity();
     };
     // Some builds of the client open synchronously and never fire `onopen`.
     if (w.open === true || s.wisp?.open === true) s.state = OPEN;

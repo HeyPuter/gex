@@ -266,15 +266,33 @@ impl FuncBody {
     /// it (or there is none). Sound for locals that never carry a value
     /// backwards (around a loop) -- a block-local temporary is set before
     /// any read in its block. The value the tee left on the stack stays.
-    pub fn strip_dead_tees(&mut self, temp: &dyn Fn(u32) -> bool) {
+    ///
+    /// `loop_safe`: also keep a tee when a read of its local comes before
+    /// it in code order, which a back-edge could reach with the tee's value
+    /// (tier 1's fused loops keep their iteration counter and member index
+    /// in pooled locals: stripping the counter's tee made a spinning loop
+    /// never reach its signal poll).
+    pub fn strip_dead_tees(&mut self, temp: &dyn Fn(u32) -> bool, loop_safe: bool) {
         if !self.fold {
             return;
         }
         let log = std::mem::take(&mut self.local_log);
+        // First read of each local, in code order (`loop_safe`).
+        let mut first_get: HashMap<u32, u32> = HashMap::new();
+        if loop_safe {
+            for &(at, idx, _) in &log {
+                if self.code[at as usize] == op::LOCAL_GET {
+                    first_get.entry(idx).or_insert(at);
+                }
+            }
+        }
         let mut next_of: HashMap<u32, usize> = HashMap::new();
         let mut dead = vec![false; log.len()];
         for (k, &(at, idx, _)) in log.iter().enumerate().rev() {
-            if self.code[at as usize] == op::LOCAL_TEE && temp(idx) {
+            if self.code[at as usize] == op::LOCAL_TEE
+                && temp(idx)
+                && first_get.get(&idx).is_none_or(|&g| g > at)
+            {
                 dead[k] = match next_of.get(&idx) {
                     None => true,
                     Some(&n) => self.code[log[n].0 as usize] == op::LOCAL_SET,
@@ -633,36 +651,45 @@ impl FuncBody {
     /// The offsets [`Self::relocs`] holds are into `code`; the encoding puts a
     /// size prefix and the local declarations in front of it, so they all move
     /// by the same amount.
-    pub fn finish_with_relocs(self) -> (Vec<u8>, Vec<u32>) {
-        let relocs = self.relocs.clone();
+    pub fn finish_with_relocs(mut self) -> (Vec<u8>, Vec<u32>) {
+        let mut relocs = std::mem::take(&mut self.relocs);
         let code_len = self.code.len();
         let out = self.finish();
         let shift = (out.len() - code_len - 1) as u32; // -1 for the trailing `end`
-        (out, relocs.into_iter().map(|r| r + shift).collect())
+        for r in &mut relocs {
+            *r += shift;
+        }
+        (out, relocs)
     }
 
     /// Serialise the body into the code-section entry form.
     pub fn finish(self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.code.len() + 16);
         // Run-length encode the local declarations.
-        let mut runs: Vec<(u32, ValType)> = Vec::new();
-        for ty in &self.locals {
-            match runs.last_mut() {
-                Some((n, t)) if *t == *ty => *n += 1,
-                _ => runs.push((1, *ty)),
+        let mut runs = 0u32;
+        let mut decl = Vec::with_capacity(32);
+        let mut i = 0;
+        while i < self.locals.len() {
+            let ty = self.locals[i];
+            let mut j = i + 1;
+            while j < self.locals.len() && self.locals[j] == ty {
+                j += 1;
             }
+            write_u32(&mut decl, (j - i) as u32);
+            decl.push(ty.byte());
+            runs += 1;
+            i = j;
         }
-        write_u32(&mut body, runs.len() as u32);
-        for (n, ty) in runs {
-            write_u32(&mut body, n);
-            body.push(ty.byte());
-        }
-        body.extend_from_slice(&self.code);
-        body.push(op::END);
-
-        let mut out = Vec::with_capacity(body.len() + 5);
-        write_u32(&mut out, body.len() as u32);
-        out.extend_from_slice(&body);
+        let mut head = Vec::with_capacity(5);
+        write_u32(&mut head, runs);
+        // Once, at its final size: the code was copied twice before (into a
+        // body, then behind its length), each a fresh allocation.
+        let body_len = head.len() + decl.len() + self.code.len() + 1;
+        let mut out = Vec::with_capacity(body_len + 5);
+        write_u32(&mut out, body_len as u32);
+        out.extend_from_slice(&head);
+        out.extend_from_slice(&decl);
+        out.extend_from_slice(&self.code);
+        out.push(op::END);
         out
     }
 }
@@ -689,6 +716,10 @@ pub enum ImportKind {
     /// A funcref table with the given minimum size.
     Table {
         min: u32,
+    },
+    /// An immutable global of the given type.
+    Global {
+        ty: ValType,
     },
 }
 
@@ -729,6 +760,9 @@ pub struct ElementSegment {
     /// The offset is written as a five-byte LEB, so a host can rewrite it in
     /// place (`crate::dense::set_base`).
     pub padded: bool,
+    /// The offset is this (imported) global's value instead of `offset`:
+    /// given at instantiation, so the module's bytes do not depend on it.
+    pub offset_global: Option<u32>,
 }
 
 /// A memory initialiser.
@@ -841,6 +875,20 @@ impl Module {
             name: name.to_string(),
             kind: ImportKind::Table { min },
         });
+    }
+
+    /// Import an immutable global, returning its index. Imported globals
+    /// come before defined ones, so this must not be mixed with
+    /// [`Module::add_global`].
+    pub fn import_global(&mut self, module: &str, name: &str, ty: ValType) -> u32 {
+        assert!(self.globals.is_empty(), "a global import after a defined global");
+        let n = self.imports.iter().filter(|i| matches!(i.kind, ImportKind::Global { .. })).count() as u32;
+        self.imports.push(Import {
+            module: module.to_string(),
+            name: name.to_string(),
+            kind: ImportKind::Global { ty },
+        });
+        n
     }
 
     /// Number of imported *functions*, which is what local function indices
@@ -1237,6 +1285,11 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *min);
                     }
+                    ImportKind::Global { ty } => {
+                        s.push(0x03);
+                        s.push(ty.byte());
+                        s.push(0x00); // immutable
+                    }
                 }
             }
             section(&mut out, 2, &s);
@@ -1335,6 +1388,13 @@ impl Module {
                     s.push(op::I32_CONST);
                     write_i32(&mut s, e.offset as i32);
                     s.push(op::END);
+                } else if let Some(g) = e.offset_global {
+                    s.push(0x02);
+                    write_u32(&mut s, e.table);
+                    s.push(0x23); // global.get
+                    write_u32(&mut s, g);
+                    s.push(op::END);
+                    s.push(0x00); // elemkind: funcref
                 } else {
                     s.push(0x02);
                     write_u32(&mut s, e.table);
@@ -1424,7 +1484,12 @@ impl Module {
         // Where this module names its own functions. A custom section, so it
         // travels with the bytes -- the shared store keeps wasm and nothing
         // else -- and an engine ignores it.
-        if !code_relocs.is_empty() {
+        //
+        // Not in a module with a dense segment (placed by an imported global,
+        // `crate::dense`): `merge` refuses those, so nothing would read it,
+        // and it was 3.5% of what node's start-up translates (340 B a unit).
+        let unmergeable = self.elements.iter().any(|e| e.offset_global.is_some());
+        if !code_relocs.is_empty() && !unmergeable {
             let mut sec = Vec::with_capacity(code_relocs.len() * 4 + 16);
             write_name(&mut sec, RELOC_SECTION);
             write_u32(&mut sec, code_relocs.len() as u32);

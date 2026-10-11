@@ -1,0 +1,167 @@
+wasm jit: checked arithmetic and unsigned-to-double conversions (gex)
+
+Methods using checked add/sub/mul or uint/ulong-to-double were refused whole
+("unsupported opcode" int_addcc 662, int_conv_to_r_un 627, int_mul_ovf 636):
+List<T>.AddRange (707k interpreter legs a minute in Hollow Knight) and
+InputStateBlock.ReadFloat (571k). ADDCC/SUBCC fuse with the COND_EXC_[I]OV /
+[I]C that follows them (wasm has no flags); IMUL_OVF[_UN] goes through the
+64-bit product; [I|L]CONV_TO_R_UN are f64.convert_i32_u / _i64_u.
+Tests: tests/unity-dotnet T.Checked.
+
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 11bfda8b6..b5c9e4ed2 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -3074,6 +3074,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						want [4] = TRUE;
+ 					break;
+ 				case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:
++				case OP_IMUL_OVF: case OP_IMUL_OVF_UN:   /* gex */
++				case OP_IADDCC: case OP_ISUBCC: case OP_LADDCC: case OP_LSUBCC: case OP_ADDCC: case OP_SUBCC:
+ 					want [0] = TRUE;   /* R323: OverflowException */
+ 					break;
+ 				default:
+@@ -3240,6 +3242,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		if (lazy_cold_frame)
+ 			lc.lazy_frame = (lazy_doomed && lazy_doomed [i]) ? 1 : 2;
+ 		int cmp_a = -1, cmp_b = -1;
++		MonoInst *wj_cc_fused = NULL;   /* gex: the COND_EXC an ADDCC/SUBCC already emitted */
+ 		gint32 cmp_imm = 0;
+ 		gint64 cmp_imm64 = 0;      /* the immediate for an i64 compare-imm (OP_LCOMPARE_IMM); cmp_imm holds the i32 one */
+ 		gboolean cmp_imm_mode = FALSE;
+@@ -3777,6 +3780,86 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				NN_SET (ins->dreg);   /* a frame-slot address is never null */
+ 				break;
+ 			}
++			/* gex: checked arithmetic. decompose.c lowers [I|L]ADD_OVF[_UN] / [I|L]SUB_OVF[_UN] to ADDCC/SUBCC followed
++			 * at once by OP_COND_EXC_[I]OV (signed) or OP_COND_EXC_[I]C (unsigned), which test the flags the
++			 * CC op set. wasm has no flags, so the pair is fused here: the CC op computes the condition from its
++			 * operands, branches to the shared throw block, then stores the result; the COND_EXC that follows
++			 * emits nothing (wj_cc_fused). The condition is computed before the store, so dreg may alias a
++			 * source. Signed overflow of a+b: ((a+b)^a) & ((a+b)^b) < 0; of a-b: (a^b) & (a^(a-b)) < 0.
++			 * Carry of a+b: a+b <u a; borrow of a-b: a <u b. */
++			case OP_IADDCC: case OP_ISUBCC: case OP_LADDCC: case OP_LSUBCC: case OP_ADDCC: case OP_SUBCC: {
++				MonoInst *nx = ins->next;
++				/* OP_ADDCC/SUBCC are native-int: 64-bit on wasm64, where checked long arithmetic uses them */
++				gboolean w = ins->opcode == OP_LADDCC || ins->opcode == OP_LSUBCC ||
++					(WJ_W64 && (ins->opcode == OP_ADDCC || ins->opcode == OP_SUBCC));
++				gboolean add = ins->opcode == OP_IADDCC || ins->opcode == OP_LADDCC || ins->opcode == OP_ADDCC;
++				WasmValtype ty = w ? WASM_I64 : WASM_I32;
++				WasmOpcode opr = add ? (w ? WASM_OP_I64_ADD : WASM_OP_I32_ADD) : (w ? WASM_OP_I64_SUB : WASM_OP_I32_SUB);
++				WasmOpcode oxor = w ? WASM_OP_I64_XOR : WASM_OP_I32_XOR, oand = w ? WASM_OP_I64_AND : WASM_OP_I32_AND;
++				WasmOpcode oltu = w ? WASM_OP_I64_LT_U : WASM_OP_I32_LT_U, olts = w ? WASM_OP_I64_LT_S : WASM_OP_I32_LT_S;
++				gboolean sgn;
++				int eid;
++#define CCL(V) do { if (!wasm_ld_as (&body, &lc, (V), ty)) { fail = "cc sreg"; goto done; } } while (0)
++#define CCR() do { CCL (ins->sreg1); CCL (ins->sreg2); wasm_op (&body, opr); } while (0)
++				if (!nx) { fail = "cc without cond_exc"; goto done; }
++				switch (nx->opcode) {
++				case OP_COND_EXC_IOV: case OP_COND_EXC_OV: sgn = TRUE; break;
++				case OP_COND_EXC_IC: case OP_COND_EXC_C: sgn = FALSE; break;
++				default: fail = "cc without cond_exc"; goto done;
++				}
++				eid = wj_exc_id_for_name ((const char *) nx->inst_p1);
++				if (!WJ_HAS_THROW (eid)) { fail = "no shared throw block for cc"; goto done; }
++				if (sgn && add) {
++					CCR (); CCL (ins->sreg1); wasm_op (&body, oxor);
++					CCR (); CCL (ins->sreg2); wasm_op (&body, oxor);
++					wasm_op (&body, oand);
++					if (w) wasm_i64_const (&body, 0); else wasm_i32_const (&body, 0);
++					wasm_op (&body, olts);
++				} else if (sgn) {
++					CCL (ins->sreg1); CCL (ins->sreg2); wasm_op (&body, oxor);
++					CCL (ins->sreg1); CCR (); wasm_op (&body, oxor);
++					wasm_op (&body, oand);
++					if (w) wasm_i64_const (&body, 0); else wasm_i32_const (&body, 0);
++					wasm_op (&body, olts);
++				} else if (add) {
++					CCR (); CCL (ins->sreg1); wasm_op (&body, oltu);
++				} else {
++					CCL (ins->sreg1); CCL (ins->sreg2); wasm_op (&body, oltu);
++				}
++				WJ_THROW_BR (eid, 0);
++				CCR ();
++				if (!wasm_st_from (&body, &lc, ins->dreg, ty)) { fail = "cc dreg"; goto done; }
++#undef CCR
++#undef CCL
++				wj_cc_fused = nx;
++				break;
++			}
++			case OP_COND_EXC_IOV: case OP_COND_EXC_OV: case OP_COND_EXC_IC: case OP_COND_EXC_C:
++				if (ins != wj_cc_fused) { fail = "cond_exc flags without cc"; goto done; }
++				wj_cc_fused = NULL;
++				break;
++			/* gex: checked 32-bit multiply, through the exact 64-bit product. */
++			case OP_IMUL_OVF: case OP_IMUL_OVF_UN: {
++				gboolean un = ins->opcode == OP_IMUL_OVF_UN;
++				WasmOpcode ext = un ? WASM_OP_I64_EXTEND_I32_U : WASM_OP_I64_EXTEND_I32_S;
++#define MULP() do { if (!wasm_ld_as (&body, &lc, ins->sreg1, WASM_I32)) { fail = "mul_ovf sreg"; goto done; } wasm_op (&body, ext); \
++	if (!wasm_ld_as (&body, &lc, ins->sreg2, WASM_I32)) { fail = "mul_ovf sreg"; goto done; } wasm_op (&body, ext); wasm_op (&body, WASM_OP_I64_MUL); } while (0)
++				if (!WJ_HAS_THROW (0)) { fail = "no shared throw block for mul_ovf"; goto done; }
++				if (un) {
++					MULP (); wasm_i64_const (&body, 32); wasm_op (&body, WASM_OP_I64_SHR_U);
++					wasm_i64_const (&body, 0); wasm_op (&body, WASM_OP_I64_NE);
++				} else {
++					MULP (); MULP (); wasm_op (&body, WASM_OP_I32_WRAP_I64); wasm_op (&body, WASM_OP_I64_EXTEND_I32_S);
++					wasm_op (&body, WASM_OP_I64_NE);
++				}
++				WJ_THROW_BR (0, 0);
++				MULP (); wasm_op (&body, WASM_OP_I32_WRAP_I64);
++#undef MULP
++				if (!wasm_st_from (&body, &lc, ins->dreg, WASM_I32)) { fail = "mul_ovf dreg"; goto done; }
++				break;
++			}
++			case OP_ICONV_TO_R_UN: UN (WASM_OP_F64_CONVERT_I32_U); break;   /* gex */
++			case OP_LCONV_TO_R_UN: UN (WASM_OP_F64_CONVERT_I64_U); break;   /* gex */
+ 			case OP_IADD: BIN (WASM_OP_I32_ADD); break;
+ 			case OP_ISUB: BIN (WASM_OP_I32_SUB); break;
+ 			case OP_IMUL: BIN (WASM_OP_I32_MUL); break;
+diff --git a/src/mono/mono/mini/mini-wasm-ir.inc b/src/mono/mono/mini/mini-wasm-ir.inc
+index 1c18e6f3b..d7e39c769 100644
+--- a/src/mono/mono/mini/mini-wasm-ir.inc
++++ b/src/mono/mono/mini/mini-wasm-ir.inc
+@@ -61,6 +61,7 @@ wj_opcode_is_ptr_sized (int opcode)
+ 	case OP_LCONV_TO_I: case OP_LCONV_TO_U: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:
+ 	case OP_RCONV_TO_I: case OP_FCONV_TO_I:
+ 	case OP_SEXT_I4: case OP_ZEXT_I4:
++	case OP_ADDCC: case OP_SUBCC:   /* gex: checked native-int arithmetic */
+ 		return TRUE;
+ 	}
+ #endif
+@@ -79,6 +80,8 @@ wasm_valtype_of_opcode (int opcode)
+ 	case OP_GET_EX_OBJ:   /* caught exception object -> i32 (ref) on wasm32 */
+ 	case OP_WASM_JIT_ALLOC_FAST:   /* new object or 0 -> i32 (ref) on wasm32 */
+ 	case OP_IADD: case OP_ISUB: case OP_IMUL:
++	case OP_IADDCC: case OP_ISUBCC: case OP_IMUL_OVF: case OP_IMUL_OVF_UN:   /* gex: checked arithmetic */
++	case OP_ADDCC: case OP_SUBCC:   /* native int: i32 on wasm32 (wj_opcode_is_ptr_sized answers wasm64) */
+ 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
+ 	case OP_IAND: case OP_IOR: case OP_IXOR:
+ 	case OP_ISHL: case OP_ISHR: case OP_ISHR_UN:
+@@ -127,6 +130,7 @@ wasm_valtype_of_opcode (int opcode)
+ 		return WASM_F32;
+ 	case OP_I8CONST: case OP_LMOVE:
+ 	case OP_LADD: case OP_LSUB: case OP_LMUL:
++	case OP_LADDCC: case OP_LSUBCC:   /* gex: checked arithmetic */
+ 	case OP_LDIV: case OP_LDIV_UN: case OP_LREM: case OP_LREM_UN:
+ 	case OP_LAND: case OP_LOR: case OP_LXOR:
+ 	case OP_LSHL: case OP_LSHR: case OP_LSHR_UN:
+@@ -143,6 +147,7 @@ wasm_valtype_of_opcode (int opcode)
+ 	case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV: case OP_FNEG:
+ 	case OP_ICONV_TO_R8: case OP_RCONV_TO_R8:
+ 	case OP_LCONV_TO_R8:   /* i64 -> f64 */
++	case OP_ICONV_TO_R_UN: case OP_LCONV_TO_R_UN:   /* gex: unsigned -> f64 */
+ 	case OP_MOVE_I8_TO_F:  /* i64 bits -> f64 (reinterpret) */
+ 	/* double math intrinsics (the F-suffixed / R-prefixed forms below are the f32 ones) */
+ 	case OP_ABS: case OP_SQRT: case OP_CEIL: case OP_FLOOR: case OP_TRUNC: case OP_ROUND:
+diff --git a/src/mono/mono/mini/wasm-encoder.h b/src/mono/mono/mini/wasm-encoder.h
+index c037a79de..e3498ec40 100644
+--- a/src/mono/mono/mini/wasm-encoder.h
++++ b/src/mono/mono/mini/wasm-encoder.h
+@@ -233,6 +233,7 @@ typedef enum {
+ 	WASM_OP_F64_CONVERT_I32_S  = 0xb7,
+ 	WASM_OP_F64_CONVERT_I32_U  = 0xb8,
+ 	WASM_OP_F64_CONVERT_I64_S  = 0xb9,
++	WASM_OP_F64_CONVERT_I64_U  = 0xba,
+ 	WASM_OP_I32_REINTERPRET_F32 = 0xbc,
+ 	WASM_OP_I64_REINTERPRET_F64 = 0xbd,
+ 	WASM_OP_F32_REINTERPRET_I32 = 0xbe,

@@ -1029,7 +1029,7 @@ fn emit_modules(
             text_base,
             0,
             Linkage::Shared,
-            pages.clone(),
+            std::mem::take(pages),
             shared_memory,
         );
         builder.set_demand_fill(demand_fill);
@@ -1232,6 +1232,28 @@ fn translate_seeded(
     (module, stats)
 }
 
+/// Edges discovery does not follow (an experiment knob, `set_discover_skip`):
+/// bit 0 call returns, bit 1 call targets folded through memory, bit 2 the
+/// block's own successors; bit 8 the discovery log; bits 16-23 a depth limit.
+static DISCOVER_SKIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// With `DISCOVER_SKIP` bit 8: every block discovery lifts, as
+/// `(address, why, depth)`, for [`take_discover_log`]. `why`: 0 a seed, 1 a
+/// conditional branch's taken side, 2 its fall-through, 3 a sole successor
+/// (goto, direct call, syscall return), 4 a call's return address, 5 a call
+/// target folded through memory. Depth is the breadth-first level.
+static DISCOVER_LOG: std::sync::Mutex<Vec<(u64, u8, u16)>> = std::sync::Mutex::new(Vec::new());
+
+/// The discovery log so far (`DISCOVER_SKIP` bit 8), emptied.
+pub fn take_discover_log() -> Vec<(u64, u8, u16)> {
+    std::mem::take(&mut *DISCOVER_LOG.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// See `DISCOVER_SKIP`.
+pub fn set_discover_skip(bits: u32) {
+    DISCOVER_SKIP.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Lift every block reachable from the seeds.
 ///
 /// Separate from encoding because one object's blocks may not fit in one
@@ -1262,8 +1284,16 @@ fn discover(
     frontier.sort_unstable();
     frontier.dedup();
     seen.extend(frontier.iter().copied());
+    let logging = DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed) & 256 != 0;
+    // Why each frontier address was queued (`DISCOVER_LOG`).
+    let mut why: HashMap<u64, u8> = HashMap::new();
+    let mut depth: u16 = 0;
 
-    while !frontier.is_empty() && stats.blocks < max_blocks {
+    // Bits 16-23 of `DISCOVER_SKIP`: the deepest breadth-first level lifted
+    // past the seeds (0: no limit). An experiment: 63% of the blocks node's
+    // start-up lifts never run, and the deeper the level the fewer run.
+    let max_depth = (DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed) >> 16) & 0xff;
+    while !frontier.is_empty() && stats.blocks < max_blocks && (max_depth == 0 || u32::from(depth) <= max_depth) {
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
@@ -1277,6 +1307,13 @@ fn discover(
         });
 
         let mut next: Vec<u64> = Vec::new();
+        if logging {
+            let mut log = DISCOVER_LOG.lock().unwrap_or_else(|e| e.into_inner());
+            for (block, _) in &lifted {
+                log.push((block.start, why.get(&block.start).copied().unwrap_or(0), depth));
+            }
+        }
+        depth = depth.saturating_add(1);
         for (block, folded) in lifted {
             stats.blocks += 1;
             stats.instructions += ((block.end - block.start) / INST_ALIGN) as usize;
@@ -1292,12 +1329,25 @@ fn discover(
             // store has not reached yet -- and code that bakes it in is wrong
             // the moment it changes. Discovery can afford a wrong guess (an
             // unneeded block); execution cannot.
-            let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
-            if let Some(t) = folded {
-                stats.discovered_from_data += 1;
-                targets.push(t);
+            let mask = DISCOVER_SKIP.load(std::sync::atomic::Ordering::Relaxed);
+            let mut targets: Vec<(u64, u8)> = Vec::new();
+            if mask & 4 == 0 {
+                match block.term {
+                    Term::Branch { taken, not_taken, .. } => {
+                        targets.push((taken, 1));
+                        targets.push((not_taken, 2));
+                    }
+                    _ => targets.extend(block.successors().map(|t| (t, 3))),
+                }
             }
-            for succ in targets {
+            if mask & 1 == 0 {
+                targets.extend(block.call_return.map(|t| (t, 4)));
+            }
+            if let Some(t) = folded.filter(|_| mask & 2 == 0) {
+                stats.discovered_from_data += 1;
+                targets.push((t, 5));
+            }
+            for (succ, kind) in targets {
                 // Deliberately *not* skipping an address inside a block
                 // already lifted: an interior address is still a legal
                 // indirect-branch target, and dispatch needs a block starting
@@ -1311,6 +1361,9 @@ fn discover(
                 {
                     seen.insert(succ);
                     next.push(succ);
+                    if logging {
+                        why.insert(succ, kind);
+                    }
                 }
             }
             collected.push(block);

@@ -52,7 +52,10 @@ pub fn lift_block(
         }
         let mark = builder.mark();
         let mut lifter = Lifter::new(&mut builder, flags, raw);
-        let flow = lifter.lift(&inst, pc);
+        let flow = match (pc == start).then(|| crate::copy_loop(&fetch, start)).flatten() {
+            Some(r) => lifter.lift_copy_loop(r),
+            None => lifter.lift(&inst, pc),
+        };
         flags = lifter.flags();
         if builder.has_inexpressible(mark) {
             builder.rewind(mark);
@@ -106,6 +109,25 @@ mod tests {
             buf[..n].copy_from_slice(&code[off..off + n]);
             n
         }
+    }
+
+    /// The byte-copy loop `l: movsb; cmp edi, eax; jne l` (a4 39 c7 75 fb)
+    /// is one `StrOp` copy, then the compare and the branch; the same three
+    /// instructions entered anywhere but at `l`, or with `esi` compared,
+    /// are lifted one by one.
+    #[test]
+    fn byte_copy_loop_is_one_string_copy() {
+        let strops = |b: &Block| b.stmts.iter().filter(|s| matches!(s, Stmt::StrOp { .. })).count();
+        let code = &[0xa4, 0x39, 0xc7, 0x75, 0xfb, 0xc3];
+        let b = lift_block(bytes(0x1000, code), 0x1000, BlockLimits::default());
+        assert_eq!(strops(&b), 1, "{}", print::block(&b));
+        assert!(matches!(b.term, Term::Branch { .. }), "{}", print::block(&b));
+        // cmp edi, esi: not the idiom.
+        let b = lift_block(bytes(0x1000, &[0xa4, 0x39, 0xf7, 0x75, 0xfb]), 0x1000, BlockLimits::default());
+        assert_eq!(strops(&b), 0, "{}", print::block(&b));
+        // jne elsewhere: not the idiom.
+        let b = lift_block(bytes(0x1000, &[0xa4, 0x39, 0xc7, 0x75, 0xfa]), 0x1000, BlockLimits::default());
+        assert_eq!(strops(&b), 0, "{}", print::block(&b));
     }
 
     /// `fpatan` (d9 f3) is handed to the host rather than raising SIGILL:

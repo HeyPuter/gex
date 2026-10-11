@@ -1,0 +1,56 @@
+sgen: cache the major heap used size between collections (gex)
+
+mono_gc_get_used_size walked every object in the major heap on each call.
+Hollow Knight asks every frame (GCManager.Update -> GetMonoHeapUsage), which
+cost 3-4.5% of its main thread in the browser on either tier. Recompute only
+after a collection or when the major section count changes;
+MONO_GC_USED_SIZE_EXACT=1 restores the walk on every call.
+
+diff --git a/src/mono/mono/sgen/sgen-gc.c b/src/mono/mono/sgen/sgen-gc.c
+index aec2a0422..d52ccb872 100644
+--- a/src/mono/mono/sgen/sgen-gc.c
++++ b/src/mono/mono/sgen/sgen-gc.c
+@@ -3253,6 +3253,34 @@ sgen_gc_collection_count (int generation)
+ 	return mono_atomic_load_i32 (generation == GENERATION_NURSERY ? &mono_gc_stats.minor_gc_count : &mono_gc_stats.major_gc_count);
+ }
+ 
++/*
++ * The major heap's used size, recomputed only when it can have changed (gex). get_used_size walks every
++ * object in the major heap, and a game that asks every frame (Hollow Knight's GCManager, through
++ * mono_gc_get_used_size) spent 3-4.5% of its main thread there. Between collections the major heap
++ * changes by blocks allocated or freed (num_major_sections, which also follows a sweep that frees
++ * blocks) and by pinned objects placed in existing blocks; those are left for the next collection, as
++ * the FIXME below already leaves pinned objects out. MONO_GC_USED_SIZE_EXACT=1 walks every time.
++ * Called with the GC lock held.
++ */
++static gint64
++major_used_size_cached (void)
++{
++	static int exact = -1;
++	static gint32 minor = -1, major = -1;
++	static size_t sections = (size_t)-1;
++	static gint64 size;
++	gint32 mi = mono_atomic_load_i32 (&mono_gc_stats.minor_gc_count);
++	gint32 ma = mono_atomic_load_i32 (&mono_gc_stats.major_gc_count);
++	if (exact < 0)
++		exact = g_hasenv ("MONO_GC_USED_SIZE_EXACT");
++	if (exact || mi != minor || ma != major || sgen_major_collector.get_num_major_sections () != sections) {
++		size = sgen_major_collector.get_used_size ();
++		/* The walk finishes any pending sweep, which can free blocks: key on the count after it. */
++		minor = mi; major = ma; sections = sgen_major_collector.get_num_major_sections ();
++	}
++	return size;
++}
++
+ size_t
+ sgen_gc_get_used_size (void)
+ {
+@@ -3260,7 +3288,7 @@ sgen_gc_get_used_size (void)
+ 	LOCK_GC;
+ 	tot = sgen_los_memory_usage;
+ 	tot += sgen_nursery_section->end_data - sgen_nursery_section->data;
+-	tot += sgen_major_collector.get_used_size ();
++	tot += major_used_size_cached ();
+ 	/* FIXME: account for pinned objects */
+ 	UNLOCK_GC;
+ 	return GINT64_TO_SIZE (tot);

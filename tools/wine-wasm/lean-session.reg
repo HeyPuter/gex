@@ -1,0 +1,22 @@
+REGEDIT4
+
+; A lean W3 session for one-shot console programs (docs/wine-native.md
+; §3.17): wineboot --init starts only what a console program needs. The
+; Event Log (svchost), NDIS, the NSI proxy and Plug and Play become
+; demand-start; MountMgr (drives) stays. On edger this takes
+; `wine cmd /c echo` from 8.3-8.5 s to 6.2-6.7 s (5 processes instead
+; of 7). Not for games: Plug and Play starts the bus drivers that HID and
+; game controllers come through.
+;   wine regedit /S lean-session.reg   (or merge into the prefix's system.reg)
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\Eventlog]
+"Start"=dword:00000003
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS]
+"Start"=dword:00000003
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\nsiproxy]
+"Start"=dword:00000003
+
+[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\PlugPlay]
+"Start"=dword:00000003

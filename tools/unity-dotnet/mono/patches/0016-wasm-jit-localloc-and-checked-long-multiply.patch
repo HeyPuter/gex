@@ -1,0 +1,199 @@
+wasm jit: stackalloc (OP_LOCALLOC[_IMM]) and 64-bit checked multiply (gex)
+
+localloc takes ALIGN16(size) from __stack_pointer, zeroed under MONO_INST_INIT; a method with
+one keeps an eager frame (never lazy) whose entry SP every exit restores. Refused in methods with
+EH clauses, whose landing pad resets the SP to the frame base. OP_LMUL_OVF[_UN] (stackalloc
+int[n] sizes, checked long math) raise OverflowException through the shared throw block with
+division-based checks that cannot trap. Number.FormatFloat, BinaryReader.ReadInt32 and friends
+now compile. Test: T.Localloc (Stack, MulOvf, BinaryReader round trip).
+
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index e6a5a6fa2..bd94df4e8 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -355,6 +355,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	gboolean method_nogc G_GNUC_UNUSED = FALSE;        /* transitive direct-call effect published in WjRegEntry */
+ 	int effective_gcp_count G_GNUC_UNUSED = 0;         /* static returning GC points after direct no-GC resolution */
+ 	gboolean lazy_ref_frame = FALSE;     /* defer a pure ref frame until the first effective GC point */
++	gboolean has_localloc = FALSE;       /* gex: OP_LOCALLOC[_IMM] somewhere: eager frame, SP restored at every exit */
+ 	/* MONO_WASM_JIT_LAZY_COLD: the lazy frame can only materialise in a raise or poll taken arm, so it is
+ 	 * never live on the hot path -- no mirrors, kill stores, exit restore, or hot ENSURE (see the knob). */
+ 	gboolean lazy_cold_frame = FALSE;
+@@ -544,6 +545,17 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		}
+ 	}
+ 	if (cfg->gshared) { fail = "gshared method"; goto done; }
++	/* gex: stackalloc (OP_LOCALLOC[_IMM]) takes its memory from the C stack below this method's frame, so
++	 * the method keeps an eager frame whose every exit restores the entry SP. Not in a method with EH
++	 * clauses: the landing pad resets the SP to the frame base, which would hand a live stackalloc
++	 * buffer to the next call. */
++	{
++		MonoBasicBlock *_lb; MonoInst *_li;
++		for (_lb = cfg->bb_entry; _lb && !has_localloc; _lb = _lb->next_bb)
++			MONO_BB_FOR_EACH_INS (_lb, _li)
++				if (_li->opcode == OP_LOCALLOC || _li->opcode == OP_LOCALLOC_IMM) { has_localloc = TRUE; break; }
++		if (has_localloc && cfg->header->num_clauses) { fail = "localloc in a method with EH clauses"; goto done; }
++	}
+ 	/* gex: a [DynamicSecurityMethod] (StackCrawlMark) method finds its caller by walking the stack, and
+ 	 * a JIT-compiled frame is invisible to that walk: Assembly.GetExecutingAssembly compiled here answered
+ 	 * System.Private.CoreLib. The interpreter keeps these, as transform.c keeps them out of inlining. */
+@@ -1280,7 +1292,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		for (bb = cfg->bb_entry; bb && !has_alloc_fast; bb = bb->next_bb)
+ 			MONO_BB_FOR_EACH_INS (bb, ins)
+ 				if (ins->opcode == OP_WASM_JIT_ALLOC_FAST) { has_alloc_fast = TRUE; break; }
+-		if (has_alloc_fast) {
++		if (has_alloc_fast || has_localloc) {   /* gex: OP_LOCALLOC uses the first as its temp */
+ 			WJ_PTR_LOCAL (alloc_tmp_idx);   /* three consecutive pointer-sized locals */
+ 			WJ_PTR_LOCAL3_REST ();
+ 		}
+@@ -2165,7 +2177,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			 * unsound positive control and is never combined with it. */
+ 			gboolean cold_gate = mono_wasm_jit_lazy_cold && gcp_walked && hot_gcp_count == 0 &&
+ 				mono_wasm_jit_raise_nogc != 2 && cfg->header->num_clauses == 0;
+-			if (framebytes > 0 && (gcp_gate || cold_gate) &&
++			if (framebytes > 0 && (gcp_gate || cold_gate) && !has_localloc &&
+ 			    naddrbytes == 0 && !eh_on && lc.ref_wt &&
+ 			    !lc.storeguard && !lc.objguard) {
+ 				gboolean all_wt = TRUE;
+@@ -2550,7 +2562,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	wasm_op (&body, WASM_OP_END); \
+ 	} while (0)
+ #define EMIT_REF_LEAVE() do { if (ehrec_on) EMIT_EHREC_POP (); \
+-	if (framebytes > 0 && !lazy_cold_frame) { \
++	if ((framebytes > 0 || has_localloc) && !lazy_cold_frame) { \
+ 		if (lazy_ref_frame) { \
+ 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+ 			wasm_ptr_test (&body); \
+@@ -2876,7 +2888,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	 * callee frames fall below the SP and stop being scanned — no zeroing, no balance bookkeeping).
+ 	 * An EH method with an EMPTY frame still captures entry_sp (refbase = entry_sp) so its landing
+ 	 * pad can pop the frames of callees the C++ unwind tore through. */
+-	if ((framebytes > 0 && !lazy_ref_frame) || eh_on) {
++	if ((framebytes > 0 && !lazy_ref_frame) || eh_on || has_localloc) {
+ 		uses_calls = TRUE;
+ 		/* entry_sp = the caller's frame base, read from __stack_pointer (imported wasm global 0). */
+ 		wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
+@@ -3165,7 +3177,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						want [4] = TRUE;
+ 					break;
+ 				case OP_LCONV_TO_OVF_I4: case OP_LCONV_TO_OVF_I4_UN: case OP_LCONV_TO_OVF_I: case OP_LCONV_TO_OVF_I_UN:
+-				case OP_IMUL_OVF: case OP_IMUL_OVF_UN:   /* gex */
++				case OP_IMUL_OVF: case OP_IMUL_OVF_UN: case OP_LMUL_OVF: case OP_LMUL_OVF_UN:   /* gex */
+ 				case OP_IADDCC: case OP_ISUBCC: case OP_LADDCC: case OP_LSUBCC: case OP_ADDCC: case OP_SUBCC:
+ 					want [0] = TRUE;   /* R323: OverflowException */
+ 					break;
+@@ -3512,6 +3524,37 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			case OP_GC_LIVENESS_DEF: case OP_GC_LIVENESS_USE:
+ 			case OP_GC_PARAM_SLOT_LIVENESS_DEF: case OP_GC_SPILL_SLOT_LIVENESS_DEF:
+ 				break;
++			case OP_LOCALLOC:
++			case OP_LOCALLOC_IMM: {
++				/* gex: sp = (__stack_pointer - ALIGN16 (size)) & ~15; zero it under MONO_INST_INIT. The
++				 * prologue captured the entry SP and every exit restores it (has_localloc). */
++				int _ltmp = alloc_tmp_idx;
++				if (!_ltmp) { fail = "localloc tmp"; goto done; }
++				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 0);
++				if (ins->opcode == OP_LOCALLOC_IMM) {
++					wasm_ptr_const (&body, (gint64) ((ins->inst_imm + 15) & ~(gssize) 15));
++				} else {
++					if (!wasm_ld_as (&body, &lc, ins->sreg1, WASM_PTR)) { fail = "localloc size"; goto done; }
++					wasm_ptr_const (&body, 15); wasm_op (&body, WASM_OP_P_ADD);
++				}
++				wasm_op (&body, WASM_OP_P_SUB);
++				wasm_ptr_const (&body, -16); wasm_op (&body, WASM_OP_P_AND);
++				wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) _ltmp);
++				wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
++				if (ins->flags & MONO_INST_INIT) {
++					wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) _ltmp);
++					wasm_i32_const (&body, 0);
++					if (ins->opcode == OP_LOCALLOC_IMM) {
++						wasm_ptr_const (&body, (gint64) ins->inst_imm);
++					} else {
++						if (!wasm_ld_as (&body, &lc, ins->sreg1, WASM_PTR)) { fail = "localloc size"; goto done; }
++					}
++					wasm_u8 (&body, 0xFC); wasm_uleb (&body, 11); wasm_u8 (&body, 0);   /* memory.fill */
++				}
++				wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) _ltmp);
++				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "localloc dreg"; goto done; }
++				break;
++			}
+ 			case OP_CALL_HANDLER: {
+ 				/* milestone 2c: "call" a finally subroutine. We don't call — we record the continuation bb
+ 				 * index in finally_ind, then GOTO the finally bb; OP_ENDFINALLY reads finally_ind to branch
+@@ -3968,6 +4011,40 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				if (!wasm_st_from (&body, &lc, ins->dreg, WASM_I32)) { fail = "mul_ovf dreg"; goto done; }
+ 				break;
+ 			}
++			case OP_LMUL_OVF: case OP_LMUL_OVF_UN: {
++				/* gex: 64-bit checked multiply. Unsigned: a >u UINT64_MAX /u max (b, 1). Signed: with
++				 * d = b unless b is 0 or -1 (then 1), (a*b) /s d != a for those b, and for b == -1 the one
++				 * overflowing case a == INT64_MIN. No division can trap. */
++#define LA() do { if (!wasm_ld_as (&body, &lc, ins->sreg1, WASM_I64)) { fail = "lmul_ovf sreg"; goto done; } } while (0)
++#define LB() do { if (!wasm_ld_as (&body, &lc, ins->sreg2, WASM_I64)) { fail = "lmul_ovf sreg"; goto done; } } while (0)
++#define LBOK() do { LB (); wasm_op (&body, WASM_OP_I64_EQZ); wasm_op (&body, WASM_OP_I32_EQZ); \
++	LB (); wasm_i64_const (&body, -1); wasm_op (&body, WASM_OP_I64_NE); wasm_op (&body, WASM_OP_I32_AND); } while (0)
++				if (!WJ_HAS_THROW (0)) { fail = "no shared throw block for lmul_ovf"; goto done; }
++				if (ins->opcode == OP_LMUL_OVF_UN) {
++					LA ();
++					wasm_i64_const (&body, -1);
++					LB (); LB (); wasm_op (&body, WASM_OP_I64_EQZ); wasm_op (&body, WASM_OP_I64_EXTEND_I32_U); wasm_op (&body, WASM_OP_I64_OR);
++					wasm_op (&body, WASM_OP_I64_DIV_U);
++					wasm_op (&body, WASM_OP_I64_GT_U);
++				} else {
++					LA (); LB (); wasm_op (&body, WASM_OP_I64_MUL);
++					LB (); wasm_i64_const (&body, 1); LBOK (); wasm_op (&body, WASM_OP_SELECT);
++					wasm_op (&body, WASM_OP_I64_DIV_S);
++					LA (); wasm_op (&body, WASM_OP_I64_NE);
++					LBOK (); wasm_op (&body, WASM_OP_I32_AND);
++					LB (); wasm_i64_const (&body, -1); wasm_op (&body, WASM_OP_I64_EQ);
++					LA (); wasm_i64_const (&body, G_MININT64); wasm_op (&body, WASM_OP_I64_EQ);
++					wasm_op (&body, WASM_OP_I32_AND);
++					wasm_op (&body, WASM_OP_I32_OR);
++				}
++				WJ_THROW_BR (0, 0);
++				LA (); LB (); wasm_op (&body, WASM_OP_I64_MUL);
++#undef LA
++#undef LB
++#undef LBOK
++				if (!wasm_st_from (&body, &lc, ins->dreg, WASM_I64)) { fail = "lmul_ovf dreg"; goto done; }
++				break;
++			}
+ 			case OP_ICONV_TO_R_UN: UN (WASM_OP_F64_CONVERT_I32_U); break;   /* gex */
+ 			case OP_LCONV_TO_R_UN: UN (WASM_OP_F64_CONVERT_I64_U); break;   /* gex */
+ 			case OP_IADD: BIN (WASM_OP_I32_ADD); break;
+diff --git a/src/mono/mono/mini/mini-wasm-ir.inc b/src/mono/mono/mini/mini-wasm-ir.inc
+index d7e39c769..42eec1a08 100644
+--- a/src/mono/mono/mini/mini-wasm-ir.inc
++++ b/src/mono/mono/mini/mini-wasm-ir.inc
+@@ -62,6 +62,7 @@ wj_opcode_is_ptr_sized (int opcode)
+ 	case OP_RCONV_TO_I: case OP_FCONV_TO_I:
+ 	case OP_SEXT_I4: case OP_ZEXT_I4:
+ 	case OP_ADDCC: case OP_SUBCC:   /* gex: checked native-int arithmetic */
++	case OP_LOCALLOC: case OP_LOCALLOC_IMM:   /* gex: stackalloc's address */
+ 		return TRUE;
+ 	}
+ #endif
+@@ -82,6 +83,7 @@ wasm_valtype_of_opcode (int opcode)
+ 	case OP_IADD: case OP_ISUB: case OP_IMUL:
+ 	case OP_IADDCC: case OP_ISUBCC: case OP_IMUL_OVF: case OP_IMUL_OVF_UN:   /* gex: checked arithmetic */
+ 	case OP_ADDCC: case OP_SUBCC:   /* native int: i32 on wasm32 (wj_opcode_is_ptr_sized answers wasm64) */
++	case OP_LOCALLOC: case OP_LOCALLOC_IMM:   /* gex: stackalloc's address -> i32 on wasm32 */
+ 	case OP_IDIV: case OP_IDIV_UN: case OP_IREM: case OP_IREM_UN:
+ 	case OP_IAND: case OP_IOR: case OP_IXOR:
+ 	case OP_ISHL: case OP_ISHR: case OP_ISHR_UN:
+@@ -131,6 +133,7 @@ wasm_valtype_of_opcode (int opcode)
+ 	case OP_I8CONST: case OP_LMOVE:
+ 	case OP_LADD: case OP_LSUB: case OP_LMUL:
+ 	case OP_LADDCC: case OP_LSUBCC:   /* gex: checked arithmetic */
++	case OP_LMUL_OVF: case OP_LMUL_OVF_UN:   /* gex */
+ 	case OP_LDIV: case OP_LDIV_UN: case OP_LREM: case OP_LREM_UN:
+ 	case OP_LAND: case OP_LOR: case OP_LXOR:
+ 	case OP_LSHL: case OP_LSHR: case OP_LSHR_UN:
+@@ -200,6 +203,7 @@ wj_opcode_is_nonref (MonoInst *ins)
+ 	 * may read or swap a reference (Interlocked on IntPtr/object) and stays unproven. */
+ 	switch (ins->opcode) {
+ 	case OP_LMUL: case OP_LDIV: case OP_LDIV_UN: case OP_LREM: case OP_LREM_UN:
++	case OP_LMUL_OVF: case OP_LMUL_OVF_UN:   /* gex */
+ 	case OP_LOR: case OP_LXOR: case OP_LAND:
+ 	case OP_LSHL: case OP_LSHR: case OP_LSHR_UN: case OP_LNEG: case OP_LNOT:
+ 	case OP_LMUL_IMM: case OP_LDIV_IMM: case OP_LDIV_UN_IMM: case OP_LREM_IMM: case OP_LREM_UN_IMM:

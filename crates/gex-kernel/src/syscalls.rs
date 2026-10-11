@@ -545,12 +545,24 @@ pub struct Kernel {
     pub ports: Arc<net::Ports>,
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
-    pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
+    ///
+    /// Weak, as [`Kernel::remote_sockets`]: the descriptors own the socket.
+    /// Pruned only in `close` before, a strong reference here kept a socket
+    /// alive (connection open, port bound) after `dup2` over its last
+    /// descriptor, `close_range`, or an `execve` closing it on exec.
+    pub sockets: std::collections::HashMap<usize, std::sync::Weak<net::Socket>>,
     /// The same, for the ones that live in the global kernel. Two tables
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
     /// ones the two kinds do not share.
-    pub remote_sockets: std::collections::HashMap<usize, Arc<unix::RemoteUnix>>,
+    ///
+    /// Weak: the descriptors own the socket. A strong reference here kept
+    /// every end alive after its last `close`, so the global kernel never
+    /// heard of it and the peer never read EOF or got `EPIPE` (a libuv
+    /// child's stdout socketpair, which a parent reads to EOF). A dead
+    /// entry still pins its allocation, so its address is not reused while
+    /// the entry stands; [`Kernel::note_remote_unix`] prunes them.
+    pub remote_sockets: std::collections::HashMap<usize, std::sync::Weak<unix::RemoteUnix>>,
     /// And for epoll sets.
     pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// And for anonymous shared files, which have seals.
@@ -767,6 +779,15 @@ fn is_monotonic_clock(clk: u64) -> bool {
 static MONOTONIC_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The "uptime" the guest sees at its first monotonic reading.
 const MONOTONIC_START_SECS: u64 = 1000;
+/// A host whose processes do not share this static (the browser's, a
+/// Worker and an instance each) names one base for all of them: given the
+/// base this process would pick, the one every process uses.
+static MONOTONIC_SHARED: std::sync::OnceLock<fn(u64) -> u64> = std::sync::OnceLock::new();
+
+/// See [`MONOTONIC_SHARED`]. Set before the first clock reading.
+pub fn share_monotonic_base(f: fn(u64) -> u64) {
+    let _ = MONOTONIC_SHARED.set(f);
+}
 
 /// A monotonic clock reading made from a wall clock reading: seconds since
 /// a shared boot instant, not since the epoch. Programs truncate monotonic
@@ -779,7 +800,10 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     use std::sync::atomic::Ordering;
     let mut base = MONOTONIC_BASE.load(Ordering::Relaxed);
     if base == 0 {
-        let want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
+        let mut want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
+        if let Some(f) = MONOTONIC_SHARED.get() {
+            want = f(want);
+        }
         base = match MONOTONIC_BASE.compare_exchange(0, want, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => want,
             Err(other) => other,
@@ -929,6 +953,12 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     const POLLHUP: u16 = 0x010;
     if h.poll_hup() {
         r |= POLLHUP;
+    }
+    // Asked for, unlike `POLLHUP`: the peer shut its sending side (or
+    // closed), so what is left to read ends in EOF.
+    const POLLRDHUP: u16 = 0x2000;
+    if p.events & POLLRDHUP != 0 && h.poll_rdhup() {
+        r |= POLLRDHUP;
     }
     r
 }
@@ -2857,23 +2887,19 @@ impl Kernel {
             // agreed to without effect, on a descriptor that exists
             nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[1], a[2], a[3]),
-            // A unix socket's directions close as asked; any other socket
-            // (the proxied network, the global kernel's) just agrees.
+            // A unix socket's directions close as asked, local or in the
+            // global kernel; the proxied network's as it can; anything else
+            // just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
-                Err(_) => match self.socket_of(a[0] as i32) {
-                    Ok(s) => s.shutdown(a[1]),
-                    Err(_) => {
-                        // SHUT_WR (1) or SHUT_RDWR (2) on a shared socketpair
-                        // end: the peer reads end-of-file, as `uv_shutdown`
-                        // expects of a child's stdin.
-                        self.fds.get(a[0] as i32).map(|f| {
-                            if a[1] >= 1 {
-                                f.handle.shutdown_write();
-                            }
-                            0
-                        })
-                    }
+                // A global-kernel one too (a socketpair's ends in two
+                // Workers): SHUT_WR is how libuv ends a child's stdin.
+                Err(_) => match self.remote_unix_of(a[0] as i32) {
+                    Ok(sock) => sock.shutdown_how(a[1]),
+                    Err(_) => match self.socket_of(a[0] as i32) {
+                        Ok(s) => s.shutdown(a[1]),
+                        Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                    },
                 },
             },
             // A local address means nothing when there is one interface and
@@ -5851,7 +5877,7 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         let fd = self.fds.insert(file, ty & SOCK_CLOEXEC != 0)?;
-        self.sockets.insert(key, sock);
+        self.note_socket(key, &sock);
         Ok(fd)
     }
 
@@ -5868,7 +5894,7 @@ impl Kernel {
     fn remote_unix_of(&self, fd: i32) -> Result<Arc<unix::RemoteUnix>, Errno> {
         let file = self.fds.get(fd)?;
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.remote_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        self.remote_sockets.get(&key).and_then(std::sync::Weak::upgrade).ok_or(Errno::ENOTSOCK)
     }
 
     /// Put a socket that lives in the global kernel at `fd`, replacing
@@ -5889,8 +5915,43 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         self.fds.install(fd, file, cloexec)?;
-        self.remote_sockets.insert(key, sock);
+        self.note_remote_unix(key, &sock);
         Ok(())
+    }
+
+    /// Put a socket that lives in the global kernel at the lowest free
+    /// descriptor.
+    pub fn insert_remote_unix(&mut self, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<i32, Errno> {
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let fd = self.fds.insert(file, cloexec)? as i32;
+        self.note_remote_unix(key, &sock);
+        Ok(fd)
+    }
+
+    /// Remember that the handle at `key` is the internet socket `sock`;
+    /// entries whose socket has closed go.
+    fn note_socket(&mut self, key: usize, sock: &Arc<net::Socket>) {
+        if self.sockets.len() >= 64 {
+            self.sockets.retain(|_, w| w.strong_count() > 0);
+        }
+        self.sockets.insert(key, Arc::downgrade(sock));
+    }
+
+    /// Remember that the handle at `key` is `sock`, a socket in the global
+    /// kernel; entries whose socket has closed go.
+    pub fn note_remote_unix(&mut self, key: usize, sock: &Arc<unix::RemoteUnix>) {
+        if self.remote_sockets.len() >= 64 {
+            self.remote_sockets.retain(|_, w| w.strong_count() > 0);
+        }
+        self.remote_sockets.insert(key, Arc::downgrade(sock));
+    }
+
+    /// The global-kernel socket behind an open file, if that is what it is.
+    pub fn remote_unix_of_file(&self, file: &OpenFile) -> Option<Arc<unix::RemoteUnix>> {
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.remote_sockets.get(&key).and_then(std::sync::Weak::upgrade)
     }
 
     /// Put a unix socket in the descriptor table.
@@ -6212,31 +6273,28 @@ impl Kernel {
             return Err(Errno::EAFNOSUPPORT);
         }
         let nonblock = ty & SOCK_NONBLOCK != 0;
-        // A stream pair with a global kernel to put it in, so either end can
-        // go to a forked child (a Worker of its own). See
-        // [`crate::pipe::RemoteSockEnd`].
+        // A stream pair in the global kernel when there is one: its ends are
+        // often for two processes (Wine makes one per new process, keeps an
+        // end and hands the other to the child), and with a Worker per
+        // process a local pair cannot cross a fork.
         const SOCK_STREAM: u64 = 1;
-        if let Some(r) = self.pipes.filter(|_| ty & 0xf == SOCK_STREAM) {
-            let p = (r.new)(self.pid);
-            if p < 0 {
-                return Err(Errno::ENFILE);
+        if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
+            let mut ids = [0u8; 8];
+            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
+            if rc < 0 {
+                return Err(Errno(-rc));
             }
-            let q = (r.new)(self.pid);
-            if q < 0 {
-                (r.close_end)(p, 0);
-                (r.close_end)(p, 1);
-                return Err(Errno::ENFILE);
-            }
-            let flags = oflags::O_RDWR | if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
             let cloexec = ty & SOCK_CLOEXEC != 0;
-            // `a` writes p and reads q; `b` the other way round.
-            let a = crate::pipe::RemoteSockEnd::new(q, p, r);
-            let b = crate::pipe::RemoteSockEnd::new(p, q, r);
-            let (pa, pb) = (a.path(), b.path());
-            let fa = self.fds.insert(OpenFile::new(Arc::new(a), pa, flags, true, true), cloexec)?;
-            let fb = self.fds.insert(OpenFile::new(Arc::new(b), pb, flags, true, true), cloexec)?;
-            m.write_u32(out, fa as u32)?;
-            m.write_u32(out + 4, fb as u32)?;
+            let mut fds = [0i32; 2];
+            for (i, fd) in fds.iter_mut().enumerate() {
+                let id = i32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
+                let sock = Arc::new(unix::RemoteUnix::new(id, false, None, r));
+                sock.set_nonblocking(nonblock);
+                *fd = self.insert_remote_unix(sock, flags, cloexec)?;
+            }
+            m.write_u32(out, fds[0] as u32)?;
+            m.write_u32(out + 4, fds[1] as u32)?;
             return Ok(0);
         }
         let (a, b) = unix::UnixSocket::pair();
@@ -6352,7 +6410,7 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
         let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-        self.sockets.insert(key, sock);
+        self.note_socket(key, &sock);
         self.sys_write_sockaddr(m, ip, port, addr, len_out)?;
         Ok(new_fd)
     }
@@ -6380,7 +6438,7 @@ impl Kernel {
             let key = Arc::as_ptr(&handle) as *const () as usize;
             let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
             let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-            self.remote_sockets.insert(key, session);
+            self.note_remote_unix(key, &session);
             return Ok(new_fd);
         }
         let listener = self.unix_of(fd)?;
@@ -6399,7 +6457,7 @@ impl Kernel {
         // socket table is the way back to the concrete type. Keyed by the
         // handle's address, which is stable for as long as the descriptor is.
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        self.sockets.get(&key).and_then(std::sync::Weak::upgrade).ok_or(Errno::ENOTSOCK)
     }
 
     fn sys_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
@@ -6552,7 +6610,16 @@ impl Kernel {
             return Ok(0);
         }
         let err = if name == SO_ERROR {
-            match self.socket_of(fd)?.status() {
+            // A unix socket (local or the global kernel's) has no connect
+            // in progress to report: zero, as for a socketpair end on Linux.
+            let Ok(sock) = self.socket_of(fd) else {
+                self.socket_family_type(fd)?;
+                if val != 0 {
+                    m.write_u32(val, 0)?;
+                }
+                return Ok(0);
+            };
+            match sock.status() {
                 net::Status::Refused => Errno::ECONNREFUSED.0,
                 // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
                 // *finished*, and Linux leaves it zero until one has; a
@@ -6716,6 +6783,22 @@ impl Kernel {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
                 sock.stage_send(files);
+            } else if let Ok(sock) = self.remote_unix_of(fd) {
+                // The far end is in another memory, where an `OpenFile` means
+                // nothing: each descriptor goes as a description the host
+                // knows how to rebuild there. One that cannot leave this
+                // process fails the send, as Linux fails one it cannot pass,
+                // rather than arriving as a hole the receiver finds later.
+                let files = self.read_scm_rights(m, control, controllen)?;
+                if !files.is_empty() {
+                    let mut descs = String::new();
+                    for f in &files {
+                        let d = (sock.remote.describe)(self, f).ok_or(Errno::EBADF)?;
+                        descs.push_str(&d);
+                        descs.push('\n');
+                    }
+                    return sock.send_described(&data, &descs);
+                }
             }
         }
         self.fds.get(fd)?.write(&data)
@@ -6788,6 +6871,61 @@ impl Kernel {
     const MSG_PEEK: u64 = 0x2;
     const MSG_DONTWAIT: u64 = 0x40;
 
+    /// `recvmsg` on a socket in the global kernel: one read for the whole
+    /// vector (so descriptors attach to it as they would to the first byte),
+    /// scattered after, and the descriptions that came with it rebuilt here.
+    #[allow(clippy::too_many_arguments)]
+    fn recvmsg_remote(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        sock: &Arc<unix::RemoteUnix>,
+        msg: u64,
+        iov: u64,
+        iovlen: u64,
+        control: u64,
+        controllen: u64,
+        room: usize,
+        peek: bool,
+    ) -> SysResult {
+        let mut parts = Vec::new();
+        let mut want = 0usize;
+        for i in 0..iovlen.min(1024) {
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
+            let len = len.min((1 << 22) - want);
+            if len > 0 {
+                parts.push((base, len));
+                want += len;
+            }
+        }
+        let mut tmp = vec![0u8; want];
+        let (n, descs) = sock.recv_described(&mut tmp, room, peek, self.pid as i32)?;
+        let mut at = 0usize;
+        for (base, len) in parts {
+            if at >= n as usize {
+                break;
+            }
+            let take = len.min(n as usize - at);
+            m.write(base, &tmp[at..at + take])?;
+            at += take;
+        }
+        let mut files = Vec::new();
+        for d in &descs {
+            // One the host cannot rebuild is said there, where it knows why.
+            if let Some(f) = (sock.remote.rebuild)(self, d) {
+                files.push(f);
+            }
+        }
+        let name = self.msg_rd(m, msg, 0)?;
+        if name != 0 {
+            m.write_u32(msg + if self.compat { 4 } else { 8 }, 0)?;
+        }
+        let written = self.write_scm_rights(m, control, controllen, files)?;
+        self.msg_wr(m, msg, 5, written)?;
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
+        Ok(n)
+    }
+
     fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Self::MSG_PEEK != 0;
         let iov = self.msg_rd(m, msg, 2)?;
@@ -6803,6 +6941,11 @@ impl Kernel {
             0
         };
         let unix_sock = self.unix_of(fd).ok();
+        if unix_sock.is_none() {
+            if let Ok(sock) = self.remote_unix_of(fd) {
+                return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
+            }
+        }
         let mut total = 0u64;
         for i in 0..iovlen.min(1024) {
             let base = self.msg_rd(m, iov, 2 * i)?;

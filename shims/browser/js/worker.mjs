@@ -66,7 +66,8 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { Gex, Env, utf8 } from './gex.mjs';
+import { Gex, Env, utf8, narrate } from './gex.mjs';
+import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -88,7 +89,11 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
   console.debug = sync;
 }
 
-const port = await channel();
+// Everything below is one Worker's: its port, its process, its state. A
+// function rather than module scope so the single-thread build (single.mjs)
+// can run many of these in one realm, one per fiber; a real Worker runs one.
+async function workerMain(port) {
+
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
@@ -419,6 +424,7 @@ async function handle(msg) {
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
+  if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -442,7 +448,16 @@ async function handle(msg) {
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
-  if (msg.glChannel) {
+  if (msg.glChannel?.inRealm) {
+    // The single-thread build: the compositor's Mesa is in this realm
+    // (web/src/compositor-worker.js `glInRealm`), and a submit is a promise
+    // the Suspending `gl_submit` waits on. A batch is run straight out of
+    // this process's memory: no copy, and no batch in flight unwaited.
+    gex.useGl({
+      submit: (memory, ring, client) =>
+        globalThis.__gexGlInRealm ? globalThis.__gexGlInRealm.submit(memory, ring, client) : -1,
+    });
+  } else if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
     gex.useGl(new GlProxy(msg.glChannel, () => {
       // An OffscreenCanvas renderer waits on the control word directly. Keep
@@ -566,9 +581,16 @@ async function handle(msg) {
   // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
-    gex.useNetwork(new NodeNetwork());
+    const net = new NodeNetwork();
+    if (single.on) net.onActivity = () => sched.wake();
+    gex.useNetwork(net);
   }
-  if (msg.netChannel) {
+  if (msg.wispNet) {
+    // The single-thread build: the system's one Wisp connection, the object
+    // itself (every fiber is in its realm). Its traffic wakes parked fibers.
+    msg.wispNet.onActivity = () => sched.wake();
+    gex.useNetwork(msg.wispNet);
+  } else if (msg.netChannel) {
     // The page's Wisp connection, called across shared memory (net-bridge.mjs):
     // a wasm32 program never hands this Worker's event loop back, so a
     // WebSocket of its own here would never deliver.
@@ -600,7 +622,7 @@ async function handle(msg) {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
-    console.debug(`[worker] pid ${msg.child?.pid}: adopt arrived`);
+      narrate(`[worker] pid ${msg.child?.pid}: adopt arrived`);
       // With the closure, as a fresh process gets it: a child inherits its
       // parent's code through the fork record but no record that those pages
       // are a closure's, so without this an exec'd `apt-get` throws every
@@ -638,6 +660,11 @@ async function handle(msg) {
           fjit: msg.fjit ?? msg.opts?.fjit,
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
+          liftMax: msg.liftMax ?? msg.opts?.liftMax,
+          inlineDispatch: msg.inlineDispatch ?? msg.opts?.inlineDispatch,
+          xlateReport: msg.xlateReport ?? msg.opts?.xlateReport,
+          discoverSkip: msg.discoverSkip ?? msg.opts?.discoverSkip,
+          t1Fold: msg.t1Fold ?? msg.opts?.t1Fold,
           providers: msg.providers ?? msg.opts?.providers,
           xcache: msg.xcache ?? msg.opts?.xcache,
           wantLibrary,
@@ -772,12 +799,29 @@ async function handle(msg) {
       // the slot it dispatches through is written now. See #136.
       liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // What the translator did: instructions lifted, wasm bytes, translations,
+      // SMC page invalidations, pages retired, retire calls, -, anonymous blocks.
+      // The discovery log (GEX_DISCOVER_SKIP bit 8, run-node's GEX_DL_FILE).
+      dl: (() => {
+        const e = gex.shim.exports;
+        const n = e.gex_dl_text?.(0, 0) >>> 0;
+        if (!n) return undefined;
+        const p = e.gex_alloc(n) >>> 0;
+        e.gex_dl_text(p, n);
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, n);
+        return t;
+      })(),
+      xlate: gex.shim.exports.gex_xlate_stat
+        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
+        : undefined,
       // What the engine cost, which `millis` does not: compiling and
       // instantiating every module this process installed.
       installMs: gex.installMillis,
       // Split: compiling is per bytes and V8 can skip seen bytes, instantiating
       // is per module and paid every time.
       compileMs: gex.compileMillis,
+      unitHits: gex.unitHits,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
       byObject: gex.blocksByObject,
@@ -874,6 +918,8 @@ async function handle(msg) {
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
+    // A fiber's timers outlive it unless stopped (single.mjs).
+    if (single.on) gex?.close?.();
     port.post({
       kind: 'threw',
       message: (e?.message ?? String(e)) + where,
@@ -900,3 +946,9 @@ const handed = await (async () => {
 
 port.post({ kind: 'ready' });
 if (handed) handle(handed);
+}
+
+// A real Worker runs itself; the single-thread build registers the function
+// and runs it once per fiber (single.mjs `FiberWorker`).
+if (single.on) registerWorkerMain(workerMain);
+else await workerMain(await channel());

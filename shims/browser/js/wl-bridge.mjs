@@ -115,7 +115,10 @@ const ringBase = (b) => M_WORDS + BLOCKS * BLOCK_WORDS + b * RING_WORDS;
 
 /** The shared arena a compositor and its guests share. */
 export function makeWlChannel() {
-  return { arena: new SharedArrayBuffer(TOTAL_WORDS * 4) };
+  // A plain buffer in the single-thread build, where the compositor and every
+  // guest are one realm (docs/single-thread.md).
+  const Buf = typeof SharedArrayBuffer === 'function' ? SharedArrayBuffer : ArrayBuffer;
+  return { arena: new Buf(TOTAL_WORDS * 4) };
 }
 
 /** Tell the guests how large the output is, so a toplevel is configured to it. */

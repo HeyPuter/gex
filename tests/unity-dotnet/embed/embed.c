@@ -63,13 +63,33 @@ worker (void *arg)
 {
 	mono_thread_attach (mono_get_root_domain ());
 	int bad = 0;
-	for (int round = 0; round < 20; round++) {
+	/* EMBED_WORKER_STRESS=N: N times the rounds here and of Churn on the main thread. */
+	int rounds = getenv ("EMBED_WORKER_STRESS") ? 20 * atoi (getenv ("EMBED_WORKER_STRESS")) : 20;
+	for (int round = 0; round < rounds; round++) {
 		P held [32];
 		P exc = NULL;
 		for (int i = 0; i < 32; i++) {
 			int v = 1000 + round * 32 + i;
 			void *a [1] = { &v };
+			exc = NULL;
 			held [i] = mono_runtime_invoke (g_make, NULL, a, &exc);
+			if (exc) {
+				P s = mono_object_to_string (exc, NULL);
+				fprintf (stderr, "worker: Make(%d) threw: %.300s\n", v, s ? mono_string_to_utf8 (s) : "?");
+			}
+			/* Checked at once too: a provider call's result lost to a syscall in its GC transition (the
+			 * mono_string_to_utf8 and Make results of this thread read 0 while Churn collected) showed here. */
+			{
+				char want [128];
+				snprintf (want, sizeof want, "object %d %.*s", v, v % 50, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+				const char *got = held [i] ? mono_string_to_utf8 (held [i]) : NULL;
+				if (!got || strcmp (got, want)) {
+					bad++;
+					unsigned long long *w = (unsigned long long *) held [i];
+					fprintf (stderr, "worker: Make(%d) returned %p = \"%.60s\" at once; words %llx %llx %llx %llx\n", v, held [i], got ? got : "(null)",
+						w ? w [0] : 0, w ? w [1] : 0, w ? w [2] : 0, w ? w [3] : 0);
+				}
+			}
 		}
 		volatile unsigned long spin = 0;
 		for (unsigned long k = 0; k < 2000000; k++)
@@ -78,8 +98,12 @@ worker (void *arg)
 			int v = 1000 + round * 32 + i;
 			char want [128];
 			snprintf (want, sizeof want, "object %d %.*s", v, v % 50, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-			if (strcmp (mono_string_to_utf8 (held [i]), want))
+			const char *got = held [i] ? mono_string_to_utf8 (held [i]) : "(null)";
+			if (strcmp (got, want)) {
+				if (bad < 4)
+					fprintf (stderr, "worker bad: round %d slot %d obj %p want \"%s\" got \"%.80s\"\n", round, i, held [i], want, got);
 				bad++;
+			}
 		}
 	}
 	worker_bad = bad;
@@ -100,6 +124,19 @@ static void Throws (P msg)
 	volatile int keep = 7; /* a frame of its own that the raise abandons */
 	mono_raise_exception (mono_get_exception_argument (NULL, mono_string_to_utf8 (msg)));
 	printf ("not reached %d\n", keep);
+}
+/* The wasm JIT's direct guest calls (T.NativeDirect): a byref, both float widths, sub-word integers, a bool return,
+ * more arguments than registers; and a P/Invoke with only scalars. */
+static long long Accum (long long *acc, float f, double d, signed char b, unsigned short c, long long x)
+{
+	*acc += (long long) (f * 4) + (long long) (d * 8) + b + c + (x >> 33);
+	return *acc * 3 + 1;
+}
+static _Bool IsOdd (int x) { return x & 1; }
+static int Inc (int x) { return x + 1; }
+__attribute__((visibility("default"))) long long gex_mad (long long a, int b, double c, float d, long long e, int f, int g)
+{
+	return a * b + (long long) (c * 2) + (long long) d + e - f + g;
 }
 typedef struct { float x, y, z; } Vec3;
 typedef struct { long a, b, c; double d; } Big;
@@ -161,6 +198,9 @@ main (int argc, char **argv)
 	mono_add_internal_call ("T::Twice", Twice);
 	mono_add_internal_call ("T::Concat", Concat);
 	mono_add_internal_call ("T::Throws", Throws);
+	mono_add_internal_call ("T::Accum", Accum);
+	mono_add_internal_call ("T::IsOdd", IsOdd);
+	mono_add_internal_call ("T::Inc", Inc);
 	int n = 50;
 	void *args [1] = { &n };
 	P exc = NULL;
@@ -218,12 +258,13 @@ main (int argc, char **argv)
 	g_make = make;
 	pthread_t t;
 	pthread_create (&t, NULL, worker, NULL);
-	for (int r = 0; r < 4; r++) {
+	int crounds = getenv ("EMBED_WORKER_STRESS") ? 4 * atoi (getenv ("EMBED_WORKER_STRESS")) : 4;
+	for (int r = 0; r < crounds; r++) {
 		mono_runtime_invoke (churn, NULL, cargs, &exc);
 		check ("Churn", exc);
 	}
 	pthread_join (t, NULL);
-	printf ("worker thread: %d bad of 640\n", worker_bad);
+	printf ("worker thread: %d bad of 640\n", getenv ("EMBED_WORKER_STRESS") ? (worker_bad ? 1 : 0) : worker_bad);
 	P clears = mono_class_get_method_from_name (k, "Clears", 1);
 	int cn = 300;
 	void *clargs [1] = { &cn };
@@ -244,6 +285,72 @@ main (int argc, char **argv)
 	P dr = mono_runtime_invoke (dels, NULL, dargs, &exc);
 	check ("Delegates", exc);
 	printf ("%s\n", mono_string_to_utf8 (dr));
+	P nd = mono_class_get_method_from_name (k, "NativeDirect", 1);
+	int ndn = 50;
+	void *ndargs [1] = { &ndn };
+	P ndr = mono_runtime_invoke (nd, NULL, ndargs, &exc);
+	check ("NativeDirect", exc);
+	printf ("%s\n", mono_string_to_utf8 (ndr));
+	P chk = mono_class_get_method_from_name (k, "Checked", 1);
+	int chn = 40;
+	void *chargs [1] = { &chn };
+	P chr = mono_runtime_invoke (chk, NULL, chargs, &exc);
+	check ("Checked", exc);
+	printf ("%s\n", mono_string_to_utf8 (chr));
+	P aa = mono_class_get_method_from_name (k, "ArgAddr", 1);
+	int aan = 40;
+	void *aaargs [1] = { &aan };
+	P aar = mono_runtime_invoke (aa, NULL, aaargs, &exc);
+	check ("ArgAddr", exc);
+	printf ("%s\n", mono_string_to_utf8 (aar));
+	P nf = mono_class_get_method_from_name (k, "NestedFinally", 1);
+	int nfn = 60;
+	void *nfargs [1] = { &nfn };
+	P nfr = mono_runtime_invoke (nf, NULL, nfargs, &exc);
+	check ("NestedFinally", exc);
+	printf ("%s\n", mono_string_to_utf8 (nfr));
+	P rf = mono_class_get_method_from_name (k, "Reflect", 1);
+	int rfn = 50;
+	void *rfargs [1] = { &rfn };
+	P rfr = mono_runtime_invoke (rf, NULL, rfargs, &exc);
+	check ("Reflect", exc);
+	printf ("%s\n", mono_string_to_utf8 (rfr));
+	P ll = mono_class_get_method_from_name (k, "Localloc", 1);
+	int lln = 100000;
+	void *llargs [1] = { &lln };
+	P llr = mono_runtime_invoke (ll, NULL, llargs, &exc);
+	check ("Localloc", exc);
+	printf ("%s\n", mono_string_to_utf8 (llr));
+	P hs = mono_class_get_method_from_name (k, "HotShapes", 1);
+	int hsn = 20000;
+	void *hsargs [1] = { &hsn };
+	P hsr = mono_runtime_invoke (hs, NULL, hsargs, &exc);
+	check ("HotShapes", exc);
+	printf ("%s\n", mono_string_to_utf8 (hsr));
+	P mi = mono_class_get_method_from_name (k, "MonoIcalls", 1);
+	int min = 20000;
+	void *miargs [1] = { &min };
+	P mir = mono_runtime_invoke (mi, NULL, miargs, &exc);
+	check ("MonoIcalls", exc);
+	printf ("%s\n", mono_string_to_utf8 (mir));
+	P lw = mono_class_get_method_from_name (k, "LcseWide", 1);
+	int lwn = 20000;
+	void *lwargs [1] = { &lwn };
+	P lwr = mono_runtime_invoke (lw, NULL, lwargs, &exc);
+	check ("LcseWide", exc);
+	printf ("%s\n", mono_string_to_utf8 (lwr));
+	P rdf = mono_class_get_method_from_name (k, "ReadFloats", 1);
+	int rdfn = 20000;
+	void *rdfargs [1] = { &rdfn };
+	P rdfr = mono_runtime_invoke (rdf, NULL, rdfargs, &exc);
+	check ("ReadFloats", exc);
+	printf ("%s\n", mono_string_to_utf8 (rdfr));
+	P us = mono_class_get_method_from_name (k, "UsedSize", 1);
+	int un = 4000;
+	void *uargs [1] = { &un };
+	P ur = mono_runtime_invoke (us, NULL, uargs, &exc);
+	check ("UsedSize", exc);
+	printf ("%s\n", mono_string_to_utf8 (ur));
 	/* The liveness walk Unity's UnloadUnusedAssets runs: every Leaf reachable from the root,
 	 * each reported once, in batches of at most 16. */
 	P lvg = mono_class_get_method_from_name (k, "LvGraph", 1);

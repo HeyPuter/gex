@@ -21,7 +21,10 @@ export default defineConfig({
     fs: { allow: [fileURLToPath(new URL('..', import.meta.url))] },
   },
   preview: { headers: ISOLATED },
-  build: { target: 'es2022', chunkSizeWarningLimit: 2048 },
+  // web/build-all.sh builds each flavour's dist from its own staged public
+  // tree: GEX_PUBLIC_DIR (default public/) into GEX_OUT_DIR (default dist/).
+  publicDir: process.env.GEX_PUBLIC_DIR || 'public',
+  build: { target: 'es2022', chunkSizeWarningLimit: 2048, outDir: process.env.GEX_OUT_DIR || 'dist' },
   // `worker.mjs` is an ES module with top-level await; the default `iife`
   // worker output cannot express that.
   worker: { format: 'es' },

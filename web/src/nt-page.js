@@ -111,6 +111,8 @@ async function main() {
   // `?trapstack=1`: a trap's wasm frames, which name the shim function it
   // was in (runtime.js passes the switch to every Worker).
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  // `heartbeat=N`: say where the guest is every N safepoints (a stuck run from a slow one).
+  if (q.get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(q.get('heartbeat'));
   // `?mem64=1`: a 64-bit guest memory (the wasm64 shim; docs/mem64.md step 6).
   if (q.get('mem64') === '1') globalThis.GEX_MEM64 = 1;
   // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs).
@@ -144,6 +146,12 @@ async function main() {
   if (q.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   // `?strace=1`: narrate every syscall (`gex_set_trace`), as main.js does.
   if (q.get('strace')) globalThis.GEX_STRACE = 1;
+  // The translator's switches, as main.js reads them (docs/jit-guest.md).
+  if (q.get('liftmax')) globalThis.GEX_LIFT_MAX = Number(q.get('liftmax'));
+  if (q.get('unitcache')) globalThis.GEX_UNIT_CACHE = Number(q.get('unitcache'));
+  if (q.get('t1fold')) globalThis.GEX_T1_FOLD = Number(q.get('t1fold'));
+  if (q.get('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(q.get('xlatereport'));
+  if (q.get('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(q.get('inlinedispatch'));
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
   canvas.width = w;
@@ -171,6 +179,8 @@ async function main() {
     dirs: [...a.dirs, ...t.dirs],
     modes: Object.assign(a.modes ?? {}, t.modes),
     hard: Object.assign(a.hard ?? {}, t.hard),
+    links: Object.assign(a.links ?? {}, t.links),
+    mtimes: Object.assign(a.mtimes ?? {}, t.mtimes),
   }));
   const files = { ...tree.files };
   // `persist=DIR`: what the program left in DIR last time (saves, settings),
@@ -229,6 +239,13 @@ async function main() {
     modes: tree.modes,
     hard,
     lazy,
+    // Symlinks the bundle kept as links: a Wine prefix's `dosdevices/c:`
+    // (W3 in the page), which Wine opens by that name.
+    symlinks: tree.links ?? {},
+    // `mtimes=1`: the bundle's file times, for a program that compares them
+    // (W3's wineboot updates a prefix whose wine.inf is newer than its
+    // install). Off by default: a call per file.
+    mtimes: q.get('mtimes') === '1' ? tree.mtimes : undefined,
     env,
     args,
     cwd: q.get('cwd') || exe.replace(/\/[^/]*$/, '') || '/',

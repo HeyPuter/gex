@@ -45,6 +45,450 @@ public static class T {
   public class DSquare : DShape { public override int Area(int x) { return x * x + k; } }
   public struct Tag { public int v; public override string ToString() { return "tag" + v; } }
   static int DSq(int x) { return x * x; }
+  // GC.GetTotalMemory(false) is mono_gc_get_used_size, which patch 0007 caches between collections:
+  // it must still see objects promoted to the major heap, give the same answer when asked again,
+  // and drop once they are collected.
+  // In chunks, each dropped on its own: a stale slot on the (conservatively scanned) stack can keep the
+  // last chunk alive, not all of them.
+  static byte[][][] usKeep = new byte[40][][];
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+  static void UsFill(int n) {
+    for (int c = 0; c < usKeep.Length; c++) {
+      usKeep[c] = new byte[n / usKeep.Length][];
+      for (int i = 0; i < usKeep[c].Length; i++) usKeep[c][i] = new byte[1000];
+    }
+  }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+  static void UsDrop() { for (int c = 0; c < usKeep.Length; c++) usKeep[c] = null; }
+  public static string UsedSize(int n) {
+    GC.Collect();
+    long before = GC.GetTotalMemory(false);
+    UsFill(n);
+    GC.Collect();
+    long held = GC.GetTotalMemory(false), again = GC.GetTotalMemory(false);
+    UsDrop();
+    GC.Collect();
+    long after = GC.GetTotalMemory(false);
+    return "usedsize " + (held - before >= (long)n * 1000 ? "grew" : "flat " + (held - before)) +
+      (again == held ? " stable" : " unstable") +
+      (held - after >= (long)n * 800 ? " shrank" : " kept " + (held - after) + " of " + (held - before));
+  }
+  // Checked arithmetic and unsigned-to-double conversions, each in its own clause-free method so the wasm JIT
+  // compiles it (OP_IADDCC/ISUBCC/LADDCC/LSUBCC + COND_EXC, OP_IMUL_OVF[_UN], OP_[I|L]CONV_TO_R_UN).
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CAdd(int a, int b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CSub(int a, int b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CAddU(uint a, uint b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CSubU(uint a, uint b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int CMul(int a, int b) => checked(a * b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static uint CMulU(uint a, uint b) => checked(a * b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static long CAddL(long a, long b) => checked(a + b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static ulong CSubUL(ulong a, ulong b) => checked(a - b);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double UToD(uint a) => a;
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double ULToD(ulong a) => a;
+  static char Ovf(Func<long> f, long want) {
+    try { return f() == want ? '.' : 'W'; } catch (OverflowException) { return 'O'; }
+  }
+  public static string Checked(int n) {
+    var sb = new System.Text.StringBuilder("checked ");
+    for (int r = 0; r < n; r++) {
+      if (r > 0 && r < n - 1) { CAdd(r, r); CSub(r, r); CAddU(1, 2); CSubU(3, 2); CMul(r, 3); CMulU(2, 3); CAddL(r, 1); CSubUL(5, 1); UToD(7); ULToD(7); continue; }
+      sb.Append(Ovf(() => CAdd(int.MaxValue - 1, 1), int.MaxValue)).Append(Ovf(() => CAdd(int.MaxValue, 1), 0));
+      sb.Append(Ovf(() => CAdd(int.MinValue, -1), 0)).Append(Ovf(() => CSub(int.MinValue, 1), 0)).Append(Ovf(() => CSub(-5, 7), -12));
+      sb.Append(Ovf(() => CAddU(uint.MaxValue, 1), 0)).Append(Ovf(() => CAddU(uint.MaxValue - 1, 1), uint.MaxValue));
+      sb.Append(Ovf(() => CSubU(1, 2), 0)).Append(Ovf(() => CSubU(2, 2), 0));
+      sb.Append(Ovf(() => CMul(65536, 32768), 0)).Append(Ovf(() => CMul(-65536, 32768), int.MinValue)).Append(Ovf(() => CMul(46341, -46340), -2147441940));
+      sb.Append(Ovf(() => CMulU(65536, 65536), 0)).Append(Ovf(() => CMulU(65535, 65537), uint.MaxValue));
+      sb.Append(Ovf(() => CAddL(long.MaxValue, 1), 0)).Append(Ovf(() => CAddL(long.MinValue, long.MaxValue), -1));
+      sb.Append(Ovf(() => unchecked((long)CSubUL(0, 1)), 0)).Append(Ovf(() => unchecked((long)CSubUL(ulong.MaxValue, 1)), unchecked((long)(ulong.MaxValue - 1))));
+      sb.Append(UToD(uint.MaxValue) == 4294967295.0 ? '.' : 'W').Append(ULToD(ulong.MaxValue) == 18446744073709551615.0 ? '.' : 'W');
+      sb.Append(' ');
+    }
+    return sb.ToString().TrimEnd();
+  }
+  // ldarga of scalar arguments (OP_LDADDR of an argument): the wasm JIT homes the argument in its addr frame.
+  public struct PtrBox { public IntPtr v; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static PtrBox ArgAsBox(IntPtr p) => Unsafe.As<IntPtr, PtrBox>(ref p);
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int ArgInt(int x) { ref int r = ref x; r += 5; return x * 3 + Bump(ref x); }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int ArgByte(byte b, sbyte c) { ref byte r = ref b; r = (byte)(r + 250); ref sbyte q = ref c; q = (sbyte)(q - 100); return b * 1000 + c; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static double ArgDouble(double d, float f) { ref double r = ref d; r *= 2; ref float g = ref f; g += 0.5f; return d + f; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static long ArgLong(long l, int k) { ref long r = ref l; for (int i = 0; i < k; i++) r = r * 3 + i; return l; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int Bump(ref int v) { v++; return v; }
+  // ldarga of a REFERENCE argument: a constrained call on a generic T, and a write through the address.
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int HashOf<TK>(TK x) => x.GetHashCode();
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static void SetRef(ref string t, string v) { t = v; }
+  [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] static int RefArg(string s, int i) { SetRef(ref s, s + i); GC.Collect(0); return s.Length + HashOf(s).GetHashCode() * 0 + HashOf(i); }
+  public static string ArgAddr(int n) {
+    long acc = 0;
+    for (int i = 0; i < n; i++) {
+      acc += ArgAsBox((IntPtr)(i * 8)).v.ToInt64();
+      acc += ArgInt(i);
+      acc += ArgByte((byte)i, (sbyte)i);
+      acc += (long)ArgDouble(i, i);
+      acc += ArgLong(i, 3);
+      if (i % 8 == 0) acc += RefArg("ref", i);
+    }
+    return "argaddr " + acc;
+  }
+  // A leave that exits two or three try-finally blocks at once (return / break from the innermost try):
+  // mono emits one OP_CALL_HANDLER per finally, which the wasm JIT once refused as a "complex continuation".
+  [MethodImpl(MethodImplOptions.NoInlining)] static int Fin2(int i, ref int log) {
+    try { try { if (i % 3 == 0) return i * 2; log += 1; } finally { log += 10; } log += 100; }
+    finally { log += 1000; }
+    return -1;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int Fin3(int n, ref int log) {
+    int k = 0;
+    for (; k < n; k++) {
+      try { try { try { if (k == 5) break; if (k % 2 == 0) continue; log += k; } finally { log += 2; } }
+        finally { log *= 3; log %= 1000003; } }
+      finally { log ^= k; }
+    }
+    return k;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int FinThrow(int i, ref int log) {
+    try { try { try { if (i % 4 == 1) throw new InvalidOperationException(); if (i % 4 == 2) return 7; } finally { log += 3; } }
+      finally { log += 5; } }
+    catch (InvalidOperationException) { log += 11; }
+    return 1;
+  }
+  // ldarga in a method with EH clauses: an int argument and a string argument whose addresses are taken
+  // inside the try, mutated through the address, and read again in the catch / finally and after them.
+  [MethodImpl(MethodImplOptions.NoInlining)] static void BumpRef(ref int v, int by) { v += by; if (v % 5 == 0) throw new InvalidOperationException(); }
+  [MethodImpl(MethodImplOptions.NoInlining)] static void AppendRef(ref string t) { t = t + "!"; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static string FinArg(int i, string s) {
+    int caught = 0;
+    try {
+      BumpRef(ref i, 3);
+      AppendRef(ref s);
+      s = s + i.ToString();
+    } catch (InvalidOperationException) {
+      caught = i;
+      AppendRef(ref s);
+    } finally {
+      finCount += i & 7;
+    }
+    return s + "/" + i + "/" + caught;
+  }
+  static int finCount;
+  // A value chosen inside the try and used after the leave: out-of-SSA puts its phi move between
+  // the CALL_HANDLER and the leave's branch.
+  [MethodImpl(MethodImplOptions.NoInlining)] static string Str(int i) => i.ToString();
+  [MethodImpl(MethodImplOptions.NoInlining)] static string FinMove(int i) {
+    string s = null;
+    try {
+      if (i % 3 == 0) { s = "a" + Str(i); return s; }
+      if (i % 3 == 1) { s = "b"; } else { s = "c" + Str(i * 2); }
+    } finally { finCount++; }
+    return s + Str(i);
+  }
+  static readonly object srLock = new object();
+  static List<string> srLoading;
+  static int srRec;
+  static Dictionary<string, string> srTable = new Dictionary<string, string> { { "k1", "v1" }, { "k2", "v2" } };
+  // SR.InternalGetResourceString's shape: lock + catch-rethrow + finally, leaves carrying a value.
+  [MethodImpl(MethodImplOptions.NoInlining)] static string SrLike(string key) {
+    if (key.Length == 0) return key;
+    bool lockTaken = false;
+    try {
+      System.Threading.Monitor.Enter(srLock, ref lockTaken);
+      if (srLoading != null && srLoading.Count > 0 && srLoading.LastIndexOf(key) >= 0) {
+        if (srRec > 0) return key;
+        srRec++;
+      }
+      srLoading ??= new List<string>();
+      srLoading.Add(key);
+      srTable.TryGetValue(key, out string s);
+      if (key == "boom") throw new InvalidOperationException();
+      srLoading.RemoveAt(srLoading.Count - 1);
+      return s ?? key;
+    } catch {
+      if (lockTaken) { srLoading = null; }
+      throw;
+    } finally {
+      if (lockTaken) System.Threading.Monitor.Exit(srLock);
+    }
+  }
+  static string srOut;
+  [MethodImpl(MethodImplOptions.NoInlining)] static void SrLike2(string key) {
+    if (key.Length == 0) { srOut = key; return; }
+    bool lockTaken = false;
+    try {
+      System.Threading.Monitor.Enter(srLock, ref lockTaken);
+      if (srLoading != null && srLoading.Count > 0 && srLoading.LastIndexOf(key) >= 0) {
+        if (srRec > 0) { srOut = key; return; }
+        srRec++;
+      }
+      srLoading ??= new List<string>();
+      srLoading.Add(key);
+      srTable.TryGetValue(key, out string s);
+      if (key == "boom") throw new InvalidOperationException();
+      srLoading.RemoveAt(srLoading.Count - 1);
+      srOut = s ?? key;
+    } catch {
+      if (lockTaken) { srLoading = null; }
+      throw;
+    } finally {
+      if (lockTaken) System.Threading.Monitor.Exit(srLock);
+    }
+  }
+  public unsafe class UmsLike {
+    long _position, _length = 1 << 20; long _offset = 3; byte[] arr = new byte[64]; public int acq;
+    [MethodImpl(MethodImplOptions.NoInlining)] void Acquire(ref byte* p) { acq++; p = (byte*)0 + 1; }
+    [MethodImpl(MethodImplOptions.NoInlining)] void Release() { acq--; }
+    [MethodImpl(MethodImplOptions.NoInlining)] public int ReadByteU() {
+      long pos = System.Threading.Interlocked.Read(ref _position);
+      long len = System.Threading.Interlocked.Read(ref _length);
+      if (pos >= len) return -1;
+      System.Threading.Interlocked.Exchange(ref _position, pos + 1);
+      int result;
+      byte* pointer = null;
+      try {
+        Acquire(ref pointer);
+        result = arr[(int)((long)(pointer - 1) + pos + _offset) & 63] + (int)pos;
+      } finally {
+        if (pointer != null) Release();
+      }
+      return result;
+    }
+  }
+  static byte[] umsData = new byte[256];
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe int UmsRead(int i) {
+    for (int k = 0; k < 256; k++) umsData[k] = (byte)(k * 7 + 3);
+    fixed (byte* p = umsData) {
+      using var u = new System.IO.UnmanagedMemoryStream(p, 256);
+      u.Position = i % 200;
+      int a = u.ReadByte(), b = u.ReadByte();
+      return a * 3 + b;
+    }
+  }
+  // stackalloc (OP_LOCALLOC / OP_LOCALLOC_IMM), constant and variable size, zero-initialised, called in a loop
+  // so a leaked SP would overflow the stack; plus BinaryReader.ReadInt32's own stackalloc.
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe int Stack(int n) {
+    byte* a = stackalloc byte[24];
+    Span<int> b = stackalloc int[n % 37 + 1];
+    int s = 0;
+    for (int k = 0; k < 24; k++) s += a[k];
+    for (int k = 0; k < b.Length; k++) { s += b[k]; b[k] = k * n; }
+    for (int k = 0; k < b.Length; k++) s += b[k];
+    a[3] = (byte)n; s += a[3];
+    return s;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static long CMulL(long a, long b) => checked(a * b);
+  [MethodImpl(MethodImplOptions.NoInlining)] static ulong CMulUL(ulong a, ulong b) => checked(a * b);
+  static string MulOvf() {
+    var sb = new System.Text.StringBuilder();
+    long[] ls = { 0, 1, -1, 2, -2, 3, long.MaxValue, long.MinValue, 1L << 31, -(1L << 32), 3037000499, 3037000500, -3037000500 };
+    foreach (long a in ls) foreach (long b in ls) {
+      try { long r = CMulL(a, b); sb.Append((char)('a' + (int)((ulong)r % 26))); } catch (OverflowException) { sb.Append('O'); }
+    }
+    sb.Append(' ');
+    ulong[] us = { 0, 1, 2, 3, ulong.MaxValue, ulong.MaxValue / 2, (ulong)uint.MaxValue, (ulong)uint.MaxValue + 1, 4294967296UL * 2 };
+    foreach (ulong a in us) foreach (ulong b in us) {
+      try { ulong r = CMulUL(a, b); sb.Append((char)('a' + (int)(r % 26))); } catch (OverflowException) { sb.Append('O'); }
+    }
+    return sb.ToString();
+  }
+  // Hollow Knight's hot interpreter legs (hg10), as shapes: Unity InputSystem's InputStateBlock.ReadFloat
+  // (ldind.* by format, uint -> float through conv.r.un), List<ref>.AddRange (checked add in shared generic code,
+  // OP_IADDCC) and a KeyCombo-style struct accessor that takes the address of a fixed buffer / local.
+  public class Ev { public int id; public Ev(int i) { id = i; } }
+  [MethodImpl(MethodImplOptions.NoInlining)] static float UNorm(uint v, uint min, uint max) => (float)(v - min) / (max - min);
+  [MethodImpl(MethodImplOptions.NoInlining)] static float INorm(int v, int min, int max) => (float)(v - min) / (max - min);
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe float ReadFloatLike(void* p, int fmt) {
+    switch (fmt) {
+      case 0: return INorm(*(int*)p, int.MinValue, int.MaxValue);
+      case 1: return UNorm(*(uint*)p, uint.MinValue, uint.MaxValue);
+      case 2: return INorm(*(short*)p, short.MinValue, short.MaxValue);
+      case 3: return UNorm(*(ushort*)p, ushort.MinValue, ushort.MaxValue);
+      case 4: return UNorm(*(byte*)p, byte.MinValue, byte.MaxValue);
+      case 5: return *(float*)p;
+      default: return (float)*(double*)p;
+    }
+  }
+  public unsafe struct Combo { fixed byte inc[8]; int n;
+    public void Add(int k) { if (n < 8) { inc[n] = (byte)k; n++; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] public int GetInclude(int i) { fixed (byte* b = inc) return b[i]; } }
+  public static unsafe string HotShapes(int n) {
+    double facc = 0; long lacc = 0;
+    var buf = stackalloc byte[8];
+    var list = new List<Ev>();
+    var add = new List<Ev> { new Ev(1), new Ev(2), new Ev(3) };
+    var combo = new Combo();
+    for (int k = 0; k < 8; k++) combo.Add(k * 7 + 1);
+    for (int i = 0; i < n; i++) {
+      *(ulong*)buf = (ulong)(uint)(i * 2654435761u) * 0x9E3779B97F4A7C15UL;
+      if ((i & 7) == 5) *(float*)buf = i * 0.25f;
+      if ((i & 7) >= 6) *(double*)buf = i * 0.125;
+      facc += ReadFloatLike(buf, i & 7);
+      list.AddRange(add);
+      if (list.Count > 300) list.Clear();
+      lacc += list.Count + combo.GetInclude(i & 7);
+    }
+    return "hotshapes " + lacc + " " + facc.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+  }
+  // The runtime's own InternalCalls called directly from JIT code (handles and raw): GCHandle.InternalGet,
+  // FastAllocateString, Array.GetLowerBoundInternal / FastCopy, RuntimeType.GetName, Enum names (an out
+  // handle), and a pending exception raised inside an icall (Monitor.Exit of an unowned lock).
+  public enum Hue { Red, Green, Blue }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int IcallLeg(int i, GCHandle h, int[] src, int[] dst, object lk) {
+    int acc = ((string)h.Target).Length;
+    acc += new string('x', i % 7).Length;
+    acc += src.GetLowerBound(0) + src.GetUpperBound(0);
+    Array.Copy(src, 0, dst, i % 4, 4);
+    acc += dst[i % 4] + dst[(i % 4) + 3];
+    acc += (i % 3 == 0 ? typeof(Hue) : i % 3 == 1 ? typeof(List<int>) : typeof(T)).Name.Length;
+    acc += Enum.GetNames(typeof(Hue))[i % 3].Length;
+    if (i % 50 == 0) { try { System.Threading.Monitor.Exit(lk); acc += 1000; } catch (System.Threading.SynchronizationLockException) { acc += 7; } }
+    if (i % 2 == 0) { lock (lk) acc += 1; }
+    return acc;
+  }
+  public static string MonoIcalls(int n) {
+    var h = GCHandle.Alloc("handle-target");
+    int[] src = { 3, 1, 4, 1, 5, 9, 2, 6 }, dst = new int[8];
+    object lk = new object();
+    long acc = 0;
+    for (int i = 0; i < n; i++) acc += IcallLeg(i, h, src, dst, lk);
+    h.Free();
+    return "monoicalls " + acc;
+  }
+  // Unity InputSystem's InputStateBlock.ReadFloat and its helpers, verbatim (decompiled), left inlinable as
+  // in the game: IntToNormalizedFloat(.., int.MinValue, ..) inlines a negative constant into a register that
+  // conv.r8 then reads, an i64 local on wasm64. hg25: invalid module, re-emitted 1195 times.
+  public static class NumH {
+    public static float IntToNormalizedFloat(int value, int minValue, int maxValue) {
+      if (value <= minValue) return 0f;
+      if (value >= maxValue) return 1f;
+      return (float)(((double)value - (double)minValue) / ((double)maxValue - (double)minValue));
+    }
+    public static float UIntToNormalizedFloat(uint value, uint minValue, uint maxValue) {
+      if (value <= minValue) return 0f;
+      if (value >= maxValue) return 1f;
+      return (float)(((double)value - (double)minValue) / ((double)maxValue - (double)minValue));
+    }
+  }
+  public static class MemH {
+    public static unsafe bool ReadSingleBit(void* ptr, uint bitOffset) {
+      if (bitOffset >= 8) { int b = (int)bitOffset / 8; ptr = (byte*)ptr + b; bitOffset %= 8; }
+      return (*(byte*)ptr & (1 << (int)bitOffset)) != 0;
+    }
+    public static unsafe uint ReadMultipleBitsAsUInt(void* ptr, uint bitOffset, uint bitCount) {
+      ulong v = *(ulong*)ptr >> (int)bitOffset;
+      return (uint)(v & ((1UL << (int)bitCount) - 1));
+    }
+    public static unsafe float ReadMultipleBitsAsNormalizedUInt(void* ptr, uint bitOffset, uint bitCount) {
+      uint value = ReadMultipleBitsAsUInt(ptr, bitOffset, bitCount);
+      uint maxValue = (uint)((1L << (int)bitCount) - 1);
+      return NumH.UIntToNormalizedFloat(value, 0u, maxValue);
+    }
+  }
+  public struct StateBlock {
+    public int format; public uint byteOffset, bitOffset, sizeInBits;
+    public unsafe float ReadFloat(void* statePtr) {
+      byte* ptr = (byte*)statePtr + (int)byteOffset;
+      switch (format) {
+      case 1112101920:
+        if (sizeInBits == 1) { if (!MemH.ReadSingleBit(ptr, bitOffset)) return 0f; return 1f; }
+        return MemH.ReadMultipleBitsAsNormalizedUInt(ptr, bitOffset, sizeInBits);
+      case 1396853076:
+        if (sizeInBits == 1) { if (!MemH.ReadSingleBit(ptr, bitOffset)) return -1f; return 1f; }
+        return MemH.ReadMultipleBitsAsNormalizedUInt(ptr, bitOffset, sizeInBits) * 2f - 1f;
+      case 1229870112: return NumH.IntToNormalizedFloat(*(int*)ptr, int.MinValue, int.MaxValue) * 2f - 1f;
+      case 1430867540: return NumH.UIntToNormalizedFloat(*(uint*)ptr, 0u, uint.MaxValue);
+      case 1397248596: return NumH.IntToNormalizedFloat(*(short*)ptr, -32768, 32767) * 2f - 1f;
+      case 1431521364: return NumH.UIntToNormalizedFloat(*(ushort*)ptr, 0u, 65535u);
+      case 1113150533: return NumH.UIntToNormalizedFloat(*ptr, 0u, 255u);
+      case 1396857172: return NumH.IntToNormalizedFloat(*ptr, -128, 127) * 2f - 1f;
+      case 1179407392: return *(float*)ptr;
+      case 1145195552: return (float)(*(double*)ptr);
+      default: throw new InvalidOperationException("State format '" + format + "' is not supported as floating-point format");
+      }
+    }
+  }
+  public static unsafe string ReadFloats(int n) {
+    int[] fmts = { 1112101920, 1396853076, 1229870112, 1430867540, 1397248596, 1431521364, 1113150533, 1396857172, 1179407392, 1145195552 };
+    var buf = stackalloc byte[24];
+    double acc = 0; var sb = new StateBlock();
+    for (int i = 0; i < n; i++) {
+      *(ulong*)buf = (ulong)(uint)(i * 2654435761u) * 0x9E3779B97F4A7C15UL;
+      *(ulong*)(buf + 8) = (ulong)(uint)(i * 40503u) * 0xC2B2AE3D27D4EB4FUL;
+      sb.format = fmts[i % fmts.Length]; sb.byteOffset = (uint)(i % 3); sb.bitOffset = (uint)(i % 5); sb.sizeInBits = (uint)(i % 4 == 0 ? 1 : 1 + i % 17);
+      if (sb.format == 1179407392) *(float*)(buf + sb.byteOffset) = i * 0.25f;
+      if (sb.format == 1145195552) *(double*)(buf + sb.byteOffset) = i * 0.125;
+      acc += sb.ReadFloat(buf);
+    }
+    return "readfloats " + acc.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+  }
+  // A field loaded twice in a row (the JIT reuses the first load) into a register a negative constant
+  // also writes: `x == 65535 ? -1 : x`, AssemblyName.FillName's shape. On wasm64 that register is an i64
+  // local, and the reused load must be widened into it or the module does not validate.
+  public struct Ver { public int major, build, revision; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static unsafe long VerKey(Ver* v) {
+    int build = v->build == 65535 ? -1 : v->build;
+    int revision = v->revision == 65535 ? -1 : v->revision;
+    return build == -1 ? v->major : revision == -1 ? v->major * 1000L + build : (v->major * 1000L + build) * 100000L + revision;
+  }
+  public static unsafe string LcseWide(int n) {
+    long acc = 0; Ver v;
+    for (int i = 0; i < n; i++) {
+      v.major = i & 15; v.build = (i % 3 == 0) ? 65535 : i % 997; v.revision = (i % 5 == 0) ? 65535 : i % 89;
+      acc += VerKey(&v);
+    }
+    return "lcsewide " + acc;
+  }
+  public static string Localloc(int n) {
+    long acc = 0;
+    for (int i = 0; i < n; i++) acc += Stack(i);
+    var ms = new System.IO.MemoryStream();
+    var w = new System.IO.BinaryWriter(ms);
+    for (int i = 0; i < 64; i++) w.Write(i * 1000003);
+    ms.Position = 0;
+    var r = new System.IO.BinaryReader(ms);
+    for (int i = 0; i < 64; i++) acc += r.ReadInt32() % 9973;
+    return "localloc " + acc + " " + MulOvf();
+  }
+  public static string NestedFinally(int n) {
+    long acc = 0; int log = 0; var ums = new UmsLike();
+    for (int i = 0; i < n; i++) {
+      acc += Fin2(i, ref log);
+      acc += Fin3(i, ref log);
+      acc += FinThrow(i, ref log);
+      acc += FinMove(i).Length * 7 + FinMove(i)[0];
+      { string fa = FinArg(i, "s"); acc += fa.Length * 13 + fa[fa.Length - 1]; }
+      string sk = (i % 4 == 0) ? "k1" : (i % 4 == 1) ? "k2" : (i % 4 == 2) ? "zz" : "boom";
+      try { acc += SrLike(sk)[0]; acc += SrLike(sk).Length; } catch (InvalidOperationException) { acc += 5; }
+      try { SrLike2(sk); acc += srOut.Length; } catch (InvalidOperationException) { acc += 3; }
+      acc += ums.ReadByteU() + ums.acq;
+      acc += UmsRead(i);
+      acc = acc * 31 + log;
+      acc %= 1000000007;
+    }
+    return "finally " + acc + " " + log + " " + finCount;
+  }
+  // Calls into System.Reflection from a hot method (PlayMaker's LoadActionField shape): the wasm JIT once
+  // refused every such caller ("residual reflection"), a guard needed only once Reflection.Emit is in use.
+  public class RBox { public int a; public string s; }
+  [MethodImpl(MethodImplOptions.NoInlining)] static int ReflGet(System.Reflection.FieldInfo fa, System.Reflection.FieldInfo fs, RBox b, int i) {
+    fa.SetValue(b, (int)fa.GetValue(b) + i);
+    var f2 = System.Reflection.FieldInfo.GetFieldFromHandle(fa.FieldHandle);
+    string s = (string)fs.GetValue(b);
+    return (int)f2.GetValue(b) + (s == null ? 0 : s.Length) + (System.Reflection.MethodBase.GetCurrentMethod().Name.Length)
+      + System.Reflection.Assembly.GetExecutingAssembly().GetName().Name.Length * 1000;
+  }
+  // Stack-walking callers: GetCurrentMethod / GetExecutingAssembly (JIT intrinsics) and Type.GetType(string),
+  // which searches the CALLING assembly and so must stay in the interpreter.
+  [MethodImpl(MethodImplOptions.NoInlining)] static int StackWalkers(int i) {
+    int r = System.Reflection.MethodBase.GetCurrentMethod().Name.Length * 100;
+    r += System.Reflection.Assembly.GetExecutingAssembly().GetName().Name.Length * 10;
+    r += Type.GetType("T") != null ? 1 : 0;
+    return r + i;
+  }
+  public static string Reflect(int n) {
+    var b = new RBox { s = "xyz" };
+    var fa = typeof(RBox).GetField("a"); var fs = typeof(RBox).GetField("s");
+    long acc = 0;
+    for (int i = 0; i < n; i++) { acc += ReflGet(fa, fs, b, i); acc = acc * 7 + StackWalkers(i); acc %= 1000000007; }
+    return "reflect " + acc + " " + b.a;
+  }
   public static string Delegates(int n) {
     long sum = 0; string tags = "";
     for (int i = 0; i < n; i++) {
@@ -79,9 +523,19 @@ public static class T {
     for (int i = 0; i < n; i++) a = BIncInterp(a);
     return a;
   }
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern int Inc(int x);
+  // A guest InternalCall: from JIT code it is a direct call (mono_wasm_jit_gex_native_call); "icall-interp" is the
+  // same call from a method the JIT refuses, i.e. the interpreter's own path.
+  static int BLoopIcall(int n) { int a = 0; for (int i = 0; i < n; i++) a = Inc(a); return a; }
+  static unsafe int BLoopIcallInterp(int n) {
+    int a = 0;
+    if (n == int.MinValue) return bnever(n);
+    for (int i = 0; i < n; i++) a = Inc(a);
+    return a;
+  }
   public static string CallBench(int n) {
     var sb = new System.Text.StringBuilder("callbench ns/call:");
-    foreach (var (name, f) in new (string, Func<int, int>)[] { ("same", BLoopSame), ("to-refused", BLoopToInterp), ("from-refused", BLoopFromInterp), ("refused-refused", BLoopInterpInterp) }) {
+    foreach (var (name, f) in new (string, Func<int, int>)[] { ("same", BLoopSame), ("to-refused", BLoopToInterp), ("from-refused", BLoopFromInterp), ("refused-refused", BLoopInterpInterp), ("icall", BLoopIcall), ("icall-interp", BLoopIcallInterp) }) {
       f(1000); f(1000);   // past the JIT threshold, compiled
       var sw = System.Diagnostics.Stopwatch.StartNew();
       int r = f(n);
@@ -122,6 +576,30 @@ public static class T {
   [MethodImpl(MethodImplOptions.InternalCall)] static extern int Twice(int x);
   [MethodImpl(MethodImplOptions.InternalCall)] static extern string Concat(string a, string b);
   [MethodImpl(MethodImplOptions.InternalCall)] static extern void Throws(string msg);
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern long Accum(ref long acc, float f, double d, sbyte b, ushort c, long x);
+  [MethodImpl(MethodImplOptions.InternalCall)] static extern bool IsOdd(int x);
+  [DllImport("__Internal")] static extern long gex_mad(long a, int b, double c, float d, long e, int f, int g);
+  // Clause-free, so the wasm JIT compiles them and calls the guest directly (mono_wasm_jit_gex_native_call).
+  [MethodImpl(MethodImplOptions.NoInlining)] static long NatLoop(int n) {
+    long acc = 0, r = 0;
+    for (int i = 0; i < n; i++) {
+      r += Accum(ref acc, i * 0.5f, i * 0.25, (sbyte)(-i), (ushort)(60000 + i), (long)i << 33);
+      if (IsOdd(i)) r += Twice(i);
+      r += Concat("a", i.ToString()).Length;
+      r += gex_mad(i, 3, i * 0.75, 2.5f, -i, 7, i);
+    }
+    return r ^ acc;
+  }
+  [MethodImpl(MethodImplOptions.NoInlining)] static void Thrower(string m) { Throws(m); }
+  public static string NativeDirect(int n) {
+    // Several rounds: a method is compiled once it has been called, so the first round runs interpreted.
+    long r = 0;
+    for (int k = 0; k < 4; k++) r += NatLoop(n);
+    string t = "";
+    for (int k = 0; k < 3; k++)
+      try { Thrower("directly"); t += " no throw"; } catch (ArgumentException e) { t += " caught " + e.Message; }
+    return "native " + r + t;
+  }
   [DllImport("__Internal")] static extern double gex_mix(int a, double b, Vec3 v, long c, float f);
   [DllImport("__Internal")] static extern Vec3 gex_scale(Vec3 v, float k);
   [DllImport("__Internal")] static extern Big gex_big(long a, Big b, long c, long d, long e, long f, long g, long h);
