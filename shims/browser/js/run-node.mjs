@@ -31,7 +31,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { appendFileSync, lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, lstatSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -134,7 +134,10 @@ const rest = [];
             } catch {
               continue;
             }
+            // It arrives as the link it is instead (a Wine prefix's
+            // `dosdevices/c: -> ../drive_c`, which Wine opens by that name).
             if (!link.isSymbolicLink()) walk(g, h);
+            else symlinks[g] = readlinkSync(h);
           } else {
             try {
               files[g] = readFileSync(h);

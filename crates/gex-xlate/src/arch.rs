@@ -334,7 +334,10 @@ mod imp {
             let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
             let mark = b.mark();
             let mut l = Lifter::new(&mut b, flags, raw);
-            let flow = l.lift(&inst, pc);
+            let flow = match (pc == start).then(|| gex_lift_x86::copy_loop(fetch, start)).flatten() {
+                Some(r) => l.lift_copy_loop(r),
+                None => l.lift(&inst, pc),
+            };
             flags = l.flags();
             if b.has_inexpressible(mark) {
                 b.rewind(mark);

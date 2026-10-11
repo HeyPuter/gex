@@ -313,6 +313,10 @@ impl Transport for LoopEnd {
 pub struct RemoteEnd {
     id: i32,
     remote: crate::unix::Remote,
+    /// A write found the far end closed and was taken anyway, as Linux takes
+    /// the first one before the peer's reset arrives; the next is `EPIPE`
+    /// (`LoopEnd::reset`; tests/gexcc/tcphalfclose).
+    reset: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteEnd {
@@ -331,6 +335,7 @@ impl Transport for RemoteEnd {
     fn send(&self, data: &[u8]) -> Result<usize, Errno> {
         match (self.remote.write)(self.id, data.as_ptr() as crate::PAddr, data.len() as u32) {
             n if n >= 0 => Ok(n as usize),
+            n if Errno(-n) == Errno::EPIPE && !data.is_empty() && !self.reset.swap(true, Ordering::Relaxed) => Ok(data.len()),
             n => Err(Errno(-n)),
         }
     }
@@ -353,7 +358,7 @@ impl Transport for RemoteEnd {
     /// end. SHUT_RD only changes this end, which the far end is not told.
     fn shutdown(&self, how: u64) -> Result<(), Errno> {
         if how == 1 || how == 2 {
-            (self.remote.shutdown)(self.id);
+            let _ = (self.remote.shutdown)(self.id, 1);
         }
         Ok(())
     }
@@ -650,7 +655,7 @@ impl Socket {
         let (t, from): (Arc<dyn Transport>, u16) = match (remote_listener, self.remote) {
             (Some(id), Some(r)) => match (r.accept)(id) {
                 // The far end's port is the other process's to know.
-                n if n >= 0 => (Arc::new(RemoteEnd { id: n, remote: r }), 0),
+                n if n >= 0 => (Arc::new(RemoteEnd { id: n, remote: r, reset: Default::default() }), 0),
                 n => return Err(Errno(-n)),
             },
             _ => match &mut *self.backlog.lock().unwrap() {
@@ -719,7 +724,7 @@ impl Socket {
                 if id >= 0 {
                     *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
                     *self.local.lock().unwrap() = Some((0x7f00_0001, self.ports.ephemeral()));
-                    *self.transport.lock().unwrap() = Some(Arc::new(RemoteEnd { id, remote: r }));
+                    *self.transport.lock().unwrap() = Some(Arc::new(RemoteEnd { id, remote: r, reset: Default::default() }));
                     return Ok(());
                 }
             } else if let Some(listener) = self.ports.listener(port) {

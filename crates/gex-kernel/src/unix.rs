@@ -418,6 +418,13 @@ impl FileHandle for UnixSocket {
         }
     }
 
+    fn poll_rdhup(&self) -> bool {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, .. } => rx.is_closed(),
+            _ => false,
+        }
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
@@ -1093,8 +1100,44 @@ pub struct Remote {
     pub writable: extern "C" fn(id: i32) -> i32,
     pub available: extern "C" fn(id: i32) -> i32,
     pub close: extern "C" fn(id: i32),
-    pub shutdown: extern "C" fn(id: i32),
+    /// Hang-ups on a connected end: bit 0 both directions shut (`POLLHUP`),
+    /// bit 1 the peer's sending side shut (`POLLRDHUP`).
+    pub hup: extern "C" fn(id: i32) -> i32,
+    /// `shutdown(2)`'s `how` on a connected socket: 0 or a negative errno.
+    pub shutdown: extern "C" fn(id: i32, how: u32) -> i32,
     pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    /// A connected pair, as `socketpair` makes: both ids written as two
+    /// little-endian `u32`s at `out`. Zero or a negated errno.
+    pub pair: extern "C" fn(out: crate::PAddr) -> i32,
+    /// Another id on the same end, for a descriptor that is going to another
+    /// process (a fork, or `SCM_RIGHTS`) and must outlive this one closing.
+    pub dup: extern "C" fn(id: i32) -> i32,
+    /// `send` with descriptors attached: `descs` is one description per
+    /// descriptor, newline-separated, as [`Remote::describe`] wrote them. The
+    /// global kernel holds each until the far end takes it, and releases what
+    /// it holds if the bytes are never read.
+    pub write_fds:
+        extern "C" fn(id: i32, at: crate::PAddr, len: u32, descs: crate::PAddr, descs_len: u32) -> i32,
+    /// `recv` that also takes up to `max_fds` descriptors. Their descriptions
+    /// go to `out` as a `u32` length and the newline-separated text; the
+    /// in-flight references they stood for are now `pid`'s. Bytes or a
+    /// negated errno.
+    pub read_fds: extern "C" fn(
+        id: i32,
+        at: crate::PAddr,
+        len: u32,
+        max_fds: u32,
+        peek: i32,
+        pid: i32,
+        out: crate::PAddr,
+        out_cap: u32,
+    ) -> i32,
+    /// A descriptor as text another process can rebuild it from, taking
+    /// whatever reference keeps it alive in flight; `None` when it is
+    /// something that cannot leave this process.
+    pub describe: fn(&crate::syscalls::Kernel, &Arc<OpenFile>) -> Option<String>,
+    /// The other half of [`Remote::describe`], in the receiving process.
+    pub rebuild: fn(&mut crate::syscalls::Kernel, &str) -> Option<Arc<OpenFile>>,
 }
 
 /// One end of a socket in the global kernel.
@@ -1155,12 +1198,75 @@ impl RemoteUnix {
         self.listening && (self.remote.pending)(self.id) != 0
     }
 
-    pub fn shutdown(&self) {
-        (self.remote.shutdown)(self.id);
+    /// `shutdown(2)`: as [`UnixSocket::shutdown_how`], in the global kernel.
+    pub fn shutdown_how(&self, how: u64) -> SysResult {
+        match (self.remote.shutdown)(self.id, how.min(u32::MAX as u64) as u32) {
+            n if n < 0 => Err(Errno(-n)),
+            _ => Ok(0),
+        }
     }
 
     pub fn bound_path(&self) -> Option<String> {
         self.peer.clone()
+    }
+
+    /// Send `buf` with descriptors described as `descs` (newline-separated).
+    pub fn send_described(&self, buf: &[u8], descs: &str) -> SysResult {
+        if self.listening {
+            return Err(Errno::ENOTCONN);
+        }
+        let n = (self.remote.write_fds)(
+            self.id,
+            buf.as_ptr() as crate::PAddr,
+            buf.len() as u32,
+            descs.as_ptr() as crate::PAddr,
+            descs.len() as u32,
+        );
+        if n < 0 {
+            return Err(Errno(-n));
+        }
+        Ok(n as u64)
+    }
+
+    /// Receive into `buf` and up to `max_fds` descriptors, which come back
+    /// as their descriptions, now held for `pid`.
+    pub fn recv_described(
+        &self,
+        buf: &mut [u8],
+        max_fds: usize,
+        peek: bool,
+        pid: i32,
+    ) -> Result<(u64, Vec<String>), Errno> {
+        if self.listening {
+            return Err(Errno::ENOTCONN);
+        }
+        let mut out = vec![0u8; 4 + 4096usize.max(300 * max_fds.min(253))];
+        let n = (self.remote.read_fds)(
+            self.id,
+            buf.as_mut_ptr() as crate::PAddr,
+            buf.len() as u32,
+            max_fds as u32,
+            peek as i32,
+            pid,
+            out.as_mut_ptr() as crate::PAddr,
+            out.len() as u32,
+        );
+        if n < 0 {
+            return Err(Errno(-n));
+        }
+        let len = (u32::from_le_bytes(out[..4].try_into().unwrap()) as usize).min(out.len() - 4);
+        let text = String::from_utf8_lossy(&out[4..4 + len]);
+        let descs = text.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        Ok((n as u64, descs))
+    }
+
+    /// Another handle on the same end, for a descriptor going to another
+    /// process; see [`Remote::dup`].
+    pub fn dup_id(&self) -> Option<i32> {
+        match (self.remote.dup)(self.id) {
+            n if n >= 0 => Some(n),
+            _ => None,
+        }
     }
 }
 
@@ -1217,6 +1323,16 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn poll_writable(&self) -> bool {
         self.listening || (self.remote.writable)(self.id) != 0
+    }
+
+    // Without these a peer's close showed in `poll` and `epoll` only as
+    // readable: no `POLLHUP`, no `EPOLLRDHUP`.
+    fn poll_hup(&self) -> bool {
+        !self.listening && (self.remote.hup)(self.id) & 1 != 0
+    }
+
+    fn poll_rdhup(&self) -> bool {
+        !self.listening && (self.remote.hup)(self.id) & 2 != 0
     }
 
     fn available(&self) -> Option<u64> {

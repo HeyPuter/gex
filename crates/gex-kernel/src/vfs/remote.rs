@@ -57,11 +57,30 @@ pub struct Remote {
     /// of its own, so a write's time is the writing process's: it stamps the
     /// file after each write.
     pub touch: extern "C" fn(handle: i32, secs: i64) -> i32,
+    /// `utimensat` with nanoseconds: a time whose nanoseconds are
+    /// [`OMIT`] is left alone; `now` is the caller's clock, for the change
+    /// time.
+    pub set_times: extern "C" fn(path: crate::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32,
+    /// `futimens`, likewise.
+    pub set_times_fd: extern "C" fn(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32,
+}
+
+/// The nanoseconds of a time `set_times` leaves alone.
+pub const OMIT: u32 = u32::MAX;
+
+/// A time for `Remote::set_times`.
+pub fn time_arg(t: Option<(i64, u32)>) -> (i64, u32) {
+    t.unwrap_or((0, OMIT))
+}
+
+/// The inverse of [`time_arg`].
+pub fn time_of(s: i64, ns: u32) -> Option<(i64, u32)> {
+    (ns != OMIT).then_some((s, ns))
 }
 
 /// Serialised [`Metadata`] size. Both modules compile this file so they agree,
 /// but they are separate wasm artefacts -- a change here means rebuilding both.
-pub const META_BYTES: usize = 36;
+pub const META_BYTES: usize = 64;
 
 /// `Metadata` as bytes, in the one layout both modules read.
 pub fn encode_meta(m: &Metadata) -> [u8; META_BYTES] {
@@ -72,6 +91,11 @@ pub fn encode_meta(m: &Metadata) -> [u8; META_BYTES] {
     out[16..24].copy_from_slice(&m.ino.to_le_bytes());
     out[24..32].copy_from_slice(&m.mtime.to_le_bytes());
     out[32..36].copy_from_slice(&m.nlink.to_le_bytes());
+    out[36..40].copy_from_slice(&m.times.mtime_ns.to_le_bytes());
+    out[40..48].copy_from_slice(&m.times.atime.to_le_bytes());
+    out[48..52].copy_from_slice(&m.times.atime_ns.to_le_bytes());
+    out[52..60].copy_from_slice(&m.times.ctime.to_le_bytes());
+    out[60..64].copy_from_slice(&m.times.ctime_ns.to_le_bytes());
     out
 }
 
@@ -92,7 +116,13 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         mtime: u64at(24) as i64,
         nlink: u32at(32).max(1),
         rdev: 0,
-        times: Default::default(),
+        times: super::Times {
+            mtime_ns: u32at(36),
+            atime: u64at(40) as i64,
+            atime_ns: u32at(48),
+            ctime: u64at(52) as i64,
+            ctime_ns: u32at(60),
+        },
     }
 }
 
@@ -260,6 +290,12 @@ impl FileSystem for RemoteFs {
         ok((self.remote.set_mtime)(a, n, secs)).map(|_| ())
     }
 
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        let ((as_, ans), (ms, mns)) = (time_arg(atime), time_arg(mtime));
+        ok((self.remote.set_times)(a, n, as_, ans, ms, mns, super::tmpfs::now())).map(|_| ())
+    }
+
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
         let (fa, fn_) = at(from.as_bytes());
         let (ta, tn) = at(to.as_bytes());
@@ -333,6 +369,11 @@ impl FileHandle for RemoteHandle {
 
     fn set_mtime(&self, secs: i64) -> Result<(), Errno> {
         ok((self.remote.touch)(self.id, secs)).map(|_| ())
+    }
+
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let ((as_, ans), (ms, mns)) = (time_arg(atime), time_arg(mtime));
+        ok((self.remote.set_times_fd)(self.id, as_, ans, ms, mns, super::tmpfs::now())).map(|_| ())
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {

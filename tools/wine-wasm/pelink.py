@@ -25,6 +25,7 @@ import tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
+DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
 
 
@@ -77,6 +78,31 @@ def spec_stdcalls(spec):
     return out
 
 
+def spec_own(spec):
+    """The function names a .spec exports from the DLL's own code: not
+    `-import` entries, not forwards (a target after the arguments)."""
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        line = line.split('#', 1)[0].strip()
+        parts = line.split()
+        if len(parts) < 3 or parts[1] not in ('stdcall', 'cdecl', 'thiscall', 'varargs', 'fastcall'):
+            continue
+        if '-import' in parts:
+            continue
+        rest = [t for t in parts[2:] if not t.startswith('-')]
+        if not rest or ')' not in ' '.join(rest):
+            continue
+        tail = ' '.join(rest).split(')', 1)[1].split()
+        if tail:
+            continue  # forwarded (or renamed to another symbol)
+        out.add(rest[0].split('(', 1)[0])
+    return out
+
+
 def spec_functions(spec):
     """The function names a .spec exports (its stdcall/cdecl/thiscall/
     varargs entries; not data, stubs or extern)."""
@@ -118,6 +144,19 @@ def main():
     global SRC
     SRC = src
     only = set(sys.argv[4:])
+    # An IMPORTS entry names an import library, which is the module's base
+    # name unless its Makefile says otherwise (IMPORTLIB = ntoskrnl for
+    # ntoskrnl.exe, winspool for winspool.drv): without this, winedevice's
+    # ntoskrnl import was "ntoskrnl.dll", matched no owner, and its
+    # ZwLoadDriver bound to ntdll's private one (NtLoadDriver, not
+    # implemented), so every driver service failed to start.
+    implib = {}
+    for d in sorted(os.listdir(os.path.join(src, 'dlls'))):
+        mk = os.path.join(src, 'dlls', d, 'Makefile.in')
+        m, il = makefile_var(mk, 'MODULE'), makefile_var(mk, 'IMPORTLIB')
+        if m and il:
+            implib.setdefault(il[0], m[0])
+    modname = lambda i: implib.get(i, i if '.' in i else i + '.dll')
     dlls = []  # (dll file name, r.o, exports, imports)
     for top in ('dlls', 'programs'):
         for d in sorted(os.listdir(os.path.join(build, top))):
@@ -133,7 +172,7 @@ def main():
             if only and mod not in only:
                 continue
             imports = [i.lstrip('-') for i in makefile_var(mk, 'IMPORTS') + makefile_var(mk, 'DELAYIMPORTS')]
-            imports = [i if '.' in i else i + '.dll' for i in imports]
+            imports = [modname(i) for i in imports]
             dlls.append((mod, ro, ex, imports))
             # what the loader is to load before the module (makedep's
             # direct imports and default ones: the C runtime, kernel32,
@@ -143,13 +182,14 @@ def main():
                 is_crt = lambda n: n.startswith(('msvcr', 'ucrt')) or n == 'crtdll'
                 crt = next((i for i in eager if is_crt(i)), None if is_crt(mod.split('.')[0]) else 'ucrtbase')
                 eager += [c for c in (crt, 'kernel32', 'ntdll') if c and c not in eager]
-            # and its delay imports, after them: a native module's calls are
-            # bound in the one module, so nothing would load a delay-loaded
-            # DLL on first call, and a DLL never loaded never ran its DllMain
-            # (wineboot's user32 and gdi32: win32u's syscall table missing,
-            # every NtUser call STATUS_INVALID_SYSTEM_SERVICE)
-            eager += [i.lstrip('-') for i in makefile_var(mk, 'DELAYIMPORTS') if i.lstrip('-') not in eager]
-            EAGER[mod] = [i if '.' in i else i + '.dll' for i in eager]
+            # and its native delay imports, after them (moduleimports.c,
+            # below): a native module's calls are bound in the one module,
+            # so nothing would load a delay-loaded DLL on first call, and a
+            # DLL never loaded never ran its DllMain (wineboot's user32 and
+            # gdi32: win32u's syscall table missing, every NtUser call
+            # STATUS_INVALID_SYSTEM_SERVICE)
+            EAGER[mod] = [modname(i) for i in eager]
+            DELAY[mod] = [modname(i.lstrip('-')) for i in makefile_var(mk, 'DELAYIMPORTS')]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
     # every DLL the build has an export list for, native or not: what an
@@ -246,6 +286,38 @@ def link(dlls, out, gexrt, others=None):
             else:
                 keep.append((alias, target))
         aliases[d] = keep
+    # Exports of the DLLs that stay i386 code, for imports a native module
+    # takes from one of them (below, and the stubs further down).
+    native = {mod for mod, _, _, _ in dlls}
+    owner_of = {}
+    for omod, oex in (others or {}).items():
+        if omod in native:
+            continue
+        for line in open(oex):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in ('func', 'forward'):
+                owner_of.setdefault(parts[0], []).append(omod)
+    guest_binds = []  # (symbol, sig, i386 owner, export name)
+    own_cache = {}
+    def own_defs(o):
+        if o not in own_cache:
+            own_cache[o] = spec_own(spec_path(SRC, 'dlls', o, o)) if SRC else set()
+        return own_cache[o]
+    def bind_guest(f, mod, imports, name, pick):
+        """An i386 DLL the module imports explicitly, ahead of the native
+        owner `pick`, is the one `name` comes from, as an import library's
+        link order has it (winedevice's ZwLoadDriver is ntoskrnl.exe's, not
+        ntdll's private alias of NtLoadDriver, which is not implemented:
+        every driver service failed to start). Binds it to a guest stub."""
+        guest = next((o for o in imports if o in owner_of.get(name, ()) and name in own_defs(o)), None)
+        have = sigs[mod].get((name, 'undefined'))
+        if not guest or not have or (pick in imports and imports.index(pick) < imports.index(guest)):
+            return False
+        sym = f'{guest}.{name}'
+        guest_binds.append((f'gexw-guest!{sym}', have, guest, name))
+        f.write(f'{name} gexw-guest {sym}\n')
+        return True
+
     for mod, ro, ex, imports in dlls:
         local = os.path.join(tmp, mod + '.l.o')
         alias_file = os.path.join(tmp, mod + '.aliases')
@@ -266,6 +338,12 @@ def link(dlls, out, gexrt, others=None):
                 # tables, and wineboot's fstat of a file it had just opened
                 # failed)
                 pick = next((o for o in EAGER.get(mod, []) + imports if o in owners), owners[0])
+                # An i386 DLL the module imports explicitly, ahead of the
+                # native owner, is the one the name comes from, as an import
+                # library's link order has it (winedevice's ZwLoadDriver is
+                # ntoskrnl.exe's, not ntdll's private NtLoadDriver alias).
+                if bind_guest(f, mod, imports, name, pick):
+                    continue
                 # a caller declaring the function otherwise than its
                 # definition (an adapter from the .spec: user32's
                 # NotifyWinEvent is void, win32u's stub returns a word) goes
@@ -281,6 +359,8 @@ def link(dlls, out, gexrt, others=None):
             # ntdll's RtlEnterCriticalSection, under kernel32.dll!EnterCriticalSection)
             for name, vias in forward_owner.items():
                 pick = next((o for o in [mod] + imports if o in vias), vias[0])
+                if bind_guest(f, mod, imports, name, pick):
+                    continue
                 f.write(f'{name} {pick}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
@@ -320,27 +400,22 @@ def link(dlls, out, gexrt, others=None):
     # (LoadLibraryA, GetProcAddress) once and calls it -- a guest address,
     # so through the ICALL pass's exit stub, as a guest call. The stub's
     # signature is its callers'.
-    native = {mod for mod, _, _, _ in dlls}
     if others and 'kernel32.dll' in native:
         undefined = {}  # name -> (sig, importing dll)
         for mod, ro, ex, imports in dlls:
             for (n, k), v in sigs[mod].items():
                 if k == 'undefined' and n not in exporters and n not in forward_owner and '!' not in n:
                     undefined.setdefault(n, (v, mod, imports))
-        owner_of = {}
-        for omod, oex in others.items():
-            if omod in native:
-                continue
-            for line in open(oex):
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] in ('func', 'forward'):
-                    owner_of.setdefault(parts[0], []).append(omod)
-        stubs = []
+        stubs = []  # (symbol, sig, owner, export name)
         for n, (sig, mod, imports) in sorted(undefined.items()):
             owners = owner_of.get(n)
             if not owners:
                 continue
-            stubs.append((n, sig, next((o for o in imports if o in owners), owners[0])))
+            stubs.append((n, sig, next((o for o in imports if o in owners), owners[0]), n))
+        stubs += sorted(set(guest_binds))
+        if guest_binds:
+            print(f'{out}: bound to i386 DLLs ahead of native ones: ' +
+                  ', '.join(sorted({s.split('!', 1)[1] for s, _, _, _ in guest_binds})))
         if stubs:
             ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
             src = os.path.join(tmp, 'guestimports.c')
@@ -349,7 +424,7 @@ def link(dlls, out, gexrt, others=None):
                 f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
                 f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
                 stdcalls = {}
-                for k, (n, sig, owner) in enumerate(stubs):
+                for k, (sym, sig, owner, n) in enumerate(stubs):
                     if owner not in stdcalls:
                         stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
                     # a stdcall entry thunk (callee pops) for i386 callers
@@ -359,7 +434,7 @@ def link(dlls, out, gexrt, others=None):
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
                     args = ', '.join(f'a{i}' for i in range(len(ps)))
-                    f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{n}");\n')
+                    f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{sym}");\n')
                     f.write(f'{attr}{ctype[r]} g{k}({params}) {{\n'
                             f'    static void *p;\n'
                             f'    if (!p) p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
@@ -375,7 +450,7 @@ def link(dlls, out, gexrt, others=None):
             obj = os.path.join(tmp, 'guestimports.o')
             subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
             objs.append(obj)
-            print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o in stubs}))})')
+            print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
 
     # Each module's load-time imports for Wine's PE loader on wasm32
     # (ntdll's fixup_imports asks __gexw_module_imports): only DLLs.
@@ -385,7 +460,14 @@ def link(dlls, out, gexrt, others=None):
         with open(src, 'w') as f:
             f.write('static const char *const gexw_imports[] = {\n')
             for mod in sorted(EAGER):
+                # Delay imports too, after them, but only native ones: an
+                # i386 one is reached through a guest-import stub, which
+                # loads it on first call as a delay-load thunk would
+                # (loading gdi32's winspool.drv up front moved the DLLs
+                # after it off the bases their units were built for).
+                native_mods = {m for m, _, _, _ in dlls}
                 deps = [d for d in EAGER[mod] if d in known and d != mod]
+                deps += [d for d in DELAY.get(mod, []) if d in native_mods and d != mod and d not in deps]
                 f.write('    "%s", "%s",\n' % (mod, ''.join(d + '\\0' for d in deps)))
             f.write('    0\n};\n')
             f.write('const char *__gexw_module_imports(const unsigned short *name)\n{\n'
