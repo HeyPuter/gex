@@ -93,6 +93,13 @@ async function fetchBytes(url, onProgress) {
   return checkWasm(url, res, out);
 }
 
+/** The page's copies, handed to the system Worker so the single build does
+ *  not fetch the 5 MB shim a second time. */
+export function primeRuntime(r) {
+  if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
+  if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
+}
+
 /** The two wasm modules every demo needs, fetched once for the page's life. */
 export async function loadRuntime(onProgress) {
   if (!shimBytes) shimBytes = await fetchBytes(SHIM_URL(), onProgress);
@@ -462,6 +469,9 @@ async function runInSystemWorker(term, opts) {
       w.postMessage({
         kind: 'run',
         globals: pageGlobals(),
+        // Already fetched by the page (main.js loadRuntime): copied, not
+        // fetched again by the Worker.
+        runtime: shimBytes ? { shimBytes, seedBytes } : undefined,
         rows: term.rows,
         cols: term.cols,
         opts: {

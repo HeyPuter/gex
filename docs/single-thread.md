@@ -640,6 +640,24 @@ These are the large files, stripped:
 | `Xwayland.wasm` | 2 064 538 B | 573 528 B |
 | `gexhostwl.wasm` (12 265 903 B with DWARF) | 144 639 B | 42 643 B |
 
+What a page fetches until the demo has passed. This is counted by
+`GEX_SERVE_LOG` behind `serve-dist.mjs --sp-port`, on gooner, with every
+response `no-store`:
+
+| demo | MP (`web/dist`, COOP/COEP) | SP (`web/dist-sp`, none) |
+|---|---:|---:|
+| busybox (to the shell prompt) | 13 files, 7 527 568 B | 16 files, 7 450 725 B |
+| gears (30 frames) | 24 files, 28 205 364 B | 26 files, 27 176 339 B |
+
+In both builds the large items are the same:
+- the shim (5 159 727 B);
+- the busybox rootfs (1 464 320 B);
+- for gears, Mesa (18.9 MB MP, 18.7 MB SP) and the guest's libc and GL
+  libraries.
+
+SP once fetched the shim twice, from the page and again from the system
+Worker. The page now hands its copy to the Worker (`primeRuntime`).
+
 Keeping the name section would add 712 183 B to the shim (5 871 910 B).
 Nothing in the runtime reads it, so the dists strip every custom section
 (`wasm-tools strip -a`), except on the seed and the providers, whose `gex.*`

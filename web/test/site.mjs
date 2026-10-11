@@ -446,8 +446,11 @@ const server = createServer(async (req, res) => {
         'content-type': type,
         // Added here so a dev server that forgets them still gets a
         // `SharedArrayBuffer` -- a different failure, worth telling apart.
-        'Cross-Origin-Opener-Policy': 'same-origin',
-        'Cross-Origin-Embedder-Policy': 'require-corp',
+        // Not with `GEX_NO_COI=1`, as for the built site below.
+        ...(process.env.GEX_NO_COI ? {} : {
+          'Cross-Origin-Opener-Policy': 'same-origin',
+          'Cross-Origin-Embedder-Policy': 'require-corp',
+        }),
       });
       res.end(html ? Buffer.from(body.toString() + reporter()) : body);
     } catch (e) {

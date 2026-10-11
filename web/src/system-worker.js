@@ -12,7 +12,7 @@ import { enableSingle } from '../../shims/browser/js/single.mjs';
 enableSingle();
 // After `enableSingle`: these compile modules as they load.
 await import('../../shims/browser/js/worker.mjs');
-const { runProgram } = await import('./runtime.js');
+const { runProgram, primeRuntime } = await import('./runtime.js');
 
 /** xterm's surface, as far as `runProgram` uses it, over messages. */
 class TermProxy {
@@ -99,6 +99,7 @@ self.onmessage = async (ev) => {
     // The page's switches: `?name=` (read through `GEX_PAGE_SEARCH`, since
     // this thread's `location` is the script's) and its `GEX_*` globals.
     Object.assign(globalThis, m.globals ?? {});
+    primeRuntime(m.runtime);
     term.rows = m.rows ?? term.rows;
     term.cols = m.cols ?? term.cols;
     try {
