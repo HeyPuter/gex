@@ -327,6 +327,10 @@ extern "C" {
     fn k_mod_claim_object(obj: u64, id: u32);
     fn k_obj_translating(obj: u64, pid: u32) -> u32;
     fn k_obj_translated(obj: u64, produced: u32);
+    /// The translation cache across page loads (docs/gexcc.md §8).
+    fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64) -> i32;
+    fn k_xcache_on() -> u32;
+    fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_ids_for_object(obj: u64, from: u32, out: gex_kernel::PAddr, cap: u32) -> u32;
@@ -9318,7 +9322,9 @@ fn object_identity(h: &Host, addr: u64) -> Option<u64> {
     let (id, _) = v.code.as_ref()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    Some(hasher.finish())
+    let key = hasher.finish();
+    note_key(h, key, id);
+    Some(key)
 }
 
 /// Whether the object covering this page has been translated whole.
@@ -9606,6 +9612,55 @@ fn shared_module_at(
     }
 }
 
+// `?xcache=`: tie each identity key to its file for the kernel's saved store
+// (docs/gexcc.md §8).
+thread_local! {
+    /// Keys this Worker has told the kernel about, each path's size and mtime
+    /// (`u64::MAX`: no such file here), and whether this load keeps a cache
+    /// (`k_xcache_on`).
+    static XKEYS: std::cell::RefCell<(std::collections::HashSet<u64>, std::collections::HashMap<String, (u64, i64)>, Option<bool>)> =
+        std::cell::RefCell::new(Default::default());
+}
+
+/// Tell the kernel which file `key` was computed from, once per key per
+/// Worker, in every process of a load that keeps a cache (`?xcache=`,
+/// whatever the process's own options: a forked child's save must name its
+/// keys' files too): for the save, and to check a restored key against its
+/// file before this process uses it.
+fn note_key(h: &Host, key: u64, path: &str) {
+    if unsafe { k_present() } == 0 {
+        return;
+    }
+    XKEYS.with(|x| {
+        let mut x = x.borrow_mut();
+        // Asked once per Worker: the host enables it before pid 1 runs.
+        if !*x.2.get_or_insert_with(|| unsafe { k_xcache_on() } != 0) {
+            return;
+        }
+        if !x.0.insert(key) {
+            return;
+        }
+        let (size, mtime) = *x.1.entry(path.to_string()).or_insert_with(|| match h.kernel.vfs.metadata(path) {
+            Ok(m) => (m.size, m.mtime),
+            Err(_) => (u64::MAX, 0),
+        });
+        if unsafe { k_key_path(key, path.as_ptr() as gex_kernel::PAddr, path.len() as u32, size, mtime) } < 0 {
+            warn_line(&format!("[gex] xcache: {path} changed since the save; its translations are dropped\n"));
+        }
+    });
+}
+
+/// The saved store a load's host put in the kernel (`k_store_restore_buf`),
+/// laid in; each file is checked when a process first uses it (`note_key`).
+/// Returns `k_store_restore`'s answer.
+#[no_mangle]
+pub extern "C" fn gex_xcache_restore() -> i32 {
+    if unsafe { k_present() } == 0 {
+        return -1;
+    }
+    unsafe { k_store_restore() }
+}
+
 fn page_identity(h: &Host, page: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let v = h
@@ -9647,7 +9702,9 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     (off + (page - v.start)).hash(&mut hasher);
-    Some(hasher.finish())
+    let key = hasher.finish();
+    note_key(h, key, id);
+    Some(key)
 }
 
 /// Nanoseconds on the host clock.
