@@ -424,6 +424,7 @@ async function handle(msg) {
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
+  if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -659,6 +660,11 @@ async function handle(msg) {
           fjit: msg.fjit ?? msg.opts?.fjit,
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
+          liftMax: msg.liftMax ?? msg.opts?.liftMax,
+          inlineDispatch: msg.inlineDispatch ?? msg.opts?.inlineDispatch,
+          xlateReport: msg.xlateReport ?? msg.opts?.xlateReport,
+          discoverSkip: msg.discoverSkip ?? msg.opts?.discoverSkip,
+          t1Fold: msg.t1Fold ?? msg.opts?.t1Fold,
           providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },
@@ -784,12 +790,29 @@ async function handle(msg) {
       // the slot it dispatches through is written now. See #136.
       liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // What the translator did: instructions lifted, wasm bytes, translations,
+      // SMC page invalidations, pages retired, retire calls, -, anonymous blocks.
+      // The discovery log (GEX_DISCOVER_SKIP bit 8, run-node's GEX_DL_FILE).
+      dl: (() => {
+        const e = gex.shim.exports;
+        const n = e.gex_dl_text?.(0, 0) >>> 0;
+        if (!n) return undefined;
+        const p = e.gex_alloc(n) >>> 0;
+        e.gex_dl_text(p, n);
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, n);
+        return t;
+      })(),
+      xlate: gex.shim.exports.gex_xlate_stat
+        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => Number(gex.shim.exports.gex_xlate_stat(i)))
+        : undefined,
       // What the engine cost, which `millis` does not: compiling and
       // instantiating every module this process installed.
       installMs: gex.installMillis,
       // Split: compiling is per bytes and V8 can skip seen bytes, instantiating
       // is per module and paid every time.
       compileMs: gex.compileMillis,
+      unitHits: gex.unitHits,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
       byObject: gex.blocksByObject,

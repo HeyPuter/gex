@@ -31,7 +31,7 @@
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
 
-import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -341,6 +341,21 @@ const host = new ProcessHost({
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
+    // GEX_LIFT_MAX=N: blocks one dispatch miss may lift (default 2048).
+    liftMax: process.env.GEX_LIFT_MAX ? Number(process.env.GEX_LIFT_MAX) : undefined,
+    // GEX_INLINE_DISPATCH=1: dispatch inline in every block (gex-emit's old form).
+    inlineDispatch: process.env.GEX_INLINE_DISPATCH ? 1 : undefined,
+    // GEX_XLATE_REPORT=N: a translator progress line every N translations.
+    xlateReport: process.env.GEX_XLATE_REPORT ? Number(process.env.GEX_XLATE_REPORT) : undefined,
+    // GEX_DISCOVER_SKIP=bits: edges discovery does not follow (1 call returns,
+    // 2 folded call targets, 4 successors).
+    discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
+    // GEX_T1_FOLD=1: tier-1's tee folding (gex-emit `set_t1_fold`).
+    t1Fold: process.env.GEX_T1_FOLD ? 1 : undefined,
+    // GEX_UNIT_CACHE=1: compiled translation units shared by every process.
+    unitCache: process.env.GEX_UNIT_CACHE ? 1 : undefined,
+    // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
+    shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
@@ -424,6 +439,8 @@ const host = new ProcessHost({
     else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
   },
   onExit: (m, pid) => {
+    // GEX_DL_FILE=PATH: the discovery log (GEX_DISCOVER_SKIP=256), to PATH.PID.
+    if (process.env.GEX_DL_FILE && m.dl) appendFileSync(`${process.env.GEX_DL_FILE}.${pid}`, m.dl);
     // How much of the run was translating vs. running translated code. Per
     // process, because a program that forks pays it again.
     if (process.env.GEX_TIME_JIT) {
@@ -437,7 +454,7 @@ const host = new ProcessHost({
           (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
           (m.byObject ? ` [${m.byObject}]` : '') +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
-            ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+            ` (${m.compileMs}ms compile${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
           // Where the shared-slot lookup went, to say why a forked and exec'd
           // child lifts its parent's libraries again.
@@ -445,6 +462,8 @@ const host = new ProcessHost({
             ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}` +
               ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}`
             : '') +
+          (m.byObject ? ` [${m.byObject}]` : '') +
+          (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB]` : '') +
           '\n',
       );
     }

@@ -858,6 +858,16 @@ async function runProgramHere(
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
       // `?fjit=1`: the function JIT in every process.
       fjit: globalThis.GEX_FJIT || undefined,
+      // `?liftmax=N`: blocks one dispatch miss may lift (default 2048).
+      liftMax: globalThis.GEX_LIFT_MAX || undefined,
+      // `?inlinedispatch=1`: dispatch inline in every block, as before.
+      inlineDispatch: globalThis.GEX_INLINE_DISPATCH || undefined,
+      // `?xlatereport=N`: a translator progress line every N translations.
+      xlateReport: globalThis.GEX_XLATE_REPORT || undefined,
+      // `?t1fold=1`: tier-1's tee folding (gex-emit `set_t1_fold`).
+      t1Fold: globalThis.GEX_T1_FOLD || undefined,
+      // `?unitcache=1`: compiled translation units shared by every process.
+      unitCache: globalThis.GEX_UNIT_CACHE || undefined,
       // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).

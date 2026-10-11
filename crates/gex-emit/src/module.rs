@@ -565,6 +565,11 @@ pub struct ModuleBuilder {
     miss_stub: u32,
     /// `enter(ctx, pc)`, which the miss stub re-dispatches through.
     enter: u32,
+    /// `dispatch(ctx, pc)`: `enter`'s lookup and tail call without its stores
+    /// of `ctx::PC` and `ctx::LAST_TARGET`, which is what a block's indirect
+    /// dispatch tail-calls (tier-1's inline dispatch never stored them on
+    /// A64, and a cgen bridge reads `LAST_TARGET`).
+    dispatch: u32,
     /// Guest block address -> wasm function index.
     blocks: HashMap<u64, u32>,
     /// Blocks awaiting code generation, paired with their function index.
@@ -582,6 +587,8 @@ pub struct ModuleBuilder {
     /// module was started: the helper functions and the region-base global.
     /// `None` leaves the module exactly as it would be without profiling.
     profile: Option<ProfileFns>,
+    /// The imported global holding this module's dense base, if any.
+    dense_global: Option<u32>,
 }
 
 /// The helpers a profiled module defines. See `crate::profile`.
@@ -738,11 +745,19 @@ impl ModuleBuilder {
                 m.import_table(IMPORT_MODULE, crate::dense::TABLE_NAME, 0);
             }
         }
+        // Where this module's dense blocks go, given at instantiation rather
+        // than written into the bytes: the bytes are then the same in every
+        // process, and a module another process compiled is reused as it is
+        // (`crate::dense::GLOBAL`). Not with profiling, whose module defines
+        // a global of its own at index 0.
+        let dense_global = (linkage == Linkage::Shared && crate::dense::on() && !profiling)
+            .then(|| m.import_global(IMPORT_MODULE, crate::dense::GLOBAL, ValType::I32));
 
         // The miss stub and `enter` are the first two local functions, so
         // their indices are known before any block is declared.
         let miss_stub = m.declare_func(block_ty);
         let enter = m.declare_func(t_syscall);
+        let dispatch = m.declare_func(t_syscall);
 
         let mut b = ModuleBuilder {
             m,
@@ -753,6 +768,7 @@ impl ModuleBuilder {
             block_ty,
             miss_stub,
             enter,
+            dispatch,
             blocks: HashMap::new(),
             pending: Vec::new(),
             imports,
@@ -761,6 +777,7 @@ impl ModuleBuilder {
             exports_by_addr: Vec::new(),
             demand_fill: false,
             profile: None,
+            dense_global,
         };
 
         if profiling {
@@ -789,7 +806,9 @@ impl ModuleBuilder {
         let stub_body = b.build_miss_stub();
         b.m.define_func(miss_stub, stub_body);
         let enter_body = b.build_enter();
-        b.m.define_func(enter, enter_body);
+        b.m.define_func_with_relocs(enter, enter_body.0, enter_body.1);
+        let dispatch_body = b.build_dispatch();
+        b.m.define_func(dispatch, dispatch_body);
 
         if linkage == Linkage::Own {
             // Re-export the imported memory (index 0, imports coming first),
@@ -903,6 +922,7 @@ impl ModuleBuilder {
                     }
                 }
             }
+            let heads = tier1::loop_heads(self.pending.iter().map(|(b, _)| b));
             let cx = tier1::Context {
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
@@ -920,6 +940,8 @@ impl ModuleBuilder {
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
                 module_id,
+                loop_heads: Some(&heads),
+                enter: Some(self.dispatch),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
@@ -1020,6 +1042,7 @@ impl ModuleBuilder {
                     // not a page, and is never demand filled.
                     guest_page: 0,
                     padded: false,
+                    offset_global: None,
                 });
                 // The dense block table, its entry 0 the miss stub as a slot
                 // nobody installed reads 0 (`crate::dense`).
@@ -1033,6 +1056,7 @@ impl ModuleBuilder {
                         passive: false,
                         guest_page: 0,
                         padded: false,
+                        offset_global: None,
                     });
                 }
             }
@@ -1134,6 +1158,7 @@ impl ModuleBuilder {
                             passive,
                             guest_page: page as u32,
                             padded: false,
+                            offset_global: None,
                         });
                     } else {
                         // A small runtime unit shares its page with a closure whose
@@ -1159,6 +1184,7 @@ impl ModuleBuilder {
                                 passive,
                                 guest_page: page as u32,
                                 padded: false,
+                                offset_global: None,
                             });
                             i = j;
                         }
@@ -1175,6 +1201,7 @@ impl ModuleBuilder {
                         passive: false,
                         guest_page: 0,
                         padded: true,
+                        offset_global: self.dense_global,
                     });
                     dense_section = Some(crate::dense::Section { base: 0, entries: dense_slots }.encode());
                 }
@@ -1243,7 +1270,7 @@ impl ModuleBuilder {
             table_slots,
             dir_entries,
             covered,
-            page_table: self.page_table.clone(),
+            page_table: std::mem::take(&mut self.page_table),
             module_id,
             n_blocks,
             exported_blocks,
@@ -1317,11 +1344,10 @@ impl ModuleBuilder {
         f.finish()
     }
 
-    /// `(ctx, pc) -> ()`: the host's entry point into translated code.
-    fn build_enter(&self) -> Vec<u8> {
+    /// `(ctx, pc) -> ()`: the host's entry point into translated code:
+    /// record the PC and the target, then [`Self::build_dispatch`]'s lookup.
+    fn build_enter(&self) -> (Vec<u8>, Vec<u32>) {
         let mut f = FuncBody::new(2);
-        let page = f.add_local(ValType::I64);
-
         // Record the entry PC so a miss inside `enter` reports it correctly,
         // and the exact target: for a shared slot's trampoline (x86-64), and
         // for the function table's bridge (merge-plan §9.8.1), which serves
@@ -1330,6 +1356,18 @@ impl ModuleBuilder {
         f.addr_i32();
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
+        f.local_get(0);
+        f.local_get(1);
+        f.return_call_local(self.dispatch);
+        f.finish_with_relocs()
+    }
+
+    /// `(ctx, pc) -> ()`: record the target in `ctx::LAST_TARGET`, then the
+    /// two-level lookup and the tail call to the block -- what tier-1's inline
+    /// dispatch does, leaving `ctx::PC` alone.
+    fn build_dispatch(&self) -> Vec<u8> {
+        let mut f = FuncBody::new(2);
+        let page = f.add_local(ValType::I64);
         f.local_get(0);
         f.addr_i32();
         f.local_get(1);

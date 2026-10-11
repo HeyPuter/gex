@@ -291,6 +291,11 @@ for (const [event, describe] of [
   // fault to one host.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
+  if (params.has('liftmax')) globalThis.GEX_LIFT_MAX = Number(params.get('liftmax'));
+  if (params.has('unitcache')) globalThis.GEX_UNIT_CACHE = Number(params.get('unitcache'));
+  if (params.has('t1fold')) globalThis.GEX_T1_FOLD = Number(params.get('t1fold'));
+  if (params.has('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(params.get('xlatereport'));
+  if (params.has('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(params.get('inlinedispatch'));
   // `?link=1`: keep the address space the guest's `ld.so` produced and start
   // the next process of the same program from it.
   if (params.has('link')) globalThis.GEX_LINK = Number(params.get('link'));

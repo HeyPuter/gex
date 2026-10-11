@@ -21,6 +21,44 @@ use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT,
 use gex_ir::*;
 use std::collections::HashMap;
 
+/// A multiply-rotate hasher for small keys (registers, addresses): the
+/// standard SipHash was a few percent of translating at run time, and
+/// nothing here hashes keys an adversary chooses.
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write_u64(n as u64);
+    }
+    fn write_u16(&mut self, n: u16) {
+        self.write_u64(n as u64);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7cc1_b727_220a_95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_isize(&mut self, n: isize) {
+        self.write_u64(n as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A `HashMap` with [`FastHasher`].
+pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+
 pub mod fmode;
 
 /// SIMD sub-opcodes (the 0xFD prefix space).
@@ -158,6 +196,91 @@ pub struct Context<'a> {
     pub page_bases: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
+    /// Every address some block of `gir` branches back to (a successor at or
+    /// below the branching block's start). A region needs a back edge to its
+    /// entry, so a block not in here grows none and the walk is skipped.
+    /// `None`: no filter.
+    pub loop_heads: Option<&'a std::collections::HashSet<u64>>,
+    /// The module's `dispatch(ctx, pc)` (a local function, relocated: `enter`
+    /// without its context stores), when it has one: an indirect dispatch
+    /// tail-calls it instead of carrying the whole table selection inline.
+    /// See [`set_inline_dispatch`].
+    pub enter: Option<u32>,
+}
+
+/// `GEX_INLINE_DISPATCH=1` natively, `set_inline_dispatch(true)` in the
+/// browser: every dispatch carries the directory lookup and the selection over
+/// the eight tables inline, as before, instead of tail-calling the module's
+/// `enter`. Inline, dispatch was 40% of a module's bytes (`gexc build` of
+/// Debian's xz: 687,595 of 1,228 KiB were dispatch and boundary code), on a
+/// path that a direct tail call reaches for the price of one call.
+static INLINE_DISPATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_inline_dispatch(on: bool) {
+    INLINE_DISPATCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn inline_dispatch() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_INLINE_DISPATCH").is_some())
+        || INLINE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fold `local.set x; local.get x` into `local.tee x` and strip the tees
+/// of temporaries nothing reads (the function JIT's peephole, `fmode`) in
+/// tier-1 blocks too: `set_t1_fold` / GEX_T1_FOLD.
+static T1_FOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_t1_fold(on: bool) {
+    T1_FOLD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn t1_fold() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_T1_FOLD").is_some()) || T1_FOLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The emitter switches that change tier-1's bytes without showing in the
+/// translation options, for a cache key (GEX_INLINE_DISPATCH, GEX_T1_FOLD):
+/// natively they are read from the environment, which the module cache's key
+/// did not see, so a run with one set served its modules to runs without.
+pub fn knobs() -> u8 {
+    inline_dispatch() as u8 | (t1_fold() as u8) << 1
+}
+
+/// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
+/// of temporaries removed.
+fn strip_tees(e: &mut Emitter) {
+    if !t1_fold() {
+        return;
+    }
+    let n = e.temps.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut temp = vec![false; n];
+    for &t in &e.temps {
+        temp[t as usize] = true;
+    }
+    e.f.strip_dead_tees(&|l| temp.get(l as usize).copied().unwrap_or(false), true);
+}
+
+/// The back-edge targets of `gir`, for [`Context::loop_heads`].
+pub fn loop_heads<'b>(blocks: impl Iterator<Item = &'b Block>) -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    for b in blocks {
+        for s in b.successors() {
+            if s <= b.start {
+                out.insert(s);
+            }
+        }
+    }
+    out
+}
+
+/// The region grown at `block`, if any (and regions are on).
+fn region_at(block: &Block, cx: &Context<'_>) -> Option<crate::region::Region> {
+    if region_limit() <= 1 || cx.loop_heads.is_some_and(|h| !h.contains(&block.start)) {
+        return None;
+    }
+    crate::region::grow(block.start, cx.gir, region_limit())
 }
 
 /// `GEX_NO_PAGE_CHECK=1`: blocks do not check their page's directory entry
@@ -381,6 +504,10 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    if t1_fold() {
+        e.f.fold_tees();
+    }
+    let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
     // The page check's stale path (and the guard's) dispatch to this block's
@@ -393,12 +520,10 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
-        if region_limit() > 1 {
-            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
-                for a in region.iter() {
-                    if let Some(b) = cx.gir.get(a) {
-                        pages.extend(checked_pages(bases, b.start, b.end));
-                    }
+        if let Some(region) = &region {
+            for a in region.iter() {
+                if let Some(b) = cx.gir.get(a) {
+                    pages.extend(checked_pages(bases, b.start, b.end));
                 }
             }
         }
@@ -430,12 +555,17 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
     }
-    run_one(&mut e, block);
+    run_one(&mut e, block, region);
+    strip_tees(&mut e);
     e.f.finish_with_relocs()
 }
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    if t1_fold() {
+        e.f.fold_tees();
+    }
+    let region = region_at(block, cx);
     // First, before the page check: a block entered for a neighbour in its
     // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
     // The page check's stale path (and the guard's) dispatch to this block's
@@ -448,12 +578,10 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
-        if region_limit() > 1 {
-            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
-                for a in region.iter() {
-                    if let Some(b) = cx.gir.get(a) {
-                        pages.extend(checked_pages(bases, b.start, b.end));
-                    }
+        if let Some(region) = &region {
+            for a in region.iter() {
+                if let Some(b) = cx.gir.get(a) {
+                    pages.extend(checked_pages(bases, b.start, b.end));
                 }
             }
         }
@@ -485,15 +613,16 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
     }
-    run_one(&mut e, block);
+    run_one(&mut e, block, region);
+    strip_tees(&mut e);
     e.f.finish()
 }
 
 /// The body of both entry points: a region if one can be grown here,
 /// otherwise the block on its own.
-fn run_one(e: &mut Emitter<'_>, block: &Block) {
-    match crate::region::grow(block.start, e.cx.gir, region_limit()) {
-        Some(region) if region_limit() > 1 => {
+fn run_one(e: &mut Emitter<'_>, block: &Block, region: Option<crate::region::Region>) {
+    match region {
+        Some(region) => {
             if std::env::var_os("GEX_REGION_DEBUG").is_some() {
                 let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
                 eprintln!("[region] {}", members.join(" "));
@@ -561,7 +690,7 @@ struct Emitter<'a> {
     free_i64: Vec<u32>,
     free_v128: Vec<u32>,
     /// Guest register cache.
-    regs: HashMap<GuestReg, Cached>,
+    regs: FastMap<GuestReg, Cached>,
     /// Set while emitting a block fused into a `wasm` loop: how many nested
     /// `if`s sit between here and the loop label, so a back-edge knows what
     /// depth to branch to. `None` when the block is not fused.
@@ -573,7 +702,7 @@ struct Emitter<'a> {
     region: Option<RegionState>,
     /// Which registers the region writes, and so has to store on the way out.
     /// The ones it only reads are already correct in the context.
-    region_writes: std::collections::HashSet<GuestReg>,
+    region_writes: std::collections::HashSet<GuestReg, std::hash::BuildHasherDefault<FastHasher>>,
     /// Function mode (`fmode`, the function JIT): every register the
     /// function uses has a local for its whole body, bound up front, and a
     /// clobbering host call reloads them all rather than forgetting them.
@@ -639,7 +768,7 @@ impl<'a> Emitter<'a> {
             free_i32: Vec::new(),
             free_i64: Vec::new(),
             free_v128: Vec::new(),
-            regs: HashMap::new(),
+            regs: FastMap::default(),
             loop_depth: None,
             reenter_local: None,
             region: None,
@@ -839,7 +968,7 @@ impl<'a> Emitter<'a> {
         self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
-            for &v in &dying[i] {
+            for &v in dying[i].iter() {
                 self.release(Value(v));
             }
         }
@@ -933,7 +1062,7 @@ impl<'a> Emitter<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             // Recycle locals whose values are dead after this statement.
-            for &v in &dying[i] {
+            for &v in dying[i].iter() {
                 self.release(Value(v));
             }
         }
@@ -4905,6 +5034,25 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_dispatch_tail_call_inner(&mut self) {
+        // Outlined: the module's `dispatch(ctx, target)` stores `LAST_TARGET`
+        // and does the same lookup and selection, so the context is left
+        // exactly as the inline form leaves it, `ctx::PC` as the caller left
+        // it. (Re-storing the PC as `enter` does is not the
+        // same: after an indirect branch's safepoint the PC is the branch
+        // itself, to be re-executed, and a provider's IFUNC address then
+        // reached the miss path, lost its bridge in a loop and panicked
+        // tier-1 in the native-debian page.)
+        if let Some(enter) = self.cx.enter.filter(|_| !inline_dispatch() && gex_abi::DISPATCH_TABLES > 1) {
+            if gex_abi::X86 {
+                self.ctx_base();
+                self.f.i64_const(self.block_start as i64);
+                self.f.store(0x37, 3, ctx::LAST_SOURCE as u32);
+            }
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.return_call_local(enter);
+            return;
+        }
         if gex_abi::DISPATCH_TABLES <= 1 {
             self.f.local_get(self.ctx_local);
             self.emit_dispatch_index();
@@ -4972,16 +5120,45 @@ impl<'a> Emitter<'a> {
 /// order the releases always ran in). Was a scan of every value after every
 /// statement: quadratic, and most of a Unity start-up's time in Mono's large
 /// JIT-generated blocks.
-fn dying_after(block: &Block) -> Vec<Vec<u32>> {
-    let mut out = vec![Vec::new(); block.stmts.len()];
-    for (v, lu) in compute_last_use(block).into_iter().enumerate() {
+fn dying_after(block: &Block) -> Dying {
+    let last = compute_last_use(block);
+    // Counted, then filled in place: one allocation for every statement's
+    // list, where a `Vec` per statement was the emitter's largest single
+    // source of allocator traffic.
+    let mut start = vec![0u32; block.stmts.len() + 1];
+    for &i in last.iter().flatten() {
+        if let Some(c) = start.get_mut(i + 1) {
+            *c += 1;
+        }
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut fill = start.clone();
+    let mut vals = vec![0u32; *start.last().unwrap_or(&0) as usize];
+    for (v, lu) in last.into_iter().enumerate() {
         if let Some(i) = lu {
-            if let Some(d) = out.get_mut(i) {
-                d.push(v as u32);
+            if let Some(at) = fill.get_mut(i) {
+                vals[*at as usize] = v as u32;
+                *at += 1;
             }
         }
     }
-    out
+    Dying { start, vals }
+}
+
+/// The values whose last use is each statement (see [`dying_after`]), in
+/// value order per statement.
+struct Dying {
+    start: Vec<u32>,
+    vals: Vec<u32>,
+}
+
+impl std::ops::Index<usize> for Dying {
+    type Output = [u32];
+    fn index(&self, i: usize) -> &[u32] {
+        &self.vals[self.start[i] as usize..self.start[i + 1] as usize]
+    }
 }
 
 /// Index of the last statement that reads each value, or `None` when the
