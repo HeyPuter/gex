@@ -52,7 +52,8 @@ if grep -a -q '^WASM_JIT_INVALID' wasmjit10.txt; then echo "FAIL (wasm JIT, thre
 # The worker thread under load (EMBED_WORKER_STRESS: 10 times its rounds and the main thread's
 # collections): a provider call's result in rax was overwritten by a syscall in the runtime's GC-safe
 # transition on the way back to the guest (a futex while another thread collected), so the worker
-# saw NULL from Make and from mono_string_to_utf8 in about 1 run in 20 (every run under this load).
+# saw NULL from Make and from mono_string_to_utf8 in about 1 run in 20 (every run under this load);
+# then, kept only in a wasm local across that wait, the result was freed and its slot reused.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" run --mem64 \
 	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=2 --env EMBED_WORKER_STRESS=10 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > stress.txt 2>&1 || true
