@@ -509,8 +509,15 @@ for (const id of list) {
   const cmdText = new URLSearchParams(extra.slice(1)).get('cmd') || '';
   const spec = DEMOS[id];
   let typed = false;
-  // A debugging port only for the typing demos: the keys go in over CDP.
-  const debugPort = spec.type ? 39300 + Math.floor(Math.random() * 600) : 0;
+  // `GEX_TRACE=<file>`: a Chrome trace (every thread: V8's sampling profiler,
+  // wasm compilation, GC) from the guest printing GEX_TRACE_BEGIN (a regex)
+  // to its printing GEX_TRACE_END, written to <file> as JSON events.
+  const traceFile = process.env.GEX_TRACE || '';
+  const traceBegin = traceFile ? new RegExp(process.env.GEX_TRACE_BEGIN || 'TRACE-BEGIN') : null;
+  const traceEnd = traceFile ? new RegExp(process.env.GEX_TRACE_END || 'TRACE-END') : null;
+  let tracing = null;
+  // A debugging port for the typing demos (the keys go in over CDP) and traces.
+  const debugPort = spec.type || traceFile ? 39300 + Math.floor(Math.random() * 600) : 0;
   let last = '';
   let lastTerminal = '';
   // Every terminal line ever shown, in first-appearance order: the reporter
@@ -562,6 +569,13 @@ for (const id of list) {
       // also carries the terminal's last line.
       const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
       console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
+      if (traceFile && !tracing && traceBegin.test(history())) {
+        tracing = startTrace(debugPort).catch((e) => (console.log(`     [${id}] trace: ${e?.message ?? e}`), null));
+      }
+      if (tracing && traceEnd.test(history()) && !tracing.ending) {
+        tracing.ending = true;
+        tracing.then((t) => t?.stop(traceFile)).then((n) => n !== undefined && console.log(`     [${id}] trace: ${n} events in ${traceFile}`));
+      }
       if (spec.type && !typed && spec.ready.test(history())) {
         typed = true;
         typeInto(debugPort, spec.type).then(
@@ -620,6 +634,15 @@ for (const id of list) {
     done,
     new Promise((r) => setTimeout(() => r({ how: 'timeout' }), WALL)),
   ]);
+  if (tracing) {
+    // Let a trace that is being written finish first.
+    const t = await tracing;
+    if (t && !t.stopped) {
+      const n = await t.stop(traceFile).catch(() => 0);
+      console.log(`     [${id}] trace: ${n} events in ${traceFile}`);
+    }
+    await t?.done;
+  }
   child.kill('SIGKILL');
   onReport = () => {};
 
@@ -673,6 +696,52 @@ for (const id of list) {
         .map((l) => `     ${l}`).join('\n'),
     );
   }
+}
+
+// `GEX_TRACE`: start a browser-wide trace; `stop(file)` ends it and writes
+// the events (a JSON array, as chrome://tracing reads it), giving their count.
+async function startTrace(port) {
+  let ws = null;
+  for (let i = 0; i < 40 && !ws; i++) {
+    ws = await browserWsUrl(port);
+    if (!ws) await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!ws) throw new Error(`no browser on debugging port ${port}`);
+  const b = await Cdp.connect(ws);
+  const events = [];
+  b.on('Tracing.dataCollected', (p) => { for (const e of p.value) events.push(e); });
+  let finished;
+  const complete = new Promise((r) => (finished = r));
+  b.on('Tracing.tracingComplete', () => finished());
+  await b.send('Tracing.start', {
+    transferMode: 'ReportEvents',
+    traceConfig: {
+      recordMode: 'recordContinuously',
+      includedCategories: [
+        'v8', 'v8.wasm', 'v8.execute', 'devtools.timeline', 'blink.worker', 'toplevel',
+        'disabled-by-default-v8.cpu_profiler', 'disabled-by-default-v8.gc', 'disabled-by-default-devtools.timeline',
+      ],
+    },
+  });
+  console.log('     trace: started');
+  const t = {
+    stopped: false,
+    done: null,
+    async stop(file) {
+      if (t.stopped) return t.done;
+      t.stopped = true;
+      t.done = (async () => {
+        await b.send('Tracing.end');
+        await complete;
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(file, JSON.stringify(events));
+        b.close();
+        return events.length;
+      })();
+      return t.done;
+    },
+  };
+  return t;
 }
 
 // Focus xterm's textarea and type `text` then Enter, the way a key press
