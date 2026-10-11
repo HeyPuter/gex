@@ -337,6 +337,9 @@ const host = new ProcessHost({
     // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
     denseDebug: !!process.env.GEX_DENSE_DEBUG,
+    // GEX_ADOPT_AFTER=N: traps a forked child takes before adopting its
+    // parent's modules (0: all of them at the fork). See `adoptAfterTraps`.
+    adoptAfter: process.env.GEX_ADOPT_AFTER !== undefined ? Number(process.env.GEX_ADOPT_AFTER) : undefined,
     mem64: MEM64,
     // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
     wasmDlls: process.env.GEX_WASM_DLLS || undefined,
