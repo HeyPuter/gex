@@ -545,7 +545,12 @@ pub struct Kernel {
     pub ports: Arc<net::Ports>,
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
-    pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
+    ///
+    /// Weak, as [`Kernel::remote_sockets`]: the descriptors own the socket.
+    /// Pruned only in `close` before, a strong reference here kept a socket
+    /// alive (connection open, port bound) after `dup2` over its last
+    /// descriptor, `close_range`, or an `execve` closing it on exec.
+    pub sockets: std::collections::HashMap<usize, std::sync::Weak<net::Socket>>,
     /// The same, for the ones that live in the global kernel. Two tables
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
@@ -5872,7 +5877,7 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         let fd = self.fds.insert(file, ty & SOCK_CLOEXEC != 0)?;
-        self.sockets.insert(key, sock);
+        self.note_socket(key, &sock);
         Ok(fd)
     }
 
@@ -5923,6 +5928,15 @@ impl Kernel {
         let fd = self.fds.insert(file, cloexec)? as i32;
         self.note_remote_unix(key, &sock);
         Ok(fd)
+    }
+
+    /// Remember that the handle at `key` is the internet socket `sock`;
+    /// entries whose socket has closed go.
+    fn note_socket(&mut self, key: usize, sock: &Arc<net::Socket>) {
+        if self.sockets.len() >= 64 {
+            self.sockets.retain(|_, w| w.strong_count() > 0);
+        }
+        self.sockets.insert(key, Arc::downgrade(sock));
     }
 
     /// Remember that the handle at `key` is `sock`, a socket in the global
@@ -6396,7 +6410,7 @@ impl Kernel {
         let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
         let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-        self.sockets.insert(key, sock);
+        self.note_socket(key, &sock);
         self.sys_write_sockaddr(m, ip, port, addr, len_out)?;
         Ok(new_fd)
     }
@@ -6443,7 +6457,7 @@ impl Kernel {
         // socket table is the way back to the concrete type. Keyed by the
         // handle's address, which is stable for as long as the descriptor is.
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        self.sockets.get(&key).and_then(std::sync::Weak::upgrade).ok_or(Errno::ENOTSOCK)
     }
 
     fn sys_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
