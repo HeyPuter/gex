@@ -473,9 +473,8 @@ timed rerun is pending (see §8).
     - `strip_pthread` removes the `-pthread` that meson's threads dependency
       adds.
     - Output: `web/public/gex/xwayland-st/`.
-    - Gooner's missing host packages come from `scratch/SP/hostx/build.sh`.
-      Run the script with `PKG_CONFIG_PATH`, `PATH` and `ACLOCAL_PATH`
-      pointed at its prefix.
+    - Host packages a distro may lack come from
+      `web/build-xwayland-host-tools.sh` (§9).
   - **Checked on gooner** (software WebGPU, correctness only):
     - **gears** (single): triangles 640, frames 30, gl error 0, covered
       15%.
@@ -492,49 +491,180 @@ timed rerun is pending (see §8).
   at once.
 - Dead fibers' memories are freed by GC.
 
-## 8. State and resume
+## 8. Final state (stream SP stopped 2026-10-10)
 
-- **Head:** see `git log merge/singleproc`.
-- **Commits:**
-  - `21652fb1`: shim glue;
-  - `0f9f926d`: page system Worker;
-  - `703db0e7`: compositor;
-  - `e10ec855`: network waits park;
-  - `4fcc6417`: kernel pipe reads;
-  - suspendable call-outs (`call_out`, `ftab_call`) and
-    `tests/single-callout`;
-  - `0a9b89f3`: woken fibers wait for the waker to park; blocking
-    `writev`/`readv`;
-  - `4e75fb43`: non-pthread Mesa and Xwayland builds;
-  - `9b8c8c9a`: GL in-realm (gears through the compositor's replay);
-  - `82f04cce`: Xwayland in-realm (HostX parks on the scheduler).
-- **Merged:**
-  - C's e4779cca, fa8ee5fd, 4f1d86e4 (the execve and provider fixes).
-  - After them, node's `child_process` (`spawnSync` with input, async
-    `spawn`) works in the single page on gooner.
-- **Demo:** https://100.64.0.3:4291/?demo=native-debian, with no
-  COOP/COEP.
-  - Served by `scratch/SP/demo/serve.mjs` (pid in `serve.pid`) from a
-    hard-linked copy of `web/dist`.
-  - Add `&gui=1&rootfs=/rootfs/native-debian-gui.tar.zst` for foot in the
-    compositor.
-- **Next:**
-  - Rerun `cmp.sh TAG single sab` on edger at this head, with
-    `GEX_WALL=900`.
-  - Time the pipeline change on edger: `scratch/SP/page/pipe.sh TAG single
-    sab` (pipelines and forks only, from `wt/sp-new`).
-  - SAB gears comparison once a threaded Mesa is built into this
-    worktree (`/tmp/gbench/sp-mesa-mt`).
-- **Builds:** `shims/browser/build.sh` (plain and shared), the kernel and
-  the seed, then `cd web && npm run build`. web/public has rootfs, cgen and
-  xwayland hard-linked from wt/gexcc.
-- **Tests:**
-  - `tests/single-callout/run.sh` (blocking in a nested call-out, single
-    and SAB);
-  - node: `GEX_SINGLE=1 [GEX_NETWORK=1] scratch/SP/nrun.sh 'cmd'`;
-  - page: `scratch/SP/page/t1.sh` (apt and tools);
-  - page: `scratch/SP/page/gui.sh DIR single|sab` (foot);
-  - edger: `scratch/SP/page/cmp.sh TAG single sab` under bench.sh (the
-    SAB-vs-single table).
-- **Microbenchmarks:** `scratch/SP/mb/run.mjs OUT.json main|worker
-  [--js-flags]` under bench.sh.
+The stream is stopped and will not be restarted. merge/singleproc lands in
+master with the multi-process build (MP) the default everywhere. The single
+build (SP) stays available behind its option: a page without
+SharedArrayBuffer, or `?single=1`, and `web/build-all.sh --sp` for its Mesa
+and Xwayland (§9).
+
+### What works in SP
+
+These run in a page with no COOP/COEP:
+- the native Debian demo, with apt over Wisp (update and install);
+- fork, exec, pipes and signals;
+- multithreaded guests;
+- the xterm terminal;
+- the Wayland compositor (foot);
+- GL through the non-pthread Mesa (gears: 640 triangles, 30 frames, gl error
+  0, 15% covered);
+- Xwayland in-realm (`xdpyinfo :0`, xlogo, xeyes; the screenshot matches
+  MP's).
+
+### Measured numbers
+
+All timings below are edger, under bench.sh. The table is the c4 run in §6,
+taken before the wake fix (ee504238):
+- the `true` command and 100 forks are faster in SP than in MP;
+- apt-get update, neovim and the node rows are within 20% either way (SP is 19% slower on `node /tmp/t.js`, 96536 vs 81067 ms);
+- pipelines and the first big apt install are slower in SP.
+
+The wake fix (0a9b89f3, §3) addresses those two slow rows. Its timed rerun
+never ran, because the stream stopped first. What it changes, counted under
+node on gooner (untimed):
+
+| run | parks | wakes |
+|---|---:|---:|
+| 3-process pipeline, before | 48 877 | 29 341 |
+| 3-process pipeline, after | 2 528 | 1 809 |
+| `apt-get install ripgrep tcc libc6-dev`, before | 310 845 | 90 973 |
+| `apt-get install ripgrep tcc libc6-dev`, after | 11 238 | 3 337 |
+
+The apt install gap is the same ping-pong as the pipeline. dpkg and apt talk
+over pipes in small writes, and before the fix every write resumed the
+reader at once. The fix cuts parks 28-fold (310 845 to 11 238).
+
+After the fix, a CPU profile of the install (node, single mode) has no
+scheduler entry near the top. The largest are exec and fork work, which MP
+pays as well:
+- `moduleContentKey` is 16% of samples. It is a byte-at-a-time JS hash of
+  each native wasm program's bytes (dpkg, apt and their methods), run on
+  every exec by `#cgenInstall`.
+- `adoptProcess`, `writeSparse` and `#processImage` (fork images) make up
+  about 12%.
+
+In MP those run on the child's own Worker. In SP they run on the one
+thread.
+
+### Known gaps
+
+- `nt_callback`, `exc_dispatch` and `provider_try` still call nested guest
+  code synchronously. A block under one of them throws an explicit error in
+  SP (§7). Wine-style callbacks are therefore MP-only.
+- Provider atomic waits on contention would trap on an unshared memory
+  (§7). None was seen.
+- The apt and pipeline rows have not been re-timed after the wake fix on
+  edger. Under node the counts above show the cause is gone.
+- On gooner (SwiftShader), the gears demo through drive.mjs reports
+  "covered 0%" in MP, on master as well. SP reports 15%. Treat that as a
+  headless-presentation artefact of MP, not an SP property.
+
+### Next steps (for whoever picks it up)
+
+1. Time `scratch/SP/page/pipe.sh` and `scratch/SP/page/cmp.sh TAG single sab`
+   on edger at the merged head (`GEX_WALL=900`, `BENCH_TIMEOUT`).
+2. Hash wasm programs once per file (cache the key on the path and mtime,
+   or hash in wasm), not on every exec. This helps both builds.
+3. Make `nt_callback`, `exc_dispatch` and `provider_try` suspendable, the
+   way `call_out` is (§7).
+
+### Branches
+
+- `merge/singleproc`: this work.
+- `merge/sp-iov` 37604a2f: the writev/readv park, kernel only, also in
+  merge/singleproc.
+- `merge/sp-gllibs` c02088a0: the guest GL libraries rebuilt for protocol 13.
+
+## 9. Building, serving and testing both builds
+
+### Layout
+
+SP runs the same shim, kernel, seeds and rootfs as MP. It loads the
+*shared* binaries and clears their memories' `shared` flag at compile time
+(§2). The same `web/dist` serves both, and a page picks SP when it has no
+SharedArrayBuffer or is given `?single=1`. Those files are built once, so
+neither build can overwrite the other's.
+
+Only native code built with or without `-pthread` differs:
+
+| | MP (default) | SP |
+|---|---|---|
+| shim, kernel, seeds, providers, rootfs | `web/public/gex/`, `web/public/rootfs/` | the same files |
+| Mesa build tree | `target/web-build/mesa-mt` | `target/web-build/mesa-st` |
+| Mesa published | `web/public/gex/gex-wgpu-replay.*` | `web/public/gex/st/gex-wgpu-replay.*` |
+| Xwayland build tree | `target/web-build/xwl-mt` | `target/web-build/xwl-st` |
+| Xwayland published | `web/public/gex/xwayland/` | `web/public/gex/xwayland-st/` |
+| Xwayland host tools | `target/web-build/xwl-host` (shared, only if the distro lacks them) | same |
+| page bundle | `web/dist` | the same |
+
+### Build
+
+```sh
+git submodule update --init third_party/mesa third_party/opengl-registry
+(cd web && npm ci)
+web/build-all.sh --both          # or --mp (the default) / --sp
+```
+
+`build-all.sh` runs these steps:
+
+1. `web/build-assets.sh`: shim (plain and shared), kernel, seeds, providers,
+   busybox rootfs and guest GL libraries. Cargo makes this step incremental.
+2. Mesa for each flavour asked for:
+   `GEX_MESA_THREADS=1|0 web/build-mesa-wasm.sh target/web-build/mesa-mt|st`.
+   - Incremental through meson and ninja.
+   - Wink caches its Tint per variant (`--variant=mt|st`).
+3. Xwayland for each flavour:
+   `GEX_XWL_THREADS=1|0 web/build-xwayland-wasm.sh target/web-build/xwl-mt|st`.
+   - The script always builds from scratch, so build-all skips it while a
+     stamp of its inputs is unchanged:
+     - the script;
+     - `web/xwayland/`;
+     - `shims/hostwl/`;
+     - the tags.
+   - If `pkg-config` cannot find wayland-scanner, wayland-protocols or
+     xwaylandproto, or xorg-macros or `X11/xshmfence.h` is missing, it first
+     runs `web/build-xwayland-host-tools.sh target/web-build/xwl-host` and
+     passes that prefix as `GEX_XWL_HOST_TOOLS`. That script is cached by a
+     `.done` stamp.
+4. `npm run build`, once.
+
+Flags:
+- `--no-assets`, `--no-gl` and `--no-x` skip steps 1, 2 and 3.
+- `GEX_WEB_BUILD=DIR` moves `target/web-build`.
+- The native Debian rootfs and its GUI variant come from their own scripts
+  (`web/build-native-debian.sh`), shared by both builds.
+
+### Serve
+
+```sh
+node web/serve-dist.mjs 8088 --sp-port 8089
+```
+
+This serves MP with COOP/COEP on 8088 and SP without them on 8089, from the
+same `web/dist`. `GEX_NO_COI=1 node web/serve-dist.mjs 8088` serves SP alone.
+
+### Test
+
+- MP: the default page smoke test, `node web/test/site.mjs` (busybox,
+  debian, gears).
+- SP leg, for the gate:
+
+  ```sh
+  GEX_WEBGPU_SOFTWARE=1 tests/single/run.sh "$PWD/target/release/gexc"
+  ```
+
+  It runs these:
+  1. `tests/single-callout/run.sh` (single and SAB under node).
+  2. `GEX_NO_COI=1 node web/test/site.mjs <demo>` for each of `SP_DEMOS`
+     (default: busybox, debian, gears).
+
+  Each demo must pass, and its terminal must contain "single-thread build
+  (no SharedArrayBuffer)", so a silent fallback cannot pass.
+  `GEX_WEBGPU_SOFTWARE=1` puts WebGPU on SwiftShader for hosts without a
+  GPU.
+- Kernel: `cargo test --release -p gex-kernel`
+  (`vectored_io_on_a_blocked_pipe_parks` covers the writev/readv park).
+- Under node: `GEX_SINGLE=1 node --import <delete SharedArrayBuffer>
+  shims/browser/js/run-node.mjs ...`. `GEX_SINGLE_STATS=1` prints the
+  scheduler counts.

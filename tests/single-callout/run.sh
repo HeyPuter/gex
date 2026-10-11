@@ -25,8 +25,12 @@ rm -rf "$w"; mkdir -p "$w"
 "$cc" -O2 -fPIC -shared -Wl,-soname,libcb.so -o "$w/libcb.so" "$here/lib.c" || exit 1
 "$cc" -O1 -o "$w/main" "$here/main.c" -L"$w" -lcb -Wl,-rpath,"$w" || exit 1
 export GEX_CGEN_CACHE=$w/cgen GEX_ELF_UNITS=libcb.so
+# The single build needs JSPI: on by default from node 25, behind a flag before.
+jspi=
+node -e 'process.exit(typeof WebAssembly.Suspending === "function" ? 0 : 1)' 2>/dev/null ||
+	jspi=--experimental-wasm-jspi
 run() { # MODE-VAR LOG
-	(cd "$w" && env "$1=1" timeout "${TMO:-300}" node --import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
+	(cd "$w" && env "$1=1" timeout "${TMO:-300}" node $jspi --import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
 		"$root/shims/browser/js/run-node.mjs" --cgen-prefer \
 		--file "/lib/ld-musl-aarch64.so.1=$tc/aarch64-linux-musl/lib/libc.so" \
 		--file "$w/libcb.so=$w/libcb.so" --file "$w/main=$w/main" "$seed" "$w/main" > "$2.out" 2> "$2.err")

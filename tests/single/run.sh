@@ -23,7 +23,7 @@ out=${WORK:-$root/target/single-test}
 mkdir -p "$out"
 [ -d "$root/web/dist" ] || { echo "FAIL single-page (no web/dist: run web/build-all.sh --sp)"; exit 1; }
 for d in ${SP_DEMOS:-busybox debian gears}; do
-	(cd "$root" && GEX_NO_COI=1 GEX_TAIL=0 node web/test/site.mjs "$d") > "$out/site-$d.txt" 2>&1; rc=$?
+	(cd "$root" && GEX_NO_COI=1 GEX_TAIL=0 GEX_STDERR=all node web/test/site.mjs "$d") > "$out/site-$d.txt" 2>&1; rc=$?
 	if [ $rc = 0 ] && grep -aq 'single-thread build (no SharedArrayBuffer)' "$out/site-$d.txt"; then
 		echo "ok   single-page $d"
 	else

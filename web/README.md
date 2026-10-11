@@ -24,6 +24,47 @@ web/build-mesa-wasm.sh          # gex-wgpu-replay (needs emdawnwebgpu and Tint)
 The first `build-mesa-wasm.sh` run builds Tint (`web/tint/build-tint.sh`) and is
 substantially slower than subsequent incremental builds.
 
+## The two builds: multi-process (default) and single-thread
+
+The page has two builds:
+
+- **MP**, the multi-process build, is the default. Every guest thread is its
+  own Worker on a shared memory. It needs SharedArrayBuffer, so it needs
+  COOP/COEP.
+- **SP**, the single-thread build (`docs/single-thread.md`), runs on any
+  static host. Every guest thread is a JSPI fiber in one Worker.
+
+Both run the same shim, kernel and seed, and the same `web/dist`. A page picks
+SP when it has no SharedArrayBuffer, or when asked with `?single=1`. Only Mesa
+and Xwayland differ: they are compiled with or without `-pthread`, and each
+flavour has its own build and published directories. One command builds
+either flavour or both, incrementally:
+
+```sh
+web/build-all.sh            # MP (the default)
+web/build-all.sh --sp       # SP
+web/build-all.sh --both     # both, side by side
+```
+
+| | MP | SP |
+|---|---|---|
+| shim, kernel, seeds, rootfs | `web/public/gex/`, `web/public/rootfs/` (shared) | same files |
+| Mesa | `target/web-build/mesa-mt` → `web/public/gex/` | `target/web-build/mesa-st` → `web/public/gex/st/` |
+| Xwayland | `target/web-build/xwl-mt` → `web/public/gex/xwayland/` | `target/web-build/xwl-st` → `web/public/gex/xwayland-st/` |
+| bundle | `web/dist` (shared) | same |
+
+`--no-assets`, `--no-gl` and `--no-x` skip the shared runtime, Mesa and
+Xwayland. `GEX_WEB_BUILD` moves `target/web-build`. To serve both at once,
+MP with COOP/COEP on one port and SP without on another:
+
+```sh
+node web/serve-dist.mjs 8088 --sp-port 8089
+```
+
+Tests: the default page smoke test is `node web/test/site.mjs`. The SP leg is
+`tests/single/run.sh`, which runs `tests/single-callout` and then the same
+demos without COOP/COEP.
+
 ## OpenGL 4.4 validation
 
 The complete 543-command core-4.4 command surface and the guest library's
