@@ -604,6 +604,7 @@ fn cache_key_memo(image: &Image, xlate: &Options, build: &str) -> String {
 /// exponent of an extended result, the status-word bits).
 pub fn x87_op(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) -> (u64, u32, u32) {
     use gex_kernel::f80::{self, F80};
+    x87_stats(op, a_sig, a_se, b_sig, b_se, cw);
     let (a, b) = (F80 { sig: a_sig, se: a_se }, F80 { sig: b_sig, se: b_se });
     match op {
         1 | 2 => {
@@ -623,6 +624,36 @@ pub fn x87_op(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) ->
             (cc as u64, 0, sw)
         }
         _ => panic!("x87 import: unknown operation {op:#x}"),
+    }
+}
+
+/// `GEX_X87_STATS=1`: which x87 operations reach the import (the fast
+/// paths left them), by operation, operand classes and control word; a
+/// summary every 2^20 calls.
+fn x87_stats(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_X87_STATS").is_some()) {
+        return;
+    }
+    static COUNTS: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let class = |sig: u64, se: u16| match (sig, se & 0x7fff) {
+        (0, 0) => "zero",
+        (_, 0x7fff) => "infnan",
+        (s, 0) if s != 0 => "denorm",
+        (s, _) if (s as i64) >= 0 => "unnormal",
+        _ => "normal",
+    };
+    let b = if op & 0xf00 >= 0x200 { class(b_sig, b_se) } else { "-" };
+    let key = format!("op {op:#x} a {} b {b} cw {cw:#x}", class(a_sig, a_se));
+    let mut g = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    *g.get_or_insert_with(std::collections::HashMap::new).entry(key).or_default() += 1;
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & ((1 << 20) - 1) == (1 << 20) - 1 {
+        let mut v: Vec<_> = g.as_ref().unwrap().iter().map(|(k, n)| (*n, k.clone())).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u64 = v.iter().map(|x| x.0).sum();
+        let top: Vec<String> = v.iter().take(12).map(|(n, k)| format!("  {n:>10} {k}")).collect();
+        eprintln!("gex-x87: {total} calls to the import; by kind:\n{}", top.join("\n"));
     }
 }
 
@@ -818,7 +849,7 @@ fn run_program_with(
     let use_cache = opts.cache && build.is_some();
     let build = build.unwrap_or_default();
     let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
-    let image_key = cache_key(image, &Options::default(), &build);
+    let image_key = cache_key_memo(image, &Options::default(), &build);
     let mut xlate = xlate.clone();
     // Off unless asked for: measured, the profile costs a recompile on the
     // second run and buys nothing measurable after it on programs this size.
@@ -3119,8 +3150,32 @@ fn dump_guest(gm: &mut GuestMem<'_>, ctx_addr: u64, tid: i32, vmas: &[gex_kernel
 fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
     // Off unless asked for: it is a lock and a hash insert on every back-edge
     // safepoint, which is not free.
+    // GEX_SAMPLE_OUT=path also turns it on, and rewrites `path` with the
+    // counts so far every 20 s (a game killed by a timeout never reaches
+    // the report at exit).
     SAMPLER
-        .get_or_init(|| opts.sample.then(|| Arc::new(Sampler::default())))
+        .get_or_init(|| {
+            let periodic = std::env::var_os("GEX_SAMPLE_OUT").is_some();
+            let s = (opts.sample || periodic).then(|| Arc::new(Sampler::default()))?;
+            if periodic {
+                let w = Arc::downgrade(&s);
+                let _ = std::thread::Builder::new().name("gex-sample-out".into()).spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    let Some(s) = w.upgrade() else { return };
+                    let counts = s.counts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let Some(path) = std::env::var_os("GEX_SAMPLE_OUT") else { return };
+                    let mut text = String::new();
+                    for (pc, n) in &counts {
+                        text.push_str(&format!("{pc:x} {n}\n"));
+                    }
+                    let tmp = std::path::PathBuf::from(&path).with_extension("tmp");
+                    if std::fs::write(&tmp, text).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                });
+            }
+            Some(s)
+        })
         .clone()
 }
 

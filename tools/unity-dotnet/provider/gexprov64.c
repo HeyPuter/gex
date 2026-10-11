@@ -114,6 +114,11 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	int ctx = gexp_ctx;
 	int32_t depth = gexp_depth;
 	static const unsigned char sysv[6] = { 7, 6, 2, 1, 8, 9 }, win[4] = { 1, 2, 8, 9 };
+	/* The runtime's hook first: it may make a syscall (a GC-safe transition
+	 * that waits out a collection), which goes through this context and
+	 * leaves its result in rax, so it must not run once the arguments
+	 * (al, the vector count) are in place. */
+	void *cookie = gexp_hook_call_guest();
 	uint64_t rsp0 = GEXP_X(ctx, 4);
 	/* Below the caller's frame (and any red zone), 16-aligned after the
 	 * stack arguments, so RSP + 8 is 16-aligned at the callee's entry. */
@@ -140,7 +145,6 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	for (unsigned i = 0; i < c->nxmm && i < 8; i++)
 		*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i) = c->xmm[i];
 	GEXP_X(ctx, 4) = sp;
-	void *cookie = gexp_hook_call_guest();
 	gexp_host_guest_call(1);
 	in_guest(1);
 	/* Run the guest until it returns to `ra`. A function body returns 1 when
@@ -164,12 +168,13 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	__gex_set_ctx((uint32_t)ctx);
 	in_guest(0);
 	gexp_host_guest_call(-1);
-	gexp_hook_call_return(cookie);
-	GEXP_X(ctx, 4) = rsp0;
+	/* The results before the runtime's hook, whose syscalls write rax. */
 	c->rax = GEXP_X(ctx, 0);
 	c->rdx = GEXP_X(ctx, 2);
 	c->xmm0 = *(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V);
 	c->xmm1 = *(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16);
+	gexp_hook_call_return(cookie);
+	GEXP_X(ctx, 4) = rsp0;
 }
 
 /* ---- raising through guest frames ---- */
@@ -212,13 +217,14 @@ uint64_t gexp_call_guest_catching(uint64_t fn, gexp_call *c)
 		return 0;
 	/* Unwound: the guest's registers as they were before the call (its
 	 * callee-saved ones were mid-function), this thread's state again. */
-	for (int i = 0; i < 16; i++)
-		GEXP_X(k.ctx, i) = k.saved[i];
 	gexp_ctx = k.ctx;
 	gexp_depth = k.depth;
 	__gex_set_ctx((uint32_t)k.ctx);
 	in_guest(0);
 	gexp_hook_unwind(mark);
+	/* After the hook, whose syscalls would write rax. */
+	for (int i = 0; i < 16; i++)
+		GEXP_X(k.ctx, i) = k.saved[i];
 	if (code != GEXP_RAISE_CODE)
 		gexp_host_throw(code); /* someone else's: keep going */
 	return k.payload ? k.payload : 1;

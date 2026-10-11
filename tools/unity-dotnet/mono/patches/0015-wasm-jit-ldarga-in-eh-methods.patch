@@ -1,0 +1,44 @@
+wasm jit: ldarga of an argument in a method with EH clauses (gex)
+
+MONO_WASM_JIT_LDADDR_ARG (and 0011's ref-argument case) were kept to clause-free methods, so
+`i.ToString()` or `Foo(ref arg)` anywhere in a try/catch/finally method refused it. The home
+is an addr-frame slot on the C stack or the ref-shadow slot, which a wasm catch leaves intact
+-- address-taken locals never had the restriction -- and the il_state island carries no
+argument homes for JIT frames. Test: T.FinArg (int and string arguments taken by address in
+a try, thrown through, read in catch/finally and after).
+
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index f8d248eeb..e6a5a6fa2 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -782,7 +782,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					 * it in an 8-byte addr-frame slot instead, exactly like the scalar-vtype params above: li goes
+ 					 * to -1, so every body access goes through the slot (wasm_ld/wasm_st test addrslot first), and
+ 					 * the prologue's param reconstruction loop copies wasm param ai into it (arg_spill). Kept to
+-					 * clause-free methods and ref-free scalars. */
++					 * ref-free scalars. */
+ 					int ai2;
+ 					for (ai2 = 0; ai2 < nargs; ++ai2)
+ 						if (cfg->args [ai2] && cfg->args [ai2]->dreg == vv)
+@@ -791,7 +791,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					 * ObjectEqualityComparer<T>.GetHashCode) is homed in its ref-shadow slot exactly as R321 homes a
+ 					 * ref local (addrslot -2): the prologue already copies every ref argument into its slot, the
+ 					 * slot is GC-scanned, and wasm_ld/wasm_st go through it once it is the home. */
+-					if (mono_wasm_jit_ldaddr_arg && ai2 < nargs && !cfg->header->num_clauses &&
++					if (mono_wasm_jit_ldaddr_arg && ai2 < nargs &&
+ 					    self_ci.args [ai2].kind == WJ_ARG_SCALAR &&
+ 					    (m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype))) {
+ 						extern int mono_wasm_jit_ldaddr_ref;
+@@ -801,7 +801,11 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 							continue;
+ 						}
+ 					}
+-					if (!mono_wasm_jit_ldaddr_arg || ai2 >= nargs || cfg->header->num_clauses ||
++					/* gex: methods with EH clauses too. The home is an addr-frame (C-stack) slot or the
++					 * ref-shadow slot, both of which a wasm catch leaves intact, exactly as for an
++					 * address-taken LOCAL, which never had the restriction; the il_state island does not
++					 * carry argument homes (its data[] stays NULL for JIT frames). */
++					if (!mono_wasm_jit_ldaddr_arg || ai2 >= nargs ||
+ 					    self_ci.args [ai2].kind != WJ_ARG_SCALAR ||
+ 					    m_type_is_byref (var->inst_vtype) || mini_type_is_reference (var->inst_vtype) ||
+ 					    wasm_valtype_group (vt [vv]) < 0) {

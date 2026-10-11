@@ -30,7 +30,7 @@ for src in "$HERE"/*.c; do
     # *smc*: self-modifying code, under the function JIT as well (which
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
-    case $name in *smc*) tiers="t1 fjit" ;; esac
+    case $name in *smc* | copy-loop) tiers="t1 fjit" ;; esac
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac

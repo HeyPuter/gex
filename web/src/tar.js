@@ -44,6 +44,9 @@ export function untar(buf, root = '') {
   // `/bin/sh` that is plainly there. Keeps this to the few hundred binaries.
   const modes = Object.create(null);
   const hard = Object.create(null);
+  // Each file's modification time (seconds), for a page that hands them on
+  // (nt-page's `mtimes=1`).
+  const mtimes = Object.create(null);
   let off = 0;
   let longName = null;
 
@@ -99,9 +102,10 @@ export function untar(buf, root = '') {
         files[p] = b.subarray(body, body + size);
         const mode = octal(b, off + 100, 8) & 0o7777;
         if (mode & 0o111) modes[p] = mode;
+        mtimes[p] = octal(b, off + 136, 12);
       }
     }
     off = next;
   }
-  return { files, dirs, links, hard, modes };
+  return { files, dirs, links, hard, modes, mtimes };
 }

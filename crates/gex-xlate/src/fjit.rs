@@ -34,6 +34,11 @@ fn batch_limit() -> usize {
 #[derive(Default)]
 pub struct Jit {
     st: Mutex<State>,
+    /// Acquisitions of `st`, and how many found it held (`GEX_FJIT_STATS`):
+    /// translations from several threads (the browser's Workers, the
+    /// native runner's) share one translator.
+    locks: std::sync::atomic::AtomicU64,
+    contended: std::sync::atomic::AtomicU64,
 }
 
 /// What recovery learned of one process's code ([`Jit::image`] starts it over).
@@ -48,6 +53,10 @@ struct Learned {
     noreturn: BTreeSet<u64>,
     /// Entries some translation holds.
     translated: HashSet<u64>,
+    /// Entries a translation in progress (on another thread) holds: left
+    /// out of other batches as the translated are, so two threads do not
+    /// emit the same callees.
+    in_flight: HashSet<u64>,
     /// Read-only segments of the images the loader told us about: a jump
     /// table read from one is as fixed as it is ahead of time. (Not
     /// tracked past `mprotect`: data the guest makes writable later counts
@@ -63,6 +72,11 @@ struct State {
     /// Processes [`Jit::forget`] dropped: a translation still in flight for
     /// one must not bring its state back.
     gone: HashSet<u64>,
+    /// Bumped by whatever invalidates what was learned ([`Jit::image`],
+    /// [`Jit::retire`], [`Jit::forget`]): a translation that saw another
+    /// value at its start was recovered from what is no longer so, and
+    /// marks nothing translated.
+    epoch: u64,
     /// For `GEX_FJIT_STATS`: translations, functions, time in recovery and
     /// emission, module bytes.
     modules: u64,
@@ -73,9 +87,22 @@ struct State {
 }
 
 impl Jit {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.locks.fetch_add(1, Relaxed);
+        match self.st.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contended.fetch_add(1, Relaxed);
+                self.st.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        }
+    }
+
     pub fn new(intrinsics: HashMap<u64, Intrinsic>) -> Jit {
         let jit = Jit::default();
-        jit.st.lock().unwrap_or_else(|e| e.into_inner()).procs.entry(0).or_default().intrinsics = std::sync::Arc::new(intrinsics);
+        jit.lock().procs.entry(0).or_default().intrinsics = std::sync::Arc::new(intrinsics);
         jit
     }
 
@@ -83,7 +110,11 @@ impl Jit {
     /// starts with what the loader knows of that image and nothing else --
     /// a new process, or an `execve` over an old one.
     pub fn image(&self, process: u64, intrinsics: HashMap<u64, Intrinsic>, image: &gex_ld::Image, elf: Option<&[u8]>) {
-        self.st.lock().unwrap_or_else(|e| e.into_inner()).procs.insert(process, Learned { intrinsics: std::sync::Arc::new(intrinsics), ..Learned::default() });
+        {
+            let mut st = self.lock();
+            st.epoch += 1;
+            st.procs.insert(process, Learned { intrinsics: std::sync::Arc::new(intrinsics), ..Learned::default() });
+        }
         self.add_image_in(process, image, elf);
     }
 
@@ -97,7 +128,8 @@ impl Jit {
     /// `_xcb_in_read_block` before its `cmovle` as a tail call, flags dead,
     /// and it read the X setup reply out of an empty queue.
     pub fn retire(&self, process: u64, ranges: &[(u64, u64)]) {
-        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.lock();
+        st.epoch += 1;
         let Some(l) = st.procs.get_mut(&process) else { return };
         for &(lo, hi) in ranges.iter().filter(|r| r.1 > r.0) {
             let gone: Vec<u64> = l.starts.range(lo..hi).map(|(&a, _)| a).collect();
@@ -112,7 +144,8 @@ impl Jit {
 
     /// Process `process` is gone.
     pub fn forget(&self, process: u64) {
-        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.lock();
+        st.epoch += 1;
         st.procs.remove(&process);
         st.gone.insert(process);
     }
@@ -138,7 +171,7 @@ impl Jit {
     fn add_image_in(&self, process: u64, image: &gex_ld::Image, elf: Option<&[u8]>) -> usize {
         let code = Code::with_elf(image, elf);
         let (starts, _) = func::seeds(&code, elf, false);
-        let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.lock();
         let st = guard.procs.entry(process).or_default();
         let mut n = 0;
         for (a, info) in starts {
@@ -219,8 +252,13 @@ impl Jit {
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);
         }
-        let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
-        let State { procs, gone, modules, functions: n_functions, recover_us, emit_us, bytes } = &mut *guard;
+        // Under the lock: recovery (it reads and extends what was learned).
+        // Not under it: summaries and emission, most of the time -- other
+        // threads' translations go on meanwhile (in the browser, a Worker
+        // waiting here waits in `memory.atomic.wait`).
+        let mut guard = self.lock();
+        let epoch = guard.epoch;
+        let State { procs, gone, .. } = &mut *guard;
         // A process already gone (a late request): what it learns goes nowhere.
         let mut scratch = Learned::default();
         let st = if gone.contains(&process) { &mut scratch } else { procs.entry(process).or_default() };
@@ -237,7 +275,7 @@ impl Jit {
             if batch.len() >= limit {
                 break;
             }
-            if batch.contains_key(&a) || (a != addr && (st.translated.contains(&a) || skip(a))) || !executable(a) {
+            if batch.contains_key(&a) || (a != addr && (st.translated.contains(&a) || st.in_flight.contains(&a) || skip(a))) || !executable(a) {
                 continue;
             }
             let Learned { starts, noreturn, .. } = &mut *st;
@@ -329,6 +367,8 @@ impl Jit {
                 st.noreturn.insert(a);
             }
         }
+        st.in_flight.extend(order.iter().copied());
+        drop(guard);
         let sums = summary::analyze_functions(&batch).map;
         let recovered = now_us().saturating_sub(started);
         let functions: Vec<Function> = order.iter().filter_map(|a| batch.remove(a)).collect();
@@ -350,6 +390,7 @@ impl Jit {
             gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins, &pops)
         }))
         .map_err(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
+        let mut done = Vec::new();
         let out = match emitted {
             Err(why) => {
                 eprintln!("[fjit] {addr:#x}: the emitter panicked ({why}); left to the fallback");
@@ -359,7 +400,7 @@ impl Jit {
                 if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
                     eprintln!("[fjit] {addr:#x}: {es:?}");
                 }
-                st.translated.extend(entries);
+                done = entries;
                 if let Ok(dir) = std::env::var("GEX_FJIT_KEEP") {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(format!("{dir}/p{process}-{addr:x}.wasm"), &wasm);
@@ -377,20 +418,38 @@ impl Jit {
                 None
             }
         };
+        let mut guard = self.lock();
+        let same = guard.epoch == epoch;
+        let State { procs, modules, functions: n_functions, recover_us, emit_us, bytes, .. } = &mut *guard;
+        if let Some(st) = procs.get_mut(&process) {
+            for a in &order {
+                st.in_flight.remove(a);
+            }
+            if same {
+                st.translated.extend(done);
+            }
+        }
         *modules += 1;
         *n_functions += n as u64;
         *recover_us += recovered;
         *emit_us += now_us().saturating_sub(started).saturating_sub(recovered);
         *bytes += out.as_ref().map_or(0, |w| w.len() as u64);
         if std::env::var_os("GEX_FJIT_STATS").is_some() && modules.is_power_of_two() {
-            eprintln!("[fjit] {}", stats_line(*modules, *n_functions, *recover_us, *emit_us, *bytes));
+            eprintln!("[fjit] {}; {}", stats_line(*modules, *n_functions, *recover_us, *emit_us, *bytes), self.lock_line());
         }
         out
     }
 
     /// What the JIT has done, for `GEX_FJIT_STATS` and `GEX_NT_STATS`.
     pub fn stats(&self) -> String {
-        self.st.lock().unwrap_or_else(|e| e.into_inner()).line()
+        let line = self.lock().line();
+        format!("{line}; {}", self.lock_line())
+    }
+
+    /// How often the translator's lock was found held.
+    fn lock_line(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!("lock {} of {} contended", self.contended.load(Relaxed), self.locks.load(Relaxed))
     }
 }
 

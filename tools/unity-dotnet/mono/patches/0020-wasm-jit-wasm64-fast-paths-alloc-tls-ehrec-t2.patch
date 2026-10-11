@@ -1,0 +1,235 @@
+wasm jit: the fast paths with pointer arithmetic of their own, ported to wasm64 (gex)
+
+The wasm64 provider shipped with INLINE_ALLOC, T2, FAST_TLS, EH_REC and the rest of its off-list
+disabled, because those paths emitted 32-bit pointer code. The embed suite with each one turned on
+showed "type mismatch: expected i64, found i32" in every case: INLINE_ALLOC 55 modules, T2 688,
+EH_REC 43, FAST_TLS 7. Now pointer-width:
+- OP_WASM_JIT_ALLOC_FAST (the inline TLAB bump): TLS slot, SgenThreadInfo, tlab_next / temp_end,
+  the size add and the vtable store, and the if-results.
+- FAST_TLS: the scratch thread slot and the MonoInternalThread read.
+- EH_REC: the record's LMF links, il_state, method and prev, the lmf-addr / finally-sp scratch
+  reads, and the cur_island_il_state publish; the magic is the low 32 bits of &il as interp.c
+  checks it; mono_wasm_jit_ehrec_unlink gets a (ptr)->void type.
+- T2: the safepoint poll's InterpMethod* argument.
+With every knob at the runtime's defaults, the embed suite has invalid=0, and T2 compiles tier-2
+bodies (samples 1285, compiled 3, guarded inlines 10).
+
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 4184b08c6..960e69cf9 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -441,6 +441,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	gboolean uses_calls = FALSE;
+ 	gboolean uses_eh_tag = FALSE;   /* in-method EH landing pad -> import the C++ exception tag x.e */
+ 	int eh_type_idx = -1;           /* type index of (i32)->void (the catch handler + the tag) */
++	int eh_ptr_ti = -1;             /* gex: (ptr)->void, mono_wasm_jit_ehrec_unlink */
+ 	const char *fail = NULL;
+ 	int fail_op = -1;
+ 	/* Populated only for a signature-classification bail and consumed by the VERBOSE=2 log at done.
+@@ -2491,43 +2492,47 @@ mono_wasm_emit_method (MonoCompile *cfg)
+  * across the body's calls (the INLINE_ILOFS lesson, see wasm-encoder.c's s.i note). */
+ #define EHREC_I32_STORE(off) do { wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (ehrec_off + (off))); } while (0)
+ #define EHREC_I32_LOAD(off) do { wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, (guint32) (ehrec_off + (off))); } while (0)
++/* gex: the record's pointer fields (the LMF links, il_state, method, prev) are pointer-width: i64 on wasm64 */
++#define EHREC_P_STORE(off) do { wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, (guint32) (ehrec_off + (off))); } while (0)
++#define EHREC_P_LOAD(off) do { wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, (guint32) (ehrec_off + (off))); } while (0)
+ #define EHREC_ADDR(off) do { wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+-	wasm_i32_const (&body, ehrec_off + (off)); wasm_op (&body, WASM_OP_I32_ADD); } while (0)
++	wasm_ptr_const (&body, ehrec_off + (off)); wasm_op (&body, WASM_OP_P_ADD); } while (0)
+ #define EHREC_LOAD_LMF_ADDR() do { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_LMFADDR_SLOT); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, WJ_SCRATCH_LMFADDR_SLOT); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, 0); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) ehlmf_idx); } while (0)
+ #define EMIT_EHREC_PUSH() do { const WjEhRecLayout *_L = mono_wasm_jit_ehrec_layout (); \
+ 	EHREC_LOAD_LMF_ADDR (); \
+ 	/* previous_lmf = *lmf_addr | 2 (the ext tag, as mono_push_lmf writes it) */ \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+-	wasm_i32_const (&body, 2); wasm_op (&body, WASM_OP_I32_OR); \
+-	EHREC_I32_STORE (_L->previous_lmf); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, 0); \
++	wasm_ptr_const (&body, 2); wasm_op (&body, WASM_OP_P_OR); \
++	EHREC_P_STORE (_L->previous_lmf); \
+ 	/* the plain-LMF fields are unused for an ext; zero them, as interp_push_lmf does */ \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, 0); EHREC_I32_STORE (_L->lmf_addr); \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, 0); EHREC_I32_STORE (_L->lmf_method); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_ptr_const (&body, 0); EHREC_P_STORE (_L->lmf_addr); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_ptr_const (&body, 0); EHREC_P_STORE (_L->lmf_method); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, _L->kind_il_state); EHREC_I32_STORE (_L->kind); \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); EHREC_I32_STORE (_L->il_state); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); EHREC_P_STORE (_L->il_state); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_ADDR (_L->il); \
++	if (WJ_W64) wasm_op (&body, WASM_OP_I32_WRAP_I64); \
+ 	wasm_i32_const (&body, (gint32) _L->magic_key); wasm_op (&body, WASM_OP_I32_XOR); EHREC_I32_STORE (_L->magic); \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_ptr_const (&body, (gint64) (intptr_t) cfg->method); EHREC_I32_STORE (_L->il_method); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_ptr_const (&body, (gint64) (intptr_t) cfg->method); EHREC_P_STORE (_L->il_method); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); wasm_i32_const (&body, -1); EHREC_I32_STORE (_L->il_offset); \
+ 	/* prev = cur_island_il_state; finally_sp = the finally-save depth */ \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+-	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+-	EHREC_I32_STORE (_L->prev); \
++	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, 0); \
++	EHREC_P_STORE (_L->prev); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); \
+ 	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_FINSP_SLOT); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, WJ_SCRATCH_FINSP_SLOT); \
+ 	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+ 	EHREC_I32_STORE (_L->finally_sp); \
+ 	/* publish: cur_island_il_state = &rec.il, then the chain head = &rec.ext, last */ \
+ 	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); EHREC_ADDR (_L->il); \
+-	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
++	wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, 0); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); EHREC_ADDR (0); \
+-	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
++	wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, 0); \
+ 	} while (0)
+ /* The head is normally this record: unlink it inline. Otherwise mono_wasm_jit_ehrec_unlink decides (cold): a stale
+  * inner LMF above it goes with it, a head that pass 1 rewound past it stays (see leave_island). */
+@@ -2536,23 +2541,23 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	extern void mono_wasm_jit_ehrec_unlink (gpointer rec); \
+ 	EHREC_LOAD_LMF_ADDR (); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+-	EHREC_ADDR (0); wasm_op (&body, WASM_OP_I32_EQ); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, 0); \
++	EHREC_ADDR (0); wasm_op (&body, WASM_OP_P_EQ); \
+ 	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) ehlmf_idx); \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->previous_lmf); \
+-	wasm_i32_const (&body, -4); wasm_op (&body, WASM_OP_I32_AND); \
+-	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_P_LOAD (_L->previous_lmf); \
++	wasm_ptr_const (&body, -4); wasm_op (&body, WASM_OP_P_AND); \
++	wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, 0); \
+ 	wasm_op (&body, WASM_OP_ELSE); \
+ 	EHREC_ADDR (0); \
+-	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_ehrec_unlink, (guint32) eh_type_idx); \
++	wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_ehrec_unlink, (guint32) eh_ptr_ti); \
+ 	wasm_op (&body, WASM_OP_END); \
+ 	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8); \
+-	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->prev); \
+-	wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0); \
++	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_P_LOAD (_L->prev); \
++	wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, 0); \
+ 	/* a finally body on this frame's exception path threw and escaped: free what it left (cold) */ \
+ 	wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7); \
+-	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, WJ_SCRATCH_FINSP_SLOT); \
++	wasm_op (&body, WASM_OP_P_LOAD); wasm_memarg (&body, WJ_PAL, WJ_SCRATCH_FINSP_SLOT); \
+ 	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx); EHREC_I32_LOAD (_L->finally_sp); \
+ 	wasm_op (&body, WASM_OP_I32_NE); \
+@@ -3059,6 +3064,10 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		eh_type_idx = -1;
+ 		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_type_idx = ti_base + _k; break; }
+ 		if (eh_type_idx < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_type_idx = ti_base + nextra++; }
++		/* gex: (ptr)->void, mono_wasm_jit_ehrec_unlink (the same type as eh_type_idx on wasm32) */
++		memset (&_t, 0, sizeof _t); _t.nparams = 1; _t.params [0] = WASM_PTR; _t.ret = WASM_VOID;
++		for (_k = 0; _k < nextra; ++_k) if (functype_eq (&extra_types [_k], &_t)) { eh_ptr_ti = ti_base + _k; break; }
++		if (eh_ptr_ti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _t; eh_ptr_ti = ti_base + nextra++; }
+ 		/* (i32,i32)->i32: mono_wasm_jit_eh_dispatch (table, blk) -> handler bbidx (a finally/fault
+ 		 * handler's bbidx is tagged with WJ_EH_DISPATCH_FINALLY_BIT; the landing pad strips it) or -1 */
+ 		memset (&_t, 0, sizeof _t); _t.nparams = 2; _t.params [0] = WASM_PTR; _t.params [1] = WASM_I32; _t.ret = WASM_I32;
+@@ -3732,43 +3741,51 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					tlab_next_off = no;
+ 				}
+ 				if (!alloc_tmp_idx) { fail = "alloc_fast without temps"; goto done; }
++				/* gex: pointer-width throughout (the temps are pointer-sized locals): on wasm64 every pointer here,
++				 * the TLAB bounds included, is an i64. */
++#define WJ_PTR_IF_RESULT (WJ_W64 ? 0x7e : 0x7f)
++#define WJ_PTR_ZERO() do { if (WJ_W64) wasm_i64_const (&body, 0); else wasm_i32_const (&body, 0); } while (0)
+ 				wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+-				wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_TLAB_SLOT);
++				wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, WJ_SCRATCH_TLAB_SLOT);
+ 				wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);
++				if (WJ_W64) { wasm_op (&body, WASM_OP_I64_EQZ); wasm_op (&body, WASM_OP_I32_EQZ); }
+ 				WJ_HINT (1);   /* R339: attached */
+-				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);                           /* (result i32) */
++				wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, WJ_PTR_IF_RESULT);
+ 				  wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+-				  wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
++				  wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, 0);
+ 				  wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) a);                     /* a = SgenThreadInfo */
++				  if (WJ_W64) { wasm_op (&body, WASM_OP_I64_EQZ); wasm_op (&body, WASM_OP_I32_EQZ); }
+ 				  WJ_HINT (1);
+-				  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
++				  wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, WJ_PTR_IF_RESULT);
+ 				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+-				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
++				    wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, (guint32) tlab_next_off);
+ 				    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) p);
+-				    wasm_i32_const (&body, (gint32) ins->inst_c1);
+-				    wasm_op (&body, WASM_OP_I32_ADD);
++				    wasm_ptr_const (&body, (gint64) ins->inst_c1);
++				    wasm_op (&body, WASM_OP_P_ADD);
+ 				    wasm_op_local (&body, WASM_OP_LOCAL_TEE, (guint32) n);
+ 				    wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+-				    wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_temp_end_off);
+-				    wasm_op (&body, WASM_OP_I32_LT_U);
++				    wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, (guint32) tlab_temp_end_off);
++				    wasm_op (&body, WASM_OP_P_LT_U);
+ 				    WJ_HINT (1);   /* R339: the TLAB has room */
+-				    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x7f);
++				    wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, WJ_PTR_IF_RESULT);
+ 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) a);
+ 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) n);
+-				      wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, (guint32) tlab_next_off);
++				      wasm_op (&body, WASM_OP_P_STORE); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, (guint32) tlab_next_off);
+ 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+ 				      wasm_ptr_const (&body, (gint64) (intptr_t) ins->inst_p0);
+-				      wasm_op (&body, WASM_OP_I32_STORE); wasm_uleb (&body, 2); wasm_uleb (&body, 0);   /* p->vtable */
++				      wasm_op (&body, WASM_OP_P_STORE); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, 0);   /* p->vtable */
+ 				      wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) p);
+ 				    wasm_op (&body, WASM_OP_ELSE);
+-				      wasm_i32_const (&body, 0);
++				      WJ_PTR_ZERO ();
+ 				    wasm_op (&body, WASM_OP_END);
+ 				  wasm_op (&body, WASM_OP_ELSE);
+-				    wasm_i32_const (&body, 0);
++				    WJ_PTR_ZERO ();
+ 				  wasm_op (&body, WASM_OP_END);
+ 				wasm_op (&body, WASM_OP_ELSE);
+-				  wasm_i32_const (&body, 0);
++				  WJ_PTR_ZERO ();
+ 				wasm_op (&body, WASM_OP_END);
++#undef WJ_PTR_IF_RESULT
++#undef WJ_PTR_ZERO
+ 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "alloc_fast dreg"; goto done; }
+ #else
+ 				fail = "alloc_fast offline"; goto done;
+@@ -3832,8 +3849,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 							/* R336: bit 0 marks a TIER-2 body's poll (InterpMethod* is aligned), so the sampler can tell
+ 							 * whether the tier-2 generation is the one executing. */
+ 							/* R355: bit 1 marks a LOOP poll, under T2_SAMPLE_LOOP=2 only (so other modes emit the same bytes) */
+-							wasm_i32_const (&body, (gint32) ((intptr_t) cfg->wasm_jit_caller_imethod | (cfg->wasm_jit_tier >= 2 ? 1 : 0) |
+-								(mono_wasm_jit_t2_sample_loop == 2 && bb != cfg->bb_entry ? 2 : 0)));
++							wasm_ptr_const (&body, (gint64) ((intptr_t) cfg->wasm_jit_caller_imethod | (cfg->wasm_jit_tier >= 2 ? 1 : 0) |
++								(mono_wasm_jit_t2_sample_loop == 2 && bb != cfg->bb_entry ? 2 : 0)));   /* gex: pointer-width */
+ 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_t2, (guint32) pt1i);
+ 						} else if (mono_wasm_jit_edge_sample && bb == cfg->bb_entry)
+ 							wj_emit_helper_call (&body, (gpointer) &mono_wasm_jit_safepoint_poll_entry, (guint32) pti);
+@@ -5046,9 +5063,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						extern int mono_wasm_jit_fast_tls;
+ 						if (mono_wasm_jit_fast_tls && call->jit_icall_id == MONO_JIT_ICALL_mono_tls_get_thread_extern) {
+ 							wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);                  /* s.b */
+-							wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, WJ_SCRATCH_THREAD_SLOT);
+-							wasm_op (&body, WASM_OP_I32_LOAD); wasm_uleb (&body, 2); wasm_uleb (&body, 0);
+-							if (!wasm_st (&body, &lc, ins->dreg)) { fail = "fast_tls dreg"; goto done; }
++							wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, WJ_SCRATCH_THREAD_SLOT);
++							wasm_op (&body, WASM_OP_P_LOAD); wasm_uleb (&body, WJ_PAL); wasm_uleb (&body, 0);
++							if (!wasm_st_from (&body, &lc, ins->dreg, WASM_PTR)) { fail = "fast_tls dreg"; goto done; }
+ 							wj_count (WJC_FAST_TLS_SITE);
+ 							break;
+ 						}
+@@ -7547,7 +7564,7 @@ vcall_cold_miss_emit:
+ 		if (ehrec_on) {
+ 			wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 8);
+ 			EHREC_ADDR (mono_wasm_jit_ehrec_layout ()->il);
+-			wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, 0);
++			wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, 0);
+ 		}
+ 		wasm_ptr_const (&body, (gint64) (intptr_t) eh_table);
+ #else

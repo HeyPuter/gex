@@ -329,23 +329,22 @@ preinit (void)
 	/* The fork's runtime wasm JIT (docs/unity-dotnet.md P5): on by default (user, 2026-10-07: normal runs
 	 * use the JIT, ejected builds .NET AOT); GEXMONO_WASM_JIT=0 runs the interpreter only. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
 	 * fills; here the host reserves the range in the process's function table (gex.provider_jit_reserve). The
-	 * rest of the jiterpreter (traces, interp_entry and jit_call wrappers) stays off. No inline TLAB
-	 * allocation: SGen runs Boehm-like under gex, without a nursery. */
+	 * rest of the jiterpreter (traces, interp_entry and jit_call wrappers) stays off. Inline TLAB
+	 * allocation (INLINE_ALLOC) is emitted only where mono_gc_wasm_inline_alloc_size accepts the clear policy. */
 	if (!getenv ("GEXMONO_WASM_JIT") || atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
 		static char *opts [] = { "--no-jiterpreter-traces-enabled", "--no-jiterpreter-interp-entry-enabled",
 			"--no-jiterpreter-jit-call-enabled" };
-		/* The wasm64 bring-up's feature set: the core tier only. Each of these is a fast path with pointer
-		 * arithmetic of its own; they come back one at a time as they are ported (docs/unity-dotnet.md P5). */
-		static const char *const off [] = {
-			"MONO_WASM_JIT_INLINE_ALLOC", "MONO_WASM_JIT_T2", "MONO_WASM_JIT_GUARDED_INLINE", "MONO_WASM_JIT_DELEGATE_DEVIRT",
-			"MONO_WASM_JIT_IC_MID", "MONO_WASM_JIT_PRED_MID",
-			"MONO_WASM_JIT_LAZY_COLD", "MONO_WASM_JIT_FAST_TLS", "MONO_WASM_JIT_INLINE_COLD_THROW", "MONO_WASM_JIT_EH_REC",
-			"MONO_WASM_JIT_VCALL_VRET", "MONO_WASM_JIT_VCALL_AOT_WAYS", "MONO_WASM_JIT_LAZY_NOGC",
-			"MONO_WASM_JIT_DIRECT_DEPS", "MONO_WASM_JIT_PROF_ORIGIN", "MONO_WASM_JIT_PROF_INLINEE",
-		};
-		for (size_t i = 0; i < sizeof off / sizeof off [0]; i++)
-			setenv (off [i], "0", 0);
+		/* The wasm64 bring-up shipped with the fast paths that do pointer arithmetic of their own turned off
+		 * (INLINE_ALLOC, T2, GUARDED_INLINE, DELEGATE_DEVIRT, IC_MID, PRED_MID, LAZY_COLD, FAST_TLS,
+		 * INLINE_COLD_THROW, EH_REC, VCALL_AOT_WAYS, LAZY_NOGC, DIRECT_DEPS, PROF_ORIGIN, PROF_INLINEE). They
+		 * are ported (mono patch 0020: the inline TLAB bump, the fast thread read, the EH record and the
+		 * tier-2 poll are pointer-width) and run at the runtime's own defaults; docs/unity-dotnet.md records
+		 * the per-knob results. Any of them can still be set to 0 from the environment. */
 		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
+		/* An address-taken scalar argument (ldarga; Unity's Unmarshal.FromIntPtrUnsafe, 3.0M interpreter legs a
+		 * minute in Hollow Knight's King's Pass) is homed in the frame instead of refusing the method. Upstream
+		 * ships it off only because Minecraft did not need it (bd265537e); T.ArgAddr tests it. */
+		setenv ("MONO_WASM_JIT_LDADDR_ARG", "1", 0);
 		/* the 64-bit worker-local vcall PIC (way loop unrolled): four receivers per site */
 		setenv ("MONO_WASM_JIT_VCALL_WAYS", "4", 0);
 		setenv ("MONO_WASM_JIT_VCALL_MEMO", "1", 0);

@@ -427,6 +427,31 @@ function slotsNeeded(meta) {
 }
 
 
+/**
+ * Whether `elf` is a wasm32 program flagged as running i386 code (native
+ * Wine's loader, W3): its GEXWASM header sits 0x40 bytes before the entry
+ * point (cgen/wasmprog.rs), with the flags at offset 36.
+ */
+/** clang's names for a C main (see the PE module's instantiation). */
+const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
+
+function isW3Program(elf) {
+  if (!(elf instanceof Uint8Array) || elf.length < 52 || elf[0] !== 0x7f || elf[4] !== 1) return false;
+  const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
+  const at = dv.getUint32(24, true) - 0x40;
+  const phoff = dv.getUint32(28, true), phent = dv.getUint16(42, true), phnum = dv.getUint16(44, true);
+  for (let i = 0; i < phnum; i++) {
+    const p = phoff + i * phent;
+    if (p + 32 > elf.length || dv.getUint32(p, true) !== 1) continue;
+    const off = dv.getUint32(p + 4, true), vaddr = dv.getUint32(p + 8, true), filesz = dv.getUint32(p + 16, true);
+    if (at < vaddr || at + 40 > vaddr + filesz) continue;
+    const h = off + (at - vaddr);
+    const magic = String.fromCharCode(...elf.subarray(h, h + 7));
+    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 1) !== 0;
+  }
+  return false;
+}
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -760,6 +785,9 @@ export class Gex {
   #forkCopied = 0;
   #forkSkipped = 0;
   #forkZeros = 0;
+  /** A W3 process's Windows address-space line: a forked child's from its
+   *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
+  #windowsSpace = 0;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -865,6 +893,12 @@ export class Gex {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
+      // A forked child of a W3 process splits its memory at its parent's
+      // line before anything claims arena -- this stack is the first claim,
+      // and a fresh instance's would otherwise go above the inherited image,
+      // which there is the top of the 2 GiB.
+      if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
+      else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }
@@ -1157,6 +1191,8 @@ export class Gex {
             return this.#hardNested() ? f(ctx, depth, need, ret) : this.#promisingOf(f)(ctx, depth, need, ret);
           })
           : (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
+        // W3: ntdll.so's handler for a guest's Unix call (cgen.rs).
+        ftab_call_vi: (idx, arg) => { this.#cgen.ftab.get(tIdx(idx >>> 0))(arg); },
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -1236,6 +1272,10 @@ export class Gex {
    * pass through to, so whatever the program needs to read is bundled here.
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
+    // A W3 program (native Wine's loader) splits the memory with Windows
+    // before the runtime's startup heap is taken, or that heap sits where
+    // Windows DLLs load (0x10000000).
+    if (isW3Program(elf)) this.#windowsSpace = -1;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
@@ -1809,7 +1849,44 @@ export class Gex {
   #processImage() {
     const t0 = performance.now();
     const e = this.#shim.exports;
-    const out = [{ at: 0, bytes: this.#bytes().slice(0, LOW_END) }];
+    // Only the runs of pages that are not all zero, scanned in place: a
+    // child's memory starts zeroed, so a zero page needs no bytes, and
+    // slicing it whole first (637 MiB of zeros for a node child) was most of
+    // the cost of a fork, paid again by the child scanning the copy for
+    // zeros (`writeSparse`). Each mapped region also goes as an entry of its
+    // own with no bytes (`end`, `prot`, and `zeros`, how much of it was
+    // left out); runs are `dense`, written without a scan.
+    const u8 = this.#bytes();
+    const words = new Int32Array(this.#memory.buffer, 0, u8.length >> 2);
+    const blank = (a, b) => {
+      for (let i = a >> 2; i < b >> 2; i++) if (words[i] !== 0) return false;
+      for (let i = b & ~3; i < b; i++) if (u8[i] !== 0) return false;
+      return true;
+    };
+    const out = [];
+    const runs = (start, end) => {
+      const PAGE = 4096;
+      let zeros = 0;
+      let i = start;
+      while (i < end) {
+        const pe = Math.min(i + PAGE, end);
+        if (blank(i, pe)) {
+          zeros += pe - i;
+          i = pe;
+          continue;
+        }
+        let run = pe;
+        while (run < end) {
+          const next = Math.min(run + PAGE, end);
+          if (blank(run, next)) break;
+          run = next;
+        }
+        out.push({ at: i, bytes: u8.slice(i, run), dense: true });
+        i = run;
+      }
+      return zeros;
+    };
+    out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
     const n = e.gex_vma_count();
@@ -1820,7 +1897,11 @@ export class Gex {
       const prot = Number(dv.getBigUint64(scratch + 16, true));
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
-      if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
+      if (end > start) {
+        const r = { at: start, end, prot, bytes: new Uint8Array(0), zeros: 0 };
+        out.push(r);
+        r.zeros = runs(start, end);
+      }
     }
     e.gex_free?.(scratch, 24);
     // A checksum per region, so the child can say whether what it runs on is
@@ -1971,7 +2052,7 @@ export class Gex {
       'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
       'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
-      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
+      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable', 'k_sock_hup',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
       'k_wake_seq', 'k_wake', 'k_park',
       // Which dispatch slots an identity's code is in, system-wide rather than
@@ -2122,7 +2203,7 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + r.bytes.byteLength), 0));
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -2145,6 +2226,12 @@ export class Gex {
       const n = r.bytes.byteLength;
       if (n > skipOver) {
         skipped += n;
+        continue;
+      }
+      zeros += r.zeros ?? 0;
+      if (r.dense) {
+        u8.set(new Uint8Array(r.bytes), r.at);
+        copied += n;
         continue;
       }
       const [wrote, blank] = writeSparse(u8, new Uint8Array(r.bytes), r.at);
@@ -2179,6 +2266,7 @@ export class Gex {
       return n;
     };
     step(`image copied, ${live()} non-zero bytes in the context`);
+    this.#windowsSpace = child.windowsSpace ?? 0;
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -2205,6 +2293,14 @@ export class Gex {
     // The parent's working directory, so a child inherits it as it does on
     // Linux. `gex_adopt_child` reads the CWD global as it builds its kernel,
     // so this has to be set first -- same ordering as the identity above.
+    // The parent's program and argv (`/proc/self/exe`, `cmdline`), likewise.
+    if (child.exe && e.gex_set_child_exe) {
+      const c = new TextEncoder().encode(child.exe);
+      const cp = e.gex_alloc(Math.max(1, c.length)) >>> 0;
+      this.#bytes().set(c, cp);
+      e.gex_set_child_exe(cp, c.length);
+      e.gex_free?.(cp, Math.max(1, c.length));
+    }
     if (child.cwd && e.gex_set_cwd) {
       const c = new TextEncoder().encode(child.cwd);
       const cp = e.gex_alloc(c.length) >>> 0;
@@ -2518,6 +2614,9 @@ export class Gex {
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
+      // A W3 process's Windows address space starts here (0: none); the
+      // child splits its memory at the same line before its heap takes any.
+      windowsSpace: e.gex_windows_space?.() ?? 0,
       image: (() => {
         const t0 = performance.now();
         const img = this.#processImage();
@@ -2559,6 +2658,16 @@ export class Gex {
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
           )
         : null,
+      // The parent's exe path and argv, NUL-separated.
+      exe:
+        e.gex_fork_exe_len && e.gex_fork_exe_len() > 0
+          ? new TextDecoder().decode(
+              this.#bytes().slice(
+                e.gex_fork_exe_ptr() >>> 0,
+                (e.gex_fork_exe_ptr() >>> 0) + (e.gex_fork_exe_len() >>> 0),
+              ),
+            )
+          : null,
       // The parent's working directory, so the child resolves relative paths
       // where the parent stood. Decoded to a string; the child restages it.
       cwd:
@@ -2646,7 +2755,7 @@ export class Gex {
       // `WebAssembly.Module` (same registry bytes -> same module) rather than
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       // Or one the page's unit cache has (another process's).
       const cached = (key ? this.#sharedModules.get(key) : undefined) ?? this.#unitGet(this.#unitKey(bytes)) ?? undefined;
       let who = 'jit2049';
@@ -2717,7 +2826,7 @@ export class Gex {
       // No metadata means nothing to key a later fill on -- install it eagerly,
       // as the fork path does (`#adoptModule`), reusing a sibling's compile.
       if (!meta || !meta.length) {
-        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
@@ -2726,14 +2835,14 @@ export class Gex {
       const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
       e.gex_free?.(gp, meta.length);
       if (!got) {
-        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(moduleContentKey(bytes)));
+        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(this.#registryKey(i, bytes)));
         eager++;
         continue;
       }
       // Keep a sibling's compiled Module when we have it, so the on-demand
       // instantiate skips the compile too; otherwise the raw bytes. The push
       // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta });
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(this.#registryKey(i, bytes)) ?? bytes, need, inst: null, meta });
       lazy++;
     }
     if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
@@ -2971,7 +3080,13 @@ export class Gex {
         __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+        // clang's three names for a C main: Wine's crt_main references all
+        // of them weakly and a position-independent module (W3's PE module)
+        // keeps the undefined ones as imports. Null through `GOT.func`, as a
+        // static link leaves them, and a trap behind the null check.
+        ...(wasmdll ? Object.fromEntries(MAIN_NAMES.map((n) => [n, () => { throw new Error(`${n}: a main the program does not define was called`); }])) : {}),
       },
+      ...(wasmdll ? { 'GOT.func': Object.fromEntries(MAIN_NAMES.map((n) => [n, new WebAssembly.Global({ value: 'i32', mutable: true }, 0)])) } : {}),
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
         // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
@@ -2988,6 +3103,29 @@ export class Gex {
           signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
+          // W3.7: Wine's Unix side runs the program's code nested
+          // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
+          // that never returns for a thread's loop), and reports each image
+          // it maps (natively for unit placement; the page's units path
+          // takes it once `gex_image_mapped` exists).
+          call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          image_mapped: (base, fd) => {
+            const number = e.gex_image_mapped?.(base, fd) ?? -1;
+            if (number === -1) return;
+            // An i386 image with a function-tier unit to fetch (cgen.rs
+            // `w3_mapped`): served here, before Wine's loader goes on. (-2
+            // is a later skeleton bound into the install.)
+            if (number === -3) {
+              this.#cgenServe();
+              return;
+            }
+            this.#cgenCatchUp();
+            if (number >= 0) {
+              e.gex_cgen_pmod_installed(number);
+              e.gex_wasmdll_installed();
+            }
+            this.#wasmdllCatchUp();
+          },
           // libgex's dlopen past its static registry (Wine's Unix side links
           // it): no shared libraries here
           dlopen: () => 0,
@@ -5108,6 +5246,17 @@ export class Gex {
   #moduleStore = null;
 
   /** Registry module `i`'s bytes (a copy), wherever they are kept; null if none. */
+  /** Registry module `i`'s content key: as the store's writer recorded it
+   *  when the module is in the store, so a catching-up Worker does not hash
+   *  bytes a sibling already hashed; computed from `bytes` otherwise. */
+  #registryKey(i, bytes) {
+    const e = this.#shim.exports;
+    if (e.gex_module_key && e.gex_module_ext && Number(e.gex_module_ext(i))) {
+      return `${bytes.length}:${e.gex_module_key(i, 0) >>> 0}:${e.gex_module_key(i, 1) >>> 0}`;
+    }
+    return moduleContentKey(bytes);
+  }
+
   #registryBytes(i) {
     const e = this.#shim.exports;
     const len = e.gex_module_len(i) >>> 0;
@@ -5219,7 +5368,7 @@ export class Gex {
       const i = this.#installed;
       const bytes = this.#registryBytes(i);
       if (!bytes) continue;
-      const key = moduleContentKey(bytes);
+      const key = this.#registryKey(i, bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
       this.#installModule(bytes, need, 64, null, 'nt-catchup', cached, true);
       if (cached) continue;
@@ -5958,7 +6107,7 @@ export class Gex {
     if (i < 0) return;
     const bytes = this.#registryBytes(i);
     if (!bytes) return;
-    const key = moduleContentKey(bytes);
+    const key = this.#registryKey(i, bytes);
     const cached = key ? this.#sharedModules.get(key) : undefined;
     this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
     this.#denseCatchUps++;

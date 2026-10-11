@@ -763,6 +763,8 @@ async function handle(msg) {
     // late-starting thread was stranded `runnable`, and the main thread hung
     // joining it. A thread's own exit already woke its joiner's futex; a thread
     // that faults is handled by the Worker's error path and never reaches here.
+    // `?fjit=`: what the function JIT did, and how often its lock was held.
+    if (msg.kind !== 'thread') ex.gex_fjit_report?.();
     if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.

@@ -1,0 +1,185 @@
+wasm jit: a continuation block for every CALL_HANDLER; bail reasons by gate (gex)
+
+The emitter runs a finally as "finally_ind = continuation block; goto handler", so the
+continuation must start a block. Out-of-SSA puts phi moves between a CALL_HANDLER and the
+leave's OP_BR, and branch optimization deletes a BR to the fallthrough block; both were refused
+as "finally: complex call_handler continuation" (tk2dSprite.UpdateMaterial and
+GUILayoutGroup.CalcHeight in Hollow Knight; UnmanagedMemoryStream.ReadByte,
+SR.InternalGetResourceString, the resource readers in the BCL). wj_split_call_handler_blocks
+moves the instructions after a CALL_HANDLER into a new block reached by an OP_BR, with the
+non-handler CFG edges, before any analysis; a CALL_HANDLER that ends its block continues at
+bb->next_bb. cfg->num_bblocks stays as it is: it sizes cfg->bblocks, which mono_free_loop_info
+walks at mono_destroy_compile (bumping it read past the array and crashed at random).
+
+[wasm-jit bails] also lists every non-opcode gate string with its count and the first method
+it refused ("why N gate (first: ...)"), so "synchronized/other" names its reasons.
+Tests: T.NestedFinally (FinMove, SrLike, SrLike2, UmsLike, UmsRead).
+
+diff --git a/src/mono/mono/mini/mini-wasm-diagnostics.inc b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+index 872008171..b42f3330c 100644
+--- a/src/mono/mono/mini/mini-wasm-diagnostics.inc
++++ b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+@@ -1050,6 +1050,21 @@ mono_wasm_jit_dump_bail_hist (void)
+ 			}
+ 		}
+ 	}
++	/* gex: every non-opcode gate string, most frequent first, with the first method it refused. */
++	{
++		guint32 lastv = 0xffffffffu; int lasti = -1, passes;
++		for (passes = 0; passes < WJ_BAIL_WHY_MAX; ++passes) {
++			int best = -1, k; guint32 bestv = 0;
++			for (k = 0; k < WJ_BAIL_WHY_MAX && wj_bail_why [k].why; ++k) {
++				guint32 v = wj_bail_why [k].n;
++				if (v > lastv || (v == lastv && k <= lasti)) continue;
++				if (best < 0 || v > bestv) { best = k; bestv = v; }
++			}
++			if (best < 0) break;
++			printf ("  why %6u  %s  (first: %s)\n", bestv, wj_bail_why [best].why, wj_bail_why [best].first);
++			lastv = bestv; lasti = best;
++		}
++	}
+ 	fflush (stdout);
+ }
+ 
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 660e37fce..f8d248eeb 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -246,12 +246,81 @@ wj_t2u_census (MonoMethod *root, WjBody *b)
+ }
+ #endif
+ 
++/* gex: give every OP_CALL_HANDLER a continuation block. The emitter runs a finally as "finally_ind = the
++ * continuation's block index; goto handler", so the continuation must start a block. Mono's own passes put
++ * code between a CALL_HANDLER and the leave's OP_BR -- out-of-SSA parks phi moves there (copies that, on a
++ * native target, run after the handler call returns) -- and branch optimization deletes the BR when its
++ * target is the next block. Those methods were refused as "finally: complex call_handler continuation"
++ * (tk2dSprite.UpdateMaterial and GUILayoutGroup.CalcHeight in Hollow Knight, UnmanagedMemoryStream.ReadByte
++ * in the BCL). Here the instructions after a CALL_HANDLER move to a new block that follows it, reached by
++ * an OP_BR, so they run after the finally exactly as they would natively; the CFG edges other than the
++ * handler's move with them. Runs before any analysis, so every later pass sees the split blocks. */
++static void
++wj_split_call_handler_blocks (MonoCompile *cfg)
++{
++	MonoBasicBlock *bb;
++	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
++		MonoInst *ins;
++		if (!bb->has_call_handler)
++			continue;
++		for (ins = bb->code; ins; ins = ins->next) {
++			MonoInst *nx, *br;
++			MonoBasicBlock *nb, *handler;
++			int k;
++			if (ins->opcode != OP_CALL_HANDLER)
++				continue;
++			nx = ins->next;
++			while (nx && (nx->opcode == OP_NOP || nx->opcode == OP_IL_SEQ_POINT || nx->opcode == OP_SEQ_POINT))
++				nx = nx->next;
++			if (!nx || (nx->opcode == OP_BR && nx->inst_target_bb))
++				break;   /* already the shape the emitter wants; the rest of bb is skipped after the handler */
++			handler = ins->inst_target_bb;
++			nb = (MonoBasicBlock *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoBasicBlock));
++			nb->block_num = (int) cfg->max_block_num + 1;
++			cfg->max_block_num = nb->block_num;
++			/* NOT cfg->num_bblocks: it sizes cfg->bblocks (the DFN array), which nb is not in, and
++			 * mono_free_loop_info walks bblocks [0, num_bblocks) at mono_destroy_compile. */
++			nb->region = bb->region;
++			nb->real_offset = bb->real_offset;
++			nb->has_call_handler = 1;
++			/* move the tail */
++			nb->code = ins->next;
++			nb->code->prev = NULL;
++			nb->last_ins = bb->last_ins;
++			br = (MonoInst *) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoInst));
++			br->opcode = OP_BR;
++			br->dreg = -1;
++			MONO_INST_NULLIFY_SREGS (br);
++			br->cil_code = ins->cil_code;
++			br->inst_target_bb = nb;
++			ins->next = br; br->prev = ins; br->next = NULL;
++			bb->last_ins = br;
++			/* edges: everything but the handler leaves with the tail */
++			for (k = bb->out_count - 1; k >= 0; --k) {
++				MonoBasicBlock *o = bb->out_bb [k];
++				if (o == handler)
++					continue;
++				mono_unlink_bblock (cfg, bb, o);
++				mono_link_bblock (cfg, nb, o);
++			}
++			mono_link_bblock (cfg, bb, nb);
++			nb->next_bb = bb->next_bb;
++			bb->next_bb = nb;
++			if (cfg->bb_exit == bb)
++				cfg->bb_exit = nb;
++			break;   /* the loop over next_bb visits nb next, for any further CALL_HANDLER in the tail */
++		}
++	}
++}
++
+ void
+ mono_wasm_emit_method (MonoCompile *cfg)
+ {
+ #ifdef WJ_RUNTIME
+ 	if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
+ #endif
++	if (cfg->header && cfg->header->num_clauses > 0)
++		wj_split_call_handler_blocks (cfg);
+ 	/* Compile-time accounting (Part 2): wj_gen_t0 = bytecode-GENERATION start (100ns ticks); wj_inst_ms =
+ 	 * the JS WebAssembly.Module/Instance time for THIS compile (written by mono_wasm_jit_instantiate_local).
+ 	 * At `done:` we fold (elapsed - instantiate) into WJC_ELAPSED_GENERATION so the two halves don't overlap. */
+@@ -3447,8 +3516,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				 * leave emits multiple OP_CALL_HANDLERs in one bb — not supported yet). */
+ 				int _cont; MonoInst *_nx = ins->next;
+ 				while (_nx && (_nx->opcode == OP_NOP || _nx->opcode == OP_IL_SEQ_POINT || _nx->opcode == OP_SEQ_POINT)) _nx = _nx->next;
+-				if (!_nx || _nx->opcode != OP_BR || !_nx->inst_target_bb) { fail = "finally: complex call_handler continuation"; goto done; }
+-				_cont = bbidx [_nx->inst_target_bb->block_num];
++				/* gex: no OP_BR at all is the leave whose target is the next block: branch optimization
++				 * deletes a BR to the fallthrough block, so the continuation is bb->next_bb. A multi-finally
++				 * leave reaches here as one CALL_HANDLER per block (method-to-ir.c, COMPILE_WASM). */
++				if (!_nx && bb->next_bb)
++					_cont = bbidx [bb->next_bb->block_num];
++				else if (!_nx || _nx->opcode != OP_BR || !_nx->inst_target_bb) { fail = "finally: complex call_handler continuation"; goto done; }
++				else
++					_cont = bbidx [_nx->inst_target_bb->block_num];
+ 				if (_cont < 0) { fail = "finally: bad continuation"; goto done; }
+ 				wasm_i32_const (&body, _cont);
+ 				wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) finally_ind_idx);
+@@ -7963,6 +8038,8 @@ done:
+ 			else cat = WJB_SYNC_OTHER;
+ 			if (cat >= 0)
+ 				wj_bail_hist [cat]++;
++			if (cat >= 0 && cat != WJB_OPCODE)
++				wj_bail_why_note (fail, mname);
+ 		}
+ 		if (mono_wasm_jit_verbose >= 2) {
+ 			printf ("WASM_JIT_BAIL %s : %s (op=%d %s)", mname, fail, fail_op, fail_op >= 0 ? wj_opname (fail_op) : "-");
+diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
+index 7413ce493..7d7fd6c8d 100644
+--- a/src/mono/mono/mini/mini-wasm.c
++++ b/src/mono/mono/mini/mini-wasm.c
+@@ -1135,6 +1135,25 @@ enum { WJB_CALLEE_NOT_JITTED, WJB_RESIDUAL_SHAPE, WJB_EH_CLAUSE, WJB_ARGRET_TYPE
+ static guint32 wj_bail_hist [WJB_N];
+ #define WJ_BAIL_OPMAX 1400
+ static guint32 wj_bail_op_hist [WJ_BAIL_OPMAX];   /* indexed by mini opcode; counts the >0 fail_op bails */
++/* gex: the gate strings inside every non-opcode bucket, with the first method each refused, so
++ * "synchronized/other 287" names its reasons. Keyed by the literal's address; stats-only, so a race
++ * costs at most a lost count. */
++#define WJ_BAIL_WHY_MAX 96
++static struct { const char *why; char *first; guint32 n; } wj_bail_why [WJ_BAIL_WHY_MAX];
++static void
++wj_bail_why_note (const char *why, const char *mname)
++{
++	int i;
++	for (i = 0; i < WJ_BAIL_WHY_MAX; ++i) {
++		if (wj_bail_why [i].why == why) { wj_bail_why [i].n++; return; }
++		if (!wj_bail_why [i].why) {
++			wj_bail_why [i].first = g_strdup (mname ? mname : "?");
++			wj_bail_why [i].n = 1;
++			wj_bail_why [i].why = why;
++			return;
++		}
++	}
++}
+ /* Ring buffer of the last 128 residual callees (MonoMethod*), for post-crash diagnosis: a residual's
+  * interp_entry can be what trips a failure, and the last ring entries name it.
+  * Populated (gated by MONO_WASM_JIT_STATS) in mono_wasm_jit_call_interp; dumped via the export below. */

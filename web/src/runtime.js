@@ -514,6 +514,8 @@ async function runProgramHere(
     symlinks = {},
     // Files fetched as they are read, [path, size, url] (`?lazy=`).
     lazy = [],
+    // File times, path to seconds (`untar`'s `mtimes`), when they matter.
+    mtimes = undefined,
     /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
     env = [],
     args,
@@ -998,7 +1000,7 @@ async function runProgramHere(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, lazy, mtimes, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.

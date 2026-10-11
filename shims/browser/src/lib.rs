@@ -272,6 +272,8 @@ extern "C" {
     fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
+    fn k_fs_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
+    fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -401,11 +403,27 @@ extern "C" {
     fn k_sock_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_readable(id: i32) -> i32;
+    fn k_sock_hup(id: i32) -> i32;
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
     fn k_sock_close(id: i32);
-    fn k_sock_shutdown(id: i32);
+    fn k_sock_shutdown(id: i32, how: u32) -> i32;
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
+    fn k_sock_dup(id: i32) -> i32;
+    fn k_boot_secs(want: u32) -> u32;
+    fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn k_sock_read_fds(
+        id: i32,
+        at: gex_kernel::PAddr,
+        len: u32,
+        max_fds: u32,
+        peek: i32,
+        pid: i32,
+        out: gex_kernel::PAddr,
+        out_cap: u32,
+    ) -> i32;
 
 }
 
@@ -708,6 +726,12 @@ extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) ->
 }
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
     unsafe { k_fs_touch(handle, secs) }
+}
+extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) }
+}
+extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
+    unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
@@ -1078,14 +1102,74 @@ extern "C" fn rs_writable(id: i32) -> i32 {
 extern "C" fn rs_available(id: i32) -> i32 {
     unsafe { k_sock_available(id) }
 }
+extern "C" fn rs_hup(id: i32) -> i32 {
+    unsafe { k_sock_hup(id) }
+}
 extern "C" fn rs_close(id: i32) {
     unsafe { k_sock_close(id) }
 }
-extern "C" fn rs_shutdown(id: i32) {
-    unsafe { k_sock_shutdown(id) }
+extern "C" fn rs_shutdown(id: i32, how: u32) -> i32 {
+    unsafe { k_sock_shutdown(id, how) }
 }
 extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
+}
+extern "C" fn rs_pair(out: gex_kernel::PAddr) -> i32 {
+    unsafe { k_sock_pair(out) }
+}
+extern "C" fn rs_dup(id: i32) -> i32 {
+    unsafe { k_sock_dup(id) }
+}
+extern "C" fn rs_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32 {
+    unsafe { k_sock_write_fds(id, at, len, descs, descs_len) }
+}
+#[allow(clippy::too_many_arguments)]
+extern "C" fn rs_read_fds(
+    id: i32,
+    at: gex_kernel::PAddr,
+    len: u32,
+    max_fds: u32,
+    peek: i32,
+    pid: i32,
+    out: gex_kernel::PAddr,
+    out_cap: u32,
+) -> i32 {
+    unsafe { k_sock_read_fds(id, at, len, max_fds, peek, pid, out, out_cap) }
+}
+
+/// Descriptors for `SCM_RIGHTS` that cannot leave this process -- an epoll
+/// set, a memfd, a local socket -- parked by number for a receiver that turns
+/// out to be this same process (a wineserver thread hearing from its own
+/// process's client). Another process finds no entry and gets nothing.
+static LOCAL_FDS: std::sync::Mutex<(u32, Vec<(u32, Arc<gex_kernel::file::OpenFile>)>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+
+/// A descriptor as a line another process can rebuild it from. See
+/// [`carry_name`]; what has no name to travel by is parked in [`LOCAL_FDS`].
+fn scm_describe(k: &gex_kernel::syscalls::Kernel, file: &Arc<gex_kernel::file::OpenFile>) -> Option<String> {
+    const IN_FLIGHT: i32 = -1;
+    let name = carry_name(k, file, IN_FLIGHT).unwrap_or_else(|| {
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        t.0 += 1;
+        let n = t.0;
+        t.1.push((n, Arc::clone(file)));
+        format!("local:{}:{n}", my_pid())
+    });
+    Some(format!("{} {} {}", file.flags(), file.offset(), name))
+}
+
+fn scm_rebuild(k: &mut gex_kernel::syscalls::Kernel, desc: &str) -> Option<Arc<gex_kernel::file::OpenFile>> {
+    let mut p = desc.splitn(3, ' ');
+    let flags = p.next()?.parse::<u64>().ok()?;
+    let offset = p.next()?.parse::<u64>().ok()?;
+    let name = p.next()?;
+    match rebuild_carried(k, name, flags, offset) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn_line(&format!("gex: SCM_RIGHTS lost '{name}': {e}\n"));
+            None
+        }
+    }
 }
 
 /// Where a unix socket's two ends live, when there is a global kernel to put
@@ -1094,6 +1178,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    // And one boot instant for every process's monotonic clocks.
+    gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
     Some(gex_kernel::unix::Remote {
         bind: rs_bind,
         connect: rs_connect,
@@ -1105,8 +1191,15 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         writable: rs_writable,
         available: rs_available,
         close: rs_close,
+        hup: rs_hup,
         shutdown: rs_shutdown,
         exists: rs_exists,
+        pair: rs_pair,
+        dup: rs_dup,
+        write_fds: rs_write_fds,
+        read_fds: rs_read_fds,
+        describe: scm_describe,
+        rebuild: scm_rebuild,
     })
 }
 
@@ -1142,6 +1235,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             mksocket: rf_mksocket,
             set_mtime: rf_set_mtime,
             touch: rf_touch,
+            set_times: rf_set_times,
+            set_times_fd: rf_set_times_fd,
         },
     )))
 }
@@ -2312,6 +2407,14 @@ fn arena_back(end: u64) -> Option<u64> {
         }
         return Some(prev);
     }
+    // Nothing past the guest's slice (`GUEST_LIMIT`): the kernel could map
+    // it, but every access to it (an anonymous mapping's zeroing first)
+    // faults. Wine's reservation of everything above 0x7ffe0000 (W3) then
+    // shrinks to what the guest can name, as reserve_area halves on a
+    // failure.
+    if end > GUEST_LIMIT {
+        return None;
+    }
     if !grow_memory_to(end) {
         return None;
     }
@@ -2606,7 +2709,7 @@ struct Jit {
     /// `registry` itself. An entry kept there holds no bytes in this module's
     /// heap: the registry grew without bound in a long fjit run (980 MiB of
     /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
-    registry_ext: Vec<Option<(u64, u32)>>,
+    registry_ext: Vec<Option<(u64, u32, u64)>>,
     /// The bytes of the last modules kept in the JS-side store, still alive:
     /// a sibling Worker that read the pending queue's front just before this
     /// one popped it is copying them out (`gex_jit_pending_refresh`).
@@ -4014,6 +4117,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         named
     } else if args[0].starts_with('/') {
         args[0].clone()
+    } else if args[0].contains('/') {
+        // `./prog` names a path from the working directory, as execve's
+        // argument would (tests/gexcc/longargs: `--argv0 ./longargs
+        // --cwd /t` re-execs `/proc/self/exe`, which was `/longargs`).
+        kernel.vfs.absolute(&args[0])
     } else {
         format!("/{}", args[0])
     };
@@ -5295,6 +5403,19 @@ static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
 /// process tree here. Serving a page once and then falling through to translate
 /// bounds it: the wasted serve is one turn, and the translate produces the
 /// block that was missing.
+/// Each page's base under which this process has installed blocks: lifted
+/// here, or taken from the store. A stored module numbering such a page
+/// otherwise is not served (see the serve filter in `gex_dispatch_miss`).
+static LIVE_BASE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+
+fn note_live(dirs: &[(u64, u32)]) {
+    let mut m = LIVE_BASE.0.borrow_mut();
+    for (p, b) in dirs {
+        m.insert(*p, *b);
+    }
+}
+
 static SERVED_PAGE: SingleThreaded<std::collections::BTreeSet<u64>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
@@ -5596,7 +5717,7 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         kernel
             .remote_sockets
             .values()
-            .any(|r| Arc::as_ptr(r) as *const () == p)
+            .any(|r| r.as_ptr() as *const () == p && r.strong_count() > 0)
     };
     match &t.waiting {
         // A terminal: nobody but the page can type into it. Nor a socket
@@ -5904,7 +6025,7 @@ fn tracing() -> bool {
 
 /// Something a person must see whatever the tracing settings, on the host's
 /// console at error level rather than in the guest's output.
-fn warn_line(s: &str) {
+pub(crate) fn warn_line(s: &str) {
     unsafe { warn(s.as_ptr() as u32, s.len() as u32) };
 }
 
@@ -6087,6 +6208,24 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    // A Unix call from guest code under Wine's own Unix side (W3): `int 0x80`
+    // with EAX = UNIX_CALL from the trampoline page. ntdll.so's handler takes
+    // it, nested, and sets EAX; the guest goes on after the syscall.
+    // And native Wine's NATIVE_LEFT (gexrt), served as for an NT process.
+    if IN_PROVIDER.with(|c| c.get()) {
+        nt::native_left(ctx, pc);
+    } else {
+        let hook = cgen::guest_unix_call_hook();
+        if hook != 0 {
+            let gm = GuestMem::new(guest_bytes());
+            let eax = gm.read_u64(ctx as u32 as u64 + ctx::x(0) as u64).unwrap_or(0) as u32;
+            if eax == gex_kernel::nt::gex_nr::UNIX_CALL {
+                // SAFETY: a host import taking scalars; no lock is held.
+                unsafe { cgen::ftab_call_vi(hook as i32, ctx) };
+                return;
+            }
+        }
+    }
     fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
@@ -6648,7 +6787,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 if frames_stay(h) {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
                 // The stack goes back so the host can see the record and
@@ -6775,12 +6914,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                    do_fork(h, pid, pc as u64, child_stack, tls);
-                    FORK[1].store(start, std::sync::atomic::Ordering::Relaxed);
-                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
+                    WASM32_STAGED.with(|c| c.set(true));
                     return 0;
                 }
-                do_fork(h, pid, pc as u64, child_stack, tls);
+                do_fork(h, pid, pc as u64, child_stack, tls, None);
                 // Give the stack back though the parent carries on: the child
                 // is a copy of this memory that must be taken now, when the
                 // stack comes back. Letting the parent run on first copied it
@@ -7032,13 +7170,20 @@ fn frames_stay(h: &Host) -> bool {
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
-static WASM32_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// Per Worker: the Worker whose syscall staged it is the one that must start
+/// it (a fork's child is a copy of memory as the call left it; see
+/// `gex_fork_pending`). Shared, a sibling thread's syscall took the flag and
+/// the forking Worker never drained its child.
+thread_local! {
+    static WASM32_STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether a wasm32 program's last syscall staged a thread or a child for
 /// the host (and forget it).
 #[no_mangle]
 pub extern "C" fn gex_wasmprog_staged() -> i32 {
-    WASM32_STAGED.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
+    WASM32_STAGED.with(|c| c.replace(false)) as i32
 }
 
 /// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
@@ -7074,7 +7219,7 @@ fn wasm32_wait(pc: u64) -> i32 {
     }
 }
 
-fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
+fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
@@ -7093,11 +7238,19 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
-    FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
+    // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
+    // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
+        .chain(h.kernel.argv.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\0");
+    FORK[1].store(start.unwrap_or(pc + gex_abi::SYSCALL_INST_BYTES), std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     FORK[5].store(h.kernel.mem.brk_current(), std::sync::atomic::Ordering::Relaxed);
+    // Only the forking thread's Worker may claim it (`gex_fork_pending`).
+    FORK_BY.store(cur() as u64 + 1, std::sync::atomic::Ordering::Relaxed);
     // Last, because it is what the host tests: the rest must be readable by
     // the time a non-zero pid appears.
     FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
@@ -7119,6 +7272,28 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 /// The parent's working directory at `fork`, staged for the child to inherit.
 static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's exe path then its argv, NUL-separated, staged at `fork`.
+static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_ptr() -> u32 {
+    FORK_EXE.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_exe_len() -> u32 {
+    FORK_EXE.0.borrow().len() as u32
+}
+
+/// The child's side of `gex_fork_exe_*`, before `gex_adopt_child`.
+static CHILD_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *CHILD_EXE.0.borrow_mut() = s.to_string();
+    }
+}
 
 /// Describe the calling process's descriptors for the child. `child` is who the
 /// reopened pipe ends belong to: opened under the parent's pid instead, the
@@ -7127,41 +7302,9 @@ static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(St
 fn stage_fork_fds(h: &Host, child: i32) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
-        // A pipe end is re-opened in the global kernel, or the parent closing
-        // its copy looks like the last reference and the reader sees a false
-        // EOF. What the child reopens: a path by default, an id when the kernel
-        // holds the open file, since an id survives the unlink of a file a
-        // child would otherwise fail to reopen by name.
-        let mut name = file.path.clone();
-        if let Some(id) = pipe_id(&file.path) {
-            let write = file.writable;
-            unsafe { k_pipe_open_end(id, write as i32, child) };
-        } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(&file.path) {
-            // A socketpair end is two pipe ends, both the child's to hold.
-            unsafe {
-                k_pipe_open_end(rx, 0, child);
-                k_pipe_open_end(tx, 1, child);
-            }
-        } else if let Some((id, master)) = pty_ref(&file.path) {
-            // The child inherits this pty end; open it on the child's behalf so
-            // the parent's copy closing is not the last reference.
-            unsafe { k_pty_open_end(id, master as i32, child) };
-            pty_note("hands on", id, master as i32, child);
-        } else if let Some(id) = file.handle.remote_id() {
-            let dup = unsafe { k_fs_dup(id) };
-            if dup < 0 {
-                warn_line(&format!(
-                    "gex: fork could not hand fd {fd} ({}) to pid {child}\n",
-                    file.path
-                ));
-                continue;
-            }
-            name = format!("#{dup}");
-        } else if !file.path.starts_with('/') {
-            // Not a path, not a pipe, and not the terminal: a socket. Nothing
-            // here can rebuild that from a name.
+        let Some(name) = carry_name(&h.kernel, &file, child) else {
             continue;
-        }
+        };
         out.push_str(&format!(
             "{} {} {} {} {}\n",
             fd,
@@ -7172,6 +7315,45 @@ fn stage_fork_fds(h: &Host, child: i32) {
         ));
     }
     *FORK_FDS.0.borrow_mut() = out;
+}
+
+/// The name a descriptor travels to another process by -- a fork's child, or
+/// the far end of `SCM_RIGHTS` -- taking whatever reference keeps it open on
+/// the way. `holder` is who a pipe or pty end is opened for: the child, or no
+/// one yet (the global kernel moves it to the receiver).
+///
+/// A pipe end is re-opened in the global kernel, or the sender closing its
+/// copy looks like the last reference and the reader sees a false EOF. A file
+/// the global kernel holds goes as a duplicated id, which survives the unlink
+/// of a file the receiver would otherwise fail to reopen by name; anything
+/// else with a path, by path. `None`: nothing with a name -- a local socket,
+/// an epoll set.
+fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
+    if let Some(id) = pipe_id(&file.path) {
+        unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
+        return Some(file.path.clone());
+    }
+    if let Some((id, master)) = pty_ref(&file.path) {
+        unsafe { k_pty_open_end(id, master as i32, holder) };
+        pty_note("hands on", id, master as i32, holder);
+        return Some(file.path.clone());
+    }
+    if let Some(id) = file.handle.remote_id() {
+        let dup = unsafe { k_fs_dup(id) };
+        if dup < 0 {
+            warn_line(&format!("gex: could not hand {} to another process\n", file.path));
+            return None;
+        }
+        // With its path after a colon, for what reads it back (`/proc`,
+        // W3's image hook finding the module beside a DLL).
+        return Some(format!("#{dup}:{}", file.path));
+    }
+    if let Some(sock) = k.remote_unix_of_file(file) {
+        // A socket in the global kernel: another id on the same end.
+        let dup = sock.dup_id()?;
+        return Some(format!("sock:{dup}:{}", sock.listening as i32));
+    }
+    file.path.starts_with('/').then(|| file.path.clone())
 }
 
 /// The console descriptors, rebuilt in a child from the name alone. A fork
@@ -7253,95 +7435,14 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = if let Some(id) = pipe_id(path) {
-                let Some(r) = global_pipes() else { continue };
-                // The parent already opened this end on the child's behalf,
-                // before the copy was taken; nothing to open here.
-                let write = flags & gex_kernel::fs::oflags::ACCMODE
-                    != gex_kernel::fs::oflags::O_RDONLY;
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemotePipeEnd {
-                        id,
-                        write,
-                        remote: r,
-                    }),
-                    path.to_string(),
-                    flags,
-                    !write,
-                    write,
-                )
-            } else if let Some((rx, tx)) = gex_kernel::pipe::RemoteSockEnd::parse(path) {
-                // Both pipe ends were opened for the child by the parent.
-                let Some(r) = global_pipes() else { continue };
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemoteSockEnd::new(rx, tx, r)),
-                    path.to_string(),
-                    flags,
-                    true,
-                    true,
-                )
-            } else if let Some((id, master)) = pty_ref(path) {
-                // Same as a pipe end: the parent already opened it for the child.
-                let Some(r) = global_ptys() else { continue };
-                gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
-                    path.to_string(),
-                    flags,
-                    true,
-                    true,
-                )
-            } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
-                // An id the parent already asked the global kernel to
-                // duplicate, so this file is the parent's file whatever has
-                // happened to its name since.
-                let Some(root) = global_root() else { continue };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    gex_kernel::vfs::remote::adopt(root.remote(), id),
-                    String::new(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
-            } else if let Some((handle, readable, writable)) = console_handle(path) {
-                // The terminal, which is this Worker's and not a file. A dup
-                // of it in the parent has to be a dup of it here.
-                gex_kernel::file::OpenFile::new(handle, path.to_string(), flags, readable, writable)
-            } else {
-                // Through the child's own mounts, not the bare root: `/dev` and
-                // `/proc` are per-process, so `/dev/null` is not in the shared
-                // filesystem by name.
-                use gex_kernel::vfs::FileSystem;
-                let handle = h.kernel.vfs.open(path, flags, 0).or_else(|e| {
-                    match global_root() {
-                        Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
-                        None => Err(e),
-                    }
-                });
-                let handle = match handle {
-                    Ok(h) => h,
-                    Err(e) => {
-                        // Never quietly: a missing descriptor is an `EBADF` at
-                        // the child's first use, far from here.
-                        warn_line(&format!(
-                            "gex: fork left fd {fd} ({path}) behind: errno {}\n",
-                            e.0
-                        ));
-                        continue;
-                    }
-                };
-                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
-                let f = gex_kernel::file::OpenFile::new(
-                    handle,
-                    path.to_string(),
-                    flags,
-                    acc != gex_kernel::fs::oflags::O_WRONLY,
-                    acc != gex_kernel::fs::oflags::O_RDONLY,
-                );
-                f.set_offset(offset);
-                f
+            let file = match rebuild_carried(&mut h.kernel, path, flags, offset) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Never quietly: a missing descriptor is an `EBADF` at
+                    // the child's first use, far from here.
+                    warn_line(&format!("gex: fork left fd {fd} ({path}) behind: {e}\n"));
+                    continue;
+                }
             };
             if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
                 n += 1;
@@ -7351,16 +7452,171 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
     })
 }
 
+/// The other half of [`carry_name`]: the open file a name stands for, in
+/// this process. The reference the sender took is this one now; nothing more
+/// is opened for a pipe, pty, file id or socket id.
+fn rebuild_carried(
+    k: &mut gex_kernel::syscalls::Kernel,
+    path: &str,
+    flags: u64,
+    offset: u64,
+) -> Result<Arc<gex_kernel::file::OpenFile>, String> {
+    use gex_kernel::file::OpenFile;
+    use gex_kernel::fs::oflags;
+    let acc = flags & oflags::ACCMODE;
+    let file = if let Some(id) = pipe_id(path) {
+        let r = global_pipes().ok_or("no global kernel")?;
+        let write = acc != oflags::O_RDONLY;
+        OpenFile::new(
+            Arc::new(gex_kernel::pipe::RemotePipeEnd { id, write, remote: r }),
+            path.to_string(),
+            flags,
+            !write,
+            write,
+        )
+    } else if let Some((id, master)) = pty_ref(path) {
+        let r = global_ptys().ok_or("no global kernel")?;
+        OpenFile::new(
+            Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
+            path.to_string(),
+            flags,
+            true,
+            true,
+        )
+    } else if let Some((id, name)) = path.strip_prefix('#').and_then(|v| {
+        let (id, name) = v.split_once(':').unwrap_or((v, ""));
+        Some((id.parse::<i32>().ok()?, name))
+    }) {
+        let root = global_root().ok_or("no global kernel")?;
+        let f = OpenFile::new(
+            gex_kernel::vfs::remote::adopt(root.remote(), id),
+            name.to_string(),
+            flags,
+            acc != oflags::O_WRONLY,
+            acc != oflags::O_RDONLY,
+        );
+        f.set_offset(offset);
+        f
+    } else if let Some(rest) = path.strip_prefix("sock:") {
+        let r = global_sockets().ok_or("no global kernel")?;
+        let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
+        let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
+        let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
+        let handle: Arc<dyn FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        k.note_remote_unix(key, &sock);
+        OpenFile::new(handle, "socket".to_string(), flags, true, true)
+    } else if let Some(rest) = path.strip_prefix("local:") {
+        let (pid, n) = rest.split_once(':').ok_or("bad local name")?;
+        if pid.parse::<i32>().ok() != Some(my_pid()) {
+            return Err(format!("parked in pid {pid}, not here"));
+        }
+        let n = n.parse::<u32>().map_err(|_| "bad local number")?;
+        let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = t.1.iter().position(|e| e.0 == n).ok_or("already taken")?;
+        return Ok(t.1.swap_remove(i).1);
+    } else if let Some((handle, readable, writable)) = console_handle(path) {
+        // The terminal, which is this Worker's and not a file.
+        OpenFile::new(handle, path.to_string(), flags, readable, writable)
+    } else {
+        // Through this process's own mounts, not the bare root: `/dev` and
+        // `/proc` are per-process, so `/dev/null` is not in the shared
+        // filesystem by name.
+        use gex_kernel::vfs::FileSystem;
+        let handle = k
+            .vfs
+            .open(path, flags, 0)
+            .or_else(|e| match global_root() {
+                Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
+                None => Err(e),
+            })
+            .map_err(|e| format!("errno {}", e.0))?;
+        let f = OpenFile::new(handle, path.to_string(), flags, acc != oflags::O_WRONLY, acc != oflags::O_RDONLY);
+        f.set_offset(offset);
+        f
+    };
+    Ok(file)
+}
+
+/// The kernel's half of W3's address-space split (see
+/// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
+/// for there, what the host left below 2 GiB the process's own arena, and the
+/// i386 code kept off the shim's heap above it.
+pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
+    mem.set_mmap_top(0x7ffe_0000);
+    mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    // And the low space a wasm32 program leaves free, between the dispatch
+    // directory and its stack (its image and break are above, in the
+    // placement window): where a Windows executable's 0x400000 is.
+    mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
+    // An access there faults, as in the NT layer.
+    gex_xlate::set_guard_limit(0x8000_0000);
+}
+
+/// Where this process's Windows address space starts (W3), or 0: what a fork
+/// hands its child to split at the same line.
+#[no_mangle]
+pub extern "C" fn gex_windows_space() -> u32 {
+    nt::windows_space() as u32
+}
+
+/// A fresh W3 process (the host saw the program's i386 flag before loading
+/// it): the split, first thing after instantiation, so the line sits at the
+/// bottom of the arena rather than above the startup heap. Where the Windows
+/// space starts, or 0 on failure.
+#[no_mangle]
+pub extern "C" fn gex_split_windows_space() -> u32 {
+    match nt::split_windows_space() {
+        Ok(lo) => lo as u32,
+        Err(e) => {
+            warn_line(&format!("gex: W3: {e}\n"));
+            0
+        }
+    }
+}
+
+/// A forked child of a W3 process: the split, first thing after
+/// instantiation, before the heap takes a span. Zero, or -1 on failure.
+#[no_mangle]
+pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
+    match nt::adopt_windows_space(lo as u64) {
+        Ok(()) => 0,
+        Err(e) => {
+            warn_line(&format!("gex: W3 child: {e}\n"));
+            -1
+        }
+    }
+}
+
 /// A child `fork` has made that the host has not built a Worker for: pid, entry
 /// pc, context address, child stack, TLS. Plain words, not a queue: the host
 /// drains this before the parent runs again, so there is only ever one.
 static FORK: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// The thread (index + 1) whose `fork` is in `FORK`.
+static FORK_BY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The pid of a child needing a Worker, or zero -- and claiming it, so a `fork`
 /// several Workers can see is not started twice (see `gex_thread_pending`).
+///
+/// Only on the Worker running the thread that forked: the child is a copy of
+/// memory as `fork` left it, and only that Worker copies it before the parent
+/// runs on (synchronously after a wasm32 program's syscall, before the run
+/// loop resumes tier-1's). A sibling thread's Worker that drained it instead
+/// copied memory while the parent ran on -- for a wasm32 program, after
+/// `__gex_fork` had unmapped the record the child starts on, so the child
+/// read its thread pointer from a zero page and trapped (the aarch64 browser
+/// flake in tests/wasm32 fork: "vfork child exit 137" with a parked thread
+/// in the parent, 6 in 750 vforks; tests/wasm32/vforkthreads).
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
+    if FORK[0].load(std::sync::atomic::Ordering::Acquire) == 0
+        || FORK_BY.load(std::sync::atomic::Ordering::Relaxed) != cur() as u64 + 1
+    {
+        return 0;
+    }
     let pid = FORK[0].swap(0, std::sync::atomic::Ordering::AcqRel) as i32;
     if pid != 0 {
         CLAIMED_FORK.with(|c| {
@@ -7700,6 +7956,8 @@ pub extern "C" fn gex_adopt_child(
     phase(1);
     // The slot maps the copied low region names are the parent's.
     dense::child();
+    // So is the probe cache, which names the parent's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -7733,6 +7991,9 @@ pub extern "C" fn gex_adopt_child(
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
     kernel.mem.grows_on_demand(arena_grow, arena_back);
+    if nt::windows_space() != 0 {
+        w3_address_space(&mut kernel.mem, nt::windows_space());
+    }
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
     // into, and the parent parked on exactly that.
@@ -7780,6 +8041,15 @@ pub extern "C" fn gex_adopt_child(
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
             let _ = kernel.vfs.set_cwd(&cwd);
+        }
+    }
+    // The parent's program and arguments (`gex_set_child_exe`).
+    {
+        let exe = std::mem::take(&mut *CHILD_EXE.0.borrow_mut());
+        if !exe.is_empty() {
+            let mut parts = exe.split('\0').map(str::to_string);
+            kernel.exe_path = parts.next().unwrap_or_default();
+            kernel.argv = parts.collect();
         }
     }
     kernel.clock = browser_clock;
@@ -8061,6 +8331,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
         }
     }
+    // The probe cache names the old program's table indices.
+    gex_kernel::ftab::fcache_reset(guest_bytes());
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
@@ -8196,6 +8468,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     FILL_ASKED.0.borrow_mut().clear();
     FILL_FAILED.0.borrow_mut().clear();
     SERVED_PAGE.0.borrow_mut().clear();
+    // And the bases blocks were installed under: the page table starts over
+    // below, and a page of the new program has nothing installed yet.
+    LIVE_BASE.0.borrow_mut().clear();
     // And the modules inherited from the parent: they cover the PARENT's pages.
     // The new program's image sits at the same PIE base, so a page number the
     // parent's image had is now another program's code; a fill answered from
@@ -8272,6 +8547,16 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         ));
     }
     drop(closure);
+    // And the store modules this Worker installed before the exec: they are
+    // still in its tables, but nothing points at them now -- the page table
+    // and directory start over above -- so counting them installed made the
+    // serve path refuse every one of them, and the new program lifted what
+    // it could have been served. A program exec'd from a fork of node (the
+    // child had taken libc and libnode whole before its exec) lifted 66,079
+    // blocks, against 4,188 for a fresh `node -e 0`. Served again, a module
+    // writes the same blocks into the same slots, and its compile is shared
+    // by content key.
+    h.jit.installed_mods.clear();
 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     let c = ctx_addr as usize;
@@ -10060,14 +10345,25 @@ fn finish_parked(
             // flight put almost all of them in nr 63. `sys_read` had the same
             // shape and was fixed with it. See task 140.
             let dst = gm.read_mut(*buf, *len)?;
-            handle.read_at(0, dst)
+            match handle.read_at(0, dst) {
+                // Another reader of the same pipe took what woke this one:
+                // the syscall again, which parks once more.
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
             // the reader has drained.
+            // Still no room (another writer got there first): the syscall
+            // again, which parks once more, rather than EAGAIN on a
+            // descriptor that is not non-blocking.
             let data = gm.read(*buf, *len)?.to_vec();
-            handle.write_at(0, &data)
+            match handle.write_at(0, &data) {
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                r => r,
+            }
         }
         // `accept` is finished by the kernel, which is the only thing with a
         // descriptor table; the wait here is only for a connection to arrive.
@@ -10374,9 +10670,22 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
+    // Which process and what is mapped there: with a Worker per process the
+    // console interleaves them all.
+    let vma = with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
+            .map(|v| format!("{:#x}-{:#x} {}", v.start, v.end, v.name))
+            .unwrap_or_else(|| "unmapped".into())
+    });
     trace_line(&format!(
-        "gex: illegal instruction {:#010x} at pc={:#x}\n",
-        raw as u32, pc
+        "gex: pid {}: illegal instruction {:#010x} at pc={:#x} ({vma})\n",
+        my_pid(),
+        raw as u32,
+        pc
     ));
     with_host(|h| set_exit(h, 128 + 4));
     trap();
@@ -11261,6 +11570,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     if cgen::libprov::replaced(pc) {
         cgen::libprov::note_stray(pc);
     }
+    // W3: the first miss in an image Wine relocated after mapping it, whose
+    // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
+    // guest goes on at this pc.
+    if cgen::w3_miss(pc) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
@@ -11756,9 +12075,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // been built from the code before the change (a
                         // translation of noita.exe before Detours patched it),
                         // and serving it would run that code again.
-                        !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
-                            Some(have) => have == *b,
-                            None => !h.jit.retired_pages.contains(p),
+                        //
+                        // AArch64 too. Its numberings diverge across an
+                        // `execve` from a fork: the exec'd program keeps the
+                        // page bases it inherited for ld.so (outside the
+                        // arena), which are not the ones the registry has, and
+                        // stores its modules under them. Served to a fresh
+                        // process numbering ld.so by the registry, their calls
+                        // into ld.so landed on empty slots, missed, and lifted
+                        // the callee again at the registry's base, once per
+                        // call: 32,997 ld.so blocks (30,371 at
+                        // `_dl_lookup_symbol_x` alone) in a `node -e 0` after
+                        // `spawnSync(node)`, 62 s against 30 in the page.
+                        d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
+                            Some(have) if gex_abi::X86 => have == *b,
+                            // On AArch64 only against blocks this process has
+                            // installed: a page numbered here with nothing
+                            // installed under the number loses nothing by
+                            // taking the module's, and refusing those cost a
+                            // second `node -e 0` its libc (4,979 blocks lifted
+                            // became 15,975).
+                            Some(have) => have == *b || LIVE_BASE.0.borrow().get(p) != Some(&have),
+                            None => !gex_abi::X86 || !h.jit.retired_pages.contains(p),
                         })
                     })
                     .collect();
@@ -11825,6 +12163,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                             }
                             keep.push((*p, *b));
                         }
+                        note_live(&keep);
                         dirs.extend_from_slice(&keep);
                         h.jit.reuse_served += 1;
                     }
@@ -12034,6 +12373,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // module), so the block at `pc` misses, re-translates, and misses
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
+        note_live(&unit.covered);
         push_pending(h, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
         publish_pending(h);
         // Point the guest directory at the slot this unit's block actually
@@ -13423,11 +13763,11 @@ pub extern "C" fn gex_jit_installed() {
             // take the front of the shared queue between this Worker's read and
             // this pop, so the note is checked against what was popped): keep
             // only where it is.
-            if let Some((off, len, _)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+            if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 h.jit.registry_sums.push(Vec::new());
                 h.jit.registry.push(Vec::new());
-                h.jit.registry_ext.push(Some((off, len)));
+                h.jit.registry_ext.push(Some((off, len, key)));
                 h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
                 h.jit.store_grace.push_back(done.wasm);
                 if h.jit.store_grace.len() > STORE_GRACE {
@@ -13765,7 +14105,17 @@ pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo:
 /// bytes are in this module's memory (`gex_module_ptr`).
 #[no_mangle]
 pub extern "C" fn gex_module_ext(i: u32) -> u64 {
-    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _)| off + 1))
+    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _, _)| off + 1))
+}
+
+/// Registry module `i`'s content key, high half (`which` 0) or low (1), when
+/// it is in the JS-side store (whose writer gave it); 0 and 0 otherwise. So a
+/// Worker catching up names the module without hashing its bytes.
+#[no_mangle]
+pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
+    with_host(|h| {
+        h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(_, _, k)| if which == 0 { (k >> 32) as u32 } else { k as u32 })
+    })
 }
 
 /// MiB of registry modules kept in the JS-side store (1) and in this heap (0).
@@ -13807,7 +14157,7 @@ pub extern "C" fn gex_jit_slots_total() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
     with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
-        Some((_, len)) => len,
+        Some((_, len, _)) => len,
         None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
     })
 }

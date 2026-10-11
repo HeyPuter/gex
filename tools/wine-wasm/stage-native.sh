@@ -32,6 +32,11 @@ mkdir -p "$out"
 # prefix every other prefix links to.
 cp -rs "$x86/." "$out/"
 rm -f "$out/gex-layout"
+# A staged prefix that carries an installed registry gets the W3 session
+# (w3-session.reg: no services that need Unix sides W3 lacks). One with no
+# registry yet gets it after wineboot's install makes one:
+# `reg-apply.py PFX/system.reg w3-session.reg`.
+[ ! -f "$out/system.reg" ] || python3 "$here/reg-apply.py" "$out/system.reg" "$here/w3-session.reg"
 find "$out" -type l ! -iregex '.*\.\(dll\|exe\|drv\|sys\|ocx\|acm\|cpl\|ax\|tlb\|nls\|ttf\|ttc\|fon\|mui\|so\|wasm\|dll16\|exe16\|drv16\|vxd\)' -print0 |
     while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
 sys=$out/drive_c/windows/syswow64

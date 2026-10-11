@@ -1541,3 +1541,57 @@ each time in one guest process tree under a wasm32 dash: zt check/checkgz,
 zstt check/checkd/checkm, and sqlite3 on sq.sql and cb.sql. It passes when
 19 checks say ok in both modes, all three libraries are replaced in the
 provider run only, and the sqlite3 output matches.
+
+## 8. A translation cache that survives a page reload (design, 2026-10-11)
+
+### Why
+In the page, a cold `node -e 0` takes 40.6 s and a warm one about 30 s. Most of the difference is 9.6 s spent translating 224k blocks (§6.6). Every reload starts with an empty module store, so it pays that 9.6 s again. Backlog item 3 (C) and T5.
+
+### What is cached, and what is not
+The cache saves the **global kernel's module store** and the slot numbering its modules were built against. It does not save compiled `WebAssembly.Module`s or any process's registry. Each saved record holds:
+
+- every stored module: its wasm bytes (what `k_mod_store` received), its `slots`, and its `dirs` (`(page, base)` pairs);
+- the claims: `by_page` (`(page, key) -> ids`), `by_object` (`obj -> ids`), and the `translated` object set;
+- the slot map (`(page, key) -> base`, from `k_slot_put`) and the slot mark.
+
+### What the cache keys on
+- **A fingerprint for the whole cache.** It hashes:
+  - the shim and kernel wasm bytes the page loaded (arch, mem64 and shared variants are different files);
+  - the query switches that change emission (`fjit`, `dense`, `dual`, `fjitlibs`).
+
+  If the fingerprint differs, the whole cache is dropped. This also covers Rust's `DefaultHasher`, which the object and page identities use and whose output is not promised to stay the same across toolchains.
+- **The content of each object.** Today an object's identity is SipHash of its file path, and a page's identity is SipHash of path plus offset (`object_identity` and `page_identity` in shims/browser/src/lib.rs). Neither depends on the file's bytes, so a library that apt replaced at the same path would keep its old translations.
+
+  The cache therefore stores, per object, its path and a hash of the file's bytes as they were when saved. To make that possible, the shim tells the kernel once per object which path each key it uses belongs to (a new `k_obj_name(key, path)`).
+
+  On restore, the kernel hashes the file now at that path in this page's filesystem. If the hash differs, or the file is gone, it drops that object's modules, claims and slot-map entries. Those slots are then left unused, which wastes them but is safe.
+- **Placement.** Keys include absolute dispatch pages. A library loaded at a different address simply misses; nothing is relocated.
+
+### Renumber on install
+- The kernel store already holds modules before `dense::register` numbers them. `share_module` runs before `push_pending`, and `push_pending` numbers each process's copy from its own `NEXT` (shims/browser/src/dense.rs).
+- So the saved bytes are unnumbered, and every process that installs a restored module renumbers it, exactly as it renumbers a module another process stored this session.
+- This answers T1 for the cache. Within one session, a Worker's dense base already comes from its own numbering; fork adoption takes the parent's base on purpose. A stored compiled `Module` or registry entry would carry an earlier session's base, so neither is ever saved.
+- Before saving, each module's dense section is checked for base 0, and zeroed with `gex_emit::dense::set_base` if not.
+
+### Slot-map replay
+- Classic tier-1 slot bases come from `k_slot_alloc`. They are baked into each module's element segments and into the `PAGE_GEN` values that function-JIT code checks. A saved module is valid only where `(page, key)` maps to the bases it was built with.
+- Restore therefore runs in the kernel before pid 1 starts, which is before any `k_slot_alloc`:
+  - it replays every saved `(page, key) -> base` with `k_slot_put`;
+  - it raises the mark with `k_slot_floor` to the highest saved base plus that page's slots.
+- Modules are re-stored in their saved order, so module ids, which are store positions, come back the same. The claims are then replayed.
+- If the restored slots would leave less than half of `k_slot_left` free, nothing is restored. Slots are a budget for the whole page, and no slot is ever reclaimed.
+
+### Where it lives
+- **Storage:** one OPFS file per fingerprint, holding a header and the records, written from the page's main thread.
+- **Saving:** a kernel export serialises the store (`k_store_save`). The host calls it when 30 s pass with no new module, and on `pagehide`. Writes are capped at 128 MiB of module bytes, against the store's own 256 MiB `MOD_BUDGET`.
+- **Restoring:** `k_store_restore(bytes)` runs once at boot, after the filesystem is ready and before the first process.
+- **Opt-in first:** behind `?xcache=1`. It becomes the default only after the measurement below.
+
+### Who else uses the store
+- W's wasm DLLs and the Mesa work use the same store and slot map. Their objects get keys, paths and content hashes the same way. Nothing changes for code that does not opt in.
+- The one change visible in the shim is the new `k_obj_name` call next to the existing claims.
+
+### Measured how
+- On edger, in the page, measure cold `node -e 0` and `apt install ripgrep tcc libc6-dev`.
+- Load twice in one browser profile. The second load runs with `?xcache=1` for "after", and without it for "before". This needs site.mjs to have a mode that reloads with a persistent profile.
+- Report translation counts as well as times.
