@@ -35,6 +35,15 @@ import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSyn
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
+import { enableSingle, FiberWorker, sched } from './single.mjs';
+// GEX_SINGLE=1: the single-thread build (docs/single-thread.md) -- every
+// process and thread a fiber on this thread, no SharedArrayBuffer, the shared
+// build's binaries on plain memories. Before anything is compiled.
+const SINGLE = !!process.env.GEX_SINGLE;
+if (SINGLE) {
+  enableSingle();
+  await import('./worker.mjs');
+}
 // `GEX_ARCH=x86` runs the x86-64 guest: the `.x86`-infixed shim and kernel
 // (see shims/browser/build.sh), and `globalThis.GEX_ARCH` for the glue.
 const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
@@ -198,7 +207,7 @@ function readStdin() {
 // `shared` flag is part of its type, so the shim, seed, kernel and every
 // closure module must be the shared ones together. That is the configuration
 // the page ships and the one a fork breaks in.
-const SHARED = !!process.env.GEX_SHARED;
+const SHARED = !!process.env.GEX_SHARED || SINGLE;
 const PUB = process.env.GEX_WEB_DIR
   ? new URL(`file://${process.env.GEX_WEB_DIR.replace(/\/?$/, '/')}`)
   : new URL('../../../web/public/gex/', import.meta.url);
@@ -277,7 +286,7 @@ function readClosure() {
 }
 
 const host = new ProcessHost({
-  makeWorker: () => new Worker(new URL('./worker.mjs', import.meta.url),
+  makeWorker: SINGLE ? () => new FiberWorker() : () => new Worker(new URL('./worker.mjs', import.meta.url),
     // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
     // guest's time actually goes (which translated library functions, JS
     // overhead, GC). Off by default -- it slows the run and writes a file each.
@@ -337,6 +346,9 @@ const host = new ProcessHost({
     fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_PROVIDERS=0: no ELF export providers (A/B runs; cgen/elfprov.rs).
     providers: process.env.GEX_PROVIDERS === '0' ? 0 : undefined,
+    // GEX_ELF_UNITS=name,...: shared objects that get their function-tier
+    // unit from the cache at the bias they map at (the page's `?elfunits=`).
+    elfUnits: process.env.GEX_ELF_UNITS || undefined,
     // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,
@@ -419,6 +431,11 @@ const host = new ProcessHost({
         // `guestMillis` is the whole time inside the guest (load, install,
         // run); `millis` is only the translator.
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
+          // Why misses translated rather than being filled, and where: a
+          // Worker whose table lacks an install it should have shows here
+          // as nofill (tests/gexcc/exec-reuse.sh).
+          (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
+          (m.byObject ? ` [${m.byObject}]` : '') +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
@@ -536,4 +553,7 @@ try {
 // `process.exitCode`, not `process.exit`: the guest's output goes through
 // `process.stdout`/`process.stderr` (async when a pipe), and `process.exit`
 // does not wait for them to drain. Setting the code lets node finish the writes.
+if (SINGLE && process.env.GEX_SINGLE_STATS) {
+  process.stderr.write(`[single] fibers ${FiberWorker.count}, sched ${JSON.stringify(sched.stats)}\n`);
+}
 process.exitCode = status;

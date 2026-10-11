@@ -7895,10 +7895,55 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // libraries at the same addresses -- finding the old program's *relocated*
     // copy, whose `.got.plt` sends a call through the PLT into unmapped memory.
     let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
+    let old_code: Vec<(u64, u64)> = h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
+        .map(|v| (v.start, v.end))
+        .collect();
+    // The dead arena the new program may reuse: the old map's own spans, and
+    // in a forked child everything it inherited below `ADOPTED_TOP` (its shim
+    // never allocates there; see `arena_take`) -- less anything the runtime
+    // owns, by the memory map's own record.
+    let mut dead: Vec<(u64, u64)> = h.kernel.mem.arena_spans().to_vec();
+    let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if inherited > gex_abi::ARENA_BOTTOM {
+        dead.push((gex_abi::ARENA_BOTTOM, inherited));
+    }
+    let dead: Option<Vec<(u64, u64)>> = dead
+        .iter()
+        .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.into_iter().flatten().collect());
     h.kernel.mem =
         gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    // Old code the new program may put something else at: what lies in the
+    // donated arena. Code elsewhere (ld.so at its fixed base) can only come
+    // back as the same object at the same place, and keeps its translations
+    // as it did before exec reused anything -- retiring it made the next
+    // fresh process lift ld.so block by block (33k blocks, nofill 31k).
+    let reused: Vec<(u64, u64)> = match &dead {
+        Some(dead) => old_code
+            .iter()
+            .flat_map(|&(lo, hi)| {
+                dead.iter().filter_map(move |&(a, b)| {
+                    let (s, e) = (lo.max(a), hi.min(b));
+                    (s < e).then_some((s, e))
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(dead) = dead {
+        h.kernel.mem.donate_arena(&dead);
+    }
+    // Everything keyed by a code address there forgets it.
+    cgen::on_exec(&reused);
+    fjit::on_retire(&reused);
     {
         // The live memory size, not `guest_bytes().len()` (which is the whole
         // 4 GiB nameable range): the fill must stay inside what actually exists.
@@ -11428,6 +11473,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .map(|v| (v.start, v.end))
             .collect();
         if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
+            return false;
+        }
+        // Nothing can be lifted at a misaligned pc (the emitter asserts a
+        // block's base is instruction-aligned, and a panic there takes the
+        // whole runtime down). On arm64 it is a PC alignment fault; here
+        // the process ends as for code that is not there. A provider's
+        // IFUNC resolver+1 used to get here once the re-bridge guard gave
+        // up on it (see `ftab::rebridge_gives_up`).
+        if pc % gex_abi::INST_ALIGN != 0 {
+            crate::warn_line(&format!("gex: pid {} jumped to a misaligned pc {pc:#x}; not translating it\n", h.kernel.pid));
             return false;
         }
         // Before anything is translated: if this page's code has been

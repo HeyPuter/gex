@@ -67,6 +67,7 @@ function forkTransfer(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
+import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -88,7 +89,11 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
   console.debug = sync;
 }
 
-const port = await channel();
+// Everything below is one Worker's: its port, its process, its state. A
+// function rather than module scope so the single-thread build (single.mjs)
+// can run many of these in one realm, one per fiber; a real Worker runs one.
+async function workerMain(port) {
+
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
@@ -442,7 +447,16 @@ async function handle(msg) {
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
-  if (msg.glChannel) {
+  if (msg.glChannel?.inRealm) {
+    // The single-thread build: the compositor's Mesa is in this realm
+    // (web/src/compositor-worker.js `glInRealm`), and a submit is a promise
+    // the Suspending `gl_submit` waits on. A batch is run straight out of
+    // this process's memory: no copy, and no batch in flight unwaited.
+    gex.useGl({
+      submit: (memory, ring, client) =>
+        globalThis.__gexGlInRealm ? globalThis.__gexGlInRealm.submit(memory, ring, client) : -1,
+    });
+  } else if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
     gex.useGl(new GlProxy(msg.glChannel, () => {
       // An OffscreenCanvas renderer waits on the control word directly. Keep
@@ -566,9 +580,16 @@ async function handle(msg) {
   // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
-    gex.useNetwork(new NodeNetwork());
+    const net = new NodeNetwork();
+    if (single.on) net.onActivity = () => sched.wake();
+    gex.useNetwork(net);
   }
-  if (msg.netChannel) {
+  if (msg.wispNet) {
+    // The single-thread build: the system's one Wisp connection, the object
+    // itself (every fiber is in its realm). Its traffic wakes parked fibers.
+    msg.wispNet.onActivity = () => sched.wake();
+    gex.useNetwork(msg.wispNet);
+  } else if (msg.netChannel) {
     // The page's Wisp connection, called across shared memory (net-bridge.mjs):
     // a wasm32 program never hands this Worker's event loop back, so a
     // WebSocket of its own here would never deliver.
@@ -865,6 +886,8 @@ async function handle(msg) {
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
+    // A fiber's timers outlive it unless stopped (single.mjs).
+    if (single.on) gex?.close?.();
     port.post({
       kind: 'threw',
       message: (e?.message ?? String(e)) + where,
@@ -891,3 +914,9 @@ const handed = await (async () => {
 
 port.post({ kind: 'ready' });
 if (handed) handle(handed);
+}
+
+// A real Worker runs itself; the single-thread build registers the function
+// and runs it once per fiber (single.mjs `FiberWorker`).
+if (single.on) registerWorkerMain(workerMain);
+else await workerMain(await channel());

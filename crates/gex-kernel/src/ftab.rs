@@ -34,6 +34,24 @@ pub enum Tier {
     Region,
 }
 
+/// Losses of its bridge in a row after which a provider address is left to
+/// tier-1 (`elfprov::rebridge`'s loop guard).
+pub const REBRIDGE_LIMIT: u32 = 64;
+
+/// Whether the re-bridge loop guard gives a provider address up to tier-1
+/// after `losses` losses in a row: only past [`REBRIDGE_LIMIT`], and only an
+/// address tier-1 can lift. An IFUNC's resolver+1 is odd, and handed one the
+/// emitter panicked ("text base must be instruction-aligned": node
+/// --build-snapshot and `node -e` in the page), so such an address keeps
+/// its bridge whatever the count.
+pub fn rebridge_gives_up(pc: u64, losses: u32) -> bool {
+    losses > REBRIDGE_LIMIT && pc % gex_abi::INST_ALIGN == 0
+}
+
+/// An install's module once its program is gone ([`FuncMap::kill_module`]):
+/// a table catching up skips it.
+pub const DEAD_MODULE: u32 = u32::MAX;
+
 /// One module's functions in the table: `len` slots from `base`, filled by
 /// the module's element segment when a thread instantiates it. `module` is
 /// the host's handle for it (an index into its own list of modules).
@@ -193,6 +211,21 @@ impl FuncMap {
         let f = self.by_addr.remove(&addr)?;
         self.unref(f.idx);
         Some(f.idx)
+    }
+
+    /// Mark every install of `module` [`DEAD_MODULE`]: a table that catches
+    /// up later (a Worker for a thread started after an `execve`) skips it
+    /// rather than instantiate a module whose program is gone -- a replaced
+    /// library's provider, linked as something else and with its data where
+    /// the new program's now is. Unit modules are not killed: an exec'd
+    /// program that maps the same object at the same place reuses its
+    /// install, and a Worker that skipped it would lift block by block.
+    pub fn kill_module(&mut self, module: u32) {
+        for i in &mut self.installs {
+            if i.module == module {
+                i.module = DEAD_MODULE;
+            }
+        }
     }
 
     /// Retire every function whose entry lies in `[start, end)`.
@@ -388,6 +421,29 @@ fn leb(b: &[u8]) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rebridge_guard_never_gives_up_an_unliftable_address() {
+        // SP's page crash: provider address 0x71dc1a1 (libc +0x9c1a1).
+        for pc in [0x71dc1a1u64, 0xa12c1a1, 0xa12cac1] {
+            for n in [1, REBRIDGE_LIMIT, REBRIDGE_LIMIT + 1, 1000, u32::MAX] {
+                assert!(!rebridge_gives_up(pc, n), "{pc:#x} after {n}");
+            }
+        }
+        let aligned = 0x71dc1a0u64;
+        assert!(!rebridge_gives_up(aligned, REBRIDGE_LIMIT));
+        assert!(rebridge_gives_up(aligned, REBRIDGE_LIMIT + 1));
+    }
+
+    #[test]
+    fn kill_module_marks_only_that_modules_installs() {
+        let mut m = FuncMap::new();
+        let a = m.publish(3, 7, Tier::Unit, &[(0x1000, 0)]);
+        let b = m.publish(1, 0x8000_0001, Tier::Unit, &[(0x2000, 0)]);
+        m.kill_module(0x8000_0001);
+        assert_eq!(m.install(a).module, 7);
+        assert_eq!(m.install(b).module, DEAD_MODULE);
+    }
 
     #[test]
     fn publish_maps_and_retires() {

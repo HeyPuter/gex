@@ -7,6 +7,13 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 MESA=$ROOT/third_party/mesa
 SANITIZE=${GEX_MESA_SANITIZE:-0}
+# GEX_MESA_THREADS=0: the single-thread build's Mesa (docs/single-thread.md),
+# without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
+# Built in its own directory and published under web/public/gex/st/, beside
+# the threaded one.
+THREADS=${GEX_MESA_THREADS:-1}
+VARIANT=mt
+[ "$THREADS" = 0 ] && VARIANT=st
 if [ "$SANITIZE" = 1 ]; then
     DEFAULT_OUT=${TMPDIR:-/tmp}/gex-mesa-wasm-sanitize
     CROSS=$ROOT/web/mesa-wasm-sanitize-cross.ini
@@ -15,6 +22,10 @@ if [ "$SANITIZE" = 1 ]; then
 else
     DEFAULT_OUT=${TMPDIR:-/tmp}/gex-mesa-wasm
     CROSS=$ROOT/web/mesa-wasm-cross.ini
+    if [ "$THREADS" = 0 ]; then
+        DEFAULT_OUT=${TMPDIR:-/tmp}/gex-mesa-wasm-st
+        CROSS=$ROOT/web/mesa-wasm-st-cross.ini
+    fi
     BUILD_TYPE=release
     GEX_SANITIZE=false
 fi
@@ -40,7 +51,11 @@ if [ -z "${GEX_EMDAWN_DIR:-}" ] && [ -f "$MESA/wink/lib/emdawn.sh" ]; then
 else
     EMDAWN=${GEX_EMDAWN_DIR:-$($ROOT/web/fetch-emdawnwebgpu.sh)}
 fi
-TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-mesa-wasm/mesa-tint-pthread}
+if [ "$THREADS" = 0 ]; then
+    TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-mesa-wasm-st/mesa-tint}
+else
+    TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-mesa-wasm/mesa-tint-pthread}
+fi
 TINT_TMP=${GEX_MESA_TINT_TMP:-${TMPDIR:-/tmp}/gex-mesa-tint-build}
 
 command -v meson >/dev/null 2>&1 || { echo "need meson" >&2; exit 1; }
@@ -60,14 +75,15 @@ if [ -z "${GEX_MESA_TINT:-}" ] && [ -f "$MESA/wink/lib/tint.sh" ]; then
     WINK_CACHE=${GEX_MESA_WINK_CACHE:-${TMPDIR:-/tmp}/gex-mesa-wink-cache}
     EMSDK_ROOT=$(CDPATH='' cd -- "$(dirname "$(command -v emcc)")/../.." && pwd)
     tint_log=$(EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma -Wno-lifetime-safety-intra-tu-suggestions" \
-        WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=mt --until=tint \
+        WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=$VARIANT --until=tint \
         --cache="$WINK_CACHE" --build-dir="$WINK_CACHE/build" --jobs="${JOBS:-$(nproc)}" \
         --emsdk="$EMSDK_ROOT" 2>&1) || { echo "$tint_log" | tail -20 >&2; exit 1; }
-    TINT_OUT=$(echo "$tint_log" | sed -n 's/^\[tint\/mt\] \(ready\|cached\) at //p' | tail -1)
+    TINT_OUT=$(echo "$tint_log" | sed -n "s/^\[tint\/$VARIANT\] \(ready\|cached\) at //p" | tail -1)
     [ -f "$TINT_OUT/libtint.a" ] || { echo "$tint_log" | tail -20 >&2; echo "no Tint from wink/build.sh" >&2; exit 1; }
 fi
 [ -f "$TINT_OUT/libtint.a" ] || {
-    OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP" KEEP_TMP=true WASM_THREADS=true \
+    WT=true; [ "$THREADS" = 0 ] && WT=false
+    OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP-$VARIANT" KEEP_TMP=true WASM_THREADS=$WT \
         "$ROOT/web/tint/build-tint.sh"
 }
 
@@ -133,6 +149,7 @@ fi
 # the build directory while the site served whatever had last been copied by
 # hand -- which looks exactly like a change that did not work.
 PUB="$ROOT/web/public/gex"
+[ "$THREADS" = 0 ] && [ -d "$PUB" ] && PUB="$PUB/st" && mkdir -p "$PUB"
 if [ -d "$PUB" ]; then
     for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
         [ -f "$BUILD/src/gallium/targets/gex-wasm/$f" ] || continue

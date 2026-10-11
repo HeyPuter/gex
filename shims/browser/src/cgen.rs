@@ -1764,6 +1764,31 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     });
 }
 
+/// `execve`: the old program's code is all gone, whatever reuses its
+/// addresses next. Before exec reused the dead arena (`do_exec`), nothing new
+/// could land there and stale entries were unreachable; now the old code
+/// ranges are retired as an unmap retires them (every tier: a provider's
+/// address in the old program is nothing in the new one), the providers' own
+/// bookkeeping is cleared, and the replaced libraries' provider installs are
+/// killed (`FuncMap::kill_module`) so a Worker started later does not
+/// instantiate them.
+pub(crate) fn on_exec(old_code: &[(u64, u64)]) {
+    on_retire_pages(old_code, old_code);
+    let dead = libprov::on_exec(old_code);
+    elfprov::on_exec();
+    let memory = crate::guest_bytes();
+    ftab(|m| {
+        for &(start, end) in old_code {
+            for (a, _) in m.retire_range(start, end) {
+                gex_kernel::ftab::fcache_clear(memory, a);
+            }
+        }
+        for n in dead {
+            m.kill_module(PROVIDER | n);
+        }
+    });
+}
+
 fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };

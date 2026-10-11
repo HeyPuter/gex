@@ -316,6 +316,44 @@ impl MemoryMap {
         self.arena.clear();
     }
 
+    /// The arena spans this map has been handed (sorted, disjoint).
+    pub fn arena_spans(&self) -> &[(u64, u64)] {
+        &self.arena
+    }
+
+    /// Give this map arena that is backed already and holds nothing anyone
+    /// uses: an `execve`'s dead address space (the old image's mappings, and a
+    /// forked child's inherited copy of its parent's). Without it the new
+    /// program's mappings all go above the old ones, and a program exec'd from
+    /// a fork of a large parent (node's child_process: a 1.3 GiB parent) ran
+    /// against the 2 GiB ceiling at twice the time. Nothing here is known to be
+    /// zero, so an anonymous `mmap` zeroes what it hands out of these, page by
+    /// page, as it would any reused hole.
+    pub fn donate_arena(&mut self, spans: &[(u64, u64)]) {
+        for &(lo, hi) in spans {
+            let (lo, hi) = (page_align_up(lo), page_align_down(hi));
+            if lo >= hi {
+                continue;
+            }
+            self.mark_dirty(lo, hi);
+            let at = self.arena.partition_point(|&(s, _)| s < lo);
+            // Disjoint from what is there already, or not given at all.
+            if at > 0 && self.arena[at - 1].1 > lo {
+                continue;
+            }
+            if at < self.arena.len() && self.arena[at].0 < hi {
+                continue;
+            }
+            self.arena.insert(at, (lo, hi));
+            if at + 1 < self.arena.len() && self.arena[at + 1].0 == hi {
+                self.arena[at].1 = self.arena.remove(at + 1).1;
+            }
+            if at > 0 && self.arena[at - 1].1 == lo {
+                self.arena[at - 1].1 = self.arena.remove(at).1;
+            }
+        }
+    }
+
     /// The address one past the highest byte in use, which is how much memory
     /// a process actually needs.
     pub fn high_water(&self) -> u64 {
@@ -1037,6 +1075,39 @@ mod tests {
         for k in kept {
             assert_eq!(k % HEAP, 0);
         }
+    }
+
+    /// An exec's dead address space, donated back, is used before the arena
+    /// grows again, and is never taken for zero.
+    #[test]
+    fn donated_arena_is_used_before_growing() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x5000_0000, std::sync::atomic::Ordering::SeqCst);
+
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        m.mark_clean(0x1000_0000, 0x1800_0000);
+        // Two touching spans merge; an overlapping one and an unaligned
+        // sliver are ignored.
+        m.donate_arena(&[
+            (0x1000_0000, 0x1400_0000),
+            (0x1400_0000, 0x1800_0000),
+            (0x1200_0000, 0x1300_0000),
+            (0x2000_0100, 0x2000_0200),
+        ]);
+        assert_eq!(m.arena_spans(), &[(0x1000_0000, 0x1800_0000)]);
+        // Donated memory held something: none of it is known zero.
+        assert!(m.clean_ranges().iter().all(|&(s, e)| e <= 0x1000_0000 || s >= 0x1800_0000));
+
+        let got = m.mmap(0, 64 << 20, 0, 0, "heap").unwrap() as u64;
+        assert!((0x1000_0000..0x1800_0000).contains(&got), "mapped at {got:#x}");
+        assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), 0x5000_0000);
     }
 
     /// `MAP_FIXED_NOREPLACE` refuses any existing mapping, reservations

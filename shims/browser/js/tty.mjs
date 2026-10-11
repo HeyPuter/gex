@@ -13,6 +13,11 @@
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
 import { lazyFetch } from './lazy-fetch.mjs';
+import { single, sched } from './single.mjs';
+
+/** The single-thread build's fibers park on the scheduler, not on the
+ *  kernel's wake word: whatever this file changes in the kernel wakes them. */
+const poke = () => { if (single.on) sched.wake(); };
 
 /// Where the page writes bytes for the kernel to copy out of. The kernel
 /// imports the calling process's memory and addresses it with `memory.copy`;
@@ -125,6 +130,7 @@ export class PageTty {
       this.#bytes().set(chunk, SCRATCH);
       queued = this.#k.k_tty_input(SCRATCH, chunk.length);
     }
+    poke();
     return queued;
   }
 
@@ -161,6 +167,7 @@ export class PageTty {
   eof() {
     this.#k.k_stdin_eof();
     this.#k.k_wake?.();
+    poke();
   }
 
   /** `c_lflag`, which says whether the guest has taken over line editing. */
@@ -186,7 +193,9 @@ export class PageTty {
    */
   resize(rows, cols) {
     const packed = (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n);
-    return this.#k.k_tty_resize(packed) !== 0;
+    const r = this.#k.k_tty_resize(packed) !== 0;
+    poke();
+    return r;
   }
 
   /** The foreground process group, or 0 before a shell has claimed one. */
@@ -196,6 +205,8 @@ export class PageTty {
 
   /** Raise a signal on the foreground group, for what no key stands for. */
   signal(signo) {
-    return this.#k.k_tty_signal(signo >>> 0);
+    const r = this.#k.k_tty_signal(signo >>> 0);
+    poke();
+    return r;
   }
 }

@@ -21,6 +21,8 @@ function narrate(text) {
  * that already matched its output has stopped reading. A hook, not prose
  * scraping, which fails open. See task 146.
  */
+import { single } from './single.mjs';
+
 function crashed(what) {
   try {
     globalThis.GEX_ON_CRASH?.(what);
@@ -71,7 +73,9 @@ export class ProcessHost {
   /// parent that waited for its child could otherwise print first.
   #outputAcks = new WeakMap();
   #outputAck(w) {
-    if (typeof SharedArrayBuffer === 'undefined') return undefined;
+    // Fibers (the single-thread build) deliver in order through one queue,
+    // and could not wait for an ack on the thread that delivers it anyway.
+    if (single.on || typeof SharedArrayBuffer === 'undefined') return undefined;
     const a = new Int32Array(new SharedArrayBuffer(4));
     this.#outputAcks.set(w, a);
     return a.buffer;

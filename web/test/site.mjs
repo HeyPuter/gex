@@ -14,7 +14,8 @@ import { Cdp, browserWsUrl } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
-const DIST = join(WEB, 'dist');
+// `GEX_DIST=web/dist-sp` tests the single-thread build's dist.
+const DIST = process.env.GEX_DIST || join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 // A site to test other than the built one; requests are passed through and
 // only the HTML is touched, to add the reporter.
@@ -201,8 +202,8 @@ if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
 // A stale `dist` proves nothing: `vite build` copies `web/public` into `dist`,
 // so refuse to run if the dist shim is older than the one in public.
 if (!UPSTREAM) {
-  const distShim = join(DIST, 'gex/gex_browser.wasm');
-  const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.wasm', import.meta.url));
+  const distShim = join(DIST, 'gex/gex_browser.shared.wasm');
+  const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.shared.wasm', import.meta.url));
   const [d, p] = await Promise.all([
     stat(distShim).catch(() => null),
     stat(pubShim).catch(() => null),
@@ -211,7 +212,7 @@ if (!UPSTREAM) {
     skip(
       `${DIST} is older than the runtime it should contain `
       + `(dist ${new Date(d.mtimeMs).toISOString()}, `
-      + `public ${new Date(p.mtimeMs).toISOString()}) -- run \`npm run build\`, `
+      + `public ${new Date(p.mtimeMs).toISOString()}) -- run web/build-all.sh, `
       + 'or point this at a dev server with GEX_SITE=http://localhost:5173',
     );
   }
@@ -445,8 +446,11 @@ const server = createServer(async (req, res) => {
         'content-type': type,
         // Added here so a dev server that forgets them still gets a
         // `SharedArrayBuffer` -- a different failure, worth telling apart.
-        'Cross-Origin-Opener-Policy': 'same-origin',
-        'Cross-Origin-Embedder-Policy': 'require-corp',
+        // Not with `GEX_NO_COI=1`, as for the built site below.
+        ...(process.env.GEX_NO_COI ? {} : {
+          'Cross-Origin-Opener-Policy': 'same-origin',
+          'Cross-Origin-Embedder-Policy': 'require-corp',
+        }),
       });
       res.end(html ? Buffer.from(body.toString() + reporter()) : body);
     } catch (e) {
@@ -466,10 +470,15 @@ const server = createServer(async (req, res) => {
     if (name === '/index.html') body = Buffer.from(body.toString() + reporter());
     // Cross-origin isolation: the page needs a `SharedArrayBuffer` for the
     // global kernel's memory, and without these headers it is not defined.
+    // `GEX_NO_COI=1` leaves them off, as any static host would: the page then
+    // has no SharedArrayBuffer and runs the single-thread build
+    // (docs/single-thread.md).
     res.writeHead(200, {
       'content-type': TYPES[extname(name)] || 'application/octet-stream',
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
+      ...(process.env.GEX_NO_COI ? {} : {
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+      }),
     });
     res.end(body);
   } catch {
@@ -596,6 +605,11 @@ for (const id of list) {
       '--no-sandbox',
       '--disable-gpu-sandbox',
       '--enable-unsafe-swiftshader',
+      // GEX_WEBGPU_SOFTWARE=1: WebGPU on SwiftShader, as drive.mjs does, so
+      // gears runs on a host with no GPU.
+      ...(process.env.GEX_WEBGPU_SOFTWARE === '1'
+        ? ['--enable-unsafe-webgpu', '--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader']
+        : []),
       // Without this the page's console goes nowhere, so a demo that throws
       // before running a byte fails as "timeout, last status: (none)".
       '--enable-logging=stderr',

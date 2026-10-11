@@ -16,16 +16,28 @@ set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-[ -d "$HERE/dist" ] || exit 0
+# web/build-all.sh rebuilds the dists itself once its steps are done.
+[ -z "${GEX_NO_REFRESH_DIST:-}" ] || exit 0
+
+# One dist per flavour (web/build-all.sh): web/dist (MP) and web/dist-sp (SP).
+# Each that exists is rebuilt from web/public the way build-all.sh makes it.
+flavours=""
+[ -d "$HERE/dist" ] && flavours="$flavours mp"
+[ -d "$HERE/dist-sp" ] && flavours="$flavours sp"
+[ -n "$flavours" ] || exit 0
 
 if [ -d "$HERE/node_modules" ] && command -v npm >/dev/null 2>&1; then
-    if (cd "$HERE" && npm run --silent build >/dev/null 2>&1); then
-        echo "  web/dist: rebuilt"
+    ok=1
+    for f in $flavours; do
+        "$HERE/build-all.sh" --$f --dist-only >/dev/null 2>&1 || ok=0
+    done
+    if [ $ok = 1 ]; then
+        echo "  web/dist*: rebuilt ($flavours )"
         exit 0
     fi
-    echo "  web/dist: vite build failed" >&2
+    echo "  web/dist*: build failed" >&2
 fi
 
-rm -rf "$HERE/dist"
-echo "  web/dist: removed -- it was older than what was just installed." >&2
-echo "  Run 'npm run build' in web/ to make it again." >&2
+rm -rf "$HERE/dist" "$HERE/dist-sp"
+echo "  web/dist, web/dist-sp: removed -- they were older than what was just installed." >&2
+echo "  Run web/build-all.sh to make them again." >&2

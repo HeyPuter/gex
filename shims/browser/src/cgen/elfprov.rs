@@ -199,6 +199,16 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
     }
 }
 
+/// `execve`: the old program's bindings go with it (see `cgen::on_exec`).
+/// Left, a miss at one of their addresses -- which the new program may now
+/// hold other code at -- was re-bridged to the old provider.
+pub(crate) fn on_exec() {
+    lock(&BOUND).clear();
+    lock(&QUEUE).clear();
+    lock(&REBRIDGE).clear();
+    lock(&REBRIDGED).clear();
+}
+
 /// The next provider-only unit for JS to serve (`#cgenProviders`), or -1.
 /// Asked before a Worker's guest first runs, so a forked child binds what
 /// it inherited.
@@ -227,6 +237,7 @@ static REBRIDGED: Mutex<Vec<(u64, u32, u64)>> = Mutex::new(Vec::new());
 /// held and something else took it later, rather than a slot that never
 /// keeps it.
 const REBRIDGE_PROGRESS: u64 = 16;
+use gex_kernel::ftab::REBRIDGE_LIMIT;
 
 /// A dispatch miss at an address a provider holds: its slot lost the bridge
 /// (a forked child instantiating a module it inherited, which fills the
@@ -258,9 +269,14 @@ pub(crate) fn rebridge(pc: u64) -> bool {
                 1
             }
         };
-        if n > 64 {
+        if gex_kernel::ftab::rebridge_gives_up(pc, n) {
             crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
             return false;
+        }
+        if n > REBRIDGE_LIMIT {
+            if n == REBRIDGE_LIMIT + 1 {
+                crate::trace_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; not liftable, bridging it again\n"));
+            }
         }
     }
     let (regs, _, slots) = super::bridges(&[pc]);
