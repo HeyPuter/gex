@@ -357,10 +357,12 @@ The final list (6,143 functions), pages against master's Mesa, ABBA
 | | 2 | split | (42.3: HK went into a NullReferenceException loop in Unity's TickRealtimeProbes; excluded) | prefetched (90.7 ms), never missed |
 | | 3 | split | 14.7 14.7 14.6 14.6 | prefetched (121.3 ms), never missed |
 | | 4 | master's | 13.6 13.5 13.7 13.9 | none |
+| HK (j8, for run 2) | 5 | split | 14.2 14.5 14.7 15.1 | prefetched (115.4 ms), never missed |
+| | 6 | master's | 13.4 13.7 13.9 13.8 | none |
 
-Muck's split is 1.5% faster (11.03 against 10.86). HK's one good split run
-is 4.5% faster than master's two (14.65 against 14.01), inside the spread
-of master's own runs (14.35 and 13.68). HK run 2's split never missed, so
+Muck's split is 1.5% faster (11.03 against 10.86). HK's split is 5.2%
+faster (14.64 against 13.91, two runs against three), about the spread
+of master's own runs (14.35 to 13.68). HK run 2's split never missed, so
 no cold function ran in it and the Mesa code it ran was the same as in run
 3: the exception loop is HK's, not the split's. With the final list
 neither page missed in any run; the prefetch, about 0.1 s of fetch and
@@ -417,6 +419,11 @@ A miss while the prefetch is still compiling does not wait for it (a
 synchronous call cannot): it fetches and compiles again.
 
 ### Testing it
+
+The gate leg, after `web/build-all.sh --both`, on any host (SwiftShader):
+`tests/mesa-cold/gate.sh` runs the two below on the mt and st builds and
+the SP dist, and prints `ok   mesa-cold gate: 3/3`. MP gears needs a GPU
+(`web/test/site.mjs gears` on web/dist, on the bench box: `ok site-gears`).
 
 `node tests/mesa-cold/run.mjs [TARGET_DIR]` (GEX_WEBGPU_SOFTWARE=1 on a host
 without a GPU) replays the gears trace through the build's Mesa whole, split,
