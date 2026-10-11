@@ -228,7 +228,9 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     };
     let Ok(pe) = gex_ld::pe::parse(&bytes) else { return -1 };
     if !is_skeleton(&pe) {
-        return -1;
+        // An i386 image (the program's, a game's DLL): its function-tier
+        // unit, when units are on; -2 tells JS to serve it.
+        return if super::w3_mapped(&path, base, &pe) { -2 } else { -1 };
     }
     match publish(&path, base, &pe) {
         Ok(n) => n,

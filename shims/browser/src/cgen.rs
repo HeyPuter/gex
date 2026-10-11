@@ -276,6 +276,32 @@ pub(crate) fn drain() -> bool {
     !lock(&WANTED).is_empty()
 }
 
+/// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
+/// (`gex.image_mapped`, not a wasm32 skeleton), placed as the NT layer's
+/// are (the native host's `nt_cgen::w3_image` with `GEX_W3_UNITS=all`).
+/// Never fatal: an image whose mapped code differs from its bytes (one
+/// Wine relocates later) or with no unit stays on tier-1. Returns whether
+/// a unit now waits for JavaScript.
+pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
+    if !on() {
+        return false;
+    }
+    let (image, _) = match gex_xlate::func::pe_input(pe, base) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    let memory = crate::guest_bytes();
+    for seg in image.segments.iter().filter(|s| s.executable) {
+        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+        if memory.get(lo..lo + n).is_none_or(|live| live != &seg.bytes[..]) {
+            crate::warn_line(&format!("gex-w3: {path} at {base:#x}: its mapped code is not the image's (relocated); tier-1\n"));
+            return false;
+        }
+    }
+    place(&image, path, base, true, Some(pe));
+    !lock(&WANTED).is_empty()
+}
+
 /// Want the unit for `image`, mapped at `base`: its key, and the check that
 /// the mapped code is what the unit was built from (a mismatch ends the run,
 /// as natively: a unit over different code is wrong code). `optional`: a

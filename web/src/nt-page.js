@@ -111,6 +111,8 @@ async function main() {
   // `?trapstack=1`: a trap's wasm frames, which name the shim function it
   // was in (runtime.js passes the switch to every Worker).
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  // `heartbeat=N`: say where the guest is every N safepoints (a stuck run from a slow one).
+  if (q.get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(q.get('heartbeat'));
   // `?mem64=1`: a 64-bit guest memory (the wasm64 shim; docs/mem64.md step 6).
   if (q.get('mem64') === '1') globalThis.GEX_MEM64 = 1;
   // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs).
