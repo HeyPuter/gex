@@ -873,8 +873,9 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> 
 // keep (`k_store_save`) and laid back in by the next load's first process
 // before anything allocates a slot (`k_store_restore`). Keys are SipHash of a
 // file path (and offset); each key is tied to its path, and each path to the
-// size and mtime the file had, so a restore drops what belongs to a file that
-// is no longer the same (the first process checks, `k_store_path_ok`).
+// size and mtime the file had, so what belongs to a file that is no longer
+// the same is dropped: checked when a process first computes one of its keys
+// (`k_key_path`), not at restore, when the file may not be there yet.
 
 /// A path some key was computed from, as the file was then.
 struct XPath {
@@ -893,10 +894,13 @@ struct XCache {
     saved_mods: usize,
     saving: bool,
     out: Vec<u8>,
-    /// A load's saved bytes, and per path whether the file is still the same.
+    /// A load's saved bytes.
     inbuf: Vec<u8>,
-    in_paths: Vec<XPath>,
-    in_ok: Vec<bool>,
+    /// Restored keys whose file no process has looked at yet: each is checked
+    /// (size and mtime) the first time a process computes it (`k_key_path`),
+    /// since the files are often not there at restore -- the page installs
+    /// its packages after pid 1 starts.
+    pending: BTreeSet<u64>,
     restored: bool,
 }
 
@@ -913,12 +917,72 @@ const XC_MAX_BYTES: usize = MOD_BUDGET;
 
 /// Key `key` was computed from `path`, whose file has `size` and `mtime`
 /// (`size` `u64::MAX`: no file to check, so the key is never restored).
+///
+/// For a restored key not yet checked, also the check: the same size and
+/// mtime confirm every restored key of that path (returns 1); anything else
+/// drops their translations, claims and slots (returns -1, the path's
+/// record then takes the file as it is now). Otherwise 0.
 #[no_mangle]
-pub extern "C" fn k_key_path(key: u64, path: gex_kmem::PAddr, len: u32, size: u64, mtime: i64) {
+pub extern "C" fn k_key_path(key: u64, path: gex_kmem::PAddr, len: u32, size: u64, mtime: i64) -> i32 {
     let p = path_of_raw(path, len);
     let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+    if x.pending.contains(&key) {
+        // Again in `k_store_restore`'s order (modules, xcache, slots), which
+        // only a check needs; another Worker may have done it meanwhile.
+        drop(x);
+        let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+        x = xcache().lock().unwrap_or_else(|e| e.into_inner());
+        if !x.pending.contains(&key) {
+            return 0;
+        }
+        let ix = x.keys[&key];
+        let same = {
+            let r = &x.paths[ix as usize];
+            size != u64::MAX && r.path == p && r.size == size && r.mtime == mtime
+        };
+        let of_path: Vec<u64> = x.keys.iter().filter(|&(k, &i)| i == ix && x.pending.contains(k)).map(|(k, _)| *k).collect();
+        for k in &of_path {
+            x.pending.remove(k);
+        }
+        if same {
+            return 1;
+        }
+        let mut sl = slots().lock().unwrap_or_else(|e| e.into_inner());
+        let gone: BTreeSet<u64> = of_path.into_iter().collect();
+        sl.retain(|(_, k), _| !gone.contains(k));
+        let mut freed: Vec<u32> = Vec::new();
+        m.by_page.retain(|(_, k), ids| {
+            let keep = !gone.contains(k);
+            if !keep {
+                freed.extend(ids.iter().copied());
+            }
+            keep
+        });
+        for k in &gone {
+            if let Some(ids) = m.by_object.remove(k) {
+                freed.extend(ids);
+            }
+            m.translated.remove(k);
+        }
+        if !freed.is_empty() {
+            let named: BTreeSet<u32> = m.by_page.values().chain(m.by_object.values()).flatten().copied().collect();
+            for id in freed {
+                if named.contains(&id) {
+                    continue;
+                }
+                let Some(sm) = m.mods.get_mut((id as usize).wrapping_sub(1)) else { continue };
+                let n = sm.wasm.len();
+                sm.wasm = Vec::new();
+                m.total -= n;
+            }
+        }
+        let r = &mut x.paths[ix as usize];
+        r.size = size;
+        r.mtime = mtime;
+        return -1;
+    }
     if x.keys.contains_key(&key) {
-        return;
+        return 0;
     }
     let ix = match x.path_ix.get(&p) {
         Some(&i) => i,
@@ -930,6 +994,7 @@ pub extern "C" fn k_key_path(key: u64, path: gex_kmem::PAddr, len: u32, size: u6
         }
     };
     x.keys.insert(key, ix);
+    0
 }
 
 struct W(Vec<u8>);
@@ -1061,86 +1126,25 @@ pub extern "C" fn k_store_save_done() {
 }
 
 /// Room for a load's saved bytes, in this memory: the host copies them to the
-/// address returned, then the first process checks the paths and restores.
+/// address returned, then the first process restores (`k_store_restore`).
 #[no_mangle]
 pub extern "C" fn k_store_restore_buf(len: u32) -> u32 {
     let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
     x.inbuf = vec![0u8; len as usize];
-    x.in_paths.clear();
-    x.in_ok.clear();
     x.inbuf.as_ptr() as u32
 }
 
-/// How many paths the saved bytes name (and parse them); negative when the
-/// bytes are not a cache this kernel reads.
+/// Whether this load restored a store (its keys are then checked on first use).
 #[no_mangle]
-pub extern "C" fn k_store_path_count() -> i32 {
-    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
-    let parsed = {
-        let mut r = R(&x.inbuf, 0);
-        (|| {
-            if r.take(8)? != XC_MAGIC {
-                return None;
-            }
-            let n = r.u32()?;
-            let mut v = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                let path = String::from_utf8(r.bytes()?).ok()?;
-                let size = r.u64()?;
-                let mtime = r.u64()? as i64;
-                v.push(XPath { path, size, mtime });
-            }
-            Some(v)
-        })()
-    };
-    match parsed {
-        Some(v) => {
-            x.in_ok = vec![false; v.len()];
-            x.in_paths = v;
-            x.in_paths.len() as i32
-        }
-        None => -1,
-    }
+pub extern "C" fn k_xcache_restored() -> u32 {
+    xcache().lock().unwrap_or_else(|e| e.into_inner()).restored as u32
 }
 
-/// Saved path `i` into the caller's memory at `at` (its length; zero when it
-/// does not fit), with its saved size and mtime through the two getters.
-#[no_mangle]
-pub extern "C" fn k_store_path(i: u32, at: gex_kmem::PAddr, cap: u32) -> u32 {
-    let x = xcache().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(p) = x.in_paths.get(i as usize) else { return 0 };
-    let b = p.path.as_bytes();
-    if b.len() > cap as usize || b.is_empty() {
-        return 0;
-    }
-    unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
-    b.len() as u32
-}
-
-#[no_mangle]
-pub extern "C" fn k_store_path_size(i: u32) -> u64 {
-    xcache().lock().unwrap_or_else(|e| e.into_inner()).in_paths.get(i as usize).map_or(u64::MAX, |p| p.size)
-}
-
-#[no_mangle]
-pub extern "C" fn k_store_path_mtime(i: u32) -> i64 {
-    xcache().lock().unwrap_or_else(|e| e.into_inner()).in_paths.get(i as usize).map_or(0, |p| p.mtime)
-}
-
-/// Path `i`'s file is the one it was.
-#[no_mangle]
-pub extern "C" fn k_store_path_ok(i: u32, ok: u32) {
-    let mut x = xcache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = x.in_ok.get_mut(i as usize) {
-        *v = ok != 0;
-    }
-}
-
-/// Lay the saved store in: slot map, mark, modules, claims, with everything
-/// keyed by a path not confirmed (`k_store_path_ok`) left out. Only into an
-/// empty store with nothing allocated, once. Returns the modules restored
-/// with bytes, or negative: -1 not a cache, -2 too late (something is in the
-/// store or the slot map, or a slot was handed out), -3 restored before.
+/// Lay the saved store in: slot map, mark, modules, claims, every key pending
+/// its file's check (`k_key_path`). Only into an empty store with nothing
+/// allocated, once. Returns the modules restored with bytes, or negative: -1
+/// not a cache, -2 too late (something is in the store or the slot map, or a
+/// slot was handed out), -3 restored before.
 #[no_mangle]
 pub extern "C" fn k_store_restore() -> i32 {
     let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
@@ -1154,33 +1158,34 @@ pub extern "C" fn k_store_restore() -> i32 {
     }
     x.restored = true;
     let inbuf = std::mem::take(&mut x.inbuf);
-    let in_paths = std::mem::take(&mut x.in_paths);
-    let in_ok = std::mem::take(&mut x.in_ok);
     let mut r = R(&inbuf, 0);
     let res = (|| -> Option<i32> {
         if r.take(8)? != XC_MAGIC {
             return None;
         }
         let n = r.u32()?;
+        let mut in_paths = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            r.bytes()?;
-            r.u64()?;
-            r.u64()?;
+            let path = String::from_utf8(r.bytes()?).ok()?;
+            let size = r.u64()?;
+            let mtime = r.u64()? as i64;
+            in_paths.push(XPath { path, size, mtime });
         }
-        // Keys whose file is still the same, carried on for the next save.
+        // Every key with a file to check (keys saved without one are left
+        // out), pending that check.
         let mut good: BTreeSet<u64> = BTreeSet::new();
         let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
         for _ in 0..r.u32()? {
             let k = r.u64()?;
             let i = r.u32()?;
-            if !in_ok.get(i as usize).copied().unwrap_or(false) {
+            let p = in_paths.get(i as usize)?;
+            if p.size == u64::MAX {
                 continue;
             }
             good.insert(k);
             let ix = match remap.get(&i) {
                 Some(&j) => j,
                 None => {
-                    let p = &in_paths[i as usize];
                     let j = x.paths.len() as u32;
                     x.paths.push(XPath { path: p.path.clone(), size: p.size, mtime: p.mtime });
                     x.path_ix.insert(p.path.clone(), j);
@@ -1189,6 +1194,7 @@ pub extern "C" fn k_store_restore() -> i32 {
                 }
             };
             x.keys.insert(k, ix);
+            x.pending.insert(k);
         }
         for _ in 0..r.u32()? {
             let page = r.u64()?;
@@ -1278,6 +1284,10 @@ pub extern "C" fn k_store_restore() -> i32 {
             m.translated.clear();
             m.total = 0;
             sl.clear();
+            x.keys.clear();
+            x.paths.clear();
+            x.path_ix.clear();
+            x.pending.clear();
             x.saved_mods = 1;
             -1
         }

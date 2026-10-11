@@ -35,7 +35,7 @@ check() { # NAME WANT-VALUE WANT-RESTORE(regex) OUTPUT
 expect() { echo "$(( (1000 / 7) * 21 * $1 + (1000 % 7) * ((1000 % 7) - 1) / 2 * $1 + $1 ))"; }
 a=$(run); check "cold run saves" "$(expect 1)" 'xcache gate: saved' "$a"
 b=$(run); check "warm run restores" "$(expect 1)" 'restored [1-9][0-9]* modules' "$b"
-grep -aq 'files unchanged' <<<"$b" && grep -aq ' 0 of ' <<<"$(grep -a 'files unchanged' <<<"$b")" && { echo "FAIL warm run: no file unchanged"; fail=1; }
+grep -aq 'changed since the save' <<<"$b" && { echo "FAIL warm run: a file it did not touch counted as changed"; fail=1; }
 sleep 1.1
 lib 2
 c=$(run); check "a replaced library is not served stale" "$(expect 2)" 'libt.so changed since the save' "$c"
