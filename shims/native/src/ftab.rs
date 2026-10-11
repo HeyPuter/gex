@@ -883,10 +883,27 @@ fn run_job(j: &Job) -> Result<bool> {
     let t0 = std::time::Instant::now();
     let t = tr.translate(&req);
     stats::TRANSLATE_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-    let Some(t) = t else { return Ok(false) };
-    let funcs = gex_kernel::ftab::module_funcs(&t.wasm).ok_or_else(|| anyhow!("a translation for {addr:#x} has no gex.funcs section"))?;
+    // Declined (or not holding `addr`): the pages `page_gen` numbered for it
+    // still get their directory entries, as a publication would give them.
+    // Otherwise the page has a base and no entry, tier-1's translation of
+    // the address (into that base: not a fresh page, so no entry of its
+    // own) is never reached, and the miss repeats for ever ("translated but
+    // missed dispatch ... retranslation livelock"), as when the emitter
+    // leaves a function over V8's size limit to tier-1.
+    let declined = |why: Option<String>| -> Result<bool> {
+        let numbered = pages.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        publish_bridges(sh, &[], &numbered)?;
+        match why {
+            Some(w) => bail!("{w}"),
+            None => Ok(false),
+        }
+    };
+    let Some(t) = t else { return declined(None) };
+    let Some(funcs) = gex_kernel::ftab::module_funcs(&t.wasm) else {
+        return declined(Some(format!("a translation for {addr:#x} has no gex.funcs section")));
+    };
     if !funcs.contains(&addr) {
-        bail!("the translation for {addr:#x} does not hold it");
+        return declined(Some(format!("the translation for {addr:#x} does not hold it")));
     }
     let t1 = std::time::Instant::now();
     let module = compile_translation(j, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;

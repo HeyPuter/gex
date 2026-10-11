@@ -467,14 +467,34 @@ fn translate_root(addr: u64) -> Option<u32> {
     };
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
     trace(&format!("translate {addr:#x}"));
-    let Some(wasm) = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32) else {
+    // Declined (or not holding `addr`): the pages numbered for it get their
+    // directory entries anyway, as an install would give them. A page with a
+    // base and no entry strands tier-1's blocks there (they go into that
+    // base, which is not fresh, so their unit writes no entry for it) --
+    // natively a livelock once the emitter left a function over V8's size
+    // limit to tier-1 (gex-fjit `max_body_bytes`); here the miss path's
+    // reconcile covers the faulting page, not the others.
+    let declined = |fresh: Vec<(u64, u32)>| {
         DECLINED.fetch_add(1, Ordering::Relaxed);
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        for (p, b) in fresh {
+            let at = gex_abi::DISPATCH_DIR + p * 4;
+            if gm.read_u32(at).unwrap_or(0) == 0 {
+                let _ = gm.write_u32(at, b);
+            }
+        }
+    };
+    let Some(wasm) = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32) else {
         trace(&format!("declined {addr:#x}"));
+        declined(fresh.into_inner());
         return None;
     };
-    let funcs = gex_kernel::ftab::module_funcs(&wasm)?;
+    let Some(funcs) = gex_kernel::ftab::module_funcs(&wasm) else {
+        declined(fresh.into_inner());
+        return None;
+    };
     if !funcs.contains(&addr) {
-        DECLINED.fetch_add(1, Ordering::Relaxed);
+        declined(fresh.into_inner());
         return None;
     }
     note_object(addr, funcs.len(), wasm.len());
