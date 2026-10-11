@@ -49,6 +49,14 @@ GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" 
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit10.txt 2>&1 || true
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit10.txt || { echo "FAIL (wasm JIT, threshold 10): no '$p'"; exit 1; }; done
 if grep -a -q '^WASM_JIT_INVALID' wasmjit10.txt; then echo "FAIL (wasm JIT, threshold 10): a module did not validate"; grep -a '^WASM_JIT_INVALID' wasmjit10.txt | head -3 | cut -c1-200; exit 1; fi
+# The worker thread under load (EMBED_WORKER_STRESS: 10 times its rounds and the main thread's
+# collections): a provider call's result in rax was overwritten by a syscall in the runtime's GC-safe
+# transition on the way back to the guest (a futex while another thread collected), so the worker
+# saw NULL from Make and from mono_string_to_utf8 in about 1 run in 20 (every run under this load).
+GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" run --mem64 \
+	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=2 --env EMBED_WORKER_STRESS=10 \
+	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > stress.txt 2>&1 || true
+grep -a -q -x -F "worker thread: 0 bad of 640" stress.txt || { echo "FAIL (worker under load)"; grep -a '^worker' stress.txt | head -3; exit 1; }
 # The liveness walk as it was before the class shapes (field metadata per object): the same set.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_LV_NOSHAPE=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > noshape.txt 2>&1 || true

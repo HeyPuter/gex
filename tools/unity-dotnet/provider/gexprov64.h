@@ -94,7 +94,15 @@ static inline uint64_t gexp_arg_win64(int ctx, unsigned i)
  * one the caller predicted (`ret`), as every F_body reports. */
 static inline int gexp_return(int ctx, uint64_t ret)
 {
+	/* The adapter has put the result in rax (and rdx); the runtime's hook
+	 * may make a syscall through this context (a GC-safe transition that
+	 * waits on a futex while a collection runs), and a syscall's result
+	 * lands in rax. Without this, a worker returning while another thread
+	 * collected saw 0 for its call's result. */
+	uint64_t rax = GEXP_X(ctx, 0), rdx = GEXP_X(ctx, 2);
 	gexp_to_guest();
+	GEXP_X(ctx, 0) = rax;
+	GEXP_X(ctx, 2) = rdx;
 	uint64_t sp = GEXP_X(ctx, 4);
 	uint64_t ra = GEXP_MEM64(sp);
 	GEXP_X(ctx, 4) = sp + 8;

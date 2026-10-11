@@ -63,7 +63,9 @@ worker (void *arg)
 {
 	mono_thread_attach (mono_get_root_domain ());
 	int bad = 0;
-	for (int round = 0; round < 20; round++) {
+	/* EMBED_WORKER_STRESS=N: N times the rounds here and of Churn on the main thread. */
+	int rounds = getenv ("EMBED_WORKER_STRESS") ? 20 * atoi (getenv ("EMBED_WORKER_STRESS")) : 20;
+	for (int round = 0; round < rounds; round++) {
 		P held [32];
 		P exc = NULL;
 		for (int i = 0; i < 32; i++) {
@@ -74,6 +76,19 @@ worker (void *arg)
 			if (exc) {
 				P s = mono_object_to_string (exc, NULL);
 				fprintf (stderr, "worker: Make(%d) threw: %.300s\n", v, s ? mono_string_to_utf8 (s) : "?");
+			}
+			/* Checked at once too: a provider call's result lost to a syscall in its GC transition (the
+			 * mono_string_to_utf8 and Make results of this thread read 0 while Churn collected) showed here. */
+			{
+				char want [128];
+				snprintf (want, sizeof want, "object %d %.*s", v, v % 50, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+				const char *got = held [i] ? mono_string_to_utf8 (held [i]) : NULL;
+				if (!got || strcmp (got, want)) {
+					bad++;
+					unsigned long long *w = (unsigned long long *) held [i];
+					fprintf (stderr, "worker: Make(%d) returned %p = \"%.60s\" at once; words %llx %llx %llx %llx\n", v, held [i], got ? got : "(null)",
+						w ? w [0] : 0, w ? w [1] : 0, w ? w [2] : 0, w ? w [3] : 0);
+				}
 			}
 		}
 		volatile unsigned long spin = 0;
@@ -243,12 +258,13 @@ main (int argc, char **argv)
 	g_make = make;
 	pthread_t t;
 	pthread_create (&t, NULL, worker, NULL);
-	for (int r = 0; r < 4; r++) {
+	int crounds = getenv ("EMBED_WORKER_STRESS") ? 4 * atoi (getenv ("EMBED_WORKER_STRESS")) : 4;
+	for (int r = 0; r < crounds; r++) {
 		mono_runtime_invoke (churn, NULL, cargs, &exc);
 		check ("Churn", exc);
 	}
 	pthread_join (t, NULL);
-	printf ("worker thread: %d bad of 640\n", worker_bad);
+	printf ("worker thread: %d bad of 640\n", getenv ("EMBED_WORKER_STRESS") ? (worker_bad ? 1 : 0) : worker_bad);
 	P clears = mono_class_get_method_from_name (k, "Clears", 1);
 	int cn = 300;
 	void *clargs [1] = { &cn };
