@@ -221,7 +221,7 @@ function moduleContentKey(bytes) {
   let a = 0x811c9dc5;
   let b = 0x9e3779b9;
   const n = bytes.length >>> 2;
-  const words = (bytes.byteOffset & 3) === 0 && !(bytes.buffer instanceof SharedArrayBuffer)
+  const words = (bytes.byteOffset & 3) === 0 && !isShared(bytes.buffer)
     ? new Uint32Array(bytes.buffer, bytes.byteOffset, n)
     : null;
   for (let i = 0; i < n; i++) {

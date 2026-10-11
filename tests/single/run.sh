@@ -7,7 +7,7 @@
 #     must run the single build. Each demo must pass, and the terminal must
 #     say it was the single build, so a silent fallback cannot pass.
 #
-#   tests/single/run.sh [gexc]          # demos: SP_DEMOS (default busybox debian gears)
+#   tests/single/run.sh [gexc]          # demos: SP_DEMOS (default busybox native-debian gears)
 #
 # Needs web/build-all.sh --sp (or --both) first: web/dist-sp, served
 # without COOP/COEP from its own dist. The gears demo also needs a
@@ -22,7 +22,7 @@ fail=0
 out=${WORK:-$root/target/single-test}
 mkdir -p "$out"
 [ -d "$root/web/dist-sp" ] || { echo "FAIL single-page (no web/dist-sp: run web/build-all.sh --sp)"; exit 1; }
-for d in ${SP_DEMOS:-busybox debian gears}; do
+for d in ${SP_DEMOS:-busybox native-debian gears}; do
 	(cd "$root" && GEX_DIST="$root/web/dist-sp" GEX_NO_COI=1 GEX_TAIL=0 GEX_STDERR=all node web/test/site.mjs "$d") > "$out/site-$d.txt" 2>&1; rc=$?
 	if [ $rc = 0 ] && grep -aq 'single-thread build (no SharedArrayBuffer)' "$out/site-$d.txt"; then
 		echo "ok   single-page $d"
