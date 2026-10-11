@@ -131,6 +131,21 @@ measurable cost below.)
 | + Tint's SPIR-V validation off (**M2 build**) | 18,655,830 | 3,296,846 | 5.114, 5.231 | 5.201, 5.161 |
 | M2 build at -Os (compile and link) | 13,158,052 | 2,798,299 | see below | see below |
 
+The CPU runs of master's second pair and the last two rows (t2, which ended
+at 05:25) overlapped another stream's Chromium left running on edger (05:17
+to 06:14), and were rerun (t2r):
+
+| build | Noita world, ms/frame | HK menu, ms/frame |
+| --- | --- | --- |
+| master (ASSERTIONS=2) | 5.106, 4.984 | 5.263, 5.232 |
+| + decoders kept apart | 5.365, 5.071 | 6.249, 6.082 |
+| M2 build | 5.292, 5.118 | 4.918, 6.527 |
+
+On this trace the HK runs of every build fall near 5.0 or near 6.2 ms/frame
+(section 4 has twenty of them), so two runs do not separate these builds;
+Noita's M2 build is 3.0% slower than master's (5.205 against 5.045), about
+its run-to-run spread.
+
 Two runs each, one per ABBA pass; master's second pair is from the second
 job (each job compares its builds against master in the same session). The
 spread between passes of one build (up to 1.1 ms on HK) is larger than any
@@ -179,16 +194,24 @@ the check only finds Mesa bugs. wink/patches/tint-spirv-reader-skip-validation.p
 makes it conditional on `TINT_SPIRV_VALIDATE=1` (read once; the replay takes
 it through `_gex_gl_setenv`, a page through `GEX_NT_PAGE_ENV`/`?env=`). Mesa
 CPU over the whole trace, where every shader translation counts, two runs
-each:
+each, ms/frame:
 
-| trace | validation off | validation on (`TINT_SPIRV_VALIDATE=1`) |
-| --- | --- | --- |
-| HK menu (3,166 frames, 49 translations) | 4.956, 4.866 ms/frame | 5.228, 5.769 |
-| Noita world (2,777 frames, 54 translations) | 4.330, 4.340 | 4.627, 4.626 |
+| trace | run | validation off | validation on (`TINT_SPIRV_VALIDATE=1`) | warm WGSL cache |
+| --- | --- | --- | --- | --- |
+| HK menu (3,166 frames, 49 translations) | first (t2b) | 4.956, 4.866 | 5.228, 5.769 | 4.768, 4.781 |
+| | rerun (t2rb) | 4.924, 5.087 | 4.941, 5.029 | 4.872, 4.741 |
+| Noita world (2,777 frames, 54 translations) | first (t2b) | 4.330, 4.340 | 4.627, 4.626 | 4.794, 4.867 |
+| | rerun (t2rb) | 4.675, 4.488 | 4.384, 4.496 | 4.910, 4.367 |
 
-Off is 0.59 ms/frame less on HK (1.9 s of Mesa CPU over the trace, 10.7%)
-and 0.29 ms/frame less on Noita (0.8 s, 6.3%). The code stays linked (the
-switch can turn it back on), so the size does not change.
+The first runs overlapped another stream's Chromium left running on edger
+(05:17 to 06:14), and the rerun does not hold them up: with validation off
+HK is 0.02 ms/frame slower (5.006 against 4.985 on, 0.4%) and Noita 0.14
+ms/frame slower (4.582 against 4.440, 3.2%), both inside the spread. Over a whole trace the
+validator's cost is lost in the noise; what it costs is time inside each
+translation (49 and 54 of them here), which an average over 3,000 frames
+dilutes. The switch stays (it costs nothing and keeps a debug check), but it
+is not a measured CPU win. The code stays linked, so the size does not
+change.
 
 ### Tint and SPIRV-Tools behind a warm WGSL cache
 
@@ -205,9 +228,12 @@ all:
 | Noita world | warm cache (54 of 54 hits) | 1,959 | 4 (0 MB) | 1 |
 
 GLSL, NIR and spirv_to_nir still run (Mesa compiles GLSL to SPIR-V before
-it looks the WGSL up). Mesa CPU with the warm cache: HK 4.768, 4.781
-ms/frame against 4.956, 4.866 cold; Noita 4.794, 4.867 against 4.330,
-4.340, which is slower and unexplained (both runs; the misses were 0).
+it looks the WGSL up). Mesa CPU with the warm cache (table above, rerun):
+HK 4.807 ms/frame against 5.006 cold, 4.0% less; Noita 4.639 against 4.582,
+1.2% more, inside its spread (4.367 to 4.910). So a shipped cache is a load
+time and stall win more than an average-CPU one, and the phase split it
+allows (Tint and SPIRV-Tools, 1.38 MB, to the cold part when a cache ships)
+is in the backlog.
 
 ## 4. The cold part (M3)
 
@@ -317,6 +343,31 @@ Binaryen at -Oz on the cold part alone takes it to 8,640,842 bytes but
 makes it 15 KB bigger compressed, so it is left at -O3.
 
 ### Speed and misses (M3, edger)
+
+The final list (6,143 functions), pages against master's Mesa, ABBA
+(j7), last-minute presents/s for each of the last four minutes:
+
+| page | run | build | presents/s | cold part |
+| --- | --- | --- | --- | --- |
+| Muck | 1 | master's | 11.1 11.0 10.9 10.4 | none |
+| | 2 | split | 11.0 11.4 11.4 10.8 | prefetched (62.4 ms), never missed |
+| | 3 | split | 10.9 11.1 11.1 10.5 | prefetched (113.0 ms), never missed |
+| | 4 | master's | 11.0 11.0 10.9 10.6 | none |
+| HK | 1 | master's | 14.2 14.4 14.3 14.5 | none |
+| | 2 | split | (42.3: HK went into a NullReferenceException loop in Unity's TickRealtimeProbes; excluded) | prefetched (90.7 ms), never missed |
+| | 3 | split | 14.7 14.7 14.6 14.6 | prefetched (121.3 ms), never missed |
+| | 4 | master's | 13.6 13.5 13.7 13.9 | none |
+
+Muck's split is 1.5% faster (11.03 against 10.86). HK's one good split run
+is 4.5% faster than master's two (14.65 against 14.01), inside the spread
+of master's own runs (14.35 and 13.68). HK run 2's split never missed, so
+no cold function ran in it and the Mesa code it ran was the same as in run
+3: the exception loop is HK's, not the split's. With the final list
+neither page missed in any run; the prefetch, about 0.1 s of fetch and
+compile in the Worker after the first frame, was all the cold part cost.
+
+The runs below are of the first list (5,912 functions), with which each
+page missed once (`_dispatch_stub_GetObjectLabelEXT`).
 
 Mesa CPU per frame, by trace replay (the last 600 frames, page main thread,
 so the cold part is loaded with the module), ms/frame, runs in alternating
