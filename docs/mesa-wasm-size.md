@@ -354,11 +354,11 @@ As the dists ship them (stripped), zstd at -19:
 | flavour | file | raw | zstd -19 |
 | --- | --- | --- | --- |
 | MP | master, whole | 18,898,007 | 3,305,617 |
-| MP | M3: gex-wgpu-replay.wasm | 9,543,153 | 1,925,046 |
-| MP | M3: gex-wgpu-replay.deferred.wasm | 10,009,210 | 1,593,492 |
+| MP | M3: gex-wgpu-replay.wasm | 9,543,153 | 1,925,010 |
+| MP | M3: gex-wgpu-replay.deferred.wasm | 10,009,210 | 1,593,506 |
 | SP | master, whole | 18,669,577 | 3,300,261 |
-| SP | M3: gex-wgpu-replay.wasm | 9,316,228 | 1,923,712 |
-| SP | M3: gex-wgpu-replay.deferred.wasm | 10,040,453 | 1,592,344 |
+| SP | M3: gex-wgpu-replay.wasm | 9,316,228 | 1,923,583 |
+| SP | M3: gex-wgpu-replay.deferred.wasm | 10,040,453 | 1,592,313 |
 
 What a page fetches and compiles before Mesa starts is 49.5% smaller raw
 than master's (9.54 against 18.90 MB) and 41.8% smaller compressed (1.93
@@ -442,6 +442,26 @@ A miss's stall, edger:
 | HK trace replay, main thread (lazy), forced late miss, no prefetch | synchronous fetch and compile | 261.7 ms |
 | the same, early miss | synchronous fetch and compile | 239.9 ms |
 | the same, late miss, prefetch still compiling | synchronous fetch and compile | 306.9 ms |
+
+On worldmachine (RX 6500 XT, AMD; never compared with edger's numbers),
+the final build, HK menu trace, page main thread:
+
+| run | build | Mesa CPU, ms/frame | cold part |
+| --- | --- | --- | --- |
+| 1 | whole (fin3) | 2.630 | none |
+| 1 | split (finsplit3) | 2.648 | loaded with the module in 60.8 ms |
+| 2 | split | 2.623 | loaded with the module in 70.0 ms |
+| 2 | whole | 2.625 | none |
+| forced miss, first frame (`_mesa_Viewport` cold, lazy, no prefetch) | split | 3.414 | fetched and compiled synchronously, 10,009,314 bytes, in 233.4 ms |
+| the same again | split | 3.256 | 232.1 ms |
+
+The split is 0.3% slower there (2.636 against 2.628 ms/frame), and loads
+cleanly on a second GPU vendor. The same runs showed each of the module's
+four pthreads prefetching its own copy of the cold part (fetch and compile,
+129 to 368 ms each, on Workers), even where the main thread had loaded it
+with the module and even with `gexNoColdPrefetch` (a pthread does not get
+the module's options). Mesa runs no code on them; the prefetch now skips
+pthreads.
 
 A miss while the prefetch is still compiling does not wait for it (a
 synchronous call cannot): it fetches and compiles again.

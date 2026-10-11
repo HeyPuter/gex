@@ -120,12 +120,13 @@ if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['instantiateWasm']) {
   };
 }
 
-if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['gexNoColdPrefetch']) {
+if (gexMesaColdSplit === 'GEX_MESA_COLD_YES' && !Module['gexNoColdPrefetch'] &&
+    !(typeof ENVIRONMENT_IS_PTHREAD !== 'undefined' && ENVIRONMENT_IS_PTHREAD)) {
   // Wait for the first presented frame, then fetch and compile in the
-  // background. `_gex_gl_presented` reads a counter in shared memory, so a
-  // pthread sees the page's frames too; one that never returns to its event
-  // loop never gets here, and a miss there compiles the cold part
-  // synchronously, which a Worker may do.
+  // background. Not in a pthread: the module's pool started each with this
+  // file, Mesa runs no code there, and every one of them fetched and
+  // compiled its own copy (four, on an mt build). A miss on a pthread would
+  // compile the cold part synchronously, which a Worker may do.
   var gexColdPoll = setInterval(function () {
     if (typeof _gex_gl_presented !== 'function' || typeof wasmBinaryFile !== 'string') return;
     var presented = 0;
