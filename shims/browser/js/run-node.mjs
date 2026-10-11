@@ -337,6 +337,9 @@ const host = new ProcessHost({
     // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
     denseDebug: !!process.env.GEX_DENSE_DEBUG,
+    // GEX_ADOPT_AFTER=N: traps a forked child takes before adopting its
+    // parent's modules (0: all of them at the fork). See `adoptAfterTraps`.
+    adoptAfter: process.env.GEX_ADOPT_AFTER !== undefined ? Number(process.env.GEX_ADOPT_AFTER) : undefined,
     mem64: MEM64,
     // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
     wasmDlls: process.env.GEX_WASM_DLLS || undefined,
@@ -355,8 +358,8 @@ const host = new ProcessHost({
     discoverSkip: process.env.GEX_DISCOVER_SKIP ? Number(process.env.GEX_DISCOVER_SKIP) : undefined,
     // GEX_T1_FOLD=1: tier-1's tee folding (gex-emit `set_t1_fold`).
     t1Fold: process.env.GEX_T1_FOLD ? 1 : undefined,
-    // GEX_UNIT_CACHE=1: compiled translation units shared by every process.
-    unitCache: process.env.GEX_UNIT_CACHE ? 1 : undefined,
+    // Compiled translation units shared by every process, unless GEX_UNIT_CACHE=0.
+    unitCache: process.env.GEX_UNIT_CACHE === '0' ? undefined : 1,
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,

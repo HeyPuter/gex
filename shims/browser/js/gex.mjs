@@ -1644,7 +1644,15 @@ export class Gex {
     const e = this.#shim.exports;
     // Its dense blocks keep the parent's numbering: point this process's
     // slots at them where nothing newer does.
-    const ds = this.#dense ? denseSection(m.mod) : null;
+    // `m.dense`: the parent's own numbering (`#compiled`); the Module's
+    // section may be another process's (the unit cache).
+    const ds = this.#dense ? (m.dense ?? denseSection(m.mod)) : null;
+    if (globalThis.GEX_DENSE_DEBUG && ds && m.dense) {
+      const own = denseSection(m.mod);
+      if (own && new DataView(own.buffer, own.byteOffset).getUint32(0, true) !== new DataView(ds.buffer, ds.byteOffset).getUint32(0, true)) {
+        console.error(`[dense] adopt: a module compiled elsewhere (base ${new DataView(own.buffer, own.byteOffset).getUint32(0, true)}) at this process's base ${new DataView(ds.buffer, ds.byteOffset).getUint32(0, true)}`);
+      }
+    }
     if (ds && e.gex_dense_adopt) {
       const dp = e.gex_alloc(ds.length) >>> 0;
       this.#bytes().set(ds, dp);
@@ -1655,7 +1663,7 @@ export class Gex {
     // See `slotsNeeded`.
     const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
     if (!m.meta || !m.meta.length || !e.gex_add_lazy_module) {
-      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-nometa');
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-nometa', null, false, m.dense);
       return;
     }
     const gp = e.gex_alloc(m.meta.length) >>> 0;
@@ -1663,11 +1671,11 @@ export class Gex {
     const need = e.gex_add_lazy_module(gp, m.meta.length) >>> 0;
     e.gex_free?.(gp, m.meta.length);
     if (!need) {
-      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-noneed');
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-noneed', null, false, m.dense);
       return;
     }
     this.#growTables(Math.max(need, truly), 'adopt');
-    this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta });
+    this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta, dense: m.dense });
   }
 
   /**
@@ -5508,7 +5516,7 @@ export class Gex {
    * or another did and this one catches up): a thread that installed them
    * differently would dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
+  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
     const t0 = performance.now();
     this.#installs++;
     if (sync) {
@@ -5516,7 +5524,7 @@ export class Gex {
       // and a `finally` after an `await` would run only once the guest
       // next yields, counting everything it ran meanwhile (a node start-up
       // reported hours of "installing").
-      const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync);
+      const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync, dense);
       this.#installMs += performance.now() - t0;
       return done;
     }
@@ -5524,7 +5532,7 @@ export class Gex {
       // With `sync` the inner call never awaits, so the install is complete
       // when this returns its promise -- what a nested loop inside an import
       // needs, since it cannot yield.
-      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync);
+      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync, dense);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -5536,7 +5544,7 @@ export class Gex {
    * turned out not to be what a run costs: each process installs thousands of
    * shared modules, and compiling and instantiating those was uncounted.
    */
-  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
+  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
@@ -5591,10 +5599,16 @@ export class Gex {
     // metadata the child cannot tell which module covers which page and must
     // instantiate all of them. The section is in the bytes; keeping it is a
     // parse.
+    // And its dense base as THIS process numbered it (`gex.dense` from its
+    // bytes, or what it was handed): with the page's unit cache, `mod` may be
+    // another process's compile, whose own section names that process's base,
+    // and a fork child instantiating from `mod` would put the blocks there.
+    const ds = dense ?? denseSection(bytes instanceof Uint8Array ? bytes : mod);
     this.#compiled.push({
       mod,
       need,
       meta: bytes instanceof Uint8Array ? metadataSection(bytes) : undefined,
+      dense: ds ?? undefined,
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
@@ -5606,12 +5620,14 @@ export class Gex {
     if (this.#guest?.exports?.blocks) {
       imports.blocks = this.#guest.exports.blocks;
       this.#growBlocks();
-      const ds = denseSection(bytes instanceof Uint8Array ? bytes : mod);
       if (ds) {
         const dv = new DataView(ds.buffer, ds.byteOffset, ds.byteLength);
         const base = dv.getUint32(0, true);
         if (globalThis.GEX_DENSE_DEBUG) {
-          console.error(`[dense] ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`);
+          const theirs = bytes instanceof Uint8Array ? denseSection(mod) : null;
+          const tb = theirs ? new DataView(theirs.buffer, theirs.byteOffset).getUint32(0, true) : base;
+          console.error(`[dense] pid ${e.gex_my_pid?.() ?? '?'} ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`
+            + (tb !== base ? ` (a module compiled elsewhere, at base ${tb})` : ''));
         }
         // Base 0 is a module nobody numbered: its blocks would land on the
         // miss stub and its neighbours.
@@ -6112,7 +6128,7 @@ export class Gex {
       const lazy = this.#lazyInherited[heir];
       if (lazy && !lazy.inst) {
         lazy.inst = true;
-        await this.#installModule(lazy.mod, lazy.need, 64, lazy.meta, 'inherit');
+        await this.#installModule(lazy.mod, lazy.need, 64, lazy.meta, 'inherit', null, false, lazy.dense);
         return true;
       }
     }
