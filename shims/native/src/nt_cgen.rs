@@ -965,8 +965,7 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
         let live = memory
             .get(lo..lo + n)
             .ok_or_else(|| anyhow!("{}: {:#x}+{n:#x} is outside guest memory", p.path, vaddr))?;
-        if live != &bytes[..] {
-            let i = (0..n).find(|&i| live[i] != bytes[i]).unwrap_or(0);
+        if let Some(i) = gex_xlate::pe_code_difference(*vaddr, bytes, live, p.base, Some(&p.pe)) {
             bail!(
                 "{}: the mapped code at {:#x} differs from the image its function-tier unit was \
                  built from (guest {:#04x}, unit {:#04x}); refusing the unit",

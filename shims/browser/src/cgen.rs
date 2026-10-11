@@ -302,7 +302,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
         return false;
     }
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
-    if !w3_matches(&image) {
+    if !w3_matches(&image, base, pe) {
         lock(&W3_DEFERRED).push(Pending { path: path.to_string(), base, pe: Arc::new(pe.clone()) });
         W3_ANY_DEFERRED.store(true, Ordering::Release);
         return false;
@@ -316,11 +316,13 @@ static W3_DEFERRED: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 static W3_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the mapped code is `image`'s.
-fn w3_matches(image: &gex_ld::Image) -> bool {
+fn w3_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage) -> bool {
     let memory = crate::guest_bytes();
     image.segments.iter().filter(|s| s.executable).all(|seg| {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
-        memory.get(lo..lo + n).is_some_and(|live| live == &seg.bytes[..])
+        memory
+            .get(lo..lo + n)
+            .is_some_and(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, Some(pe)).is_none())
     })
 }
 
@@ -341,7 +343,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         p
     };
     let Ok((image, _)) = gex_xlate::func::pe_input(&p.pe, p.base) else { return false };
-    if !w3_matches(&image) {
+    if !w3_matches(&image, p.base, &p.pe) {
         crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", p.path, p.base));
         return false;
     }
@@ -362,7 +364,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
     for seg in image.segments.iter().filter(|s| s.executable && !skeleton) {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
         let live = memory.get(lo..lo + n);
-        if let Some(i) = live.and_then(|live| (0..n).find(|&i| live[i] != seg.bytes[i])) {
+        if let Some(i) = live.and_then(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, pe)) {
             crate::warn_line(&format!(
                 "gex-cgen: {path}: the mapped code at {:#x} differs from the image (guest {:#04x}, image {:#04x}); refusing its unit\n",
                 seg.vaddr + i as u64,
