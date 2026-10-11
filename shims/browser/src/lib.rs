@@ -5222,6 +5222,19 @@ static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
 /// process tree here. Serving a page once and then falling through to translate
 /// bounds it: the wasted serve is one turn, and the translate produces the
 /// block that was missing.
+/// Each page's base under which this process has installed blocks: lifted
+/// here, or taken from the store. A stored module numbering such a page
+/// otherwise is not served (see the serve filter in `gex_dispatch_miss`).
+static LIVE_BASE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+
+fn note_live(dirs: &[(u64, u32)]) {
+    let mut m = LIVE_BASE.0.borrow_mut();
+    for (p, b) in dirs {
+        m.insert(*p, *b);
+    }
+}
+
 static SERVED_PAGE: SingleThreaded<std::collections::BTreeSet<u64>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
@@ -11705,9 +11718,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // been built from the code before the change (a
                         // translation of noita.exe before Detours patched it),
                         // and serving it would run that code again.
-                        !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
-                            Some(have) => have == *b,
-                            None => !h.jit.retired_pages.contains(p),
+                        //
+                        // AArch64 too. Its numberings diverge across an
+                        // `execve` from a fork: the exec'd program keeps the
+                        // page bases it inherited for ld.so (outside the
+                        // arena), which are not the ones the registry has, and
+                        // stores its modules under them. Served to a fresh
+                        // process numbering ld.so by the registry, their calls
+                        // into ld.so landed on empty slots, missed, and lifted
+                        // the callee again at the registry's base, once per
+                        // call: 32,997 ld.so blocks (30,371 at
+                        // `_dl_lookup_symbol_x` alone) in a `node -e 0` after
+                        // `spawnSync(node)`, 62 s against 30 in the page.
+                        d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
+                            Some(have) if gex_abi::X86 => have == *b,
+                            // On AArch64 only against blocks this process has
+                            // installed: a page numbered here with nothing
+                            // installed under the number loses nothing by
+                            // taking the module's, and refusing those cost a
+                            // second `node -e 0` its libc (4,979 blocks lifted
+                            // became 15,975).
+                            Some(have) => have == *b || LIVE_BASE.0.borrow().get(p) != Some(&have),
+                            None => !gex_abi::X86 || !h.jit.retired_pages.contains(p),
                         })
                     })
                     .collect();
@@ -11774,6 +11806,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                             }
                             keep.push((*p, *b));
                         }
+                        note_live(&keep);
                         dirs.extend_from_slice(&keep);
                         h.jit.reuse_served += 1;
                     }
@@ -11977,6 +12010,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // module), so the block at `pc` misses, re-translates, and misses
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
+        note_live(&unit.covered);
         push_pending(h, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
         publish_pending(h);
         // Point the guest directory at the slot this unit's block actually
