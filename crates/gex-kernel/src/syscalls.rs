@@ -823,14 +823,15 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// needs the kernel: the answer is the clock, and `started` (the process's
 /// [`Kernel::started`], which the processor-time clocks count from).
 ///
-/// Returns false, writing nothing that matters, for any other call, for a
-/// processor-time question before `started` is known (0), and for a buffer
-/// the guest cannot be written at: the host then makes the call as usual, so
-/// the answer and any `EFAULT` are the kernel's. `compat` is
-/// [`Kernel::compat`] (the i386 numbering, number in `eax`, 32-bit layouts).
-/// The result goes where [`set_result`] puts it. Signal delivery, which the
-/// kernel does at every syscall boundary, is the host's to arrange: it falls
-/// back to the full call whenever a signal may be pending.
+/// Returns false, writing nothing, for any other call. A clock call is
+/// always answered here, `EFAULT` included (a buffer the guest cannot be
+/// written at, as the kernel's own calls answer), so a host that routes these
+/// numbers here never takes its kernel for them (docs/kernel-locking.md §5.2
+/// step 1). `compat` is [`Kernel::compat`] (the i386 numbering, number in
+/// `eax`, 32-bit layouts); `started` the process's start, which the
+/// processor-time clocks count from. The result goes where [`set_result`]
+/// puts it. Signal delivery, which the kernel does at every syscall
+/// boundary, is the host's to arrange (the page's safepoints).
 pub fn clock_call(
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
@@ -855,6 +856,8 @@ pub fn clock_call(
     enum Call {
         // (clock id, buffer, 32-bit timespec)
         Clock(u64, u64, bool),
+        // (buffer, 32-bit timespec)
+        Res(u64, bool),
         // (buffer, 32-bit timeval)
         Tod(u64, bool),
         Rusage(u64),
@@ -865,6 +868,8 @@ pub fn clock_call(
         match raw {
             x::CLOCK_GETTIME => Call::Clock(a0, a1, true),
             x::CLOCK_GETTIME64 => Call::Clock(a0, a1, false),
+            x::CLOCK_GETRES => Call::Res(a1, true),
+            x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
             x::GETTIMEOFDAY => Call::Tod(a0, true),
             x::GETRUSAGE => Call::Rusage(a1),
             x::SCHED_YIELD => Call::Yield,
@@ -875,6 +880,7 @@ pub fn clock_call(
         // unchanged but for the number.
         match raw {
             228 => Call::Clock(a0, a1, false),
+            229 => Call::Res(a1, false),
             96 => Call::Tod(a0, false),
             98 => Call::Rusage(a1),
             24 => Call::Yield,
@@ -883,15 +889,17 @@ pub fn clock_call(
     } else {
         match raw {
             nr::CLOCK_GETTIME => Call::Clock(a0, a1, false),
+            nr::CLOCK_GETRES => Call::Res(a1, false),
             nr::GETTIMEOFDAY => Call::Tod(a0, false),
             nr::GETRUSAGE => Call::Rusage(a1),
             nr::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
     };
+    // Before the host has said when the process started (0): no time used.
     let cpu = || {
         let (s, n) = clock();
-        (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started)
+        if started == 0 { 0 } else { (s as u128 * 1_000_000_000 + n as u128).saturating_sub(started) }
     };
     let pair = |m: &mut GuestMem<'_>, at: u64, hi: u64, lo: u64, w32: bool| {
         if w32 {
@@ -903,9 +911,6 @@ pub fn clock_call(
     let ok = match call {
         Call::Clock(clk, buf, w32) => {
             // As `sys_clock_gettime`, which a null buffer faults in.
-            if buf == 0 || (matches!(clk, 2 | 3) && started == 0) {
-                return false;
-            }
             let (secs, nanos) = match clk {
                 2 | 3 => {
                     let t = cpu();
@@ -914,8 +919,9 @@ pub fn clock_call(
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
                 _ => clock(),
             };
-            pair(m, buf, secs, nanos as u64, w32).is_ok()
+            buf != 0 && pair(m, buf, secs, nanos as u64, w32).is_ok()
         }
+        Call::Res(buf, w32) => buf == 0 || pair(m, buf, 0, 1, w32).is_ok(),
         Call::Tod(buf, w32) => {
             if buf == 0 {
                 true
@@ -925,9 +931,6 @@ pub fn clock_call(
             }
         }
         Call::Rusage(buf) => {
-            if started == 0 {
-                return false;
-            }
             if buf == 0 {
                 true
             } else {
@@ -941,13 +944,12 @@ pub fn clock_call(
         // browser schedules those without being asked.
         Call::Yield => true,
     };
-    if !ok {
-        return false;
-    }
     if gex_abi::X86 {
         let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
     }
-    set_result(m, ctx_addr, 0).is_ok()
+    let ret = if ok { 0 } else { (Errno::EFAULT.0 as i64).wrapping_neg() as u64 };
+    let _ = set_result(m, ctx_addr, ret);
+    true
 }
 
 /// What a process and thread are called, as a host last saw them under its
@@ -8036,15 +8038,23 @@ mod tests {
             assert_eq!(m.read(buf, 160).unwrap(), &want[..], "call {n} {args:?}");
             assert_eq!(ret(&m, at), want_ret, "call {n}");
         }
-        // Declined: another call, a null clock buffer, the processor clock
-        // before the process's start is known.
+        // Declined: another call. Answered in place: a null clock buffer
+        // (EFAULT, as the kernel's), the processor clock before the
+        // process's start is known (no time used), and the resolution.
         let mut m = GuestMem::new(&mut mem);
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(!clock_call(&mut m, at, false, fixed, k.started));
         set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0]);
-        assert!(!clock_call(&mut m, at, false, fixed, k.started));
+        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert_eq!(ret(&m, at) as i64, -(Errno::EFAULT.0 as i64));
+        m.write_u64(buf, !0).unwrap();
         set_args(&mut m, at, nr::GETRUSAGE, &[0, buf]);
-        assert!(!clock_call(&mut m, at, false, fixed, 0));
+        assert!(clock_call(&mut m, at, false, fixed, 0));
+        assert_eq!(m.read_u64(buf).unwrap(), 0);
+        assert_eq!(ret(&m, at), 0);
+        set_args(&mut m, at, nr::CLOCK_GETRES, &[1, buf]);
+        assert!(clock_call(&mut m, at, false, fixed, k.started));
+        assert_eq!((m.read_u64(buf).unwrap(), m.read_u64(buf + 8).unwrap()), (0, 1));
         // i386: the number in eax, arguments in ebx/ecx, 32-bit layouts.
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 2]| {
             m.write_u64(at + ctx::x(0) as u64, n).unwrap();

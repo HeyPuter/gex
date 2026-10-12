@@ -4147,6 +4147,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.compat = program.compat();
     gex_xlate::set_compat(program.compat());
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    // The clock calls' process constants (`clock_syscall`), before the
+    // process's first syscall.
+    kernel.started = now_ns() as u128;
+    clock_constants(program.compat(), kernel.started);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
     MY_PID.store(kernel.pid, std::sync::atomic::Ordering::Relaxed);
@@ -6481,8 +6485,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     }
-    // The clock calls, answered without the kernel lock (see `clock_fast_path`).
-    if !IN_PROVIDER.with(|c| c.get()) && clock_fast_path(ctx) {
+    // The clock calls, which never take the kernel lock (`clock_syscall`).
+    if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
         return;
     }
     fjit::watch_check(pc as u64, "syscall");
@@ -6503,7 +6507,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let base = ctx as u32 as u64;
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
         // An i386-ABI process (W3's Wine): its number, in `x(0)`, is i386's.
-        let compat = FAST_ABI.load(std::sync::atomic::Ordering::Relaxed) == 1;
+        let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Relaxed) == 1;
         let n = if compat && !gex_abi::PPC {
             let raw = gm.read_u64(base + ctx::x(0) as u64).unwrap_or(u64::MAX);
             gex_kernel::i386::canonical_number(raw)
@@ -6808,17 +6812,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
         let slot = sys_note(nr, a0, a1);
-        // The signals this call will see, read before it takes them: a fast
-        // clock call after it is safe only while no newer one was sent.
-        let sig_seen = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
-        FAST_ABI.store(
-            if h.kernel.compat { 1 } else { 2 },
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        FAST_STARTED.store(h.kernel.started as u64, std::sync::atomic::Ordering::Relaxed);
-        FAST_SIG.with(|c| c.set(sig_seen));
-        FAST_RUN.with(|c| c.set(0));
+        // The clocks never come here (`clock_syscall`); one that does is a
+        // regression, said once, as an error every page test fails on.
+        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn_line(&format!("[gex] pid {}: clock call {} took the kernel lock\n", h.kernel.pid, h.kernel.syscall_nr));
+            }
+        }
         CANON_NR.with(|c| c.set(h.kernel.syscall_nr));
         FD_ACTIVITY.with(|c| c.set(h.kernel.take_fd_activity()));
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
@@ -7563,19 +7565,29 @@ fn wakes_nobody(nr: u64) -> bool {
     )
 }
 
-/// What `clock_fast_path` needs to know about this process without taking
-/// the kernel: its ABI (0 not yet known, 1 i386, 2 native) and when it
-/// started (`Kernel::started`), both refreshed by every full syscall.
-static FAST_ABI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-static FAST_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Clock calls answered by `clock_fast_path`.
-static FAST_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The clock calls' process constants (`clock_syscall`): the ABI (0 before
+/// the process is loaded, 1 i386, 2 native) and when the process started
+/// (`Kernel::started`, ns), which the processor-time clocks count from. Set
+/// at load, exec and a child's or thread's adoption (`clock_constants`),
+/// before the process's first syscall, and not changed by any syscall after.
+static CLOCK_ABI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static CLOCK_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Clock calls answered by `clock_syscall`.
+static CLOCK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The clock-family numbers (canonical), which `clock_syscall` answers.
+fn is_clock_nr(n: u64) -> bool {
+    use gex_kernel::syscalls::nr;
+    matches!(n, nr::CLOCK_GETTIME | nr::CLOCK_GETRES | nr::GETTIMEOFDAY | nr::GETRUSAGE | nr::SCHED_YIELD)
+}
+
+fn clock_constants(compat: bool, started: u128) {
+    use std::sync::atomic::Ordering::Release;
+    CLOCK_STARTED.store(started as u64, Release);
+    CLOCK_ABI.store(if compat { 1 } else { 2 }, Release);
+}
 
 thread_local! {
-    /// `k_signal_seq` as this thread's last full syscall read it.
-    static FAST_SIG: Cell<i32> = const { Cell::new(i32::MIN) };
-    /// Fast calls since this thread's last full syscall.
-    static FAST_RUN: Cell<u32> = const { Cell::new(0) };
     /// This thread's ids as its last full syscall saw them (`ident_call`).
     static IDS: Cell<gex_kernel::syscalls::Idents> = const {
         Cell::new(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 })
@@ -7588,43 +7600,54 @@ thread_local! {
     static FD_ACTIVITY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// `clock_gettime`, `gettimeofday`, `getrusage` and `sched_yield` served
-/// lock-free (`gex_kernel::syscalls::clock_call`), with no proc snapshot and
-/// no wake. Every other syscall takes the host lock several times
-/// (`with_host`), and a W3 process's ~25 idle Wine Workers contend for it:
-/// Undertale's game thread asks the time ~2,000 times a second (Wine's
-/// `NtDelayExecution` calls `NtYieldExecution`, which is getrusage,
-/// sched_yield, getrusage) and spent ~25 ms of an 87 ms frame in `KLock::take`
-/// for these alone.
+/// The clocks, with no kernel lock (docs/kernel-locking.md §5.2 step 1):
+/// `clock_gettime`, `clock_getres`, `gettimeofday`, `getrusage` and
+/// `sched_yield` are answered here, always, from the clock and the process's
+/// constants (`gex_kernel::syscalls::clock_call`, `EFAULT` included). They
+/// read nothing the kernel guards: the time base is fixed at boot
+/// (`k_boot_secs`), the ABI and start at load. Undertale's game process makes
+/// about 7,000 of them a second (Wine's `NtDelayExecution` is getrusage,
+/// sched_yield, getrusage, and its timers read the clock).
 ///
-/// The kernel delivers pending signals at every syscall boundary, which this
-/// skips; so it stands down -- the full call runs -- while a signal may be
-/// waiting: whenever `k_signal_seq` has moved since this thread's last full
-/// call, and on every 64th call in a row (a signal raised inside the process
-/// does not move the sequence).
-fn clock_fast_path(ctx: i32) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    let abi = FAST_ABI.load(Relaxed);
-    if abi == 0 || tracing() || EXITED.load(Relaxed) || cgen::libprov::any_registered() {
-        return false;
-    }
-    if unsafe { k_present() } != 0 && FAST_SIG.with(|c| c.get()) != unsafe { k_signal_seq() } {
-        return false;
-    }
-    if FAST_RUN.with(|c| c.get()) >= 63 {
+/// Not done here, as the kernel would at a syscall boundary: delivering a
+/// pending signal, which the next safepoint does (`gex_safepoint`'s own
+/// check); and a provider collection's stop (cgen/libprov.rs), which parks
+/// the thread on its way back to guest code, as after any syscall.
+///
+/// The getpid family is answered here too, from this thread's ids as its
+/// last full syscall left them (`ident_call`, step 6a).
+fn clock_syscall(ctx: i32) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let abi = CLOCK_ABI.load(Acquire);
+    // Before the process is loaded there is no guest to make a call; once it
+    // has exited, the full path ends the thread.
+    if abi == 0 || EXITED.load(Relaxed) {
         return false;
     }
     let mut gm = GuestMem::new(guest_bytes());
-    let started = FAST_STARTED.load(Relaxed) as u128;
-    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started)
-        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, ctx as u32 as u64, abi == 1, &c.get()))
+    let started = CLOCK_STARTED.load(Acquire) as u128;
+    let at = ctx as u32 as u64;
+    if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started)
+        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, at, abi == 1, &c.get()))
     {
         return false;
     }
-    FAST_RUN.with(|c| c.set(c.get() + 1));
     SYS_CALLS.fetch_add(1, Relaxed);
+    if tracing() {
+        let nr = gm.read_u64(at + if abi == 1 { ctx::x(0) } else { ctx::SYSCALL_NR } as u64).unwrap_or(0);
+        let ret = gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0);
+        trace_line(&format!("[sys] {nr} (no kernel lock) = {ret:#x}\n"));
+    }
+    // A provider's collection running: park here, as the full path does on
+    // its way back to guest code.
+    if cgen::libprov::stop_active() {
+        let tid = IDS.with(|c| c.get().tid);
+        if tid != 0 {
+            cgen::libprov::park_if_stopping(tid as u32, false);
+        }
+    }
     // Narration, not a warning: a page test fails on any console error.
-    if FAST_CALLS.fetch_add(1, Relaxed) == 0 {
+    if CLOCK_CALLS.fetch_add(1, Relaxed) == 0 {
         trace_line(&format!(
             "[gex] pid {}: clock calls served without the kernel lock\n",
             MY_PID.load(Relaxed)
@@ -8849,6 +8872,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());
     }
+    // An exec keeps the process's start (its processor time goes on).
+    if h.kernel.started == 0 {
+        h.kernel.started = now_ns() as u128;
+    }
+    clock_constants(h.kernel.compat, h.kernel.started);
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     cgen::wasmprog::stage(program.as_ref());
@@ -11323,7 +11351,14 @@ pub extern "C" fn gex_compat() -> i32 {
 /// state has been adopted, before any block is translated there.
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
-    with_host(|h| h.kernel.compat = on != 0);
+    with_host(|h| {
+        h.kernel.compat = on != 0;
+        // A child's process starts now; a thread's is its process's, already set.
+        if h.kernel.started == 0 {
+            h.kernel.started = now_ns() as u128;
+        }
+        clock_constants(h.kernel.compat, h.kernel.started);
+    });
     // An adopted child's stack (`gex_adopt_child`, before this) went to
     // `ctx::SP`; an i386-ABI process's is `esp` (`ctx::sp_slot`), which on
     // an AArch64 build is another slot (its i386-ABI processes are wasm32
