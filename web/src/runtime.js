@@ -427,7 +427,8 @@ function pageGlobals() {
  * and forwards keys, sizes and output.
  */
 async function runInSystemWorker(term, opts) {
-  const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // `onFilesLoaded` is a function, which cannot cross to the Worker.
+  const { network, onNetEvent, onFilesLoaded, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
   // Said once, so a person (and tests/single/run.sh) can tell which build ran.
   term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system
@@ -544,6 +545,9 @@ async function runProgramHere(
     tty = true,
     network = null,
     onNetEvent = null,
+    // Called once pid 1 has copied `files` into the kernel's filesystem: the
+    // caller can drop its own references to the bytes (a bundle's buffer).
+    onFilesLoaded = null,
     gl = null,
     // Which Gallium driver the host's Mesa runs when `gl` is 'compositor':
     // gex_wgpu, straight onto WebGPU.
@@ -994,6 +998,8 @@ async function runProgramHere(
         /* a publish happened; the compositor draws on its own clock */
       }
       else if (m.kind === 'net') onNetEvent?.(m.event);
+      // Pid 1 has copied `files` into the kernel's filesystem.
+      else if (m.kind === 'files-loaded') onFilesLoaded?.();
     },
   });
 

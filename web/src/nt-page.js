@@ -217,7 +217,9 @@ async function main() {
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
   const exe = q.get('exe') || '/t/window.exe';
-  const exeBytes = files[exe] ?? files[hard[exe]];
+  // A copy, not a view: a view would keep the whole bundle alive (see
+  // `onFilesLoaded` below).
+  const exeBytes = (files[exe] ?? files[hard[exe]])?.slice();
   if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
   // `argv=` (a JSON array) keeps arguments with spaces whole; `args=` splits.
   const args = [exe, ...(q.get('argv') ? JSON.parse(q.get('argv')) : q.get('args') ? q.get('args').split(' ') : [])];
@@ -263,6 +265,14 @@ async function main() {
     wlInput: canvas,
     hostX: q.get('hostx') === '1',
     preModules,
+    // Once the kernel holds its own copy of every file, nothing here may view
+    // the bundle's SharedArrayBuffer, or it stays resident beside that copy
+    // (459 MiB of the mspaint demo's tab, twice).
+    onFilesLoaded: () => {
+      for (const o of [files, tree.files, ...trees.map((t) => t.files)]) for (const k of Object.keys(o)) delete o[k];
+      trees.length = 0;
+      mark('bundle released');
+    },
   });
   state.status = status;
   state.phase = 'done';

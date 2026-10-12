@@ -680,6 +680,15 @@ async function handle(msg) {
         },
       );
       if (!entry) throw new Error('the program could not be loaded');
+      // The files are in the kernel's filesystem now, copied. The views here
+      // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for the
+      // mspaint demo), which stays resident while anything views it: let go,
+      // and tell the page so it can let go of its own.
+      if (msg.files) {
+        msg.files = null;
+        msg.elf = null;
+        port.post({ kind: 'files-loaded' });
+      }
     }
 
     // Statically recompile each object once it proves hot, rather than meeting
