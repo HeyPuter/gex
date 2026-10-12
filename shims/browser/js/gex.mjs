@@ -3173,14 +3173,16 @@ export class Gex {
     // stay i64, with an i32 copy of the table base for its element segment.
     const lowered = libprov && !m64();
     const w64 = m64() || lowered;
-    // A wasm32 program's module is keyed by its bytes (`wasm:`), not its
-    // path: the page keeps those for every process (host.mjs), so a program
-    // run again, by any process, is not compiled again, and a file apt
-    // replaced is not mistaken for the old one.
+    // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
+    // (`wasm:`), not its path: the page keeps those for every process
+    // (host.mjs), so a program run again, by any process, is not compiled
+    // again, and a file apt replaced is not mistaken for the old one. Keyed
+    // by path, winepe.wasm (8.9 MB) was compiled once per Wine process, ten
+    // times for the mspaint demo, each copy of its code resident.
     const pbytes = wasmdll ? new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice() : null;
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes,
-        wasmprog ? `wasm:${moduleContentKey(pbytes)}` : null)
+        `wasm:${moduleContentKey(pbytes)}`)
       : prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
