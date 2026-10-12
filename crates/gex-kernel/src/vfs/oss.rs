@@ -322,12 +322,20 @@ mod tests {
         }
         // 192000 bytes a second: the 32 KiB buffer fills, then drains in
         // about 171 ms.
+        let start = Instant::now();
         assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
         std::thread::sleep(std::time::Duration::from_millis(60));
         let n = h.write_at(0, &vec![0u8; 100_000]).unwrap();
-        // 60 ms played at least 11520 bytes, and less than the whole buffer.
-        assert!(n >= 11_520 && n < BUFSIZE, "{n}");
+        // Against the clock as it actually ran (a loaded machine sleeps
+        // longer than asked): at least the 60 ms asked for has played,
+        // no more than the time that passed, and while that was short of
+        // the whole buffer's 171 ms, less than all of it.
+        let played = start.elapsed().as_micros() as u64 * 192_000 / 1_000_000;
+        assert!(n >= 11_520 && n <= played.min(BUFSIZE) + 4, "{n} (played {played})");
+        if played + 4 < BUFSIZE {
+            assert!(n < BUFSIZE, "{n} (played {played})");
+        }
     }
 
     #[test]
