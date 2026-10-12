@@ -7110,6 +7110,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 t.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
                 t.waiting = waiting;
                 t.blocked_on = Some(op);
+                // The scheduler's first turn, under this same take: most
+                // parked calls are ready at once, or register their wait
+                // here. The slot is read first, as `schedule` does.
+                waitq::begin_turn();
+                let pick = pick_turn(h);
+                FIRST_PICK.with(|c| *c.borrow_mut() = Some(pick));
                 3
             }
             SyscallOutcome::SpawnProcess {
@@ -8165,6 +8171,9 @@ fn set_current(h: &mut Host, i: usize) {
 }
 
 thread_local! {
+    /// The first turn of the `schedule` a blocking call goes on to, made
+    /// under the call's own take of the kernel lock (`pick_turn`).
+    static FIRST_PICK: RefCell<Option<Pick>> = const { RefCell::new(None) };
     /// The last `schedule` found this Worker's thread exited, or its whole
     /// process: what `wasm32_wait` asks instead of the thread table.
     static SCHED_OVER: Cell<bool> = const { Cell::new(false) };
@@ -10484,7 +10493,12 @@ fn schedule() -> i32 {
     // what is runnable, so that a notify arriving while this makes up its
     // mind cannot be slept through: `gex_park` sleeps only while the slot
     // still reads this.
-    waitq::begin_turn();
+    // A blocking call's own take may have made the first turn already
+    // (`FIRST_PICK`), after reading the slot itself.
+    let first = FIRST_PICK.with(|c| c.borrow().is_some());
+    if !first {
+        waitq::begin_turn();
+    }
     SCHED_OVER.with(|c| c.set(false));
     // Unconditional and at the top: every other counter sits on a path that
     // can be missed, and this is the last place everything passes through. If
@@ -10504,7 +10518,7 @@ fn schedule() -> i32 {
     // thread, from what that wait was, without the kernel lock: a parked
     // thread woken by something it does not wait for, or by nothing, looks
     // and parks again (docs/kernel-locking.md §5.2 step 2).
-    if let Some((why, ends_by_itself)) = waitq::idle_turn() {
+    if let Some((why, ends_by_itself)) = (!first).then(waitq::idle_turn).flatten() {
         if why != 0 {
             report_idle(why);
             set_paused_to(why);
@@ -10523,85 +10537,10 @@ fn schedule() -> i32 {
         // kernel (to find a buffer's shared mapping) and guest memory (the
         // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
-        let pick = with_host(|h| {
-            // A handler frame a safepoint built, without the kernel: this
-            // thread runs on at the handler.
-            if let Some(target) = HANDLER_AT.with(|c| c.take()) {
-                h.threads[cur()].pc = target;
-                h.threads[cur()].waiting = Waiting::Runnable;
-            }
-            // Only when it has anything to move (`needs_pump`): most turns it
-            // has not. What it writes to a client's socket (a frame callback,
-            // a buffer release, input) notifies the socket's waiters -- Wine's
-            // Wayland reader thread, parked in `poll` in another Worker.
-            if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
-                let gm = GuestMem::new(guest_bytes());
-                w.pump(&h.kernel, &gm);
-            }
-            // Every thread gone ends this process, all this Worker has; the
-            // status is in the shared table for whoever waits.
-            if h.threads
-                .iter()
-                .all(|t| matches!(t.waiting, Waiting::Exited))
-            {
-                let code = h.exit.take().unwrap_or(0);
-                exit_process(h, code);
-                h.exit.get_or_insert(code);
-                return Pick::Over;
-            }
-            let now = now_ns();
-            // Nothing to choose: this Worker owns one table entry and the
-            // engine schedules the rest, so picking any *other* runnable thread
-            // would put two Workers on one set of registers.
-            let sig = any_signal(h);
-            let i = cur();
-            if thread_ready(&h.threads[i], now, sig) {
-                let timed_out = match &h.threads[i].waiting {
-                    // A cross-Worker FUTEX_WAKE advances the shared generation
-                    // without touching this Worker's local `Parked` queue. It
-                    // is still a wake, not a timeout. The old `!parked.woken()`
-                    // test therefore handed ETIMEDOUT to every such untimed
-                    // glibc lock wait, which glibc correctly treats as a fatal
-                    // futex result. Only an expired deadline is a timeout.
-                    Waiting::Futex { deadline, .. } => {
-                        deadline.is_some_and(|at| now >= at)
-                    }
-                    _ => false,
-                };
-                // Woken by the signal and not by the wait: ask the same
-                // question with the signal taken away.
-                let by_signal = sig && !thread_ready(&h.threads[i], now, false);
-                // Picked, and finished under this same take: the wait it was
-                // registered for is over.
-                waitq::leave();
-                IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
-                if tracing() {
-                    let (pc, blocked) = (h.threads[i].pc, h.threads[i].blocked_on.is_some());
-                    trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={blocked}\n"));
-                }
-                Pick::Resumed(resume_thread(h, i, timed_out, by_signal))
-            } else if matches!(h.threads[i].waiting, Waiting::Exited) {
-                // This Worker's thread is done; the process is not (others are
-                // their own Workers, and a joiner is parked on its futex).
-                Pick::Over
-            } else {
-                // Nothing this Worker owns can run; everything else is a Worker
-                // the engine already runs.
-                let look = idle_look(h);
-                // Its slot goes on the queues of what it waits for, and once
-                // it is there any change notifies it. A change before that is
-                // seen here: ask again.
-                if waitq::enter(h, i, look.why, look.all_blocked, look.ends_by_itself)
-                    && {
-                        let sig = any_signal(h);
-                        thread_ready(&h.threads[i], now_ns(), sig)
-                    }
-                {
-                    return Pick::Again;
-                }
-                Pick::Idle(look)
-            }
-        });
+        let pick = match FIRST_PICK.with(|c| c.take()) {
+            Some(pick) => pick,
+            None => with_host(pick_turn),
+        };
         // Going round again is what picks a thread and, crucially, finishes the
         // syscall it parked in; resuming its saved pc directly leaves x0 with
         // no return value.
@@ -10708,6 +10647,89 @@ fn schedule() -> i32 {
             }
             None => return 2,
         }
+    }
+}
+
+/// One locked turn of `schedule` for this Worker's thread: run it again if
+/// its wait is over (finishing the call it parked in), or register the wait
+/// and say why nothing can run.
+fn pick_turn(h: &mut Host) -> Pick {
+    // A handler frame a safepoint built, without the kernel: this
+    // thread runs on at the handler.
+    if let Some(target) = HANDLER_AT.with(|c| c.take()) {
+        h.threads[cur()].pc = target;
+        h.threads[cur()].waiting = Waiting::Runnable;
+    }
+    // Only when it has anything to move (`needs_pump`): most turns it
+    // has not. What it writes to a client's socket (a frame callback,
+    // a buffer release, input) notifies the socket's waiters -- Wine's
+    // Wayland reader thread, parked in `poll` in another Worker.
+    if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
+        let gm = GuestMem::new(guest_bytes());
+        w.pump(&h.kernel, &gm);
+    }
+    // Every thread gone ends this process, all this Worker has; the
+    // status is in the shared table for whoever waits.
+    if h.threads
+        .iter()
+        .all(|t| matches!(t.waiting, Waiting::Exited))
+    {
+        let code = h.exit.take().unwrap_or(0);
+        exit_process(h, code);
+        h.exit.get_or_insert(code);
+        return Pick::Over;
+    }
+    let now = now_ns();
+    // Nothing to choose: this Worker owns one table entry and the
+    // engine schedules the rest, so picking any *other* runnable thread
+    // would put two Workers on one set of registers.
+    let sig = any_signal(h);
+    let i = cur();
+    if thread_ready(&h.threads[i], now, sig) {
+        let timed_out = match &h.threads[i].waiting {
+            // A cross-Worker FUTEX_WAKE advances the shared generation
+            // without touching this Worker's local `Parked` queue. It
+            // is still a wake, not a timeout. The old `!parked.woken()`
+            // test therefore handed ETIMEDOUT to every such untimed
+            // glibc lock wait, which glibc correctly treats as a fatal
+            // futex result. Only an expired deadline is a timeout.
+            Waiting::Futex { deadline, .. } => {
+                deadline.is_some_and(|at| now >= at)
+            }
+            _ => false,
+        };
+        // Woken by the signal and not by the wait: ask the same
+        // question with the signal taken away.
+        let by_signal = sig && !thread_ready(&h.threads[i], now, false);
+        // Picked, and finished under this same take: the wait it was
+        // registered for is over.
+        waitq::leave();
+        IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
+        if tracing() {
+            let (pc, blocked) = (h.threads[i].pc, h.threads[i].blocked_on.is_some());
+            trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={blocked}\n"));
+        }
+        Pick::Resumed(resume_thread(h, i, timed_out, by_signal))
+    } else if matches!(h.threads[i].waiting, Waiting::Exited) {
+        // This Worker's thread is done; the process is not (others are
+        // their own Workers, and a joiner is parked on its futex).
+        Pick::Over
+    } else {
+        // Nothing this Worker owns can run; everything else is a Worker
+        // the engine already runs.
+        let look = idle_look(h);
+        // Its slot goes on the queues of what it waits for, and once
+        // it is there any change notifies it. A change before that is
+        // seen here: ask again.
+        if waitq::enter(h, i, look.why, look.all_blocked, look.ends_by_itself)
+            && {
+                let sig = any_signal(h);
+                thread_ready(&h.threads[i], now_ns(), sig)
+            }
+        {
+            return Pick::Again;
+        }
+        Pick::Idle(look)
     }
 }
 
