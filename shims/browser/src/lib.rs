@@ -10815,7 +10815,7 @@ fn pick_turn(h: &mut Host) -> Pick {
                 Pick::Resumed(None)
             }
         }
-    } else if matches!(r.waiting, Waiting::Exited) {
+    } else if matches!(r.waiting, Waiting::Exited) && !leader_waits() {
         // This Worker's thread is done; the process is not (others are
         // their own Workers, and a joiner is parked on its futex).
         Pick::Over
@@ -10837,6 +10837,17 @@ fn pick_turn(h: &mut Host) -> Pick {
         }
         Pick::Idle(look)
     }
+}
+
+/// Whether this Worker, its own thread exited, waits for its process to end
+/// rather than ending: the process's first Worker (thread 0), whose end is
+/// the process's and whose answer is the process's status. Its thread may
+/// `pthread_exit` while another goes on, as on Linux, where the process
+/// lives until its last thread ends it (Wine's `ExitProcess` from a second
+/// thread does exactly this). It parks on the process's queue, which
+/// `exit_process` notifies.
+fn leader_waits() -> bool {
+    cur() == 0 && !EXITED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a wait that is over timed out, and whether a signal and not the
@@ -10872,6 +10883,10 @@ fn finish_mine(signalled: bool) -> i32 {
     // The process ended under it (`exit_process` marks every thread).
     if matches!(r.waiting, Waiting::Exited) {
         drop(r);
+        if leader_waits() {
+            set_paused_to(2);
+            return 2;
+        }
         waitq::leave();
         SCHED_OVER.with(|c| c.set(true));
         return 2;

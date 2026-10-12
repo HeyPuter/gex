@@ -272,7 +272,9 @@ pub(crate) fn idle_turn() -> Turn {
         // one of its own threads (`tgkill`), or from its timer, that would
         // do something: asked of the signal state itself (`sigs`). It ends
         // the wait.
-        if crate::sigs::ready() {
+        // (A thread that has exited takes none: it waits only for its
+        // process to end, `leader_waits`.)
+        if !matches!(m.waiting, Waiting::Exited) && crate::sigs::ready() {
             return Turn::Ready(true);
         }
         if wait_ready(&m.waiting, &m.blocked_on, now_ns(), false) {
