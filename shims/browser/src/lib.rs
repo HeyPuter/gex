@@ -7407,12 +7407,22 @@ pub extern "C" fn gex_wasmprog_staged() -> i32 {
     WASM32_STAGED.with(|c| c.replace(false)) as i32
 }
 
+thread_local! {
+    /// `wasm32_wait` has said this Worker's program waits on the page.
+    static PAGE_WAIT_SAID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
 /// given back to JS, so the Worker waits here until the call can finish, and
 /// the call returns. Anything else that ends the wait (the process gone)
 /// traps as usual.
 fn wasm32_wait(pc: u64) -> i32 {
-    let mut said = false;
+    // Narration, once per Worker: a wasm32 program's every blocking call
+    // comes through here (all of W3's Wine), and a line per call was about
+    // 90 console.debug lines a second on Undertale; its wined3d thread spent
+    // 1.4 ms a frame in them under the profiler. The check also took the
+    // kernel's lock on every pass of the loop; it is made on the first pass.
+    let mut said = PAGE_WAIT_SAID.with(|c| c.get());
     loop {
         let picked = schedule();
         let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
@@ -7432,8 +7442,9 @@ fn wasm32_wait(pc: u64) -> i32 {
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
             trace_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
-            said = true;
+            PAGE_WAIT_SAID.with(|c| c.set(true));
         }
+        said = true;
         if gex_park(20) < 0 {
             park_until_ready();
         }
