@@ -3041,7 +3041,7 @@ fn set_host(host: Host) {
             .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable);
         FDS.store(fds, std::sync::atomic::Ordering::Release);
         if let Some(h) = h.borrow_mut().as_mut() {
-            publish_signals(h);
+            publish_process(h);
         }
     });
 }
@@ -3066,16 +3066,19 @@ fn set_host(host: Host) {
     FDS.store(fds, std::sync::atomic::Ordering::Release);
     // SAFETY: as above.
     if let Some(h) = unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut() } {
-        publish_signals(h);
+        publish_process(h);
     }
 }
 
-/// The new process's signal state, for the checks and deliveries that take
-/// no kernel lock (`sigs`), and its one thread as the one this Worker runs.
-fn publish_signals(h: &mut Host) {
+/// What a new process's Workers read without the kernel lock: its signal
+/// state (`sigs`), with its one thread as the one this Worker runs, and
+/// whether it is a wasm32 program (`WASM32`).
+fn publish_process(h: &mut Host) {
+    WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
     if let Some(t) = h.threads.first() {
-        let tid = t.kstate.tid;
+        let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
+        MY_CTX.with(|c| c.set(ctx_addr));
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -6987,7 +6990,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     regview::set_threaded(true);
                 }
                 stage_thread(tid, ctx_addr, start);
-                if frames_stay(h) {
+                if frames_stay() {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
                     WASM32_STAGED.with(|c| c.set(true));
@@ -7114,7 +7117,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 child_stack,
                 tls,
             } => {
-                if frames_stay(h) {
+                if frames_stay() {
                     // A wasm32 process clones at its thread entry (the
                     // context's PC, as the musl fork's __clone leaves it);
                     // the call returns, and `#wasmprogSyscall` hands the
@@ -7204,7 +7207,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
-    let stop = if stop == 3 && with_host(|h| frames_stay(h)) {
+    let stop = if stop == 3 && frames_stay() {
         wasm32_wait(pc as u64)
     } else if stop == 3 {
         // Ask first, wait second: most parked calls are already ready by now
@@ -7221,7 +7224,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // block), returning is the same as re-entering there minus the trap and
         // a round of the event loop. Only then: a signal or a different thread
         // is a real re-entry that must go out through JS.
-        let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        let here = my_ctx();
         if picked == 1
             && resume() == Some(pc as u64 + gex_abi::SYSCALL_INST_BYTES)
             && resume_ctx().unwrap_or(here) == here
@@ -7475,9 +7478,15 @@ thread_local! {
 /// Whether the syscall being served cannot leave its wasm frames: a wasm32
 /// program's, a stateful provider's, or guest code a provider called (its
 /// frames are below the call-out).
-fn frames_stay(h: &Host) -> bool {
-    h.kernel.wasm32 || IN_PROVIDER.with(|c| c.get()) || cgen::provider_callout_open()
+fn frames_stay() -> bool {
+    WASM32.load(std::sync::atomic::Ordering::Acquire)
+        || IN_PROVIDER.with(|c| c.get())
+        || cgen::provider_callout_open()
 }
+
+/// `Kernel::wasm32` of this process, for what asks it without the kernel
+/// (`frames_stay`). Set where the kernel's is, and by `set_host`.
+pub(crate) static WASM32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
@@ -7520,7 +7529,7 @@ fn wasm32_wait(pc: u64) -> i32 {
     loop {
         let picked = schedule();
         if picked == 1 {
-            let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+            let here = my_ctx();
             if resume() == Some(pc + gex_abi::SYSCALL_INST_BYTES) && resume_ctx().unwrap_or(here) == here {
                 set_resume_none();
                 set_resume_ctx_none();
@@ -7531,9 +7540,7 @@ fn wasm32_wait(pc: u64) -> i32 {
         // An idle turn saw this Worker's thread still in a registered wait;
         // any other way out of `schedule` must be asked.
         let idle = waitq::waiting_here();
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed)
-            || (!idle && with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)))
-        {
+        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || SCHED_OVER.with(|c| c.replace(false)) {
             return picked;
         }
         // Bit 4 of `paused()`: the idle turn found a wait only the page ends.
@@ -8151,9 +8158,24 @@ fn cur() -> usize {
 fn set_current(h: &mut Host, i: usize) {
     CURRENT.with(|c| c.set(i));
     if let Some(t) = h.threads.get(i) {
-        let tid = t.kstate.tid;
+        let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
+        MY_CTX.with(|c| c.set(ctx_addr));
         sigs::bind(&mut h.kernel, tid);
     }
+}
+
+thread_local! {
+    /// The last `schedule` found this Worker's thread exited, or its whole
+    /// process: what `wasm32_wait` asks instead of the thread table.
+    static SCHED_OVER: Cell<bool> = const { Cell::new(false) };
+    /// This Worker's thread's register context (`set_current`): its own,
+    /// for what asks without the kernel.
+    static MY_CTX: Cell<u64> = const { Cell::new(0) };
+}
+
+/// [`MY_CTX`].
+fn my_ctx() -> u64 {
+    MY_CTX.with(|c| c.get())
 }
 
 /// A thread `clone` has made that the host has not made a Worker for:
@@ -8699,6 +8721,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     clock_constants(h.kernel.compat, h.kernel.started);
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
+    WASM32.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
@@ -9965,9 +9988,9 @@ struct IdleLook {
 
 /// What the scheduler decided.
 enum Pick {
-    /// Run this thread: which one, whether its deadline passed, and whether
-    /// what woke it was a signal rather than the thing it was waiting for.
-    Thread(usize, bool, bool),
+    /// This Worker's thread ran again ([`resume_thread`]): where it resumes,
+    /// or `None` when its process ended.
+    Resumed(Option<(u64, u64)>),
     /// Nothing in this process can run yet, and what the same look found
     /// about why (see [`IdleLook`]).
     Idle(IdleLook),
@@ -10462,6 +10485,7 @@ fn schedule() -> i32 {
     // mind cannot be slept through: `gex_park` sleeps only while the slot
     // still reads this.
     waitq::begin_turn();
+    SCHED_OVER.with(|c| c.set(false));
     // Unconditional and at the top: every other counter sits on a path that
     // can be missed, and this is the last place everything passes through. If
     // it climbs, the loop is out here; if not, the guest is inside a stretch of
@@ -10547,7 +10571,15 @@ fn schedule() -> i32 {
                 // Woken by the signal and not by the wait: ask the same
                 // question with the signal taken away.
                 let by_signal = sig && !thread_ready(&h.threads[i], now, false);
-                Pick::Thread(i, timed_out, by_signal)
+                // Picked, and finished under this same take: the wait it was
+                // registered for is over.
+                waitq::leave();
+                IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
+                if tracing() {
+                    let (pc, blocked) = (h.threads[i].pc, h.threads[i].blocked_on.is_some());
+                    trace_line(&format!("[gex] switch to thread {i} at pc={pc:#x} blocked={blocked}\n"));
+                }
+                Pick::Resumed(resume_thread(h, i, timed_out, by_signal))
             } else if matches!(h.threads[i].waiting, Waiting::Exited) {
                 // This Worker's thread is done; the process is not (others are
                 // their own Workers, and a joiner is parked on its futex).
@@ -10575,12 +10607,13 @@ fn schedule() -> i32 {
         // no return value.
         if matches!(pick, Pick::Over) {
             waitq::leave();
+            SCHED_OVER.with(|c| c.set(true));
             return 2;
         }
         if matches!(pick, Pick::Again) {
             continue;
         }
-        let Pick::Thread(i, timed_out, by_signal) = pick else {
+        let Pick::Resumed(resume) = pick else {
             let Pick::Idle(look) = pick else { unreachable!() };
             // Nothing can run, but not everything that cannot run is stuck. A
             // thread wanting a keystroke needs the page (bit 0); one waiting on
@@ -10666,120 +10699,113 @@ fn schedule() -> i32 {
             set_paused_to(2);
             return 2;
         };
-        // Picked: the wait it was registered for is over.
-        waitq::leave();
-        IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
-        if tracing() {
-            let (pc, blocked) = with_host(|h| (h.threads[i].pc, h.threads[i].blocked_on.is_some()));
-            trace_line(&format!(
-                "[gex] switch to thread {i} at pc={pc:#x} blocked={blocked}
-"
-            ));
-        }
-        let resume = with_host(|h| {
-            set_current(h, i);
-            let t = &mut h.threads[i];
-            let was_futex = matches!(t.waiting, Waiting::Futex { .. });
-            let ctx_addr = t.kstate.ctx_addr;
-            t.waiting = Waiting::Runnable;
-            let op = t.blocked_on.take();
-            // A futex thread arriving with nothing to finish must still receive
-            // a legal result. Linux permits spurious futex wakes, and zero is
-            // exactly that result; leaving x0 untouched hands glibc the uaddr
-            // as an errno and makes it call futex_fatal_error.
-            if was_futex && op.is_none() {
-                warn_line(&format!(
-                    "[gex] pid {} recovered a spurious futex wake for thread {i}",
-                    h.kernel.pid,
-                ));
-                let mut gm = GuestMem::new(guest_bytes());
-                let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
-                ftx_note(!0, 0, 0, t.pc, t.kstate.tid);
-            }
-            let (mut pc, kstate) = (t.pc, t.kstate.clone());
-            if let Some(op) = op {
-                // The syscall that parked this thread still owes it a return
-                // value, and the kernel writes that into the context of
-                // whichever thread it thinks is running.
-                let mut gm = GuestMem::new(guest_bytes());
-                h.kernel.enter_thread(&kstate);
-                let r = finish_parked(&op, timed_out, by_signal, &mut gm);
-                // A priority-inheritance lock still held: the syscall again,
-                // from its instruction (the registers are as the guest made the call).
-                if r == Err(PI_RETRY) {
-                    h.kernel.leave_thread(&mut h.threads[cur()].kstate);
-                    return Some((kstate.ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES));
-                }
-                // A parked call's answer never reaches the syscall ring (the
-                // ring is written when the call is made), so an error here is
-                // otherwise invisible -- and glibc aborts over a bad futex one.
-                if let gex_kernel::BlockOp::FutexWait { uaddr, .. } = &op {
-                    ftx_note(
-                        !0,
-                        *uaddr,
-                        match &r {
-                            Ok(v) => *v as i64,
-                            Err(e) => -(e.0 as i64),
-                        },
-                        t.pc,
-                        t.kstate.tid,
-                    );
-                }
-                let outcome = h.kernel.finish_blocking(&mut gm, r);
-                // Did the answer land in the register the guest reads?
-                // `finish_blocking` writes into whichever thread the kernel
-                // thinks is running, which with two threads is worth checking.
-                if let (gex_kernel::BlockOp::FutexWait { .. }, Ok(v)) = (&op, &r) {
-                    let got = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(!0);
-                    if got != *v {
-                        warn_line(&format!(
-                            "[gex] pid {} wrote {v} for a futex wait and x0 holds {got:#x}",
-                            h.kernel.pid,
-                        ));
-                    }
-                }
-                h.kernel.leave_thread(&mut h.threads[cur()].kstate);
-                match outcome {
-                    // One process, not the run: `exit_process` publishes the
-                    // status the parent's `wait4` collects, rather than taking
-                    // the whole guest down with a parked child's exit.
-                    SyscallOutcome::Exit(code) => {
-                        exit_process(h, code);
-                        return None;
-                    }
-                    // Finishing a blocked syscall can *deliver a signal*, whose
-                    // frame says where to go; this is the only place that can
-                    // honour it, since the saved pc is after the `svc`, not the
-                    // handler. Dropping it broke every shell `fork`, where a
-                    // child's SIGCHLD must run a handler.
-                    SyscallOutcome::Resume(target) => {
-                        if tracing() {
-                            trace_line(&format!("[sig] resume at {target:#x}\n"));
-                        }
-                        pc = target;
-                    }
-                    // Ends one process, with no stack to return to, so the
-                    // caller is told there is no thread to resume.
-                    SyscallOutcome::Killed { signal, .. } => {
-                        exit_process(h, -(signal as i32));
-                        return None;
-                    }
-                    _ => {}
-                }
-            }
-            Some((kstate.ctx_addr, pc))
-        });
         match resume {
+            // Both are this Worker's own (`RESUME`, `RESUME_CTX`): no kernel.
             Some((ctx_addr, pc)) => {
-                with_host(|h| {
-                    set_resume(pc);
-                    set_resume_ctx(ctx_addr);
-                });
+                set_resume(pc);
+                set_resume_ctx(ctx_addr);
                 return 1;
             }
             None => return 2,
         }
     }
+}
+
+/// Run this Worker's thread `i` again, its wait over: finish the syscall
+/// it parked in (`timed_out`, `by_signal` as `schedule` found them).
+/// Where to resume, or `None` when the process ended.
+fn resume_thread(h: &mut Host, i: usize, timed_out: bool, by_signal: bool) -> Option<(u64, u64)> {
+    set_current(h, i);
+    let t = &mut h.threads[i];
+    let was_futex = matches!(t.waiting, Waiting::Futex { .. });
+    let ctx_addr = t.kstate.ctx_addr;
+    t.waiting = Waiting::Runnable;
+    let op = t.blocked_on.take();
+    // A futex thread arriving with nothing to finish must still receive
+    // a legal result. Linux permits spurious futex wakes, and zero is
+    // exactly that result; leaving x0 untouched hands glibc the uaddr
+    // as an errno and makes it call futex_fatal_error.
+    if was_futex && op.is_none() {
+        warn_line(&format!(
+            "[gex] pid {} recovered a spurious futex wake for thread {i}",
+            h.kernel.pid,
+        ));
+        let mut gm = GuestMem::new(guest_bytes());
+        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
+        ftx_note(!0, 0, 0, t.pc, t.kstate.tid);
+    }
+    let (mut pc, kstate) = (t.pc, t.kstate.clone());
+    if let Some(op) = op {
+        // The syscall that parked this thread still owes it a return
+        // value, and the kernel writes that into the context of
+        // whichever thread it thinks is running.
+        let mut gm = GuestMem::new(guest_bytes());
+        h.kernel.enter_thread(&kstate);
+        let r = finish_parked(&op, timed_out, by_signal, &mut gm);
+        // A priority-inheritance lock still held: the syscall again,
+        // from its instruction (the registers are as the guest made the call).
+        if r == Err(PI_RETRY) {
+            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+            return Some((kstate.ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES));
+        }
+        // A parked call's answer never reaches the syscall ring (the
+        // ring is written when the call is made), so an error here is
+        // otherwise invisible -- and glibc aborts over a bad futex one.
+        if let gex_kernel::BlockOp::FutexWait { uaddr, .. } = &op {
+            ftx_note(
+                !0,
+                *uaddr,
+                match &r {
+                    Ok(v) => *v as i64,
+                    Err(e) => -(e.0 as i64),
+                },
+                t.pc,
+                t.kstate.tid,
+            );
+        }
+        let outcome = h.kernel.finish_blocking(&mut gm, r);
+        // Did the answer land in the register the guest reads?
+        // `finish_blocking` writes into whichever thread the kernel
+        // thinks is running, which with two threads is worth checking.
+        if let (gex_kernel::BlockOp::FutexWait { .. }, Ok(v)) = (&op, &r) {
+            let got = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(!0);
+            if got != *v {
+                warn_line(&format!(
+                    "[gex] pid {} wrote {v} for a futex wait and x0 holds {got:#x}",
+                    h.kernel.pid,
+                ));
+            }
+        }
+        h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+        match outcome {
+            // One process, not the run: `exit_process` publishes the
+            // status the parent's `wait4` collects, rather than taking
+            // the whole guest down with a parked child's exit.
+            SyscallOutcome::Exit(code) => {
+                exit_process(h, code);
+                return None;
+            }
+            // Finishing a blocked syscall can *deliver a signal*, whose
+            // frame says where to go; this is the only place that can
+            // honour it, since the saved pc is after the `svc`, not the
+            // handler. Dropping it broke every shell `fork`, where a
+            // child's SIGCHLD must run a handler.
+            SyscallOutcome::Resume(target) => {
+                if tracing() {
+                    trace_line(&format!("[sig] resume at {target:#x}\n"));
+                }
+                pc = target;
+            }
+            // Ends one process, with no stack to return to, so the
+            // caller is told there is no thread to resume.
+            SyscallOutcome::Killed { signal, .. } => {
+                exit_process(h, -(signal as i32));
+                return None;
+            }
+            _ => {}
+        }
+    }
+    Some((kstate.ctx_addr, pc))
 }
 
 /// What a parked syscall should return now that its thread is running again.
