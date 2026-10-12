@@ -47,6 +47,15 @@ const WALL = Number(process.env.DEMO_WALL || 300) * 1000;
 const STEPS = JSON.parse(process.env.DEMO_STEPS || '[]');
 const t0 = Date.now();
 const log = (s) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${s}`);
+// Whatever ends the run says so in the log, as a FAIL line: a leg that dies
+// with only a stack trace on stderr reads, to a harness that greps the log,
+// like a run that printed nothing at all.
+for (const ev of ['uncaughtException', 'unhandledRejection']) {
+  process.on(ev, (e) => {
+    log(`FAIL ${ev}: ${e?.stack || e}`);
+    process.exit(1);
+  });
+}
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
   '.wasm': 'application/wasm', '.json': 'application/json', '.zst': 'application/zstd' };
@@ -84,7 +93,15 @@ const chrome = spawn(CHROME, [
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
 let stderr = '';
 chrome.stderr.on('data', (d) => (stderr += d));
+let closing = false;
+chrome.on('exit', (code, sig) => {
+  if (closing) return;
+  log(`FAIL the browser exited (code ${code}, signal ${sig}); its last words:`);
+  for (const l of stderr.split('\n').filter(Boolean).slice(-15)) log(`  ${l.slice(0, 300)}`);
+  process.exit(1);
+});
 const cleanup = () => {
+  closing = true;
   try { chrome.kill('SIGKILL'); } catch {}
   if (!process.env.DEMO_PROFILE) try { rmSync(prof, { recursive: true, force: true }); } catch {}
 };
@@ -100,7 +117,7 @@ for (let i = 0; i < 100 && !ws; i++) {
   ws = await browserWsUrl(port);
   if (!ws) await new Promise((r) => setTimeout(r, 100));
 }
-if (!ws) throw new Error('no browser');
+if (!ws) throw new Error(`no browser on port ${port} after 10 s`);
 const b = await Cdp.connect(ws);
 let page = null;
 for (let i = 0; i < 50 && !page; i++) {
