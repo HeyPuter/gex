@@ -434,7 +434,7 @@ function pageGlobals() {
  */
 async function runInSystemWorker(term, opts) {
   // `onFilesLoaded` is a function, which cannot cross to the Worker.
-  const { network, onNetEvent, onFilesLoaded, onDesktop, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  const { network, onNetEvent, onFilesLoaded, onDesktop, transfer, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
   // Said once, so a person (and tests/single/run.sh) can tell which build ran.
   term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system
@@ -554,6 +554,9 @@ async function runProgramHere(
     // Called once pid 1 has copied `files` into the kernel's filesystem: the
     // caller can drop its own references to the bytes (a bundle's buffer).
     onFilesLoaded = null,
+    // Buffers `files` views that the caller gives up to pid 1's Worker
+    // (moved, not copied; freed there once the kernel has the files).
+    transfer = [],
     // Called with the DOM desktop when `wl` is an element, before any window.
     onDesktop = null,
     gl = null,
@@ -1034,6 +1037,7 @@ async function runProgramHere(
     const status = await host.start({
       elf,
       files,
+      transfer,
       dirs,
       modes,
       env,

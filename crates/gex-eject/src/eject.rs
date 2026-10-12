@@ -32,6 +32,9 @@ pub const GENERATED: &[&str] = &[
     "serve.mjs",
     "index.html",
     ".gitignore",
+    // A W3 page's (w3.rs).
+    "bundle",
+    "units",
 ];
 
 pub struct EjectOptions {
@@ -74,7 +77,7 @@ fn synthetic(path: &str) -> bool {
         .any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
 
-fn write_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     }
@@ -105,7 +108,7 @@ fn normalize(p: &str) -> String {
 
 /// Make `out` ready for a (re-)eject: new, empty, or a project whose
 /// generated files and build are removed and whose `user/` stays.
-fn prepare(out: &Path) -> Result<bool> {
+pub(crate) fn prepare(out: &Path) -> Result<bool> {
     if !out.exists() {
         std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
         return Ok(false);

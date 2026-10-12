@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+// The ejected W3 page leg: a site from web/eject-site.mjs of a W3 project
+// (docs/eject.md, "W3 pages") reaches its window in headless Chromium, built
+// with the features its project left out really gone.
+//
+//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH]
+//
+// Checks, in order:
+//   1. the site's nt.json says kind w3, and for each feature it says is off,
+//      the files that feature is are not in the site ("compositor":
+//      assets/compositor-*, assets/compositor-worker-*, assets/gpu-device-*;
+//      "gl": gex/gex-wgpu-replay.*);
+//   2. served (cross-origin isolated) and opened at its launcher, a toplevel
+//      titled RE (default "Untitled - Paint") appears;
+//   3. with "compositor" off, what draws it is the page's bare desktop
+//      (`describe().compositor === 'none'`), and the window has pixels.
+// Prints PASS or FAIL lines; exits 0 only when all pass.
+
+import { spawn } from 'node:child_process';
+import { createReadStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import http from 'node:http';
+import { tmpdir } from 'node:os';
+import { extname, join, resolve } from 'node:path';
+import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
+
+const av = process.argv.slice(2);
+const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
+const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome'].includes(av[i - 1])) ?? '');
+const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
+const timeout = Number(opt('--timeout', '400')) * 1000;
+const port = Number(opt('--port', '8731'));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let failed = 0;
+const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if (!ok) failed++; return ok; };
+
+// 1. What the build left out.
+const ntPath = join(site, 'project/build/web/nt.json');
+if (!check(existsSync(ntPath), `${ntPath} exists`)) process.exit(1);
+const nt = JSON.parse(readFileSync(ntPath, 'utf8'));
+check(nt.kind === 'w3', `the site is a W3 page (kind ${nt.kind})`);
+const off = nt.features_off ?? [];
+const assets = existsSync(join(site, 'assets')) ? readdirSync(join(site, 'assets')) : [];
+const gexDir = existsSync(join(site, 'gex')) ? readdirSync(join(site, 'gex')) : [];
+if (off.includes('compositor')) {
+  const left = assets.filter((n) => /^(compositor|compositor-worker|gpu-device)-/.test(n));
+  check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
+}
+if (off.includes('gl')) {
+  const left = gexDir.filter((n) => n.startsWith('gex-wgpu-replay'));
+  check(left.length === 0, `"gl" off: no Mesa in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
+}
+
+// 2. Served and run to the title.
+const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
+const server = http.createServer((req, res) => {
+  let p = join(site, decodeURIComponent(new URL(req.url, 'http://x').pathname));
+  if (!p.startsWith(site)) { res.writeHead(403).end(); return; }
+  let st = null;
+  try { st = statSync(p); if (st.isDirectory()) { p = join(p, 'index.html'); st = statSync(p); } } catch { st = null; }
+  const h = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin' };
+  if (!st?.isFile()) { res.writeHead(404, h).end(); return; }
+  res.writeHead(200, { ...h, 'Content-Type': types[extname(p)] || 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
+  createReadStream(p).pipe(res);
+});
+await new Promise((r) => server.listen(port, '127.0.0.1', r));
+const profile = mkdtempSync(join(tmpdir(), 'gex-w3-leg-'));
+const cport = port + 1;
+const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
+  '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-webgpu',
+  '--use-angle=vulkan', '--enable-features=Vulkan', '--ozone-platform=headless',
+  '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
+  `--remote-debugging-port=${cport}`, `--user-data-dir=${profile}`, 'about:blank',
+], { detached: true, stdio: 'ignore' });
+const done = () => {
+  try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
+  server.close();
+  rmSync(profile, { recursive: true, force: true });
+  console.log(failed ? `FAIL ${failed} check(s)` : 'PASS all');
+  process.exit(failed ? 1 : 0);
+};
+let ws = null;
+for (let i = 0; i < 80 && !ws; i++) { ws = await browserWsUrl(cport); if (!ws) await sleep(250); }
+if (!check(!!ws, 'Chromium started')) done();
+const browser = await Cdp.connect(ws);
+const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
+const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
+await browser.send('Runtime.enable', {}, page);
+const ev = async (e) => (await browser.send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }, page).catch(() => ({})))?.result?.value;
+const t0 = Date.now();
+await browser.send('Page.navigate', { url: `http://127.0.0.1:${port}/` }, page);
+let d = null;
+while (Date.now() - t0 < timeout) {
+  const s = await ev('(async () => { const c = globalThis.__gexCompositor; return c ? JSON.stringify(await c.describe()) : null; })()');
+  d = s ? JSON.parse(s) : null;
+  if (d?.titles?.some((t) => titleRe.test(t))) break;
+  const st = await ev('JSON.stringify({ phase: globalThis.__nt?.phase, error: globalThis.__nt?.error })');
+  if (st && JSON.parse(st).phase === 'failed') { check(false, `the page failed: ${JSON.parse(st).error}`); done(); }
+  await sleep(500);
+}
+const secs = ((Date.now() - t0) / 1000).toFixed(1);
+if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleRe.source}/ (${secs} s; titles ${JSON.stringify(d?.titles ?? [])})`)) done();
+
+// 3. Drawn by the page itself when the compositor is out.
+if (off.includes('compositor')) {
+  check(d.compositor === 'none', `drawn without the scene compositor (describe().compositor ${d.compositor})`);
+  const comp = await ev("[...document.querySelectorAll('script')].some((s) => /compositor-worker/.test(s.src)) || performance.getEntriesByType('resource').some((r) => /compositor(-worker)?-[^/]*\\.js$/.test(r.name))");
+  check(!comp, 'the page loaded no compositor script');
+}
+await sleep(2000);
+d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
+check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
+done();

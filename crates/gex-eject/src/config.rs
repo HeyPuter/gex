@@ -98,6 +98,9 @@ pub struct Config {
     /// functions are linked into one module with direct calls between them
     /// (docs/eject-pe.md §6a).
     pub link_groups: Vec<Vec<String>>,
+    /// The runtime's features this build leaves out (`"features"`, each
+    /// `false`; see [`crate::features`]). Empty: everything in.
+    pub features_off: Vec<String>,
 }
 
 impl Default for Config {
@@ -112,6 +115,7 @@ impl Default for Config {
             allow_syscalls: Vec::new(),
             jit_fallback: false,
             link_groups: Vec::new(),
+            features_off: Vec::new(),
         }
     }
 }
@@ -144,7 +148,8 @@ fn template_fields() -> Vec<(&'static str, Json)> {
                  \"import\" or \"library\"; `gexc eject override` prints a checked entry. \"coverage\" is \"profile\" (what the session ran), \"static\" (and what discovery finds) or \"exhaustive\". \"args\" \
                  replaces the recorded arguments. \"syscalls\": \"recorded\" allows only the system \
                  calls the session made (\"all\": any); \"allow_syscalls\" adds some by name. \"jit_fallback\": true translates code the build \
-                 never saw instead of failing on it.",
+                 never saw instead of failing on it. \"features\": the parts of gex's runtime the \
+                 build keeps; false leaves one out (see docs/eject.md, \"Features\").",
             ),
         ),
         ("replace", Json::Arr(Vec::new())),
@@ -153,6 +158,10 @@ fn template_fields() -> Vec<(&'static str, Json)> {
         ("syscalls", json::s("recorded")),
         ("allow_syscalls", Json::Arr(Vec::new())),
         ("jit_fallback", json::b(false)),
+        (
+            "features",
+            obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(true))).collect()),
+        ),
     ]
 }
 
@@ -164,7 +173,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -281,6 +290,24 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>>>()?,
             Some(_) => bail!("{what}: \"link_groups\" is not a list of lists"),
+        };
+        c.features_off = match v.get("features") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Obj(kv)) => {
+                let mut off = Vec::new();
+                for (k, x) in kv {
+                    match x {
+                        Json::Bool(true) => {}
+                        Json::Bool(false) => off.push(k.clone()),
+                        _ => bail!("{what}: features: \"{k}\" is not true or false"),
+                    }
+                    if crate::features::feature(k).is_none() {
+                        crate::features::check(&[k.clone()])?;
+                    }
+                }
+                off
+            }
+            Some(_) => bail!("{what}: \"features\" is not an object of true and false"),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

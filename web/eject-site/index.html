@@ -67,6 +67,26 @@
       (reg.active ?? navigator.serviceWorker.controller).postMessage({ prefetch: true }, [ch.port2]);
     });
     const m = await (await fetch('project/build/web/nt.json', { cache: 'no-cache' })).json();
+    // A W3 page (Wine as wasm32, docs/eject.md "W3 pages"): started as it was
+    // recorded, its units in front of the translator.
+    if (m.kind === 'w3') {
+      const p = new URLSearchParams({
+        tar: '/project/build/web/rootfs.tar',
+        exe: m.exe,
+        argv: JSON.stringify(m.argv ?? []),
+        env: (m.env ?? []).join(','),
+        cwd: m.cwd ?? '/',
+        size: q.get('size') ?? m.size,
+        cgen: '1',
+        cgenurl: '/project/build/web/units',
+        preload: '/project/build/web/units/preload.json',
+        ...(m.mtimes ? { mtimes: '1' } : {}),
+        ...(m.params ?? {}),
+      });
+      for (const k of ['trapstack', 'present', 'fjit', 'compositor', 'strace']) if (q.has(k)) p.set(k, q.get(k));
+      location.replace(`nt.html?${p}`);
+      await new Promise(() => {});
+    }
     const env = [`GEX_WINE_PREFIX=${m.prefix}`, ...m.settings, ...m.env, ...(q.get('env') ? [q.get('env')] : [])];
     const fit = `${Math.max(640, innerWidth) & ~7}x${Math.max(480, innerHeight) & ~7}`;
     const p = new URLSearchParams({

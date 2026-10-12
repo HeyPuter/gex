@@ -34,13 +34,20 @@ const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
 const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache'].includes(av[i - 1]));
+// A W3 page's site (below): --strip takes the debug sections out of every
+// .wasm (the bundle's included), --prune leaves out files the browser never
+// reads (precompiled .cwasm, static archives), --dedupe puts identical files
+// next to each other in the tar so zstd's window stores the second as a match.
 if (!project || !out) {
   console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--wgsl-cache FILE] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
-const nt = JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
-const title = opt('--title', nt.exe.split('/').pop().replace(/\.exe$/i, ''));
+// A W3 page's project (gexc eject of a tools/eject/record-w3.mjs recording):
+// build/web/w3.json instead of nt.json. See `w3Site` below.
+const w3 = existsSync(join(project, 'build/web/w3.json')) ? JSON.parse(readFileSync(join(project, 'build/web/w3.json'), 'utf8')) : null;
+const nt = w3 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
+const title = opt('--title', w3 ? (w3.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -71,6 +78,11 @@ function walk(dir, fn, base = dir) {
     if (e.isDirectory()) walk(p, fn, base);
     else if (e.isFile() || e.isSymbolicLink()) fn(p, relative(base, p));
   }
+}
+
+if (w3) {
+  w3Site();
+  process.exit(0);
 }
 
 // The page and the runtime.
@@ -235,4 +247,76 @@ Content-Encoding. nginx:
   }
 `);
 function mb(n) { return (n / 1048576).toFixed(1); }
+
+/** The site of a W3 page's project: its page (built with the project's
+ *  features), bundle and units, the launcher and the service worker. */
+function w3Site() {
+  const web = join(project, 'build/web');
+  const work = `${out.replace(/\/+$/, '')}.work`;
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+  const strip = flag('--strip');
+  const stripped = (src) => {
+    if (!strip || !src.endsWith('.wasm')) return src;
+    const dst = join(work, 'strip', sha(readFileSync(src)));
+    mkdirSync(dirname(dst), { recursive: true });
+    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
+    return dst;
+  };
+  walk(join(web, 'page'), (p, rel) => place(stripped(p), rel));
+  // The bundle.
+  let tar = join(web, 'rootfs.tar');
+  if (strip || flag('--prune') || flag('--dedupe')) {
+    const x = join(work, 'tarx');
+    mkdirSync(x, { recursive: true });
+    execFileSync('tar', ['-xf', tar, '-C', x]);
+    if (strip) walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
+    if (flag('--prune')) walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+    tar = join(work, 'rootfs.tar');
+    const dirs = [];
+    const byHash = new Map();
+    const all = (d, rel) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        const p = join(d, e.name);
+        if (e.isDirectory()) { dirs.push(r); all(p, r); continue; }
+        const k = flag('--dedupe') && e.isFile() ? sha(readFileSync(p)) : `path:${r}`;
+        if (!byHash.has(k)) byHash.set(k, []);
+        byHash.get(k).push(r);
+      }
+    };
+    all(x, '');
+    const list = join(work, 'tar-list');
+    writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
+    execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
+  }
+  place(tar, 'project/build/web/rootfs.tar');
+  // The units, largest first in the preload list.
+  const preload = [];
+  for (const u of w3.units) {
+    const d = join(web, 'units', u.key);
+    place(join(d, 'c.wasm'), `project/build/web/units/${u.key}/c.wasm`);
+    place(join(d, 'c.entries'), `project/build/web/units/${u.key}/c.entries`);
+    preload.push([`cgen:${u.key}`, `/project/build/web/units/${u.key}/c.wasm`, statSync(join(d, 'c.wasm')).size]);
+    preload.push([`file:${u.key}/c.entries`, `/project/build/web/units/${u.key}/c.entries`, 0]);
+  }
+  preload.sort((a, b) => b[2] - a[2]);
+  writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
+  writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
+  // The launcher, the service worker and its decoder.
+  const smallHash = createHash('sha256');
+  walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
+  const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
+  writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
+  copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
+  cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
+  writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
+  rmSync(work, { recursive: true, force: true });
+  const total = Object.values(files).reduce((a, f) => a + f.size, 0);
+  const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
+  let small = 0;
+  walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small }, null, 1));
+  console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`);
+}
 console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);

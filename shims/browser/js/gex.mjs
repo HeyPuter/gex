@@ -3182,6 +3182,9 @@ export class Gex {
     // by path, winepe.wasm (8.9 MB) was compiled once per Wine process, ten
     // times for the mspaint demo, each copy of its code resident.
     const pbytes = wasmdll ? new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice() : null;
+    // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) collects: the
+    // native wasm32 modules a session ran.
+    if (wasmdll) console.warn(`[gex-record] module ${this.#cgenStr(e.gex_cgen_pmod_file, prov)} ${moduleContentKey(pbytes)}`);
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes,
         `wasm:${moduleContentKey(pbytes)}`)
@@ -4040,6 +4043,10 @@ export class Gex {
   #cgenUnit(u, key, path, t0) {
     const e = this.#shim.exports;
     const got = this.#env.loadUnit?.(key) ?? null;
+    // For gex-eject's W3 recorder: which image each unit is, and which images
+    // had none; and which program this process is, at its main image.
+    console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
+    if (/\.exe$/i.test(path)) console.warn(`[gex-record] process ${path} :: ${this.cmdline}`);
     if (!got) {
       if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
       this.#cgenProviders(u);

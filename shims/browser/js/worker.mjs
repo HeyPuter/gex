@@ -687,6 +687,11 @@ async function handle(msg) {
       if (msg.files) {
         msg.files = null;
         msg.elf = null;
+        // A bundle the page moved here rather than shared: freed now, not
+        // whenever this Worker's isolate next collects (one that runs a guest
+        // in wasm may not for the whole session).
+        for (const b of msg.transfer ?? []) b?.transfer?.(0);
+        msg.transfer = null;
         port.post({ kind: 'files-loaded' });
       }
     }

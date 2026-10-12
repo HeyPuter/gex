@@ -10,6 +10,11 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (docs/eject.md)
+  gexc eject <w3-record-dir> --out <project> --web-src <gex>/web [--unit-cache DIR]... [--features -compositor,...] [--build]
+                                   the same for a W3 page (Wine as wasm32)
+                                   recorded by tools/eject/record-w3.mjs: its
+                                   bundle, units and runtime, and the features
+                                   the build keeps (docs/eject.md, \"W3 pages\")
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
   gexc eject override <project> <object> <symbol|0xoffset> [--size N]
@@ -133,6 +138,11 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let mut then_build = false;
             let mut web_shim = None;
             let mut web_page = None;
+            let mut web_src = None;
+            let mut unit_cache: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
+                .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
+                .unwrap_or_default();
+            let mut features_off = Vec::new();
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -149,6 +159,23 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                         i += 1;
                         web_page = Some(PathBuf::from(args.get(i).context("--web-page needs a directory (web/build-eject-page.sh DIR)")?));
                     }
+                    "--web-src" => {
+                        i += 1;
+                        web_src = Some(PathBuf::from(args.get(i).context("--web-src needs gex's web/ directory")?));
+                    }
+                    "--unit-cache" => {
+                        i += 1;
+                        unit_cache.push(PathBuf::from(args.get(i).context("--unit-cache needs a directory")?));
+                    }
+                    "--features" => {
+                        i += 1;
+                        for f in args.get(i).context("--features needs a list, e.g. -compositor")?.split(',') {
+                            match f.strip_prefix('-') {
+                                Some(n) => features_off.push(n.to_string()),
+                                None => bail!("--features: \"{f}\": say which to leave out, as -NAME (everything else is in)"),
+                            }
+                        }
+                    }
                     o if o.starts_with('-') => bail!("gexc eject: unknown option {o}"),
                     r => {
                         if record.replace(PathBuf::from(r)).is_some() {
@@ -161,6 +188,36 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let record = record.context("gexc eject <record-dir> --out <project>")?;
             let out = out.context("gexc eject: where to? (--out <project>)")?;
             let runtime = std::env::current_exe().context("finding this gexc to copy into the project")?;
+            if gex_eject::w3::is_recording(&record) {
+                let web_src = web_src.context("a W3 recording needs --web-src <gex>/web (the page's source and the built runtime)")?;
+                let s = gex_eject::w3::eject(
+                    &record,
+                    &out,
+                    &runtime,
+                    &gex_eject::w3::W3Options { web_src, unit_cache, features_off },
+                )?;
+                eprintln!(
+                    "{}: a W3 page: {} processes, {} units ({} MiB), bundle {} MiB, {} wasm modules{}",
+                    out.display(),
+                    s.processes,
+                    s.units,
+                    s.unit_bytes >> 20,
+                    s.bundle_bytes >> 20,
+                    s.modules,
+                    if s.kept_user { "; user/ kept" } else { "" }
+                );
+                eprintln!(
+                    "  the project holds the program's own code and the files it read; \
+                     distributing it is subject to their licences"
+                );
+                if then_build {
+                    build(&out)?;
+                }
+                return Ok(None);
+            }
+            if web_src.is_some() || !features_off.is_empty() {
+                bail!("--web-src and --features are for a W3 recording (w3-session.json)");
+            }
             let s = gex_eject::eject::eject(
                 &record,
                 &out,
@@ -199,6 +256,16 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
 
 fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
+    if let Some(w) = &r.w3 {
+        eprintln!(
+            "{}: W3 page built: {} page files, {} units; features off: {}",
+            dir.display(),
+            w.page_files,
+            w.units,
+            if w.features_off.is_empty() { "none".to_string() } else { w.features_off.join(", ") }
+        );
+        return Ok(());
+    }
     if let Some(pe) = &r.pe {
         for (path, base, entries, bytes, how) in &pe.units {
             eprintln!("  {path:<60} {base:#10x} {entries:>7} entries {:>7} KiB  {how}", bytes / 1024);

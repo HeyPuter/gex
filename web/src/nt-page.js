@@ -52,17 +52,21 @@ const term = {
 };
 
 /**
- * The bundle, in a SharedArrayBuffer. Every file is a view of it, and the
- * views go to the process's Worker in its start message: a structured clone
- * shares a SharedArrayBuffer where it would copy an ArrayBuffer, and copying
- * Noita's 1.8 GB fails ("Data cannot be cloned, out of memory").
+ * The bundle, in one ArrayBuffer. Every file is a view of it, and the buffer
+ * is moved (transferred, not cloned) to pid 1's Worker with its start
+ * message: a clone would copy it, and copying Noita's 1.8 GB fails ("Data
+ * cannot be cloned, out of memory"). It used to be a SharedArrayBuffer for
+ * the same reason, which stayed resident for the whole session beside the
+ * kernel's copy of every file (459 MiB of the mspaint demo's tab): a shared
+ * buffer is freed only when every isolate that saw it has collected its
+ * wrapper. A transferred one the Worker frees itself, once loaded.
  */
 async function fetchShared(url) {
   const res = await fetch(url, { cache: 'no-cache' });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length'));
   if (!total) throw new Error(`${url}: no content-length`);
-  const out = new Uint8Array(new SharedArrayBuffer(total));
+  const out = new Uint8Array(new ArrayBuffer(total));
   const reader = res.body.getReader();
   let at = 0;
   for (;;) {
@@ -190,8 +194,10 @@ async function main() {
   // `tar=a.tar,b.tar`: bundles laid over one another, later ones winning --
   // a small test program over a large cached bundle of its libraries.
   const trees = [];
+  const buffers = [];
   for (const url of (q.get('tar') || '/gex/nt/bundle.tar').split(',')) {
     const tar = await fetchShared(url);
+    buffers.push(tar.buffer);
     // The buffer, not the array: `untar` wraps what it is given in a new
     // Uint8Array, which copies an array but views a buffer.
     mark(`fetched ${url} (${(tar.length / 1048576).toFixed(0)} MiB)`);
@@ -246,6 +252,18 @@ async function main() {
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
   const gl = q.get('gl') === '1';
+  // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) keeps of this
+  // run besides the Workers' `[gex-record]` lines: how it was started.
+  state.session = {
+    exe,
+    argv: args.slice(1),
+    env,
+    cwd: q.get('cwd') || exe.replace(/\/[^/]*$/, '') || '/',
+    mtimes: q.get('mtimes') === '1',
+    size: `${w}x${h}`,
+    tar: (q.get('tar') || '/gex/nt/bundle.tar').split(','),
+    params: Object.fromEntries(q),
+  };
   const preModules = await preloading;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
@@ -283,12 +301,14 @@ async function main() {
     onDesktop: bare ? (d) => { globalThis.__gexCompositor = bareDesktop(d, desk); } : null,
     hostX: q.get('hostx') === '1',
     preModules,
+    transfer: buffers,
     // Once the kernel holds its own copy of every file, nothing here may view
     // the bundle's SharedArrayBuffer, or it stays resident beside that copy
     // (459 MiB of the mspaint demo's tab, twice).
     onFilesLoaded: () => {
       for (const o of [files, tree.files, ...trees.map((t) => t.files)]) for (const k of Object.keys(o)) delete o[k];
       trees.length = 0;
+      buffers.length = 0;
       mark('bundle released');
     },
   });
