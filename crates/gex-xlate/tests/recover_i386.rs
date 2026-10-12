@@ -350,6 +350,8 @@ fn a_page_hash_leaves_import_slots_out() {
     assert_eq!(h(&mem), before);
     mem[0x1018] = 0xcc;
     assert_ne!(h(&mem), before);
+}
+
 /// A vtable kept in `.text` (Microsoft merges `.rdata` there): the relocated
 /// pointer to the table seeds a weak start whose decode runs on into
 /// `get_b`, which only the table names. `get_b` is a function of its own

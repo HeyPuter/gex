@@ -1030,7 +1030,11 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
     }
     // No caller waits for a return (a root, or the bridge): leave, and the
     // root dispatches there flat.
-    if ret == gex_abi::ftab::NO_RETURN {
+    // The awaited return itself, reached with the stack moved (a callee
+    // that changes `esp`, such as MSVC's `__chkstk`): a call-out from there
+    // would wait for a second return to where it starts. Leave; the caller's
+    // return check resumes there (the browser host's `gex_ftab_fallback`).
+    if ret == gex_abi::ftab::NO_RETURN || target == ret {
         return Ok(gex_abi::ftab::RET_LEFT);
     }
     call_out(caller, ctx, target, ret, sp + delta)
