@@ -950,7 +950,11 @@ fn read_unit(path: &std::path::Path, stubs: &[u64]) -> Result<Option<(std::path:
 }
 
 /// A unit for `p`, if one was built, with the byte check.
-fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
+/// `at_map`: Wine has only just mapped the image, and every byte counts, its
+/// import slots too: a unit placed before the loader has filled them (and
+/// put back the protection it lifts to do it, which retires the page and
+/// the unit's functions on it) waits for the image's first miss instead.
+fn place(p: &Pending, memory: &[u8], at_map: bool) -> Result<Option<Placed>> {
     if is_wasm_skeleton(&p.pe) {
         return Ok(None);
     }
@@ -959,13 +963,14 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
         return Ok(None);
     };
     let mut pages = Vec::new();
+    note_import_slots(p.base, &p.pe);
     // What the unit was built from must be what is mapped.
     for (vaddr, bytes) in &pr.segs {
         let (lo, n) = (*vaddr as usize, bytes.len());
         let live = memory
             .get(lo..lo + n)
             .ok_or_else(|| anyhow!("{}: {:#x}+{n:#x} is outside guest memory", p.path, vaddr))?;
-        if let Some(i) = gex_xlate::pe_code_difference(*vaddr, bytes, live, p.base, Some(&p.pe)) {
+        if let Some(i) = gex_xlate::pe_code_difference(*vaddr, bytes, live, p.base, (!at_map).then_some(&*p.pe)) {
             bail!(
                 "{}: the mapped code at {:#x} differs from the image its function-tier unit was \
                  built from (guest {:#04x}, unit {:#04x}); refusing the unit",
@@ -989,15 +994,38 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
 
 /// A hash of guest page `page` as it is now.
 fn page_hash(memory: &[u8], page: u64) -> u64 {
-    let lo = (page * gex_abi::DISPATCH_PAGE) as usize;
-    let hi = (lo + gex_abi::DISPATCH_PAGE as usize).min(memory.len());
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for c in memory.get(lo..hi).unwrap_or(&[]).chunks(8) {
-        let mut b = [0u8; 8];
-        b[..c.len()].copy_from_slice(c);
-        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x0100_0000_01b3);
+    let slots = IMPORT_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    gex_xlate::masked_page_hash(memory, page, gex_abi::DISPATCH_PAGE, &slots)
+}
+
+/// The import slots of every PE image placed (absolute, sorted): bytes the
+/// loader writes that are not code ([`page_hash`]).
+static IMPORT_SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn note_import_slots(base: u64, pe: &gex_ld::pe::PeImage) {
+    let end = base + pe.image_size as u64;
+    {
+        let mut v = IMPORT_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        v.retain(|&(a, _)| a < base || a >= end);
+        v.extend(gex_xlate::pe_import_slots(pe).into_iter().map(|(a, b)| (base + a, base + b)));
+        v.sort_unstable();
     }
-    h
+    let mut v = PE_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|&(a, b)| b <= base || a >= end);
+    v.push((base, end));
+}
+
+/// Where the PE images with units are (start, end).
+static PE_IMAGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Whether `addr` is inside a PE image a unit was placed for: a page of one
+/// made non-executable for a while (Wine's loader lifts `.text` to fill an
+/// import table there, then puts it back) is not gone (the hosts'
+/// `gone_code`). Its units stay; its bytes are compared when it is
+/// executable again (the kernel retires it then), and a changed page reads
+/// as patched.
+pub(crate) fn in_pe_image(addr: u64) -> bool {
+    PE_IMAGES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a <= addr && addr < b)
 }
 
 /// The pages installed units cover, with their hash as built.
@@ -1335,12 +1363,12 @@ fn build_now(p: &Pending) -> Result<()> {
 
 /// A unit for `p`: placed if built; built first under `GEX_NT_CGEN_SYNC`.
 fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
-    if let Some(pl) = place(p, memory)? {
+    if let Some(pl) = place(p, memory, true)? {
         return Ok(Some(pl));
     }
     if sync_build() && !is_wine(p) && mode() != Mode::Aot {
         build_now(p)?;
-        return place(p, memory);
+        return place(p, memory, true);
     }
     Ok(None)
 }
@@ -1900,7 +1928,7 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
     let (path, base) = (p.path.clone(), p.base);
     let t0 = std::time::Instant::now();
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-    let placed = match place(&p, memory.bytes()) {
+    let placed = match place(&p, memory.bytes(), at_map) {
         Ok(pl) => pl,
         Err(_) if at_map => {
             let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);

@@ -74,6 +74,40 @@ pub fn pe_import_slots(pe: &gex_ld::pe::PeImage) -> Vec<(u64, u64)> {
     out
 }
 
+/// The hash the function tier keeps of a dispatch page (`page_size` bytes
+/// at `page * page_size`), with the bytes of `slots` (absolute, sorted
+/// ranges: [`pe_import_slots`] placed at an image's base) counted as zero.
+/// A loader that fills an import address table inside `.text` after a unit
+/// was placed has not rewritten code: without the mask, the page read as
+/// patched, and every function on it (MSVC's `__SEH_prolog4` next to the
+/// table) left for tier-1 through a call-out that never ended.
+pub fn masked_page_hash(memory: &[u8], page: u64, page_size: u64, slots: &[(u64, u64)]) -> u64 {
+    let lo = page * page_size;
+    let hi = lo + page_size;
+    let range = memory.get(lo as usize..(hi as usize).min(memory.len())).unwrap_or(&[]);
+    let first = slots.partition_point(|r| r.1 <= lo);
+    let hits = &slots[first..slots[first..].partition_point(|r| r.0 < hi) + first];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut step = |c: &[u8]| {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x0100_0000_01b3);
+    };
+    if hits.is_empty() {
+        range.chunks(8).for_each(&mut step);
+    } else {
+        let mut copy = range.to_vec();
+        for &(a, b) in hits {
+            let (a, b) = (a.max(lo) - lo, b.min(hi) - lo);
+            if let Some(x) = copy.get_mut(a as usize..(b as usize).min(range.len())) {
+                x.fill(0);
+            }
+        }
+        copy.chunks(8).for_each(&mut step);
+    }
+    h
+}
+
 /// The first byte where the mapped code `live` of the segment at `vaddr`
 /// differs from the image's `bytes` (as [`func::pe_input`] made them), or
 /// `None`. Bytes in an import slot of `pe` mapped at `base` do not count:

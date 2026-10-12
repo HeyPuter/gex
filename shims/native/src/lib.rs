@@ -5698,7 +5698,11 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            if !k.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0) {
+            let vma = k.mem.vma_at(a);
+            // A PE image's page made non-executable for a while keeps its
+            // unit (`nt_cgen::in_pe_image`).
+            let dormant = vma.is_some_and(|v| v.prot != 0) && nt_cgen::in_pe_image(a);
+            if !vma.is_some_and(|v| v.prot & prot::EXEC != 0) && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
                     _ => out.push((a, a + page)),

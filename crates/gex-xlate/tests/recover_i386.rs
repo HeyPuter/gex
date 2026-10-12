@@ -336,3 +336,18 @@ fn import_slots_written_by_the_loader_are_not_a_code_difference() {
     live[other] ^= 0xff;
     assert_eq!(gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, &live, base, Some(&pe)), Some(other));
 }
+
+/// A page's hash leaves the import slots out: the loader filling them after
+/// a unit was placed does not make the page read as patched.
+#[test]
+fn a_page_hash_leaves_import_slots_out() {
+    let mut mem = vec![0x90u8; 0x3000];
+    let slots = [(0x1010u64, 0x1018u64)];
+    let h = |m: &[u8]| gex_xlate::masked_page_hash(m, 1, 0x1000, &slots);
+    let before = h(&mem);
+    assert_eq!(gex_xlate::masked_page_hash(&mem, 1, 0x1000, &[]), gex_xlate::masked_page_hash(&mem, 1, 0x1000, &[(0x2000, 0x2004)]));
+    mem[0x1010..0x1018].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(h(&mem), before);
+    mem[0x1018] = 0xcc;
+    assert_ne!(h(&mem), before);
+}

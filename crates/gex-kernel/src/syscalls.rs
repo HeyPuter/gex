@@ -2802,7 +2802,16 @@ impl Kernel {
                 if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
                     self.retire_code(a[0], a[1]);
                 }
-                self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
+                let r = self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
+                // Executable again (a loader filling an import table in
+                // `.text`, a JIT done writing): what is there now is checked
+                // against the function tier's units (`cgen::on_retire`
+                // compares the pages; a page made non-executable for a while
+                // is not gone: `cgen::in_pe_image`).
+                if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
+                    self.retire_code(a[0], a[1]);
+                }
+                r
             }
             nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 

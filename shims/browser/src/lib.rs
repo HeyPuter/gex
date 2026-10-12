@@ -12616,8 +12616,12 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            let exec = h.kernel.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0);
-            if !exec {
+            let vma = h.kernel.mem.vma_at(a);
+            let exec = vma.is_some_and(|v| v.prot & prot::EXEC != 0);
+            // A PE image's page made non-executable for a while keeps its
+            // unit (`cgen::in_pe_image`).
+            let dormant = vma.is_some_and(|v| v.prot != 0) && crate::cgen::in_pe_image(a);
+            if !exec && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
                     _ => out.push((a, a + page)),
