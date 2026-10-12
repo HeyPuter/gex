@@ -6711,8 +6711,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // to say which library and function a silent abort came from.
         {
             use gex_kernel::syscalls::nr as knr;
-            let is_kill = matches!(nr, knr::KILL | knr::TKILL | knr::TGKILL);
-            let sig = if nr == knr::TGKILL { a2 } else { a1 };
+            // The kernel's own (canonical) number: `nr` is the raw one, which
+            // for an x86 or i386 process is in that ABI's numbering.
+            let canon = h.kernel.syscall_nr;
+            let is_kill = matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL);
+            let sig = if canon == knr::TGKILL { a2 } else { a1 };
             // A signal for a thread of this process is raised here, not in
             // the global kernel, so the global counter does not move: this
             // one tells the other threads' safepoints to look.
