@@ -5277,8 +5277,12 @@ fn dying_after(block: &Block) -> Dying {
     }
     let mut fill = start.clone();
     let mut vals = vec![0u32; *start.last().unwrap_or(&0) as usize];
+    // Only the statements counted above (`i + 1` within `start`): a block
+    // with values but no statements defaults them to statement 0, which it
+    // does not have -- filling it anyway wrote past `vals` (Muck in the page,
+    // a tier-1 panic_bounds_check here).
     for (v, lu) in last.into_iter().enumerate() {
-        if let Some(i) = lu {
+        if let Some(i) = lu.filter(|&i| i + 1 < start.len()) {
             if let Some(at) = fill.get_mut(i) {
                 vals[*at as usize] = v as u32;
                 *at += 1;
@@ -5649,6 +5653,15 @@ fn atomic_cmpxchg_op(ty: Ty, sz: MemSz) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dying_after_a_block_with_values_and_no_statements() {
+        let mut b = Block::new(0x1000);
+        b.n_values = 3;
+        let d = dying_after(&b);
+        assert_eq!(d.start, vec![0]);
+        assert!(d.vals.is_empty());
+    }
 
     #[test]
     fn atomic_groups_are_seven_wide() {
