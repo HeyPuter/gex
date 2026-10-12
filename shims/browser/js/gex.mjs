@@ -4738,16 +4738,6 @@ export class Gex {
         if (next !== 0n) {
           pc = faulted ?? next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
-          // A resume of this Worker's own thread after it exited: a Wine
-          // thread's pthread_exit under its start routine's call-out leaves
-          // the context's pc (the call-out's return pad) as the resume, and
-          // entering it ran into the pad's breakpoint (the process died with
-          // 133: winedevice, services). The thread is over: so is this Worker,
-          // as for a thread that exits outside a call-out.
-          if (!faulted && (nextCtx === 0 || nextCtx === ctx) && e.gex_ctx_exited?.(ctx) > 0) {
-            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] run loop: ctx ${ctx.toString(16)} exited; its resume at ${BigInt.asUintN(64, next).toString(16)} dropped`);
-            return e.gex_exit_code();
-          }
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
         }
@@ -5535,16 +5525,6 @@ export class Gex {
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
-            err.gexHandoff = true;
-            throw err;
-          }
-          // This thread ended (pthread_exit inside a call-out: a Wine
-          // thread's exit_thread under its start routine's call-out). The
-          // scheduler's resume names another thread's context, and leaving
-          // as "a resume on another thread's context" returned 0 to the
-          // native caller, which ran the guest on at the call-out's stale
-          // return pad (a breakpoint: the process died with 133).
-          if (e.gex_ctx_exited?.(ctx) > 0) {
             err.gexHandoff = true;
             throw err;
           }
