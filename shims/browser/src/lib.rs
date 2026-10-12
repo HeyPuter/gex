@@ -2950,11 +2950,16 @@ fn install_panic_hook() {
 /// Install the kernel this Worker will run against.
 #[cfg(not(feature = "shared-memory"))]
 fn set_host(host: Host) {
+    // A new process: its registry starts empty, whatever a fork copied.
+    regview::reset();
+    regview::publish_marks(&host.jit.page_table);
     HOST.with(|h| *h.borrow_mut() = Some(host));
 }
 
 #[cfg(feature = "shared-memory")]
 fn set_host(host: Host) {
+    regview::reset();
+    regview::publish_marks(&host.jit.page_table);
     // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
@@ -5291,7 +5296,16 @@ pub extern "C" fn gex_page_base(page: u32) -> u32 {
 /// and the run translates into 4..7, so a single total would grow 0..3 hugely.
 #[no_mangle]
 pub extern "C" fn gex_table_need(i: u32) -> u32 {
-    with_host(|h| h.jit.page_table.table_need(i as usize) as u32)
+    // Without the lock (docs/kernel-locking.md, step 4): the per-table marks
+    // are atomics the page table shares with every clone, published once per
+    // table (`regview`). JS asks this once per table per install.
+    match regview::table_need(i as usize) {
+        Some(n) => n as u32,
+        None => with_host(|h| {
+            regview::publish_marks(&h.jit.page_table);
+            h.jit.page_table.table_need(i as usize) as u32
+        }),
+    }
 }
 
 /// Register a module a forked child inherited, without instantiating it. A
@@ -6895,6 +6909,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 if !h.jit.ever_threaded {
                     backfill_registry(h);
                     h.jit.ever_threaded = true;
+                    regview::set_threaded(true);
                 }
                 stage_thread(tid, ctx_addr, start);
                 if frames_stay(h) {
@@ -8788,6 +8803,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // the high-water mark. No entries, so `usize::MAX` ("nothing with active
     // segments to place") is true whatever the new program turns out to be.
     h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots(), usize::MAX);
+    regview::publish_marks(&h.jit.page_table);
     h.jit.translated.clear();
     // And whatever was queued for the host to install: a fork copies the
     // parent's queue, and a module of the OLD program installed after this
@@ -9690,6 +9706,7 @@ fn backfill_registry(h: &mut Host) {
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         h.jit.registry_sums.push(chunk_sums(&wasm));
+        regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
         h.jit.registry.push(wasm);
         h.jit.registry_ext.push(None);
     }
@@ -12673,6 +12690,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         h.jit.translated = known;
         h.jit.page_table = std::mem::take(&mut unit.page_table);
+        regview::publish_marks(&h.jit.page_table);
         if pc == 0x10f6d24 {
             let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
@@ -13238,6 +13256,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         // out of order hands two modules the same slots.
         for m in &modules {
             h.jit.page_table = m.page_table.clone();
+            regview::publish_marks(&h.jit.page_table);
             for b in &m.exported_blocks {
                 h.jit.translated.insert(b.0);
                 h.jit.provider.insert(b.0, m.module_id);
@@ -14166,6 +14185,7 @@ pub extern "C" fn gex_jit_installed() {
             if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 h.jit.registry_sums.push(Vec::new());
+                regview::publish_module(h.jit.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some((off, key)));
                 h.jit.registry.push(Vec::new());
                 h.jit.registry_ext.push(Some((off, len, key)));
                 h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -14183,6 +14203,7 @@ pub extern "C" fn gex_jit_installed() {
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             h.jit.registry_sums.push(chunk_sums(&wasm));
+            regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
             h.jit.registry.push(wasm);
             h.jit.registry_ext.push(None);
             h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -14489,7 +14510,7 @@ fn content_key(bytes: &[u8]) -> u64 {
 /// writing.
 #[no_mangle]
 pub extern "C" fn gex_jit_keeps() -> u32 {
-    with_host(|h| h.jit.ever_threaded as u32)
+    regview::threaded() as u32
 }
 
 /// The module this Worker installs next is at `off` in the process's JS-side
@@ -14505,7 +14526,7 @@ pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo:
 /// bytes are in this module's memory (`gex_module_ptr`).
 #[no_mangle]
 pub extern "C" fn gex_module_ext(i: u32) -> u64 {
-    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _, _)| off + 1))
+    regview::row(i).map_or(0, |r| r.ext.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Registry module `i`'s content key, high half (`which` 0) or low (1), when
@@ -14513,8 +14534,9 @@ pub extern "C" fn gex_module_ext(i: u32) -> u64 {
 /// Worker catching up names the module without hashing its bytes.
 #[no_mangle]
 pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
-    with_host(|h| {
-        h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(_, _, k)| if which == 0 { (k >> 32) as u32 } else { k as u32 })
+    regview::row(i).map_or(0, |r| {
+        let k = r.key.load(std::sync::atomic::Ordering::Relaxed);
+        if which == 0 { (k >> 32) as u32 } else { k as u32 }
     })
 }
 
@@ -14528,19 +14550,23 @@ pub extern "C" fn gex_registry_mib(external: u32) -> u32 {
 /// How many translated modules this process has, for a Worker catching up.
 #[no_mangle]
 pub extern "C" fn gex_module_count() -> u32 {
-    with_host(|h| h.jit.registry.len() as u32)
+    regview::count()
 }
 
 /// Where module `i`'s bytes are: a pointer, not a copy, since the registry
 /// lives in the process memory a joining Worker already sees.
 #[no_mangle]
 pub extern "C" fn gex_module_ptr(i: u32) -> u32 {
-    with_host(|h| {
-        h.jit
-            .registry
-            .get(i as usize)
-            .map_or(0, |m| m.as_ptr() as u32)
-    })
+    regview::row(i).map_or(0, |r| r.ptr.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Where registry module `i`'s row is in this process's memory, or 0: four
+/// little-endian words -- pointer, length, store offset plus one (u64), key
+/// (u64) -- all a Worker catching up asks about a module, in one call and
+/// without the kernel's lock (`regview`).
+#[no_mangle]
+pub extern "C" fn gex_module_row(i: u32) -> u32 {
+    regview::row(i).map_or(0, |r| r as *const regview::Row as u32)
 }
 
 /// Every slot this process has claimed, across every module.
@@ -14550,16 +14576,143 @@ pub extern "C" fn gex_module_ptr(i: u32) -> u32 {
 /// thread replaying the whole registry.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots_total() -> u32 {
-    with_host(|h| h.jit.page_table.slots() as u32)
+    match regview::slots() {
+        Some(n) => n as u32,
+        None => with_host(|h| {
+            regview::publish_marks(&h.jit.page_table);
+            h.jit.page_table.slots() as u32
+        }),
+    }
 }
 
 /// How long module `i` is.
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
-    with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
-        Some((_, len, _)) => len,
-        None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
-    })
+    regview::row(i).map_or(0, |r| r.len.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The translation registry and the dispatch tables' lengths as a reader
+/// holding no lock sees them (docs/kernel-locking.md, step 4).
+///
+/// JS asks about them all the time -- each table's need at every install,
+/// each module's pointer, length, place and key while a Worker catches up --
+/// and under the lock those questions were half of node -e 0's waiting. The
+/// writers, who hold the lock, publish here as they go:
+///
+/// - each registry module's row, written before the count that makes it
+///   visible is stored (release; readers acquire). Rows live in segments
+///   that are allocated once and never freed or moved, so a row's address
+///   stays good. The registry itself only grows; a new process (a forked
+///   child copies these statics with its memory) starts it over with
+///   `reset`.
+/// - the page table's counters: every clone of a page table shares them, so
+///   publishing is keeping the `Arc`s, done whenever `h.jit.page_table` is
+///   assigned. A replaced set is leaked rather than freed, because a reader
+///   may still hold it: a few dozen bytes per exec.
+pub(crate) mod regview {
+    use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[repr(C)]
+    pub struct Row {
+        pub ptr: AtomicU32,
+        pub len: AtomicU32,
+        pub ext: AtomicU64,
+        pub key: AtomicU64,
+    }
+
+    const SEG: usize = 1024;
+    const SEGS: usize = 4096;
+    static SEGMENTS: [AtomicPtr<Row>; SEGS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SEGS];
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn count() -> u32 {
+        COUNT.load(Ordering::Acquire)
+    }
+
+    pub fn row(i: u32) -> Option<&'static Row> {
+        if i >= count() {
+            return None;
+        }
+        let seg = SEGMENTS.get(i as usize / SEG)?.load(Ordering::Acquire);
+        // SAFETY: a segment, once published, is SEG rows that are never freed
+        // or moved, and row `i` was written before the count passed it.
+        (!seg.is_null()).then(|| unsafe { &*seg.add(i as usize % SEG) })
+    }
+
+    /// Row `i` (the registry's length before the push), under the kernel's
+    /// lock; visible to readers once written. `ext` is the JS-side store's
+    /// offset and the content key, for a module kept there.
+    pub fn publish_module(i: usize, ptr: u32, len: u32, ext: Option<(u64, u64)>) {
+        let Some(slot) = SEGMENTS.get(i / SEG) else { return };
+        let mut seg = slot.load(Ordering::Acquire);
+        if seg.is_null() {
+            let rows: Box<[Row]> = (0..SEG)
+                .map(|_| Row { ptr: AtomicU32::new(0), len: AtomicU32::new(0), ext: AtomicU64::new(0), key: AtomicU64::new(0) })
+                .collect();
+            seg = Box::leak(rows).as_mut_ptr();
+            slot.store(seg, Ordering::Release);
+        }
+        // SAFETY: as in `row`; only the lock holder writes.
+        let r = unsafe { &*seg.add(i % SEG) };
+        r.ptr.store(ptr, Ordering::Relaxed);
+        r.len.store(len, Ordering::Relaxed);
+        r.ext.store(ext.map_or(0, |(off, _)| off + 1), Ordering::Relaxed);
+        r.key.store(ext.map_or(0, |(_, k)| k), Ordering::Relaxed);
+        COUNT.store(i as u32 + 1, Ordering::Release);
+    }
+
+    /// A new, empty registry (a new process's host).
+    pub fn reset() {
+        COUNT.store(0, Ordering::Release);
+        THREADED.store(false, Ordering::Release);
+    }
+
+    /// `Jit::ever_threaded`: whether the registry keeps modules at all.
+    static THREADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_threaded(on: bool) {
+        THREADED.store(on, Ordering::Release);
+    }
+
+    pub fn threaded() -> bool {
+        THREADED.load(Ordering::Acquire)
+    }
+
+    struct Marks {
+        high: Arc<AtomicU64>,
+        next: Arc<AtomicU64>,
+        highs: Arc<Vec<AtomicU64>>,
+    }
+    static MARKS: AtomicPtr<Marks> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Keep `t`'s counters for lock-free readers, unless they are the ones
+    /// already kept.
+    pub fn publish_marks(t: &gex_xlate::PageTable) {
+        let (high, next, highs) = t.marks();
+        let had = MARKS.load(Ordering::Acquire);
+        // SAFETY: a published `Marks` is never freed.
+        if !had.is_null() && unsafe { Arc::ptr_eq(&(*had).highs, &highs) && Arc::ptr_eq(&(*had).high, &high) } {
+            return;
+        }
+        MARKS.store(Box::leak(Box::new(Marks { high, next, highs })), Ordering::Release);
+    }
+
+    fn marks() -> Option<&'static Marks> {
+        let m = MARKS.load(Ordering::Acquire);
+        // SAFETY: as above.
+        (!m.is_null()).then(|| unsafe { &*m })
+    }
+
+    /// `PageTable::table_need`, read lock-free.
+    pub fn table_need(i: usize) -> Option<u64> {
+        marks().map(|m| m.highs.get(i).map_or(0, |h| h.load(Ordering::SeqCst)))
+    }
+
+    /// `PageTable::slots`, read lock-free.
+    pub fn slots() -> Option<u64> {
+        marks().map(|m| m.high.load(Ordering::SeqCst).max(m.next.load(Ordering::SeqCst)))
+    }
 }
 
 /// A direct-mapped table of back-edge counts, keyed by guest pc.

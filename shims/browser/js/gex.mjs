@@ -2851,7 +2851,7 @@ export class Gex {
       // and another thread allocating can move it.
       const bytes = this.#registryBytes(i);
       if (!bytes) continue;
-      const ptr = e.gex_module_ptr(i) >>> 0, len = bytes.length;
+      const ptr = this.#registryRow(i).ptr, len = bytes.length;
       // A sibling Worker may already have compiled this module: reuse its
       // `WebAssembly.Module` (same registry bytes -> same module) rather than
       // paying `WebAssembly.compile` again. The bytes are still needed for the
@@ -5369,23 +5369,47 @@ export class Gex {
    *  when the module is in the store, so a catching-up Worker does not hash
    *  bytes a sibling already hashed; computed from `bytes` otherwise. */
   #registryKey(i, bytes) {
-    const e = this.#shim.exports;
-    if (e.gex_module_key && e.gex_module_ext && Number(e.gex_module_ext(i))) {
-      return `${bytes.length}:${e.gex_module_key(i, 0) >>> 0}:${e.gex_module_key(i, 1) >>> 0}`;
-    }
+    const r = this.#registryRow(i);
+    if (r.ext) return `${bytes.length}:${r.keyHi}:${r.keyLo}`;
     return moduleContentKey(bytes);
   }
 
-  #registryBytes(i) {
+  /** Registry module `i`'s row: where its bytes are (`ptr`, or `ext`, the
+   *  module store's offset plus one), how many, and the store writer's key.
+   *  One call and a read of the row (`gex_module_row`), which the shim
+   *  publishes for readers holding no lock; the getters one field at a time
+   *  for a shim without it. Remembered for the last `i` asked, since a
+   *  catch-up asks about each module several times running. */
+  #registryRow(i) {
+    if (this.#rowMemo?.i === i) return this.#rowMemo;
     const e = this.#shim.exports;
-    const len = e.gex_module_len(i) >>> 0;
+    let r;
+    const at = e.gex_module_row ? e.gex_module_row(i) >>> 0 : -1;
+    if (at > 0) {
+      const v = new DataView(this.#bytes().buffer, at, 24);
+      r = { i, ptr: v.getUint32(0, true), len: v.getUint32(4, true), ext: Number(v.getBigUint64(8, true)),
+        keyHi: v.getUint32(20, true), keyLo: v.getUint32(16, true) };
+    } else if (at === 0) {
+      // Not published yet: not remembered either.
+      return { i, ptr: 0, len: 0, ext: 0, keyHi: 0, keyLo: 0 };
+    } else {
+      const ext = e.gex_module_ext ? Number(e.gex_module_ext(i)) : 0;
+      r = { i, ptr: e.gex_module_ptr(i) >>> 0, len: e.gex_module_len(i) >>> 0, ext,
+        keyHi: ext && e.gex_module_key ? e.gex_module_key(i, 0) >>> 0 : 0,
+        keyLo: ext && e.gex_module_key ? e.gex_module_key(i, 1) >>> 0 : 0 };
+    }
+    this.#rowMemo = r;
+    return r;
+  }
+  #rowMemo = null;
+
+  #registryBytes(i) {
+    const { ptr, len, ext } = this.#registryRow(i);
     if (!len) return null;
-    const ext = e.gex_module_ext ? Number(e.gex_module_ext(i)) : 0;
     if (ext) {
       if (!this.#moduleStore) throw new Error(`gex: registry module ${i} is in the module store, and this Worker has none`);
       return new Uint8Array(this.#moduleStore, ext - 1, len).slice();
     }
-    const ptr = e.gex_module_ptr(i) >>> 0;
     return this.#bytes().slice(ptr, ptr + len);
   }
 
