@@ -16,6 +16,10 @@ use std::sync::{Condvar, Mutex};
 /// Linux's pipe capacity.
 pub const PIPE_BUF: usize = 65536;
 
+/// Linux's `PIPE_BUF`: a write of at most this many bytes goes in whole or
+/// not at all, so no other writer's bytes land inside it.
+pub const PIPE_ATOMIC: usize = 4096;
+
 #[derive(Debug, Default)]
 struct State {
     buf: VecDeque<u8>,
@@ -150,6 +154,12 @@ impl Pipe {
                 };
             }
             let room = PIPE_BUF.saturating_sub(s.buf.len());
+            // A small write waits for room for all of it (`EAGAIN` here; the
+            // syscall layer parks a blocking one and tries it whole again).
+            if buf.len() <= PIPE_ATOMIC && room < buf.len() {
+                s.refused += 1;
+                return Err(Errno::EAGAIN);
+            }
             if room > 0 {
                 let n = room.min(buf.len() - written);
                 s.buf.extend(&buf[written..written + n]);
@@ -242,9 +252,14 @@ impl Pipe {
     }
 
     /// True when a writer would not block.
+    /// Room for any write of at most [`PIPE_ATOMIC`] bytes (or no reader
+    /// left, which a write must hear about), as Linux reports `POLLOUT`
+    /// once a page of the pipe is free. Less room than that is not
+    /// writable: a small write would be refused, and its waiter would only
+    /// wake to be refused again.
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
-        s.buf.len() < PIPE_BUF || s.readers == 0
+        PIPE_BUF.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
     }
 }
 
@@ -331,6 +346,20 @@ mod tests {
         let mut buf = vec![0u8; PIPE_BUF];
         assert_eq!(p.read(&mut buf).unwrap(), PIPE_BUF as u64);
         assert_eq!(p.write(b"x").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_small_write_goes_in_whole_or_not_at_all() {
+        // At most PIPE_ATOMIC bytes: never split, so no other writer's
+        // bytes can land inside it (Linux's PIPE_BUF rule).
+        let p = Pipe::new();
+        p.write(&vec![1u8; PIPE_BUF - 10]).unwrap();
+        assert_eq!(p.write(&[2u8; 32]).err(), Some(Errno::EAGAIN));
+        assert_eq!(p.buffered(), PIPE_BUF - 10);
+        assert_eq!(p.write(&[2u8; 10]).unwrap(), 10);
+        let mut buf = vec![0u8; 64];
+        p.read(&mut buf).unwrap();
+        assert_eq!(p.write(&[3u8; 32]).unwrap(), 32);
     }
 }
 

@@ -12,6 +12,8 @@
 //! slice) and an offset, and fails (`None`) for an offset that is out of
 //! range or not 4-aligned, as the futex syscalls require.
 
+pub mod rcu;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn word(bytes: &mut [u8], off: u64) -> Option<&AtomicU32> {

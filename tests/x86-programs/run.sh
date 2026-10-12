@@ -23,7 +23,9 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # retire-during-lift: code retired while the translator lifts other code
 # outside the kernel lock (docs/kernel-locking.md step 5). Tier-1 only: the
 # function JIT livelocks on its chain natively (gexc --fjit, 2026-10-12).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift"}
+# close-while-reading: descriptors read without the kernel lock while other
+# threads close and replace them; pipe and socket stress (step 3).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift close-while-reading"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

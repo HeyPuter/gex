@@ -1731,8 +1731,11 @@ fn perform_block(
                 turn!(seen);
             }
         }
-        BlockOp::WriteStream { handle, buf, len } => {
-            let data = GuestMem::new(data).read(buf, len)?.to_vec();
+        BlockOp::WriteStream { handle, buf, len, gathered } => {
+            let data = match gathered {
+                Some(g) => g.to_vec(),
+                None => GuestMem::new(data).read(buf, len)?.to_vec(),
+            };
             let mut done = 0usize;
             while done < data.len() {
                 let seen = ready::seq();
@@ -1748,6 +1751,14 @@ fn perform_block(
                 match handle.write_at(0, &data[done..]) {
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
                     Ok(n) => done += n as usize,
+                    // Another writer filled it between the check and the
+                    // write: wait again, as the page does, never EAGAIN on a
+                    // descriptor that is not non-blocking. (Or a small write
+                    // waiting for room for all of it.)
+                    Err(Errno::EAGAIN) => {
+                        ready::wait(seen, std::time::Duration::from_millis(1));
+                        continue;
+                    }
                     // A partial write already delivered is what the caller
                     // gets; the error belongs to the next call.
                     Err(_) if done > 0 => break,
@@ -1756,15 +1767,24 @@ fn perform_block(
             }
             Ok(done as u64)
         }
-        BlockOp::ReadStream { handle, buf, len } => {
+        BlockOp::ReadStream { handle, buf, len, vectors } => {
             let mut tmp = vec![0u8; len];
             loop {
                 let seen = ready::seq();
                 service(data);
                 if handle.poll_readable() {
-                    let n = handle.read_at(0, &mut tmp)?;
+                    // Another reader of the same pipe can take what woke
+                    // this one: wait again, as the page does.
+                    let n = match handle.read_at(0, &mut tmp) {
+                        Err(Errno::EAGAIN) => continue,
+                        r => r?,
+                    };
                     let mut mem = GuestMem::new(data);
-                    mem.write(buf, &tmp[..n as usize])?;
+                    match &vectors {
+                        // A `readv`, read once and scattered.
+                        Some(v) => gex_kernel::syscalls::scatter(&mut mem, v, &tmp[..n as usize])?,
+                        None => mem.write(buf, &tmp[..n as usize])?,
+                    }
                     return Ok(n);
                 }
                 turn!(seen);

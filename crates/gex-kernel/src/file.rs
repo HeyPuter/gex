@@ -20,6 +20,13 @@ pub struct OpenFile {
     flags: AtomicU64,
     /// Absolute path, for `/proc/self/fd` and diagnostics.
     pub path: String,
+    /// Held across a positioned `read`, `write`, `readv`, `writev` and
+    /// `lseek` of a seekable file: the offset's load, the transfer and the
+    /// offset's update are one step, as Linux's `f_pos_lock` makes them (two
+    /// threads reading one descriptor never get the same bytes). These calls
+    /// run without the kernel lock (docs/kernel-locking.md §3.4). A stream
+    /// has no position and locks itself.
+    pos: Mutex<()>,
     /// Cursor into a directory listing, for `getdents64`.
     dir_pos: AtomicUsize,
     /// Cached listing, so a sequence of `getdents64` calls sees a stable
@@ -49,6 +56,7 @@ impl OpenFile {
             offset: AtomicU64::new(0),
             flags: AtomicU64::new(flags),
             path,
+            pos: Mutex::new(()),
             dir_pos: AtomicUsize::new(0),
             dir_cache: Mutex::new(None),
             readable,
@@ -72,6 +80,7 @@ impl OpenFile {
             flags: AtomicU64::new(flags),
             unlink_on_close: Some(path.clone()),
             path,
+            pos: Mutex::new(()),
             dir_pos: AtomicUsize::new(0),
             dir_cache: Mutex::new(None),
             readable,
@@ -121,7 +130,21 @@ impl OpenFile {
             && !self.handle.poll_readable()
     }
 
+    /// The position lock (`pos`) for a seekable file, `None` for a stream.
+    /// [`read_here`](Self::read_here) and [`write_here`](Self::write_here)
+    /// want it held; `read` and `write` take it themselves.
+    pub fn pos_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        (!self.handle.is_stream()).then(|| self.pos.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
+        let _pos = self.pos_lock();
+        self.read_here(buf)
+    }
+
+    /// `read` with the position lock already held (a vectored read holds it
+    /// across its vectors).
+    pub fn read_here(&self, buf: &mut [u8]) -> SysResult {
         if !self.readable {
             return Err(Errno::EBADF);
         }
@@ -134,6 +157,12 @@ impl OpenFile {
     }
 
     pub fn write(&self, buf: &[u8]) -> SysResult {
+        let _pos = self.pos_lock();
+        self.write_here(buf)
+    }
+
+    /// `write` with the position lock already held.
+    pub fn write_here(&self, buf: &[u8]) -> SysResult {
         if !self.writable {
             return Err(Errno::EBADF);
         }
@@ -172,6 +201,7 @@ impl OpenFile {
         if self.handle.is_stream() {
             return Err(Errno::ESPIPE);
         }
+        let _pos = self.pos_lock();
         let base = match whence {
             0 => 0,
             1 => self.offset.load(Ordering::Relaxed),
@@ -213,16 +243,41 @@ impl OpenFile {
     }
 }
 
-/// The per-process descriptor table.
-#[derive(Clone)]
-pub struct FdTable {
+/// The descriptors themselves: what one published snapshot of an
+/// [`FdTable`] holds.
+#[derive(Clone, Default)]
+struct Table {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,
+}
+
+/// How many reader slots a table's epoch array has: one per Worker of the
+/// page (`k_ws_self` is 0..=128, a reader's id that plus one), so a few more
+/// than that. A reader whose id falls outside takes the writers' mutex.
+pub const FD_READER_SLOTS: usize = 130;
+
+/// The per-process descriptor table (docs/kernel-locking.md §3.4).
+///
+/// No kernel lock: a lookup reads the published snapshot
+/// ([`gex_atomic::rcu::Published`], announced in its epoch array, §4.2) and
+/// takes its own `Arc` to the description; a change (open, close, dup,
+/// F_DUPFD, pipe, socket, accept, exec, exit) takes the table's mutex,
+/// copies the snapshot, changes the copy and publishes it. The snapshot it
+/// replaced is dropped as soon as no reader can still be looking at it --
+/// at once, almost always, since a lookup holds its pin for a load and a
+/// reference count -- so a `close` closes the description when it returns,
+/// as on Linux: a pipe's reader sees its end of file without waiting for
+/// another change to the table.
+///
+/// A read on a descriptor another thread closes keeps the description
+/// alive through its own `Arc` until it is done, as Linux does.
+pub struct FdTable {
+    cur: gex_atomic::rcu::Published<Table>,
     /// Bumped by every change, so `/proc/self/fd` can skip rebuilding its
     /// listing when nothing changed -- as `MemoryMap::generation` does.
-    generation: u64,
+    generation: AtomicU64,
     /// `RLIMIT_NOFILE`'s soft limit: no descriptor at or above it.
-    limit: usize,
+    limit: AtomicUsize,
 }
 
 /// `RLIMIT_NOFILE`, as Linux starts a process: 1024 soft, and the hard
@@ -236,166 +291,216 @@ impl Default for FdTable {
     }
 }
 
+impl std::fmt::Debug for FdTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FdTable").field("open", &self.list().len()).finish()
+    }
+}
+
+/// A copy of the table that shares every open-file description: what `fork`
+/// needs, so the child sees the same offsets. The copy is a table of its own.
+impl Clone for FdTable {
+    fn clone(&self) -> FdTable {
+        let t = self.read(|t| t.clone());
+        FdTable::from_parts(t, self.generation(), self.limit())
+    }
+}
+
 impl FdTable {
     pub fn new() -> FdTable {
+        FdTable::from_parts(Table::default(), 0, NOFILE_SOFT)
+    }
+
+    fn from_parts(t: Table, generation: u64, limit: usize) -> FdTable {
         FdTable {
-            entries: Vec::new(),
-            cloexec: Vec::new(),
-            generation: 0,
-            limit: NOFILE_SOFT,
+            cur: gex_atomic::rcu::Published::new(t, FD_READER_SLOTS),
+            generation: AtomicU64::new(generation),
+            limit: AtomicUsize::new(limit),
         }
     }
 
+    /// Look at the current snapshot, from this thread's reader slot (its
+    /// [`crate::sync::me`] id; none, and the writers' mutex, without one).
+    fn read<R>(&self, f: impl FnOnce(&Table) -> R) -> R {
+        self.cur.read(crate::sync::me() as usize, f)
+    }
+
+    /// Change the table: copy the snapshot, let `f` change the copy, and
+    /// publish it unless `f` failed. Every change bumps the generation, as
+    /// before (a failed one included).
+    fn update<R, E>(&self, f: impl FnOnce(&mut Table) -> Result<R, E>) -> Result<R, E> {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.cur.write(|old| {
+            let mut t = old.clone();
+            match f(&mut t) {
+                Ok(r) => (Some(t), Ok(r)),
+                Err(e) => (None, Err(e)),
+            }
+        })
+    }
+
     /// `RLIMIT_NOFILE`'s soft limit (descriptors already above it stay).
-    pub fn set_limit(&mut self, limit: usize) {
-        self.limit = limit.min(NOFILE_HARD);
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit.min(NOFILE_HARD), Ordering::Relaxed);
     }
 
     pub fn limit(&self) -> usize {
-        self.limit
+        self.limit.load(Ordering::Relaxed)
     }
 
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
         if fd < 0 {
             return Err(Errno::EBADF);
         }
-        self.entries
-            .get(fd as usize)
-            .and_then(|e| e.clone())
+        self.read(|t| t.entries.get(fd as usize).and_then(|e| e.clone()))
             .ok_or(Errno::EBADF)
     }
 
     /// Install a description at the lowest free descriptor at or above `min`.
-    pub fn insert_at(&mut self, file: Arc<OpenFile>, min: i32, cloexec: bool) -> SysResult {
-        self.generation += 1;
+    pub fn insert_at(&self, file: Arc<OpenFile>, min: i32, cloexec: bool) -> SysResult {
+        let limit = self.limit();
         // F_DUPFD's argument: negative or past the limit is EINVAL
-        if min < 0 || min as usize >= self.limit {
+        if min < 0 || min as usize >= limit {
+            self.generation.fetch_add(1, Ordering::Relaxed);
             return Err(Errno::EINVAL);
         }
         let min = min as usize;
-        while self.entries.len() <= min {
-            self.entries.push(None);
-            self.cloexec.push(false);
-        }
-        let slot = self.entries[min..]
-            .iter()
-            .position(|e| e.is_none())
-            .map(|p| p + min);
-        let idx = match slot {
-            Some(i) if i < self.limit => i,
-            Some(_) => return Err(Errno::EMFILE),
-            None => {
-                if self.entries.len() >= self.limit {
-                    return Err(Errno::EMFILE);
-                }
-                self.entries.push(None);
-                self.cloexec.push(false);
-                self.entries.len() - 1
+        self.update(|t| {
+            while t.entries.len() <= min {
+                t.entries.push(None);
+                t.cloexec.push(false);
             }
-        };
-        self.entries[idx] = Some(file);
-        self.cloexec[idx] = cloexec;
-        Ok(idx as u64)
+            let slot = t.entries[min..]
+                .iter()
+                .position(|e| e.is_none())
+                .map(|p| p + min);
+            let idx = match slot {
+                Some(i) if i < limit => i,
+                Some(_) => return Err(Errno::EMFILE),
+                None => {
+                    if t.entries.len() >= limit {
+                        return Err(Errno::EMFILE);
+                    }
+                    t.entries.push(None);
+                    t.cloexec.push(false);
+                    t.entries.len() - 1
+                }
+            };
+            t.entries[idx] = Some(file);
+            t.cloexec[idx] = cloexec;
+            Ok(idx as u64)
+        })
     }
 
-    pub fn insert(&mut self, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
+    pub fn insert(&self, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
         self.insert_at(file, 0, cloexec)
     }
 
     /// Force a description into a specific descriptor, closing what was there.
-    pub fn install(&mut self, fd: i32, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
-        self.generation += 1;
+    pub fn install(&self, fd: i32, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
         // dup2/dup3 to a descriptor past RLIMIT_NOFILE: EBADF, as Linux
-        if fd < 0 || fd as usize >= self.limit {
+        if fd < 0 || fd as usize >= self.limit() {
+            self.generation.fetch_add(1, Ordering::Relaxed);
             return Err(Errno::EBADF);
         }
         let fd = fd as usize;
-        while self.entries.len() <= fd {
-            self.entries.push(None);
-            self.cloexec.push(false);
-        }
-        self.entries[fd] = Some(file);
-        self.cloexec[fd] = cloexec;
-        Ok(fd as u64)
+        self.update(|t| {
+            while t.entries.len() <= fd {
+                t.entries.push(None);
+                t.cloexec.push(false);
+            }
+            t.entries[fd] = Some(file);
+            t.cloexec[fd] = cloexec;
+            Ok::<_, Errno>(fd as u64)
+        })
     }
 
     /// Drop every descriptor, as the kernel does when a process dies. A pipe
     /// end left open would leave a reader waiting for an EOF that never comes.
-    pub fn close_all(&mut self) {
-        self.generation += 1;
-        self.entries.clear();
-        self.cloexec.clear();
+    pub fn close_all(&self) {
+        let _ = self.update(|t| {
+            t.entries.clear();
+            t.cloexec.clear();
+            Ok::<_, ()>(())
+        });
     }
 
     /// Close (or mark close-on-exec) every open descriptor in `[first, last]`.
     /// Gaps in the range are skipped, not faulted -- the point is "shut
     /// everything from here up" without knowing which are open.
-    pub fn close_range(&mut self, first: u32, last: u32, cloexec_only: bool) {
-        self.generation += 1;
-        let hi = (last as usize).min(self.entries.len().saturating_sub(1));
-        for fd in (first as usize)..=hi {
-            if self.entries.get(fd).is_none_or(|e| e.is_none()) {
-                continue;
-            }
-            if cloexec_only {
-                if fd < self.cloexec.len() {
-                    self.cloexec[fd] = true;
+    pub fn close_range(&self, first: u32, last: u32, cloexec_only: bool) {
+        let _ = self.update(|t| {
+            let hi = (last as usize).min(t.entries.len().saturating_sub(1));
+            for fd in (first as usize)..=hi {
+                if t.entries.get(fd).is_none_or(|e| e.is_none()) {
+                    continue;
                 }
-            } else {
-                self.entries[fd] = None;
+                if cloexec_only {
+                    if fd < t.cloexec.len() {
+                        t.cloexec[fd] = true;
+                    }
+                } else {
+                    t.entries[fd] = None;
+                }
             }
-        }
+            Ok::<_, ()>(())
+        });
     }
 
-    pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
-        self.generation += 1;
+    pub fn close(&self, fd: i32) -> Result<(), Errno> {
         if fd < 0 {
+            self.generation.fetch_add(1, Ordering::Relaxed);
             return Err(Errno::EBADF);
         }
-        match self.entries.get_mut(fd as usize) {
+        self.update(|t| match t.entries.get_mut(fd as usize) {
             Some(slot) if slot.is_some() => {
                 *slot = None;
                 Ok(())
             }
             _ => Err(Errno::EBADF),
-        }
+        })
     }
 
-    pub fn set_cloexec(&mut self, fd: i32, on: bool) -> Result<(), Errno> {
-        self.generation += 1;
-        if fd < 0 || fd as usize >= self.cloexec.len() || self.entries[fd as usize].is_none() {
-            return Err(Errno::EBADF);
-        }
-        self.cloexec[fd as usize] = on;
-        Ok(())
+    pub fn set_cloexec(&self, fd: i32, on: bool) -> Result<(), Errno> {
+        self.update(|t| {
+            if fd < 0 || fd as usize >= t.cloexec.len() || t.entries[fd as usize].is_none() {
+                return Err(Errno::EBADF);
+            }
+            t.cloexec[fd as usize] = on;
+            Ok(())
+        })
     }
 
     pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
         // A closed descriptor still has a slot in the flag vector, so check
         // the entry too -- otherwise `F_GETFD` answers for a descriptor that
         // is not there.
-        if fd < 0
-            || fd as usize >= self.cloexec.len()
-            || self.entries.get(fd as usize).is_none_or(|e| e.is_none())
-        {
-            return Err(Errno::EBADF);
-        }
-        Ok(self.cloexec[fd as usize])
+        self.read(|t| {
+            if fd < 0
+                || fd as usize >= t.cloexec.len()
+                || t.entries.get(fd as usize).is_none_or(|e| e.is_none())
+            {
+                return Err(Errno::EBADF);
+            }
+            Ok(t.cloexec[fd as usize])
+        })
     }
 
     /// Drop every close-on-exec descriptor, as `execve` does.
-    pub fn close_on_exec(&mut self) {
-        self.generation += 1;
-        for (i, flag) in self.cloexec.iter().enumerate() {
-            if *flag {
-                self.entries[i] = None;
+    pub fn close_on_exec(&self) {
+        let _ = self.update(|t| {
+            for (i, flag) in t.cloexec.iter().enumerate() {
+                if *flag {
+                    t.entries[i] = None;
+                }
             }
-        }
+            Ok::<_, ()>(())
+        });
     }
 
     /// How many times the table has changed.
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Every open descriptor, with its description. `fork` needs this when the
@@ -403,34 +508,30 @@ impl FdTable {
     /// child lacks, so it is sent a description of each fd and rebuilds it
     /// (`gex_fork_fds` in the browser shim).
     pub fn entries(&self) -> Vec<(i32, Arc<OpenFile>, bool)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                e.as_ref()
-                    .map(|f| (i as i32, Arc::clone(f), self.cloexec[i]))
-            })
-            .collect()
+        self.read(|t| {
+            t.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.as_ref().map(|f| (i as i32, Arc::clone(f), t.cloexec[i])))
+                .collect()
+        })
     }
 
     /// Every open descriptor and the path behind it.
     pub fn list(&self) -> Vec<(i32, String)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| e.as_ref().map(|f| (i as i32, f.path.clone())))
-            .collect()
+        self.read(|t| {
+            t.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.as_ref().map(|f| (i as i32, f.path.clone())))
+                .collect()
+        })
     }
 
     /// Duplicate the table, sharing every open-file description. This is what
     /// `fork` needs: the child sees the same offsets.
     pub fn clone_table(&self) -> FdTable {
-        FdTable {
-            entries: self.entries.clone(),
-            cloexec: self.cloexec.clone(),
-            generation: self.generation,
-            limit: self.limit,
-        }
+        self.clone()
     }
 }
 
@@ -506,5 +607,76 @@ impl FileHandle for PipeEnd {
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         self.pipe.close_end(self.write);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipe_pair() -> (Arc<OpenFile>, Arc<OpenFile>) {
+        let p = Arc::new(Pipe::new());
+        let r = OpenFile::new(Arc::new(PipeEnd { pipe: Arc::clone(&p), write: false }), "r".into(), 0, true, false);
+        let w = OpenFile::new(Arc::new(PipeEnd { pipe: p, write: true }), "w".into(), 1, false, true);
+        (r, w)
+    }
+
+    /// A close drops the description when it returns, with readers about:
+    /// the pipe's reader sees end of file at once (§3.4).
+    #[test]
+    fn a_close_closes_the_description_at_once() {
+        let t = FdTable::new();
+        let (r, w) = pipe_pair();
+        let weak = Arc::downgrade(&w);
+        t.install(3, r, false).unwrap();
+        t.install(4, w, false).unwrap();
+        let rd = t.get(3).unwrap();
+        t.close(4).unwrap();
+        assert!(weak.upgrade().is_none(), "the write end outlived its close");
+        assert!(rd.handle.poll_hup());
+    }
+
+    /// Readers in their own slots (the page's Workers) look descriptors up
+    /// while another thread closes and replaces them: every lookup finds one
+    /// description or none, and nothing freed is ever read.
+    #[test]
+    fn lookups_race_closes_and_replacements() {
+        use std::sync::atomic::AtomicBool;
+        let t = Arc::new(FdTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (1..5)
+            .map(|id| {
+                let (t, stop) = (t.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    crate::sync::set_thread_id(id);
+                    let (mut found, mut gone) = (0u64, 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        match t.get(7) {
+                            Ok(f) => {
+                                assert!(f.path == "r" || f.path == "w");
+                                found += 1;
+                            }
+                            Err(e) => {
+                                assert_eq!(e, Errno::EBADF);
+                                gone += 1;
+                            }
+                        }
+                    }
+                    (found, gone)
+                })
+            })
+            .collect();
+        for i in 0..20_000 {
+            let (r, w) = pipe_pair();
+            t.install(7, if i % 2 == 0 { r } else { w }, false).unwrap();
+            if i % 3 == 0 {
+                t.close(7).unwrap();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            let (found, _) = r.join().unwrap();
+            assert!(found > 0);
+        }
     }
 }

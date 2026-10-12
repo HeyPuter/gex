@@ -3030,7 +3030,16 @@ fn set_host(host: Host) {
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
     *jitout::BOX.0.borrow_mut() = None;
-    HOST.with(|h| *h.borrow_mut() = Some(host));
+    HOST.with(|h| {
+        *h.borrow_mut() = Some(host);
+        // The new process's descriptor table (`FDS`), which stays in place
+        // inside the cell until the next `set_host`.
+        let fds = h
+            .borrow_mut()
+            .as_mut()
+            .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable);
+        FDS.store(fds, std::sync::atomic::Ordering::Release);
+    });
 }
 
 #[cfg(feature = "shared-memory")]
@@ -3043,6 +3052,14 @@ fn set_host(host: Host) {
     *jitout::BOX.0.borrow_mut() = None;
     // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
+    // The new process's descriptor table (`FDS`).
+    // SAFETY: as above; the table stays in place until the next `set_host`.
+    let fds = unsafe {
+        (*core::ptr::addr_of_mut!(HOST))
+            .as_mut()
+            .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable)
+    };
+    FDS.store(fds, std::sync::atomic::Ordering::Release);
 }
 
 /// Whether this Worker has a kernel yet.
@@ -6370,6 +6387,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
         return;
     }
+    // This Worker's reader slot in the descriptor table's epoch array
+    // (`gex_kernel::file::FdTable`): its wait slot, which no other live
+    // Worker has. Without one, a lookup takes the table's own mutex.
+    #[cfg(feature = "shared-memory")]
+    if gex_kernel::sync::me() == 0 && unsafe { k_present() } != 0 {
+        gex_kernel::sync::set_thread_id(waitq::slot() as u32 + 1);
+    }
     fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
@@ -6455,13 +6479,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // each numbers its own.
         let obj = match n {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::CLOSE | nr::DUP3
-            | nr::LSEEK => with_host(|h| {
-                h.kernel
-                    .fds
-                    .get(g(0) as i32)
-                    .ok()
-                    .map(|f| format!(" fd0={}", f.path))
-            }),
+            | nr::LSEEK => fds_free()
+                .and_then(|fds| fds.get(g(0) as i32).ok())
+                .map(|f| format!(" fd0={}", f.path)),
             _ => None,
         }
         .unwrap_or_default();
@@ -7279,10 +7299,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // What each ready-for-read descriptor is: told readable and not
                 // reading is either a lying handle or a guest that never gets
                 // there, and the open file says which.
-                let what = with_host(|h| {
+                let what = {
                     let mut s = String::new();
                     for fd in &rv {
-                        match h.kernel.fds.get(*fd as i32) {
+                        match fds_free().ok_or(gex_kernel::Errno::EBADF).and_then(|t| t.get(*fd as i32)) {
                             Ok(f) => s.push_str(&format!(
                                 " {fd}:{}{} av={:?} pr={} {}",
                                 if f.readable { "r" } else { "-" },
@@ -7295,7 +7315,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         }
                     }
                     s
-                });
+                };
                 format!(
                     " nfds={nfds} r=[{}] w=[{}]{what}",
                     join(&rv),
@@ -7433,6 +7453,23 @@ fn clock_syscall(ctx: i32) -> bool {
         ));
     }
     true
+}
+
+/// This process's descriptor table, which needs no kernel lock
+/// (docs/kernel-locking.md §3.4): `h.kernel.fds` of the installed host
+/// (`set_host`). The table stays where it is for the life of
+/// the process -- it is closed (`close_all`), never replaced -- so the
+/// pointer holds until the next `set_host`, which runs before any thread of
+/// the new process makes a call.
+static FDS: std::sync::atomic::AtomicPtr<gex_kernel::file::FdTable> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// This process's descriptor table, without the kernel (`FDS`): `None`
+/// before a process is installed.
+pub(crate) fn fds_free() -> Option<&'static gex_kernel::file::FdTable> {
+    let p = FDS.load(std::sync::atomic::Ordering::Acquire);
+    // SAFETY: see `FDS`. Every use of the table goes through `&self`, its
+    // state behind its own atomics and mutex.
+    (!p.is_null()).then(|| unsafe { &*p })
 }
 
 /// The mark the page's glue puts on a stateful provider's syscalls (as gexrt's
@@ -8491,7 +8528,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // so nothing is dropped, and a pipe end between two Workers lives in the
     // global kernel and only learns of a close from `Drop` -- otherwise the
     // reader waits forever for an EOF nobody sends.
-    h.kernel.fds = gex_kernel::file::FdTable::new();
+    h.kernel.fds.close_all();
     h.kernel.remote_sockets.clear();
     // Internet sockets too: a listener (in the global kernel) is unbound and
     // a connection closed when its last holder goes, as on Linux at exit.
@@ -10814,7 +10851,17 @@ fn finish_parked(
         // Doing it here rather than re-executing the instruction is what keeps
         // the guest's pc moving forward: a syscall that parks is finished by
         // the scheduler, never retried.
-        gex_kernel::BlockOp::ReadStream { handle, buf, len } => {
+        gex_kernel::BlockOp::ReadStream { handle, vectors: Some(v), len, .. } => {
+            // A `readv`: one read, scattered, so no other reader takes the
+            // bytes between two vectors.
+            let mut tmp = vec![0u8; *len];
+            match handle.read_at(0, &mut tmp) {
+                Err(Errno::EAGAIN) => Err(PI_RETRY),
+                Ok(n) => gex_kernel::syscalls::scatter(gm, v, &tmp[..n as usize]).map(|()| n),
+                r => r,
+            }
+        }
+        gex_kernel::BlockOp::ReadStream { handle, buf, len, vectors: None } => {
             // Into the guest's buffer, with nothing in between.
             //
             // This is the read that parked, finished by the scheduler, and it
@@ -10831,14 +10878,17 @@ fn finish_parked(
                 r => r,
             }
         }
-        gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
+        gex_kernel::BlockOp::WriteStream { handle, buf, len, gathered } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
             // the reader has drained.
             // Still no room (another writer got there first): the syscall
             // again, which parks once more, rather than EAGAIN on a
             // descriptor that is not non-blocking.
-            let data = gm.read(*buf, *len)?.to_vec();
+            let data = match gathered {
+                Some(g) => g.to_vec(),
+                None => gm.read(*buf, *len)?.to_vec(),
+            };
             match handle.write_at(0, &data) {
                 Err(Errno::EAGAIN) => Err(PI_RETRY),
                 r => r,
@@ -14586,7 +14636,7 @@ pub extern "C" fn gex_abandon(code: i32) {
         // no longer exists and the parent's `read` never returns: the run wedges
         // one process further along than the one that died, which is the shape
         // that made a lifter fault in a forked child look like a hang in `apt`.
-        h.kernel.fds = gex_kernel::file::FdTable::new();
+        h.kernel.fds.close_all();
         h.kernel.remote_sockets.clear();
         // SAFETY: takes a scalar and borrows nothing here.
         unsafe {

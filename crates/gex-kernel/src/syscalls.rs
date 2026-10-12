@@ -332,6 +332,11 @@ pub enum BlockOp {
         handle: Arc<dyn crate::vfs::FileHandle>,
         buf: u64,
         len: usize,
+        /// A `readv` of more than one vector: read once, `len` bytes in all,
+        /// and the bytes scattered over these (base, length) vectors in place
+        /// of `buf`, so no other reader takes bytes from between them
+        /// ([`scatter`]).
+        vectors: Option<Arc<[(u64, u64)]>>,
     },
     /// A `connect` on a descriptor that is not non-blocking. Ready once the
     /// connection is up, refused, or gone.
@@ -361,6 +366,9 @@ pub enum BlockOp {
         handle: Arc<dyn crate::vfs::FileHandle>,
         buf: u64,
         len: usize,
+        /// A vectored write of at most `PIPE_ATOMIC` bytes, gathered: written
+        /// whole, in place of `buf`/`len` (see [`gather_small`]).
+        gathered: Option<Arc<[u8]>>,
     },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
@@ -961,6 +969,165 @@ pub fn clock_call(
     true
 }
 
+// -- I/O on a descriptor table ----------------------------------------------
+//
+// The bodies of `read`, `write`, `pread64`, `pwrite64`, `readv` and `writev`:
+// they need the descriptor table and nothing else of the kernel, so the full
+// call and any caller holding only the table run the same code.
+
+fn io_write(fds: &FdTable, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+    // Straight out of the guest's memory: a guest address is already a
+    // linear-memory offset, so the bytes are a slice and a copy would be
+    // pure overhead.
+    let data = m.read(buf, len as usize)?;
+    let file = fds.get(fd)?;
+    file.write(data)
+}
+
+fn io_read(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+    // Straight into the guest's memory, no intermediate buffer: the guest
+    // picks the length and a copy would allocate that much on every call.
+    // Capped as Linux caps it (MAX_RW_COUNT): a regular file gives every
+    // byte asked for below that, and programs rely on it (Wine maps a PE
+    // image's sections with one pread each; a 16 MiB cap left the rest of
+    // a 24 MiB .text zero).
+    let len = rw_len(m, buf, len);
+    let dst = m.read_mut(buf, len)?;
+    fds.get(fd)?.read(dst)
+}
+
+fn io_pread(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+    // As `io_read`: the guest's buffer is the destination already.
+    let len = rw_len(m, buf, len);
+    let dst = m.read_mut(buf, len)?;
+    fds.get(fd)?.pread(off, dst)
+}
+
+fn io_pwrite(fds: &FdTable, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+    let data = m.read(buf, len as usize)?.to_vec();
+    fds.get(fd)?.pwrite(off, &data)
+}
+
+fn io_writev(fds: &FdTable, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool) -> SysResult {
+    let vecs = Kernel::read_iovecs(m, iov, count, compat)?;
+    let file = fds.get(fd)?;
+    // At most PIPE_BUF bytes to a stream go as one write, which a pipe
+    // takes whole or not at all: Linux's guarantee that such a write is
+    // never split by another writer's.
+    if file.handle.is_stream() {
+        if let Some(bytes) = gather_small(m, &vecs) {
+            return file.write_here(&bytes);
+        }
+    }
+    // One position for the whole call, as Linux holds `f_pos_lock`.
+    let _pos = file.pos_lock();
+    let mut total = 0u64;
+    for (base, len) in vecs {
+        if len == 0 {
+            continue;
+        }
+        let data = match m.read(base, len as usize) {
+            Ok(d) => d,
+            // Same rule as below: bytes already accepted have to be
+            // reported, or the caller sends them twice.
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        };
+        let n = match file.write_here(data) {
+            Ok(n) => n,
+            // A pipe or socket that has filled up answers `EAGAIN`. If
+            // earlier vectors were already accepted, the call has
+            // succeeded partially and must say so: returning the error
+            // instead throws away the count for bytes that are already
+            // gone, and the caller -- believing it sent nothing --
+            // retransmits them. An X client doing that corrupts the
+            // request stream.
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        };
+        total += n;
+        // A short write ends the call; the caller retries the remainder.
+        if n < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// A vectored write's bytes, in one buffer, when there are at most
+/// [`crate::pipe::PIPE_ATOMIC`] of them in more than one vector (one vector
+/// is already one write); `None` otherwise, or when a vector cannot be read
+/// (the vector-at-a-time path reports that).
+fn gather_small(m: &GuestMem<'_>, vecs: &[(u64, u64)]) -> Option<Vec<u8>> {
+    let total: u64 = vecs.iter().map(|v| v.1).sum();
+    if total as usize > crate::pipe::PIPE_ATOMIC || vecs.iter().filter(|v| v.1 > 0).count() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total as usize);
+    for &(base, len) in vecs {
+        out.extend_from_slice(m.read(base, len as usize).ok()?);
+    }
+    Some(out)
+}
+
+/// Put the first `bytes` read by one call over `vectors` in order (a
+/// stream's `readv`, read once: see [`BlockOp::ReadStream`]).
+pub fn scatter(m: &mut GuestMem<'_>, vectors: &[(u64, u64)], bytes: &[u8]) -> Result<(), Errno> {
+    let mut at = 0usize;
+    for &(base, len) in vectors {
+        if at >= bytes.len() {
+            break;
+        }
+        let k = (len as usize).min(bytes.len() - at);
+        m.write(base, &bytes[at..at + k])?;
+        at += k;
+    }
+    Ok(())
+}
+
+fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool) -> SysResult {
+    let vecs = Kernel::read_iovecs(m, iov, count, compat)?;
+    let file = fds.get(fd)?;
+    // A stream is read once for all the vectors and the bytes scattered:
+    // read a vector at a time, another reader of the same pipe could take
+    // the bytes between two vectors (a record torn between two readers),
+    // which Linux's one read under the pipe's lock never allows.
+    if file.handle.is_stream() && vecs.iter().filter(|v| v.1 > 0).count() > 1 {
+        let want = vecs.iter().map(|v| v.1).sum::<u64>().min(1 << 24) as usize;
+        let mut tmp = vec![0u8; want];
+        let n = file.read_here(&mut tmp)? as usize;
+        scatter(m, &vecs, &tmp[..n])?;
+        return Ok(n as u64);
+    }
+    // One position for the whole call, as Linux holds `f_pos_lock`.
+    let _pos = file.pos_lock();
+    let mut total = 0u64;
+    for (base, len) in vecs {
+        if len == 0 {
+            continue;
+        }
+        let mut tmp = vec![0u8; len as usize];
+        let n = match file.read_here(&mut tmp) {
+            Ok(n) => n,
+            // The vector filled and the next one found the socket empty,
+            // which is `EAGAIN`. Reporting that would discard the count
+            // for bytes this call has *already taken out of the socket*
+            // and written into the caller's memory -- they are consumed,
+            // and nothing can give them back. The caller sees "nothing
+            // arrived" and waits for data it is already holding.
+            //
+            // That is the X protocol deadlocking: the server reads a
+            // request header into the first vector, loses it here, and
+            // waits forever for a request the client believes it sent.
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        };
+        m.write(base, &tmp[..n as usize])?;
+        total += n;
+        if n < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// What a process and thread are called, as a host last saw them under its
 /// lock: the answers [`ident_call`] gives without it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1531,7 +1698,7 @@ impl Kernel {
     }
 
     pub fn new(ctx_addr: u64, brk_start: u64, exe_path: String) -> Kernel {
-        let mut fds = FdTable::new();
+        let fds = FdTable::new();
         // The three standard streams, reported as terminals when the host's
         // are, because that is what decides libc's buffering mode.
         let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -2390,11 +2557,32 @@ impl Kernel {
                     && file.flags() & crate::fs::oflags::O_NONBLOCK == 0
                     && file.handle.is_stream() =>
             {
-                Some(BlockOp::ReadStream { handle, buf, len })
+                let vectors = if n == nr::READV { self.readv_vectors(m, a) } else { None };
+                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>().min(1 << 24) as usize);
+                Some(BlockOp::ReadStream { handle, buf, len, vectors })
             }
-            nr::WRITE | nr::WRITEV if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len }),
+            nr::WRITEV if file.write_is_atomic() => {
+                let gathered = self.small_writev(m, a);
+                let len = gathered.as_ref().map_or(len, |g| g.len());
+                Some(BlockOp::WriteStream { handle, buf, len, gathered })
+            }
+            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None }),
             _ => None,
         }
+    }
+
+    /// A `readv`'s vectors when there is more than one with room in it,
+    /// for a parked read to fill in one go.
+    fn readv_vectors(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[(u64, u64)]>> {
+        let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
+        (vecs.iter().filter(|v| v.1 > 0).count() > 1).then(|| Arc::from(vecs))
+    }
+
+    /// A `writev`'s bytes when they are few enough to be written whole
+    /// ([`gather_small`]).
+    fn small_writev(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[u8]>> {
+        let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
+        gather_small(m, &vecs).map(Arc::from)
     }
 
     /// A vectored call's first non-empty vector (`a[1]`, `a[2]`), where a
@@ -2555,6 +2743,7 @@ impl Kernel {
                     handle: Arc::clone(&file.handle),
                     buf: a[1],
                     len: a[2].min(1 << 24) as usize,
+                    gathered: None,
                 })
             }
             // `writev` and `readv` on a stream block as `write` and `read` do,
@@ -2571,7 +2760,11 @@ impl Kernel {
                 if !file.write_is_atomic() {
                     return None;
                 }
+                // Or, at most PIPE_BUF bytes in all, on the whole of it,
+                // gathered: such a write is never split.
                 let (buf, len) = self.first_iovec(m, a)?;
+                let gathered = self.small_writev(m, a);
+                let len = gathered.as_ref().map_or(len, |g| g.len() as u64);
                 match file.handle.write_room() {
                     Some(room) if len <= room => return None,
                     Some(_) => {}
@@ -2582,6 +2775,7 @@ impl Kernel {
                     handle: Arc::clone(&file.handle),
                     buf,
                     len: len.min(1 << 24) as usize,
+                    gathered,
                 })
             }
             nr::READV => {
@@ -2590,10 +2784,13 @@ impl Kernel {
                     return None;
                 }
                 let (buf, len) = self.first_iovec(m, a)?;
+                let vectors = self.readv_vectors(m, a);
+                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>());
                 Some(BlockOp::ReadStream {
                     handle: Arc::clone(&file.handle),
                     buf,
                     len: len.min(1 << 24) as usize,
+                    vectors,
                 })
             }
             nr::ACCEPT | nr::ACCEPT4 => {
@@ -2615,6 +2812,7 @@ impl Kernel {
                     handle: Arc::clone(&file.handle),
                     buf: a[1],
                     len: a[2].min(1 << 24) as usize,
+                    vectors: None,
                 })
             }
             // A transfer whose input is an empty blocking stream (`cat f |
@@ -3741,24 +3939,11 @@ impl Kernel {
     // -- I/O -----------------------------------------------------------------
 
     fn sys_write(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        // Straight out of the guest's memory: a guest address is already a
-        // linear-memory offset, so the bytes are a slice and a copy would be
-        // pure overhead.
-        let data = m.read(buf, len as usize)?;
-        let file = self.fds.get(fd)?;
-        file.write(data)
+        io_write(&self.fds, m, fd, buf, len)
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        // Straight into the guest's memory, no intermediate buffer: the guest
-        // picks the length and a copy would allocate that much on every call.
-        // Capped as Linux caps it (MAX_RW_COUNT): a regular file gives every
-        // byte asked for below that, and programs rely on it (Wine maps a PE
-        // image's sections with one pread each; a 16 MiB cap left the rest of
-        // a 24 MiB .text zero).
-        let len = rw_len(m, buf, len);
-        let dst = m.read_mut(buf, len)?;
-        self.fds.get(fd)?.read(dst)
+        io_read(&self.fds, m, fd, buf, len)
     }
 
     fn sys_pread(
@@ -3769,15 +3954,11 @@ impl Kernel {
         len: u64,
         off: u64,
     ) -> SysResult {
-        // As `sys_read`: the guest's buffer is the destination already.
-        let len = rw_len(m, buf, len);
-        let dst = m.read_mut(buf, len)?;
-        self.fds.get(fd)?.pread(off, dst)
+        io_pread(&self.fds, m, fd, buf, len, off)
     }
 
     fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
-        let data = m.read(buf, len as usize)?.to_vec();
-        self.fds.get(fd)?.pwrite(off, &data)
+        io_pwrite(&self.fds, m, fd, buf, len, off)
     }
 
     /// Copy up to `count` bytes from one descriptor to another through a kernel
@@ -3935,69 +4116,11 @@ impl Kernel {
     }
 
     fn sys_writev(&mut self, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
-        let file = self.fds.get(fd)?;
-        let mut total = 0u64;
-        for (base, len) in vecs {
-            if len == 0 {
-                continue;
-            }
-            let data = match m.read(base, len as usize) {
-                Ok(d) => d,
-                // Same rule as below: bytes already accepted have to be
-                // reported, or the caller sends them twice.
-                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
-            };
-            let n = match file.write(data) {
-                Ok(n) => n,
-                // A pipe or socket that has filled up answers `EAGAIN`. If
-                // earlier vectors were already accepted, the call has
-                // succeeded partially and must say so: returning the error
-                // instead throws away the count for bytes that are already
-                // gone, and the caller -- believing it sent nothing --
-                // retransmits them. An X client doing that corrupts the
-                // request stream.
-                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
-            };
-            total += n;
-            // A short write ends the call; the caller retries the remainder.
-            if n < len {
-                break;
-            }
-        }
-        Ok(total)
+        io_writev(&self.fds, m, fd, iov, count, self.compat)
     }
 
     fn sys_readv(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
-        let file = self.fds.get(fd)?;
-        let mut total = 0u64;
-        for (base, len) in vecs {
-            if len == 0 {
-                continue;
-            }
-            let mut tmp = vec![0u8; len as usize];
-            let n = match file.read(&mut tmp) {
-                Ok(n) => n,
-                // The vector filled and the next one found the socket empty,
-                // which is `EAGAIN`. Reporting that would discard the count
-                // for bytes this call has *already taken out of the socket*
-                // and written into the caller's memory -- they are consumed,
-                // and nothing can give them back. The caller sees "nothing
-                // arrived" and waits for data it is already holding.
-                //
-                // That is the X protocol deadlocking: the server reads a
-                // request header into the first vector, loses it here, and
-                // waits forever for a request the client believes it sent.
-                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
-            };
-            m.write(base, &tmp[..n as usize])?;
-            total += n;
-            if n < len {
-                break;
-            }
-        }
-        Ok(total)
+        io_readv(&self.fds, m, fd, iov, count, self.compat)
     }
 
     /// Open a pseudoterminal end if `p` names one, else `None` so the ordinary
