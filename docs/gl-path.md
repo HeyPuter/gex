@@ -483,3 +483,42 @@ current gexc; U's 10-04 gl64 works. Reported to U.
   - 602022460540b75b41d5e97f2c41207dbd79ce17 gex-wasm: the replay and smoke
     targets compile webgpu.cpp as C++20.
 - The pre-rebase branch `gl/perf-5f5572e` (bc42c2dd) stays local only.
+
+## GL errors and GL_ARB_debug_output in the guest (2026-10-11)
+
+`glGetError` is a synchronous submit: the batch so far runs on the host and
+the guest waits for the answer. wined3d checks every GL call with it
+(`checkGLcall`) whenever Wine's d3d ERR channel is on, which is the default,
+unless the context has GL_ARB_debug_output. Undertale's wined3d thread
+(worldmachine, units-ut3) made 93 submits a frame, 98% of them after a
+GET_ERROR, and waited 15.6 ms a frame on them; with ERR off for d3d it made
+1.9 a frame and its busy time fell from 28.4 to 6.0 ms a frame.
+
+So the guest library (`guest/gl/gexgl.c`) answers GL_ARB_debug_output
+itself:
+
+- `glDebugMessageCallback`, `glDebugMessageControl`, `glDebugMessageInsert`
+  and `glGetDebugMessageLog` never reach the host (a callback cannot cross
+  the transport), nor do `glEnable`/`glDisable` of `GL_DEBUG_OUTPUT` and
+  `GL_DEBUG_OUTPUT_SYNCHRONOUS`.
+- While a callback is set and error messages are enabled, every waiting
+  submit ends with one GET_ERROR of its own. An error it brings back goes to
+  the callback and to the slot `glGetError` answers from first.
+- **`glGetError` stays exact.** It answers from that slot, or asks the host
+  as before. wined3d's capability probes (`while (glGetError()); op; if
+  (glGetError()) ...`) depend on that.
+- **Only the message is late.** It is delivered at the next submit that
+  waits, which may be several calls after the one that failed, and its text
+  says so. GL allows that unless `GL_DEBUG_OUTPUT_SYNCHRONOUS` is enabled;
+  here it is late even then (wined3d enables it only with `+d3d_sync`).
+- Only error messages are generated; the host's own debug messages
+  (performance, portability) are not forwarded.
+- A client that sets no callback sees no change: no extra GET_ERROR, the
+  same submits (gears, edger: unchanged).
+
+The check is `tests/integration/programs/gl44-debug-output-probe.c`
+(`tests/gl44-probe.sh debug-output`): an error reaches the callback by the
+next `glFinish`, `glGetError` still reports it once, an error right before
+`glGetError` or before a waiting query is reported exactly, valid calls raise
+nothing, and disabled error messages are not delivered. 12/12 natively
+against Mesa and in the page (edger, hardware WebGPU).
