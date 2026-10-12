@@ -1767,6 +1767,23 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
   the fix every round matches exactly. `?hostxcount=1` logs, once a second,
   the bytes the X server took from and sent to each client, its bytes to the
   compositor and its scenes published.
+- **A second GL client had no window.** glxgears ran at about 45 fps, but
+  no window appeared when it was not the first X client to take its window
+  id: one started from the xterm after one from the launcher, or the
+  reverse. The window manager (`crates/gex-xwm`) remembered which window ids
+  it had Composite-redirected and never forgot one. The X server gives a new
+  client the id a gone one had, so the new window was taken for redirected
+  and never was, and rootless Xwayland makes no `wl_surface` for a window
+  that is not redirected. A destroyed window's id now leaves that set and the
+  pending pairings. The launcher also no longer starts the host's Mesa
+  itself: every program, launched or typed, starts it with its first GL
+  request, so a launch is the same command a shell runs. The legs start
+  glxgears from the xterm, then from the launcher, and require each one's
+  own window pixels to change. On b8 the launcher run after the xterm run
+  failed with no window in 60 s.
+- `web/build-all.sh`: the key that decides whether to rebuild Xwayland and
+  hostwl now covers `crates/gex-wayland` and `crates/gex-xwm`, which hostwl
+  is built from. Before, a change to either alone shipped the old hostwl.
 - **The X server's pools are freed.** Each pool had stayed for good.
   Xwayland drops a buffer unused for a second and makes a new pool, so an
   xterm printing a line a second kept about 0.9 MB per line. A pool now
@@ -1782,4 +1799,4 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
   `?hostxcount=1` prints `pools=N`.
 
 Legs: `node tests/demo/desktop.mjs web/dist-demo` (the desktop, then the
-cursor, presentation, xterm-contents and pool legs; `DEMO_DPR=2` for the device-pixel output).
+cursor, presentation, xterm-contents, pool and glxgears legs (`DEMO_GL=0` skips the last); `DEMO_DPR=2` for the device-pixel output).

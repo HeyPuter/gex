@@ -224,7 +224,13 @@ pub struct Xwm {
     pending_pairs: Vec<(u32, u32)>,
     /// Windows already redirected. Redirecting twice is `BadAccess`, and a
     /// window can be met twice (CreateNotify, and again at MapRequest for one
-    /// that existed before the manager did).
+    /// that existed before the manager did). A window id leaves this set when
+    /// the window is destroyed: the X server hands the same id to the next
+    /// client that takes that client's slot, and a new window wrongly taken
+    /// for redirected is never redirected -- and rootless Xwayland makes no
+    /// `wl_surface` for a window that is not. That was a second glxgears,
+    /// started after the first had exited, running at full rate with no
+    /// window.
     redirected: std::collections::HashSet<u32>,
     check_window: u32,
     /// Composite's major opcode, once the server has answered for it. Zero
@@ -762,6 +768,10 @@ impl Xwm {
             }
             ev::DESTROY_NOTIFY => {
                 let window = word(8);
+                // Everything keyed by the id goes with the window: the id is
+                // the next window's to reuse (see `redirected`).
+                self.redirected.remove(&window);
+                self.pending_pairs.retain(|(w, _)| *w != window);
                 if let Some(w) = self.windows.remove(&window) {
                     if let Some(surface) = w.surface {
                         client.forget_x11(surface);
@@ -1005,4 +1015,68 @@ impl Xwm {
         true
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gex_kernel::errno::Errno;
+    use gex_kernel::vfs::{FileType, Metadata};
+
+    /// A connection that takes whatever is written and has nothing to read.
+    #[derive(Debug)]
+    struct Sink;
+    impl FileHandle for Sink {
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> gex_kernel::errno::SysResult {
+            Err(Errno::EAGAIN)
+        }
+        fn write_at(&self, _offset: u64, buf: &[u8]) -> gex_kernel::errno::SysResult {
+            Ok(buf.len() as u64)
+        }
+        fn metadata(&self) -> Result<Metadata, Errno> {
+            let mut m = Metadata::regular(0);
+            m.file_type = FileType::Fifo;
+            Ok(m)
+        }
+    }
+
+    fn notify(kind: u8, window: u32) -> Vec<u8> {
+        let mut m = vec![0u8; 32];
+        m[0] = kind;
+        m[8..12].copy_from_slice(&window.to_le_bytes());
+        m
+    }
+
+    /// Composite `RedirectWindow` requests in what the manager has written.
+    fn redirects(xwm: &Xwm) -> usize {
+        let mut n = 0;
+        let mut at = 0;
+        while at + 4 <= xwm.outbox.len() {
+            let units = u16::from_le_bytes([xwm.outbox[at + 2], xwm.outbox[at + 3]]) as usize;
+            if xwm.outbox[at] == xwm.composite && xwm.outbox[at + 1] == composite::REDIRECT_WINDOW {
+                n += 1;
+            }
+            at += units.max(1) * 4;
+        }
+        n
+    }
+
+    #[test]
+    fn a_window_id_used_again_is_redirected_again() {
+        let mut xwm = Xwm::start(Arc::new(Sink)).unwrap();
+        xwm.composite = 140;
+        xwm.outbox.clear();
+        let mut client = Client::new();
+        // The first glxgears: created, then gone.
+        xwm.event(&notify(ev::CREATE_NOTIFY, 0x60_0002), &mut client);
+        xwm.event(&notify(ev::DESTROY_NOTIFY, 0x60_0002), &mut client);
+        assert_eq!(redirects(&xwm), 1);
+        // The second, with the same id: it needs its own redirection, or the
+        // X server never makes it a surface.
+        xwm.event(&notify(ev::CREATE_NOTIFY, 0x60_0002), &mut client);
+        assert_eq!(redirects(&xwm), 2, "the reused id was not redirected");
+        // And a second meeting of one live window is still only one.
+        xwm.event(&notify(ev::MAP_REQUEST, 0x60_0002), &mut client);
+        assert_eq!(redirects(&xwm), 2);
+    }
 }
