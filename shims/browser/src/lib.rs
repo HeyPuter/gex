@@ -3102,11 +3102,7 @@ fn set_host(host: Host) {
 fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
-    if let Some(t) = h.threads.first() {
-        let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
-        MY_CTX.with(|c| c.set(ctx_addr));
-        sigs::bind(&mut h.kernel, tid);
-    }
+    bind_mine(h, 0);
 }
 
 /// Whether this Worker has a kernel yet.
@@ -6421,7 +6417,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
     let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
-    let tracked_tid = if stop_tracked { with_host(|h| h.threads[cur()].kstate.tid) as u32 } else { 0 };
+    let tracked_tid = if stop_tracked { my_tid() as u32 } else { 0 };
     if stop_tracked {
         cgen::libprov::syscall_enter(tracked_tid);
     }
@@ -6470,7 +6466,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     };
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
-        let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        let base = my_ctx();
         // The number and arguments where this architecture's ABI puts them;
         // the number canonicalised so the names below match on x86-64 too.
         let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
@@ -7228,10 +7224,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // docs/elf-providers.md): JS binds them before the guest goes on, as the
     // native host does after the same syscall.
     let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
-        with_host(|h| {
-            set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
+        set_resume_ctx(my_ctx());
         1
     } else {
         stop
@@ -7274,11 +7268,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // call (a call that never returns is the one worth seeing); this fills in
     // the answer for the ones that do.
     if unsafe { HEARTBEAT } != 0 {
-        let x0 = with_host(|h| {
-            let gm = GuestMem::new(guest_bytes());
-            let at = h.threads[cur()].kstate.ctx_addr;
-            gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0)
-        });
+        let x0 = GuestMem::new(guest_bytes()).read_u64(my_ctx() + ctx::x(0) as u64).unwrap_or(0);
         unsafe {
             let last = (SYSLOG_AT + SYSLOG_N - 1) % SYSLOG_N;
             SYSLOG[last].3 = x0;
@@ -7286,7 +7276,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
-        let (i, ctx_addr) = with_host(|h| (cur(), h.threads[cur()].kstate.ctx_addr));
+        let (i, ctx_addr) = (cur(), my_ctx());
         let x0 = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         // For a `select`, split the count: the total hides whether the ready
         // descriptors are readable or writable, which decides where a
@@ -8218,9 +8208,16 @@ fn cur() -> usize {
 /// Under the kernel lock, which `h` keeps every caller honest about.
 fn set_current(h: &mut Host, i: usize) {
     CURRENT.with(|c| c.set(i));
+    bind_mine(h, i);
+}
+
+/// Make thread `i`'s own state this Worker's: what it asks about its thread
+/// without the kernel (its context, its tid, its signals).
+fn bind_mine(h: &mut Host, i: usize) {
     if let Some(t) = h.threads.get(i) {
         let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
         MY_CTX.with(|c| c.set(ctx_addr));
+        MY_TID.with(|c| c.set(tid));
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -8235,11 +8232,18 @@ thread_local! {
     /// This Worker's thread's register context (`set_current`): its own,
     /// for what asks without the kernel.
     static MY_CTX: Cell<u64> = const { Cell::new(0) };
+    /// And its tid.
+    static MY_TID: Cell<i32> = const { Cell::new(0) };
 }
 
 /// [`MY_CTX`].
-fn my_ctx() -> u64 {
+pub(crate) fn my_ctx() -> u64 {
     MY_CTX.with(|c| c.get())
+}
+
+/// [`MY_TID`].
+pub(crate) fn my_tid() -> i32 {
+    MY_TID.with(|c| c.get())
 }
 
 /// A thread `clone` has made that the host has not made a Worker for:
@@ -11800,7 +11804,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // registers are in the context at a safepoint), and a thread that came
     // back from a syscall through JS is running guest code again.
     if cgen::libprov::any_registered() {
-        let tid = with_host(|h| h.threads[cur()].kstate.tid) as u32;
+        let tid = my_tid() as u32;
         cgen::libprov::guest_again(tid);
     }
     // A loop that has left an exception dispatched nested (nt::exc_escape).
@@ -12103,10 +12107,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             nt::serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     // Control leaving an exception dispatched nested (nt::exc_escape).
@@ -12121,10 +12123,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if !no_leave && cgen::may_leave() {
             return gex_emit::module::DISPATCH_MISS_LEAVE;
         }
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     // A block this process has (the slot names it in `blocks`) that this
@@ -12148,10 +12148,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             FILL_WANTED.with(|c| c.set(page as i64));
             FILL_PENDING.with(|c| c.set(page as i64));
         }
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     // An ejected project's training run: a pc of a unit image no function
@@ -12167,19 +12165,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     // An address an ELF export provider (or a replaced library's provider)
     // holds whose slot lost its bridge.
     if cgen::elfprov::rebridge(pc) {
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     if cgen::libprov::replaced(pc) {
@@ -12189,10 +12183,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
     // guest goes on at this pc.
     if cgen::w3_miss(pc) {
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     remiss(pc);
@@ -12359,10 +12351,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             FILL_PC.with(|c| c.set(pc));
             FILL_WANTED.with(|c| c.set(page as i64));
             FILL_PENDING.with(|c| c.set(page as i64));
-            with_host(|h| {
-                set_resume(pc);
-                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-            });
+            set_resume(pc);
+            set_resume_ctx(my_ctx());
             trap();
         }
     }
@@ -12517,10 +12507,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The same resume the ordinary path uses: come back at the address
         // that missed, once JavaScript has instantiated what was queued and
         // the address resolves.
-        with_host(|h| {
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-        });
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
         trap();
     }
     // Three parts: what to translate, under the lock; the translation, with
@@ -14166,7 +14154,7 @@ pub extern "C" fn gex_current_ctx() -> i64 {
     if at != 0 {
         return at as i64;
     }
-    with_host_free(|h| h.threads.get(cur()).map_or(0, |t| t.kstate.ctx_addr as i64)).unwrap_or(0)
+    my_ctx() as i64
 }
 
 #[no_mangle]
@@ -14179,12 +14167,10 @@ pub extern "C" fn gex_current_pc() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
     }
-    with_host_free(|h| {
-        let gm = GuestMem::new(guest_bytes());
-        let at = h.threads.get(cur()).map_or(0, |t| t.kstate.ctx_addr);
-        gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64
-    })
-    .unwrap_or(0)
+    match my_ctx() {
+        0 => 0,
+        at => GuestMem::new(guest_bytes()).read_u64(at + ctx::PC as u64).unwrap_or(0) as i64,
+    }
 }
 
 /// Link register at the same crash-safe context snapshot as `gex_current_pc`.
@@ -14200,7 +14186,10 @@ pub extern "C" fn gex_current_lr() -> i64 {
     if at != 0 {
         return read(at);
     }
-    with_host_free(|h| h.threads.get(cur()).map_or(0, |t| read(t.kstate.ctx_addr))).unwrap_or(0)
+    match my_ctx() {
+        0 => 0,
+        at => read(at),
+    }
 }
 
 /// Which mapped object an address belongs to, written into `out` as bytes.

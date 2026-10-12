@@ -714,7 +714,7 @@ fn wait_epoch(seen: u32, ns: i64) {
 }
 
 fn this_tid() -> u32 {
-    crate::with_host(|h| h.threads[crate::cur()].kstate.tid) as u32
+    crate::my_tid() as u32
 }
 
 /// Whether a collection is stopping the guest's threads.
@@ -807,7 +807,7 @@ pub extern "C" fn gex_libprov_guest_call(delta: i32) {
 }
 
 fn prov_check(delta: i32) {
-    let ctx = crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr);
+    let ctx = crate::my_ctx();
     let gm = crate::GuestMem::new(crate::guest_bytes());
     let reg = |o: usize| gm.read_u64(ctx + o as u64).unwrap_or(0);
     let sp = reg(gex_abi::ctx::x(4));
