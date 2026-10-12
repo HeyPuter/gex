@@ -3633,6 +3633,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 sys_nr = k.syscall_nr;
                 o
             });
+            if stall_on {
+                stall::decoded(sys_nr);
+            }
             // A blocking syscall is run here, with the kernel unlocked, and
             // then finished under the lock again.
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {

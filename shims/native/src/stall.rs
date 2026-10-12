@@ -3,7 +3,11 @@
 //! (which, for how long) or outside one (running guest code, or parked in a
 //! wasm32 `memory.atomic.wait`, which is no syscall) -- and how much CPU
 //! each used over the next 200 ms, which tells a busy thread from a waiting
-//! one. `GEX_STALL_EVERY=MS` dumps on that period regardless. For the
+//! one. `GEX_STALL_EVERY=MS` dumps on that period regardless.
+//! `GEX_STALL_FRAME=MS` dumps when the compositor has shown no new frame
+//! for MS (and again each further MS): a GUI session that boots to nothing
+//! is often busy with syscalls the whole time, so only the screen says it
+//! stalled. For the
 //! stalls a CPU profile cannot see: a whole session idle, waiting on a
 //! wakeup that comes late. Off unless set; when off, one load per syscall.
 
@@ -15,19 +19,30 @@ use std::time::{Duration, Instant};
 struct Conf {
     quiet: Option<Duration>,
     every: Option<Duration>,
+    frame: Option<Duration>,
 }
 
 fn conf() -> &'static Conf {
     static C: OnceLock<Conf> = OnceLock::new();
     C.get_or_init(|| {
         let ms = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
-        Conf { quiet: ms("GEX_STALL"), every: ms("GEX_STALL_EVERY") }
+        Conf { quiet: ms("GEX_STALL"), every: ms("GEX_STALL_EVERY"), frame: ms("GEX_STALL_FRAME") }
     })
 }
 
 pub fn on() -> bool {
     let c = conf();
-    c.quiet.is_some() || c.every.is_some()
+    c.quiet.is_some() || c.every.is_some() || c.frame.is_some()
+}
+
+/// Milliseconds since `START` of the compositor's latest frame.
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The compositor showed a frame (`GEX_STALL_FRAME`).
+pub fn frame() {
+    if conf().frame.is_some() {
+        LAST_FRAME_MS.store(start().elapsed().as_millis() as u64, Relaxed);
+    }
 }
 
 #[derive(Clone)]
@@ -36,6 +51,8 @@ struct Entry {
     pid: i32,
     /// The raw number of the call it is in, or `None` when outside one.
     inside: Option<u64>,
+    /// That call's canonical number, once the kernel has decoded it.
+    call: Option<u64>,
     since: Instant,
     last: u64,
     /// The latest call-out from a unit: target, return address; how many
@@ -70,11 +87,22 @@ pub fn enter(pid: i32, tid: i32, nr: u64) {
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
     e.tid = tid;
     e.pid = pid;
     e.inside = Some(nr);
+    e.call = None;
     e.since = now;
+}
+
+/// The kernel has decoded the call this thread is in: its canonical number,
+/// which a stall dump names (the raw number is the guest ABI's).
+pub fn decoded(canonical: u64) {
+    let host = HOST_TID.with(|t| *t);
+    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
+        e.call = Some(canonical);
+    }
 }
 
 /// The call it entered has returned; `name` is the kernel's canonical number.
@@ -97,6 +125,7 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
         tid: 0,
         pid: 0,
         inside: None,
+        call: None,
         since: Instant::now(),
         last: !0,
         co: (0, 0),
@@ -162,7 +191,10 @@ fn dump(why: &str) {
     for (h, e) in &snap {
         let (Some(b), Some(a)) = (before.get(h), cpu_ms(*h)) else { continue };
         let state = match e.inside {
-            Some(nr) => format!("in raw {nr}"),
+            Some(nr) => match e.call {
+                Some(c) => format!("in {} (raw {nr})", gex_kernel::syscalls::syscall_name(c)),
+                None => format!("in raw {nr}"),
+            },
             None => format!("outside (last {})", gex_kernel::syscalls::syscall_name(e.last)),
         };
         let co = if e.co_n > 0 {
@@ -191,6 +223,7 @@ fn watch() {
     let c = conf();
     let mut last_every = Instant::now();
     let mut dumped_for = u64::MAX;
+    let mut frame_dumped_at = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let Some(st) = START.get() else { continue };
@@ -206,6 +239,15 @@ fn watch() {
             if now.saturating_sub(last) >= q.as_millis() as u64 && dumped_for != last {
                 dumped_for = last;
                 dump(&format!("no syscall for {} ms", now - last));
+            }
+        }
+        if let Some(q) = c.frame {
+            let last = LAST_FRAME_MS.load(Relaxed);
+            let now = st.elapsed().as_millis() as u64;
+            let q = q.as_millis() as u64;
+            if now.saturating_sub(last) >= q && now.saturating_sub(frame_dumped_at.max(last)) >= q {
+                frame_dumped_at = now;
+                dump(&format!("no frame for {} ms", now - last));
             }
         }
     }
