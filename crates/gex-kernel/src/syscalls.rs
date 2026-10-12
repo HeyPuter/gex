@@ -5414,6 +5414,12 @@ impl Kernel {
         Ok(0)
     }
 
+    /// Whether any interval timer is armed: the hint a safepoint reads,
+    /// without the kernel's lock, before asking [`Kernel::timer_due`] under it.
+    pub fn timers_armed(&self) -> bool {
+        self.itimers.iter().any(|t| t.is_some())
+    }
+
     /// Whether an interval timer has expired and has yet to raise its signal.
     /// The host asks this on its way past: a process that never traps into
     /// the kernel (a shell's `timeout` spinning on `wait4`/`sigsuspend`) would

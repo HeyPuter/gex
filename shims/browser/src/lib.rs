@@ -5632,7 +5632,29 @@ const SAFEPOINT_SIGNALS: bool = true;
 // same Worker (see `CTX_ADDR` for what a process-wide one did).
 thread_local! {
     static SIGNAL_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// Safepoints since this Worker last asked under the lock; see `SWEEP_EVERY`.
+    static SAFEPOINT_SWEEP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// `LOCAL_SIGNALS` as this Worker last saw it at a safepoint.
+    static LOCAL_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// Kill-family syscalls this process has made: a `tgkill` to one of its own
+/// threads raises the signal in this process's kernel, which the global
+/// counter never sees. Per process, as `TIMERS_ARMED`.
+static LOCAL_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether this process has an interval timer armed, as its last syscall left
+/// it (`alarm` and `setitimer` are syscalls). Per process: the shim's data is
+/// the process's. A safepoint asks the kernel about a due timer only while
+/// this is set.
+static TIMERS_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A safepoint with no hint of a signal (the global counter unmoved, no timer
+/// armed) still asks under the lock every this many: what the hints do not
+/// see -- a signal raised in this process some other way than a syscall, a
+/// timer an `exec` kept -- is late by at most this many back-edge polls, not
+/// lost.
+const SWEEP_EVERY: u32 = 64;
 
 /// How long a syscall waits where it stands before giving the stack back.
 ///
@@ -6619,6 +6641,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             use gex_kernel::syscalls::nr as knr;
             let is_kill = matches!(nr, knr::KILL | knr::TKILL | knr::TGKILL);
             let sig = if nr == knr::TGKILL { a2 } else { a1 };
+            // A signal for a thread of this process is raised here, not in
+            // the global kernel, so the global counter does not move: this
+            // one tells the other threads' safepoints to look.
+            if is_kill {
+                LOCAL_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             if is_kill && sig == 6 {
                 let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
                 let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
@@ -7043,6 +7071,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // own after every syscall.
         retire_unmapped_code_in(h);
         mapped = std::mem::take(&mut h.kernel.new_code);
+        TIMERS_ARMED.store(h.kernel.timers_armed(), std::sync::atomic::Ordering::Relaxed);
         stop
     });
     gl::DEFER.with(|d| d.set(false));
@@ -11650,17 +11679,32 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // signal only when the kernel checks them, which `deliver_pending` does --
     // so a due timer has to count as "something to deliver" here, or a
     // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
-    let anything = SIGNAL_SEEN.with(|c| c.replace(sent)) != sent
-        || with_host(|h| h.kernel.signals.has_pending() || h.kernel.timer_due());
+    //
+    // Asking about this process's own pending signals and timers took the
+    // kernel's lock at every safepoint, twice: about 35,000 takes a second
+    // in Undertale's process, the most of any site (docs/kernel-locking.md,
+    // step 3). The lock is taken now only on a hint: the counter moved, a
+    // timer is armed (`TIMERS_ARMED`), this process signalled itself
+    // (`LOCAL_SIGNALS`), or the periodic sweep.
+    let local = LOCAL_SIGNALS.load(std::sync::atomic::Ordering::Acquire);
+    let moved = (SIGNAL_SEEN.with(|c| c.replace(sent)) != sent)
+        | (LOCAL_SEEN.with(|c| c.replace(local)) != local);
+    let sweep = SAFEPOINT_SWEEP.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n.is_multiple_of(SWEEP_EVERY)
+    });
+    let hinted = moved || sweep || TIMERS_ARMED.load(std::sync::atomic::Ordering::Relaxed);
     // A thread table with this thread in it: a safepoint can fire in a child
     // still being built, where an empty table would panic.
-    let have_thread = with_host(|h| cur() < h.threads.len());
-    if have_thread
-        && anything
-        && with_host(|h| {
-            h.kernel.procs.has_signals(h.kernel.pid)
-                || h.kernel.signals.has_pending()
-                || h.kernel.timer_due()
+    //
+    // And asked about *this* thread: `signals` is whichever thread last
+    // entered the kernel, so a `pthread_kill` to a thread spinning in its own
+    // code sat in `thread_signals` unseen, and a join on it never returned.
+    if hinted
+        && with_host(|h| match h.threads.get(cur()).map(|t| t.kstate.tid) {
+            Some(tid) => h.kernel.signal_pending_for(tid),
+            None => false,
         })
     {
         let delivered = with_host(|h| {
