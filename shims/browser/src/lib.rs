@@ -3666,11 +3666,29 @@ fn jit_in(h: &mut Host) -> bool {
 /// back, so it waits holding it. The translator needs nothing under the lock to
 /// finish, so this ends.
 fn jit_in_held(h: &mut Host) {
+    let mut waits = 0u32;
     while !jit_in(h) {
         #[cfg(feature = "shared-memory")]
         jit_wait();
+        waits += 1;
+        jit_wait_said(waits, true);
         #[cfg(not(feature = "shared-memory"))]
         panic!("gex: the JIT state is out with no other Worker to bring it back");
+    }
+}
+
+/// Once a second of waiting (a wait is at most a millisecond), say so, naming
+/// the translator: a Worker stuck here is blocked on a translation that does
+/// not finish.
+fn jit_wait_said(waits: u32, held: bool) {
+    if waits % 1000 == 0 {
+        warn_line(&format!(
+            "[gex] worker {} has waited {}s for the JIT state ({}), out with worker {}\n",
+            jit_me() - 1,
+            waits / 1000,
+            if held { "holding the kernel lock" } else { "lock given back" },
+            (jitout::OUT.load(std::sync::atomic::Ordering::Relaxed) & !jitout::DONE).wrapping_sub(1),
+        ));
     }
 }
 
@@ -3703,6 +3721,7 @@ fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     {
         let nested = DEPTH.with(|d| d.get()) > 0;
         let mut f = Some(f);
+        let mut waits = 0u32;
         loop {
             let r = with_host(|h| {
                 if nested {
@@ -3716,6 +3735,8 @@ fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
                 return r;
             }
             jit_wait();
+            waits += 1;
+            jit_wait_said(waits, false);
         }
     }
 }
@@ -12893,8 +12914,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             for a in &fresh {
                 h.jit.translated.remove(a);
             }
-            if tracing() {
-                trace_line(&format!("[gex] miss at pc={pc:#x}: code changed during translation, unit dropped\n"));
+            static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if tracing() || n <= 4 || n.is_power_of_two() {
+                warn_line(&format!(
+                    "[gex] miss at pc={pc:#x}: code retired or replaced during its translation, unit dropped ({n} so far)\n"
+                ));
             }
             set_resume(pc);
             // `get`: an `execve` by a sibling leaves one thread.
