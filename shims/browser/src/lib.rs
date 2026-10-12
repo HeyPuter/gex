@@ -5857,6 +5857,8 @@ fn park_until_ready() {
 /// futex is all it waits on.
 #[derive(Clone, Copy)]
 struct ParkPlan {
+    /// The thread it was read for (`cur()` then).
+    thread: usize,
     soonest: Option<u64>,
     futex: Option<(u64, u32)>,
 }
@@ -5873,7 +5875,7 @@ fn park_plan(h: &Host) -> ParkPlan {
         Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
         _ => None,
     };
-    ParkPlan { soonest, futex }
+    ParkPlan { thread: cur(), soonest, futex }
 }
 
 thread_local! {
@@ -5914,8 +5916,10 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     // under the lock it held to decide (`PARK_PLAN`), so a park straight after
     // one takes no lock of its own.
     let now = now_ns();
-    let ParkPlan { soonest, futex } =
-        PARK_PLAN.with(|c| c.take()).unwrap_or_else(|| with_host(|h| park_plan(h)));
+    let ParkPlan { soonest, futex, .. } = PARK_PLAN
+        .with(|c| c.take())
+        .filter(|p| p.thread == cur())
+        .unwrap_or_else(|| with_host(|h| park_plan(h)));
     if let Some(at) = soonest {
         ns = ns.min(at.saturating_sub(now));
     }
