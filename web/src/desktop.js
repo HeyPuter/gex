@@ -465,6 +465,45 @@ async function boot() {
   status(`session ended (${st})`);
 }
 
+// `?diag=1`: what the compositor drew and what the page's canvas holds, twice
+// a second, in a corner. A screen that does not change while "drawn" counts
+// up and "held" changes is a browser not displaying frames the page has; a
+// "drawn" that stays put is the compositor not seeing the client's frames.
+// The corner box repaints the page twice a second, which may itself bring a
+// stalled canvas up to date; `?diag=log` says the same in the console
+// instead, every 2 s, and changes nothing on the page.
+if (q.get('diag')) {
+  const quiet = q.get('diag') === 'log';
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:9;font:12px monospace;'
+    + 'background:#000c;color:#9f9;padding:4px 6px;pointer-events:none;white-space:pre';
+  if (!quiet) document.body.append(box);
+  let lastHeld = '';
+  let ticks = 0;
+  let heldChanges = 0;
+  setInterval(() => {
+    const comp = globalThis.__gexCompositor;
+    const c = document.getElementById('out');
+    let held = '-';
+    try {
+      const t = new OffscreenCanvas(c.width, c.height);
+      const g = t.getContext('2d', { willReadFrequently: true });
+      g.drawImage(c, 0, 0);
+      const d = g.getImageData(0, 0, c.width, c.height).data;
+      let h = 2166136261;
+      for (let i = 0; i < d.length; i += 16) h = Math.imul(h ^ d[i] ^ (d[i + 1] << 8) ^ (d[i + 2] << 16), 16777619) >>> 0;
+      held = h.toString(16);
+    } catch (e) {
+      held = `! ${e?.message ?? e}`;
+    }
+    if (held !== lastHeld) heldChanges++;
+    lastHeld = held;
+    const n = comp?.counters?.() ?? {};
+    box.textContent = `drawn ${n.frames ?? '-'}  held ${held} (${heldChanges} changes)  ${c.width}x${c.height} dpr ${devicePixelRatio}`;
+    if (quiet && ticks++ % 4 === 0) console.log(`[diag] ${box.textContent}`);
+  }, 500);
+}
+
 boot().catch((e) => {
   console.error(e);
   splash(`could not start: ${e.message ?? e}`);
