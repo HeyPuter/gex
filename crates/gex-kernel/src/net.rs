@@ -56,6 +56,11 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         usize::from(self.has_data())
     }
     fn close(&self);
+    /// The wait queue a change in this end's readiness is announced on
+    /// (`FileHandle::wait_queue`); 0 for one no event announces.
+    fn wait_queue(&self) -> u32 {
+        0
+    }
     /// `shutdown(how)`: 0 reads, 1 writes, 2 both. A transport that cannot
     /// half-close accepts it and does nothing.
     fn shutdown(&self, how: u64) -> Result<(), Errno> {
@@ -328,6 +333,9 @@ impl std::fmt::Debug for RemoteEnd {
 impl Transport for RemoteEnd {
     fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
         Ok(())
+    }
+    fn wait_queue(&self) -> u32 {
+        (self.remote.queue)(self.id)
     }
     fn status(&self) -> Status {
         Status::Open
@@ -1029,6 +1037,18 @@ impl FileHandle for Socket {
             Some(t) => t.has_data() || matches!(t.status(), Status::Closed | Status::Refused),
             None => true,
         }
+    }
+
+    /// In a page, a listener's and a loopback connection's ends are in the
+    /// global kernel, and so is the queue their changes are announced on: a
+    /// thread parked in `accept`, `poll` or `read` on one had none, and slept
+    /// through the connection or the bytes (tests/x86-programs/tcp-loopback,
+    /// a forked child connecting to its parent).
+    fn wait_queue(&self) -> u32 {
+        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
+            return (r.queue)(id);
+        }
+        self.transport.lock().unwrap().as_ref().map_or(0, |t| t.wait_queue())
     }
 
     /// Writable, which for a socket mid-`connect` means the connect has
