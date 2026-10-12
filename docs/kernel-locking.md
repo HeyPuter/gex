@@ -342,7 +342,7 @@ same box.
 | 3 | The idle loop (§3.7, its part) and the cheap half of targeted wakes (§3.3), on w/ut-page-tw2's targeted wake. `wasm32_wait`/`schedule`/`gex_park` take the lock once a pass, not seven times. A safepoint takes it only on a hint of a signal (the global or this process's signal counter, an armed timer, a sweep every 64th), and asks about *its own* thread, which fixed `pthread_kill` to a spinning thread. A read or write wakes nobody unless its descriptor is a stream, and a read of a pipe with room wakes nobody. | `tests/browser-thread-signal.sh` (a64, x86); `check-futex-wake.mjs`; the browser pipe and fork legs; the W3 legs | Undertale takes and wait per frame per process |
 | 6b | Per-object wake slots (§3.3, the rest): a wait on one pipe or socket parks on that object's slot, bumped by its other end; multi-fd polls keep the global word. After step 6, whose per-object fd state makes the slot natural. | a test that a syscall in one process wakes no idle Worker in another | idle Workers' wakes per second in every Wine process |
 | 4 | Translation registry reads without KLock (§3.6, the read half): `gex_table_need` and the `gex_module_*` getters read published state, and JS asks once a batch, not once an index or field. | the fjit legs; units-only Undertale; node -e 0 | node -e 0 wait at those sites |
-| 5 | Translation outside KLock (§3.6, the write half): lock-free lookups, CAS publication, per-registry mutexes. | the fjit legs (W3 echo with fjit, Undertale with fjit); an SMC test with 2 threads; a Muck census | node -e 0 dispatch_miss held time; Unity HK/Muck presents/s |
+| 5 | Translation outside KLock (§3.6, the write half). As built: a dispatch miss decides what to lift under KLock, takes the JIT state (page table, translated set, intrinsics) out of `Host` (`jitout::OUT`), gives the lock back, lifts, leaves the result marked done, and queues the unit under the lock again. Everything that reads that state goes through `with_jit`, which puts a finished result back and otherwise waits for it: with the lock given back from outside the kernel, holding it from inside (`retire_code`, `do_exec`, `do_fork`, nested calls), which ends because the lift needs nothing under the lock. Code retired during a lift is retired again once its unit is queued (the order one lock gave); an exec drops the unit. | the fjit legs (W3 echo with fjit, Undertale with fjit); the page SMC programs (`smc-race`, `smc-threads`, `smc-direct-jump`, `mem64-smc`, `copy-loop`); a Muck census | node -e 0 dispatch_miss held time; Unity HK/Muck presents/s |
 | 6 | Syscalls: the nothing-shared ones (§3.1, `clock_call` folded in), then the sharded `FutexTable` (§3.2), then the fd snapshot and fd mutex (§3.4). | a test that each nothing-shared call is answered while another Worker holds KLock; `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue; a close-while-reading test; pipe and socket stress in both hosts | Undertale syscall wait per frame; node -e 0 network Workers' KLock |
 | 7 | mm mutex and VMA snapshot (§3.5). | an mmap/munmap storm against translation on 4 threads, natively and in the page; the fork tests | dispatch_miss time per frame |
 | 8 | Signals (§3.8) and the rest of the thread table (§3.7). | the signal suites; the nullcall fault leg; a tgkill storm; W3 legs (Wine uses SIGUSR and SIGALRM heavily) | idle Workers' CPU |
@@ -376,6 +376,15 @@ same box.
     takes, and `gex_module_*`, 357k) waited 7.2 s; `gex_dispatch_miss`
     held 5.35 s over 7,200 takes; syscalls held 2.6 s. Hence steps 4 and 5
     next.
+  - **Step 5, measured** (edger, node -e 0, census builds, two runs each,
+    A = step 4, B = step 5): the cold process's KLock held time went from
+    3.7 and 6.2 s to 0.76 and 1.25 s; the miss now holds it 0.3-0.4 s for
+    4.6-7.3k misses (decide and queue), against 3.3 and 5.5 s for 4.9-7.2k.
+    Wait over all processes went from 1.1 and 2.4 s to 0.4 and 0.7 s. The
+    warm run's wall time did not move (13.25 and 13.50 s for A, 13.29 and
+    13.65 s for B): the cold process's lifting was never the critical path's
+    lock wait, only its own. Undertale tier-1 on worldmachine, 200 s, last
+    120 s: 21.9-22.9 fps against 22.3-22.5 for step 4.
   - Registry reads touch neither fds nor mm, so step 4 needs neither first;
     step 5's write half publishes what steps 6 and 7 then stop guarding.
 
