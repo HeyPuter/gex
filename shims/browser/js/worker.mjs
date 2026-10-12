@@ -768,6 +768,13 @@ async function handle(msg) {
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
+      // Who sent the last signal anywhere (the global kernel's record): a
+      // signal death names its sender.
+      try {
+        const k = gex.kernel;
+        const v = BigInt.asUintN(64, BigInt(k?.k_last_kill?.() ?? 0));
+        console.warn(`[gex] pid ${msg.pid ?? '?'} ended with ${status}; last signal sent: ${Number(v & 0xffn)} from pid ${Number(BigInt.asIntN(24, v >> 40n))} to ${Number(BigInt.asIntN(32, (v >> 8n) & 0xffffffffn))} (#${k?.k_last_kill_seq?.() ?? '?'})`);
+      } catch {}
       ex.gex_set_trace?.(1);
       ex.gex_dump_state?.();
       ex.gex_set_trace?.(0);

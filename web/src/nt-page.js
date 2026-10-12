@@ -112,6 +112,9 @@ async function main() {
   // was in (runtime.js passes the switch to every Worker).
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   if (q.get('doorstats')) globalThis.GEX_DOOR_STATS = Number(q.get('doorstats')) || 1;
+  // `?exittrace=1`: each Worker's exit status (and pc), from the host.
+  if (q.get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
+  if (q.get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   // `heartbeat=N`: say where the guest is every N safepoints (a stuck run from a slow one).
   if (q.get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(q.get('heartbeat'));
   // `?mem64=1`: a 64-bit guest memory (the wasm64 shim; docs/mem64.md step 6).
@@ -153,6 +156,7 @@ async function main() {
   if (q.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   // `?strace=1`: narrate every syscall (`gex_set_trace`), as main.js does.
   if (q.get('strace')) globalThis.GEX_STRACE = 1;
+  if (q.get('stracepid')) globalThis.GEX_STRACE_PID = Number(q.get('stracepid'));
   // The translator's switches, as main.js reads them (docs/jit-guest.md).
   if (q.get('liftmax')) globalThis.GEX_LIFT_MAX = Number(q.get('liftmax'));
   // The page-wide unit cache is on unless `?unitcache=0`.
