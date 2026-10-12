@@ -115,8 +115,16 @@ async function main() {
   if (q.get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(q.get('heartbeat'));
   // `?mem64=1`: a 64-bit guest memory (the wasm64 shim; docs/mem64.md step 6).
   if (q.get('mem64') === '1') globalThis.GEX_MEM64 = 1;
-  // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs).
-  if (q.get('fjit')) globalThis.GEX_FJIT = Number(q.get('fjit')) || 1;
+  // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs);
+  // `?fjit=2` traces it, `?fjit=0` turns it off. On by default for Wine's
+  // own loader (W3, `exe=.../lib/wine/<arch>-unix/wine`): code no
+  // function-tier unit holds otherwise runs on tier-1 behind the units'
+  // fallback, and Undertale drops from its 30 fps cap to ~15 in some
+  // scenes (worldmachine, units-ut2: 23.1 fps over 120 s without, a flat
+  // 30.0 with).
+  const fjitQ = q.get('fjit');
+  const w3Loader = /\/lib\/wine\/[^/]+-unix\/wine$/.test(q.get('exe') || '');
+  if (fjitQ !== null ? fjitQ !== '0' : w3Loader) globalThis.GEX_FJIT = Number(fjitQ) || 1;
   // `?wasmdlls=soname=path,...`: shared objects replaced by wasm64 providers (cgen/libprov.rs).
   if (q.get('wasmdlls')) globalThis.GEX_WASM_DLLS = q.get('wasmdlls');
   // `?elfunits=name,...`: shared objects that get function-tier units (with `?cgen=1`).

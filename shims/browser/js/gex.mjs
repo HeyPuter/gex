@@ -727,6 +727,9 @@ export class Gex {
   #tableRetries = 0;
   #iCopied = 0;
   #compileMs = 0;
+  /** `#fjitModule`'s compile time, and when it next reports (`[gex] fjit so far`). */
+  #fjitCompileMs = 0;
+  #fjitNextReport = 0;
   #instantiateMs = 0;
   #growMs = 0;
   /// What every Worker pays instantiating the shim and guest before the guest
@@ -3642,7 +3645,18 @@ export class Gex {
     if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
     const t0 = performance.now();
     mod = new WebAssembly.Module(bytes);
-    this.#compileMs += performance.now() - t0;
+    const dt = performance.now() - t0;
+    this.#compileMs += dt;
+    this.#fjitCompileMs += dt;
+    // Every 60 s while the JIT makes modules: what it has cost so far (the
+    // census at exit comes too late for a game that never exits).
+    if (t0 >= this.#fjitNextReport && e.gex_fjit_translate_ms) {
+      if (this.#fjitNextReport) {
+        console.error(`[gex] fjit so far: ${e.gex_fjit_modules()} modules, ${e.gex_fjit_wasm_kib()} KiB of wasm, `
+          + `${e.gex_fjit_translate_ms()} ms translating (the process), ${this.#fjitCompileMs.toFixed(0)} ms compiling (this Worker)`);
+      }
+      this.#fjitNextReport = t0 + 60000;
+    }
     this.#sharedModules.set(name, mod);
     this.#env.shareModule?.(name, mod);
     return mod;
