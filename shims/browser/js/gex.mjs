@@ -1313,6 +1313,8 @@ export class Gex {
         // surface the compositor's own hit test picked.
         wl_poll_input: (ptr, max) =>
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        // Whether that ring holds anything, without draining it.
+        wl_input_pending: () => (this.#wl?.inputPending() ? 1 : 0),
     };
   }
 

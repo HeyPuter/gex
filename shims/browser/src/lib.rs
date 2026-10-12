@@ -10607,7 +10607,9 @@ fn schedule() -> i32 {
         // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
         let pick = with_host(|h| {
-            if let Some(w) = h.wayland.clone() {
+            // Only when it has anything to move (`needs_pump`): most turns it
+            // has not.
+            if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
                 let gm = GuestMem::new(guest_bytes());
                 // What the pump wrote to a client's socket (a frame callback,
                 // a buffer release, input) is readiness for a thread parked in
