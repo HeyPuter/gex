@@ -959,6 +959,69 @@ pub fn clock_call(
     set_result(m, ctx_addr, 0).is_ok()
 }
 
+/// What a process and thread are called, as a host last saw them under its
+/// lock: the answers [`ident_call`] gives without it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Idents {
+    pub pid: u32,
+    pub ppid: u32,
+    pub tid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// `getpid`, `getppid`, `gettid` and the 32-bit `get[e]uid`/`get[e]gid`
+/// answered from `ids` with no lock (docs/kernel-locking.md §3.1), as
+/// [`clock_call`] answers the clocks: a host that keeps `ids` current calls
+/// this before taking its lock, and the full syscall runs whenever it returns
+/// false. `ids.tid == 0` means the host has none yet, and `ids.ppid == 0`
+/// leaves `getppid` to the full call. The 16-bit i386 forms
+/// are left to the full call, which owns their overflow rule.
+pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Idents) -> bool {
+    if gex_abi::PPC || ids.tid == 0 {
+        return false;
+    }
+    let raw = if compat {
+        m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
+    } else {
+        m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
+    };
+    let v = if compat {
+        use crate::i386::raw as x;
+        match raw {
+            x::GETPID => ids.pid,
+            x::GETPPID if ids.ppid != 0 => ids.ppid,
+            x::GETTID => ids.tid,
+            x::GETUID | x::GETEUID => ids.uid,
+            x::GETGID | x::GETEGID => ids.gid,
+            _ => return false,
+        }
+    } else if gex_abi::X86 {
+        use crate::x86::raw as x;
+        match raw {
+            x::GETPID => ids.pid,
+            x::GETPPID if ids.ppid != 0 => ids.ppid,
+            x::GETTID => ids.tid,
+            x::GETUID | x::GETEUID => ids.uid,
+            x::GETGID | x::GETEGID => ids.gid,
+            _ => return false,
+        }
+    } else {
+        match raw {
+            nr::GETPID => ids.pid,
+            nr::GETPPID if ids.ppid != 0 => ids.ppid,
+            nr::GETTID => ids.tid,
+            nr::GETUID | nr::GETEUID => ids.uid,
+            nr::GETGID | nr::GETEGID => ids.gid,
+            _ => return false,
+        }
+    };
+    if gex_abi::X86 {
+        let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+    }
+    set_result(m, ctx_addr, v as u64).is_ok()
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -1977,7 +2040,7 @@ impl Kernel {
             raw
         };
 
-        self.fd_activity |= wakes_fd_waiters(n);
+        self.fd_activity |= wakes_fd_waiters(n) && self.io_may_wake(n, &a);
         self.syscall_nr = n;
 
         // Returning from a handler restores a whole context, so it cannot go
@@ -5442,6 +5505,32 @@ impl Kernel {
         Ok(0)
     }
 
+    /// Whether this read or write, about to be made, can end anyone's wait
+    /// (see [`wakes_fd_waiters`]). Its descriptor must be a stream -- a read
+    /// or write of a file, `/proc` or a device never ends a wait -- and a
+    /// read must be able to make room (`FileHandle::read_frees_nothing`).
+    /// Each "no" spares every parked Worker in the page a wake: Undertale's
+    /// reads of the wineserver's replies were half of all global wakes, every
+    /// one of them going round every idle Worker of every process
+    /// (docs/kernel-locking.md, step 3). Anything else is "yes".
+    fn io_may_wake(&self, n: u64, a: &[u64; 6]) -> bool {
+        let read = matches!(n, nr::READ | nr::READV | nr::PREAD64);
+        if !read && !matches!(n, nr::WRITE | nr::WRITEV | nr::PWRITE64) {
+            return true;
+        }
+        let Ok(file) = self.fds.get(a[0] as i32) else { return true };
+        if !file.handle.is_stream() {
+            return false;
+        }
+        !(read && file.handle.read_frees_nothing())
+    }
+
+    /// Whether any interval timer is armed: the hint a safepoint reads,
+    /// without the kernel's lock, before asking [`Kernel::timer_due`] under it.
+    pub fn timers_armed(&self) -> bool {
+        self.itimers.iter().any(|t| t.is_some())
+    }
+
     /// Whether an interval timer has expired and has yet to raise its signal.
     /// The host asks this on its way past: a process that never traps into
     /// the kernel (a shell's `timeout` spinning on `wait4`/`sigsuspend`) would
@@ -7902,6 +7991,35 @@ mod tests {
             )
             .unwrap() as i32;
         assert_eq!(k.unix_of(pfd).err(), Some(Errno::ENOTSOCK));
+    }
+
+    /// `ident_call` answers the id calls as the kernel does, and declines
+    /// what it was not given.
+    #[test]
+    fn ident_call_answers_as_the_kernel_does() {
+        if gex_abi::PPC || gex_abi::X86 {
+            return;
+        }
+        let (mut mem, mut k) = setup();
+        let at = k.ctx_addr;
+        let ids = Idents { pid: k.pid as u32, ppid: 0, tid: k.tid as u32, uid: k.uid, gid: k.gid };
+        for n in [nr::GETPID, nr::GETTID, nr::GETUID, nr::GETEUID, nr::GETGID, nr::GETEGID] {
+            let mut m = GuestMem::new(&mut mem);
+            set_args(&mut m, at, n, &[]);
+            k.syscall(&mut m, 0);
+            let want = ret(&m, at);
+            m.write_u64(at + ctx::x(0) as u64, 0x5555).unwrap();
+            set_args(&mut m, at, n, &[]);
+            assert!(ident_call(&mut m, at, false, &ids), "call {n}");
+            assert_eq!(ret(&m, at), want, "call {n}");
+        }
+        let mut m = GuestMem::new(&mut mem);
+        set_args(&mut m, at, nr::GETPPID, &[]);
+        assert!(!ident_call(&mut m, at, false, &ids), "no parent given");
+        set_args(&mut m, at, nr::GETPID, &[]);
+        assert!(!ident_call(&mut m, at, false, &Idents { tid: 0, ..ids }), "no thread yet");
+        set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0x3000]);
+        assert!(!ident_call(&mut m, at, false, &ids), "not an id call");
     }
 
     /// `clock_call`, the lock-free answer, writes what the full call writes,

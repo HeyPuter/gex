@@ -20,7 +20,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # (Boehm's stop-the-world; the page asked the wrong thread's signal state).
 # exec-tail: code ending in the last bytes of an executable mapping (the page
 # fetched only up to four bytes before the end: SIGILL in Mono's JIT code).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve"}
+# retire-during-lift: code retired while the translator lifts other code
+# outside the kernel lock (docs/kernel-locking.md step 5). Tier-1 only: the
+# function JIT livelocks on its chain natively (gexc --fjit, 2026-10-12).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

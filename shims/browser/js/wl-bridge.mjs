@@ -423,6 +423,13 @@ export class WlProxy {
     return count;
   }
 
+  /** Whether this process's input ring holds an event. */
+  inputPending() {
+    if (this.#block < 0) return false;
+    const a = this.#a;
+    return Atomics.load(a, this.#ring + K_HEAD) !== Atomics.load(a, this.#ring + K_TAIL);
+  }
+
   /** Give the block back, so a later process can have it. */
   release() {
     if (this.#block < 0) return;

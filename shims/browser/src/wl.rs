@@ -44,7 +44,13 @@ extern "C" {
     /// 8 close, 9 dismiss popup. Coordinates are surface-local pixels;
     /// button/key codes are Linux `BTN_*`/evdev numbers.
     fn wl_poll_input(ptr: u32, max: u32) -> u32;
+    /// Whether this process's input ring holds an event, without taking it.
+    fn wl_input_pending() -> u32;
 }
+
+/// The floor under [`WaylandDevice::needs_pump`]: whatever it does not look
+/// at still gets a pump at least this often.
+const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
@@ -296,6 +302,8 @@ struct Inner {
     /// How many clients were live at the last publish, so a client going away
     /// is a scene change even when no one drew.
     published: Mutex<usize>,
+    /// When a pump last ran (host ns), for `PUMP_FLOOR_NS`.
+    last_pump: std::sync::atomic::AtomicU64,
 }
 
 /// The compositor as the guest sees it: a name that accepts connections.
@@ -341,6 +349,7 @@ impl WaylandDevice {
     /// compositor is told is the address of that range -- nothing is copied
     /// here, and nothing is composited here either.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) -> bool {
+        self.inner.last_pump.store(crate::now_ns(), std::sync::atomic::Ordering::Relaxed);
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut sent_any = false;
         // Compositor input and control for this turn, addressed by client: a
@@ -589,6 +598,34 @@ impl WaylandDevice {
             unsafe { wl_publish(scene.as_ptr() as u32, count) };
         }
         sent_any
+    }
+
+    /// Whether a pump now would do anything: a client socket with bytes or a
+    /// hang-up to read, bytes still owed to one, an X window manager to
+    /// drive, or input in the ring for a client that takes it -- or the floor
+    /// (`PUMP_FLOOR_NS`) has passed. Asked on every scheduler turn of every
+    /// Worker, under the lock as the pump was: Undertale's game process pumped 7,000
+    /// times a second, nearly all with nothing to move, and the pump was 311
+    /// of the 546 ms a 10 s window held the lock for the turn (census,
+    /// worldmachine) -- the turn that is 70% of the game's lock wait.
+    pub fn needs_pump(&self) -> bool {
+        let now = crate::now_ns();
+        if now.saturating_sub(self.inner.last_pump.load(std::sync::atomic::Ordering::Relaxed)) >= PUMP_FLOOR_NS {
+            return true;
+        }
+        // Held elsewhere (an accept, a GL attach): pump, as before.
+        let Ok(sessions) = self.inner.sessions.try_lock() else {
+            return true;
+        };
+        let mut wants = false;
+        for s in sessions.iter() {
+            if s.xwm.is_some() || s.sent < s.out.len() || s.socket.poll_readable() || s.socket.poll_hup() {
+                return true;
+            }
+            wants |= s.client.wants_input();
+        }
+        // SAFETY: a host import taking nothing.
+        wants && unsafe { wl_input_pending() } != 0
     }
 
     /// Write every client's surfaces into the scene arena.

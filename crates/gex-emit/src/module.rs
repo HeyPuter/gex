@@ -366,6 +366,20 @@ impl PageTable {
 
     /// How far the host has to grow its tables to contain what this table
     /// names -- its own allocations and anything it has adopted.
+    /// The counters behind [`Self::slots`] and [`Self::table_need`], shared
+    /// by every clone of this table: what a reader holding no lock can keep
+    /// and ask again later (the browser host's registry view).
+    #[allow(clippy::type_complexity)]
+    pub fn marks(
+        &self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
+    ) {
+        (self.high.clone(), self.next_slot.clone(), self.highs.clone())
+    }
+
     pub fn slots(&self) -> u64 {
         self.high
             .load(std::sync::atomic::Ordering::SeqCst)

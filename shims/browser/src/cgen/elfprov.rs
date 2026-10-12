@@ -284,7 +284,7 @@ pub(crate) fn rebridge(pc: u64) -> bool {
     // child's directory is rebuilt from what it can honour, which leaves the
     // page its parent numbered for these bridges at the miss stub.
     let page = pc / gex_abi::DISPATCH_PAGE;
-    if let Some(base) = crate::with_host(|h| h.jit.page_table.lookup(page)) {
+    if let Some(base) = crate::with_jit(|h| h.jit.page_table.lookup(page)) {
         super::write_dirs(vec![(page, base)]);
     }
     lock(&REBRIDGE).extend(regs);

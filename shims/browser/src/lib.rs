@@ -2607,6 +2607,7 @@ struct SingleThreaded<T>(RefCell<T>);
 unsafe impl<T> Sync for SingleThreaded<T> {}
 
 /// Why a guest thread is not running.
+#[derive(Clone)]
 enum Waiting {
     /// Ready to be picked up.
     Runnable,
@@ -2950,11 +2951,24 @@ fn install_panic_hook() {
 /// Install the kernel this Worker will run against.
 #[cfg(not(feature = "shared-memory"))]
 fn set_host(host: Host) {
+    // A new process: its registry starts empty, whatever a fork copied.
+    regview::reset();
+    regview::publish_marks(&host.jit.page_table);
+    // A fork copies the parent's memory, translation in flight or not; the
+    // child's JIT state is the `host` given here.
+    jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
+    *jitout::BOX.0.borrow_mut() = None;
     HOST.with(|h| *h.borrow_mut() = Some(host));
 }
 
 #[cfg(feature = "shared-memory")]
 fn set_host(host: Host) {
+    regview::reset();
+    regview::publish_marks(&host.jit.page_table);
+    // A fork copies the parent's memory, translation in flight or not; the
+    // child's JIT state is the `host` given here.
+    jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
+    *jitout::BOX.0.borrow_mut() = None;
     // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
@@ -3576,6 +3590,161 @@ impl Drop for KLock {
         // SAFETY: as above.
         unsafe {
             warch::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, 1);
+        }
+    }
+}
+
+/// The JIT's own state while a translation runs outside `KLock`
+/// (docs/kernel-locking.md, step 5).
+///
+/// A dispatch miss lifts with the kernel lock let go: the translator takes the
+/// page table, the translated set and the intrinsics out of `Host::jit`, marks
+/// them out here, gives the lock back, translates, and leaves what it produced
+/// in `BOX` with `DONE` set. Whoever next wants the JIT state under the lock
+/// (`jit_in`) puts it back, the translator itself included. Nothing else in the
+/// kernel waits for a translation any more: a sibling's syscall, futex or
+/// schedule pass goes ahead while it lifts.
+mod jitout {
+    use std::sync::atomic::AtomicU32;
+    /// 0 when the JIT state is in `Host::jit`; otherwise the translating
+    /// Worker's id plus one, with `DONE` once its result is in `BOX`.
+    pub(crate) static OUT: AtomicU32 = AtomicU32::new(0);
+    pub(crate) const DONE: u32 = 1 << 31;
+    /// Bumped by `retire_code`, each range it retired logged in `RETIRED`
+    /// under the new value: a translator that sees it moved installs its unit
+    /// and then retires those ranges again, the order the two would have had
+    /// under one lock (a unit queued, then its code retired).
+    pub(crate) static EPOCH: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static RETIRED: super::SingleThreaded<std::collections::VecDeque<(u32, u64, u64)>> =
+        super::SingleThreaded(std::cell::RefCell::new(std::collections::VecDeque::new()));
+    /// Bumped by `do_exec`: a unit of the program it replaced is dropped.
+    pub(crate) static EXEC_EPOCH: AtomicU32 = AtomicU32::new(0);
+    pub(crate) type Parts = (
+        gex_xlate::PageTable,
+        std::collections::HashSet<u64>,
+        std::collections::HashMap<u64, gex_xlate::Intrinsic>,
+    );
+    /// The translator's result, written before `DONE` (release) and taken
+    /// after seeing it (acquire), so never touched by two Workers at once.
+    pub(crate) static BOX: super::SingleThreaded<Option<Parts>> =
+        super::SingleThreaded(std::cell::RefCell::new(None));
+}
+
+/// This Worker as `jitout::OUT` names it.
+fn jit_me() -> u32 {
+    #[cfg(feature = "shared-memory")]
+    { worker_id() + 1 }
+    #[cfg(not(feature = "shared-memory"))]
+    { 1 }
+}
+
+/// Put the JIT state back into `h` if a translation has finished with it.
+/// False while another Worker is still translating with it out.
+fn jit_in(h: &mut Host) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let s = jitout::OUT.load(Acquire);
+    if s == 0 {
+        return true;
+    }
+    if s & jitout::DONE == 0 {
+        if s == jit_me() {
+            // This Worker is the translator, between taking the state out and
+            // putting its result in the box: nothing runs there that asks.
+            panic!("gex: the JIT state was asked for in the middle of this Worker's own translation");
+        }
+        return false;
+    }
+    let Some((table, known, intr)) = jitout::BOX.0.borrow_mut().take() else {
+        panic!("gex: a translation said it was done and left nothing");
+    };
+    h.jit.page_table = table;
+    h.jit.translated = known;
+    h.jit.intrinsics = intr;
+    regview::publish_marks(&h.jit.page_table);
+    jitout::OUT.store(0, Release);
+    #[cfg(feature = "shared-memory")]
+    // SAFETY: the address of a `static AtomicU32` in the shared memory.
+    unsafe {
+        warch::memory_atomic_notify(jitout::OUT.as_ptr() as *mut i32, u32::MAX);
+    }
+    true
+}
+
+/// `jit_in`, for a caller already inside the kernel: it cannot give the lock
+/// back, so it waits holding it. The translator needs nothing under the lock to
+/// finish, so this ends.
+fn jit_in_held(h: &mut Host) {
+    let mut waits = 0u32;
+    while !jit_in(h) {
+        #[cfg(feature = "shared-memory")]
+        jit_wait();
+        waits += 1;
+        jit_wait_said(waits, true);
+        #[cfg(not(feature = "shared-memory"))]
+        panic!("gex: the JIT state is out with no other Worker to bring it back");
+    }
+}
+
+/// Once a second of waiting (a wait is at most a millisecond), say so, naming
+/// the translator: a Worker stuck here is blocked on a translation that does
+/// not finish.
+fn jit_wait_said(waits: u32, held: bool) {
+    if waits % 1000 == 0 {
+        warn_line(&format!(
+            "[gex] worker {} has waited {}s for the JIT state ({}), out with worker {}\n",
+            jit_me() - 1,
+            waits / 1000,
+            if held { "holding the kernel lock" } else { "lock given back" },
+            (jitout::OUT.load(std::sync::atomic::Ordering::Relaxed) & !jitout::DONE).wrapping_sub(1),
+        ));
+    }
+}
+
+/// Wait (briefly) for `jitout::OUT` to move while a translation is under way.
+#[cfg(feature = "shared-memory")]
+fn jit_wait() {
+    let s = jitout::OUT.load(std::sync::atomic::Ordering::Acquire);
+    if s != 0 && s & jitout::DONE == 0 {
+        // SAFETY: as `jit_in`.
+        unsafe {
+            warch::memory_atomic_wait32(jitout::OUT.as_ptr() as *mut i32, s as i32, 1_000_000);
+        }
+    }
+}
+
+/// `with_host` for anything that reads or changes the JIT's page table,
+/// translated set or intrinsics: they may be out with a translator
+/// (`jitout`). From outside the kernel this waits for it with the lock
+/// given back; from inside (a nested call) it waits holding the lock.
+#[track_caller]
+fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    #[cfg(not(feature = "shared-memory"))]
+    {
+        with_host(|h| {
+            jit_in_held(h);
+            f(h)
+        })
+    }
+    #[cfg(feature = "shared-memory")]
+    {
+        let nested = DEPTH.with(|d| d.get()) > 0;
+        let mut f = Some(f);
+        let mut waits = 0u32;
+        loop {
+            let r = with_host(|h| {
+                if nested {
+                    jit_in_held(h);
+                } else if !jit_in(h) {
+                    return None;
+                }
+                Some((f.take().expect("with_jit runs its closure once"))(h))
+            });
+            if let Some(r) = r {
+                return r;
+            }
+            jit_wait();
+            waits += 1;
+            jit_wait_said(waits, false);
         }
     }
 }
@@ -4530,7 +4699,7 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
     // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
     // by `gex_add_closure_module` as libraries stream in, and this runs on every
     // Worker's miss path -- see the note there.
-    with_host(|h| closure_owner_held(h, page))
+    with_jit(|h| closure_owner_held(h, page))
 }
 
 /// Which closure object owns an image page, for a caller that ALREADY holds
@@ -5011,7 +5180,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
     };
     // Kept because `execve` republishes: the modules are still in this
     // instance's tables, so the new program gets every library the old one had.
-    with_host(|h| {
+    with_jit(|h| {
         // Not the image's pages unless this process runs *this* image's
         // program (every closure root is an image at `PIE_BASE`, so the
         // question is which, not whether).
@@ -5107,7 +5276,7 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     // by streaming closures (`gex_add_closure_module`) while this runs on every
     // Worker's fill path. The owner lookup inside is the *held* form: KLOCK is
     // not re-entrant, and calling `gex_closure_owner` here panicked the process.
-    with_host(|h| {
+    with_jit(|h| {
         // An image page belongs to whichever root of the closure this process is
         // actually running, so it is looked up by module and not by page alone.
         if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
@@ -5227,7 +5396,7 @@ pub extern "C" fn gex_claim_page(page: u64) -> u32 {
             dir_note(page, entry, "claim-page");
             // Under KLOCK: `page_table` and `CLOSURE_DIRS` are process state two
             // Workers must not push to at once (the second race the audit found).
-            with_host(|h| {
+            with_jit(|h| {
                 h.jit.page_table.assign(page, entry);
                 CLOSURE_DIRS.0.borrow_mut().push((page, entry));
             });
@@ -5293,7 +5462,16 @@ pub extern "C" fn gex_page_base(page: u32) -> u32 {
 /// and the run translates into 4..7, so a single total would grow 0..3 hugely.
 #[no_mangle]
 pub extern "C" fn gex_table_need(i: u32) -> u32 {
-    with_host(|h| h.jit.page_table.table_need(i as usize) as u32)
+    // Without the lock (docs/kernel-locking.md, step 4): the per-table marks
+    // are atomics the page table shares with every clone, published once per
+    // table (`regview`). JS asks this once per table per install.
+    match regview::table_need(i as usize) {
+        Some(n) => n as u32,
+        None => with_jit(|h| {
+            regview::publish_marks(&h.jit.page_table);
+            h.jit.page_table.table_need(i as usize) as u32
+        }),
+    }
 }
 
 /// Register a module a forked child inherited, without instantiating it. A
@@ -5311,7 +5489,7 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
     // path has somewhere to ask from here on.
     FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     let idx = LAZY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    with_host(|h| {
+    with_jit(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let mut owner = LAZY_OWNER.0.borrow_mut();
         for (page, base) in &meta.dir_entries {
@@ -5566,7 +5744,7 @@ pub extern "C" fn gex_stdin_eof() {
 /// to tell "wait for a keystroke" from "the program is over".
 #[no_mangle]
 pub extern "C" fn gex_paused_for_input() -> i32 {
-    with_host(|h| (paused() & 1 != 0) as i32)
+    (paused() & 1 != 0) as i32
 }
 
 /// Whether the guest stopped because it is waiting on the network. The page
@@ -5574,7 +5752,7 @@ pub extern "C" fn gex_paused_for_input() -> i32 {
 /// data it is waiting for can arrive -- and then call [`gex_wake`].
 #[no_mangle]
 pub extern "C" fn gex_paused_for_net() -> i32 {
-    with_host(|h| (paused() & 2 != 0) as i32)
+    (paused() & 2 != 0) as i32
 }
 
 /// Whether ending this wait needs the page's own event loop to turn: a guest
@@ -5582,7 +5760,7 @@ pub extern "C" fn gex_paused_for_net() -> i32 {
 /// on a network callback that runs on *this* Worker's event loop cannot.
 #[no_mangle]
 pub extern "C" fn gex_paused_for_host() -> i32 {
-    with_host(|h| (paused() & 4 != 0) as i32)
+    (paused() & 4 != 0) as i32
 }
 
 thread_local! {
@@ -5634,7 +5812,29 @@ const SAFEPOINT_SIGNALS: bool = true;
 // same Worker (see `CTX_ADDR` for what a process-wide one did).
 thread_local! {
     static SIGNAL_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// Safepoints since this Worker last asked under the lock; see `SWEEP_EVERY`.
+    static SAFEPOINT_SWEEP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// `LOCAL_SIGNALS` as this Worker last saw it at a safepoint.
+    static LOCAL_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// Kill-family syscalls this process has made: a `tgkill` to one of its own
+/// threads raises the signal in this process's kernel, which the global
+/// counter never sees. Per process, as `TIMERS_ARMED`.
+static LOCAL_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether this process has an interval timer armed, as its last syscall left
+/// it (`alarm` and `setitimer` are syscalls). Per process: the shim's data is
+/// the process's. A safepoint asks the kernel about a due timer only while
+/// this is set.
+static TIMERS_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A safepoint with no hint of a signal (the global counter unmoved, no timer
+/// armed) still asks under the lock every this many: what the hints do not
+/// see -- a signal raised in this process some other way than a syscall, a
+/// timer an `exec` kept -- is late by at most this many back-edge polls, not
+/// lost.
+const SWEEP_EVERY: u32 = 64;
 
 /// How long a syscall waits where it stands before giving the stack back.
 ///
@@ -5854,6 +6054,41 @@ fn park_until_ready() {
     }
 }
 
+/// What [`gex_park`] needs to know about this Worker's waiting thread: its
+/// own deadline, and the futex address and generation it parked at if a
+/// futex is all it waits on.
+#[derive(Clone, Copy)]
+struct ParkPlan {
+    /// The thread it was read for (`cur()` then).
+    thread: usize,
+    soonest: Option<u64>,
+    futex: Option<(u64, u32)>,
+}
+
+fn park_plan(h: &Host) -> ParkPlan {
+    let waiting = h.threads.get(cur()).map(|t| &t.waiting);
+    let soonest = match waiting {
+        Some(Waiting::Sleep(at)) => Some(*at),
+        Some(Waiting::Futex { deadline, .. }) => *deadline,
+        Some(Waiting::Net(deadline)) => *deadline,
+        _ => None,
+    };
+    let futex = match waiting {
+        Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
+        _ => None,
+    };
+    ParkPlan { thread: cur(), soonest, futex }
+}
+
+thread_local! {
+    /// The park plan the last scheduler turn read while finding nothing to
+    /// run, for the [`gex_park`] that follows it. Only this Worker changes its
+    /// own thread's wait, and only by running it, which goes through
+    /// `schedule` (it clears this) or a syscall (likewise); a wake from
+    /// another Worker moves the futex slot or the wake counter, not the plan.
+    static PARK_PLAN: std::cell::Cell<Option<ParkPlan>> = const { std::cell::Cell::new(None) };
+}
+
 /// Sleep until another Worker does something, or `max_ms` passes. Blocks on a
 /// word in the global kernel's memory that every syscall bumps, rather than
 /// polling round the event loop. Bounded so a Worker still returns for what only
@@ -5878,20 +6113,15 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     // that wake loop (dm19), the main thread 22%. And -- read under the same
     // lock -- whether this Worker's thread is simply waiting on a futex, with
     // the address and the generation it parked at.
+    //
+    // The scheduler turn that found nothing to run already read all of that,
+    // under the lock it held to decide (`PARK_PLAN`), so a park straight after
+    // one takes no lock of its own.
     let now = now_ns();
-    let (soonest, futex) = with_host(|h| {
-        let soonest = h.threads.get(cur()).and_then(|t| match &t.waiting {
-            Waiting::Sleep(at) => Some(*at),
-            Waiting::Futex { deadline, .. } => *deadline,
-            Waiting::Net(deadline) => *deadline,
-            _ => None,
-        });
-        let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
-            Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
-            _ => None,
-        };
-        (soonest, futex)
-    });
+    let ParkPlan { soonest, futex, .. } = PARK_PLAN
+        .with(|c| c.take())
+        .filter(|p| p.thread == cur())
+        .unwrap_or_else(|| with_host(|h| park_plan(h)));
     if let Some(at) = soonest {
         ns = ns.min(at.saturating_sub(now));
     }
@@ -6217,6 +6447,9 @@ fn count_syscall() {
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // The thread runs again: whatever its last idle turn read about its wait
+    // is out of date (see `PARK_PLAN`).
+    PARK_PLAN.with(|c| c.set(None));
     // A Windows process's every syscall is an NT call, made before the kernel
     // is taken: the NT layer takes it itself, briefly, and blocks without it.
     if let Some(p) = nt::process() {
@@ -6436,6 +6669,18 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
         MY_PID.store(h.kernel.pid, std::sync::atomic::Ordering::Relaxed);
+        // What `ident_call` answers from until this thread's next full call.
+        // No parent: asking for it is a call into the system-wide kernel, and
+        // a reparent would go unseen; `getppid` takes the full path.
+        IDS.with(|c| {
+            c.set(gex_kernel::syscalls::Idents {
+                pid: h.kernel.pid as u32,
+                ppid: 0,
+                tid: h.threads[cur()].kstate.tid as u32,
+                uid: h.kernel.uid,
+                gid: h.kernel.gid,
+            })
+        });
         report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -6588,6 +6833,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             use gex_kernel::syscalls::nr as knr;
             let is_kill = matches!(nr, knr::KILL | knr::TKILL | knr::TGKILL);
             let sig = if nr == knr::TGKILL { a2 } else { a1 };
+            // A signal for a thread of this process is raised here, not in
+            // the global kernel, so the global counter does not move: this
+            // one tells the other threads' safepoints to look.
+            if is_kill {
+                LOCAL_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             if is_kill && sig == 6 {
                 let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
                 let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
@@ -6817,6 +7068,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // thread runs on another stack, and `Elsewhere` is the state
                 // that says "not me". Without it two Workers would run the
                 // same context.
+                thread_table_changed();
                 h.threads.push(Thread {
                     kstate: ThreadState {
                         ctx_addr,
@@ -6836,6 +7088,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 if !h.jit.ever_threaded {
                     backfill_registry(h);
                     h.jit.ever_threaded = true;
+                    regview::set_threaded(true);
                 }
                 stage_thread(tid, ctx_addr, start);
                 if frames_stay(h) {
@@ -7012,6 +7265,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // own after every syscall.
         retire_unmapped_code_in(h);
         mapped = std::mem::take(&mut h.kernel.new_code);
+        TIMERS_ARMED.store(h.kernel.timers_armed(), std::sync::atomic::Ordering::Relaxed);
         stop
     });
     gl::DEFER.with(|d| d.set(false));
@@ -7324,6 +7578,10 @@ thread_local! {
     static FAST_SIG: Cell<i32> = const { Cell::new(i32::MIN) };
     /// Fast calls since this thread's last full syscall.
     static FAST_RUN: Cell<u32> = const { Cell::new(0) };
+    /// This thread's ids as its last full syscall saw them (`ident_call`).
+    static IDS: Cell<gex_kernel::syscalls::Idents> = const {
+        Cell::new(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 })
+    };
     /// The canonical number of the syscall this thread just made, for
     /// `wakes_nobody`; `u64::MAX` when the kernel did not run it.
     static CANON_NR: Cell<u64> = const { Cell::new(u64::MAX) };
@@ -7360,7 +7618,9 @@ fn clock_fast_path(ctx: i32) -> bool {
     }
     let mut gm = GuestMem::new(guest_bytes());
     let started = FAST_STARTED.load(Relaxed) as u128;
-    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started) {
+    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started)
+        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, ctx as u32 as u64, abi == 1, &c.get()))
+    {
         return false;
     }
     FAST_RUN.with(|c| c.set(c.get() + 1));
@@ -7424,11 +7684,16 @@ fn wasm32_wait(pc: u64) -> i32 {
     // 90 console.debug lines a second on Undertale; its wined3d thread spent
     // 1.4 ms a frame in them under the profiler. The check also took the
     // kernel's lock on every pass of the loop; it is made on the first pass.
+    //
+    // A pass of this loop takes the kernel's lock once, in `schedule`: a turn
+    // that finds nothing to run leaves what it saw for the rest of the pass
+    // (`PARK_PLAN`, and `paused()`), where each question used to take the
+    // lock again (docs/kernel-locking.md, step 3).
     let mut said = PAGE_WAIT_SAID.with(|c| c.get());
     loop {
         let picked = schedule();
-        let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         if picked == 1 {
+            let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
             if resume() == Some(pc + gex_abi::SYSCALL_INST_BYTES) && resume_ctx().unwrap_or(here) == here {
                 set_resume_none();
                 set_resume_ctx_none();
@@ -7436,10 +7701,16 @@ fn wasm32_wait(pc: u64) -> i32 {
             }
             return picked;
         }
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)) {
+        // An idle turn saw this Worker's thread still waiting, under the lock;
+        // any other way out of `schedule` must be asked.
+        let idle = PARK_PLAN.with(|c| c.get()).is_some();
+        if EXITED.load(std::sync::atomic::Ordering::Relaxed)
+            || (!idle && with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)))
+        {
             return picked;
         }
-        if !said && with_host(|h| h.threads.iter().any(|t| wait_needs_page(t, &h.kernel))) {
+        // Bit 4 of `paused()`: the idle turn found a wait only the page ends.
+        if !said && idle && paused() & 4 != 0 {
             // A wait on the page itself (its keyboard, the Worker's own
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
@@ -7455,6 +7726,9 @@ fn wasm32_wait(pc: u64) -> i32 {
 
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
+    // Not with a sibling mid-translation: the child is a copy of this memory,
+    // and a translator outside the lock is changing the heap.
+    jit_in_held(h);
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
     h.threads[cur()].pc = pc + gex_abi::SYSCALL_INST_BYTES;
@@ -8163,6 +8437,7 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
             return 0;
         };
         h.threads[i].waiting = Waiting::Runnable;
+        thread_table_changed();
         set_current(h, i);
         h.threads[i].pc as i64
     })
@@ -8400,6 +8675,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
         t.waiting = Waiting::Exited;
         t.blocked_on = None;
     }
+    thread_table_changed();
     // See `gex_exited`: tells a program that finished from one that abandoned
     // the wasm stack with no status set.
     EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8451,6 +8727,9 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// is what makes fork-then-exec work. Returns the entry point, or zero if the
 /// program could not be loaded (the caller already has an errno).
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    // A sibling's translation in flight is of the program this replaces.
+    jit_in_held(h);
+    jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
     // and the moment it execs every one describes a program that is gone.
@@ -8717,6 +8996,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // the high-water mark. No entries, so `usize::MAX` ("nothing with active
     // segments to place") is true whatever the new program turns out to be.
     h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots(), usize::MAX);
+    regview::publish_marks(&h.jit.page_table);
     h.jit.translated.clear();
     // And whatever was queued for the host to install: a fork copies the
     // parent's queue, and a module of the OLD program installed after this
@@ -8818,6 +9098,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     write_u64(data, c + ctx::MON_SIZE, 0);
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
+    thread_table_changed();
     h.threads = vec![Thread {
         kstate: ThreadState::new(ctx_addr, h.kernel.pid),
         pc: entry,
@@ -9619,6 +9900,7 @@ fn backfill_registry(h: &mut Host) {
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         h.jit.registry_sums.push(chunk_sums(&wasm));
+        regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
         h.jit.registry.push(wasm);
         h.jit.registry_ext.push(None);
     }
@@ -9826,13 +10108,31 @@ fn now_ns() -> u64 {
     unsafe { now() as u64 }
 }
 
+/// What a scheduler turn that found nothing to run saw, under the one lock
+/// it took to decide: everything the idle path then acts on, so that a pass
+/// of a waiting Worker's loop takes the kernel's lock once rather than seven
+/// times (docs/kernel-locking.md, step 3).
+#[derive(Clone, Copy)]
+struct IdleLook {
+    /// What the page must supply, as `paused()` bits (see `idle_why`).
+    why: u8,
+    /// Every thread parked on an untimed futex and none of them ready: a
+    /// deadlock if it persists. Only asked when `why` is 0.
+    all_blocked: bool,
+    /// This Worker's thread is in a wait that ends without the page.
+    ends_by_itself: bool,
+    /// For the `gex_park` that follows.
+    park: ParkPlan,
+}
+
 /// What the scheduler decided.
 enum Pick {
     /// Run this thread: which one, whether its deadline passed, and whether
     /// what woke it was a signal rather than the thing it was waiting for.
     Thread(usize, bool, bool),
-    /// Nothing in this process can run yet.
-    Idle,
+    /// Nothing in this process can run yet, and what the same look found
+    /// about why (see [`IdleLook`]).
+    Idle(IdleLook),
     /// This process has finished.
     Over,
 }
@@ -9863,15 +10163,23 @@ fn any_signal(h: &mut Host) -> bool {
 /// other processes too (what lets the scheduler cross a process boundary): all
 /// it consults is reference-counted and outside guest memory.
 fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
+    wait_ready(&t.waiting, t.blocked_on.as_ref(), now, signalled)
+}
+
+/// [`thread_ready`] on a thread's wait as parts: what an idle turn's snapshot
+/// (`IDLE_SNAP`) keeps and asks again without the lock. Everything it
+/// consults is atomics, the clock, or a handle's own lock (`FileHandle` is
+/// `Sync`; pipes and unix sockets ask the global kernel).
+fn wait_ready(waiting: &Waiting, blocked_on: Option<&gex_kernel::BlockOp>, now: u64, signalled: bool) -> bool {
     // A signal ends a wait -- every interruptible one, all here but a thread
     // exited or running in another Worker. Becoming runnable is all that is
     // needed: the picked thread finishes its parked call, and the code after
     // already asks `deliver_pending`,
     // which either builds the handler's frame or ends the process.
-    if SIGNAL_ENDS_WAIT && signalled && !matches!(t.waiting, Waiting::Exited | Waiting::Elsewhere) {
+    if SIGNAL_ENDS_WAIT && signalled && !matches!(waiting, Waiting::Exited | Waiting::Elsewhere) {
         return true;
     }
-    match &t.waiting {
+    match waiting {
         Waiting::Runnable => true,
         Waiting::Futex { parked, deadline, val, wake_gen } => {
             // Four ways this wait ends. `woken()` is a same-Worker wake; the
@@ -9910,7 +10218,7 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
         Waiting::Write(handle) => handle.poll_writable(),
         Waiting::Net(deadline) => {
             deadline.is_some_and(|d| now >= d)
-                || match &t.blocked_on {
+                || match blocked_on {
                     Some(gex_kernel::BlockOp::Connect { socket }) => {
                         socket.status() != gex_kernel::net::Status::Connecting
                     }
@@ -9923,7 +10231,7 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
         // Ready when one of the children this call can collect has a status
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
-        Waiting::Child => match &t.blocked_on {
+        Waiting::Child => match blocked_on {
             Some(gex_kernel::BlockOp::WaitChild {
                 children,
                 procs,
@@ -10162,10 +10470,267 @@ fn report_idle(why: u8) {
     ));
 }
 
+/// The idle half of a scheduler turn, asked under the same lock as the pick.
+fn idle_look(h: &mut Host) -> IdleLook {
+    let why = idle_why(h);
+    // Every thread parked on a futex AND not one of them already
+    // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
+    // a sibling marks its waiter `woken` (or bumps the shared
+    // generation) but leaves `waiting` as `Futex` until the thread is
+    // picked, so a check on the variant alone counts an already-woken
+    // thread as blocked. During thread startup that is exactly the
+    // window -- one thread runs a `pthread_once` init and wakes the
+    // others, which sit `Futex`-typed-but-woken for an instant -- and
+    // declaring deadlock there killed the process's Workers ("nothing
+    // could wake it") while a wake was in hand. `thread_ready` sees
+    // the wake, so a ready thread means this is not a deadlock: fall
+    // through, let its Worker pick it, and only the genuinely
+    // all-blocked case (no thread ready) reaches the report.
+    let all_blocked = why == 0 && {
+        let now = now_ns();
+        let k = &mut h.kernel;
+        h.threads
+            .iter()
+            .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
+            && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
+    };
+    // A wait that ends by itself: a sleep (the clock), a `wait4` (the child,
+    // in another Worker, exits), a futex (another Worker wakes it). This
+    // Worker's thread only: a Worker owns exactly one.
+    let ends_by_itself = h.threads.get(cur()).is_none_or(|t| {
+        matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
+    });
+    IdleLook { why, all_blocked, ends_by_itself, park: park_plan(h) }
+}
+
+/// What the page must supply for this process's waits to end, as `paused()`
+/// bits: 1 a keystroke, 2 the event loop to turn, 4 only the page can end it.
+fn idle_why(h: &Host) -> u8 {
+    // Only a terminal is a keystroke; a pipe or socket is written by
+    // another process (apt's http method, a pipeline) and wants the
+    // event loop, not a key.
+    // Bit 1 means "the page has to supply a keystroke", and the JS
+    // side answers it by *awaiting* one -- with no timeout when
+    // nothing else is set. So it must be reserved for the page's own
+    // terminal. A pty is not that: it is two ends in the global
+    // kernel, and the end that will write is a program in another
+    // Worker. Classed as a keyboard, a `select` on one waited for a
+    // keystroke into the page that was never coming, which is what
+    // made an interactive bash in xterm go deaf after one character
+    // -- readline waits in `select` where a plain shell waits in
+    // `read`, and a read happened to also set bit 2 and be retried.
+    let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        use gex_kernel::vfs::FileType;
+        let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
+        if Arc::as_ptr(handle) as *const () == stdin_p {
+            return 1;
+        }
+        if handle.peer_wakes() {
+            return 2;
+        }
+        match handle.metadata().map(|m| m.file_type) {
+            Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
+            _ => 1,
+        }
+    };
+    let mut mask = 0u8;
+    // Bit 2: only the page can end this wait (a network callback on
+    // this Worker's event loop, so it cannot be slept on, unlike a
+    // wait another Worker's notify ends). Always set with bit 1,
+    // never alone -- alone it answers "paused for input?" and
+    // "paused for net?" both no, a silent death read as a clean
+    // exit. Per wait, not per process: apt has a network, but its
+    // pipe to the http method is filled by another Worker.
+    if h.threads.iter().any(|t| wait_needs_page(t, &h.kernel)) {
+        mask |= 2 | 4;
+    }
+    for t in h.threads.iter() {
+        match &t.waiting {
+            // Like a read: a pipe or socket is drained by another
+            // process, a terminal by the page.
+            Waiting::Write(handle) => mask |= by_kind(handle),
+            // A listener's client connects from outside the guest,
+            // so the event loop must turn.
+            Waiting::Accept(_) => mask |= 2,
+            Waiting::Read(handle) => {
+                mask |= by_kind(handle);
+            }
+            // Every timed wait and poll parks as `Net`, but most are
+            // not the network -- an interactive shell polls its
+            // terminal -- so a poll is classified by what it polls.
+            Waiting::Net(deadline) => {
+                match &t.blocked_on {
+                    Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
+                        let mut saw = false;
+                        for p in fds {
+                            if let Some(handle) = &p.handle {
+                                mask |= by_kind(handle);
+                                saw = true;
+                            }
+                        }
+                        if !saw {
+                            mask |= 2;
+                        }
+                    }
+                    _ => mask |= 2,
+                }
+                // A wait that can time out needs the clock to
+                // move, and only the page can move it, so it
+                // wants the event loop whatever else it wants.
+                if deadline.is_some() {
+                    mask |= 2;
+                }
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
+/// Bumped whenever a thread's entry changes other than by its own Worker
+/// running it: `exit_process` (an `exit_group` in any thread marks them all
+/// exited), exec's new table, a thread added, a Worker adopting its thread.
+/// Per process, as `LOCAL_SIGNALS`. An idle turn's snapshot (`IDLE_SNAP`)
+/// holds only while it has not moved.
+static THREAD_TABLE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn thread_table_changed() {
+    THREAD_TABLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Idle turns answered from a snapshot before one takes the lock again
+/// anyway: what the snapshot cannot see (another thread's wait, which
+/// `idle_why` classifies, a signal sent with no counter moving) is looked at
+/// at least this often.
+const IDLE_FAST_MAX: u32 = 16;
+
+/// What an idle turn saw under the lock, kept so the next turns can ask
+/// whether this Worker's thread became ready without the lock: its wait and
+/// the call it parked in (asked again with `wait_ready`: atomics, the clock,
+/// and handles that carry their own locks), the rest of the turn's answer,
+/// and the counters that say nothing else moved.
+struct IdleSnap {
+    thread: usize,
+    waiting: Waiting,
+    blocked_on: Option<gex_kernel::BlockOp>,
+    look: IdleLook,
+    wayland: Option<crate::wl::WaylandDevice>,
+    signal_seq: i32,
+    local_signals: u32,
+    table_gen: u32,
+    turns: u32,
+}
+
+thread_local! {
+    static IDLE_SNAP: RefCell<Option<IdleSnap>> = const { RefCell::new(None) };
+    /// Idle turns answered without the lock, and with it (`gex_pick_counts`).
+    static PICK_FAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The counters an idle snapshot is checked against, read before the turn
+/// looks at anything, as `WAKE_SEEN` is: a signal or exit landing while the
+/// turn decides moves them after this read, and the next turn sees it.
+fn idle_counters() -> (i32, u32, u32) {
+    use std::sync::atomic::Ordering;
+    let seq = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
+    (seq, LOCAL_SIGNALS.load(Ordering::Acquire), THREAD_TABLE_GEN.load(Ordering::Acquire))
+}
+
+/// An idle turn without the kernel's lock (docs/kernel-locking.md, step 6:
+/// the pick reads only its own thread). Answers when the last turn found this
+/// Worker's thread waiting and nothing since could have changed that but what
+/// the wait itself watches (a futex's generation, the clock, a pipe or a
+/// socket), which is asked here: no signal counter moved and no timer is
+/// armed, the thread table
+/// (exits, exec) did not change, the process has not exited, and the
+/// compositor has nothing to pump. `None`: take the lock and look.
+fn idle_fast(counters: (i32, u32, u32)) -> Option<IdleLook> {
+    use std::sync::atomic::Ordering;
+    if unsafe { k_present() } == 0
+        || EXITED.load(Ordering::Relaxed)
+        || TIMERS_ARMED.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+    IDLE_SNAP.with(|c| {
+        let mut c = c.borrow_mut();
+        let snap = c.as_mut()?;
+        snap.turns += 1;
+        if snap.turns > IDLE_FAST_MAX
+            || snap.thread != cur()
+            || (snap.signal_seq, snap.local_signals, snap.table_gen) != counters
+            || snap.wayland.as_ref().is_some_and(|w| w.needs_pump())
+        {
+            *c = None;
+            return None;
+        }
+        if wait_ready(&snap.waiting, snap.blocked_on.as_ref(), now_ns(), false) {
+            *c = None;
+            return None;
+        }
+        Some(snap.look)
+    })
+}
+
+/// Keep what an idle turn saw for `idle_fast`, when this Worker's thread
+/// waits on something any Worker may ask about and the turn is not watching
+/// for a deadlock.
+fn idle_snapshot(h: &Host, look: &IdleLook, counters: (i32, u32, u32)) {
+    let Some(t) = h.threads.get(cur()) else { return };
+    // A deadlock watch counts turns under the lock; a thread that is not
+    // waiting, or is not this Worker's to run, has nothing to keep.
+    if look.all_blocked || matches!(t.waiting, Waiting::Runnable | Waiting::Exited | Waiting::Elsewhere) {
+        return;
+    }
+    // Only handles whose readiness is safe to ask from any Worker: a pipe or
+    // a socket (the global kernel's, or a handle with its own lock). The
+    // page's terminal is not -- `StdinQueue` is a `RefCell` the lock alone
+    // guards, and a `Tty` asks it -- nor is anything else `idle_why` would
+    // call a keystroke.
+    let shareable = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        use gex_kernel::vfs::FileType;
+        Arc::as_ptr(handle) as *const () != Arc::as_ptr(&*STDIN) as *const ()
+            && (handle.peer_wakes()
+                || matches!(handle.metadata().map(|m| m.file_type), Ok(FileType::Socket) | Ok(FileType::Fifo)))
+    };
+    let ok = match (&t.waiting, &t.blocked_on) {
+        (Waiting::Read(hd) | Waiting::Write(hd) | Waiting::Accept(hd), _) => shareable(hd),
+        (Waiting::Net(_), Some(gex_kernel::BlockOp::Poll { fds, .. })) => {
+            fds.iter().all(|p| p.handle.as_ref().is_none_or(shareable))
+        }
+        _ => true,
+    };
+    if !ok {
+        return;
+    }
+    let (signal_seq, local_signals, table_gen) = counters;
+    IDLE_SNAP.with(|c| {
+        *c.borrow_mut() = Some(IdleSnap {
+            thread: cur(),
+            waiting: t.waiting.clone(),
+            blocked_on: t.blocked_on.clone(),
+            look: *look,
+            wayland: h.wayland.clone(),
+            signal_seq,
+            local_signals,
+            table_gen,
+            turns: 0,
+        })
+    });
+}
+
+/// Idle scheduler turns this Worker answered without the kernel's lock
+/// (`idle_fast`), for the census.
+#[no_mangle]
+pub extern "C" fn gex_pick_fast_count() -> u64 {
+    PICK_FAST.with(|c| c.get())
+}
+
 /// Choose the next guest thread to run, and finish whatever syscall it was in
 /// the middle of. It no longer chooses between *processes*: there is one per
 /// Worker, and the others run elsewhere.
 fn schedule() -> i32 {
+    PARK_PLAN.with(|c| c.set(None));
     // What the wake counter read *before* anything was asked about what is
     // runnable, so that a wake arriving while this makes up its mind cannot
     // be slept through. `gex_park` sleeps only while the counter is still
@@ -10188,14 +10753,23 @@ fn schedule() -> i32 {
         }
     }
     loop {
+        let counters = idle_counters();
+        let fast = idle_fast(counters);
+        if fast.is_some() {
+            PICK_FAST.with(|c| c.set(c.get() + 1));
+        } else {
+            IDLE_SNAP.with(|c| *c.borrow_mut() = None);
+        }
         // Before anything is chosen, the compositor: a wayland client writes
         // a request then blocks on the reply, so it must run here, the one
         // place every thread passes through on its way to waiting. Needs the
         // kernel (to find a buffer's shared mapping) and guest memory (the
         // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
-        with_host(|h| {
-            if let Some(w) = h.wayland.clone() {
+        let pick = if let Some(look) = fast { Pick::Idle(look) } else { with_host(|h| {
+            // Only when it has anything to move (`needs_pump`): most turns it
+            // has not.
+            if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
                 let gm = GuestMem::new(guest_bytes());
                 // What the pump wrote to a client's socket (a frame callback,
                 // a buffer release, input) is readiness for a thread parked in
@@ -10207,8 +10781,6 @@ fn schedule() -> i32 {
                     unsafe { k_wake() };
                 }
             }
-        });
-        let pick = with_host(|h| {
             // Every thread gone ends this process, all this Worker has; the
             // status is in the shared table for whoever waits.
             if h.threads
@@ -10250,9 +10822,11 @@ fn schedule() -> i32 {
             } else {
                 // Nothing this Worker owns can run; everything else is a Worker
                 // the engine already runs.
-                Pick::Idle
+                let look = idle_look(h);
+                idle_snapshot(h, &look, counters);
+                Pick::Idle(look)
             }
-        });
+        }) };
         // Going round again is what picks a thread and, crucially, finishes the
         // syscall it parked in; resuming its saved pc directly leaves x0 with
         // no return value.
@@ -10260,124 +10834,24 @@ fn schedule() -> i32 {
             return 2;
         }
         let Pick::Thread(i, timed_out, by_signal) = pick else {
+            let Pick::Idle(look) = pick else { unreachable!() };
             // Nothing can run, but not everything that cannot run is stuck. A
             // thread wanting a keystroke needs the page (bit 0); one waiting on
             // the network needs its event loop to turn (bit 1). Both mean
             // giving the stack back, and the two are not exclusive -- a shell in
             // one process and a download in another want both -- so this is a
             // pair of bits classified from each handle.
-            let why = with_host(|h| {
-                // Only a terminal is a keystroke; a pipe or socket is written by
-                // another process (apt's http method, a pipeline) and wants the
-                // event loop, not a key.
-                // Bit 1 means "the page has to supply a keystroke", and the JS
-                // side answers it by *awaiting* one -- with no timeout when
-                // nothing else is set. So it must be reserved for the page's own
-                // terminal. A pty is not that: it is two ends in the global
-                // kernel, and the end that will write is a program in another
-                // Worker. Classed as a keyboard, a `select` on one waited for a
-                // keystroke into the page that was never coming, which is what
-                // made an interactive bash in xterm go deaf after one character
-                // -- readline waits in `select` where a plain shell waits in
-                // `read`, and a read happened to also set bit 2 and be retried.
-                let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
-                    use gex_kernel::vfs::FileType;
-                    let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
-                    if Arc::as_ptr(handle) as *const () == stdin_p {
-                        return 1;
-                    }
-                    if handle.peer_wakes() {
-                        return 2;
-                    }
-                    match handle.metadata().map(|m| m.file_type) {
-                        Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
-                        _ => 1,
-                    }
-                };
-                let mut mask = 0u8;
-                // Bit 2: only the page can end this wait (a network callback on
-                // this Worker's event loop, so it cannot be slept on, unlike a
-                // wait another Worker's notify ends). Always set with bit 1,
-                // never alone -- alone it answers "paused for input?" and
-                // "paused for net?" both no, a silent death read as a clean
-                // exit. Per wait, not per process: apt has a network, but its
-                // pipe to the http method is filled by another Worker.
-                if h.threads.iter().any(|t| wait_needs_page(t, &h.kernel)) {
-                    mask |= 2 | 4;
-                }
-                for t in h.threads.iter() {
-                    match &t.waiting {
-                        // Like a read: a pipe or socket is drained by another
-                        // process, a terminal by the page.
-                        Waiting::Write(handle) => mask |= by_kind(handle),
-                        // A listener's client connects from outside the guest,
-                        // so the event loop must turn.
-                        Waiting::Accept(_) => mask |= 2,
-                        Waiting::Read(handle) => {
-                            mask |= by_kind(handle);
-                        }
-                        // Every timed wait and poll parks as `Net`, but most are
-                        // not the network -- an interactive shell polls its
-                        // terminal -- so a poll is classified by what it polls.
-                        Waiting::Net(deadline) => {
-                            match &t.blocked_on {
-                                Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
-                                    let mut saw = false;
-                                    for p in fds {
-                                        if let Some(handle) = &p.handle {
-                                            mask |= by_kind(handle);
-                                            saw = true;
-                                        }
-                                    }
-                                    if !saw {
-                                        mask |= 2;
-                                    }
-                                }
-                                _ => mask |= 2,
-                            }
-                            // A wait that can time out needs the clock to
-                            // move, and only the page can move it, so it
-                            // wants the event loop whatever else it wants.
-                            if deadline.is_some() {
-                                mask |= 2;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                mask
-            });
+            let IdleLook { why, all_blocked, ends_by_itself, park } = look;
             if why != 0 {
                 // Counted, the case that hides: handing the stack back for a
                 // wait the page satisfies is right, but doing it a thousand
                 // times a second for one nothing satisfies is a silent hang.
                 report_idle(why);
                 set_paused_to(why);
+                PARK_PLAN.with(|c| c.set(Some(park)));
                 return 2;
             }
-            if with_host(|h| {
-                let now = now_ns();
-                let sig = any_signal(h);
-                // Every thread parked on a futex AND not one of them already
-                // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
-                // a sibling marks its waiter `woken` (or bumps the shared
-                // generation) but leaves `waiting` as `Futex` until the thread is
-                // picked, so a check on the variant alone counts an already-woken
-                // thread as blocked. During thread startup that is exactly the
-                // window -- one thread runs a `pthread_once` init and wakes the
-                // others, which sit `Futex`-typed-but-woken for an instant -- and
-                // declaring deadlock there killed the process's Workers ("nothing
-                // could wake it") while a wake was in hand. `thread_ready` sees
-                // the wake, so a ready thread means this is not a deadlock: fall
-                // through, let its Worker pick it, and only the genuinely
-                // all-blocked case (no thread ready) reaches the report below.
-                let _ = sig;
-                let k = &mut h.kernel;
-                h.threads
-                    .iter()
-                    .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
-            }) && {
+            if all_blocked && {
                 // Confirm it persists before acting. A single all-blocked instant
                 // is not a deadlock -- during startup one is routine -- so require
                 // a run of them at a wake seq that never moves (a real deadlock
@@ -10437,15 +10911,11 @@ fn schedule() -> i32 {
             // long child reported itself "idle" every power of two.
             // (This Worker's thread: a Worker owns exactly one, and the
             // others' entries are their own Workers' business.)
-            let ends_by_itself = with_host(|h| {
-                h.threads.get(cur()).is_none_or(|t| {
-                    matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
-                })
-            });
             if !ends_by_itself {
                 report_idle(0);
             }
             set_paused_to(2);
+            PARK_PLAN.with(|c| c.set(Some(park)));
             return 2;
         };
         IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -11343,7 +11813,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             c.set((start, addr as u64));
             same
         });
-        let again = with_host(|h| {
+        let again = with_jit(|h| {
             let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
                 h.jit.translated.remove(&start);
@@ -11373,7 +11843,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // The bridge left for this very address having run nothing: tier-1
         // takes the slot over, and the function JIT serves it no more.
         fjit::tier1_only(addr as u64);
-        with_host(|h| {
+        with_jit(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
         return;
@@ -11390,7 +11860,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 _pc as u64, addr as u64
             ));
         }
-        with_host(|h| {
+        with_jit(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
         return;
@@ -11408,7 +11878,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
-        with_host(|h| {
+        with_jit(|h| {
             if h.jit.page_table.forget(page).is_none() {
                 return;
             }
@@ -11593,17 +12063,32 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // signal only when the kernel checks them, which `deliver_pending` does --
     // so a due timer has to count as "something to deliver" here, or a
     // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
-    let anything = SIGNAL_SEEN.with(|c| c.replace(sent)) != sent
-        || with_host(|h| h.kernel.signals.has_pending() || h.kernel.timer_due());
+    //
+    // Asking about this process's own pending signals and timers took the
+    // kernel's lock at every safepoint, twice: about 35,000 takes a second
+    // in Undertale's process, the most of any site (docs/kernel-locking.md,
+    // step 3). The lock is taken now only on a hint: the counter moved, a
+    // timer is armed (`TIMERS_ARMED`), this process signalled itself
+    // (`LOCAL_SIGNALS`), or the periodic sweep.
+    let local = LOCAL_SIGNALS.load(std::sync::atomic::Ordering::Acquire);
+    let moved = (SIGNAL_SEEN.with(|c| c.replace(sent)) != sent)
+        | (LOCAL_SEEN.with(|c| c.replace(local)) != local);
+    let sweep = SAFEPOINT_SWEEP.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n.is_multiple_of(SWEEP_EVERY)
+    });
+    let hinted = moved || sweep || TIMERS_ARMED.load(std::sync::atomic::Ordering::Relaxed);
     // A thread table with this thread in it: a safepoint can fire in a child
     // still being built, where an empty table would panic.
-    let have_thread = with_host(|h| cur() < h.threads.len());
-    if have_thread
-        && anything
-        && with_host(|h| {
-            h.kernel.procs.has_signals(h.kernel.pid)
-                || h.kernel.signals.has_pending()
-                || h.kernel.timer_due()
+    //
+    // And asked about *this* thread: `signals` is whichever thread last
+    // entered the kernel, so a `pthread_kill` to a thread spinning in its own
+    // code sat in `thread_signals` unseen, and a join on it never returned.
+    if hinted
+        && with_host(|h| match h.threads.get(cur()).map(|t| t.kstate.tid) {
+            Some(tid) => h.kernel.signal_pending_for(tid),
+            None => false,
         })
     {
         let delivered = with_host(|h| {
@@ -11700,7 +12185,7 @@ fn miss_count(k: usize) {
 }
 
 fn remiss(pc: u64) {
-    let said = with_host(|h| {
+    let said = with_jit(|h| {
         if !h.jit.translated.contains(&pc) {
             return None;
         }
@@ -11897,7 +12382,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             MISSES
         };
         if n.is_multiple_of(200) {
-            let (blocks, ms, intr) = with_host(|h| {
+            let (blocks, ms, intr) = with_jit(|h| {
                 (h.jit.blocks, h.jit.nanos / 1_000_000, h.jit.intrinsics.len())
             });
             trace_line(&format!(
@@ -12209,9 +12694,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
-    let translated = with_host(|h| {
+    // Three parts: what to translate, under the lock; the translation, with
+    // the lock given back and the JIT state out (`jitout`); and its install,
+    // under the lock again. A sibling's syscalls no longer wait for a lift.
+    enum MissPre {
+        Done(bool),
+        Go {
+            exec: Vec<(u64, u64)>,
+            known: std::collections::HashSet<u64>,
+            table: gex_xlate::PageTable,
+            intr: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
+            page: u64,
+            started: u64,
+            epoch: (u32, u32),
+        },
+    }
+    let pre = with_jit(|h| {
         if !h.jit.described {
-            return false;
+            return MissPre::Done(false);
         }
         let exec: Vec<(u64, u64)> = h
             .kernel
@@ -12222,7 +12722,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .map(|v| (v.start, v.end))
             .collect();
         if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
-            return false;
+            return MissPre::Done(false);
         }
         // Nothing can be lifted at a misaligned pc (the emitter asserts a
         // block's base is instruction-aligned, and a panic there takes the
@@ -12232,7 +12732,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // up on it (see `ftab::rebridge_gives_up`).
         if pc % gex_abi::INST_ALIGN != 0 {
             crate::warn_line(&format!("gex: pid {} jumped to a misaligned pc {pc:#x}; not translating it\n", h.kernel.pid));
-            return false;
+            return MissPre::Done(false);
         }
         // Before anything is translated: if this page's code has been
         // translated already, by another process or by this one before an
@@ -12514,7 +13014,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     if covers {
                         set_resume(pc);
                         set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                        return true;
+                        return MissPre::Done(true);
                     }
                     // Otherwise fall through and lift the block in this same
                     // turn. What was served is queued either way, and the
@@ -12548,7 +13048,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         let started = now_ns();
-        let known = std::mem::take(&mut h.jit.translated);
         // x86-64: what the page table's identity hooks answer from, as of now,
         // and which pages are a JIT's (writable and executable), so their
         // blocks carry a self-modifying-code guard. See `Block::guard`.
@@ -12568,15 +13067,35 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         }
         phase(11);
-    // The page table moves in and back out: cloning it (a BTreeMap of every
-    // page the process has numbered) on each miss, twice, was a second of a
-    // node start-up's 7,400 misses.
+        // The page table moves out and back: cloning it (a BTreeMap of every
+        // page the process has numbered) on each miss, twice, was a second of
+        // a node start-up's 7,400 misses. Out of `Host` and marked so, until
+        // `jit_in` puts it back.
+        let epoch = (
+            jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire),
+            jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        );
+        let go = MissPre::Go {
+            exec,
+            known: std::mem::take(&mut h.jit.translated),
+            table: std::mem::take(&mut h.jit.page_table),
+            intr: std::mem::take(&mut h.jit.intrinsics),
+            page,
+            started,
+            epoch,
+        };
+        jitout::OUT.store(jit_me(), std::sync::atomic::Ordering::Release);
+        go
+    });
+    let translated = match pre {
+        MissPre::Done(t) => t,
+        MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
     let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
-            std::mem::take(&mut h.jit.page_table),
+            table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
@@ -12585,10 +13104,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
             cfg!(feature = "shared-memory"),
-            &h.jit.intrinsics,
+            &intr,
         );
-        h.jit.translated = known;
-        h.jit.page_table = std::mem::take(&mut unit.page_table);
+        // The blocks are counted translated before the set goes back, so a
+        // sibling that takes it up first does not lift them again; taken out
+        // again below if the unit is dropped.
+        let fresh: Vec<u64> = unit
+            .exported_blocks
+            .iter()
+            .map(|(a, _)| *a)
+            .filter(|a| known.insert(*a))
+            .collect();
+        *jitout::BOX.0.borrow_mut() = Some((std::mem::take(&mut unit.page_table), known, intr));
+        jitout::OUT.store(jit_me() | jitout::DONE, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "shared-memory")]
+        // SAFETY: the address of a `static AtomicU32` in the shared memory.
+        unsafe {
+            warch::memory_atomic_notify(jitout::OUT.as_ptr() as *mut i32, u32::MAX);
+        }
+        with_jit(|h| {
         if pc == 0x10f6d24 {
             let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
@@ -12596,6 +13130,58 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
                 stats.blocks, ok, has_block, exec.len(),
             ));
+        }
+        // Code retired while this lifted: installed all the same, then those
+        // ranges retired again below (see `jitout::EPOCH`). The program
+        // replaced, or more retired than the log holds: the unit is dropped,
+        // and the branch misses again.
+        let retired_since: Option<Vec<(u64, u64)>> = {
+            let now = jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire);
+            let log = jitout::RETIRED.0.borrow();
+            let covered = now == epoch.0 || log.iter().any(|(e, _, _)| *e == epoch.0.wrapping_add(1));
+            covered.then(|| {
+                log.iter()
+                    .filter(|(e, _, _)| e.wrapping_sub(epoch.0).wrapping_sub(1) < u32::MAX / 2)
+                    .map(|&(_, s, e)| (s, e))
+                    .collect()
+            })
+        };
+        let execd = jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch.1;
+        if retired_since.is_none() || execd {
+            for a in &fresh {
+                h.jit.translated.remove(a);
+            }
+            // And the pages it numbered. The translator gives a page its base
+            // in the page table it was handed, which came back with the
+            // result; the directory entry is written only when the unit is
+            // installed. Kept numbered with the entry never written, the next
+            // lift there sees an old page, writes no entry for it either, and
+            // every block of it that runs into that page (an instruction
+            // across the boundary) fails its page check against the empty
+            // entry, asks to be translated again, and gets the same check: a
+            // miss loop for ever (Undertale, frozen at its first frame, when
+            // any retire dropped the unit). After an `execve` the table is
+            // the new program's, and nothing of this unit is in it.
+            if !execd {
+                for (p, b) in &unit.dir_entries {
+                    if h.jit.page_table.lookup(*p) == Some(*b) {
+                        h.jit.page_table.forget(*p);
+                    }
+                }
+            }
+            static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if tracing() || n <= 4 || n.is_power_of_two() {
+                warn_line(&format!(
+                    "[gex] miss at pc={pc:#x}: program replaced (or too much retired) during its translation, unit dropped ({n} so far)\n"
+                ));
+            }
+            set_resume(pc);
+            // `get`: an `execve` by a sibling leaves one thread.
+            if let Some(t) = h.threads.get(cur()) {
+                set_resume_ctx(t.kstate.ctx_addr);
+            }
+            return true;
         }
         if stats.blocks == 0 {
             return false;
@@ -12627,7 +13213,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // re-translation in every process that comes later. The growth is real
         // and worth fixing, but the fix is route-independent units -- one
         // publication that covers a page for everybody -- not a smaller cache.
-        let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.covered);
+        // Not into the store if code was retired while it lifted: it may hold
+        // the old bytes, and another process would be served them.
+        let stale = retired_since.as_ref().is_some_and(|r| !r.is_empty());
+        let mod_id = if stale { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
         if mod_id == 0 {
             h.jit.store_full += 1;
         } else {
@@ -12756,11 +13345,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 unit.dir_entries.len()
             ));
         }
+        if let Some(r) = retired_since.filter(|r| !r.is_empty()) {
+            static REPLAYED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if tracing() || n <= 4 || n.is_power_of_two() {
+                warn_line(&format!(
+                    "[gex] miss at pc={pc:#x}: {} range(s) retired during its translation, retired again after its install ({n} so far)\n",
+                    r.len()
+                ));
+            }
+            retire_ranges(h, &r);
+        }
         // Come back at the address that missed, now that it will resolve.
         set_resume(pc);
         set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         true
-    });
+        })
+        }
+    };
     if translated && in_place(_ctx, pc) {
         return gex_emit::module::DISPATCH_MISS_REDISPATCH;
     }
@@ -12901,6 +13503,27 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
 /// old slots are left behind, unreachable.
 pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
+    use std::sync::atomic::Ordering;
+    // Inside the kernel, so it waits for a translation holding the lock; and a
+    // translation that may have read the old code retires these ranges again
+    // once its unit is queued (`jitout::EPOCH`).
+    jit_in_held(h);
+    if !ranges.is_empty() {
+        let e = jitout::EPOCH.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let mut log = jitout::RETIRED.0.borrow_mut();
+        for &(start, end) in ranges {
+            log.push_back((e, start, end));
+        }
+        while log.len() > 256 {
+            log.pop_front();
+        }
+        drop(log);
+    }
+    retire_ranges(h, ranges);
+}
+
+/// `retire_code`'s work on the JIT state, without the bookkeeping.
+fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
     use std::sync::atomic::{AtomicU32, Ordering};
     for &(start, end) in ranges {
         if end <= start {
@@ -13031,7 +13654,7 @@ fn maybe_recompile_at(pc: u64) -> bool {
     // visible only under a flag nobody reaches for.
     if tracing() || unsafe { HEARTBEAT } != 0 {
         let ms = (now_ns() - began) / 1_000_000;
-        let (slots, mods, bytes) = with_host(|h| {
+        let (slots, mods, bytes) = with_jit(|h| {
             (
                 h.jit.page_table.slots(),
                 h.jit.pending.len(),
@@ -13077,7 +13700,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // other's slots; recompiling without asking translated it all again and
     // could reach V8's 10M-slot table ceiling. By whole pages, the identity
     // map's key; an object every page of which is answered is skipped.
-    let (adopted, pages) = with_host(|h| {
+    let (adopted, pages) = with_jit(|h| {
         let first = gex_abi::dispatch_page(map.start);
         let last = gex_abi::dispatch_page(map.end.saturating_sub(1));
         let pages = (last - first + 1) as usize;
@@ -13125,8 +13748,8 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         return 0;
     }
     let seeds = object_seeds(map);
-    let intrinsics = with_host(|h| h.jit.intrinsics.clone());
-    let (exec, page_table, known) = with_host(|h| {
+    let intrinsics = with_jit(|h| h.jit.intrinsics.clone());
+    let (exec, page_table, known) = with_jit(|h| {
         let exec: Vec<(u64, u64)> = h
             .kernel
             .mem
@@ -13155,7 +13778,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         &intrinsics,
     );
     let object_nanos = now_ns().saturating_sub(object_started);
-    let produced = with_host(|h| {
+    let produced = with_jit(|h| {
         h.jit.translated = known;
         if modules.iter().all(|m| m.exported_blocks.is_empty()) {
             return 0usize;
@@ -13164,6 +13787,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         // out of order hands two modules the same slots.
         for m in &modules {
             h.jit.page_table = m.page_table.clone();
+            regview::publish_marks(&h.jit.page_table);
             for b in &m.exported_blocks {
                 h.jit.translated.insert(b.0);
                 h.jit.provider.insert(b.0, m.module_id);
@@ -13332,7 +13956,7 @@ fn note_intrinsics(addr: u64) {
         return;
     };
     let (found, pending) = scan_intrinsics(&path, start);
-    let added = with_host(|h| {
+    let added = with_jit(|h| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
         *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
@@ -13787,7 +14411,7 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
 /// reachability-trimmed closure build.
 #[no_mangle]
 pub extern "C" fn gex_coverage_snapshot() -> u32 {
-    with_host(|h| {
+    with_jit(|h| {
         let mut v: Vec<u64> = h.jit.translated.iter().copied().collect();
         v.sort_unstable();
         h.jit.coverage_snap = v;
@@ -13842,7 +14466,7 @@ pub extern "C" fn gex_jit_slots() -> u32 {
 /// `gex_abi::dispatch_entry`.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
-    with_host(|h| {
+    with_jit(|h| {
         let page = gex_abi::dispatch_page(addr as u64);
         match h.jit.page_table.lookup(page) {
             Some(entry) => gex_abi::dispatch_entry(
@@ -13862,7 +14486,7 @@ pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
 /// pages the directory calls done, into fresh slots, then miss on the old ones.
 #[no_mangle]
 pub extern "C" fn gex_page_count() -> u32 {
-    with_host(|h| h.jit.page_table.entries().len() as u32)
+    with_jit(|h| h.jit.page_table.entries().len() as u32)
 }
 
 /// Write every page assignment to `out` as a `u64` page and a `u32` entry,
@@ -13872,7 +14496,7 @@ pub extern "C" fn gex_page_count() -> u32 {
 /// one per page: the table is a `BTreeMap` and a per-page export was quadratic.
 #[no_mangle]
 pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
-    with_host(|h| {
+    with_jit(|h| {
         let entries = h.jit.page_table.entries();
         if (entries.len() * 12) as u32 > cap {
             return -1;
@@ -13893,7 +14517,7 @@ pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
     phase(3);
-    with_host(|h| h.jit.page_table.assign(page as u64, entry));
+    with_jit(|h| h.jit.page_table.assign(page as u64, entry));
 }
 
 /// How many pages the identity map answers for.
@@ -14014,7 +14638,7 @@ pub extern "C" fn gex_slots_left_k() -> u32 {
 /// branch into one of these pages must keep reaching the miss stub.
 #[no_mangle]
 pub extern "C" fn gex_jit_installed() {
-    with_host(|h| {
+    with_jit(|h| {
         let Some(done) = h.jit.pending.pop_front() else {
             // Empty, but this Worker's published view may still name a module a
             // sibling already took: the queue is shared between a process's
@@ -14092,6 +14716,7 @@ pub extern "C" fn gex_jit_installed() {
             if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 h.jit.registry_sums.push(Vec::new());
+                regview::publish_module(h.jit.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some((off, key)));
                 h.jit.registry.push(Vec::new());
                 h.jit.registry_ext.push(Some((off, len, key)));
                 h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -14109,6 +14734,7 @@ pub extern "C" fn gex_jit_installed() {
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             h.jit.registry_sums.push(chunk_sums(&wasm));
+            regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
             h.jit.registry.push(wasm);
             h.jit.registry_ext.push(None);
             h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -14415,7 +15041,7 @@ fn content_key(bytes: &[u8]) -> u64 {
 /// writing.
 #[no_mangle]
 pub extern "C" fn gex_jit_keeps() -> u32 {
-    with_host(|h| h.jit.ever_threaded as u32)
+    regview::threaded() as u32
 }
 
 /// The module this Worker installs next is at `off` in the process's JS-side
@@ -14431,7 +15057,7 @@ pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo:
 /// bytes are in this module's memory (`gex_module_ptr`).
 #[no_mangle]
 pub extern "C" fn gex_module_ext(i: u32) -> u64 {
-    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _, _)| off + 1))
+    regview::row(i).map_or(0, |r| r.ext.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Registry module `i`'s content key, high half (`which` 0) or low (1), when
@@ -14439,8 +15065,9 @@ pub extern "C" fn gex_module_ext(i: u32) -> u64 {
 /// Worker catching up names the module without hashing its bytes.
 #[no_mangle]
 pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
-    with_host(|h| {
-        h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(_, _, k)| if which == 0 { (k >> 32) as u32 } else { k as u32 })
+    regview::row(i).map_or(0, |r| {
+        let k = r.key.load(std::sync::atomic::Ordering::Relaxed);
+        if which == 0 { (k >> 32) as u32 } else { k as u32 }
     })
 }
 
@@ -14454,19 +15081,23 @@ pub extern "C" fn gex_registry_mib(external: u32) -> u32 {
 /// How many translated modules this process has, for a Worker catching up.
 #[no_mangle]
 pub extern "C" fn gex_module_count() -> u32 {
-    with_host(|h| h.jit.registry.len() as u32)
+    regview::count()
 }
 
 /// Where module `i`'s bytes are: a pointer, not a copy, since the registry
 /// lives in the process memory a joining Worker already sees.
 #[no_mangle]
 pub extern "C" fn gex_module_ptr(i: u32) -> u32 {
-    with_host(|h| {
-        h.jit
-            .registry
-            .get(i as usize)
-            .map_or(0, |m| m.as_ptr() as u32)
-    })
+    regview::row(i).map_or(0, |r| r.ptr.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Where registry module `i`'s row is in this process's memory, or 0: four
+/// little-endian words -- pointer, length, store offset plus one (u64), key
+/// (u64) -- all a Worker catching up asks about a module, in one call and
+/// without the kernel's lock (`regview`).
+#[no_mangle]
+pub extern "C" fn gex_module_row(i: u32) -> u32 {
+    regview::row(i).map_or(0, |r| r as *const regview::Row as u32)
 }
 
 /// Every slot this process has claimed, across every module.
@@ -14476,16 +15107,163 @@ pub extern "C" fn gex_module_ptr(i: u32) -> u32 {
 /// thread replaying the whole registry.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots_total() -> u32 {
-    with_host(|h| h.jit.page_table.slots() as u32)
+    match regview::slots() {
+        Some(n) => n as u32,
+        None => with_jit(|h| {
+            regview::publish_marks(&h.jit.page_table);
+            h.jit.page_table.slots() as u32
+        }),
+    }
 }
 
 /// How long module `i` is.
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
-    with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
-        Some((_, len, _)) => len,
-        None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
-    })
+    regview::row(i).map_or(0, |r| r.len.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The translation registry and the dispatch tables' lengths as a reader
+/// holding no lock sees them (docs/kernel-locking.md, step 4).
+///
+/// JS asks about them all the time -- each table's need at every install,
+/// each module's pointer, length, place and key while a Worker catches up --
+/// and under the lock those questions were half of node -e 0's waiting. The
+/// writers, who hold the lock, publish here as they go:
+///
+/// - each registry module's row, written before the count that makes it
+///   visible is stored (release; readers acquire). Rows live in segments
+///   that are allocated once and never freed or moved, so a row's address
+///   stays good. The registry itself only grows; a new process (a forked
+///   child copies these statics with its memory) starts it over with
+///   `reset`.
+/// - the page table's counters: every clone of a page table shares them, so
+///   publishing is keeping the `Arc`s, done whenever `h.jit.page_table` is
+///   assigned. That changes them only when a process starts and at each
+///   `execve`; a replaced set is freed four replacements later, not at
+///   once, because a reader may still hold it.
+pub(crate) mod regview {
+    use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[repr(C)]
+    pub struct Row {
+        pub ptr: AtomicU32,
+        pub len: AtomicU32,
+        pub ext: AtomicU64,
+        pub key: AtomicU64,
+    }
+
+    const SEG: usize = 1024;
+    const SEGS: usize = 4096;
+    static SEGMENTS: [AtomicPtr<Row>; SEGS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; SEGS];
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn count() -> u32 {
+        COUNT.load(Ordering::Acquire)
+    }
+
+    pub fn row(i: u32) -> Option<&'static Row> {
+        if i >= count() {
+            return None;
+        }
+        let seg = SEGMENTS.get(i as usize / SEG)?.load(Ordering::Acquire);
+        // SAFETY: a segment, once published, is SEG rows that are never freed
+        // or moved, and row `i` was written before the count passed it.
+        (!seg.is_null()).then(|| unsafe { &*seg.add(i as usize % SEG) })
+    }
+
+    /// Row `i` (the registry's length before the push), under the kernel's
+    /// lock; visible to readers once written. `ext` is the JS-side store's
+    /// offset and the content key, for a module kept there.
+    pub fn publish_module(i: usize, ptr: u32, len: u32, ext: Option<(u64, u64)>) {
+        let Some(slot) = SEGMENTS.get(i / SEG) else { return };
+        let mut seg = slot.load(Ordering::Acquire);
+        if seg.is_null() {
+            let rows: Box<[Row]> = (0..SEG)
+                .map(|_| Row { ptr: AtomicU32::new(0), len: AtomicU32::new(0), ext: AtomicU64::new(0), key: AtomicU64::new(0) })
+                .collect();
+            seg = Box::leak(rows).as_mut_ptr();
+            slot.store(seg, Ordering::Release);
+        }
+        // SAFETY: as in `row`; only the lock holder writes.
+        let r = unsafe { &*seg.add(i % SEG) };
+        r.ptr.store(ptr, Ordering::Relaxed);
+        r.len.store(len, Ordering::Relaxed);
+        r.ext.store(ext.map_or(0, |(off, _)| off + 1), Ordering::Relaxed);
+        r.key.store(ext.map_or(0, |(_, k)| k), Ordering::Relaxed);
+        COUNT.store(i as u32 + 1, Ordering::Release);
+    }
+
+    /// A new, empty registry (a new process's host).
+    pub fn reset() {
+        COUNT.store(0, Ordering::Release);
+        THREADED.store(false, Ordering::Release);
+    }
+
+    /// `Jit::ever_threaded`: whether the registry keeps modules at all.
+    static THREADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_threaded(on: bool) {
+        THREADED.store(on, Ordering::Release);
+    }
+
+    pub fn threaded() -> bool {
+        THREADED.load(Ordering::Acquire)
+    }
+
+    struct Marks {
+        high: Arc<AtomicU64>,
+        next: Arc<AtomicU64>,
+        highs: Arc<Vec<AtomicU64>>,
+    }
+    static MARKS: AtomicPtr<Marks> = AtomicPtr::new(core::ptr::null_mut());
+    /// Replaced mark sets, freed RETIRED_KEEP replacements later.
+    const RETIRED_KEEP: usize = 4;
+    static RETIRED: [AtomicPtr<Marks>; RETIRED_KEEP] = [const { AtomicPtr::new(core::ptr::null_mut()) }; RETIRED_KEEP];
+    static RETIRED_N: AtomicU32 = AtomicU32::new(0);
+
+    /// Keep `t`'s counters for lock-free readers, unless they are the ones
+    /// already kept.
+    pub fn publish_marks(t: &gex_xlate::PageTable) {
+        let (high, next, highs) = t.marks();
+        let had = MARKS.load(Ordering::Acquire);
+        // SAFETY: a published `Marks` is never freed.
+        if !had.is_null() && unsafe { Arc::ptr_eq(&(*had).highs, &highs) && Arc::ptr_eq(&(*had).high, &high) } {
+            return;
+        }
+        MARKS.store(Box::leak(Box::new(Marks { high, next, highs })), Ordering::Release);
+        // The set replaced is kept for readers that may still hold it, and
+        // freed once RETIRED_KEEP later replacements have passed. Sets change
+        // only when a process starts and at each `execve`, which leaves the
+        // process one thread: a reader would have to sleep inside a getter
+        // through that many execs. So at most RETIRED_KEEP + 1 sets exist
+        // however long a process runs or however often it execs.
+        if !had.is_null() {
+            let n = RETIRED_N.fetch_add(1, Ordering::Relaxed) as usize;
+            let old = RETIRED[n % RETIRED_KEEP].swap(had, Ordering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: published by this function from a `Box`, unpublished
+                // RETIRED_KEEP replacements ago, and in no slot any more.
+                drop(unsafe { Box::from_raw(old) });
+            }
+        }
+    }
+
+    fn marks() -> Option<&'static Marks> {
+        let m = MARKS.load(Ordering::Acquire);
+        // SAFETY: as above.
+        (!m.is_null()).then(|| unsafe { &*m })
+    }
+
+    /// `PageTable::table_need`, read lock-free.
+    pub fn table_need(i: usize) -> Option<u64> {
+        marks().map(|m| m.highs.get(i).map_or(0, |h| h.load(Ordering::SeqCst)))
+    }
+
+    /// `PageTable::slots`, read lock-free.
+    pub fn slots() -> Option<u64> {
+        marks().map(|m| m.high.load(Ordering::SeqCst).max(m.next.load(Ordering::SeqCst)))
+    }
 }
 
 /// A direct-mapped table of back-edge counts, keyed by guest pc.
