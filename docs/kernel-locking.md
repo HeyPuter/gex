@@ -392,6 +392,19 @@ same box.
     signal runs the handler on it. It fails the same way on a tree without
     steps 3-5 (integ-1012b, 2026-10-12), so it predates them. Native tiers
     pass.
+  - **Known failure, native, not KLock's:** `gexc run --fjit` livelocks
+    ("retranslation livelock") once a page of a long direct-jump chain is
+    retired under it, as `tests/x86-programs/retire-during-lift` does
+    (2026-10-12). Pre-existing; it is why that test is not named `*smc*`
+    (run.sh would run it under `--fjit`). Tier-1 native and the page pass.
+  - **Step 5, the drop freeze** (5892193e): a unit dropped across a retire
+    left the pages it had numbered in the page table with no directory
+    entry, and a block running onto one of them failed its page check for
+    ever (Undertale frozen at its first frame). A dropped unit now forgets
+    those pages; `retire-during-lift` puts a block across every page
+    boundary and hung 2 of 2 on a build dropping on every retire without
+    the fix. Steps 6 and 7 must keep the rule: a page given a base is
+    either published or forgotten.
   - Registry reads touch neither fds nor mm, so step 4 needs neither first;
     step 5's write half publishes what steps 6 and 7 then stop guarding.
 
