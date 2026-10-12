@@ -339,7 +339,8 @@ same box.
 | 0 | Census: per `with_host` site, time held and time waited (`GEX_KLOCKDIAG=1`, a report every 10 s, as fbdiag does). Diagnostic, not landed. | none | where the remaining 4.5+1.3 ms/frame of Undertale and the network Workers' 0.1 s go |
 | 1 | `gex_kernel::sync` lock types (§4.0); the trap-out held-lock check (§4.1); the epoch array (§4.2). No behaviour change. | unit tests for the three lock flavours; a held-across-trap test that must fail without the check | none expected |
 | 2 | Split `Kernel` into `Process` and `ThreadCtx`; remove `enter_thread`. Mechanical, still under KLock. | all existing tests; the W3 page echo; the native thread suites | no change expected |
-| 3 | Targeted wakes (§3.3) and the idle loop (§3.7, its part): an idle Worker parks on its own wake slot or the futex it waits on, not the global `WAKE` word, and is woken only by what it waits for; `wasm32_wait`/`schedule`/`gex_park` take the lock once a pass, not seven times. Built on w/ut-page-tw2's targeted wake. | a test that a syscall in one process wakes no idle Worker in another; `check-futex-wake.mjs`; the W3 legs | Undertale takes and wait per frame per process; the wined3d thread's KLock in the GL ioctl |
+| 3 | The idle loop (§3.7, its part) and the cheap half of targeted wakes (§3.3), on w/ut-page-tw2's targeted wake. `wasm32_wait`/`schedule`/`gex_park` take the lock once a pass, not seven times. A safepoint takes it only on a hint of a signal (the global or this process's signal counter, an armed timer, a sweep every 64th), and asks about *its own* thread, which fixed `pthread_kill` to a spinning thread. A read or write wakes nobody unless its descriptor is a stream, and a read of a pipe with room wakes nobody. | `tests/browser-thread-signal.sh` (a64, x86); `check-futex-wake.mjs`; the browser pipe and fork legs; the W3 legs | Undertale takes and wait per frame per process |
+| 6b | Per-object wake slots (§3.3, the rest): a wait on one pipe or socket parks on that object's slot, bumped by its other end; multi-fd polls keep the global word. After step 6, whose per-object fd state makes the slot natural. | a test that a syscall in one process wakes no idle Worker in another | idle Workers' wakes per second in every Wine process |
 | 4 | Translation registry reads without KLock (§3.6, the read half): `gex_table_need` and the `gex_module_*` getters read published state, and JS asks once a batch, not once an index or field. | the fjit legs; units-only Undertale; node -e 0 | node -e 0 wait at those sites |
 | 5 | Translation outside KLock (§3.6, the write half): lock-free lookups, CAS publication, per-registry mutexes. | the fjit legs (W3 echo with fjit, Undertale with fjit); an SMC test with 2 threads; a Muck census | node -e 0 dispatch_miss held time; Unity HK/Muck presents/s |
 | 6 | Syscalls: the nothing-shared ones (§3.1, `clock_call` folded in), then the sharded `FutexTable` (§3.2), then the fd snapshot and fd mutex (§3.4). | a test that each nothing-shared call is answered while another Worker holds KLock; `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue; a close-while-reading test; pipe and socket stress in both hosts | Undertale syscall wait per frame; node -e 0 network Workers' KLock |
@@ -358,6 +359,18 @@ same box.
     per process, against about 520 real syscalls a frame in the game's
     process. Each syscall bumps the global wake word and wakes them all.
     Hence step 3 first.
+  - **Step 3, measured** (worldmachine, Undertale page on a master base
+    without function-tier units, so below the cap; 200 s, last 120 s):
+    the game's process went from 80.1k to 22.7k takes a second and from
+    827 to 288 ms a second waited (about 3,870 to 1,040 takes a frame);
+    idle Wine processes from 18-26k to 3.3-4.8k takes a second; 20.3-20.7
+    to 21.9 fps. Of the remaining global wakes all came from the game's
+    process, about 700 a second, most of them reads and writes on the
+    wineserver's pipes; the read filter takes the reads out. Each wake left
+    costs an idle Worker one take of its own process's lock, so the
+    per-object slots that would end them save idle CPU rather than the
+    game's lock wait, and wait for step 6 (6b). To be rerun on units-ut3
+    once the units are re-keyed.
   - **node -e 0** (edger, warm run, 14 processes; 1.71 M takes, 10.5 s
     waited, 11.8 s held): registry reads from JS (`gex_table_need`, 498k
     takes, and `gex_module_*`, 357k) waited 7.2 s; `gex_dispatch_miss`
