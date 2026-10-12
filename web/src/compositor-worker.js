@@ -36,6 +36,7 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  waitPublish,
 } from '@gex/wl-bridge.mjs';
 
 // -- decoration metrics -----------------------------------------------------
@@ -1320,8 +1321,12 @@ let comp = null;
 let canvas = null;
 let running = false;
 
+// Whether a publish was drawn since the last animation frame (`onPublishes`).
+let drawnSincePaint = false;
+
 function loop() {
   if (!comp || !running) return;
+  drawnSincePaint = false;
   try {
     // A guest paces itself against frames *displayed*, not produced: its
     // `eglSwapBuffers` waits for this count to move. On the page that was the
@@ -1336,6 +1341,31 @@ function loop() {
     return;
   }
   requestAnimationFrame(loop);
+}
+
+/**
+ * Draw when a guest publishes, not at the next animation frame: a frame drawn
+ * now reaches the screen a frame tick sooner than one drawn at the next tick
+ * (publish to draw was 3-15 ms of a click's 55-70 ms on mspaint, worldmachine).
+ * At most once between animation frames, so a guest publishing on every
+ * scheduler turn still costs one extra draw a frame at most; the rest waits
+ * for `loop`, which draws whatever is newest.
+ */
+async function onPublishes(channel) {
+  let seen;
+  for (;;) {
+    seen = await waitPublish(channel, seen);
+    if (seen === null || !running) return;
+    if (!comp || drawnSincePaint) continue;
+    drawnSincePaint = true;
+    try {
+      comp.frame();
+    } catch (e) {
+      post({ kind: 'error', error: e?.stack || String(e) });
+      running = false;
+      return;
+    }
+  }
 }
 
 // -- the guest's OpenGL, in this worker -------------------------------------
@@ -1494,6 +1524,7 @@ const onMessage = ({ data: m }) => {
         comp.setDirect(m.direct);
         running = true;
         requestAnimationFrame(loop);
+        if (m.drawOnPublish !== false && !globalThis.GEX_NO_PUBDRAW) onPublishes(m.channel);
         post({ kind: 'ready' });
       }).catch((e) => post({ kind: 'error', error: e?.stack || String(e) }));
     } else if (m.kind === 'gl') {

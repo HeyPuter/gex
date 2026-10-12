@@ -89,6 +89,9 @@ export const EV_MOVED = 10;
 // meta: what the compositor decided, read by every process.
 const M_OUT_W = 0;
 const M_OUT_H = 1;
+/** Bumped and notified by every publish, so a compositor can draw on the
+ * publish instead of at its next animation frame (`waitPublish`). */
+const M_PUB = 2;
 const M_WORDS = 8;
 
 // Block header: the token that claimed it, a heartbeat so a dead process's
@@ -129,6 +132,20 @@ export function setOutputSize(channel, w, h) {
   const a = new Int32Array(channel.arena);
   Atomics.store(a, M_OUT_W, w | 0);
   Atomics.store(a, M_OUT_H, h | 0);
+}
+
+/**
+ * Resolves when any process publishes after `seen` (the value of a previous
+ * call, or undefined for "from now"), with the new value; null where there is
+ * no `Atomics.waitAsync` (the caller keeps its frame clock alone).
+ */
+export async function waitPublish(channel, seen) {
+  if (typeof Atomics.waitAsync !== 'function' || !(channel.arena instanceof SharedArrayBuffer)) return null;
+  const a = new Int32Array(channel.arena);
+  const v = seen ?? Atomics.load(a, M_PUB);
+  const r = Atomics.waitAsync(a, M_PUB, v);
+  if (r.async) await r.value;
+  return Atomics.load(a, M_PUB);
 }
 
 export function outputSize(channel) {
@@ -394,6 +411,8 @@ export class WlProxy {
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);
     console.timeStamp(`gex:publish ${n} b${this.#block}`);
+    Atomics.add(this.#a, M_PUB, 1);
+    Atomics.notify(this.#a, M_PUB);
     this.#wake?.();
   }
 
