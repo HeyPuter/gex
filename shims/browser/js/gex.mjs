@@ -4109,6 +4109,7 @@ export class Gex {
       }
     }
     i32[(a + 116) >> 2] = tid;
+    i32[(a + 120) >> 2] = pid;
     let r;
     try {
       // This Worker's instance, started under the lock: its start runs on
@@ -4737,6 +4738,16 @@ export class Gex {
         if (next !== 0n) {
           pc = faulted ?? next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
+          // A resume of this Worker's own thread after it exited: a Wine
+          // thread's pthread_exit under its start routine's call-out leaves
+          // the context's pc (the call-out's return pad) as the resume, and
+          // entering it ran into the pad's breakpoint (the process died with
+          // 133: winedevice, services). The thread is over: so is this Worker,
+          // as for a thread that exits outside a call-out.
+          if (!faulted && (nextCtx === 0 || nextCtx === ctx) && e.gex_ctx_exited?.(ctx) > 0) {
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] run loop: ctx ${ctx.toString(16)} exited; its resume at ${BigInt.asUintN(64, next).toString(16)} dropped`);
+            return e.gex_exit_code();
+          }
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
         }
@@ -5477,7 +5488,7 @@ export class Gex {
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
-          if (hit >= 0) return hit === me ? 1 : 0;
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return hit === me ? 1 : 0; }
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {
@@ -5515,22 +5526,32 @@ export class Gex {
             throw err;
           }
           const hit = e.gex_callout_hit();
-          if (hit >= 0) return ended(hit === me ? 1 : 0);
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === me ? 1 : 0); }
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) return 0;
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
             err.gexHandoff = true;
             throw err;
           }
+          // This thread ended (pthread_exit inside a call-out: a Wine
+          // thread's exit_thread under its start routine's call-out). The
+          // scheduler's resume names another thread's context, and leaving
+          // as "a resume on another thread's context" returned 0 to the
+          // native caller, which ran the guest on at the call-out's stale
+          // return pad (a breakpoint: the process died with 133).
+          if (e.gex_ctx_exited?.(ctx) > 0) {
+            err.gexHandoff = true;
+            throw err;
+          }
           // Control left an exception dispatched nested further out: this
           // call-out's caller leaves, and the dispatch's loop sees the escape
           // at the next check (nt.rs `exc_escape`).
-          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) return 0;
+          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: exception escaped`); return 0; }
           // The NtCallbackReturn of a callback further out (the function
           // this call-out ran was the callback's dispatcher): its loop's, so
           // up through every frame between, as natively.
@@ -5563,12 +5584,14 @@ export class Gex {
           const rc = e.gex_resume_ctx() >>> 0;
           if (rc && rc !== ctx) {
             // A resume on another thread's context is not this call-out's.
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
           const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
           if (sp > c.spWant + c.unwound) {
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
           }
