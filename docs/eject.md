@@ -497,9 +497,19 @@ node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
   feature off ships (Mesa for `gl`), checks the bundler really left out
   what `compositor` off names, and writes `build/web/` (`page/`,
   `rootfs.tar`, `units/`, `w3.json`: the launch).
-- **The site** (`web/eject-site.mjs`) is the page, the bundle, the units
-  with a preload list, the launcher (which starts nt.html as recorded) and
-  `sw.js`.
+- **The site** (`web/eject-site.mjs`) is the page as plain files, the
+  bundle and the units as `FILE.zst` with a preload list, `pack.json` (their
+  sizes and the build id), the launcher (which starts nt.html as recorded)
+  and the hosting files (`serve.mjs`, `_headers`). There is **no service
+  worker**: the host sends the isolation headers (COOP `same-origin`, COEP
+  `require-corp`), and nt.html (`pack=`) fetches each packed file and
+  decodes it itself, straight into the one buffer that is then moved to
+  pid 1's Worker, which lets go of it once the kernel has the files (moved
+  on to a closed `MessagePort`: `ArrayBuffer.prototype.transfer(0)` alone
+  leaves a buffer that arrived by `postMessage` resident until the Worker
+  collects). The first load is the only one, and one copy of the bundle is
+  resident: the kernel's. The browser's HTTP cache does the caching
+  (`FILE.zst?v=BUILD`).
 
 Everything else is the page as gex runs it: several processes, the
 kernel, run-time translation behind the units.

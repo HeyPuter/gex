@@ -13,7 +13,9 @@
 //   2. served (cross-origin isolated) and opened at its launcher, a toplevel
 //      titled RE (default "Untitled - Paint") appears;
 //   3. with "compositor" off, what draws it is the page's bare desktop
-//      (`describe().compositor === 'none'`), and the window has pixels.
+//      (`describe().compositor === 'none'`), and the window has pixels;
+//   4. no service worker: the site ships no sw.js, none is registered, and
+//      the first load is the only one (the launcher once, nt.html once).
 // Prints PASS or FAIL lines; exits 0 only when all pass.
 
 import { spawn } from 'node:child_process';
@@ -45,6 +47,7 @@ if (off.includes('compositor')) {
   const left = assets.filter((n) => /^(compositor|compositor-worker|gpu-device)-/.test(n));
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
 }
+check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
 if (off.includes('gl')) {
   const left = gexDir.filter((n) => n.startsWith('gex-wgpu-replay'));
   check(left.length === 0, `"gl" off: no Mesa in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
@@ -87,6 +90,10 @@ const { targetId } = await browser.send('Target.createTarget', { url: 'about:bla
 const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
 await browser.send('Runtime.enable', {}, page);
 const ev = async (e) => (await browser.send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }, page).catch(() => ({})))?.result?.value;
+// Every load of the top frame: the launcher, then nt.html, and nothing again.
+const loads = [];
+await browser.send('Page.enable', {}, page);
+browser.on('Page.frameNavigated', (p) => { if (!p.frame.parentId) loads.push(new URL(p.frame.url).pathname); });
 const t0 = Date.now();
 await browser.send('Page.navigate', { url: `http://127.0.0.1:${port}/` }, page);
 let d = null;
@@ -109,6 +116,12 @@ if (off.includes('compositor')) {
   const comp = await ev("performance.getEntriesByType('resource').some((r) => /\\/(compositor|compositor-worker|gpu-device)-[^/]*\\.js$/.test(r.name))");
   check(!comp, 'the page loaded no compositor script');
 }
+// 4. No service worker, and no second load.
+const regs = await ev('navigator.serviceWorker.getRegistrations().then((r) => r.length)');
+check(regs === 0, `no service worker registered (${regs})`);
+const launcher = loads.filter((u) => u === '/' || u.endsWith('/index.html')).length;
+const ntLoads = loads.filter((u) => u.endsWith('/nt.html')).length;
+check(launcher === 1 && ntLoads === 1, `one load, no reload (top-frame loads: ${loads.join(' ')})`);
 await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);

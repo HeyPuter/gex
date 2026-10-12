@@ -179,43 +179,7 @@ copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
 cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
 
-// Headers: isolation everywhere; packed files and hashed assets cached for
-// good (their URLs carry the build); the rest revalidated.
-writeFileSync(join(out, '_headers'), `/*
-  Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Embedder-Policy: require-corp
-  Cross-Origin-Resource-Policy: same-origin
-  Cache-Control: no-cache
-/*.zst
-  Cache-Control: public, max-age=31536000, immutable
-/assets/*
-  Cache-Control: public, max-age=31536000, immutable
-`);
-writeFileSync(join(out, 'serve.mjs'), `#!/usr/bin/env node
-// A static server for this site with the headers it wants (_headers). node serve.mjs [port]
-import { createServer } from 'node:http';
-import { createReadStream, statSync } from 'node:fs';
-import { dirname, extname, join, normalize } from 'node:path';
-import { fileURLToPath } from 'node:url';
-const here = dirname(fileURLToPath(import.meta.url));
-const port = Number(process.argv[2] ?? 8000);
-const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.css': 'text/css', '.png': 'image/png' };
-createServer((req, res) => {
-  const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
-  if (path.includes('..')) { res.writeHead(403).end(); return; }
-  const file = join(here, path.endsWith('/') ? path + 'index.html' : path);
-  let st; try { st = statSync(file); } catch { st = null; }
-  if (!st?.isFile()) { res.writeHead(404).end(); return; }
-  const immutable = path.endsWith('.zst') || path.startsWith('/assets/');
-  res.writeHead(200, {
-    'Content-Type': types[extname(file)] ?? 'application/octet-stream', 'Content-Length': st.size,
-    'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin',
-    'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
-  });
-  if (req.method === 'HEAD') { res.end(); return; }
-  createReadStream(file).pipe(res);
-}).listen(port, () => console.log(\`http://localhost:\${port}/\`));
-`);
+writeHosting();
 
 const total = Object.values(files).reduce((a, f) => a + f.size, 0);
 const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
@@ -246,10 +210,51 @@ Content-Encoding. nginx:
     types { application/javascript mjs js; application/wasm wasm; application/json json; text/html html; }
   }
 `);
+/** _headers and serve.mjs: the headers the site wants from its host. */
+function writeHosting() {
+  // Headers: isolation everywhere; packed files and hashed assets cached for
+  // good (their URLs carry the build); the rest revalidated.
+  writeFileSync(join(out, '_headers'), `/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin
+  Cache-Control: no-cache
+/*.zst
+  Cache-Control: public, max-age=31536000, immutable
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+`);
+  writeFileSync(join(out, 'serve.mjs'), `#!/usr/bin/env node
+// A static server for this site with the headers it wants (_headers). node serve.mjs [port]
+import { createServer } from 'node:http';
+import { createReadStream, statSync } from 'node:fs';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const here = dirname(fileURLToPath(import.meta.url));
+const port = Number(process.argv[2] ?? 8000);
+const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.wasm': 'application/wasm', '.css': 'text/css', '.png': 'image/png' };
+createServer((req, res) => {
+  const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
+  if (path.includes('..')) { res.writeHead(403).end(); return; }
+  const file = join(here, path.endsWith('/') ? path + 'index.html' : path);
+  let st; try { st = statSync(file); } catch { st = null; }
+  if (!st?.isFile()) { res.writeHead(404).end(); return; }
+  const immutable = path.endsWith('.zst') || path.startsWith('/assets/');
+  res.writeHead(200, {
+    'Content-Type': types[extname(file)] ?? 'application/octet-stream', 'Content-Length': st.size,
+    'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin',
+    'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+  });
+  if (req.method === 'HEAD') { res.end(); return; }
+  createReadStream(file).pipe(res);
+}).listen(port, () => console.log(\`http://localhost:\${port}/\`));
+`);
+}
 function mb(n) { return (n / 1048576).toFixed(1); }
 
 /** The site of a W3 page's project: its page (built with the project's
- *  features), bundle and units, the launcher and the service worker. */
+ *  features, as plain files), its bundle and units (packed, decoded by the
+ *  page), the launcher and the hosting files. No service worker. */
 function w3Site() {
   const web = join(project, 'build/web');
   const work = `${out.replace(/\/+$/, '')}.work`;
@@ -263,7 +268,14 @@ function w3Site() {
     if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
     return dst;
   };
-  walk(join(web, 'page'), (p, rel) => place(stripped(p), rel));
+  // The page as plain files: nothing between it and the server decodes, so
+  // only what the page itself fetches and decodes (the bundle, the units:
+  // nt-page.js `pack=`) is packed. A host's own compression still applies.
+  walk(join(web, 'page'), (p, rel) => {
+    const dst = join(out, rel);
+    mkdirSync(dirname(dst), { recursive: true });
+    copyFileSync(stripped(p), dst);
+  });
   // The bundle.
   let tar = join(web, 'rootfs.tar');
   if (strip || flag('--prune') || flag('--dedupe')) {
@@ -303,14 +315,15 @@ function w3Site() {
   preload.sort((a, b) => b[2] - a[2]);
   writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
   writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
-  // The launcher, the service worker and its decoder.
+  // The launcher and the page's decoder. No service worker: the host sends
+  // the isolation headers (COOP/COEP), and the page decodes what is packed.
   const smallHash = createHash('sha256');
   walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
   const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
   writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
-  copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
   cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
   writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
+  writeHosting();
   rmSync(work, { recursive: true, force: true });
   const total = Object.values(files).reduce((a, f) => a + f.size, 0);
   const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);

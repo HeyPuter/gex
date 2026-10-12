@@ -689,8 +689,20 @@ async function handle(msg) {
         msg.elf = null;
         // A bundle the page moved here rather than shared: freed now, not
         // whenever this Worker's isolate next collects (one that runs a guest
-        // in wasm may not for the whole session).
-        for (const b of msg.transfer ?? []) b?.transfer?.(0);
+        // in wasm may not for the whole session). Not with
+        // `ArrayBuffer.prototype.transfer(0)`: that detaches V8's view, but
+        // the browser's own handle on a buffer that arrived by postMessage
+        // keeps the bytes until that collection (Chromium: 400 MiB stayed
+        // resident either way). Moved again, into a port already closed, the
+        // message is dropped and the bytes with it.
+        const gone = (msg.transfer ?? []).filter((b) => b instanceof ArrayBuffer && !b.detached);
+        if (gone.length && typeof MessageChannel === 'function') {
+          const ch = new MessageChannel();
+          ch.port2.close();
+          ch.port1.postMessage(null, gone);
+          ch.port1.close();
+        }
+        for (const b of gone) if (!b.detached) b.transfer?.(0);
         msg.transfer = null;
         port.post({ kind: 'files-loaded' });
       }
