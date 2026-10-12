@@ -618,7 +618,10 @@ impl MemoryMap {
             code,
             origin,
         });
-        self.vmas.sort_by_key(|v| v.start);
+        // Sorted already but for the one just pushed: move it into place.
+        let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
+        let v = self.vmas.pop().expect("just pushed");
+        self.vmas.insert(at, v);
         self.merge_adjacent();
     }
 
@@ -631,21 +634,29 @@ impl MemoryMap {
     fn merge_adjacent(&mut self) {
         let mut i = 0;
         while i + 1 < self.vmas.len() {
-            let (a, b) = (&self.vmas[i], &self.vmas[i + 1]);
-            if a.end == b.start
-                && a.prot == b.prot
-                && a.name == b.name
-                && a.code.is_none()
-                && b.code.is_none()
-                && a.origin.is_none()
-                && b.origin.is_none()
-            {
-                self.vmas[i].end = self.vmas[i + 1].end;
-                self.vmas.remove(i + 1);
-            } else {
+            if !self.merge_at(i) {
                 i += 1;
             }
         }
+    }
+
+    /// Fold mapping `i + 1` into mapping `i` if they qualify
+    /// ([`Self::merge_adjacent`]). Returns whether it did.
+    fn merge_at(&mut self, i: usize) -> bool {
+        let (Some(a), Some(b)) = (self.vmas.get(i), self.vmas.get(i + 1)) else { return false };
+        if a.end == b.start
+            && a.prot == b.prot
+            && a.name == b.name
+            && a.code.is_none()
+            && b.code.is_none()
+            && a.origin.is_none()
+            && b.origin.is_none()
+        {
+            self.vmas[i].end = self.vmas[i + 1].end;
+            self.vmas.remove(i + 1);
+            return true;
+        }
+        false
     }
 
     /// `brk(0)` reports the break; `brk(addr)` moves it and returns the new
@@ -799,25 +810,10 @@ impl MemoryMap {
         // address in use stays low: a `munmap` hole is reused before the arena
         // -- and the memory behind it -- gets bigger.
         if self.take.is_some() {
-            let chunks = self.arena.clone();
-            for (lo, hi) in chunks {
-                let mut candidate = page_align_up(lo);
-                while candidate + len <= hi {
-                    if self.is_free(candidate, candidate + len) {
-                        self.insert_from(candidate, candidate + len, prot, name, origin);
-                        return Ok(candidate);
-                    }
-                    match self
-                        .vmas
-                        .iter()
-                        .filter(|v| v.start < candidate + len && v.end > candidate)
-                        .map(|v| v.end)
-                        .max()
-                    {
-                        Some(end) => candidate = page_align_up(end),
-                        None => break,
-                    }
-                }
+            let found = self.arena.iter().find_map(|&(lo, hi)| self.first_fit(lo, hi, len));
+            if let Some(candidate) = found {
+                self.insert_from(candidate, candidate + len, prot, name, origin);
+                return Ok(candidate);
             }
             let start = self.extend_arena(len)?;
             self.insert_from(start, start + len, prot, name, origin);
@@ -911,7 +907,38 @@ impl MemoryMap {
     }
 
     fn is_free(&self, start: u64, end: u64) -> bool {
+        // `vmas` is sorted and non-overlapping, so the ends are sorted too:
+        // the first mapping ending above `start` is the only one to check.
+        let i = self.vmas.partition_point(|v| v.end <= start);
+        self.vmas.get(i).is_none_or(|v| v.start >= end)
+    }
+
+    #[cfg(test)]
+    fn is_free_slow(&self, start: u64, end: u64) -> bool {
         !self.vmas.iter().any(|v| v.start < end && v.end > start)
+    }
+
+    /// The lowest page-aligned `len`-byte hole in `[lo, hi)`, first fit, in
+    /// one pass over the sorted mappings from `lo` (the bottom-up search used
+    /// to filter every mapping for each candidate: quadratic in the number of
+    /// mappings, which a Wine process has thousands of, under the kernel
+    /// lock, on every anonymous `mmap`).
+    fn first_fit(&self, lo: u64, hi: u64, len: u64) -> Option<u64> {
+        let mut candidate = page_align_up(lo);
+        let mut i = self.vmas.partition_point(|v| v.end <= candidate);
+        loop {
+            let end = candidate.checked_add(len)?;
+            if end > hi {
+                return None;
+            }
+            match self.vmas.get(i) {
+                Some(v) if v.start < end => {
+                    candidate = candidate.max(page_align_up(v.end));
+                    i += 1;
+                }
+                _ => return Some(candidate),
+            }
+        }
     }
 
     /// Remove `[addr, addr+len)` from the map, splitting mappings as needed.
@@ -1093,6 +1120,48 @@ mod tests {
         assert_eq!(kept.len(), 4);
         for k in kept {
             assert_eq!(k % HEAP, 0);
+        }
+    }
+
+    /// Bottom-up placement is first fit: with thousands of mappings and holes
+    /// of every size, each `mmap` lands in the lowest hole that holds it (the
+    /// one-pass search must agree with checking every page).
+    #[test]
+    fn bottom_up_placement_is_the_lowest_hole_that_fits() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x2000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x2000_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        // 3000 one-to-four-page mappings with alternating names (so they do
+        // not merge), then every third one freed: holes of 1-4 pages.
+        let mut at = Vec::new();
+        for i in 0..3000u64 {
+            let len = PAGE_SIZE * (1 + i % 4);
+            let a = m.mmap(0, len, prot::READ, 0, if i % 2 == 0 { "a" } else { "b" }).unwrap() as u64;
+            at.push((a, len));
+        }
+        for (i, &(a, len)) in at.iter().enumerate() {
+            if i % 3 == 1 {
+                m.unmap(a, len).unwrap();
+            }
+        }
+        let lowest = |m: &MemoryMap, len: u64| {
+            let mut a = page_align_up(m.arena[0].0);
+            while !m.is_free_slow(a, a + len) {
+                a += PAGE_SIZE;
+            }
+            a
+        };
+        for len in [PAGE_SIZE, 2 * PAGE_SIZE, 3 * PAGE_SIZE, 4 * PAGE_SIZE, 9 * PAGE_SIZE, PAGE_SIZE] {
+            let want = lowest(&m, len);
+            let got = m.mmap(0, len, prot::READ, 0, "c").unwrap() as u64;
+            assert_eq!(got, want, "a {len:#x}-byte mapping");
         }
     }
 
