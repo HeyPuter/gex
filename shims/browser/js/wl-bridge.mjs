@@ -241,6 +241,8 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
+  // A mark for traces (`console.timeStamp` costs nothing unless tracing).
+  console.timeStamp(`gex:ev ${kind} b${block}`);
   // And a wake, as another guest's syscall would give: with every thread of
   // the process parked, nothing drains the ring until a park's bound (20 ms)
   // runs out. The Worker that wakes takes a scheduler turn, whose compositor
@@ -391,6 +393,7 @@ export class WlProxy {
     Atomics.store(this.#a, this.#base + B_COUNT, n);
     Atomics.store(this.#a, this.#base + B_HEARTBEAT, Date.now());
     Atomics.add(this.#a, this.#base + B_GEN, 1);
+    console.timeStamp(`gex:publish ${n} b${this.#block}`);
     this.#wake?.();
   }
 
@@ -416,6 +419,7 @@ export class WlProxy {
       count++;
     }
     Atomics.store(a, base + K_TAIL, tail);
+    if (count) console.timeStamp(`gex:poll ${count} b${this.#block}`);
     return count;
   }
 

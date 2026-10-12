@@ -992,6 +992,8 @@ class Compositor {
       return;
     }
     this.#lastSig = sig;
+    // Marks for traces (`console.timeStamp` costs nothing unless tracing).
+    console.timeStamp('gex:draw');
     // Nothing to draw into: see `Painter.begin`. The arena is still acked
     // below on the next frame that works, so a restored context catches up.
     if (this.#painter.begin(this.#outW, this.#outH) === false) {
@@ -1036,6 +1038,7 @@ class Compositor {
       this.#painter.textured(this.#pointer.x, this.#pointer.y, c.w, c.h, c.tex);
     }
     this.#painter.end();
+    console.timeStamp('gex:drawn');
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     this.#frames++;
     if (this.#stats) {
