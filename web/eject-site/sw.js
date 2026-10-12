@@ -52,23 +52,42 @@ function isolate(response) {
 
 const TYPES = { wasm: 'application/wasm', js: 'text/javascript', mjs: 'text/javascript', json: 'application/json', tar: 'application/x-tar', html: 'text/html' };
 
-/** FILE's bytes as a cached Response: from the cache, or FILE.zst decoded. */
-async function packed(path, entry, build, onBytes = null) {
+/** FILE's bytes as a Response: from the cache, or FILE.zst decoded as it
+ *  streams (and stored in the cache as it goes). With `serve` false (the
+ *  launcher's prefetch), only stored: null once it is in the cache.
+ *
+ *  Never held whole here. A decoded copy kept by this worker (as a
+ *  Response's body, a buffer one was made from, or a clone nobody read)
+ *  stays resident in the page's renderer for the page's whole life, beside
+ *  the page's own copy: 459 MiB for the mspaint bundle. */
+async function packed(path, entry, build, onBytes = null, serve = true) {
   const cache = await caches.open(cacheName(build));
   const key = `${scope}${path}?v=${build}`;
+  const fromCache = async () => {
+    const hit = await cache.match(key);
+    if (!hit) throw new Error(`${path}: not in the cache after it was stored`);
+    return serve ? hit : null;
+  };
   const hit = await cache.match(key);
   if (hit) {
     onBytes?.(entry.zsize);
-    return hit;
+    return serve ? hit : null;
   }
-  if (inflight.has(key)) return (await inflight.get(key)).clone();
-  const p = (async () => {
+  if (inflight.has(key)) {
+    await inflight.get(key);
+    return fromCache();
+  }
+  let stored;
+  const job = new Promise((r) => { stored = r; });
+  // Waiters only need it settled; they read the cache (and fail there).
+  inflight.set(key, job);
+  let teed = false;
+  try {
     const res = await fetch(`${scope}${path}.zst?v=${build}`);
     if (!res.ok) throw new Error(`${path}.zst: ${res.status}`);
-    // Decoded as it streams, a network chunk at a time: the decoder's wasm
-    // memory is module-wide and never shrinks, so a one-shot decode of the
-    // mspaint bundle (459 MiB from 40 MiB) left a 498 MiB heap resident for
-    // the service worker's life, beside the page's own copy of the bundle.
+    // The compressed file is read whole first (40 MiB for mspaint's 459):
+    // the decoder's wasm memory is module-wide and never shrinks, so it is
+    // fed a network chunk at a time rather than given one buffer.
     const parts = [];
     let at = 0;
     const reader = res.body.getReader();
@@ -81,47 +100,82 @@ async function packed(path, entry, build, onBytes = null) {
     }
     if (at !== entry.zsize) throw new Error(`${path}.zst: ${at} of ${entry.zsize} bytes`);
     const d = await decoder();
-    let out = new Uint8Array(entry.size);
+    const gen = d.decodeStreaming(parts);
+    const CHUNK = 4 << 20;
     let n = 0;
-    try {
-      for (const part of d.decodeStreaming(parts)) {
-        if (n + part.length > out.length) throw new Error('longer than packed');
-        out.set(part, n);
-        n += part.length;
+    let oneShot = null;
+    const pull = (c) => {
+      if (oneShot) {
+        const end = Math.min(oneShot.length, n + CHUNK);
+        if (end > n) c.enqueue(oneShot.slice(n, end));
+        n = end;
+      } else {
+        // Coalesced a few MiB at a time: the decoder gives 128 KiB.
+        const got = [];
+        let len = 0;
+        while (len < CHUNK) {
+          const r = gen.next();
+          if (r.done) break;
+          got.push(r.value);
+          len += r.value.length;
+        }
+        if (len) {
+          if (n + len > entry.size) throw new Error('longer than packed');
+          let buf = got[0];
+          if (got.length > 1) {
+            buf = new Uint8Array(len);
+            let o = 0;
+            for (const g of got) { buf.set(g, o); o += g.length; }
+          }
+          c.enqueue(buf);
+          n += len;
+          return;
+        }
       }
-    } catch (e) {
-      // The one-shot path, as before, if the stream would not finish.
-      console.warn(`[sw] ${path}: streaming decode failed (${e?.message ?? e}); decoding at once`);
-      const z = new Uint8Array(entry.zsize);
-      let o = 0;
-      for (const p of parts) { z.set(p, o); o += p.length; }
-      out = d.decode(z, entry.size);
-      n = out.length;
-    }
-    if (n !== entry.size) throw new Error(`${path}: decoded ${n} of ${entry.size} bytes`);
+      if (n === entry.size) {
+        parts.length = 0;
+        oneShot = null;
+        c.close();
+      } else if (!oneShot) {
+        throw new Error(`decoded ${n} of ${entry.size} bytes`);
+      }
+    };
+    const body = new ReadableStream({
+      pull(c) {
+        try {
+          pull(c);
+        } catch (e) {
+          if (oneShot) { c.error(e); return; }
+          // The one-shot path, as before, if the stream would not finish:
+          // the rest from a whole decode.
+          console.warn(`[sw] ${path}: streaming decode failed (${e?.message ?? e}); decoding at once`);
+          const z = new Uint8Array(entry.zsize);
+          let o = 0;
+          for (const q of parts) { z.set(q, o); o += q.length; }
+          const whole = d.decode(z, entry.size);
+          if (whole.length !== entry.size) { c.error(new Error(`${path}: decoded ${whole.length} of ${entry.size} bytes`)); return; }
+          oneShot = whole;
+          try { pull(c); } catch (e2) { c.error(e2); }
+        }
+      },
+    }, { highWaterMark: 0 });
     const ext = path.split('.').pop();
     const headers = { 'Content-Type': TYPES[ext] ?? 'application/octet-stream', 'Content-Length': String(entry.size) };
-    try {
-      await cache.put(key, new Response(out, { headers }));
-    } catch (e) {
-      console.warn(`[sw] ${path}: not cached (${e?.message ?? e})`);
-      return new Response(out, { headers });
+    if (!serve) {
+      await cache.put(key, new Response(body, { headers }));
+      return null;
     }
-    // Served from the cache from now on, and the decoded bytes let go of
-    // at once: held until this worker next collects, which an idle service
-    // worker may not do for the page's whole life, they stayed resident
-    // beside the page's own copy (459 MiB for the mspaint bundle).
-    out.buffer.transfer?.(0);
-    out = null;
-    const hit = await cache.match(key);
-    if (!hit) throw new Error(`${path}: gone from the cache just after it was put there`);
-    return hit;
-  })();
-  inflight.set(key, p);
-  try {
-    return (await p).clone();
+    // Teed: what one side has not read yet is all that is held.
+    const [toCache, toPage] = body.tee();
+    teed = true;
+    cache.put(key, new Response(toCache, { headers }))
+      .catch((e) => console.warn(`[sw] ${path}: not cached (${e?.message ?? e})`))
+      .finally(() => stored());
+    return new Response(toPage, { headers });
   } finally {
-    inflight.delete(key);
+    // Without a tee in flight, settled now (stored or failed).
+    if (!teed) stored();
+    job.then(() => { if (inflight.get(key) === job) inflight.delete(key); });
   }
 }
 
@@ -170,7 +224,7 @@ self.addEventListener('message', (event) => {
     const worker = async () => {
       while (i < list.length) {
         const [path, entry] = list[i++];
-        await packed(path, entry, p.build, tick);
+        await packed(path, entry, p.build, tick, false);
       }
     };
     await Promise.all([worker(), worker(), worker(), worker()]);
