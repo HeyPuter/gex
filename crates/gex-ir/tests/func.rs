@@ -617,3 +617,55 @@ fn x87_arithmetic_and_compares_round_trip_and_run() {
     assert_eq!(o.regs[reg_index(x(1))], 0x3fff);
     assert_eq!(o.regs[reg_index(x(2))], 0);
 }
+
+/// Entry `x1 = 1`, interior entry `x1 = 2`, both into `x2 = x1 + 1`, then a
+/// block that reads x2 back and returns. The join's only dominator is the
+/// virtual root above the two entries.
+fn two_entries_join() -> Function {
+    let mut t = F::new(0x1000);
+    let b0 = t.block(0x1000);
+    let b1 = t.block(0x1010);
+    let b2 = t.block(0x1020);
+    let b3 = t.block(0x1030);
+    t.f.entries = vec![0x1010];
+    let one = t.def(b0, Expr::ConstI64(1));
+    t.write(b0, x(1), one);
+    t.term(b0, FTerm::Jump(Edge::to(b2)));
+    let two = t.def(b1, Expr::ConstI64(2));
+    t.write(b1, x(1), two);
+    t.term(b1, FTerm::Jump(Edge::to(b2)));
+    let v = t.read(b2, x(1));
+    let k = t.def(b2, Expr::ConstI64(1));
+    let w = t.def(b2, Expr::Bin { op: BinOp::Add, ty: Ty::I64, a: v, b: k });
+    t.write(b2, x(2), w);
+    t.term(b2, FTerm::Jump(Edge::to(b3)));
+    let r = t.read(b3, x(2));
+    t.write(b3, x(0), r);
+    let lr = t.read(b3, x(30));
+    t.term(b3, FTerm::Return { target: lr });
+    t.f
+}
+
+#[test]
+fn a_join_of_two_entries_is_renamed_too() {
+    let f = two_entries_join();
+    f.verify().unwrap();
+    let s = to_ssa(&f, &|_| CallEffect::UNKNOWN);
+    s.verify().unwrap_or_else(|e| panic!("{e}\n{}", text::print(&s)));
+    roundtrip(&s);
+    // x1 is a parameter of the join, and x2 is forwarded from its write:
+    // neither is read from the context after the entries.
+    let join = s.block_at(0x1020).unwrap();
+    let regs: Vec<GuestReg> = s.block(join).params.iter().map(|p| p.reg).collect();
+    assert!(regs.contains(&x(1)), "{}", text::print(&s));
+    let reads: Vec<GuestReg> = [0x1020, 0x1030]
+        .iter()
+        .flat_map(|&a| s.block(s.block_at(a).unwrap()).stmts.iter())
+        .filter_map(|st| match st {
+            Stmt::Def { expr: Expr::ReadReg(r), .. } => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert!(!reads.contains(&x(1)) && !reads.contains(&x(2)), "{reads:?}\n{}", text::print(&s));
+    same_run(&f, &s, &|_| CallEffect::UNKNOWN, GuestReg::Sp);
+}
