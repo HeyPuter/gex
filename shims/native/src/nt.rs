@@ -552,6 +552,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         if !retired.is_empty() {
             retire_translations(caller, &retired)?;
         }
+        recheck_units(caller);
     }
     // An image just mapped that has a hot set gets its function-tier unit.
     super::nt_cgen::drain_in_caller(caller)?;

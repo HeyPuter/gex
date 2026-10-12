@@ -12603,6 +12603,12 @@ fn retire_unmapped_code() {
             crate::fjit::on_retire(&retired);
             retire_code(h, &retired);
         }
+        // Made executable again: the units' pages are compared, nothing is
+        // forgotten (`Kernel::recheck_code`).
+        let recheck = std::mem::take(&mut h.kernel.recheck_code);
+        if !recheck.is_empty() {
+            crate::cgen::on_retire(&recheck, &[]);
+        }
     });
 }
 
