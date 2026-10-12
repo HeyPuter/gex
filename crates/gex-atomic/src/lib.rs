@@ -46,6 +46,16 @@ pub fn store_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<()> {
     Some(())
 }
 
+/// An atomic exchange: the old value.
+pub fn swap_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<u32> {
+    Some(word(bytes, off)?.swap(v, Ordering::SeqCst))
+}
+
+/// An atomic add: the old value.
+pub fn add_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<u32> {
+    Some(word(bytes, off)?.fetch_add(v, Ordering::SeqCst))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

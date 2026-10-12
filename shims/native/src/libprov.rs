@@ -439,6 +439,13 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
         crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
     })?;
+    // Door calls into the wineserver (docs/wineserver-kernel.md, `door`).
+    linker.func_wrap(IMPORT_MODULE, "door_publish", |mut caller: Caller<'_, HostState>, area: i32| -> wasmtime::Result<()> {
+        crate::host(crate::door::publish(&mut caller, area as u32))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "door_call", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::call(&mut caller, req as u32, pid, tid))
+    })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
     // does (`wasmdll`). The image is named by the descriptor it was mapped
