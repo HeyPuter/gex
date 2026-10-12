@@ -2560,7 +2560,10 @@ impl Kernel {
     /// `EAGAIN` on a stream descriptor that should block (see the call in
     /// `syscall`): the same [`BlockOp`] `blocking_op` would have chosen, on
     /// the first non-empty vector of a vectored call.
-    fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+    fn eagain_park(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        if n == nr::FUTEX {
+            return self.lock_pi_op(m, a);
+        }
         let file = self.fds.get(a[0] as i32).ok()?;
         let (buf, len) = match n {
             nr::READ | nr::WRITE => (a[1], a[2]),
@@ -2587,6 +2590,34 @@ impl Kernel {
             nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None }),
             _ => None,
         }
+    }
+
+    /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
+    /// set the waiters bit and answered `EAGAIN`).
+    fn lock_pi_op(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
+        let operation = (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+        if operation != futex::op::LOCK_PI && operation != futex::op::LOCK_PI2 {
+            return None;
+        }
+        // An absolute time: CLOCK_REALTIME for LOCK_PI, the
+        // monotonic clock for LOCK_PI2 (unless FUTEX_CLOCK_REALTIME).
+        let deadline = if a[3] == 0 {
+            None
+        } else {
+            let secs = m.read_u64(a[3]).ok()?;
+            let nanos = m.read_u64(a[3] + 8).ok()?;
+            let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+            let monotonic = operation == futex::op::LOCK_PI2 && (a[1] as u32) & futex::op::CLOCK_REALTIME == 0;
+            let now = if monotonic { self.clock_nanos(1) } else { self.now_nanos() };
+            let left = want.saturating_sub(now).min(3600 * 1_000_000_000);
+            Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
+        };
+        Some(BlockOp::FutexLockPi {
+            table: Arc::clone(&self.futexes),
+            uaddr: a[0],
+            tid: self.tid as u32,
+            deadline,
+        })
     }
 
     /// A `readv`'s vectors when there is more than one with room in it,
@@ -2881,31 +2912,8 @@ impl Kernel {
             nr::FUTEX => {
                 let operation =
                     (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
-                if operation == futex::op::LOCK_PI || operation == futex::op::LOCK_PI2 {
-                    let mapped = self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end);
-                    if !mapped || a[0] % 4 != 0 {
-                        return None;
-                    }
-                    // An absolute time: CLOCK_REALTIME for LOCK_PI, the
-                    // monotonic clock for LOCK_PI2 (unless FUTEX_CLOCK_REALTIME).
-                    let deadline = if a[3] == 0 {
-                        None
-                    } else {
-                        let secs = m.read_u64(a[3]).ok()?;
-                        let nanos = m.read_u64(a[3] + 8).ok()?;
-                        let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-                        let monotonic = operation == futex::op::LOCK_PI2 && (a[1] as u32) & futex::op::CLOCK_REALTIME == 0;
-                        let now = if monotonic { self.clock_nanos(1) } else { self.now_nanos() };
-                        let left = want.saturating_sub(now).min(3600 * 1_000_000_000);
-                        Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
-                    };
-                    return Some(BlockOp::FutexLockPi {
-                        table: Arc::clone(&self.futexes),
-                        uaddr: a[0],
-                        tid: self.tid as u32,
-                        deadline,
-                    });
-                }
+                // A priority-inheritance lock is tried first (`sys_futex`),
+                // which parks only a call that found it held (`lock_pi_op`).
                 if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
                     return None;
                 }
@@ -3525,21 +3533,61 @@ impl Kernel {
                 Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
             }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
-            // LOCK_PI reaches here only when `blocking_op` refused it: a
-            // word the process does not have, or misaligned.
+            // Take the lock if it is free. Held, the waiters bit goes on
+            // *before* the caller parks (`EAGAIN`, which `lock_pi_op` turns
+            // into the park), as Linux sets it in the kernel: the owner's
+            // unlock then comes here and wakes, where without the bit it
+            // released the lock in user space and the waiter slept on.
             futex::op::LOCK_PI | futex::op::LOCK_PI2 => {
-                Err(if uaddr % 4 != 0 { Errno::EINVAL } else { Errno::EFAULT })
+                if uaddr % 4 != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if !self.mem.vmas().iter().any(|v| uaddr >= v.start && uaddr + 4 <= v.end) {
+                    return Err(Errno::EFAULT);
+                }
+                let tid = self.tid as u32;
+                loop {
+                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                    match v & futex::pi::TID_MASK {
+                        0 => {
+                            if gex_atomic::cas_u32(m.bytes, uaddr, v, tid | (v & futex::pi::WAITERS))
+                                .ok_or(Errno::EFAULT)?
+                                .is_ok()
+                            {
+                                return Ok(0);
+                            }
+                        }
+                        owner if owner == tid => return Err(Errno::EDEADLK),
+                        _ => {
+                            if v & futex::pi::WAITERS != 0
+                                || gex_atomic::cas_u32(m.bytes, uaddr, v, v | futex::pi::WAITERS)
+                                    .ok_or(Errno::EFAULT)?
+                                    .is_ok()
+                            {
+                                // Counted until its wait ends (the host's
+                                // `pi_done`).
+                                self.futexes.pi_wait(uaddr);
+                                return Err(Errno::EAGAIN);
+                            }
+                        }
+                    }
+                }
             }
             // Release a PI lock this thread owns, and wake one waiter, which
-            // takes it in its own `FUTEX_LOCK_PI` loop.
+            // takes it in its own `FUTEX_LOCK_PI` loop. The waiters bit stays
+            // while anyone waits (`pi_waiters`): a waiter that has set it may
+            // not be parked yet, and a thread taking the lock in user space
+            // meanwhile (from a bare 0) would release it there too, waking
+            // nobody.
             futex::op::UNLOCK_PI => {
                 let tid = self.tid as u32;
+                let rest = if self.futexes.pi_waiters(uaddr) { futex::pi::WAITERS } else { 0 };
                 loop {
                     let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
                     if v & futex::pi::TID_MASK != tid {
                         return Err(Errno::EPERM);
                     }
-                    if gex_atomic::cas_u32(m.bytes, uaddr, v, 0).ok_or(Errno::EFAULT)?.is_ok() {
+                    if gex_atomic::cas_u32(m.bytes, uaddr, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
                         break;
                     }
                 }
@@ -8337,21 +8385,21 @@ mod tests {
             mem[iov + 16 * i..iov + 16 * i + 8].copy_from_slice(&b.to_le_bytes());
             mem[iov + 16 * i + 8..iov + 16 * i + 16].copy_from_slice(&l.to_le_bytes());
         }
-        let park = |k: &Kernel, mem: &mut Vec<u8>, n, a| k.eagain_park(&GuestMem::new(mem), n, a);
-        match park(&k, &mut mem, nr::READ, [rfd, 0x4000, 7, 0, 0, 0]) {
+        let park = |k: &mut Kernel, mem: &mut Vec<u8>, n, a| k.eagain_park(&GuestMem::new(mem), n, a);
+        match park(&mut k, &mut mem, nr::READ, [rfd, 0x4000, 7, 0, 0, 0]) {
             Some(BlockOp::ReadStream { buf: 0x4000, len: 7, .. }) => {}
             other => panic!("read: {other:?}"),
         }
-        match park(&k, &mut mem, nr::WRITE, [wfd, 0x4000, 9, 0, 0, 0]) {
+        match park(&mut k, &mut mem, nr::WRITE, [wfd, 0x4000, 9, 0, 0, 0]) {
             Some(BlockOp::WriteStream { buf: 0x4000, len: 9, .. }) => {}
             other => panic!("write: {other:?}"),
         }
-        match park(&k, &mut mem, nr::WRITEV, [wfd, iov as u64, 2, 0, 0, 0]) {
+        match park(&mut k, &mut mem, nr::WRITEV, [wfd, iov as u64, 2, 0, 0, 0]) {
             Some(BlockOp::WriteStream { buf: 0x3100, len: 100, .. }) => {}
             other => panic!("writev: {other:?}"),
         }
-        assert!(park(&k, &mut mem, nr::READ, [nbr, 0x4000, 7, 0, 0, 0]).is_none(), "O_NONBLOCK keeps its EAGAIN");
-        assert!(park(&k, &mut mem, nr::WRITE, [rfd, 0x4000, 7, 0, 0, 0]).is_none(), "not a write end");
+        assert!(park(&mut k, &mut mem, nr::READ, [nbr, 0x4000, 7, 0, 0, 0]).is_none(), "O_NONBLOCK keeps its EAGAIN");
+        assert!(park(&mut k, &mut mem, nr::WRITE, [rfd, 0x4000, 7, 0, 0, 0]).is_none(), "not a write end");
     }
 
     #[test]

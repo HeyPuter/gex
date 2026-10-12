@@ -96,11 +96,37 @@ pub struct FutexTable {
     /// Bounded: the browser drains it after each syscall; a native run, which
     /// blocks in [`Self::wait`] and never drains, must not grow it without end.
     woken: Mutex<VecDeque<u64>>,
+    /// How many callers wait for each priority-inheritance lock: a
+    /// `FUTEX_LOCK_PI` that found it held counts until its wait ends, so an
+    /// unlock with nobody left clears the waiters bit, as Linux does (a
+    /// trylock in user space takes only a bare 0).
+    pi: Mutex<HashMap<u64, u32>>,
 }
 
 impl FutexTable {
     pub fn new() -> FutexTable {
         FutexTable::default()
+    }
+
+    /// A caller starts waiting for the PI lock at `addr` ([`Self::pi`]).
+    pub fn pi_wait(&self, addr: u64) {
+        *self.pi.lock().unwrap_or_else(|e| e.into_inner()).entry(addr).or_insert(0) += 1;
+    }
+
+    /// Its wait for the PI lock at `addr` is over, however it ended.
+    pub fn pi_done(&self, addr: u64) {
+        let mut pi = self.pi.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = pi.get_mut(&addr) {
+            *n -= 1;
+            if *n == 0 {
+                pi.remove(&addr);
+            }
+        }
+    }
+
+    /// Whether anyone waits for the PI lock at `addr`.
+    pub fn pi_waiters(&self, addr: u64) -> bool {
+        self.pi.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&addr)
     }
 
     fn queue(&self, addr: u64) -> Arc<Queue> {

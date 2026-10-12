@@ -10944,6 +10944,11 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
         }
         return Done::At(ctx_addr, pc);
     };
+    // A priority-inheritance lock's wait is over, however it ends: no
+    // longer counted as waiting (`sys_futex`).
+    if let gex_kernel::BlockOp::FutexLockPi { table, uaddr, .. } = &op {
+        table.pi_done(*uaddr);
+    }
     let res = finish_parked(&op, timed_out, by_signal, &mut gm);
     // The syscall again, from its instruction (the registers are as the
     // guest made the call): a priority-inheritance lock still held, a

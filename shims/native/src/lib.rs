@@ -1650,6 +1650,15 @@ fn perform_block(
             }
         }
         BlockOp::FutexLockPi { table, uaddr, tid, deadline } => {
+            // Counted as waiting since `sys_futex` parked it: no longer, however
+            // this ends.
+            struct Done<'a>(&'a gex_kernel::futex::FutexTable, u64);
+            impl Drop for Done<'_> {
+                fn drop(&mut self) {
+                    self.0.pi_done(self.1);
+                }
+            }
+            let _done = Done(&table, uaddr);
             use gex_kernel::futex::pi;
             let start = std::time::Instant::now();
             loop {
