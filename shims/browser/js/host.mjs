@@ -482,6 +482,7 @@ export class ProcessHost {
         // The wineserver's door (docs/wineserver-kernel.md): every Worker of
         // the session, now and later, gets the server's memory and module.
         this.#door = m.door;
+        console.error(`[host] wineserver pid ${m.door?.pid} published its door`);
         for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
         break;
       }

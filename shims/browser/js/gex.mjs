@@ -4095,13 +4095,20 @@ export class Gex {
     if (replyOff + 64 + replyMax > bufSize) { st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
+    let waitedMs = 0;
     for (let spins = 0; ; spins++) {
       const v = Atomics.compareExchange(i32, L, 0, 1);
       if (v === 0) break;
       if (spins < 200) continue;
       if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
       Atomics.wait(i32, L, 2, 1);
+      // A lock held this long is a stuck door (a Worker ended inside one,
+      // or a deadlock): say who holds it, every 5 s of waiting.
+      if (++waitedMs % 5000 === 0) {
+        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
+      }
     }
+    i32[(a + 116) >> 2] = tid;
     let r;
     try {
       // This Worker's instance, started under the lock: its start runs on
