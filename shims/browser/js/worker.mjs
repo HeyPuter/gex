@@ -66,7 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { Gex, Env, utf8, narrate } from './gex.mjs';
+import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
@@ -315,7 +315,7 @@ async function handle(msg) {
       );
     }
     now() {
-      return BigInt(Date.now()) * 1000000n;
+      return hostNowNs();
     }
     async readStdin() {
       if (stdinEof) return false;
