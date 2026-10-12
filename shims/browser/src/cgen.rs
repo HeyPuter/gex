@@ -745,7 +745,7 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
 pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
-    crate::with_host(|h| {
+    crate::with_jit(|h| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         let mut new_pages = Vec::new();
         for &a in addrs {
@@ -1132,7 +1132,7 @@ pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
 }
 
 pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
-    crate::with_host(|h| {
+    crate::with_jit(|h| {
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (page, base) in dirs {
             if h.jit.page_table.lookup(page) == Some(base) {

@@ -2953,6 +2953,10 @@ fn set_host(host: Host) {
     // A new process: its registry starts empty, whatever a fork copied.
     regview::reset();
     regview::publish_marks(&host.jit.page_table);
+    // A fork copies the parent's memory, translation in flight or not; the
+    // child's JIT state is the `host` given here.
+    jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
+    *jitout::BOX.0.borrow_mut() = None;
     HOST.with(|h| *h.borrow_mut() = Some(host));
 }
 
@@ -2960,6 +2964,10 @@ fn set_host(host: Host) {
 fn set_host(host: Host) {
     regview::reset();
     regview::publish_marks(&host.jit.page_table);
+    // A fork copies the parent's memory, translation in flight or not; the
+    // child's JIT state is the `host` given here.
+    jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
+    *jitout::BOX.0.borrow_mut() = None;
     // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
@@ -3579,6 +3587,135 @@ impl Drop for KLock {
         // SAFETY: as above.
         unsafe {
             warch::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, 1);
+        }
+    }
+}
+
+/// The JIT's own state while a translation runs outside `KLock`
+/// (docs/kernel-locking.md, step 5).
+///
+/// A dispatch miss lifts with the kernel lock let go: the translator takes the
+/// page table, the translated set and the intrinsics out of `Host::jit`, marks
+/// them out here, gives the lock back, translates, and leaves what it produced
+/// in `BOX` with `DONE` set. Whoever next wants the JIT state under the lock
+/// (`jit_in`) puts it back, the translator itself included. Nothing else in the
+/// kernel waits for a translation any more: a sibling's syscall, futex or
+/// schedule pass goes ahead while it lifts.
+mod jitout {
+    use std::sync::atomic::AtomicU32;
+    /// 0 when the JIT state is in `Host::jit`; otherwise the translating
+    /// Worker's id plus one, with `DONE` once its result is in `BOX`.
+    pub(crate) static OUT: AtomicU32 = AtomicU32::new(0);
+    pub(crate) const DONE: u32 = 1 << 31;
+    /// Bumped by whatever may make a translation in flight wrong: code retired
+    /// (`retire_code`) or the program replaced (`do_exec`). A translator that
+    /// sees it moved drops its unit and misses again.
+    pub(crate) static EPOCH: AtomicU32 = AtomicU32::new(0);
+    pub(crate) type Parts = (
+        gex_xlate::PageTable,
+        std::collections::HashSet<u64>,
+        std::collections::HashMap<u64, gex_xlate::Intrinsic>,
+    );
+    /// The translator's result, written before `DONE` (release) and taken
+    /// after seeing it (acquire), so never touched by two Workers at once.
+    pub(crate) static BOX: super::SingleThreaded<Option<Parts>> =
+        super::SingleThreaded(std::cell::RefCell::new(None));
+}
+
+/// This Worker as `jitout::OUT` names it.
+fn jit_me() -> u32 {
+    #[cfg(feature = "shared-memory")]
+    { worker_id() + 1 }
+    #[cfg(not(feature = "shared-memory"))]
+    { 1 }
+}
+
+/// Put the JIT state back into `h` if a translation has finished with it.
+/// False while another Worker is still translating with it out.
+fn jit_in(h: &mut Host) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let s = jitout::OUT.load(Acquire);
+    if s == 0 {
+        return true;
+    }
+    if s & jitout::DONE == 0 {
+        if s == jit_me() {
+            // This Worker is the translator, between taking the state out and
+            // putting its result in the box: nothing runs there that asks.
+            panic!("gex: the JIT state was asked for in the middle of this Worker's own translation");
+        }
+        return false;
+    }
+    let Some((table, known, intr)) = jitout::BOX.0.borrow_mut().take() else {
+        panic!("gex: a translation said it was done and left nothing");
+    };
+    h.jit.page_table = table;
+    h.jit.translated = known;
+    h.jit.intrinsics = intr;
+    regview::publish_marks(&h.jit.page_table);
+    jitout::OUT.store(0, Release);
+    #[cfg(feature = "shared-memory")]
+    // SAFETY: the address of a `static AtomicU32` in the shared memory.
+    unsafe {
+        warch::memory_atomic_notify(jitout::OUT.as_ptr() as *mut i32, u32::MAX);
+    }
+    true
+}
+
+/// `jit_in`, for a caller already inside the kernel: it cannot give the lock
+/// back, so it waits holding it. The translator needs nothing under the lock to
+/// finish, so this ends.
+fn jit_in_held(h: &mut Host) {
+    while !jit_in(h) {
+        #[cfg(feature = "shared-memory")]
+        jit_wait();
+        #[cfg(not(feature = "shared-memory"))]
+        panic!("gex: the JIT state is out with no other Worker to bring it back");
+    }
+}
+
+/// Wait (briefly) for `jitout::OUT` to move while a translation is under way.
+#[cfg(feature = "shared-memory")]
+fn jit_wait() {
+    let s = jitout::OUT.load(std::sync::atomic::Ordering::Acquire);
+    if s != 0 && s & jitout::DONE == 0 {
+        // SAFETY: as `jit_in`.
+        unsafe {
+            warch::memory_atomic_wait32(jitout::OUT.as_ptr() as *mut i32, s as i32, 1_000_000);
+        }
+    }
+}
+
+/// `with_host` for anything that reads or changes the JIT's page table,
+/// translated set or intrinsics: they may be out with a translator
+/// (`jitout`). From outside the kernel this waits for it with the lock
+/// given back; from inside (a nested call) it waits holding the lock.
+#[track_caller]
+fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    #[cfg(not(feature = "shared-memory"))]
+    {
+        with_host(|h| {
+            jit_in_held(h);
+            f(h)
+        })
+    }
+    #[cfg(feature = "shared-memory")]
+    {
+        let nested = DEPTH.with(|d| d.get()) > 0;
+        let mut f = Some(f);
+        loop {
+            let r = with_host(|h| {
+                if nested {
+                    jit_in_held(h);
+                } else if !jit_in(h) {
+                    return None;
+                }
+                Some((f.take().expect("with_jit runs its closure once"))(h))
+            });
+            if let Some(r) = r {
+                return r;
+            }
+            jit_wait();
         }
     }
 }
@@ -4533,7 +4670,7 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
     // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
     // by `gex_add_closure_module` as libraries stream in, and this runs on every
     // Worker's miss path -- see the note there.
-    with_host(|h| closure_owner_held(h, page))
+    with_jit(|h| closure_owner_held(h, page))
 }
 
 /// Which closure object owns an image page, for a caller that ALREADY holds
@@ -5014,7 +5151,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
     };
     // Kept because `execve` republishes: the modules are still in this
     // instance's tables, so the new program gets every library the old one had.
-    with_host(|h| {
+    with_jit(|h| {
         // Not the image's pages unless this process runs *this* image's
         // program (every closure root is an image at `PIE_BASE`, so the
         // question is which, not whether).
@@ -5110,7 +5247,7 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     // by streaming closures (`gex_add_closure_module`) while this runs on every
     // Worker's fill path. The owner lookup inside is the *held* form: KLOCK is
     // not re-entrant, and calling `gex_closure_owner` here panicked the process.
-    with_host(|h| {
+    with_jit(|h| {
         // An image page belongs to whichever root of the closure this process is
         // actually running, so it is looked up by module and not by page alone.
         if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
@@ -5230,7 +5367,7 @@ pub extern "C" fn gex_claim_page(page: u64) -> u32 {
             dir_note(page, entry, "claim-page");
             // Under KLOCK: `page_table` and `CLOSURE_DIRS` are process state two
             // Workers must not push to at once (the second race the audit found).
-            with_host(|h| {
+            with_jit(|h| {
                 h.jit.page_table.assign(page, entry);
                 CLOSURE_DIRS.0.borrow_mut().push((page, entry));
             });
@@ -5301,7 +5438,7 @@ pub extern "C" fn gex_table_need(i: u32) -> u32 {
     // table (`regview`). JS asks this once per table per install.
     match regview::table_need(i as usize) {
         Some(n) => n as u32,
-        None => with_host(|h| {
+        None => with_jit(|h| {
             regview::publish_marks(&h.jit.page_table);
             h.jit.page_table.table_need(i as usize) as u32
         }),
@@ -5323,7 +5460,7 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
     // path has somewhere to ask from here on.
     FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     let idx = LAZY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    with_host(|h| {
+    with_jit(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let mut owner = LAZY_OWNER.0.borrow_mut();
         for (page, base) in &meta.dir_entries {
@@ -7541,6 +7678,9 @@ fn wasm32_wait(pc: u64) -> i32 {
 
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
+    // Not with a sibling mid-translation: the child is a copy of this memory,
+    // and a translator outside the lock is changing the heap.
+    jit_in_held(h);
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
     h.threads[cur()].pc = pc + gex_abi::SYSCALL_INST_BYTES;
@@ -8537,6 +8677,9 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// is what makes fork-then-exec work. Returns the entry point, or zero if the
 /// program could not be loaded (the caller already has an errno).
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    // A sibling's translation in flight is of the program this replaces.
+    jit_in_held(h);
+    jitout::EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
     // and the moment it execs every one describes a program that is gone.
@@ -11446,7 +11589,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             c.set((start, addr as u64));
             same
         });
-        let again = with_host(|h| {
+        let again = with_jit(|h| {
             let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
                 h.jit.translated.remove(&start);
@@ -11476,7 +11619,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // The bridge left for this very address having run nothing: tier-1
         // takes the slot over, and the function JIT serves it no more.
         fjit::tier1_only(addr as u64);
-        with_host(|h| {
+        with_jit(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
         return;
@@ -11493,7 +11636,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 _pc as u64, addr as u64
             ));
         }
-        with_host(|h| {
+        with_jit(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
         return;
@@ -11511,7 +11654,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
-        with_host(|h| {
+        with_jit(|h| {
             if h.jit.page_table.forget(page).is_none() {
                 return;
             }
@@ -11818,7 +11961,7 @@ fn miss_count(k: usize) {
 }
 
 fn remiss(pc: u64) {
-    let said = with_host(|h| {
+    let said = with_jit(|h| {
         if !h.jit.translated.contains(&pc) {
             return None;
         }
@@ -12015,7 +12158,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             MISSES
         };
         if n.is_multiple_of(200) {
-            let (blocks, ms, intr) = with_host(|h| {
+            let (blocks, ms, intr) = with_jit(|h| {
                 (h.jit.blocks, h.jit.nanos / 1_000_000, h.jit.intrinsics.len())
             });
             trace_line(&format!(
@@ -12310,9 +12453,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
-    let translated = with_host(|h| {
+    // Three parts: what to translate, under the lock; the translation, with
+    // the lock given back and the JIT state out (`jitout`); and its install,
+    // under the lock again. A sibling's syscalls no longer wait for a lift.
+    enum MissPre {
+        Done(bool),
+        Go {
+            exec: Vec<(u64, u64)>,
+            known: std::collections::HashSet<u64>,
+            table: gex_xlate::PageTable,
+            intr: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
+            page: u64,
+            started: u64,
+            epoch: u32,
+        },
+    }
+    let pre = with_jit(|h| {
         if !h.jit.described {
-            return false;
+            return MissPre::Done(false);
         }
         let exec: Vec<(u64, u64)> = h
             .kernel
@@ -12323,7 +12481,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .map(|v| (v.start, v.end))
             .collect();
         if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
-            return false;
+            return MissPre::Done(false);
         }
         // Nothing can be lifted at a misaligned pc (the emitter asserts a
         // block's base is instruction-aligned, and a panic there takes the
@@ -12333,7 +12491,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // up on it (see `ftab::rebridge_gives_up`).
         if pc % gex_abi::INST_ALIGN != 0 {
             crate::warn_line(&format!("gex: pid {} jumped to a misaligned pc {pc:#x}; not translating it\n", h.kernel.pid));
-            return false;
+            return MissPre::Done(false);
         }
         // Before anything is translated: if this page's code has been
         // translated already, by another process or by this one before an
@@ -12615,7 +12773,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     if covers {
                         set_resume(pc);
                         set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                        return true;
+                        return MissPre::Done(true);
                     }
                     // Otherwise fall through and lift the block in this same
                     // turn. What was served is queued either way, and the
@@ -12649,7 +12807,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         let started = now_ns();
-        let known = std::mem::take(&mut h.jit.translated);
         // x86-64: what the page table's identity hooks answer from, as of now,
         // and which pages are a JIT's (writable and executable), so their
         // blocks carry a self-modifying-code guard. See `Block::guard`.
@@ -12669,15 +12826,32 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         }
         phase(11);
-    // The page table moves in and back out: cloning it (a BTreeMap of every
-    // page the process has numbered) on each miss, twice, was a second of a
-    // node start-up's 7,400 misses.
+        // The page table moves out and back: cloning it (a BTreeMap of every
+        // page the process has numbered) on each miss, twice, was a second of
+        // a node start-up's 7,400 misses. Out of `Host` and marked so, until
+        // `jit_in` puts it back.
+        let epoch = jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let go = MissPre::Go {
+            exec,
+            known: std::mem::take(&mut h.jit.translated),
+            table: std::mem::take(&mut h.jit.page_table),
+            intr: std::mem::take(&mut h.jit.intrinsics),
+            page,
+            started,
+            epoch,
+        };
+        jitout::OUT.store(jit_me(), std::sync::atomic::Ordering::Release);
+        go
+    });
+    let translated = match pre {
+        MissPre::Done(t) => t,
+        MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
     let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
-            std::mem::take(&mut h.jit.page_table),
+            table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
@@ -12686,11 +12860,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
             cfg!(feature = "shared-memory"),
-            &h.jit.intrinsics,
+            &intr,
         );
-        h.jit.translated = known;
-        h.jit.page_table = std::mem::take(&mut unit.page_table);
-        regview::publish_marks(&h.jit.page_table);
+        // The blocks are counted translated before the set goes back, so a
+        // sibling that takes it up first does not lift them again; taken out
+        // again below if the unit is dropped.
+        let fresh: Vec<u64> = unit
+            .exported_blocks
+            .iter()
+            .map(|(a, _)| *a)
+            .filter(|a| known.insert(*a))
+            .collect();
+        *jitout::BOX.0.borrow_mut() = Some((std::mem::take(&mut unit.page_table), known, intr));
+        jitout::OUT.store(jit_me() | jitout::DONE, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "shared-memory")]
+        // SAFETY: the address of a `static AtomicU32` in the shared memory.
+        unsafe {
+            warch::memory_atomic_notify(jitout::OUT.as_ptr() as *mut i32, u32::MAX);
+        }
+        with_jit(|h| {
         if pc == 0x10f6d24 {
             let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
@@ -12698,6 +12886,22 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
                 stats.blocks, ok, has_block, exec.len(),
             ));
+        }
+        // Code was retired or the program replaced while this lifted: the unit
+        // may be of bytes that are gone. Dropped, and the branch misses again.
+        if jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            for a in &fresh {
+                h.jit.translated.remove(a);
+            }
+            if tracing() {
+                trace_line(&format!("[gex] miss at pc={pc:#x}: code changed during translation, unit dropped\n"));
+            }
+            set_resume(pc);
+            // `get`: an `execve` by a sibling leaves one thread.
+            if let Some(t) = h.threads.get(cur()) {
+                set_resume_ctx(t.kstate.ctx_addr);
+            }
+            return true;
         }
         if stats.blocks == 0 {
             return false;
@@ -12862,7 +13066,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume(pc);
         set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         true
-    });
+        })
+        }
+    };
     if translated && in_place(_ctx, pc) {
         return gex_emit::module::DISPATCH_MISS_REDISPATCH;
     }
@@ -12994,6 +13200,12 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// old slots are left behind, unreachable.
 pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
     use std::sync::atomic::{AtomicU32, Ordering};
+    // Inside the kernel, so it waits for a translation holding the lock; and a
+    // translation that read the old code drops its unit (`jitout::EPOCH`).
+    jit_in_held(h);
+    if !ranges.is_empty() {
+        jitout::EPOCH.fetch_add(1, Ordering::Release);
+    }
     for &(start, end) in ranges {
         if end <= start {
             continue;
@@ -13123,7 +13335,7 @@ fn maybe_recompile_at(pc: u64) -> bool {
     // visible only under a flag nobody reaches for.
     if tracing() || unsafe { HEARTBEAT } != 0 {
         let ms = (now_ns() - began) / 1_000_000;
-        let (slots, mods, bytes) = with_host(|h| {
+        let (slots, mods, bytes) = with_jit(|h| {
             (
                 h.jit.page_table.slots(),
                 h.jit.pending.len(),
@@ -13169,7 +13381,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // other's slots; recompiling without asking translated it all again and
     // could reach V8's 10M-slot table ceiling. By whole pages, the identity
     // map's key; an object every page of which is answered is skipped.
-    let (adopted, pages) = with_host(|h| {
+    let (adopted, pages) = with_jit(|h| {
         let first = gex_abi::dispatch_page(map.start);
         let last = gex_abi::dispatch_page(map.end.saturating_sub(1));
         let pages = (last - first + 1) as usize;
@@ -13217,8 +13429,8 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         return 0;
     }
     let seeds = object_seeds(map);
-    let intrinsics = with_host(|h| h.jit.intrinsics.clone());
-    let (exec, page_table, known) = with_host(|h| {
+    let intrinsics = with_jit(|h| h.jit.intrinsics.clone());
+    let (exec, page_table, known) = with_jit(|h| {
         let exec: Vec<(u64, u64)> = h
             .kernel
             .mem
@@ -13247,7 +13459,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         &intrinsics,
     );
     let object_nanos = now_ns().saturating_sub(object_started);
-    let produced = with_host(|h| {
+    let produced = with_jit(|h| {
         h.jit.translated = known;
         if modules.iter().all(|m| m.exported_blocks.is_empty()) {
             return 0usize;
@@ -13425,7 +13637,7 @@ fn note_intrinsics(addr: u64) {
         return;
     };
     let (found, pending) = scan_intrinsics(&path, start);
-    let added = with_host(|h| {
+    let added = with_jit(|h| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
         *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
@@ -13880,7 +14092,7 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
 /// reachability-trimmed closure build.
 #[no_mangle]
 pub extern "C" fn gex_coverage_snapshot() -> u32 {
-    with_host(|h| {
+    with_jit(|h| {
         let mut v: Vec<u64> = h.jit.translated.iter().copied().collect();
         v.sort_unstable();
         h.jit.coverage_snap = v;
@@ -13935,7 +14147,7 @@ pub extern "C" fn gex_jit_slots() -> u32 {
 /// `gex_abi::dispatch_entry`.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
-    with_host(|h| {
+    with_jit(|h| {
         let page = gex_abi::dispatch_page(addr as u64);
         match h.jit.page_table.lookup(page) {
             Some(entry) => gex_abi::dispatch_entry(
@@ -13955,7 +14167,7 @@ pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
 /// pages the directory calls done, into fresh slots, then miss on the old ones.
 #[no_mangle]
 pub extern "C" fn gex_page_count() -> u32 {
-    with_host(|h| h.jit.page_table.entries().len() as u32)
+    with_jit(|h| h.jit.page_table.entries().len() as u32)
 }
 
 /// Write every page assignment to `out` as a `u64` page and a `u32` entry,
@@ -13965,7 +14177,7 @@ pub extern "C" fn gex_page_count() -> u32 {
 /// one per page: the table is a `BTreeMap` and a per-page export was quadratic.
 #[no_mangle]
 pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
-    with_host(|h| {
+    with_jit(|h| {
         let entries = h.jit.page_table.entries();
         if (entries.len() * 12) as u32 > cap {
             return -1;
@@ -13986,7 +14198,7 @@ pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
     phase(3);
-    with_host(|h| h.jit.page_table.assign(page as u64, entry));
+    with_jit(|h| h.jit.page_table.assign(page as u64, entry));
 }
 
 /// How many pages the identity map answers for.
@@ -14107,7 +14319,7 @@ pub extern "C" fn gex_slots_left_k() -> u32 {
 /// branch into one of these pages must keep reaching the miss stub.
 #[no_mangle]
 pub extern "C" fn gex_jit_installed() {
-    with_host(|h| {
+    with_jit(|h| {
         let Some(done) = h.jit.pending.pop_front() else {
             // Empty, but this Worker's published view may still name a module a
             // sibling already took: the queue is shared between a process's
@@ -14578,7 +14790,7 @@ pub extern "C" fn gex_module_row(i: u32) -> u32 {
 pub extern "C" fn gex_jit_slots_total() -> u32 {
     match regview::slots() {
         Some(n) => n as u32,
-        None => with_host(|h| {
+        None => with_jit(|h| {
             regview::publish_marks(&h.jit.page_table);
             h.jit.page_table.slots() as u32
         }),
