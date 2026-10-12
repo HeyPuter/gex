@@ -558,8 +558,13 @@ census in step 2 of §10 checks that before the numbers are trusted.
 **gex-eject ships no cross-process shared memory** (user, 2026-10-07).
 SM is runtime-owned memory with the kernel module's lifecycle, never a
 guest-visible `MAP_SHARED` region (§3.1). So whether it is shared is a
-build option, not a design fork (coordinator, 2026-10-12; the user is
-being asked which default eject takes):
+build option, not a design fork (coordinator, 2026-10-12).
+
+**Decided (user, 2026-10-12): allowed.** In eject, SM may be shared
+across a program's Windows processes as a runtime-owned memory, like the
+kernel module's memory. It is not guest-visible shared memory, so the
+"no cross-process shm" rule does not apply to it. The two build options
+stay:
 
 - **Private SM (the build option eject can always take).**
   - The process's Workers alone import SM.
@@ -569,11 +574,12 @@ being asked which default eject takes):
   - This fits a one-process eject today: the web eject runtime is one
     process and one thread (eject.md, "Limits of the web build"), and a
     Wine program cannot be ejected yet at all.
-- **Shared SM (the page and native default).**
+- **Shared SM (the page and native default, and eject's for several
+  Windows processes).**
   - SM is imported by the Workers of every process in the session, as
     the kernel module's memory is.
-  - An eject build of several Windows processes needs this, if the user
-    allows runtime-owned shared memory in eject.
+  - An eject build of several Windows processes uses this (allowed
+    above).
 
 The code is the same in both; the option chooses which Workers receive
 SM and whether a pump Worker exists.
