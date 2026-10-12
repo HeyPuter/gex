@@ -100,7 +100,8 @@ function run(child) {
         entry = await gex.load(workerData.shim, workerData.seed, workerData.elf,
                                {}, ['prog'], { strace: !!process.env.GEX_STRACE });
       }
-      const status = await gex.run(entry);
+      // A child runs on its forking thread's registers (see worker.mjs).
+      const status = await gex.run(entry, c?.ctx ? Number(c.ctx) : undefined);
       parentPort.postMessage({ kind: 'exit', status });
       } catch (err) {
         // Reported rather than left as an unhandled rejection: a child that

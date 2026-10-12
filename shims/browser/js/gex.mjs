@@ -727,6 +727,9 @@ export class Gex {
   #tableRetries = 0;
   #iCopied = 0;
   #compileMs = 0;
+  /** `#fjitModule`'s compile time, and when it next reports (`[gex] fjit so far`). */
+  #fjitCompileMs = 0;
+  #fjitNextReport = 0;
   #instantiateMs = 0;
   #growMs = 0;
   /// What every Worker pays instantiating the shim and guest before the guest
@@ -841,7 +844,46 @@ export class Gex {
    * How the run loop waited, by kind. `park` is a sleep on the shared word
    * another Worker ends; `turn` is a MessageChannel task; `nap` is a timer.
    */
-  waits = { park: 0, turn: 0, nap: 0 };
+  waits = { park: 0, turn: 0, nap: 0, net: 0 };
+
+  /** Resolves the network wait in progress (`#netWait`) on this Worker's own
+   *  network's activity. */
+  #netWake = null;
+  #kernelWords = null;
+
+  /** What ends a network wait, sampled before the guest is given another
+   *  chance (`gex_wake`): the global kernel's wake counter and the page
+   *  network's event count. */
+  #netSnap() {
+    const k = this.#kernel;
+    return { k: k?.k_wake_addr ? k.k_wake_seq() : null, n: this.#net?.activitySeq?.() ?? null };
+  }
+
+  /**
+   * Sleep, without blocking this Worker's event loop, until the network has
+   * something (this Worker's own network's `onActivity`, or the page's
+   * through the bridge's activity word), another Worker bumps the global
+   * kernel's wake counter (`Atomics.waitAsync` on it), or the waiting
+   * thread's own deadline is due (`gex_wait_bound_ms`, at most 50 ms). It
+   * replaces a MessageChannel turn loop that spun every network-waiting
+   * Worker at full speed, each turn taking the host lock four times (node's
+   * idle Workers in the page: ~2.2 s of KLock each over a 13 s run).
+   */
+  #netWait(e, snap) {
+    const ms = e.gex_wait_bound_ms ? e.gex_wait_bound_ms(50) : 1;
+    const k = this.#kernel;
+    const waits = [new Promise((r) => { this.#netWake = r; })];
+    if (k?.k_wake_addr && snap.k !== null) {
+      this.#kernelWords ??= new Int32Array(this.#kernelSpec.memory.buffer);
+      const w = Atomics.waitAsync(this.#kernelWords, k.k_wake_addr() >>> 2, snap.k, ms);
+      if (!w.async) return Promise.resolve();
+      waits.push(w.value);
+    } else {
+      waits.push(new Promise((r) => setTimeout(r, Math.min(ms, 4))));
+    }
+    if (snap.n !== null) waits.push(this.#net.activityWait(snap.n, ms));
+    return Promise.race(waits).finally(() => { this.#netWake = null; });
+  }
 
   // A MessageChannel first, then `setTimeout(_, 1)`: a bare timer nests and the
   // HTML spec clamps a nested timer to 4ms, but the level resets after a
@@ -1321,6 +1363,7 @@ export class Gex {
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
+    if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
@@ -1809,6 +1852,7 @@ export class Gex {
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
       // The unit cache and ELF export providers, as `load` gives a process its
       // own: a forked child's table starts empty while its GOT holds what
@@ -2591,6 +2635,10 @@ export class Gex {
       moduleStore: this.#moduleStore ?? undefined,
       // A thread of a 32-bit process decodes in compatibility mode too.
       compat: e.gex_compat?.() ?? 0,
+      // The process's run options, so a fork from this thread hands its
+      // child the same ones (the fork record's `opts`): a thread Worker had
+      // none, and a child of a thread lost dense numbering and the rest.
+      procOpts: this.#opts,
     };
     if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] #drainThread posting tid ${tid} (t=${Date.now()})`);
     e.gex_thread_taken();
@@ -2632,6 +2680,7 @@ export class Gex {
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    if (thread.procOpts) this.#opts = thread.procOpts;
     if (thread.compat) this.#shim.exports.gex_set_compat?.(1);
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
     // A spawned thread runs almost none of the process's modules, so registering
@@ -2930,6 +2979,17 @@ export class Gex {
    */
   useNetwork(net) {
     this.#net = net;
+    // Its events end a network wait (`#netWait`). Chained: the single-thread
+    // build's scheduler wake is set before this.
+    if (net && 'onActivity' in net) {
+      const prev = net.onActivity;
+      net.onActivity = (...a) => {
+        prev?.apply(net, a);
+        const r = this.#netWake;
+        this.#netWake = null;
+        r?.();
+      };
+    }
     // Guarded, because this runs before the shim exists (a Worker is given its
     // devices between construction and `adoptProcess`); `load`/`attach` set it
     // from `#net` too.
@@ -3592,7 +3652,18 @@ export class Gex {
     if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
     const t0 = performance.now();
     mod = new WebAssembly.Module(bytes);
-    this.#compileMs += performance.now() - t0;
+    const dt = performance.now() - t0;
+    this.#compileMs += dt;
+    this.#fjitCompileMs += dt;
+    // Every 60 s while the JIT makes modules: what it has cost so far (the
+    // census at exit comes too late for a game that never exits).
+    if (t0 >= this.#fjitNextReport && e.gex_fjit_translate_ms) {
+      if (this.#fjitNextReport) {
+        console.error(`[gex] fjit so far: ${e.gex_fjit_modules()} modules, ${e.gex_fjit_wasm_kib()} KiB of wasm, `
+          + `${e.gex_fjit_translate_ms()} ms translating (the process), ${this.#fjitCompileMs.toFixed(0)} ms compiling (this Worker)`);
+      }
+      this.#fjitNextReport = t0 + 60000;
+    }
     this.#sharedModules.set(name, mod);
     this.#env.shareModule?.(name, mod);
     return mod;
@@ -4051,8 +4122,14 @@ export class Gex {
 
   /** Say how large the compositor's output is, before the guest runs. */
   wlOutput(w, h) {
+    // Kept, and given again to every shim instance this process makes: a
+    // fresh instance (a fork child's, an exec's) starts at the default
+    // 640x480, and W3 starts every Windows program by fork and exec.
+    this.#wlOut = [w | 0, h | 0];
     this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
   }
+
+  #wlOut = null;
 
   /**
    * This process's name in the compositor's scene arena: its pid, which every
@@ -4336,6 +4413,9 @@ export class Gex {
         this.#where = 'drainThread';
         await this.#drainThread();
         this.#where = 'resume';
+        // A guest fault the shim staged for the process's hook (W3): run
+        // it, and go on where it left the context.
+        const faulted = this.#deliverFault(ctx);
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -4343,7 +4423,7 @@ export class Gex {
         // read as bugs anywhere but here.
         const next = e.gex_exited?.() ? 0n : e.gex_resume_pc();
         if (next !== 0n) {
-          pc = next;
+          pc = faulted ?? next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
@@ -4359,6 +4439,7 @@ export class Gex {
         // loop matters: one event-loop turn is no promise the wait is over.
         if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
           let woke = 0;
+          let snap = this.#netSnap();
           while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
             // Another Worker can execute exit_group while this one is parked.
             // The global-kernel wake it generates is not a resume request for
@@ -4401,6 +4482,11 @@ export class Gex {
                 // case, so it is the condition for turning.
                 const onLoop = !!e.gex_paused_for_host();
                 this.#netTurns = onLoop ? this.#netTurns + 1 : 0;
+                if (onLoop && e.gex_wait_bound_ms && this.#kernel?.k_wake_addr) {
+                  // Asleep until the network, another Worker or the clock.
+                  this.waits.net++;
+                  await this.#netWait(e, snap);
+                } else
                 // A nap every 1024th turn keeps an empty socket from spinning
                 // the Worker hot and lets timer-driven work run. Raising it
                 // from 64 did not change throughput -- the naps overlap with
@@ -4419,6 +4505,7 @@ export class Gex {
               }
             }
             if (e.gex_exited?.()) return e.gex_exit_code();
+            snap = this.#netSnap();
             woke = e.gex_wake();
             if (woke === 1) break;
           }
@@ -5151,7 +5238,9 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const nextPc = e.gex_resume_pc();
+          const faulted = this.#deliverFault(ctx);
+          const resumed = e.gex_resume_pc();
+          const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
           // business, down through every frame.
           if (nextPc === 0n) {
@@ -5189,6 +5278,45 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /**
+   * A guest fault the shim staged (`gex_fault_take`: a W3 process's branch
+   * to non-executable memory) given to the process's fault hook, Wine's
+   * ntdll.so, as shims/native's `deliver_guest_fault_kind` does: the hook
+   * builds the guest's exception frame and points the context at the
+   * dispatcher. Returns where the guest goes on, or null with none staged.
+   */
+  #deliverFault(ctx) {
+    const e = this.#shim.exports;
+    if (!e.gex_fault_take) return null;
+    const buf = e.gex_alloc(16) >>> 0;
+    let hook, code, addr, kind;
+    try {
+      hook = e.gex_fault_take(buf) >>> 0;
+      if (!hook) return null;
+      const dv = new DataView(this.#memory.buffer);
+      code = dv.getUint32(buf, true);
+      addr = dv.getBigUint64(buf + 4, true);
+      kind = dv.getUint32(buf + 12, true);
+    } finally {
+      e.gex_free?.(buf, 16);
+    }
+    const f = this.#cgenStore().ftab.get(tIdx(hook));
+    if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
+    // The hook's C frames go below the guest's stack pointer, as a signal
+    // frame does, with room for the exception frame it builds there.
+    const spG = this.#wasmprogStack();
+    const cur = spG.value;
+    const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
+    const low = Math.min(Number(cur) >>> 0, esp);
+    spG.value = m64() ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
+    try {
+      f(ctx, code | 0, Number(BigInt.asUintN(32, addr)) | 0, kind | 0);
+    } finally {
+      spG.value = cur;
+    }
+    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+  }
 
   /**
    * An exception dispatched nested (nt.rs `raise_nested`, ffa2cec9's browser
@@ -5256,7 +5384,9 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const nextPc = e.gex_resume_pc();
+          const faulted = this.#deliverFault(ctx);
+          const resumed = e.gex_resume_pc();
+          const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
           // business, down through every frame.
           if (nextPc === 0n) {

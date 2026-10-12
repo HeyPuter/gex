@@ -182,6 +182,11 @@ static void gexgl_note_submit(void) {
     if (submit_trace_total % 5000u == 0) gexgl_report_submit_trace();
 }
 
+/* GL_ARB_debug_output (below glGetError): whether a waiting submit should
+   carry a GET_ERROR for the debug callback, and what to do with its answer. */
+static int gexgl_debug_wants_errors(void);
+static void gexgl_debug_folded_error(unsigned error);
+
 /* Hand everything recorded so far to the host and wait for it. */
 static void flush(void) {
     if (!ring || ring->tail == 0) {
@@ -189,7 +194,28 @@ static void flush(void) {
         return;
     }
     gexgl_note_submit();
-    if (ioctl(gl_fd, GEX_GL_SUBMIT, ring) != 0) {
+    /* With a debug callback set, the batch ends with a GET_ERROR of its own,
+       whose answer is the last word of the reply: the error any command in
+       it (or in an unwaited batch before it) raised, delivered now rather
+       than by a glGetError round trip per call. Raw, not begin(): there is
+       no room to flush for, and it must not count as the batch's last
+       command in the submit trace. Without room it waits for the next one;
+       the host's error flag keeps it until then. */
+    int folded = 0;
+    if (gexgl_debug_wants_errors() && ring->capacity - ring->tail >= 8u) {
+        uint32_t *at = (uint32_t *)(cmds + ring->tail);
+        at[0] = GEXGL_GET_ERROR;
+        at[1] = 8u;
+        ring->tail += 8u;
+        folded = 1;
+    }
+    const int failed = ioctl(gl_fd, GEX_GL_SUBMIT, ring) != 0;
+    if (!failed && folded && ring->reply_len >= 4u) {
+        uint32_t error;
+        memcpy(&error, replies + ring->reply_len - 4u, 4);
+        if (error) gexgl_debug_folded_error(error);
+    }
+    if (failed) {
         /* Said out loud, because the alternative is losing GL commands in
            silence. A failed submit drops the whole queued batch, and the
            application is never told: object creation vanishes and the first
@@ -511,8 +537,15 @@ void glDepthRangef(float near_value, float far_value) {
 void glClear(unsigned mask) { CMD1(GEXGL_CLEAR, mask); }
 void glViewport(int x, int y, int w, int h) { CMD4(GEXGL_VIEWPORT, x, y, w, h); }
 void glScissor(int x, int y, int w, int h) { CMD4(GEXGL_SCISSOR, x, y, w, h); }
-void glEnable(unsigned cap) { CMD1(GEXGL_ENABLE, cap); }
-void glDisable(unsigned cap) { CMD1(GEXGL_DISABLE, cap); }
+static int gexgl_debug_cap(unsigned cap, int on);
+void glEnable(unsigned cap) {
+    if (gexgl_debug_cap(cap, 1)) return;
+    CMD1(GEXGL_ENABLE, cap);
+}
+void glDisable(unsigned cap) {
+    if (gexgl_debug_cap(cap, 0)) return;
+    CMD1(GEXGL_DISABLE, cap);
+}
 void glBlendFunc(unsigned s, unsigned d) { CMD2(GEXGL_BLEND_FUNC, s, d); }
 void glDepthFunc(unsigned f) { CMD1(GEXGL_DEPTH_FUNC, f); }
 void glCullFace(unsigned m) { CMD1(GEXGL_CULL_FACE, m); }
@@ -1938,6 +1971,106 @@ unsigned glGetError(void) {
     return reply_u32();
 }
 
+/* GL_ARB_debug_output (and KHR_debug's same-named core commands), answered
+ * here.
+ *
+ * A callback cannot cross the transport, so the host never sees these: the
+ * guest keeps the callback and delivers what it can generate itself, which
+ * is the GL errors. Each waiting submit then carries one GET_ERROR (flush),
+ * and an error it brings back goes both to the callback and to the slot
+ * glGetError answers from first -- so glGetError stays exact, and only the
+ * message is late: it arrives at the next submit that waits, which may be
+ * several calls after the one that failed. GL allows that unless
+ * GL_DEBUG_OUTPUT_SYNCHRONOUS is enabled; with it enabled the message is
+ * still delivered at the next waiting submit (a deviation, said in
+ * docs/gl.md), not at the call.
+ *
+ * Why it exists: wined3d checks every GL call with glGetError
+ * (checkGLcall) whenever Wine's d3d ERR channel is on, which is the
+ * default, unless the context has ARB_debug_output. Through this transport
+ * each check is a synchronous round trip: Undertale's wined3d thread made
+ * 93 a frame, 98% of all its submits (worldmachine, gltr1), and spent 15.6
+ * ms a frame waiting on them. Its capability probes call glGetError
+ * directly and still get exact answers. */
+typedef void (*gexgl_debug_proc)(unsigned source, unsigned type, unsigned id,
+                                 unsigned severity, int length,
+                                 const char *message, const void *user);
+static gexgl_debug_proc debug_callback;
+static const void *debug_user;
+/* Error messages enabled (glDebugMessageControl); on by default, as GL has
+   every message of high severity. */
+static int debug_errors_enabled = 1;
+/* GL_DEBUG_OUTPUT (KHR_debug's master switch; on unless disabled). */
+static int debug_output_enabled = 1;
+static int debug_synchronous;
+
+#define GEXGL_DEBUG_OUTPUT 0x92E0u
+#define GEXGL_DEBUG_OUTPUT_SYNCHRONOUS 0x8242u
+#define GEXGL_DEBUG_SOURCE_API 0x8246u
+#define GEXGL_DEBUG_TYPE_ERROR 0x824Cu
+#define GEXGL_DEBUG_SEVERITY_HIGH 0x9146u
+#define GEXGL_DONT_CARE 0x1100u
+
+static int gexgl_debug_wants_errors(void) {
+    return debug_callback && debug_errors_enabled && debug_output_enabled;
+}
+
+static void gexgl_debug_folded_error(unsigned error) {
+    gexgl_set_error(error);
+    if (!gexgl_debug_wants_errors()) return;
+    char message[96];
+    int length = snprintf(message, sizeof message,
+                          "GL error 0x%04x (raised by a call before the last"
+                          " waiting submit)", error);
+    if (length < 0) length = 0;
+    if (length >= (int)sizeof message) length = (int)sizeof message - 1;
+    debug_callback(GEXGL_DEBUG_SOURCE_API, GEXGL_DEBUG_TYPE_ERROR, error,
+                   GEXGL_DEBUG_SEVERITY_HIGH, length, message, debug_user);
+}
+
+/* Whether glEnable/glDisable named one of the debug switches, which are
+   kept here and not sent to a host that may not know them. */
+static int gexgl_debug_cap(unsigned cap, int on) {
+    if (cap == GEXGL_DEBUG_OUTPUT) { debug_output_enabled = on; return 1; }
+    if (cap == GEXGL_DEBUG_OUTPUT_SYNCHRONOUS) { debug_synchronous = on; return 1; }
+    return 0;
+}
+
+void glDebugMessageCallback(gexgl_debug_proc callback, const void *user) {
+    debug_callback = callback;
+    debug_user = user;
+}
+
+void glDebugMessageControl(unsigned source, unsigned type, unsigned severity,
+                           int count, const unsigned *ids,
+                           unsigned char enabled) {
+    (void)ids;
+    /* Only the error messages exist here, so only a control that covers
+       them changes anything; one naming ids names none of ours. */
+    if (count > 0) return;
+    if (source != GEXGL_DONT_CARE && source != GEXGL_DEBUG_SOURCE_API) return;
+    if (type != GEXGL_DONT_CARE && type != GEXGL_DEBUG_TYPE_ERROR) return;
+    if (severity != GEXGL_DONT_CARE && severity != GEXGL_DEBUG_SEVERITY_HIGH) return;
+    debug_errors_enabled = enabled != 0;
+}
+
+void glDebugMessageInsert(unsigned source, unsigned type, unsigned id,
+                          unsigned severity, int length, const char *buf) {
+    if (!debug_callback || !debug_output_enabled || !buf) return;
+    debug_callback(source, type, id, severity,
+                   length < 0 ? (int)strlen(buf) : length, buf, debug_user);
+}
+
+/* Everything is delivered to the callback or not at all; nothing is kept. */
+unsigned glGetDebugMessageLog(unsigned count, int buf_size, unsigned *sources,
+                              unsigned *types, unsigned *ids,
+                              unsigned *severities, int *lengths,
+                              char *log) {
+    (void)count; (void)buf_size; (void)sources; (void)types; (void)ids;
+    (void)severities; (void)lengths; (void)log;
+    return 0;
+}
+
 /* WebGPU device loss is surfaced by the host transport itself; while the
    context is alive there is no pending GL reset. CTS calls this after every
    case when terminate-on-device-lost is enabled, including GL 4.4 cases. */
@@ -2001,6 +2134,9 @@ static const char *const gexgl_local_extensions[] = {
        Khronos shared GL/ES test keys desktop support off this ARB
        token even though the functions are core since OpenGL 3.2. */
     "GL_ARB_draw_elements_base_vertex",
+    /* Answered in the guest (glDebugMessageCallback above): its errors come
+       from a GET_ERROR on each waiting submit, not a round trip per call. */
+    "GL_ARB_debug_output",
 };
 
 static int gexgl_extension_name_compare(const void *left, const void *right) {

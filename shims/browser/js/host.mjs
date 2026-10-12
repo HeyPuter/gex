@@ -587,6 +587,7 @@ export class ProcessHost {
             pc: m.thread.pc,
             memory: m.thread.memory,
             moduleStore: m.thread.moduleStore,
+            procOpts: m.thread.procOpts,
             kernelStack: this.#nextKernelStack(key),
             shim: shimMod,
             guest: this.#guest,
@@ -680,8 +681,8 @@ export class ProcessHost {
                 ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]`
                 : '') +
               (m.liftSlots ? ` slots[${m.liftSlots}]` : '') +
-              (m.waits && (m.waits.park || m.waits.turn || m.waits.nap)
-                ? `, waited park=${m.waits.park} turn=${m.waits.turn} nap=${m.waits.nap}`
+              (m.waits && (m.waits.park || m.waits.turn || m.waits.nap || m.waits.net)
+                ? `, waited park=${m.waits.park} turn=${m.waits.turn} nap=${m.waits.nap} net=${m.waits.net ?? 0}`
                 : '') +
               (m.byObject ? ` [${m.byObject}]` : '') +
               (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB]` : '') +

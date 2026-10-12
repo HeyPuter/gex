@@ -70,6 +70,9 @@ if [ -f "$MESA_BUILD/gex-wgpu-replay.wasm" ]; then
         mkdir -p "$tree/gex"
         cp "$MESA_BUILD/gex-wgpu-replay.js" \
            "$MESA_BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
+        rm -f "$tree/gex/gex-wgpu-replay.deferred.wasm"
+        [ ! -f "$MESA_BUILD/gex-wgpu-replay.deferred.wasm" ] ||
+            cp "$MESA_BUILD/gex-wgpu-replay.deferred.wasm" "$tree/gex/"
     done
 else
     echo "warning: no gex-wgpu-replay in $MESA_BUILD; testing whatever host" \

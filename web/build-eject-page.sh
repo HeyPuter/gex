@@ -31,4 +31,8 @@ for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
     if [ -f "$WEB/public/gex/$f" ]; then cp "$WEB/public/gex/$f" "$OUT/gex/$f"
     else echo "build-eject-page: no web/public/gex/$f (web/build-mesa-wasm.sh): the page has no OpenGL" >&2; fi
 done
+# Mesa's cold part, when the build split one off (docs/mesa-wasm-size.md).
+rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
+[ ! -f "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" ] ||
+    cp "$WEB/public/gex/gex-wgpu-replay.deferred.wasm" "$OUT/gex/"
 echo "build-eject-page: $OUT"

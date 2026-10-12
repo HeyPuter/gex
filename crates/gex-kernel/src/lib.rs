@@ -53,6 +53,7 @@ pub mod proc;
 pub mod pty;
 pub mod signal;
 pub mod stdio;
+pub mod sync;
 pub mod syscalls;
 pub mod timerfd;
 pub mod tty;

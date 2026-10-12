@@ -45,6 +45,28 @@ fn trace(s: &str) {
 }
 static JIT: OnceLock<gex_xlate::fjit::Jit> = OnceLock::new();
 
+/// What translating has cost this process: shim time in `translate_root`
+/// (recovery and emission, declined ones included) and the wasm it made.
+static TRANSLATE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WASM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds this process has spent translating (`TRANSLATE_NS`).
+#[no_mangle]
+pub extern "C" fn gex_fjit_translate_ms() -> u32 {
+    (TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000) as u32
+}
+
+/// KiB of wasm the JIT has made in this process, and how many modules.
+#[no_mangle]
+pub extern "C" fn gex_fjit_wasm_kib() -> u32 {
+    (WASM_BYTES.load(Ordering::Relaxed) / 1024) as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fjit_modules() -> u32 {
+    lock(&MODULES).len() as u32
+}
+
 /// One translation: its bytes (named `gex-fjit` for profiles), the bridges
 /// every Worker writes (cgen.rs `bridges`), the pages it numbered and what
 /// the dispatch tables must hold.
@@ -486,7 +508,13 @@ fn translate_root(addr: u64) -> Option<u32> {
             }
         }
     };
-    let Some(wasm) = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32) else {
+    let t0 = crate::now_ns();
+    let wasm = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32);
+    TRANSLATE_NS.fetch_add(crate::now_ns().saturating_sub(t0), Ordering::Relaxed);
+    if let Some(w) = &wasm {
+        WASM_BYTES.fetch_add(w.len() as u64, Ordering::Relaxed);
+    }
+    let Some(wasm) = wasm else {
         trace(&format!("declined {addr:#x}"));
         declined(fresh.into_inner());
         return None;

@@ -148,12 +148,56 @@ fi
 # Where the page loads them from. Left out before, so a rebuilt module sat in
 # the build directory while the site served whatever had last been copied by
 # hand -- which looks exactly like a change that did not work.
+#
+# The replay links with -sSPLIT_MODULE=1: its .wasm is wasm-split's
+# instrumented module and never shipped, and .wasm.orig is the plain one,
+# which web/mesa-split.py splits by web/mesa-hot.txt into what the page loads
+# and a cold part (gex-wgpu-replay.deferred.wasm) it fetches the first time a
+# function there runs (docs/mesa-wasm-size.md). GEX_MESA_HOT=none ships it
+# whole; GEX_MESA_HOT=FILE splits by another list. GEX_MESA_PROFILE=1 ships
+# it whole and instrumented instead, to measure which functions a workload
+# runs (wasm-split --instrument --in-memory: a byte per function at address
+# 0 up, below the main stack, which --stack-first puts first; the glue prints
+# the set, and tools/mesa-hot.py turns logs of it into web/mesa-hot.txt).
+TGT=$BUILD/src/gallium/targets/gex-wasm
+if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
+    HOT=${GEX_MESA_HOT:-$ROOT/web/mesa-hot.txt}
+    if [ "${GEX_MESA_PROFILE:-0}" = 1 ]; then
+        mkdir -p "$TGT/split"
+        rm -f "$TGT/split/gex-wgpu-replay.deferred.wasm"
+        # The link's features, as web/mesa-split.py names them.
+        "$(em-config BINARYEN_ROOT)/bin/wasm-split" --mvp-features --enable-threads --enable-simd \
+            --enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int \
+            --enable-sign-ext --enable-mutable-globals --enable-multivalue \
+            --instrument --in-memory -g \
+            "$TGT/gex-wgpu-replay.wasm.orig" -o "$TGT/split/gex-wgpu-replay.wasm"
+        echo "  profiling build: tools/mesa-hot.py $TGT/gex-wgpu-replay.wasm.orig LOG..."
+    else
+        python3 "$ROOT/web/mesa-split.py" "$TGT/gex-wgpu-replay.wasm.orig" "$HOT" "$TGT/split"
+    fi
+    # The glue's loader (web/gex-wgpu-split.js) prefetches a cold part only
+    # where there is one.
+    if [ -f "$TGT/split/gex-wgpu-replay.deferred.wasm" ]; then
+        cold=YES
+    else
+        cold=NO
+    fi
+    # The assignment only: the test beside it names YES too.
+    sed -i "s/\\(gexMesaColdSplit *= *[\"']\\)GEX_MESA_COLD_[A-Z]*/\\1GEX_MESA_COLD_$cold/" "$TGT/gex-wgpu-replay.js"
+    cp "$TGT/gex-wgpu-replay.js" "$TGT/split/gex-wgpu-replay.js"
+    # And over the instrumented one, for the tests that copy from here.
+    cp "$TGT/split/gex-wgpu-replay.wasm" "$TGT/gex-wgpu-replay.wasm"
+    rm -f "$TGT/gex-wgpu-replay.deferred.wasm"
+    [ -f "$TGT/split/gex-wgpu-replay.deferred.wasm" ] &&
+        cp "$TGT/split/gex-wgpu-replay.deferred.wasm" "$TGT/gex-wgpu-replay.deferred.wasm"
+fi
 PUB="$ROOT/web/public/gex"
 [ "$THREADS" = 0 ] && [ -d "$PUB" ] && PUB="$PUB/st" && mkdir -p "$PUB"
-if [ -d "$PUB" ]; then
-    for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
-        [ -f "$BUILD/src/gallium/targets/gex-wasm/$f" ] || continue
-        cp "$BUILD/src/gallium/targets/gex-wasm/$f" "$PUB/$f"
+if [ -d "$PUB" ] && [ -f "$TGT/split/gex-wgpu-replay.wasm" ]; then
+    rm -f "$PUB/gex-wgpu-replay.deferred.wasm"
+    for f in gex-wgpu-replay.js gex-wgpu-replay.wasm gex-wgpu-replay.deferred.wasm; do
+        [ -f "$TGT/split/$f" ] || continue
+        cp "$TGT/split/$f" "$PUB/$f"
         echo "  published $PUB/$f"
     done
 fi
