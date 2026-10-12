@@ -312,3 +312,18 @@ fn an_instruction_ending_text_in_a_zero_byte_lifts_whole() {
     assert!(matches!(thunk.blocks[0].term, FTerm::Unresolved { .. }), "{text}");
     assert!(text.contains(&format!("{:#x}", base + 0x5030)), "the slot, rebased: {text}");
 }
+
+/// A vtable kept in `.text` (Microsoft merges `.rdata` there): the relocated
+/// pointer to the table seeds a weak start whose decode runs on into
+/// `get_b`, which only the table names. `get_b` is a function of its own
+/// all the same, not an interior entry of that garbage (uiribbon.dll's
+/// 0x2f15153d, called through its vtable a few thousand times at start-up).
+#[test]
+fn a_virtual_tail_s_callee_after_a_vtable_in_text_is_a_function() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/vtext32.exe")).unwrap();
+    let pe = gex_ld::pe::parse(&bytes).unwrap();
+    let (img, extra) = gex_xlate::func::pe_input(&pe, pe.preferred_base).unwrap();
+    let prog = recover_pe(&img, &extra, &RecoverOptions::default());
+    let found: Vec<u64> = prog.functions.keys().copied().collect();
+    assert!(found.contains(&0x401010), "get_b not a function: {found:x?}");
+}
