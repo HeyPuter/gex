@@ -64,6 +64,7 @@ const profile = mkdtempSync(join(tmpdir(), 'gex-record-w3-'));
 const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
   '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-webgpu',
   '--use-angle=vulkan', '--enable-features=Vulkan', '--ozone-platform=headless',
+  '--ozone-override-screen-size=1280,900', '--window-size=1280,900', '--disable-hang-monitor',
   '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
   `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });
@@ -100,12 +101,17 @@ browser.on('Runtime.consoleAPICalled', (p) => {
 });
 browser.on('Target.attachedToTarget', async (p) => {
   const s = p.sessionId;
+  // A Worker is held at its start until its console is on, so no line is
+  // missed. Anything else (the service worker) goes at once: its
+  // Runtime.enable does not answer while it is held.
+  if (p.targetInfo?.type !== 'worker') await browser.send('Runtime.runIfWaitingForDebugger', {}, s).catch(() => {});
   await browser.send('Runtime.enable', {}, s).catch(() => {});
   await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s).catch(() => {});
   await browser.send('Runtime.runIfWaitingForDebugger', {}, s).catch(() => {});
 });
 await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, page);
 await browser.send('Runtime.enable', {}, page);
+await browser.send('Page.enable', {}, page);
 const ev = async (e) => (await browser.send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }, page).catch(() => ({})))?.result?.value;
 await browser.send('Page.navigate', { url }, page);
 
@@ -120,7 +126,13 @@ while (Date.now() - t0 < timeout) {
   if (st && JSON.parse(st).phase === 'failed') { console.error(`record-w3: the page failed: ${JSON.parse(st).error}`); done(1); }
   await sleep(500);
 }
-if (!title) { console.error(`record-w3: no window titled /${titleRe.source}/ in ${timeout / 1000} s`); done(1); }
+if (!title) {
+  console.error(`record-w3: no window titled /${titleRe.source}/ in ${timeout / 1000} s`);
+  console.error(`  at ${await ev('location.href')}, phase ${await ev('globalThis.__nt?.phase')}`);
+  console.error(`  page says: ${String(await ev("globalThis.__nt?.out ?? document.body?.innerText ?? ''")).slice(-1500)}`);
+  for (const e of errors.slice(0, 8)) console.error(`  console error: ${e}`);
+  done(1);
+}
 const atTitle = (Date.now() - t0) / 1000;
 await sleep(settle);
 const sess = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.session ?? null)')) ?? 'null');
@@ -135,7 +147,13 @@ const session = {
   title_seconds: atTitle,
   page: sess,
   bundle: opt('--bundle', null) ? resolve(opt('--bundle', null)) : null,
-  processes: [...processes].map(([image, cmdline]) => ({ image, cmdline })),
+  // Each Wine process's main image: a unit's .exe (a Windows program) or the
+  // first wasm32 module it loaded as an .exe (Wine's own programs).
+  processes: [
+    ...[...processes].map(([image, cmdline]) => ({ image, cmdline })),
+    ...[...modules.keys()].filter((m) => /^wasmdll:.*\.exe$/i.test(m) && !processes.has(m.slice(8)))
+      .map((m) => ({ image: m.slice(8), cmdline: null })),
+  ],
   units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path })),
   unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path })),
   modules: [...modules].map(([path, content]) => ({ path, content })),

@@ -68,6 +68,7 @@ const cport = port + 1;
 const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
   '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-webgpu',
   '--use-angle=vulkan', '--enable-features=Vulkan', '--ozone-platform=headless',
+  '--ozone-override-screen-size=1280,900', '--window-size=1280,900', '--disable-hang-monitor',
   '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
   `--remote-debugging-port=${cport}`, `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });
@@ -103,7 +104,9 @@ if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleR
 // 3. Drawn by the page itself when the compositor is out.
 if (off.includes('compositor')) {
   check(d.compositor === 'none', `drawn without the scene compositor (describe().compositor ${d.compositor})`);
-  const comp = await ev("[...document.querySelectorAll('script')].some((s) => /compositor-worker/.test(s.src)) || performance.getEntriesByType('resource').some((r) => /compositor(-worker)?-[^/]*\\.js$/.test(r.name))");
+  // dom-compositor.js is the bare desktop's own layer: only the scene
+  // compositor's files count.
+  const comp = await ev("performance.getEntriesByType('resource').some((r) => /\\/(compositor|compositor-worker|gpu-device)-[^/]*\\.js$/.test(r.name))");
   check(!comp, 'the page loaded no compositor script');
 }
 await sleep(2000);
