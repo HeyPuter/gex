@@ -16,6 +16,8 @@
 // and is the only writer of it, plus a ring the compositor writes input into.
 // No locks -- one writer per word, and the compositor polls at frame rate.
 
+import { single, sched } from './single.mjs';
+
 /** Processes that can publish surfaces at once. */
 const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
@@ -99,9 +101,12 @@ const B_HEARTBEAT = 1;
 const B_COUNT = 2;
 const B_GEN = 3;
 const B_ACK = 4;
-/** Where the global kernel's wake word is (`k_wake_addr`), or zero: what the
- * compositor bumps after putting an event in this block's ring. */
+/** Where the process's wait queue is in the global kernel's memory
+ * (`gex_proc_queue_addr`), or zero, and where the wait slots' words start
+ * (`gex_slots_addr`): what the compositor notifies after putting an event in
+ * this block's ring (docs/kernel-locking.md §5.2 step 2). */
 const B_WAKE = 5;
+const B_SLOTS = 6;
 const B_WORDS = 8;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
@@ -241,16 +246,40 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
-  // And a wake, as another guest's syscall would give: with every thread of
-  // the process parked, nothing drains the ring until a park's bound (20 ms)
-  // runs out. The Worker that wakes takes a scheduler turn, whose compositor
-  // pump delivers the event and wakes the client's reader in turn.
-  const wake = Atomics.load(a, blockBase(block) + B_WAKE);
+  // And a notify on the process's wait queue: with every thread of the
+  // process parked, nothing drains the ring otherwise. The thread that wakes
+  // takes a scheduler turn, whose compositor pump delivers the event and
+  // notifies the client's reader in turn.
+  const q = Atomics.load(a, blockBase(block) + B_WAKE);
+  const slots = Atomics.load(a, blockBase(block) + B_SLOTS);
   const k = channel.kernelMemory;
-  if (wake && k && typeof SharedArrayBuffer === 'function' && k.buffer instanceof SharedArrayBuffer) {
-    const w = new Int32Array(k.buffer);
-    Atomics.add(w, wake >>> 2, 1);
-    Atomics.notify(w, wake >>> 2);
+  if (q && slots && k) {
+    notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
+    // The single-thread build: the fibers parked on those words look.
+    if (single.on) sched.checkSlots();
+  }
+}
+
+/** Queue words: a bitmap of the slots registered on it, 8 words
+ *  (shims/kernel/src/wait.rs `Queue`). */
+const Q_BITS = 8;
+
+/**
+ * Notify the wait queue at byte address `q` in the kernel's memory `w`, as
+ * `k_wq_notify` does: bump and wake the word of every slot registered on it,
+ * the slots' words starting at `slots`. Not the queues chained to it -- a
+ * process queue has none.
+ */
+export function notifyQueue(w, q, slots) {
+  for (let i = 0; i < Q_BITS; i++) {
+    let bits = Atomics.load(w, (q >>> 2) + i) >>> 0;
+    while (bits) {
+      const b = 31 - Math.clz32(bits & -bits);
+      bits &= bits - 1;
+      const at = (slots >>> 2) + i * 32 + b;
+      Atomics.add(w, at, 1);
+      if (w.buffer instanceof SharedArrayBuffer) Atomics.notify(w, at);
+    }
   }
 }
 
@@ -284,7 +313,8 @@ export class WlProxy {
   #tokenFn;
   /** Called with the token once it is known, so the host can send the memory. */
   onToken = null;
-  /** The global kernel's wake word address (`k_wake_addr`), or 0; asked when
+  /** This process's wait queue's address in the global kernel's memory and
+   *  where the slot words start, as `{ addr, slots }`, or null; asked when
    *  the block is claimed. See `B_WAKE`. */
   wakeAddr = null;
 
@@ -340,8 +370,11 @@ export class WlProxy {
   }
 
   #noteWake() {
-    const at = this.wakeAddr?.() | 0;
-    if (at) Atomics.store(this.#a, this.#base + B_WAKE, at);
+    const w = this.wakeAddr?.();
+    if (w?.addr && w?.slots) {
+      Atomics.store(this.#a, this.#base + B_SLOTS, w.slots | 0);
+      Atomics.store(this.#a, this.#base + B_WAKE, w.addr | 0);
+    }
   }
 
   get token() {

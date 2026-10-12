@@ -5,13 +5,13 @@
  * A Wayland client's input goes page -> compositor -> the process's ring in
  * the wl arena (`sendEvent`) -> the shim's compositor pump, which runs on a
  * scheduler turn of one of the process's Workers. With every Worker parked on
- * the global kernel's wake word (`gex_park`, 20 ms bound), nothing drained the
- * ring until a bound ran out: up to 20 ms on every click and key, and the
- * park-late diag found Wine's Wayland reader thread waiting out its bound.
- * `sendEvent` now bumps the wake word the process's `WlProxy` names.
+ * its wait slot (`gex_park`), nothing drains the ring unless `sendEvent`
+ * notifies the process's wait queue, which the process's `WlProxy` names and
+ * every waiting thread of the process is registered on.
  *
  * This instantiates the kernel module in a second thread on shared memory and
- * parks it on the wake word for 5 s (`k_park`, as `gex_park` does); the first
+ * parks it on a slot registered on a queue for 5 s (`k_ws_park`, as
+ * `gex_park` does); the first
  * thread claims a block as a guest would, then sends a pointer event 100 ms
  * later. The park must end, woken (0), within a few milliseconds of the event.
  *
@@ -43,7 +43,10 @@ if (isMainThread) {
   // The guest's half: a process claims its block (on its first publish).
   const channel = makeWlChannel();
   const proxy = new WlProxy(channel, () => {}, () => 7);
-  proxy.wakeAddr = () => k.k_wake_addr();
+  const queue = k.k_wq_new();
+  const slot = k.k_ws_alloc();
+  k.k_wq_add(queue, slot);
+  proxy.wakeAddr = () => ({ addr: k.k_wq_addr(queue), slots: k.k_ws_addr(0) });
   const guestMem = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
   proxy.publish(guestMem, 0, 0);
   if (!proxy.ok) {
@@ -55,10 +58,10 @@ if (isMainThread) {
   const compositorChannel = { arena: channel.arena };
   setKernelMemory(compositorChannel, memory);
 
-  const seq = k.k_wake_seq();
+  const seq = k.k_ws_seq(slot);
   const parked = new Promise((resolve, reject) => {
     const w = new Worker(fileURLToPath(import.meta.url), {
-      workerData: { module, memory, process_, seq, ns: 5000 * 1e6 },
+      workerData: { module, memory, process_, slot, seq, ns: 5000 * 1e6 },
     });
     w.once('message', resolve);
     w.once('error', reject);
@@ -77,9 +80,9 @@ if (isMainThread) {
   console.log(`  page input wakes a process whose threads are all parked (${late.toFixed(1)} ms after the event; the park's bound was 5 s)`);
   process.exit(0);
 } else {
-  const { module, memory, process_, seq, ns } = workerData;
+  const { module, memory, process_, slot, seq, ns } = workerData;
   const k = await instantiate(module, memory, process_);
-  const r = k.k_park(seq, BigInt(ns));
+  const r = k.k_ws_park(slot, seq, BigInt(ns));
   // `performance.now()` counts from each thread's own origin.
   parentPort.postMessage({ r, end: performance.timeOrigin + performance.now() });
 }

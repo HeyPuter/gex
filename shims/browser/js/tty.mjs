@@ -15,9 +15,9 @@
 import { lazyFetch } from './lazy-fetch.mjs';
 import { single, sched } from './single.mjs';
 
-/** The single-thread build's fibers park on the scheduler, not on the
- *  kernel's wake word: whatever this file changes in the kernel wakes them. */
-const poke = () => { if (single.on) sched.wake(); };
+/** The single-thread build's fibers park on the scheduler, not on their
+ *  wait slots' words: whatever this file changes in the kernel, they look. */
+const poke = () => { if (single.on) sched.checkSlots(); };
 
 /// Where the page writes bytes for the kernel to copy out of. The kernel
 /// imports the calling process's memory and addresses it with `memory.copy`;
@@ -166,7 +166,6 @@ export class PageTty {
   /** There will be no more input -- the page has gone, or `^D` at the end. */
   eof() {
     this.#k.k_stdin_eof();
-    this.#k.k_wake?.();
     poke();
   }
 

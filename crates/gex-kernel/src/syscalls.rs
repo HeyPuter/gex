@@ -1114,6 +1114,12 @@ pub enum PollReport {
         /// `struct epoll_event` packed in 12 bytes (x86-64's, and the i386
         /// ABI's in any build), rather than 16.
         packed: bool,
+        /// The set, whose wait queue the waiter registers on (it is chained
+        /// onto every watched descriptor's), and its interest list's
+        /// generation when the descriptors were collected: a change means
+        /// the list in hand is out of date and the call must be made again.
+        set: Arc<unix::EpollSet>,
+        generation: u32,
     },
     /// `select`'s three `fd_set`s. A zero address means the caller did not
     /// pass that set.
@@ -1192,7 +1198,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             }
             Ok(ready)
         }
-        PollReport::Epoll { out, max, data, packed } => {
+        PollReport::Epoll { out, max, data, packed, .. } => {
             // Only the ready ones, each with the caller's own token, which is
             // the whole difference between this and `poll`.
             let mut n = 0u64;
@@ -2432,6 +2438,7 @@ impl Kernel {
             // happened to suit it.
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
                 let set = self.epoll_of(a[0] as i32).ok()?;
+                let generation = set.generation();
                 let fds = self.epoll_pollfds(&set);
                 if poll_ready(&fds) {
                     return None;
@@ -2470,6 +2477,8 @@ impl Kernel {
                         max: a[2] as u32,
                         data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
                         packed: gex_abi::X86 || self.compat,
+                        set: Arc::clone(&set),
+                        generation,
                     },
                 })
             }
@@ -5505,6 +5514,17 @@ impl Kernel {
         self.itimers.iter().any(|t| t.is_some())
     }
 
+    /// How long until the next interval timer fires, if one is armed: a
+    /// parked thread's host sleeps no longer than that, since the timer's
+    /// signal may be what ends its wait.
+    pub fn timer_in_ns(&self) -> Option<u64> {
+        if self.itimers.iter().all(|t| t.is_none()) {
+            return None;
+        }
+        let now = self.now_nanos();
+        self.itimers.iter().flatten().map(|t| t.next.saturating_sub(now).min(u64::MAX as u128) as u64).min()
+    }
+
     /// Whether an interval timer has expired and has yet to raise its signal.
     /// The host asks this on its way past: a process that never traps into
     /// the kernel (a shell's `timeout` spinning on `wait4`/`sigsuspend`) would
@@ -6333,10 +6353,12 @@ impl Kernel {
         };
         // Watching something that is not open is an error, and a program that
         // gets silence instead waits for a readiness that cannot arrive.
-        if op != unix::epoll_op::DEL {
-            self.fds.get(fd)?;
-        }
-        set.ctl(op, fd, events, data)
+        let source = if op != unix::epoll_op::DEL {
+            self.fds.get(fd)?.handle.wait_queue()
+        } else {
+            0
+        };
+        set.ctl_queue(op, fd, events, data, source)
     }
 
     /// Note that `[addr, addr + len)` no longer holds the code it did.
@@ -6383,6 +6405,7 @@ impl Kernel {
             .iter()
             .filter_map(|w| {
                 let file = self.fds.get(w.fd).ok()?;
+                set.rechain(w.fd, file.handle.wait_queue());
                 Some(PollFd {
                     addr: 0,
                     fd: w.fd,

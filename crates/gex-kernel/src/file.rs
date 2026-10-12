@@ -497,6 +497,10 @@ impl FileHandle for PipeEnd {
     fn is_stream(&self) -> bool {
         true
     }
+
+    fn wait_queue(&self) -> u32 {
+        self.pipe.wait_queue()
+    }
 }
 
 impl Drop for PipeEnd {

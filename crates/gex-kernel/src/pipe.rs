@@ -43,7 +43,8 @@ struct State {
 pub struct Pipe {
     state: Mutex<State>,
     ready: Condvar,
-
+    /// Who waits on either end (`crate::wait`): notified wherever `ready` is.
+    queue: crate::wait::Queue,
 }
 
 impl Default for Pipe {
@@ -67,9 +68,14 @@ impl Pipe {
                 broken: 0,
             }),
             ready: Condvar::new(),
+            queue: crate::wait::Queue::new(),
         }
     }
 
+    /// The wait queue both ends' waiters register on.
+    pub fn wait_queue(&self) -> u32 {
+        self.queue.id()
+    }
 
 
     /// Note that another descriptor now refers to one end.
@@ -93,6 +99,7 @@ impl Pipe {
         // Waking both sides is what turns the last close into an EOF or an
         // EPIPE rather than a hang.
         self.ready.notify_all();
+                self.queue.notify();
     }
 
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
@@ -111,6 +118,7 @@ impl Pipe {
                 buf[k..n].copy_from_slice(&back[..n - k]);
                 s.buf.drain(..n);
                 self.ready.notify_all();
+                self.queue.notify();
                 return Ok(n as u64);
             }
             // No data: end of file once no writer can ever supply any.
@@ -153,6 +161,7 @@ impl Pipe {
                 s.last.extend(buf[written..written + n].iter().take(160));
                 written += n;
                 self.ready.notify_all();
+                self.queue.notify();
                 if written == buf.len() {
                     return Ok(written as u64);
                 }
@@ -357,6 +366,8 @@ pub struct Remote {
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub buffered: extern "C" fn(id: i32) -> i32,
+    /// The pipe's wait queue (`crate::wait`).
+    pub queue: extern "C" fn(id: i32) -> u32,
 }
 
 /// One end of a pipe in the global kernel. Dropping closes that end there, so
@@ -431,6 +442,10 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
 
     fn poll_writable(&self) -> bool {
         !self.write || (self.remote.writable)(self.id) != 0
+    }
+
+    fn wait_queue(&self) -> u32 {
+        (self.remote.queue)(self.id)
     }
 
     /// The read end of a pipe with room in it: no writer is parked on it.

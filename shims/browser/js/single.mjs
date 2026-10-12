@@ -179,10 +179,15 @@ const SLICE_MS = 8;
 class Waiter {
   constructor(resolve, futex, fiber) {
     this.resolve = resolve;
-    this.futex = futex; // a BigInt address, or null for the global word
+    this.futex = futex; // a BigInt address, null for the global word, or a slot (below)
     this.fiber = fiber;
     this.timer = 0;
     this.done = false;
+    /** A wait slot's word (`k_ws_park`): a function giving the kernel
+     *  memory's current words (it can grow), the index, the value parked at. */
+    this.words = null;
+    this.at = 0;
+    this.seq = 0;
   }
 }
 
@@ -191,6 +196,11 @@ export class Sched {
   #global = new Set();
   /** Fibers parked on a futex, by address. */
   #futex = new Map();
+  /** Fibers parked on their wait slot (`k_ws_park`, docs/kernel-locking.md
+   *  §5.2 step 2). A notify bumps the slot's word in the kernel's (plain)
+   *  memory and its `memory.atomic.notify` wakes nobody, so whoever may have
+   *  notified asks `checkSlots` -- and every park and yield does. */
+  #slots = new Set();
   /** Resolutions held back for a macrotask (see `#resume`). */
   #held = [];
   /** Woken waiters not yet resumed: they run when the running fiber parks,
@@ -260,7 +270,8 @@ export class Sched {
     if (w.done) return;
     w.done = true;
     if (w.timer) clearTimeout(w.timer);
-    if (w.futex === null) this.#global.delete(w);
+    if (w.words) this.#slots.delete(w);
+    else if (w.futex === null) this.#global.delete(w);
     else {
       const s = this.#futex.get(w.futex);
       s?.delete(w);
@@ -287,22 +298,48 @@ export class Sched {
     for (const f of ready) this.#resume(f);
   }
 
-  #park(futex, ns, fiber) {
+  #park(futex, ns, fiber, slot = null) {
+    // Whatever the running fiber notified before it parks.
+    this.checkSlots();
     return new Promise((resolve) => {
       const w = new Waiter(resolve, futex, fiber);
-      if (futex === null) this.#global.add(w);
+      if (slot) {
+        w.words = slot.words;
+        w.at = slot.at;
+        w.seq = slot.seq;
+        this.#slots.add(w);
+      } else if (futex === null) this.#global.add(w);
       else {
         let s = this.#futex.get(futex);
         if (!s) this.#futex.set(futex, (s = new Set()));
         s.add(w);
       }
-      // `ns` bounds every wait, as it bounds `memory.atomic.wait32`.
-      const ms = Math.max(0, Number(ns) / 1e6);
-      if (Number.isFinite(ms) && ms < 2 ** 31) {
+      // `ns` bounds a wait, as it bounds `memory.atomic.wait32`; a negative
+      // one waits for ever.
+      const n = Number(ns);
+      const ms = Math.max(0, n / 1e6);
+      if (n >= 0 && Number.isFinite(ms) && ms < 2 ** 31) {
         w.timer = setTimeout(() => { this.stats.timeouts++; this.#settle(w, 2); }, ms);
       }
       this.#flush();
     });
+  }
+
+  /** Sleep until the wait slot word `words()[at]` leaves `seq`, or `ns` pass
+   *  (negative: for ever): 0 woken, 1 it had already moved, 2 timed out. */
+  parkSlot(words, at, seq, ns, fiber = null) {
+    if (Atomics.load(words(), at) !== seq) return 1;
+    this.stats.slotParks = (this.stats.slotParks ?? 0) + 1;
+    return this.#park(null, ns, fiber, { words, at, seq });
+  }
+
+  /** A wait slot may have been notified (a kernel call, the compositor's
+   *  input): every fiber whose slot moved re-checks. */
+  checkSlots() {
+    if (!this.#slots.size) return;
+    for (const w of [...this.#slots]) {
+      if (Atomics.load(w.words(), w.at) !== w.seq) this.#settle(w, 0);
+    }
   }
 
   /** Sleep until the global counter is bumped, or `ns` pass: 0 woken, 2 timed out. */
@@ -311,28 +348,21 @@ export class Sched {
     return this.#park(null, ns, fiber);
   }
 
-  /** Sleep until futex `addr` is woken, or `ns` pass. */
-  parkFutex(addr, ns, fiber = null) {
-    this.stats.futexParks++;
-    return this.#park(BigInt.asUintN(64, BigInt(addr)), ns, fiber);
-  }
 
-  /** The global counter moved: everyone parked on it re-checks. */
+  /** Something of the page's own happened that this realm has no queue for
+   *  -- the network's bytes, which the one Wisp connection has no way to say
+   *  are whose: every parked fiber re-checks. The single-thread build only;
+   *  the default build's network waits turn their own Worker's loop. */
   wake() {
-    if (!this.#global.size) return;
+    if (!this.#global.size && !this.#slots.size) return;
     this.stats.wakes++;
     for (const w of [...this.#global]) this.#settle(w, 0);
-  }
-
-  /** A futex was woken (and with it the global counter). */
-  wakeFutex(addr) {
-    const s = this.#futex.get(BigInt.asUintN(64, BigInt(addr)));
-    if (s) for (const w of [...s]) this.#settle(w, 0);
-    this.wake();
+    for (const w of [...this.#slots]) this.#settle(w, 0);
   }
 
   /** Forget a fiber's waits (its Worker was terminated). */
   drop(fiber) {
+    for (const w of [...this.#slots]) if (w.fiber === fiber) { w.done = true; clearTimeout(w.timer); this.#slots.delete(w); }
     for (const w of [...this.#global]) if (w.fiber === fiber) { w.done = true; clearTimeout(w.timer); this.#global.delete(w); }
     for (const [k, s] of this.#futex) {
       for (const w of [...s]) if (w.fiber === fiber) { w.done = true; clearTimeout(w.timer); s.delete(w); }
@@ -346,6 +376,7 @@ export class Sched {
    * loop when it has run out.
    */
   maybeYield() {
+    this.checkSlots();
     if (!this.sliceOver()) return 0;
     this.stats.yields++;
     return new Promise((resolve) => {
@@ -360,6 +391,7 @@ export class Sched {
    * just woke would wait out the slice.
    */
   yieldNow() {
+    this.checkSlots();
     if (!this.#ready.length) return this.maybeYield();
     this.stats.yields++;
     this.#flush();
@@ -368,7 +400,7 @@ export class Sched {
 
   /** How many fibers are parked, for a census. */
   get parked() {
-    let n = this.#global.size;
+    let n = this.#global.size + this.#slots.size;
     for (const s of this.#futex.values()) n += s.size;
     return n;
   }

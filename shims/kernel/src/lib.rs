@@ -19,6 +19,8 @@ use std::sync::{Mutex, OnceLock};
 
 use gex_kernel::proc::ProcTable;
 
+mod wait;
+
 /// Stacks, one per Worker. Every Worker instantiates this module and shares its
 /// memory but has its own `__stack_pointer`, all initialised to the same
 /// address by wasm-ld -- so without a distinct slice each, two Workers here at
@@ -51,63 +53,10 @@ pub extern "C" fn k_stack_count() -> u32 {
     STACK_COUNT
 }
 
-/// The word every Worker waits on and bumps, so a blocked guest is woken by a
-/// wake rather than by JS polling once a millisecond. It lives here because
-/// `memory.atomic.wait32`/`notify` act on the addressed memory, and only this
-/// module's is shared across every process; a word in a process's memory is
-/// visible only to that process's own threads.
-///
-/// A counter, not a flag, so a wake between deciding to park and parking is not
-/// lost: the parker samples the value and sleeps only while it is unchanged.
-static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-fn wake_addr() -> *mut i32 {
-    &WAKE as *const std::sync::atomic::AtomicI32 as *mut i32
-}
-
-/// Where the counter is in this module's memory: a Worker that must keep
-/// its event loop running (a network wait) waits on it with
-/// `Atomics.waitAsync` instead of polling (gex.mjs `#netWait`).
-#[no_mangle]
-pub extern "C" fn k_wake_addr() -> u32 {
-    wake_addr() as u32
-}
-
-/// What the counter reads now. Sampled before a Worker decides to park.
-#[no_mangle]
-pub extern "C" fn k_wake_seq() -> i32 {
-    WAKE.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Something happened that another Worker may have been waiting for. Called
-/// after every syscall, not at hand-picked spots: missing one wake-up strands a
-/// process, and a notify with nobody waiting costs a few nanoseconds.
-#[no_mangle]
-pub extern "C" fn k_wake() {
-    WAKE.fetch_add(1, std::sync::atomic::Ordering::Release);
-    // SAFETY: the address of a static in this module's own shared memory,
-    // which is what this instruction requires.
-    unsafe {
-        core::arch::wasm32::memory_atomic_notify(wake_addr(), u32::MAX);
-    }
-}
-
-/// Sleep until the counter leaves `seq`, or `ns` nanoseconds pass. Returns 0
-/// woken, 1 value already moved, 2 timed out. A bounded wait keeps a Worker
-/// answerable to the page.
-#[no_mangle]
-pub extern "C" fn k_park(seq: i32, ns: i64) -> i32 {
-    // SAFETY: as above. Blocking is allowed because every guest runs in a
-    // Worker; the page's own thread never enters this module.
-    unsafe { core::arch::wasm32::memory_atomic_wait32(wake_addr(), seq, ns) }
-}
-
 /// Per-address futex wake generations, shared across every Worker.
 ///
-/// The global [`WAKE`] counter says "somebody did something" and makes every
-/// parked Worker re-check; this says *which futex* was woken, precisely. A
-/// Worker parking on a futex records the address's generation here, and wakes
-/// only when it changes -- a real wake ALWAYS bumps it, whatever the futex word
+/// A Worker parking on a futex records the address's generation here, and is
+/// ready only when it changes -- a real wake ALWAYS bumps it, whatever the futex word
 /// does afterward, so this has none of the ambiguity of guessing from the word
 /// (which a heavily-contended condvar counter can leave back at the waited-for
 /// value before the sleeper is scheduled, stranding a whole thread pool). It is
@@ -128,26 +77,44 @@ fn futex_slot(addr: u64) -> usize {
     (((a ^ (a >> 15)).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 40) as usize & (FUTEX_SLOTS - 1)
 }
 
-/// A futex at `addr` was woken: bump its generation and wake every parked
-/// Worker to re-check. Called by the browser host for every wake its per-Worker
-/// `FutexTable` recorded -- a `FUTEX_WAKE`, a thread exit clearing its tid, any
-/// of them.
+/// The wait queue of the futex bucket `addr` hashes to, made on first use: a
+/// thread parked on a futex registers its wait slot here
+/// (docs/kernel-locking.md §5.2 step 2), and a wake notifies it. Fewer
+/// buckets than generation slots; a shared bucket only wakes a waiter that
+/// then finds its own generation unmoved and parks again.
+const FUTEX_QUEUES: usize = 4096;
+static FUTEX_QS: [std::sync::atomic::AtomicU32; FUTEX_QUEUES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; FUTEX_QUEUES];
+
+#[no_mangle]
+pub extern "C" fn k_futex_queue(addr: u64) -> u32 {
+    use std::sync::atomic::Ordering::SeqCst;
+    note_panics();
+    let at = &FUTEX_QS[futex_slot(addr) & (FUTEX_QUEUES - 1)];
+    let q = at.load(SeqCst);
+    if q != 0 {
+        return q;
+    }
+    let fresh = wait::new_queue();
+    match at.compare_exchange(0, fresh, SeqCst, SeqCst) {
+        Ok(_) => fresh,
+        Err(theirs) => {
+            wait::free_queue(fresh);
+            theirs
+        }
+    }
+}
+
+/// A futex at `addr` was woken: bump its generation and notify the threads
+/// waiting on its bucket's queue. Called by the browser host for every wake
+/// its per-Worker `FutexTable` recorded -- a `FUTEX_WAKE`, a thread exit
+/// clearing its tid, any of them.
 #[no_mangle]
 pub extern "C" fn k_futex_wake(addr: u64) {
-    let slot = &FUTEX_GENS[futex_slot(addr)];
-    slot.fetch_add(1, std::sync::atomic::Ordering::Release);
-    // The Workers parked on this futex wait on its slot (`k_park_futex`), not
-    // on `WAKE`: without this notify they slept out their whole bound (20 ms
-    // in W3's `gex_park`) on every wake. That was Undertale's page regression
-    // once d761d4d4 stopped other threads' deadlines from cutting it short.
-    // SAFETY: the address of a static in this module's own shared memory.
-    unsafe {
-        core::arch::wasm32::memory_atomic_notify(
-            slot as *const std::sync::atomic::AtomicU32 as *mut i32,
-            u32::MAX,
-        );
-    }
-    k_wake();
+    FUTEX_GENS[futex_slot(addr)].fetch_add(1, std::sync::atomic::Ordering::Release);
+    // The threads parked on this futex's bucket, and nobody else.
+    let q = FUTEX_QS[futex_slot(addr) & (FUTEX_QUEUES - 1)].load(std::sync::atomic::Ordering::SeqCst);
+    wait::notify(q);
 }
 
 /// The generation of the futex at `addr`, sampled when a Worker parks on it and
@@ -155,28 +122,6 @@ pub extern "C" fn k_futex_wake(addr: u64) {
 #[no_mangle]
 pub extern "C" fn k_futex_gen(addr: u64) -> u32 {
     FUTEX_GENS[futex_slot(addr)].load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Sleep until the futex at `addr` is woken (its generation leaves `gen`), or
-/// `ns` pass. Returns 0 woken, 1 the generation already moved, 2 timed out.
-///
-/// Unlike [`k_park`], which sleeps on the one global [`WAKE`] counter that every
-/// syscall in every process bumps, this sleeps on just this futex's generation
-/// slot -- so an idle condvar waiter (a GLib thread-pool worker, say) is not
-/// woken by the blanket notify a busy sibling fires on every syscall. That
-/// thundering herd made a multi-threaded GTK program crawl: N idle threads each
-/// took the host lock to re-check on every one of another thread's syscalls. A
-/// `FUTEX_WAKE` to this address (via `k_futex_wake`) still bumps the slot and
-/// wakes it precisely; the caller passes a bounded `ns` so signals, deadlines
-/// and page work -- which do not touch this slot -- are still answered in time.
-#[no_mangle]
-pub extern "C" fn k_park_futex(addr: u64, gen: u32, ns: i64) -> i32 {
-    let slot = futex_slot(addr);
-    let at = &FUTEX_GENS[slot] as *const std::sync::atomic::AtomicU32 as *mut i32;
-    // SAFETY: the address of a static in this module's own shared memory, which
-    // is what the wait instruction requires. `gen` is compared as the same bit
-    // pattern the generation was stored with (a wrapping u32 counter).
-    unsafe { core::arch::wasm32::memory_atomic_wait32(at, gen as i32, ns) }
 }
 
 /// What this module last panicked with. It has no console (it imports nothing
@@ -190,6 +135,7 @@ static PANIC: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 fn note_panics() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        wait::install();
         std::panic::set_hook(Box::new(|info| {
             let mut slot = PANIC.lock().unwrap_or_else(|e| e.into_inner());
             *slot = format!("{info}");
@@ -269,14 +215,28 @@ pub extern "C" fn k_slot_len() -> u32 {
     slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
-/// Standard input, shared. Whoever has the keystroke writes it and calls
-/// [`k_wake`], so a parked reader is woken by the same counter a pipe write
-/// bumps -- rather than by a `postMessage` a Worker parked inside wasm cannot
+/// Standard input, shared. Whoever has the keystroke writes it, which
+/// notifies its queue ([`stdin_queue`]), so a parked reader is woken --
+/// rather than by a `postMessage` a Worker parked inside wasm cannot
 /// receive.
 fn stdin() -> &'static Mutex<(std::collections::VecDeque<u8>, bool)> {
     note_panics();
     static Q: OnceLock<Mutex<(std::collections::VecDeque<u8>, bool)>> = OnceLock::new();
     Q.get_or_init(|| Mutex::new((std::collections::VecDeque::new(), false)))
+}
+
+/// The wait queue of standard input and the shared terminal: a reader of
+/// either registers here, and typing, end of input or a change of the
+/// foreground group notifies it.
+fn stdin_queue() -> &'static gex_kernel::wait::Queue {
+    note_panics();
+    static Q: OnceLock<gex_kernel::wait::Queue> = OnceLock::new();
+    Q.get_or_init(gex_kernel::wait::Queue::new)
+}
+
+#[no_mangle]
+pub extern "C" fn k_stdin_queue() -> u32 {
+    stdin_queue().id()
 }
 
 /// Append what was typed, from the caller's process memory.
@@ -286,8 +246,8 @@ pub extern "C" fn k_stdin_write(at: gex_kmem::PAddr, len: u32) -> i32 {
     // SAFETY: the same copy every pipe write makes, and `pull_checked`
     // refuses a range outside the process memory rather than reading it.
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
-    let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
-    s.0.extend(buf);
+    stdin().lock().unwrap_or_else(|e| e.into_inner()).0.extend(buf);
+    stdin_queue().notify();
     len as i32
 }
 
@@ -295,6 +255,7 @@ pub extern "C" fn k_stdin_write(at: gex_kmem::PAddr, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_stdin_eof() {
     stdin().lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+    stdin_queue().notify();
 }
 
 /// Bytes waiting, or -1 once there will be no more and none are left.
@@ -383,7 +344,7 @@ pub extern "C" fn k_tty_input(at: gex_kmem::PAddr, len: u32) -> i32 {
         let _ = procs().kill_group(gex_kernel::INIT_PID, fg_group(), sig);
     }
     // Wake a reader parked inside wasm, which runs no event loop.
-    k_wake();
+    stdin_queue().notify();
     echoed().lock().unwrap_or_else(|e| e.into_inner()).len() as i32
 }
 
@@ -468,12 +429,11 @@ pub extern "C" fn k_tty_signal(signo: u32) -> i32 {
         return -22;
     }
     note_kill(0, -fg_group(), signo);
-    let n = match procs().kill_group(gex_kernel::INIT_PID, fg_group(), signo) {
+    // `kill_group` wakes the group's waiting threads.
+    match procs().kill_group(gex_kernel::INIT_PID, fg_group(), signo) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
-    };
-    k_wake();
-    n
+    }
 }
 
 #[no_mangle]
@@ -484,6 +444,8 @@ pub extern "C" fn k_tty_fg() -> i32 {
 #[no_mangle]
 pub extern "C" fn k_tty_set_fg(pgrp: i32) {
     tty().set_fg(pgrp);
+    // Whose read may go on has changed.
+    stdin_queue().notify();
 }
 
 #[no_mangle]
@@ -1752,6 +1714,12 @@ pub extern "C" fn k_has_signals(pid: i32) -> i32 {
     procs().has_signals(pid) as i32
 }
 
+/// `pid`'s wait queue (`ProcTable::queue`).
+#[no_mangle]
+pub extern "C" fn k_proc_queue(pid: i32) -> u32 {
+    procs().queue(pid)
+}
+
 /// Whether `pid` is a live process.
 #[no_mangle]
 pub extern "C" fn k_exists(pid: i32) -> i32 {
@@ -1975,6 +1943,12 @@ pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     }
 }
 
+/// The pipe's wait queue.
+#[no_mangle]
+pub extern "C" fn k_pipe_queue(id: i32) -> u32 {
+    pipe_at(id).map_or(0, |p| p.wait_queue())
+}
+
 /// Would a read block? False also when every writer has gone, which is EOF.
 #[no_mangle]
 pub extern "C" fn k_pipe_readable(id: i32) -> i32 {
@@ -2143,7 +2117,6 @@ pub extern "C" fn k_pty_close_end(id: i32, master: i32, pid: i32) {
                     .insert(id, pid);
             }
         }
-        k_wake();
     }
 }
 
@@ -2167,9 +2140,6 @@ pub extern "C" fn k_pty_forget(pid: i32) -> u32 {
                 p.close_slave();
             }
         }
-    }
-    if n > 0 {
-        k_wake();
     }
     n
 }
@@ -2231,8 +2201,6 @@ pub extern "C" fn k_pty_write(id: i32, master: i32, at: gex_kmem::PAddr, len: u3
     } else {
         p.slave_write(&buf);
     }
-    // Wake a reader parked in another Worker, which runs no event loop.
-    k_wake();
     len as i32
 }
 
@@ -2375,7 +2343,14 @@ pub extern "C" fn k_pty_fg(id: i32) -> i32 {
 pub extern "C" fn k_pty_set_fg(id: i32, pgrp: i32) {
     if let Some(p) = pty_at(id) {
         p.tty.set_fg(pgrp);
+        p.notify();
     }
+}
+
+/// The pair's wait queue.
+#[no_mangle]
+pub extern "C" fn k_pty_queue(id: i32) -> u32 {
+    pty_at(id).map_or(0, |p| p.queue_id())
 }
 
 #[no_mangle]
@@ -2840,17 +2815,8 @@ pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
     let s = std::sync::Arc::new(UnixSocket::new(true));
     match names().connect(&s, &p) {
-        Ok(_) => {
-            // A connection is waiting on someone's listener, and that someone
-            // may be parked. The guest syscall path wakes after every call;
-            // these entry points are reached from the *host* -- the
-            // compositor's X window manager, the page's own sockets -- and woke
-            // nothing at all. A parked Worker re-checks on its own every 20 ms
-            // whatever happens, so this is latency rather than correctness:
-            // without it a host-side connect waits for that timer.
-            k_wake();
-            keep(s)
-        }
+        // The listener's queue is notified by the connect itself.
+        Ok(_) => keep(s),
         Err(e) => -e.0,
     }
 }
@@ -2860,12 +2826,7 @@ pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
 pub extern "C" fn k_sock_accept(listener: i32) -> i32 {
     let Some(l) = sock_at(listener) else { return -9 };
     match l.accept() {
-        Ok(s) => {
-            // The other end is connected now, which a parked client may be
-            // waiting to hear.
-            k_wake();
-            keep(s)
-        }
+        Ok(s) => keep(s),
         Err(e) => -e.0,
     }
 }
@@ -2899,15 +2860,17 @@ pub extern "C" fn k_sock_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
+    // The send notifies the reading end's queue.
     match s.send(&buf) {
-        Ok(n) => {
-            // Bytes for whoever is reading, who may be parked. Same reason as
-            // `k_sock_connect`: the host has no syscall path to wake for it.
-            k_wake();
-            n as i32
-        }
+        Ok(n) => n as i32,
         Err(e) => -e.0,
     }
+}
+
+/// The end's wait queue.
+#[no_mangle]
+pub extern "C" fn k_sock_queue(id: i32) -> u32 {
+    sock_at(id).map_or(0, |s| s.queue_id())
 }
 
 #[no_mangle]
@@ -3104,10 +3067,7 @@ pub extern "C" fn k_sock_write_fds(
     // back (and its references with it) rather than riding a later send.
     s.stage_send(Vec::new());
     match r {
-        Ok(n) => {
-            k_wake();
-            n as i32
-        }
+        Ok(n) => n as i32,
         Err(e) => -e.0,
     }
 }

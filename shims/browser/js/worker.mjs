@@ -491,7 +491,7 @@ async function handle(msg) {
       port.post({ kind: 'wl-memory', token, memory: gex.memory, kernel: gex.kernelWake()?.memory });
     };
     proxy.onToken = gex.onWlToken;
-    proxy.wakeAddr = () => gex.kernelWake()?.addr ?? 0;
+    proxy.wakeAddr = () => gex.kernelWake();
   } else if (msg.wlStub) {
     // A headless compositor for node: the shim's gex-wayland runs and binds
     // `wayland-0`, so a guest connects and inits exactly as in the browser, but

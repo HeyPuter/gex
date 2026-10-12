@@ -218,6 +218,17 @@ fn output_size() -> (i32, i32) {
 /// because the ioctl arrives on whichever thread the client called it from.
 static COMPOSITOR: std::sync::Mutex<Option<WaylandDevice>> = std::sync::Mutex::new(None);
 
+/// Whether this process's compositor has anything to move (`needs_pump`),
+/// for a scheduler turn that takes no lock (`waitq::idle_turn`): if so, the
+/// turn takes the lock and pumps. A compositor busy elsewhere is a yes.
+pub fn pump_wanted() -> bool {
+    let device = match COMPOSITOR.try_lock() {
+        Ok(d) => d.clone(),
+        Err(_) => return true,
+    };
+    device.is_some_and(|d| d.needs_pump())
+}
+
 /// Remember it at mount, so the GL device can find it later.
 pub fn set_compositor(device: &WaylandDevice) {
     *COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(device.clone());

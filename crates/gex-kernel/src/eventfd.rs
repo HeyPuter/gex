@@ -33,6 +33,8 @@ const MAX: u64 = u64::MAX - 1;
 pub struct EventFd {
     count: Mutex<u64>,
     semaphore: bool,
+    /// Who waits on it (`crate::wait`): a read makes room, a write a value.
+    queue: crate::wait::Queue,
 }
 
 impl EventFd {
@@ -40,6 +42,7 @@ impl EventFd {
         EventFd {
             count: Mutex::new(initval),
             semaphore,
+            queue: crate::wait::Queue::new(),
         }
     }
 }
@@ -63,6 +66,8 @@ impl FileHandle for EventFd {
         } else {
             std::mem::replace(&mut *c, 0)
         };
+        drop(c);
+        self.queue.notify();
         buf[..8].copy_from_slice(&val.to_ge_bytes());
         Ok(8)
     }
@@ -84,6 +89,8 @@ impl FileHandle for EventFd {
             return Err(Errno::EAGAIN);
         }
         *c += val;
+        drop(c);
+        self.queue.notify();
         Ok(8)
     }
 
@@ -108,6 +115,10 @@ impl FileHandle for EventFd {
 
     fn poll_readable(&self) -> bool {
         *self.count.lock().unwrap() > 0
+    }
+
+    fn wait_queue(&self) -> u32 {
+        self.queue.id()
     }
 
     fn poll_writable(&self) -> bool {

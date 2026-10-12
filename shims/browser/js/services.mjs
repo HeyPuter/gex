@@ -7,6 +7,7 @@
 // It holds a process memory of its own only because the kernel imports one and
 // `k_pipe_write` reads bytes from there; it is a staging buffer, nothing more.
 import { lazyFetch } from './lazy-fetch.mjs';
+import { single, sched } from './single.mjs';
 let k = null;
 let stage = null; // Uint8Array over this Worker's dummy process memory
 const STAGE_AT = 0x1000;
@@ -40,8 +41,7 @@ self.onmessage = async (e) => {
   }
   if (!k) return;
   if (msg?.kind === 'write') {
-    // Into the kernel, then a wake: whoever is parked on the other end is woken
-    // by the same counter another guest's write would bump.
+    // Into the kernel, whose pipe notifies whoever waits on its other end.
     const bytes = msg.bytes;
     let off = 0;
     while (off < bytes.length) {
@@ -51,13 +51,13 @@ self.onmessage = async (e) => {
       if (wrote <= 0) break;
       off += wrote;
     }
-    k.k_wake();
+    if (single.on) sched.checkSlots();
     post({ kind: 'wrote', id: msg.id, n: off });
     return;
   }
   if (msg?.kind === 'close') {
     k.k_pipe_close_end(msg.pipe, 1);
-    k.k_wake();
+    if (single.on) sched.checkSlots();
     return;
   }
 };

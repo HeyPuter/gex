@@ -202,6 +202,22 @@ impl FileHandle for OssHandle {
         false
     }
 
+    /// A full buffer drains by the clock, which no notify reports: a writer
+    /// waiting for room is ready when one byte has played.
+    fn ready_in_ns(&self) -> Option<u64> {
+        if self.node != OssNode::Dsp {
+            return None;
+        }
+        let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        s.drain();
+        if s.queued < BUFSIZE {
+            // Room now: a writer is ready, and a reader never is.
+            return None;
+        }
+        let bps = s.bytes_per_second().max(1);
+        Some((1_000_000_000 / bps).max(1))
+    }
+
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         let request = request as u32;
         // An int argument read and written back.

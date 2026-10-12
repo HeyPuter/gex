@@ -227,6 +227,21 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// The wait queue a change in this handle's readiness is announced on
+    /// ([`crate::wait`]): a thread waiting for it registers its wait slot
+    /// there. 0 for a handle whose readiness no event changes (a file is
+    /// always ready; a timer becomes ready by the clock, [`Self::ready_in_ns`]).
+    fn wait_queue(&self) -> u32 {
+        0
+    }
+
+    /// How long until this handle becomes ready by the clock alone (a
+    /// timerfd's next expiry, a sound device draining its buffer), for a
+    /// waiter to bound its park by. `None` when only an event makes it ready.
+    fn ready_in_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether the peer has shut its sending side, so reading ends at EOF
     /// once the buffer is empty: `POLLRDHUP` / `EPOLLRDHUP`, reported only
     /// when asked for.
