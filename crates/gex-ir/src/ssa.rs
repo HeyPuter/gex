@@ -292,10 +292,20 @@ pub fn to_ssa_sp(f: &Function, call: &dyn Fn(Callee) -> CallEffect, sp: GuestReg
     let mut end_state: Vec<Option<State>> = vec![None; n];
     let mut subst: HashMap<Value, Value> = HashMap::new();
 
-    // Iterative preorder over the dominator tree.
+    // Iterative preorder over the dominator tree: a tree per entry block,
+    // and one per reachable block whose only dominator is the virtual root
+    // above the entries (a join of paths from two entries, such as the code
+    // after an interior entry that the function's own entry also reaches).
+    // Such a block starts with nothing known but its parameters: it is in
+    // the dominance frontier of every entry, which defines every register.
+    // Left out, its tree kept its memory form, and a jump table ending in it
+    // read its index from the context and no longer resolved.
     let mut stack: Vec<BlockId> = entries.iter().rev().copied().collect();
-    // Also any reachable block with no idom that is not an entry (cannot
-    // happen, but keeps the walk total).
+    for &b in rpo.iter().rev() {
+        if idom[b.index()].is_none() && !is_entry[b.index()] {
+            stack.insert(0, b);
+        }
+    }
     while let Some(b) = stack.pop() {
         let mut st: State = match idom[b.index()] {
             None => vec![None; N_REGS],

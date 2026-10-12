@@ -220,9 +220,13 @@ mod imp {
         !bytes.is_empty() && gex_isa_x86::decode(bytes, pc).is_known()
     }
 
-    /// A linear sweep of the code: every `lea reg, [rip+disp]` and every
-    /// `mov reg, imm` whose value lands in executable memory is an
-    /// address-taken function. The sweep starts at the range's beginning and
+    /// A linear sweep of the code: every `lea reg, [rip+disp]`, every
+    /// `mov reg/mem, imm` and every `push imm` whose value lands in
+    /// executable memory is an address-taken function. `push imm32` is how
+    /// i386 code passes a function as an argument (a callback, a handler
+    /// registered in a table: GameMaker's runner registers each builtin with
+    /// `push offset fn`), and a PE without base relocations names those
+    /// functions nowhere else. The sweep starts at the range's beginning and
     /// follows instruction lengths; compiler output keeps it in step, and a
     /// stretch out of step only costs spurious seeds `is_exec` rejects.
     pub fn scan_code_pointers(
@@ -255,7 +259,17 @@ mod imp {
                         seed(t);
                     }
                 }
-                _ => {}
+                _ => match (inst.op, inst.ops[0]) {
+                    (Op::Push, Some(Operand::Imm(v))) => {
+                        // Sign-extended as decoded: an address of an i386
+                        // program is its low 32 bits.
+                        let t = if super::compat() { v as u32 as u64 } else { v as u64 };
+                        if is_exec(t) {
+                            seed(t);
+                        }
+                    }
+                    _ => {}
+                },
             }
             a += inst.len.max(1) as u64;
         }
