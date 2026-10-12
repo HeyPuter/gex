@@ -14607,8 +14607,9 @@ pub extern "C" fn gex_module_len(i: u32) -> u32 {
 ///   `reset`.
 /// - the page table's counters: every clone of a page table shares them, so
 ///   publishing is keeping the `Arc`s, done whenever `h.jit.page_table` is
-///   assigned. A replaced set is leaked rather than freed, because a reader
-///   may still hold it: a few dozen bytes per exec.
+///   assigned. That changes them only when a process starts and at each
+///   `execve`; a replaced set is freed four replacements later, not at
+///   once, because a reader may still hold it.
 pub(crate) mod regview {
     use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -14685,6 +14686,10 @@ pub(crate) mod regview {
         highs: Arc<Vec<AtomicU64>>,
     }
     static MARKS: AtomicPtr<Marks> = AtomicPtr::new(core::ptr::null_mut());
+    /// Replaced mark sets, freed RETIRED_KEEP replacements later.
+    const RETIRED_KEEP: usize = 4;
+    static RETIRED: [AtomicPtr<Marks>; RETIRED_KEEP] = [const { AtomicPtr::new(core::ptr::null_mut()) }; RETIRED_KEEP];
+    static RETIRED_N: AtomicU32 = AtomicU32::new(0);
 
     /// Keep `t`'s counters for lock-free readers, unless they are the ones
     /// already kept.
@@ -14696,6 +14701,21 @@ pub(crate) mod regview {
             return;
         }
         MARKS.store(Box::leak(Box::new(Marks { high, next, highs })), Ordering::Release);
+        // The set replaced is kept for readers that may still hold it, and
+        // freed once RETIRED_KEEP later replacements have passed. Sets change
+        // only when a process starts and at each `execve`, which leaves the
+        // process one thread: a reader would have to sleep inside a getter
+        // through that many execs. So at most RETIRED_KEEP + 1 sets exist
+        // however long a process runs or however often it execs.
+        if !had.is_null() {
+            let n = RETIRED_N.fetch_add(1, Ordering::Relaxed) as usize;
+            let old = RETIRED[n % RETIRED_KEEP].swap(had, Ordering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: published by this function from a `Box`, unpublished
+                // RETIRED_KEEP replacements ago, and in no slot any more.
+                drop(unsafe { Box::from_raw(old) });
+            }
+        }
     }
 
     fn marks() -> Option<&'static Marks> {
