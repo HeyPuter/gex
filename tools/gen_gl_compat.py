@@ -583,7 +583,10 @@ def emit_nt(cmds, plans, opcodes, pname_rust):
 def host_case(c, opcode, plan):
     toks = plan.split(" ")
     r, ptoks = toks[0], toks[1:]
-    L = [f"/* {c.name} */", f"template <typename R> static bool gexgen_{opcode}(R& a) {{"]
+    # Never inlined: each is called from one case of the decoder's switch, and
+    # inlined, all 2,520 made that switch one 1.2 MB function -- slow for V8
+    # to compile, and indivisible by wasm-split (docs/mesa-wasm-size.md).
+    L = [f"/* {c.name} */", f"template <typename R> __attribute__((noinline)) static bool gexgen_{opcode}(R& a) {{"]
     args = []
     post = []
     check = []

@@ -31,6 +31,9 @@ for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     [ -d "$tree" ] || continue
     mkdir -p "$tree/gex"
     cp "$BUILD/gex-wgpu-replay.js" "$BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
+    # The cold part, when the build split one off (docs/mesa-wasm-size.md).
+    rm -f "$tree/gex/gex-wgpu-replay.deferred.wasm"
+    [ ! -f "$BUILD/gex-wgpu-replay.deferred.wasm" ] || cp "$BUILD/gex-wgpu-replay.deferred.wasm" "$tree/gex/"
 done
 
 # The guest's own GL driver too, and the glibc build of it, which is the one

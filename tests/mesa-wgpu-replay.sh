@@ -30,6 +30,9 @@ REPLAY=$BUILD/gex-mesa-replay.js
 for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     mkdir -p "$tree/gex"
     cp "$BUILD/gex-wgpu-replay.js" "$BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
+    # The cold part, when the build split one off (docs/mesa-wasm-size.md).
+    rm -f "$tree/gex/gex-wgpu-replay.deferred.wasm"
+    [ ! -f "$BUILD/gex-wgpu-replay.deferred.wasm" ] || cp "$BUILD/gex-wgpu-replay.deferred.wasm" "$tree/gex/"
     cp "$TRACE" "$tree/gex/replay.gexgltr"
 done
 cp "$ROOT/web/public/mesa-wgpu-replay.html" "$ROOT/web/dist/mesa-wgpu-replay.html"
