@@ -44,10 +44,13 @@ export class Compositor {
   #stats;
 
   /** `makeWorker`: what stands in for compositor-worker.js's Worker (the
-   *  single-thread build's system Worker hosts it; see runtime.js). */
-  static async create(canvas, channel, inputTarget = canvas, { makeWorker = null } = {}) {
+   *  single-thread build's system Worker hosts it; see runtime.js).
+   *  `scale`: the page's devicePixelRatio when the canvas's backing store is
+   *  in device pixels (the frames and titles the compositor draws are scaled
+   *  by it). */
+  static async create(canvas, channel, inputTarget = canvas, { makeWorker = null, scale = 1 } = {}) {
     const c = new Compositor();
-    await c.#start(canvas, channel, inputTarget, makeWorker);
+    await c.#start(canvas, channel, inputTarget, makeWorker, { scale });
     return c;
   }
 
@@ -84,7 +87,7 @@ export class Compositor {
     });
   }
 
-  async #start(canvas, channel, inputTarget, makeWorker) {
+  async #start(canvas, channel, inputTarget, makeWorker, { scale = 1 } = {}) {
     const sameTarget = inputTarget === canvas;
     // A canvas can be handed to a worker once and never again, and a page
     // that runs a session twice hands over the same element the second time:
@@ -124,7 +127,9 @@ export class Compositor {
       if (m.kind === 'direct') {
         this.#setDirect(m.w ? { w: m.w, h: m.h } : null);
       } else if (m.kind === 'cursor') {
-        if (this.#direct) this.#canvas.style.cursor = m.css;
+        // The client's cursor, as the browser's own: one pointer, never a
+        // second one drawn into the frame.
+        this.#canvas.style.cursor = m.css;
         this.#cursorCss = m.css;
       } else if (m.kind === 'describe' || m.kind === 'wgsl-cache' || m.kind === 'readout') {
         this.#pending.get(m.id)?.(m.kind === 'wgsl-cache' ? { blob: m.blob, stats: m.stats } : m.state);
@@ -147,7 +152,8 @@ export class Compositor {
     // 4.6 Muck's 3D scene drew black, so 43 is only per run.
     const glLimits = pq?.has('gllimits') ? Number(pq.get('gllimits')) || 0 : null;
     worker.postMessage(
-      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present, direct, glLimits },
+      { kind: 'init', canvas: offscreen, width: canvas.width, height: canvas.height, scale,
+        channel, stats: this.#stats, present, direct, glLimits },
       [offscreen],
     );
     await ready;

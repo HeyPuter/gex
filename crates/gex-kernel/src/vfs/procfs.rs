@@ -25,6 +25,47 @@ pub trait ProcSource: Send + Sync {
     fn fds(&self) -> Vec<(i32, String)>;
     fn stat(&self) -> String;
     fn status(&self) -> String;
+    /// Every process on the system, this one included, for `/proc/<pid>`
+    /// and the listing of `/proc` (what `ps` and `htop` read). Empty where
+    /// the kernel knows only this process.
+    fn others(&self) -> Vec<crate::proc::ProcEntry> {
+        Vec::new()
+    }
+    /// A session's controlling terminal, as its pts number and the terminal's
+    /// foreground process group (`stat`'s `tty_nr` and `tpgid`).
+    fn tty_of(&self, _sid: i32) -> Option<(u32, i32)> {
+        None
+    }
+}
+
+/// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and
+/// `htop` parse it strictly -- by position after the `)` -- and a short line
+/// is a process they skip (htop listed none) or a fatal error (`ps`: "fatal
+/// library error, reap").
+pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>) -> String {
+    let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
+    // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
+    // majflt cmajflt utime stime cutime cstime priority nice num_threads
+    // itrealvalue starttime vsize rss rsslim startcode endcode startstack
+    // kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
+    // exit_signal processor rt_priority policy delayacct_blkio_ticks
+    // guest_time cguest_time start_data end_data start_brk arg_start arg_end
+    // env_start env_end exit_code
+    format!(
+        "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 \
+         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+    )
+}
+
+/// `/proc/<pid>/status`, the fields programs look for.
+pub fn status_text(pid: i32, comm: &str, state: char, ppid: i32) -> String {
+    let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
+    format!(
+        "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\n\
+         PPid:\t{ppid}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\n\
+         Groups:\t\nVmRSS:\t       0 kB\nThreads:\t1\nvoluntary_ctxt_switches:\t0\n\
+         nonvoluntary_ctxt_switches:\t0\n"
+    )
 }
 
 /// A generated file: contents are captured when it is opened.
@@ -85,15 +126,41 @@ impl ProcFs {
     }
 
     /// Rewrite a `<pid>/…` path to `self/…` so both spellings share one
-    /// implementation, as they do on Linux for the current process.
+    /// implementation, as they do on Linux for the current process. A
+    /// thread's directory (`<pid>/task/<tid>/…`) is its process's: every
+    /// process here has the one thread `/proc` reports.
     fn canonical(&self, path: &str) -> String {
+        let path = untask(path);
         let pid = self.source.pid().to_string();
         match path.strip_prefix(&pid) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => {
                 format!("self{rest}")
             }
-            _ => path.to_string(),
+            _ => path,
         }
+    }
+
+    /// Another process's `/proc/<pid>/…`: its entry and the rest of the path.
+    fn other(&self, path: &str) -> Option<(crate::proc::ProcEntry, String)> {
+        let (first, rest) = path.split_once('/').unwrap_or((path, ""));
+        let pid: i32 = first.parse().ok()?;
+        let e = self.source.others().into_iter().find(|e| e.pid == pid)?;
+        Some((e, rest.to_string()))
+    }
+
+    fn generate_other(&self, e: &crate::proc::ProcEntry, rest: &str) -> Option<Vec<u8>> {
+        let comm = e.comm();
+        let state = if e.zombie { 'Z' } else { 'S' };
+        Some(match rest {
+            "stat" => stat_line(e.pid, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid)).into_bytes(),
+            "status" => status_text(e.pid, &comm, state, e.ppid).into_bytes(),
+            "statm" => b"0 0 0 0 0 0 0\n".to_vec(),
+            "cmdline" => e.cmdline().to_vec(),
+            "comm" => format!("{comm}\n").into_bytes(),
+            // Another process's memory and environment are not ours to show.
+            "environ" | "maps" => Vec::new(),
+            _ => return None,
+        })
     }
 
     fn generate(&self, path: &str) -> Option<Vec<u8>> {
@@ -104,6 +171,11 @@ impl ProcFs {
             "self/environ" => s.environ(),
             "self/stat" => s.stat().into_bytes(),
             "self/status" => s.status().into_bytes(),
+            "self/statm" => b"0 0 0 0 0 0 0\n".to_vec(),
+            "loadavg" => {
+                let n = s.others().len().max(1);
+                format!("0.00 0.00 0.00 1/{n} {}\n", s.pid()).into_bytes()
+            }
             "self/comm" => {
                 let exe = s.exe();
                 let name = exe.rsplit('/').next().unwrap_or("gex").to_string();
@@ -160,10 +232,52 @@ impl FileSystem for ProcFs {
         if let Some(data) = self.generate(&path) {
             return Ok(Arc::new(Generated { data }));
         }
+        if let Some((e, rest)) = self.other(&path) {
+            if let Some(data) = self.generate_other(&e, &rest) {
+                return Ok(Arc::new(Generated { data }));
+            }
+            let mut out = base_entries();
+            let names: &[&str] = match rest.as_str() {
+                "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task"],
+                "task" => {
+                    out.push(DirEntry { name: e.pid.to_string(), file_type: FileType::Directory, ino: 1 });
+                    &[]
+                }
+                _ => return Err(Errno::ENOENT),
+            };
+            for name in names {
+                let file_type = if *name == "task" { FileType::Directory } else { FileType::Regular };
+                out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
+            }
+            return Ok(Arc::new(GenDir { entries: out }));
+        }
+        if path == "self/task" {
+            let mut out = base_entries();
+            out.push(DirEntry { name: self.source.pid().to_string(), file_type: FileType::Directory, ino: 1 });
+            return Ok(Arc::new(GenDir { entries: out }));
+        }
         let entries = match path.as_str() {
-            "" => vec!["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "sys"],
+            "" => {
+                // Every process, as Linux lists them: what `ps` and `htop`
+                // scan for. This one too, under its number as well as `self`.
+                let mut out = base_entries();
+                let mut pids: Vec<i32> = self.source.others().iter().map(|e| e.pid).collect();
+                if !pids.contains(&self.source.pid()) {
+                    pids.push(self.source.pid());
+                }
+                pids.sort_unstable();
+                for pid in pids {
+                    out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
+                }
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "sys"] {
+                    let file_type = if matches!(name, "self" | "sys") { FileType::Directory } else { FileType::Regular };
+                    out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
+                }
+                return Ok(Arc::new(GenDir { entries: out }));
+            }
             "self" => vec![
-                "maps", "cmdline", "environ", "stat", "status", "comm", "exe", "cwd", "fd",
+                "maps", "cmdline", "environ", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
+                "task",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -206,8 +320,24 @@ impl FileSystem for ProcFs {
                 times: Default::default(),
             });
         }
+        if let Some((e, rest)) = self.other(&path) {
+            return match rest.as_str() {
+                "" | "task" => Ok(Metadata::dir()),
+                r if self.generate_other(&e, r).is_some() => Ok(Metadata {
+                    file_type: FileType::Regular,
+                    size: 0,
+                    mode: 0o444,
+                    ino: 1,
+                    mtime: 0,
+                    nlink: 1,
+                    rdev: 0,
+                    times: Default::default(),
+                }),
+                _ => Err(Errno::ENOENT),
+            };
+        }
         match path.as_str() {
-            "" | "self" | "self/fd" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
@@ -241,6 +371,21 @@ impl FileSystem for ProcFs {
             }
         }
     }
+}
+
+/// `<pid>/task/<tid>/rest` -> `<pid>/rest`, and `<pid>/task/<tid>` ->
+/// `<pid>`: a thread's directory is its process's.
+fn untask(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 3 && parts[1] == "task" && parts[2].parse::<i32>().is_ok() {
+        let mut out = parts[0].to_string();
+        for p in &parts[3..] {
+            out.push('/');
+            out.push_str(p);
+        }
+        return out;
+    }
+    path.to_string()
 }
 
 fn base_entries() -> Vec<DirEntry> {
@@ -291,6 +436,59 @@ mod tests {
         fn status(&self) -> String {
             "Name:\tprog\nPid:\t42\n".into()
         }
+        fn others(&self) -> Vec<crate::proc::ProcEntry> {
+            let e = |pid, ppid, info: &[u8]| crate::proc::ProcEntry {
+                pid,
+                ppid,
+                pgid: pid,
+                sid: 1,
+                zombie: false,
+                info: info.to_vec(),
+            };
+            vec![e(1, 0, b"bash\n/bin/bash\0/etc/session\0"), e(7, 1, b"xterm\nxterm\0-e\0bash\0"), e(42, 7, b"prog\n")]
+        }
+    }
+
+    fn read(f: &ProcFs, path: &str) -> String {
+        let h = f.open(path, 0, 0).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = h.read_at(0, &mut buf).unwrap() as usize;
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[test]
+    fn the_root_lists_every_process() {
+        let names: Vec<String> = fs().open("", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        for pid in ["1", "7", "42", "self", "loadavg"] {
+            assert!(names.iter().any(|n| n == pid), "{pid} missing from {names:?}");
+        }
+    }
+
+    #[test]
+    fn another_process_has_its_stat_and_cmdline() {
+        let f = fs();
+        let stat = read(&f, "7/stat");
+        assert!(stat.starts_with("7 (xterm) S 1 7 1 "), "{stat}");
+        // htop and procps parse by position after the ')': all 52 fields.
+        assert_eq!(stat.split_whitespace().count(), 52, "{stat}");
+        assert_eq!(read(&f, "7/cmdline"), "xterm\0-e\0bash\0");
+        assert_eq!(read(&f, "1/comm"), "bash\n");
+        assert!(read(&f, "1/status").contains("PPid:\t0\n"));
+        // A thread's directory is its process's.
+        assert_eq!(read(&f, "7/task/7/stat"), stat);
+        let task: Vec<String> = f.open("7/task", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(task.contains(&"7".to_string()));
+        assert!(f.metadata("7").unwrap().file_type == FileType::Directory);
+        assert_eq!(f.open("99/stat", 0, 0).err().map(|_| ()), Some(()));
+    }
+
+    #[test]
+    fn this_process_keeps_its_own_view() {
+        // Its own pid is `self`, served from its own state, not the table's.
+        assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
+        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None).split_whitespace().count(), 52);
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7))).split_whitespace().map(String::from).collect();
+        assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
     }
 
     fn fs() -> ProcFs {

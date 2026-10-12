@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gex desktop</title>
+    <meta name="description" content="Debian programs, built to WebAssembly or translated from arm64, on a desktop in your browser." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>▚</text></svg>" />
+  </head>
+  <body>
+    <div id="panel">
+      <button id="apps" class="pbtn" title="Applications">▚ Applications</button>
+      <div id="tasks"></div>
+      <span id="pstatus"></span>
+      <button id="console-btn" class="pbtn" title="The system console: pid 1's terminal">console</button>
+      <span id="clock"></span>
+    </div>
+    <div id="screen">
+      <canvas id="out" tabindex="0"></canvas>
+      <div id="splash">
+        <div class="splash-card">
+          <div class="logo">▚ gex</div>
+          <div id="splash-text">starting</div>
+          <div class="bar"><div id="splash-bar"></div></div>
+        </div>
+      </div>
+    </div>
+    <div id="launcher" class="dwin hidden">
+      <div class="dwin-title"><span>Applications</span><button class="dwin-close" title="Close">×</button></div>
+      <div class="dwin-body">
+        <p class="lhint">Each program downloads once, the first time you open it, and is added to the running system.</p>
+        <ul id="items"></ul>
+      </div>
+    </div>
+    <div id="console" class="dwin hidden">
+      <div class="dwin-title"><span>Console (pid 1)</span><button class="dwin-close" title="Close">×</button></div>
+      <div class="dwin-body"><div id="term"></div></div>
+    </div>
+    <script type="module" src="/src/desktop.js"></script>
+  </body>
+</html>

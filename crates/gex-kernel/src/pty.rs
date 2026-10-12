@@ -141,8 +141,11 @@ impl Pty {
     pub fn master_read(&self, buf: &mut [u8]) -> SysResult {
         let mut s = self.lock();
         if s.to_master.is_empty() {
+            // Every slave closed: a hangup, which Linux reports to the master
+            // as EIO rather than end-of-file (`os.read` on a pty.fork child
+            // that has exited, xterm noticing its shell is gone).
             return if s.slave_ever && s.slave_open == 0 {
-                Ok(0)
+                Err(Errno::EIO)
             } else {
                 Err(Errno::EAGAIN)
             };
@@ -235,6 +238,46 @@ fn drain(q: &mut VecDeque<u8>, buf: &mut [u8]) -> u64 {
     n as u64
 }
 
+/// `st_rdev` of `/dev/pts/N` (major 136), in Linux's encoding.
+pub const fn pts_rdev(n: u32) -> u64 {
+    let (major, minor) = (136u64, n as u64);
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// `st_rdev` of `/dev/ptmx` (5:2).
+pub const PTMX_RDEV: u64 = (5 << 8) | 2;
+
+/// `st_ino` of `/dev/pts/N`: the same from `stat` on the name and `fstat` on
+/// a descriptor, which is how `ttyname` recognises the one as the other.
+pub const fn pts_ino(n: u32) -> u64 {
+    0x7074_0000 + n as u64
+}
+
+/// `st_ino` of `/dev/ptmx`.
+pub const PTMX_INO: u64 = 0x7074_ffff;
+
+/// What `/proc/<pid>/fd/N` says for a pty end gex names `pty:[id:m|s]`
+/// internally: `/dev/ptmx` for a master, `/dev/pts/N` for a slave (the id is
+/// the pts number). Anything else as it is.
+pub fn link_name(path: &str) -> String {
+    let parsed = path
+        .strip_prefix("pty:[")
+        .and_then(|v| v.strip_suffix(']'))
+        .and_then(|v| v.split_once(':'))
+        .and_then(|(id, side)| Some((id.parse::<u32>().ok()?, side)));
+    match parsed {
+        Some((_, "m")) => "/dev/ptmx".to_string(),
+        Some((n, "s")) => format!("/dev/pts/{n}"),
+        _ => path.to_string(),
+    }
+}
+
+/// `/proc/<pid>/stat`'s `tty_nr` for a controlling terminal that is
+/// `/dev/pts/N`: the device number, as an int.
+pub const fn tty_nr(n: u32) -> i32 {
+    pts_rdev(n) as i32
+}
+
 /// A pty pair that lives in another wasm module, reached by number and a table
 /// of `extern "C"` calls -- the [`crate::pipe::Remote`] shape, with the terminal
 /// added. `id` names the pair; `master` picks the end. Data calls copy through
@@ -324,15 +367,19 @@ impl crate::vfs::FileHandle for RemotePty {
         }
     }
 
+    /// The node `/dev/pts/N` (or `/dev/ptmx`) as `stat` on its name gives
+    /// it: the same inode and device number, or `ttyname` finds no name.
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        let n = (self.remote.ptn)(self.id).max(0) as u32;
+        let (ino, rdev, mode) = if self.master { (PTMX_INO, PTMX_RDEV, 0o666) } else { (pts_ino(n), pts_rdev(n), 0o620) };
         Ok(crate::vfs::Metadata {
             file_type: crate::vfs::FileType::CharDevice,
             size: 0,
-            mode: 0o620,
-            ino: 0,
+            mode,
+            ino,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev,
             times: Default::default(),
         })
     }
@@ -383,6 +430,13 @@ impl crate::vfs::FileHandle for RemotePty {
     }
 
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
+        // The descriptor's own ioctls are the kernel's to answer, as they are
+        // for any file. Answering them here with ENOTTY failed libuv's
+        // `uv__nonblock` (FIONBIO) on a pty: nvim's input stream never opened,
+        // so it drew in an xterm and took no keys.
+        if descriptor_level(request) {
+            return None;
+        }
         Some(self.do_ioctl(m, request, arg))
     }
 
@@ -393,6 +447,50 @@ impl crate::vfs::FileHandle for RemotePty {
             if self.master { "master" } else { "slave" },
             (self.remote.available)(self.id, self.m()).max(0),
         )
+    }
+}
+
+/// FIONBIO, FIONCLEX, FIOCLEX, FIOASYNC: properties of the descriptor, not
+/// the device.
+fn descriptor_level(request: u64) -> bool {
+    matches!(request, 0x5421 | 0x5450 | 0x5451 | 0x5452)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The master sees the slave side going away as EIO, as on Linux: once
+    /// its output is read, not before, and not before a slave was ever open.
+    #[test]
+    fn the_master_reads_eio_once_every_slave_has_closed() {
+        let p = super::Pty::new(0);
+        let mut buf = [0u8; 8];
+        assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EAGAIN), "no slave yet: wait");
+        p.open_slave();
+        p.slave_write(b"bye");
+        p.close_slave();
+        assert_eq!(p.master_read(&mut buf), Ok(3), "what it wrote first");
+        assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EIO));
+        assert!(p.master_readable(), "a hangup is readable, so poll wakes the reader");
+    }
+
+    #[test]
+    fn a_pty_end_has_the_name_a_program_can_stat() {
+        assert_eq!(super::link_name("pty:[4:s]"), "/dev/pts/4");
+        assert_eq!(super::link_name("pty:[4:m]"), "/dev/ptmx");
+        assert_eq!(super::link_name("pipe:[2]"), "pipe:[2]");
+        assert_eq!(super::pts_rdev(4), 0x8804);
+        assert_eq!(super::pts_rdev(300), (300 & 0xff) | (136 << 8) | ((300 & !0xff) << 12));
+    }
+
+    #[test]
+    fn the_descriptor_ioctls_are_left_to_the_kernel() {
+        for req in [0x5421, 0x5450, 0x5451, 0x5452] {
+            assert!(super::descriptor_level(req), "{req:#x}");
+        }
+        // TCGETS, TIOCGWINSZ, TIOCGPTN are the terminal's.
+        for req in [0x5401, 0x5413, 0x8004_5430] {
+            assert!(!super::descriptor_level(req), "{req:#x}");
+        }
     }
 }
 

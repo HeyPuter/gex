@@ -264,6 +264,8 @@ extern "C" {
     fn k_setpgid(caller: i32, target: i32, pgid: i32) -> i32;
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
+    fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
     // other side copies across with `memory.copy`, which is the only way it
@@ -659,6 +661,12 @@ extern "C" fn r_request_halt(code: i32) {
 extern "C" fn r_halt_code() -> i32 {
     unsafe { k_halt_code() }
 }
+extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_info(pid, at, len) }
+}
+extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
+    unsafe { k_proc_snapshot(at, cap) }
+}
 
 /// The process table every process shares, if the host gave us one.
 ///
@@ -701,6 +709,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             setpgid: r_setpgid,
             request_halt: r_request_halt,
             halt_code: r_halt_code,
+            set_info: r_set_info,
+            snapshot: r_snapshot,
         },
     )))
 }
@@ -1437,6 +1447,22 @@ impl FileHandle for StdinQueue {
 fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
+    if unsafe { k_present() } != 0 {
+        // `/dev/pts`: the pairs some process still holds an end of (the global
+        // kernel numbers them from 0 and the id is the pts number).
+        devfs.add_pts(Arc::new(|| {
+            let mut out = Vec::new();
+            for id in 0.. {
+                if unsafe { k_pty_ptn(id) } < 0 {
+                    break;
+                }
+                if unsafe { k_pty_counts(id) } != 0 {
+                    out.push(id as u32);
+                }
+            }
+            out
+        }));
+    }
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
@@ -7683,8 +7709,10 @@ fn stage_fork_fds(h: &Host, child: i32) {
 /// copy looks like the last reference and the reader sees a false EOF. A file
 /// the global kernel holds goes as a duplicated id, which survives the unlink
 /// of a file the receiver would otherwise fail to reopen by name; anything
-/// else with a path, by path. `None`: nothing with a name -- a local socket,
-/// an epoll set.
+/// else with a path, by path. An epoll set goes as its registrations (the
+/// same descriptor numbers name the same files in a fork's child): a copy, so
+/// an `epoll_ctl` on one side after the fork is not seen by the other, where
+/// Linux shares the one set. `None`: nothing with a name -- a local socket.
 fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
     if let Some(id) = pipe_id(&file.path) {
         unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
@@ -7710,7 +7738,18 @@ fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFil
         let dup = sock.dup_id()?;
         return Some(format!("sock:{dup}:{}", sock.listening as i32));
     }
+    if let Some(set) = k.epoll_of_file(file) {
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        return Some(format!("epoll:{key}:{}", set.describe()));
+    }
     file.path.starts_with('/').then(|| file.path.clone())
+}
+
+thread_local! {
+    /// While `gex_adopt_fds` runs: the epoll sets rebuilt so far, by the
+    /// parent's key, so two descriptors for one set stay one set.
+    static ADOPTED_EPOLLS: RefCell<Option<std::collections::HashMap<String, Arc<gex_kernel::file::OpenFile>>>> =
+        const { RefCell::new(None) };
 }
 
 /// The console descriptors, rebuilt in a child from the name alone. A fork
@@ -7775,7 +7814,8 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
         return -1;
     };
     let text = text.to_string();
-    with_host(|h| {
+    ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
+    let n = with_host(|h| {
         let mut n = 0;
         for line in text.lines() {
             let mut parts = line.splitn(5, ' ');
@@ -7806,7 +7846,9 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
             }
         }
         n
-    })
+    });
+    ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = None);
+    n
 }
 
 /// The other half of [`carry_name`]: the open file a name stands for, in
@@ -7853,6 +7895,19 @@ fn rebuild_carried(
             acc != oflags::O_RDONLY,
         );
         f.set_offset(offset);
+        f
+    } else if let Some(rest) = path.strip_prefix("epoll:") {
+        let (key, watches) = rest.split_once(':').ok_or("bad epoll name")?;
+        let watches = gex_kernel::unix::EpollSet::parse(watches).ok_or("bad epoll registrations")?;
+        if let Some(f) = ADOPTED_EPOLLS.with(|m| m.borrow().as_ref().and_then(|m| m.get(key).cloned())) {
+            return Ok(f);
+        }
+        let f = k.adopt_epoll(watches, flags);
+        ADOPTED_EPOLLS.with(|m| {
+            if let Some(m) = m.borrow_mut().as_mut() {
+                m.insert(key.to_string(), Arc::clone(&f));
+            }
+        });
         f
     } else if let Some(rest) = path.strip_prefix("sock:") {
         let r = global_sockets().ok_or("no global kernel")?;

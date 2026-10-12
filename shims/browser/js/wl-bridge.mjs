@@ -91,6 +91,8 @@ export const EV_MOVED = 10;
 // meta: what the compositor decided, read by every process.
 const M_OUT_W = 0;
 const M_OUT_H = 1;
+/** Device pixels per surface unit for guest Wayland clients (wl_output.scale). */
+const M_SCALE = 2;
 const M_WORDS = 8;
 
 // Block header: the token that claimed it, a heartbeat so a dead process's
@@ -130,15 +132,17 @@ export function makeWlChannel() {
 }
 
 /** Tell the guests how large the output is, so a toplevel is configured to it. */
-export function setOutputSize(channel, w, h) {
+export function setOutputSize(channel, w, h, scale) {
   const a = new Int32Array(channel.arena);
   Atomics.store(a, M_OUT_W, w | 0);
   Atomics.store(a, M_OUT_H, h | 0);
+  if (scale) Atomics.store(a, M_SCALE, Math.max(1, scale | 0));
 }
 
 export function outputSize(channel) {
   const a = new Int32Array(channel.arena);
-  return { w: Atomics.load(a, M_OUT_W) || 640, h: Atomics.load(a, M_OUT_H) || 480 };
+  return { w: Atomics.load(a, M_OUT_W) || 640, h: Atomics.load(a, M_OUT_H) || 480,
+    scale: Atomics.load(a, M_SCALE) || 1 };
 }
 
 const decoder = new TextDecoder();
@@ -153,6 +157,7 @@ const titleBytes = new Uint8Array(R_TITLE_WORDS * 4);
  * light per surface and does no work at all for a block that has not changed
  * since the caller last acked it -- `changed` says which those were.
  */
+
 export function readScene(channel, { onlyChanged = false } = {}) {
   const a = new Int32Array(channel.arena);
   const out = [];

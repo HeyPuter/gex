@@ -454,6 +454,25 @@ function isW3Program(elf) {
   return false;
 }
 
+/** The epoch every Worker's high-resolution clock shares, in nanoseconds:
+ * `performance.timeOrigin` is when this realm started, on the wall clock, so
+ * `timeOrigin + now()` reads the same in every Worker. Whole microseconds,
+ * exact in a double. */
+const ORIGIN_NS = BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n;
+
+/**
+ * Nanoseconds since the Unix epoch, as the guest's clocks and deadlines read
+ * them: monotonic and fine-grained (about 5 us with cross-origin isolation),
+ * where `Date.now()` steps by a millisecond and follows the wall clock
+ * backwards. A delta-time loop saw 0 ms frames, and Wine's
+ * QueryPerformanceCounter, which sits on CLOCK_MONOTONIC, ticked by 1 ms.
+ * The same base in every Worker: park deadlines, futex timeouts and the
+ * lock-free clock calls compare one Worker's reading with another's.
+ */
+export function hostNowNs() {
+  return ORIGIN_NS + BigInt(Math.round(performance.now() * 1e6));
+}
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -462,7 +481,7 @@ export class Env {
     else console.log(text);
   }
   /** Nanoseconds since an arbitrary epoch. */
-  now() { return BigInt(Math.round(performance.now() * 1e6)); }
+  now() { return hostNowNs(); }
   /**
    * Block until everything `write` has been handed is delivered. Called just
    * before the process's exit is published. Synchronous output needs nothing.
@@ -1376,6 +1395,7 @@ export class Gex {
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+    if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
@@ -1865,6 +1885,7 @@ export class Gex {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
       // The unit cache and ELF export providers, as `load` gives a process its
       // own: a forked child's table starts empty while its GOT holds what
@@ -4136,15 +4157,18 @@ export class Gex {
   }
 
   /** Say how large the compositor's output is, before the guest runs. */
-  wlOutput(w, h) {
+  wlOutput(w, h, scale = 1) {
     // Kept, and given again to every shim instance this process makes: a
     // fresh instance (a fork child's, an exec's) starts at the default
     // 640x480, and W3 starts every Windows program by fork and exec.
     this.#wlOut = [w | 0, h | 0];
+    this.#wlScale = Math.max(1, scale | 0);
     this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
+    this.#shim?.exports?.gex_set_wl_scale?.(this.#wlScale);
   }
 
   #wlOut = null;
+  #wlScale = 1;
 
   /**
    * This process's name in the compositor's scene arena: its pid, which every

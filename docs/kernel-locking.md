@@ -334,25 +334,119 @@ Every step lands alone, in a gate round. The gate runs:
 Each step also states its measured effect against the step before, on the
 same box.
 
+**Removal, not fast paths** (the user, 2026-10-12). Each remaining step
+deletes KLock from one subsystem for good: that subsystem's state becomes
+concurrent by design (atomics, per-object locks and wait queues, RCU-style
+publication), and its `with_host` uses are deleted. A lock-free shortcut that
+falls back to KLock (a snapshot re-checked "every Nth turn", a hint that
+sends the call down the locked path) does not count as a step. Such a
+fallback may exist only inside one branch, before it lands.
+
+**Progress metric**, in every report: the call sites in shims/browser/src
+that take the kernel lock (`with_host`, `with_host_free`, `with_jit`; lines
+that are only comments excluded), and how many the step deleted. Baseline:
+232 on master f3689d12 (a495e23c: 236). Plus the per-syscall census of the
+calls that still take it (diag/klock-6e's `[klock-calls]`).
+
+### 5.1 Landed
+
+Steps 0 to 5, and 6a (getpid, gettid and the uid/gid calls from immutable
+per-thread ids, fd2ac628), with the compositor wake fixes on step/klock-6
+(b638c279, 1c658a54, 6cf33b9c). Steps 3 to 5 took work out from under the
+lock or made it cheaper; they deleted no sites (232 to 219 lock-taking
+sites on step/klock-6 at 6cf33b9c, most of it 6a and the idle loop).
+
 | Step | Change | New gate leg / check | Measure |
 |---|---|---|---|
 | 0 | Census: per `with_host` site, time held and time waited (`GEX_KLOCKDIAG=1`, a report every 10 s, as fbdiag does). Diagnostic, not landed. | none | where the remaining 4.5+1.3 ms/frame of Undertale and the network Workers' 0.1 s go |
 | 1 | `gex_kernel::sync` lock types (§4.0); the trap-out held-lock check (§4.1); the epoch array (§4.2). No behaviour change. | unit tests for the three lock flavours; a held-across-trap test that must fail without the check | none expected |
 | 2 | Split `Kernel` into `Process` and `ThreadCtx`; remove `enter_thread`. Mechanical, still under KLock. | all existing tests; the W3 page echo; the native thread suites | no change expected |
 | 3 | The idle loop (§3.7, its part) and the cheap half of targeted wakes (§3.3), on w/ut-page-tw2's targeted wake. `wasm32_wait`/`schedule`/`gex_park` take the lock once a pass, not seven times. A safepoint takes it only on a hint of a signal (the global or this process's signal counter, an armed timer, a sweep every 64th), and asks about *its own* thread, which fixed `pthread_kill` to a spinning thread. A read or write wakes nobody unless its descriptor is a stream, and a read of a pipe with room wakes nobody. | `tests/browser-thread-signal.sh` (a64, x86); `check-futex-wake.mjs`; the browser pipe and fork legs; the W3 legs | Undertale takes and wait per frame per process |
-| 6b | Per-object wake slots (§3.3, the rest): a wait on one pipe or socket parks on that object's slot, bumped by its other end; multi-fd polls keep the global word. After step 6, whose per-object fd state makes the slot natural. | a test that a syscall in one process wakes no idle Worker in another | idle Workers' wakes per second in every Wine process |
 | 4 | Translation registry reads without KLock (§3.6, the read half): `gex_table_need` and the `gex_module_*` getters read published state, and JS asks once a batch, not once an index or field. | the fjit legs; units-only Undertale; node -e 0 | node -e 0 wait at those sites |
 | 5 | Translation outside KLock (§3.6, the write half). As built: a dispatch miss decides what to lift under KLock, takes the JIT state (page table, translated set, intrinsics) out of `Host` (`jitout::OUT`), gives the lock back, lifts, leaves the result marked done, and queues the unit under the lock again. Everything that reads that state goes through `with_jit`, which puts a finished result back and otherwise waits for it: with the lock given back from outside the kernel, holding it from inside (`retire_code`, `do_exec`, `do_fork`, nested calls), which ends because the lift needs nothing under the lock. Code retired during a lift is retired again once its unit is queued (the order one lock gave); an exec drops the unit. | the fjit legs (W3 echo with fjit, Undertale with fjit); the page SMC programs (`smc-race`, `smc-threads`, `smc-direct-jump`, `mem64-smc`, `copy-loop`); a Muck census | node -e 0 dispatch_miss held time; Unity HK/Muck presents/s |
-| 6 | Syscalls: the nothing-shared ones (§3.1, `clock_call` folded in), then the sharded `FutexTable` (§3.2), then the fd snapshot and fd mutex (§3.4). | a test that each nothing-shared call is answered while another Worker holds KLock; `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue; a close-while-reading test; pipe and socket stress in both hosts | Undertale syscall wait per frame; node -e 0 network Workers' KLock |
-| 7 | mm mutex and VMA snapshot (§3.5). | an mmap/munmap storm against translation on 4 threads, natively and in the page; the fork tests | dispatch_miss time per frame |
-| 8 | Signals (§3.8) and the rest of the thread table (§3.7). | the signal suites; the nullcall fault leg; a tgkill storm; W3 legs (Wine uses SIGUSR and SIGALRM heavily) | idle Workers' CPU |
-| 9 | Lifecycle, devices, introspection and NT (§3.9, §3.10). `with_host` and `KLock` deleted. | fork/exec/wait stress in the page; the xcache save; the whole gate | Undertale KLock: 0; the full table again |
-| 10 | Native: `Mutex<Kernel>` gone (steps 2-9 already changed gex-kernel, so this is the host glue). | native suites under TSan, where they build | native Noita/HK, as a check only |
 
-- Steps 3 to 8 each remove KLock from a class of calls while every other
-  call still takes it. So any step can stop without leaving a half-locked
-  structure: whatever is not yet converted stays under KLock as now.
-- The order is by the step 0 census (2026-10-11):
+### 5.2 Remaining, ordered by measured wait
+
+Measured on worldmachine, Undertale in the page, units-ut3, `&fjit=0`,
+diag/klock-6e census (2026-10-12). The game's process takes the lock for
+these syscalls per 10 s: clock_gettime 55k, pselect6 9.4k, getrusage 7k,
+futex 4.8k, sched_yield 3.5k, read 3.5k, rt_sigprocmask 3k, write 2k,
+epoll_pwait 1.6k, writev, recvmsg, sendmsg, ppoll and ioctl under 1k each.
+On top of the syscalls, every idle Worker of every process takes the lock
+in the scheduler pick after each wake of the global WAKE word: about
+44k takes and 650 ms of wait per 10 s in the game's process, and
+15-22k takes in each idle Wine process.
+
+1. **Clocks: lock deleted.** clock_gettime, clock_getres, gettimeofday,
+   getrusage and sched_yield never take KLock, with no fallback:
+   - the time base (`MONOTONIC_BASE`, `k_boot_secs`), the process's ABI and
+     its start time are immutable process constants, set at load, exec and
+     fork, before the process's first syscall;
+   - EFAULT is answered in place;
+   - pending signals are delivered at the next safepoint (which has its own
+     lock-free signal check) rather than at this syscall's boundary;
+   - a provider collection's stop protocol (cgen/libprov.rs) parks the
+     thread at syscall exit through libprov's own lock.
+   - Deletes: `clock_fast_path`'s `FAST_SIG`, `FAST_RUN` and
+     `any_registered` fallbacks and the locked path for these numbers.
+   - Leg: each call answered while another Worker holds KLock for 5 s.
+2. **Waits: the global WAKE re-check deleted (§3.3).** Linux's wait-queue
+   model:
+   - every thread owns one wait slot (a word in the global kernel's
+     memory it parks on);
+   - every waitable object (pipe end, unix and TCP socket, eventfd,
+     timerfd, the terminal, a child-status table entry, a futex) owns a
+     waiter list: a small per-object-locked list of thread slots;
+   - a blocking read, write, accept, connect or wait4 registers the
+     thread's slot on its object, re-checks readiness, parks on its slot,
+     and unregisters on return;
+   - poll, ppoll, select and pselect register the slot on every watched
+     object (no first-fd-plus-bound polling);
+   - epoll keeps its interest list on the epoll object; each watched
+     object notifies the epoll object, which notifies its own waiters;
+   - a writer, closer, connect, exit or signal notifies the slots on its
+     object's list and nothing else; a signal notifies its target
+     thread's slot;
+   - the scheduler pick asks only its own thread and never takes KLock
+     for an idle Worker: `wasm32_wait`/`schedule`/`gex_park` park on the
+     thread slot with the thread's own deadline.
+   - Deletes: `k_wake` after syscalls, `wakes_waiters`, the pick's
+     `with_host`, `PARK_PLAN`'s re-reads, `idle_look`'s locked survey.
+   - Legs: a syscall in one process wakes no Worker in another; a poll on
+     two pipes wakes within 1 ms of a write to the second; 43-thread
+     mspaint click latency (P's edger-lat) and its lock-wait trace.
+3. **fd table: lock deleted (§3.4).** The fd table becomes an
+   `Arc<[Option<Arc<OpenFile>>]>` published through an atomic pointer
+   with epoch reclamation (§4.2); open, close, dup, fcntl(F_DUPFD), pipe,
+   socket and accept take a per-process fd mutex, copy and publish.
+   read, write, readv, writev, pread, pwrite, recvmsg, sendmsg, poll,
+   select and epoll_pwait then run without KLock; offsets are atomics
+   in `OpenFile`. Leg: close-while-reading; pipe and socket stress in
+   both hosts.
+4. **Futexes: lock deleted (§3.2).** `FutexTable` sharded by the kernel
+   module's hash, 256 shards with their own locks; WAKE and REQUEUE take
+   at most two shards in address order; PI owners per shard. Leg:
+   `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue.
+5. **Signal masks and per-thread state: lock deleted.** rt_sigprocmask,
+   sigaltstack, set_tid_address, set_robust_list, arch_prctl on a
+   per-thread state only its owner writes; pending words atomic (§3.8,
+   the per-thread half). Leg: thread-signals in the page tier, which
+   fails today (§5.3, thread-signals).
+6. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
+   published VMA snapshot for readers (dispatch_miss, faults,
+   /proc/self/maps).
+7. **Signals and the thread table: lock deleted (§3.7, §3.8).**
+8. **Lifecycle, devices, introspection, NT; then KLock itself deleted
+   (§3.9, §3.10).**
+9. **Native: `Mutex<Kernel>` gone (§3.11).**
+
+
+### 5.3 Measurements and known failures
+
+- Each §5.2 step deletes KLock from one subsystem while every other still
+  takes it. So any step can stop without leaving a half-locked structure:
+  whatever is not yet converted stays under KLock as now.
+- Steps 0 to 5 were ordered by the step 0 census (2026-10-11):
   - **Undertale** (worldmachine, units-ut3, 600 s): every Wine process's
     idle Workers pass through `wasm32_wait`, `schedule` and `gex_park` about
     550 times a frame, taking KLock 7 times a pass: 80-130k takes a second
