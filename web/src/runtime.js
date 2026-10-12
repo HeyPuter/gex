@@ -5,6 +5,8 @@
 // editing is the guest's choice (ICANON in its termios), and the page has to
 // follow it or every keystroke appears twice.
 
+// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
+import './zfetch.js';
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
@@ -571,6 +573,10 @@ async function runProgramHere(
     // one wl_shm frames landed on. There is one output now, so this is only a
     // fallback for where to attach the listeners.
     wlInput = null,
+    // The page's devicePixelRatio when `wl`'s backing store is in device
+    // pixels: the compositor scales its frames by it and guest Wayland
+    // clients are told the rounded value as wl_output.scale.
+    wlScale = 1,
     // Run the X server in the page instead of in a guest process: a Worker
     // holding `Xwayland.wasm` and the compositor beside it (see
     // `web/src/hostx.js`). Guest X clients reach it through the global
@@ -625,6 +631,16 @@ async function runProgramHere(
     // page compiles its units while the bundle downloads), as [name, Module]
     // pairs every Worker takes instead of fetching and compiling its own.
     preModules = null,
+    // Called once the system is up and before pid 1 starts, with what an
+    // embedder needs to act on the running system from outside the guest:
+    // the process host (kernel stack slices), the global kernel, the shared
+    // terminal and the compositor. The demo desktop's launcher adds files
+    // with it (web/src/overlay.js) and types commands to pid 1.
+    onSystem = null,
+    // With `gl: 'compositor'`: start the host's Mesa only when `startGl`
+    // (handed to `onSystem`) is called -- a desktop whose first windows
+    // draw no GL does not download it.
+    glLazy = false,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -656,6 +672,8 @@ async function runProgramHere(
   // gated on `have_gl()`) and gles-gears died at `eglInitialize`/`ring_open`.
   let glChannel = null;
   let glServe = null;
+  let startGl = null;
+  let glStarted = null;
   if (gl && single.on) {
     // The single-thread build: no ring. Each process's `gl_submit` calls the
     // compositor's Mesa in this realm on its own memory (compositor-worker.js
@@ -734,16 +752,38 @@ async function runProgramHere(
     // has no compositor.js: the page passes an element instead (above).
     if (canvas && !GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
     if (canvas && GEX_COMPOSITOR) {
-      setOutputSize(wlChannel, canvas.width, canvas.height);
+      setOutputSize(wlChannel, canvas.width, canvas.height, Math.max(1, Math.round(wlScale)));
       const { Compositor } = await import('./compositor.js');
-      compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas);
+      compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas, { scale: wlScale });
       globalThis.__gexCompositor = compositor;
       if (gl === 'compositor' && glChannel) {
-        await startHostGl(compositor, glChannel, {
+        const opts = {
           api: 'core',
           backend: glBackend,
           canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',
-        }, term);
+        };
+        // `glLazy`: Mesa (about 20 MB before compression) is fetched when
+        // the embedder first asks (`onSystem`'s `startGl`), not at boot.
+        startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
+        if (!glLazy) await startGl();
+        else if (glChannel.control && typeof Atomics.waitAsync === 'function') {
+          // And by the guest: a GL program started from a shell, not from
+          // the embedder's launcher, makes its first request into a ring
+          // nothing serves yet -- and waits thirty seconds for the answer,
+          // then dies. Its first request starts Mesa (gl-bridge.mjs STATE).
+          const ctl = new Int32Array(glChannel.control);
+          (async () => {
+            while (!glStarted) {
+              const st = Atomics.load(ctl, 0);
+              if (st === 1) {
+                startGl();
+                break;
+              }
+              const w = Atomics.waitAsync(ctl, 0, st, 5000);
+              if (w.async) await w.value;
+            }
+          })();
+        }
       }
     }
   }
@@ -776,10 +816,14 @@ async function runProgramHere(
     // global kernel that only exists once the server has bound it.
     let listening = null;
     const up = new Promise((resolve) => (listening = resolve));
+    const countX = !!flag('hostxcount');
     xServer.onmessage = (e) => {
       const m = e.data;
-      if (m.kind === 'log') term.writeln(m.text);
-      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
+      if (m.kind === 'log') {
+        term.writeln(m.text);
+        // `?hostxcount=1`: to the console too, timed, for a harness.
+        if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
+      } else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
       else if (m.kind === 'ready') listening(true);
       else if (m.kind === 'failed') {
         term.writeln(`gex: the X server failed: ${m.why}`);
@@ -804,6 +848,7 @@ async function runProgramHere(
       verbose: globalThis.GEX_HOSTX_VERBOSE || Number(new URLSearchParams(location.search).get('xverbose')) || undefined,
       trace: globalThis.GEX_HOSTX_TRACE || undefined,
       wlTrace: flag('wltrace') ? 1 : undefined,
+      count: flag('hostxcount') ? 1 : undefined,
     });
     // Two modules and a kernel to instantiate; a slow machine takes a few
     // seconds. A run that goes ahead without the display is worse than one that
@@ -1033,6 +1078,7 @@ async function runProgramHere(
     if (sharedTty) sharedTty.resize(rows, cols);
     else host.resize(rows, cols);
   });
+  onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl });
   try {
     const status = await host.start({
       elf,

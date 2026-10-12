@@ -1,3 +1,5 @@
+// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
+import './zfetch.js';
 import { requestGexDevice, textureCanvas } from './gpu-device.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
@@ -44,10 +46,22 @@ import {
 // A frame the compositor draws, not the client: this is what "server-side
 // decorations" means, and a Qt or KDE app that sees the xdg-decoration
 // protocol stops drawing its own.
-const TITLE_H = 26;
-const BORDER = 1;
-const BUTTON = 18;
-const BUTTON_GAP = 6;
+//
+// In device pixels: the output is the canvas's backing store, which is the
+// CSS size times devicePixelRatio, so every metric is scaled by that ratio
+// (`UI`) and the frame is as large on the screen at any density.
+let UI = 1;
+let TITLE_H = 26;
+let BORDER = 1;
+let BUTTON = 18;
+let BUTTON_GAP = 6;
+function setUiScale(u) {
+  UI = u > 0 && Number.isFinite(u) ? u : 1;
+  TITLE_H = Math.round(26 * UI);
+  BORDER = Math.max(1, Math.round(UI));
+  BUTTON = Math.round(18 * UI);
+  BUTTON_GAP = Math.round(6 * UI);
+}
 
 const COL = {
   desktop: [0.07, 0.09, 0.12, 1],
@@ -148,9 +162,13 @@ class Painter {
       fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: blend, alpha: blend } }] },
       primitive: { topology: 'triangle-strip' },
     });
-    // Linear and clamped, whatever the texture: the guest's GL frames are
-    // textures Mesa made, and sampling must not depend on their state.
+    // Clamped, whatever the texture: the guest's GL frames are textures Mesa
+    // made, and sampling must not depend on their state. Nearest where a
+    // texture is drawn at its own size (a window, 1:1 with the device's
+    // pixels, at whole-pixel positions), linear only where it is scaled.
     this.sampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
+    this.nearest = device.createSampler({ minFilter: 'nearest', magFilter: 'nearest' });
+    this.groupsNearest = new WeakMap();
     this.uniforms = device.createBuffer({ size: SLOT * MAX_DRAWS, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.data = new ArrayBuffer(SLOT * MAX_DRAWS);
     this.f32 = new Float32Array(this.data);
@@ -161,18 +179,19 @@ class Painter {
     this.scene = null;
   }
 
-  #group(tex) {
-    let g = this.groups.get(tex);
+  #group(tex, nearest) {
+    const groups = nearest ? this.groupsNearest : this.groups;
+    let g = groups.get(tex);
     if (!g) {
       g = this.device.createBindGroup({
         layout: this.layout,
         entries: [
           { binding: 0, resource: { buffer: this.uniforms, size: 80 } },
-          { binding: 1, resource: this.sampler },
+          { binding: 1, resource: nearest ? this.nearest : this.sampler },
           { binding: 2, resource: tex.createView() },
         ],
       });
-      this.groups.set(tex, g);
+      groups.set(tex, g);
     }
     return g;
   }
@@ -209,7 +228,12 @@ class Painter {
     f[o + 8] = color[0]; f[o + 9] = color[1]; f[o + 10] = color[2]; f[o + 11] = color[3];
     f[o + 12] = this.w; f[o + 13] = this.h;
     this.u32[o + 14] = mode; this.u32[o + 15] = swizzle; this.u32[o + 16] = opaque;
-    this.pass.setBindGroup(0, this.#group(tex), [this.n * SLOT]);
+    // 1:1 and on whole pixels: nearest, so a terminal's glyphs are the
+    // client's own pixels and not a blend of two neighbours.
+    const nearest = mode === 1 || (w === Math.round(w) && h === Math.round(h) && x === Math.round(x)
+      && y === Math.round(y) && Math.round(w / Math.max(1e-9, uv[2])) === tex.width
+      && Math.round(h / Math.max(1e-9, uv[3])) === tex.height);
+    this.pass.setBindGroup(0, this.#group(tex, nearest), [this.n * SLOT]);
     this.pass.draw(4);
     this.n++;
   }
@@ -333,19 +357,21 @@ class TextCache {
   get(text) {
     let e = this.#entries.get(text);
     if (e) return e;
-    const scale = 2; // drawn at 2x and minified, so the glyphs stay crisp
+    // At device pixels and drawn 1:1, so the glyphs are the browser's own
+    // rendering at this density, not a resampling of it.
     const cv = new OffscreenCanvas(1, 1);
     let ctx = cv.getContext('2d');
-    ctx.font = `${13 * scale}px system-ui, sans-serif`;
+    const px = Math.round(13 * UI);
+    ctx.font = `${px}px system-ui, sans-serif`;
     const width = Math.max(1, Math.ceil(ctx.measureText(text).width));
     cv.width = width;
-    cv.height = 18 * scale;
+    cv.height = Math.round(18 * UI);
     ctx = cv.getContext('2d');
-    ctx.font = `${13 * scale}px system-ui, sans-serif`;
+    ctx.font = `${px}px system-ui, sans-serif`;
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'white';
     ctx.fillText(text, 0, cv.height / 2);
-    e = { tex: canvasTexture(this.#device, cv), w: cv.width / scale, h: cv.height / scale };
+    e = { tex: canvasTexture(this.#device, cv), w: cv.width, h: cv.height };
     // A cache with no bound is a leak; titles change rarely and a session has
     // a handful of windows, so a small cap is plenty.
     if (this.#entries.size > 64) {
@@ -360,29 +386,6 @@ class TextCache {
   }
 }
 
-/** The pointer image, drawn when no client has set one of its own. */
-function defaultCursor(device) {
-  const s = 2;
-  const cv = new OffscreenCanvas(12 * s, 19 * s);
-  const ctx = cv.getContext('2d');
-  ctx.scale(s, s);
-  ctx.beginPath();
-  ctx.moveTo(0.5, 0.5);
-  ctx.lineTo(0.5, 15.5);
-  ctx.lineTo(4.5, 11.5);
-  ctx.lineTo(7, 17.5);
-  ctx.lineTo(9.5, 16.5);
-  ctx.lineTo(7, 10.5);
-  ctx.lineTo(11.5, 10.5);
-  ctx.closePath();
-  ctx.fillStyle = 'white';
-  ctx.fill();
-  ctx.strokeStyle = 'black';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  return { tex: canvasTexture(device, cv), w: 12, h: 19 };
-}
-
 // -- the compositor ---------------------------------------------------------
 
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
@@ -391,7 +394,6 @@ class Compositor {
   #device;
   #painter;
   #text;
-  #cursorFallback;
   #channel;
   /** Guest memories to read pixels from, by the token of the process. */
   #memories = new Map();
@@ -444,7 +446,6 @@ class Compositor {
       this.#painter.ctx2d = canvas.getContext('2d', { alpha: false });
     }
     this.#text = new TextCache(device);
-    this.#cursorFallback = defaultCursor(device);
     this.resize(canvas.width, canvas.height);
   }
 
@@ -542,7 +543,7 @@ class Compositor {
           this.#reportPosition(win);
         } else if (s.role === ROLE_TOPLEVEL) {
           // Cascade, so two windows that appear together are both reachable.
-          const step = 28;
+          const step = Math.round(28 * UI);
           const n = this.#placed++;
           const roomX = Math.max(1, this.#outW - s.width - BORDER);
           const roomY = Math.max(1, this.#outH - s.height - TITLE_H - BORDER);
@@ -553,13 +554,25 @@ class Compositor {
           this.#reportPosition(win);
         }
       }
+      // Device pixels from here on. A surface's buffer is `bs` pixels per
+      // surface unit and its client was told `cs` device pixels per unit
+      // (wl_output.scale), so it covers width * cs / bs device pixels: 1:1
+      // when the client drew at the output's scale. X windows are cs = 1 and
+      // device pixels throughout (the X server is told the device size).
+      const bs = (s.flags >> 8) & 0xff || 1;
+      const cs = (s.flags >> 16) & 0xff || 1;
       win.role = s.role;
-      win.width = s.width;
-      win.height = s.height;
+      win.bs = bs;
+      win.cs = cs;
+      win.width = Math.round((s.width * cs) / bs);
+      win.height = Math.round((s.height * cs) / bs);
       win.title = s.title;
       win.parent = s.parent;
-      win.relX = s.relX;
-      win.relY = s.relY;
+      win.relX = s.relX * cs;
+      win.relY = s.relY * cs;
+      // A cursor's hotspot, in its surface's units (CSS pixels for the page).
+      win.hotX = s.relX;
+      win.hotY = s.relY;
       win.info = s;
       // A client that asked to be dragged (a GTK titlebar) starts a drag as if
       // the pointer had grabbed our own frame.
@@ -744,7 +757,7 @@ class Compositor {
     const f = this.#frameOf(win);
     return {
       x: f.frameX + f.frameW - BUTTON - BUTTON_GAP,
-      y: f.frameY + (TITLE_H - BUTTON) / 2,
+      y: f.frameY + Math.floor((TITLE_H - BUTTON) / 2),
       w: BUTTON,
       h: BUTTON,
     };
@@ -753,15 +766,15 @@ class Compositor {
   #drawDecoration(win, active) {
     const p = this.#painter;
     const f = this.#frameOf(win);
-    p.solid(f.frameX + 3, f.frameY + 4, f.frameW, f.frameH, COL.shadow);
+    p.solid(f.frameX + Math.round(3 * UI), f.frameY + Math.round(4 * UI), f.frameW, f.frameH, COL.shadow);
     p.solid(f.frameX, f.frameY, f.frameW, f.frameH, COL.border);
     p.solid(f.frameX, f.frameY, f.frameW, TITLE_H, active ? COL.titleActive : COL.titleIdle);
     const label = win.title || 'window';
     const t = this.#text.get(label);
-    const room = f.frameW - BUTTON - 2 * BUTTON_GAP - 10;
+    const room = f.frameW - BUTTON - 2 * BUTTON_GAP - Math.round(10 * UI);
     const w = Math.min(t.w, Math.max(0, room));
     if (w > 4) {
-      p.textured(f.frameX + 8, f.frameY + (TITLE_H - t.h) / 2, w, t.h, t.tex, {
+      p.textured(f.frameX + Math.round(8 * UI), f.frameY + Math.floor((TITLE_H - t.h) / 2), w, t.h, t.tex, {
         uv: [0, 0, w / t.w, 1],
       });
     }
@@ -770,8 +783,8 @@ class Compositor {
     // The cross, from the same text cache as the title: one texture and one
     // draw, rather than a quad per pixel of two diagonals.
     const x = this.#text.get('\u2715');
-    const size = Math.min(b.w, b.h) - 6;
-    p.textured(b.x + (b.w - size) / 2, b.y + (b.h - size) / 2, size, size, x.tex);
+    const size = Math.min(b.w, b.h) - Math.round(6 * UI);
+    p.textured(b.x + Math.floor((b.w - size) / 2), b.y + Math.floor((b.h - size) / 2), size, size, x.tex);
   }
 
   #drawSurface(k, win) {
@@ -855,7 +868,8 @@ class Compositor {
   /** What the output shows, as a string: equal strings, equal pixels (a GL
    *  window's frame counted by its presented serial). */
   #signature() {
-    const parts = [this.#outW, this.#outH, this.#focus, this.#pointer.x, this.#pointer.y, this.#order.join(',')];
+    // Not the pointer: the cursor is the page's (`#updateCursor`), not drawn.
+    const parts = [this.#outW, this.#outH, this.#focus, this.#order.join(',')];
     for (const [k, win] of this.#windows) {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
@@ -877,7 +891,6 @@ class Compositor {
   #directWanted = false;
   #direct = null; // { k, w, h, ox, oy } while presenting directly
   #directSerial = -1;
-  #cursorSerial = -1;
 
   setDirect(on) {
     this.#directWanted = !!on;
@@ -906,12 +919,10 @@ class Compositor {
       this.#canvas.width = d.w;
       this.#canvas.height = d.h;
       this.#directSerial = -1;
-      this.#cursorSerial = -1;
       post({ kind: 'direct', w: d.w, h: d.h });
       this.#note(`direct present ${d.w}x${d.h} (${d.k})`);
     }
     this.#direct = { k: d.k, w: d.w, h: d.h, ox: d.ox, oy: d.oy };
-    this.#directCursor(byKey);
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     if (d.gl.serial === this.#directSerial) {
       this.#skipped++;
@@ -935,41 +946,93 @@ class Compositor {
     this.#note('direct present off: compositing');
   }
 
-  /* The client's cursor as the page's CSS cursor: none when it hid it (a
-   * game drawing its own), its image when it set one. Read from the guest's
-   * buffer when its serial moves. */
-  #directCursor(byKey) {
-    let found = null;
-    for (const [k, win] of this.#windows) if (win.role === ROLE_CURSOR) { found = [k, win]; break; }
-    if (!found) {
-      if (this.#cursorSerial !== 0) post({ kind: 'cursor', css: 'none' });
-      this.#cursorSerial = 0;
-      return;
+  /* The pointer is the page's own CSS cursor, never drawn into the frame:
+   * the image the client under the pointer set (wl_pointer.set_cursor, which
+   * is also how Xwayland shows an X cursor), `none` when that client set no
+   * image (a game drawing its own), and the browser's default over the
+   * desktop and the frames this compositor draws. An image is read from the
+   * guest's buffer when its serial moves, and encoded once per distinct
+   * content: a client that re-commits the same arrow on every motion costs a
+   * hash, not a PNG. */
+  #cursorCss = '';
+  #cursorImages = new Map(); // content hash -> css, or a promise of it
+
+  #updateCursor(byKey) {
+    let css = 'default';
+    const overKey = this.#direct ? this.#direct.k : this.#drag ? null : this.#pointer.over;
+    const over = overKey ? this.#windows.get(overKey) : null;
+    if (over) {
+      let cur = null;
+      for (const [k, w] of this.#windows) {
+        if (w.role === ROLE_CURSOR && w.token === over.token && w.client === over.client) {
+          cur = [k, w];
+          break;
+        }
+      }
+      if (!cur) css = 'none';
+      else {
+        const got = this.#cursorImage(byKey.get(cur[0]), cur[1]);
+        if (got === null) return; // still encoding: keep what is shown
+        css = got;
+      }
     }
-    const [k, win] = found;
-    const s = byKey.get(k);
-    if (!s || !s.addr || s.serial === this.#cursorSerial) return;
-    this.#cursorSerial = s.serial;
+    if (css === this.#cursorCss) return;
+    this.#cursorCss = css;
+    post({ kind: 'cursor', css });
+  }
+
+  /** The CSS for a cursor surface's image, or null while it is encoded. */
+  #cursorImage(s, win) {
+    if (!s || !s.addr || s.width <= 0 || s.height <= 0 || s.width > 256 || s.height > 256) return 'none';
+    if (win.cursorSerial === s.serial && win.cursorAddr === s.addr && win.cursorCss) return win.cursorCss;
     const mem = this.#memoryOf(s.token);
-    if (!mem || s.width <= 0 || s.height <= 0 || s.width > 256 || s.height > 256) return;
+    if (!mem || s.addr + (s.height - 1) * s.stride + s.width * 4 > mem.length) return 'none';
     const px = new Uint8ClampedArray(s.width * s.height * 4);
+    const opaque = s.format === 1;
+    let h = 2166136261 ^ s.width ^ (s.height << 12) ^ (win.hotX << 20) ^ (win.hotY << 26) ^ (win.bs << 8);
     for (let y = 0; y < s.height; y++) {
       for (let x = 0; x < s.width; x++) {
         const i = s.addr + y * s.stride + x * 4;
         const o = (y * s.width + x) * 4;
-        px[o] = mem[i + 2]; px[o + 1] = mem[i + 1]; px[o + 2] = mem[i]; px[o + 3] = win.info?.format === 1 ? 255 : mem[i + 3];
+        px[o] = mem[i + 2]; px[o + 1] = mem[i + 1]; px[o + 2] = mem[i]; px[o + 3] = opaque ? 255 : mem[i + 3];
+        h = Math.imul(h ^ (px[o] | (px[o + 1] << 8) | (px[o + 2] << 16) | (px[o + 3] << 24)), 16777619);
       }
     }
-    const cv = new OffscreenCanvas(s.width, s.height);
-    cv.getContext('2d').putImageData(new ImageData(px, s.width, s.height), 0, 0);
-    const hx = Math.max(0, win.relX | 0), hy = Math.max(0, win.relY | 0);
-    cv.convertToBlob().then((blob) => {
-      post({ kind: 'cursor', css: `url(${URL.createObjectURL(blob)}) ${hx} ${hy}, default` });
-    }).catch(() => {});
+    const key = `${h >>> 0}`;
+    const known = this.#cursorImages.get(key);
+    if (typeof known === 'string') {
+      win.cursorSerial = s.serial;
+      win.cursorAddr = s.addr;
+      win.cursorCss = known;
+      return known;
+    }
+    if (!known) {
+      const cv = new OffscreenCanvas(s.width, s.height);
+      cv.getContext('2d').putImageData(new ImageData(px, s.width, s.height), 0, 0);
+      const hx = Math.max(0, win.hotX | 0);
+      const hy = Math.max(0, win.hotY | 0);
+      const bs = win.bs || 1;
+      this.#cursorImages.set(key, cv.convertToBlob().then((blob) => {
+        const url = URL.createObjectURL(blob);
+        // A buffer drawn at a scale is that many pixels per CSS pixel.
+        const img = bs > 1 ? `-webkit-image-set(url(${url}) ${bs}x)` : `url(${url})`;
+        this.#cursorImages.set(key, `${img} ${hx} ${hy}, default`);
+        if (this.#cursorImages.size > 64) {
+          for (const [k, v] of this.#cursorImages) {
+            if (k === key) continue;
+            if (typeof v === 'string') URL.revokeObjectURL(v.slice(v.indexOf('url(') + 4, v.indexOf(')')));
+            this.#cursorImages.delete(k);
+            if (this.#cursorImages.size <= 32) break;
+          }
+        }
+      }).catch(() => this.#cursorImages.delete(key)));
+    }
+    return null;
   }
 
   frame() {
     const { byKey, blocks } = this.#reconcile();
+    this.#updateCursor(byKey);
     const d = this.#directTarget();
     if (d) {
       this.#frameDirect(d, byKey, blocks);
@@ -978,6 +1041,7 @@ class Compositor {
     if (this.#direct) this.#leaveDirect();
     // Upload every surface whose content moved on.
     for (const [k, s] of byKey) {
+      if (s.role === ROLE_CURSOR) continue; // the page's cursor, not a texture
       const t = this.#textures.get(k);
       if (t && t.serial === s.serial) continue;
       this.#upload(k, s);
@@ -1017,27 +1081,8 @@ class Compositor {
       const win = this.#windows.get(k);
       if (win) this.#drawSurface(k, win);
     }
-    // The cursor the client asked for, at the pointer, offset by its hotspot.
-    let drew = false;
-    for (const [k, win] of this.#windows) {
-      if (win.role !== ROLE_CURSOR) continue;
-      const t = this.#textures.get(k);
-      if (!t) continue;
-      this.#painter.textured(
-        this.#pointer.x - win.relX,
-        this.#pointer.y - win.relY,
-        win.width,
-        win.height,
-        t.tex,
-        { swizzle: 1 },
-      );
-      drew = true;
-      break;
-    }
-    if (!drew) {
-      const c = this.#cursorFallback;
-      this.#painter.textured(this.#pointer.x, this.#pointer.y, c.w, c.h, c.tex);
-    }
+    // No cursor: the client's is the page's own CSS cursor (`#updateCursor`),
+    // so there is one pointer on the screen and it moves at the browser's rate.
     this.#painter.end();
     console.timeStamp('gex:drawn');
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
@@ -1106,8 +1151,9 @@ class Compositor {
     if (win.configuredAs === want) return;
     win.configuredAs = want;
     this.#note(`configure ${win.key} ${want}`);
-    sendEvent(this.#channel, win.block, EV_CONFIGURE, fit.w, fit.h, 0, activated ? 1 : 0,
-      win.client, win.surface);
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_CONFIGURE, Math.floor(fit.w / k), Math.floor(fit.h / k), 0,
+      activated ? 1 : 0, win.client, win.surface);
   }
 
   #focusWindow(k) {
@@ -1168,8 +1214,9 @@ class Compositor {
     }
     this.#pointer.over = over;
     if (!hit || hit.part !== 'content') return;
-    sendEvent(this.#channel, hit.win.block, EV_MOTION, hit.local.x, hit.local.y, time, 0,
-      hit.win.client, hit.win.surface);
+    const k = hit.win.cs || 1;
+    sendEvent(this.#channel, hit.win.block, EV_MOTION, Math.floor(hit.local.x / k), Math.floor(hit.local.y / k),
+      time, 0, hit.win.client, hit.win.surface);
   }
 
   pointerButton(button, pressed, time) {
@@ -1221,8 +1268,9 @@ class Compositor {
       // The press lands where the pointer is, so the client's last motion has
       // to be this position -- a click without a motion in front of it would
       // otherwise arrive wherever the pointer was last seen by that client.
-      sendEvent(this.#channel, hit.win.block, EV_MOTION, hit.local.x, hit.local.y, time, 0,
-        hit.win.client, hit.win.surface);
+      const k = hit.win.cs || 1;
+      sendEvent(this.#channel, hit.win.block, EV_MOTION, Math.floor(hit.local.x / k),
+        Math.floor(hit.local.y / k), time, 0, hit.win.client, hit.win.surface);
     }
     sendEvent(this.#channel, hit.win.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0,
       hit.win.client, hit.win.surface);
@@ -1307,6 +1355,7 @@ class Compositor {
       // The GL device's counters (submits, their time, readbacks): the
       // compositor side of a frame's cost.
       gl: glDevice?.glState?.() ?? null,
+      turns,
     };
   }
 }
@@ -1320,6 +1369,8 @@ let post = (m, transfer) => self.postMessage(m, transfer ?? []);
 let comp = null;
 let canvas = null;
 let running = false;
+/** Turns of the frame loop, for a test: a loop that stops reads as a still screen. */
+let turns = 0;
 
 // Whether a publish was drawn since the last animation frame (`onPublishes`).
 let drawnSincePaint = false;
@@ -1327,6 +1378,7 @@ let drawnSincePaint = false;
 function loop() {
   if (!comp || !running) return;
   drawnSincePaint = false;
+  turns++;
   try {
     // A guest paces itself against frames *displayed*, not produced: its
     // `eglSwapBuffers` waits for this count to move. On the page that was the
@@ -1515,12 +1567,13 @@ async function serveGlRing() {
 const onMessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
-      canvas = m.canvas;
       presentOverride = m.present ?? null;
+      canvas = m.canvas;
+      setUiScale(m.scale || 1);
       // The compositor draws with WebGPU on the device Mesa will use.
       if (m.glLimits != null) globalThis.GEX_GL_LIMITS = m.glLimits;
       requestGexDevice().then((gpu) => {
-        comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
+        comp = new Compositor(canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
         comp.setDirect(m.direct);
         running = true;
         requestAnimationFrame(loop);

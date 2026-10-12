@@ -30,7 +30,16 @@ export default defineConfig({
   // web/build-all.sh builds each flavour's dist from its own staged public
   // tree: GEX_PUBLIC_DIR (default public/) into GEX_OUT_DIR (default dist/).
   publicDir: process.env.GEX_PUBLIC_DIR || 'public',
-  build: { target: 'es2022', chunkSizeWarningLimit: 2048, outDir: process.env.GEX_OUT_DIR || 'dist' },
+  build: {
+    target: 'es2022',
+    chunkSizeWarningLimit: 2048,
+    outDir: process.env.GEX_OUT_DIR || 'dist',
+    // web/build-demo.sh: the desktop (desktop.html) is the demo build's only
+    // page; every other build is the demo list (index.html).
+    ...(process.env.GEX_DEMO === '1'
+      ? { rollupOptions: { input: fileURLToPath(new URL('desktop.html', import.meta.url)) } }
+      : {}),
+  },
   // `worker.mjs` is an ES module with top-level await; the default `iife`
   // worker output cannot express that.
   worker: { format: 'es' },

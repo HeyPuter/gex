@@ -198,6 +198,15 @@ fn output_size() -> (i32, i32) {
     unsafe { OUTPUT }
 }
 
+static OUTPUT_SCALE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+/// Device pixels per surface unit (`wl_output.scale`): the page's
+/// devicePixelRatio, rounded, when its output is in device pixels.
+#[no_mangle]
+pub extern "C" fn gex_set_wl_scale(scale: i32) {
+    OUTPUT_SCALE.store(scale.clamp(1, 8), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// This process's name in the compositor's scene arena: its pid.
 ///
 /// It has to be the *process's* and not the Worker's. A process's threads are
@@ -716,7 +725,9 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1);
+    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1)
+        | ((info.buffer_scale & 0xff) << 8)
+        | ((info.client_scale & 0xff) << 16);
     // Which X window this is, for a host that knows a drawable and not a
     // surface -- an OpenGL client naming what it draws into.
     r[17] = info.xid as i32;
@@ -739,6 +750,7 @@ impl HostListener for WaylandDevice {
         let mut client = Client::new();
         let (w, h) = output_size();
         client.set_default_size(w, h);
+        client.set_scale(OUTPUT_SCALE.load(std::sync::atomic::Ordering::Relaxed));
         let idx = {
             let mut n = self.inner.next_idx.lock().unwrap();
             *n += 1;

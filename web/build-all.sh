@@ -3,7 +3,7 @@
 # single-thread build (SP, docs/single-thread.md), or both, from one tree.
 #
 #   web/build-all.sh [--mp | --sp | --both] [--debug]
-#                    [--no-assets] [--no-gl] [--no-x] [--dist-only]
+#                    [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]
 #
 # Each flavour gets its own dist:
 #
@@ -56,7 +56,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 CACHE="${GEX_WEB_BUILD:-$ROOT/target/web-build}"
 DEBUGDIR="$ROOT/target/web-debug"
-MP=1 SP=0 ASSETS=1 GL=1 X=1 DEBUG=0
+MP=1 SP=0 ASSETS=1 GL=1 X=1 DEBUG=0 DISTS=1
 for a in "$@"; do
     case $a in
     --mp) MP=1 SP=0 ;;
@@ -67,7 +67,11 @@ for a in "$@"; do
     --no-gl) GL=0 ;;
     --no-x) X=0 ;;
     --dist-only) ASSETS=0 GL=0 X=0 ;;
-    *) echo "usage: web/build-all.sh [--mp | --sp | --both] [--debug] [--no-assets] [--no-gl] [--no-x] [--dist-only]" >&2; exit 2 ;;
+    # Only Xwayland into web/public (web/build-demo.sh's step).
+    --x-only) ASSETS=0 GL=0 X=1 DISTS=0 ;;
+    # Only Mesa into web/public (web/build-demo.sh --gl).
+    --gl-only) ASSETS=0 GL=1 X=0 DISTS=0 ;;
+    *) echo "usage: web/build-all.sh [--mp | --sp | --both] [--debug] [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]" >&2; exit 2 ;;
     esac
 done
 mkdir -p "$CACHE"
@@ -123,6 +127,7 @@ xwl() { # xwl <mt|st>
 [ "$SP" = 1 ] && [ "$GL" = 1 ] && mesa st
 [ "$MP" = 1 ] && [ "$X" = 1 ] && xwl mt
 [ "$SP" = 1 ] && [ "$X" = 1 ] && xwl st
+[ "$DISTS" = 1 ] || exit 0
 
 # -- 3. one dist per flavour ---------------------------------------------------
 dist() { # dist <mp|sp>

@@ -4,6 +4,7 @@ tests/corpus/bin/
 web/node_modules/
 web/dist/
 web/dist-sp/
+web/dist-demo/
 web/public/gex/
 web/public/rootfs/
 web/public/closure/
@@ -18,3 +19,5 @@ logs/
 core.[0-9]*
 hs_err_pid*.log
 TestResults.qpa
+web/public/pkgs/
+web/public/gex-apt/
