@@ -280,6 +280,16 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether a read on this handle, made now, can end nobody's wait. Asked
+    /// *before* the read, of a stream only (a read of anything else never
+    /// ends a wait). A read ends a writer's wait by making room, and a writer
+    /// parks only when there is none, so a stream that knows it has room
+    /// says so here and the read is not followed by a wake of every parked
+    /// Worker. `false`, "it might", is always safe.
+    fn read_frees_nothing(&self) -> bool {
+        false
+    }
+
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         let _ = (m, request, arg);
         None

@@ -1966,7 +1966,7 @@ impl Kernel {
             raw
         };
 
-        self.fd_activity |= wakes_fd_waiters(n);
+        self.fd_activity |= wakes_fd_waiters(n) && self.io_may_wake(n, &a);
         self.syscall_nr = n;
 
         // Returning from a handler restores a whole context, so it cannot go
@@ -5412,6 +5412,32 @@ impl Kernel {
             })
         };
         Ok(0)
+    }
+
+    /// Whether this read or write, about to be made, can end anyone's wait
+    /// (see [`wakes_fd_waiters`]). Its descriptor must be a stream -- a read
+    /// or write of a file, `/proc` or a device never ends a wait -- and a
+    /// read must be able to make room (`FileHandle::read_frees_nothing`).
+    /// Each "no" spares every parked Worker in the page a wake: Undertale's
+    /// reads of the wineserver's replies were half of all global wakes, every
+    /// one of them going round every idle Worker of every process
+    /// (docs/kernel-locking.md, step 3). Anything else is "yes".
+    fn io_may_wake(&self, n: u64, a: &[u64; 6]) -> bool {
+        let read = matches!(n, nr::READ | nr::READV | nr::PREAD64);
+        if !read && !matches!(n, nr::WRITE | nr::WRITEV | nr::PWRITE64) {
+            return true;
+        }
+        let Ok(file) = self.fds.get(a[0] as i32) else { return true };
+        if !file.handle.is_stream() {
+            return false;
+        }
+        !(read && file.handle.read_frees_nothing())
+    }
+
+    /// Whether any interval timer is armed: the hint a safepoint reads,
+    /// without the kernel's lock, before asking [`Kernel::timer_due`] under it.
+    pub fn timers_armed(&self) -> bool {
+        self.itimers.iter().any(|t| t.is_some())
     }
 
     /// Whether an interval timer has expired and has yet to raise its signal.

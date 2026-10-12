@@ -201,7 +201,7 @@ pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     // Every entry's page in the directory, not only the pages numbered now: a
     // fork's child has the parent's numbering (`gex_adopt_page`) but may have
     // had its directory rebuilt without it (`gex_reset_directory`).
-    crate::with_host(|h| {
+    crate::with_jit(|h| {
         for &a in addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
             if let Some(b) = h.jit.page_table.lookup(page) {

@@ -433,6 +433,13 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         !self.write || (self.remote.writable)(self.id) != 0
     }
 
+    /// The read end of a pipe with room in it: no writer is parked on it.
+    /// (One that fills it between this question and the read sleeps to its
+    /// park's bound, or the next wake, not for ever.)
+    fn read_frees_nothing(&self) -> bool {
+        !self.write && (self.remote.writable)(self.id) != 0
+    }
+
     fn available(&self) -> Option<u64> {
         Some(if self.write {
             0
