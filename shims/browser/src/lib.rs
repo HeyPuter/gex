@@ -6666,6 +6666,18 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
         MY_PID.store(h.kernel.pid, std::sync::atomic::Ordering::Relaxed);
+        // What `ident_call` answers from until this thread's next full call.
+        // No parent: asking for it is a call into the system-wide kernel, and
+        // a reparent would go unseen; `getppid` takes the full path.
+        IDS.with(|c| {
+            c.set(gex_kernel::syscalls::Idents {
+                pid: h.kernel.pid as u32,
+                ppid: 0,
+                tid: h.threads[cur()].kstate.tid as u32,
+                uid: h.kernel.uid,
+                gid: h.kernel.gid,
+            })
+        });
         report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -7562,6 +7574,10 @@ thread_local! {
     static FAST_SIG: Cell<i32> = const { Cell::new(i32::MIN) };
     /// Fast calls since this thread's last full syscall.
     static FAST_RUN: Cell<u32> = const { Cell::new(0) };
+    /// This thread's ids as its last full syscall saw them (`ident_call`).
+    static IDS: Cell<gex_kernel::syscalls::Idents> = const {
+        Cell::new(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 })
+    };
     /// The canonical number of the syscall this thread just made, for
     /// `wakes_nobody`; `u64::MAX` when the kernel did not run it.
     static CANON_NR: Cell<u64> = const { Cell::new(u64::MAX) };
@@ -7598,7 +7614,9 @@ fn clock_fast_path(ctx: i32) -> bool {
     }
     let mut gm = GuestMem::new(guest_bytes());
     let started = FAST_STARTED.load(Relaxed) as u128;
-    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started) {
+    if !gex_kernel::syscalls::clock_call(&mut gm, ctx as u32 as u64, abi == 1, browser_clock, started)
+        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, ctx as u32 as u64, abi == 1, &c.get()))
+    {
         return false;
     }
     FAST_RUN.with(|c| c.set(c.get() + 1));
