@@ -200,7 +200,7 @@ impl std::error::Error for DoorExit {}
 struct Inst {
     id: u64,
     store: Store<()>,
-    dispatch: wasmtime::TypedFunc<(i32, i32), i32>,
+    dispatch: wasmtime::TypedFunc<(i32, i32, i64, i64), i32>,
     sp: Global,
 }
 
@@ -327,7 +327,7 @@ fn instantiate(engine: &Engine, s: &Arc<Server>) -> Result<Inst> {
         Ok(_) => bail!("door: __gex_thread_start returned"),
     }
     let dispatch = match table.get(&mut store, s.get(area::DISPATCH) as u64) {
-        Some(Ref::Func(Some(f))) => f.typed::<(i32, i32), i32>(&store)?,
+        Some(Ref::Func(Some(f))) => f.typed::<(i32, i32, i64, i64), i32>(&store)?,
         _ => bail!("door: no dispatch function"),
     };
     Ok(Inst { id: s.id, store, dispatch, sp })
@@ -377,7 +377,7 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
             at += size;
         }
         let _ = inst.sp.set(&mut inst.store, Val::I32(s.get(area::STACK_TOP) as i32));
-        let r = inst.dispatch.call(&mut inst.store, (pid, tid));
+        let r = inst.dispatch.call(&mut inst.store, (pid, tid, 0, 0));
         let r = match r {
             Ok(r) => r as u32,
             Err(e) => {

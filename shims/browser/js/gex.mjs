@@ -3888,6 +3888,10 @@ export class Gex {
       // Door calls into the wineserver (docs/wineserver-kernel.md).
       door_publish: (area) => this.#doorPublish(area >>> 0),
       door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid),
+      // A Worker the door was broadcast to while it ran (it takes no
+      // messages): Wine runs its program again as a child, which starts with
+      // the door (loader.c `wineserver_relaunch`). None in the SP build.
+      door_missing: () => (this.#door || single.on ? 0 : 1),
     };
   }
 
@@ -3910,7 +3914,7 @@ export class Gex {
   #doorInst = null;
   #doorViews = null;
   /** Census: door calls, fallbacks, proxies. */
-  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0 };
+  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0 };
 
   /** The server: `area` is its door area, in this process's memory. */
   #doorPublish(area) {
@@ -3974,7 +3978,10 @@ export class Gex {
     }
     const table = new WebAssembly.Table({ element: 'anyfunc', initial: size });
     class DoorExit extends Error {}
-    const syscall = (ctx) => this.#doorSyscall(ctx >>> 0, DoorExit);
+    const st = this.#doorStats;
+    const syscall = globalThis.GEX_DOOR_STATS
+      ? (ctx) => { const t = performance.now(); try { this.#doorSyscall(ctx >>> 0, DoorExit); } finally { st.sys++; st.tSys += performance.now() - t; } }
+      : (ctx) => this.#doorSyscall(ctx >>> 0, DoorExit);
     const imports = {
       env: {
         memory: d.memory, __indirect_function_table: table, __stack_pointer: sp,
@@ -4007,7 +4014,7 @@ export class Gex {
       if (!(err instanceof DoorExit)) throw err;
     }
     const dispatch = table.get(v.dv.getUint32(a + 60, true));
-    return { door: d, dispatch, sp, stackTop };
+    return { door: d, dispatch, sp, stackTop, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
   }
 
   /** A system call from server code inside a door (i386 numbers, the
@@ -4066,8 +4073,12 @@ export class Gex {
    *  1 use the pipes, 2 the thread died in the request. */
   #doorCall(req, pid, tid) {
     const d = this.#door;
-    if (!d || single.on) return 1;
     const st = this.#doorStats;
+    if (!d || single.on) {
+      if (globalThis.GEX_DOOR_STATS && !(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
+      return 1;
+    }
+    const T = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
     const cm = this.#bytes();
     const cdv = new DataView(cm.buffer);
     const reqSize = cdv.getUint32(req + 4, true);
@@ -4102,7 +4113,13 @@ export class Gex {
         at += size;
       }
       di.sp.value = di.stackTop;
-      r = di.dispatch(pid, tid) >>> 0;
+      const T1 = T ? performance.now() : 0;
+      // The time, as set_current_time would read it (gettimeofday,
+      // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
+      // of the door saved.
+      const ns = this.#env.now();
+      r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      if (T) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { st.fallbacks++; r = 1; }
       else if (r === 0xfffffffe) r = 2;
       else {
@@ -4123,14 +4140,18 @@ export class Gex {
     if (kick) this.#doorKick();
     if (globalThis.GEX_DOOR_STATS) {
       const now = performance.now();
+      if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
       if (!st.t0) st.t0 = now;
-      else if (now - st.t0 >= 10000) {
+      else if (now - st.t0 >= 10000 || st.calls + st.fallbacks >= 50000) {
         const sa = dv.getUint32(a + 96, true) >> 2;
         const top = [];
         if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
         top.sort((x, y) => y[0] - x[0]);
         console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
-          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 8).map(([c, n]) => `${n}:${c}`).join(' ')})`);
+          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 8).map(([c, n]) => `${n}:${c}`).join(' ')});`
+          + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
+          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each)`);
+        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = 0;
         st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
       }
     }
