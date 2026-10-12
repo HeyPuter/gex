@@ -3607,10 +3607,15 @@ mod jitout {
     /// Worker's id plus one, with `DONE` once its result is in `BOX`.
     pub(crate) static OUT: AtomicU32 = AtomicU32::new(0);
     pub(crate) const DONE: u32 = 1 << 31;
-    /// Bumped by whatever may make a translation in flight wrong: code retired
-    /// (`retire_code`) or the program replaced (`do_exec`). A translator that
-    /// sees it moved drops its unit and misses again.
+    /// Bumped by `retire_code`, each range it retired logged in `RETIRED`
+    /// under the new value: a translator that sees it moved installs its unit
+    /// and then retires those ranges again, the order the two would have had
+    /// under one lock (a unit queued, then its code retired).
     pub(crate) static EPOCH: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static RETIRED: super::SingleThreaded<std::collections::VecDeque<(u32, u64, u64)>> =
+        super::SingleThreaded(std::cell::RefCell::new(std::collections::VecDeque::new()));
+    /// Bumped by `do_exec`: a unit of the program it replaced is dropped.
+    pub(crate) static EXEC_EPOCH: AtomicU32 = AtomicU32::new(0);
     pub(crate) type Parts = (
         gex_xlate::PageTable,
         std::collections::HashSet<u64>,
@@ -8700,7 +8705,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(h);
-    jitout::EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
     // and the moment it execs every one describes a program that is gone.
@@ -12486,7 +12491,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             intr: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
             page: u64,
             started: u64,
-            epoch: u32,
+            epoch: (u32, u32),
         },
     }
     let pre = with_jit(|h| {
@@ -12851,7 +12856,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // page the process has numbered) on each miss, twice, was a second of
         // a node start-up's 7,400 misses. Out of `Host` and marked so, until
         // `jit_in` puts it back.
-        let epoch = jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let epoch = (
+            jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire),
+            jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        );
         let go = MissPre::Go {
             exec,
             known: std::mem::take(&mut h.jit.translated),
@@ -12908,9 +12916,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 stats.blocks, ok, has_block, exec.len(),
             ));
         }
-        // Code was retired or the program replaced while this lifted: the unit
-        // may be of bytes that are gone. Dropped, and the branch misses again.
-        if jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch {
+        // Code retired while this lifted: installed all the same, then those
+        // ranges retired again below (see `jitout::EPOCH`). The program
+        // replaced, or more retired than the log holds: the unit is dropped,
+        // and the branch misses again.
+        let retired_since: Option<Vec<(u64, u64)>> = {
+            let now = jitout::EPOCH.load(std::sync::atomic::Ordering::Acquire);
+            let log = jitout::RETIRED.0.borrow();
+            let covered = now == epoch.0 || log.iter().any(|(e, _, _)| *e == epoch.0.wrapping_add(1));
+            covered.then(|| {
+                log.iter()
+                    .filter(|(e, _, _)| e.wrapping_sub(epoch.0).wrapping_sub(1) < u32::MAX / 2)
+                    .map(|&(_, s, e)| (s, e))
+                    .collect()
+            })
+        };
+        if retired_since.is_none()
+            || jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch.1
+        {
             for a in &fresh {
                 h.jit.translated.remove(a);
             }
@@ -12918,7 +12941,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if tracing() || n <= 4 || n.is_power_of_two() {
                 warn_line(&format!(
-                    "[gex] miss at pc={pc:#x}: code retired or replaced during its translation, unit dropped ({n} so far)\n"
+                    "[gex] miss at pc={pc:#x}: program replaced (or too much retired) during its translation, unit dropped ({n} so far)\n"
                 ));
             }
             set_resume(pc);
@@ -12958,7 +12981,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // re-translation in every process that comes later. The growth is real
         // and worth fixing, but the fix is route-independent units -- one
         // publication that covers a page for everybody -- not a smaller cache.
-        let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.covered);
+        // Not into the store if code was retired while it lifted: it may hold
+        // the old bytes, and another process would be served them.
+        let stale = retired_since.as_ref().is_some_and(|r| !r.is_empty());
+        let mod_id = if stale { 0 } else { share_module(&unit.wasm, unit.table_slots, &unit.covered) };
         if mod_id == 0 {
             h.jit.store_full += 1;
         } else {
@@ -13086,6 +13112,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 unit.table_slots,
                 unit.dir_entries.len()
             ));
+        }
+        if let Some(r) = retired_since.filter(|r| !r.is_empty()) {
+            static REPLAYED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if tracing() || n <= 4 || n.is_power_of_two() {
+                warn_line(&format!(
+                    "[gex] miss at pc={pc:#x}: {} range(s) retired during its translation, retired again after its install ({n} so far)\n",
+                    r.len()
+                ));
+            }
+            retire_ranges(h, &r);
         }
         // Come back at the address that missed, now that it will resolve.
         set_resume(pc);
@@ -13224,13 +13261,28 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
 /// old slots are left behind, unreachable.
 pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
     // Inside the kernel, so it waits for a translation holding the lock; and a
-    // translation that read the old code drops its unit (`jitout::EPOCH`).
+    // translation that may have read the old code retires these ranges again
+    // once its unit is queued (`jitout::EPOCH`).
     jit_in_held(h);
     if !ranges.is_empty() {
-        jitout::EPOCH.fetch_add(1, Ordering::Release);
+        let e = jitout::EPOCH.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let mut log = jitout::RETIRED.0.borrow_mut();
+        for &(start, end) in ranges {
+            log.push_back((e, start, end));
+        }
+        while log.len() > 256 {
+            log.pop_front();
+        }
+        drop(log);
     }
+    retire_ranges(h, ranges);
+}
+
+/// `retire_code`'s work on the JIT state, without the bookkeeping.
+fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
     for &(start, end) in ranges {
         if end <= start {
             continue;
