@@ -31,13 +31,19 @@ pub trait ProcSource: Send + Sync {
     fn others(&self) -> Vec<crate::proc::ProcEntry> {
         Vec::new()
     }
+    /// A session's controlling terminal, as its pts number and the terminal's
+    /// foreground process group (`stat`'s `tty_nr` and `tpgid`).
+    fn tty_of(&self, _sid: i32) -> Option<(u32, i32)> {
+        None
+    }
 }
 
 /// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and
 /// `htop` parse it strictly -- by position after the `)` -- and a short line
 /// is a process they skip (htop listed none) or a fatal error (`ps`: "fatal
 /// library error, reap").
-pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32) -> String {
+pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>) -> String {
+    let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
     // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
     // itrealvalue starttime vsize rss rsslim startcode endcode startstack
@@ -46,7 +52,7 @@ pub fn stat_line(pid: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i
     // guest_time cguest_time start_data end_data start_brk arg_start arg_end
     // env_start env_end exit_code
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 \
          18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
@@ -146,7 +152,7 @@ impl ProcFs {
         let comm = e.comm();
         let state = if e.zombie { 'Z' } else { 'S' };
         Some(match rest {
-            "stat" => stat_line(e.pid, &comm, state, e.ppid, e.pgid, e.sid).into_bytes(),
+            "stat" => stat_line(e.pid, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid)).into_bytes(),
             "status" => status_text(e.pid, &comm, state, e.ppid).into_bytes(),
             "statm" => b"0 0 0 0 0 0 0\n".to_vec(),
             "cmdline" => e.cmdline().to_vec(),
@@ -480,7 +486,9 @@ mod tests {
     fn this_process_keeps_its_own_view() {
         // Its own pid is `self`, served from its own state, not the table's.
         assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
-        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1).split_whitespace().count(), 52);
+        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None).split_whitespace().count(), 52);
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7))).split_whitespace().map(String::from).collect();
+        assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
     }
 
     fn fs() -> ProcFs {

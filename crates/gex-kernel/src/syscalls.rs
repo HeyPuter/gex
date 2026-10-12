@@ -6236,6 +6236,22 @@ impl Kernel {
         Ok(fd)
     }
 
+    /// The epoll set an open file is, if it is one.
+    pub fn epoll_of_file(&self, file: &OpenFile) -> Option<Arc<unix::EpollSet>> {
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.epolls.get(&key).cloned()
+    }
+
+    /// An open epoll set holding `watches`, registered here: what a fork's
+    /// child rebuilds its parent's set as.
+    pub fn adopt_epoll(&mut self, watches: Vec<unix::Watch>, flags: u64) -> Arc<OpenFile> {
+        let set = Arc::new(unix::EpollSet::with_watches(watches));
+        let handle: Arc<dyn crate::vfs::FileHandle> = set.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        self.epolls.insert(key, set);
+        OpenFile::new(handle, "anon_inode:[eventpoll]".into(), flags, true, true)
+    }
+
     /// The epoll set behind a descriptor.
     ///
     /// Kept in a side table for the same reason sockets are: an
@@ -7453,6 +7469,16 @@ pub struct ProcState {
     pub procs: Option<Arc<ProcTable>>,
     /// The image whose name and command line the table was last told.
     pub info_exe: Option<String>,
+    /// The system's pseudoterminals, for `stat`'s `tty_nr`.
+    pub ptys: Option<crate::pty::Remote>,
+}
+
+/// The session's controlling terminal: its pts number (the pair's id) and
+/// foreground group.
+fn tty_of(ptys: Option<crate::pty::Remote>, sid: i32) -> Option<(u32, i32)> {
+    let r = ptys?;
+    let id = (r.for_sid)(sid);
+    (id >= 0).then(|| (id as u32, (r.fg)(id)))
 }
 
 /// A `/proc` source backed by a snapshot the kernel refreshes.
@@ -7483,11 +7509,16 @@ impl ProcSource for KernelProcSource {
     fn stat(&self) -> String {
         let s = self.0.lock().unwrap();
         let comm: String = s.exe.rsplit('/').next().unwrap_or("gex").chars().take(15).collect();
-        crate::vfs::procfs::stat_line(s.pid, &comm, 'R', s.ppid, s.pgid, s.sid)
+        let tty = tty_of(s.ptys, s.sid);
+        crate::vfs::procfs::stat_line(s.pid, &comm, 'R', s.ppid, s.pgid, s.sid, tty)
     }
     fn others(&self) -> Vec<crate::proc::ProcEntry> {
         let procs = self.0.lock().unwrap().procs.clone();
         procs.map(|p| p.entries()).unwrap_or_default()
+    }
+    fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
+        let ptys = self.0.lock().unwrap().ptys;
+        tty_of(ptys, sid)
     }
     fn status(&self) -> String {
         let s = self.0.lock().unwrap();
@@ -7509,6 +7540,7 @@ impl Kernel {
         s.ppid = self.procs.ppid(self.pid);
         s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
         s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+        s.ptys = self.ptys;
         if s.procs.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &self.procs)) {
             s.procs = Some(Arc::clone(&self.procs));
         }
@@ -7536,7 +7568,9 @@ impl Kernel {
         }
         let fds_generation = self.fds.generation();
         if s.fds_generation != fds_generation || s.fds.is_empty() {
-            s.fds = self.fds.list();
+            // A pty end under the name a program can open and `stat`, which is
+            // how `ttyname` and `ps` find it.
+            s.fds = self.fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect();
             s.fds_generation = fds_generation;
         }
         // argv and envp never change, so they are built once.

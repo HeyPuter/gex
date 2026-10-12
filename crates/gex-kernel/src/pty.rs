@@ -211,6 +211,46 @@ fn drain(q: &mut VecDeque<u8>, buf: &mut [u8]) -> u64 {
     n as u64
 }
 
+/// `st_rdev` of `/dev/pts/N` (major 136), in Linux's encoding.
+pub const fn pts_rdev(n: u32) -> u64 {
+    let (major, minor) = (136u64, n as u64);
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// `st_rdev` of `/dev/ptmx` (5:2).
+pub const PTMX_RDEV: u64 = (5 << 8) | 2;
+
+/// `st_ino` of `/dev/pts/N`: the same from `stat` on the name and `fstat` on
+/// a descriptor, which is how `ttyname` recognises the one as the other.
+pub const fn pts_ino(n: u32) -> u64 {
+    0x7074_0000 + n as u64
+}
+
+/// `st_ino` of `/dev/ptmx`.
+pub const PTMX_INO: u64 = 0x7074_ffff;
+
+/// What `/proc/<pid>/fd/N` says for a pty end gex names `pty:[id:m|s]`
+/// internally: `/dev/ptmx` for a master, `/dev/pts/N` for a slave (the id is
+/// the pts number). Anything else as it is.
+pub fn link_name(path: &str) -> String {
+    let parsed = path
+        .strip_prefix("pty:[")
+        .and_then(|v| v.strip_suffix(']'))
+        .and_then(|v| v.split_once(':'))
+        .and_then(|(id, side)| Some((id.parse::<u32>().ok()?, side)));
+    match parsed {
+        Some((_, "m")) => "/dev/ptmx".to_string(),
+        Some((n, "s")) => format!("/dev/pts/{n}"),
+        _ => path.to_string(),
+    }
+}
+
+/// `/proc/<pid>/stat`'s `tty_nr` for a controlling terminal that is
+/// `/dev/pts/N`: the device number, as an int.
+pub const fn tty_nr(n: u32) -> i32 {
+    pts_rdev(n) as i32
+}
+
 /// A pty pair that lives in another wasm module, reached by number and a table
 /// of `extern "C"` calls -- the [`crate::pipe::Remote`] shape, with the terminal
 /// added. `id` names the pair; `master` picks the end. Data calls copy through
@@ -298,15 +338,19 @@ impl crate::vfs::FileHandle for RemotePty {
         }
     }
 
+    /// The node `/dev/pts/N` (or `/dev/ptmx`) as `stat` on its name gives
+    /// it: the same inode and device number, or `ttyname` finds no name.
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        let n = (self.remote.ptn)(self.id).max(0) as u32;
+        let (ino, rdev, mode) = if self.master { (PTMX_INO, PTMX_RDEV, 0o666) } else { (pts_ino(n), pts_rdev(n), 0o620) };
         Ok(crate::vfs::Metadata {
             file_type: crate::vfs::FileType::CharDevice,
             size: 0,
-            mode: 0o620,
-            ino: 0,
+            mode,
+            ino,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev,
             times: Default::default(),
         })
     }
@@ -381,6 +425,15 @@ fn descriptor_level(request: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pty_end_has_the_name_a_program_can_stat() {
+        assert_eq!(super::link_name("pty:[4:s]"), "/dev/pts/4");
+        assert_eq!(super::link_name("pty:[4:m]"), "/dev/ptmx");
+        assert_eq!(super::link_name("pipe:[2]"), "pipe:[2]");
+        assert_eq!(super::pts_rdev(4), 0x8804);
+        assert_eq!(super::pts_rdev(300), (300 & 0xff) | (136 << 8) | ((300 & !0xff) << 12));
+    }
+
     #[test]
     fn the_descriptor_ioctls_are_left_to_the_kernel() {
         for req in [0x5421, 0x5450, 0x5451, 0x5452] {

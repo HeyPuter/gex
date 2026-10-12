@@ -95,11 +95,43 @@ pub struct DevFs {
     /// Nodes the host added whose every open is a handle of its own (an
     /// audio device: each open is a stream with its own format and buffer).
     per_open: Vec<(String, Arc<dyn Fn() -> Arc<dyn FileHandle> + Send + Sync>)>,
+    /// The pts numbers in use, when the system has pseudoterminals: `/dev/pts`
+    /// lists them and `stat` answers for each (and for `/dev/ptmx`). Opening
+    /// one is the kernel's (`open_pty`), not this filesystem's.
+    pts: Option<Arc<dyn Fn() -> Vec<u32> + Send + Sync>>,
 }
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs { extra: Vec::new(), per_open: Vec::new() }
+        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None }
+    }
+
+    /// `/dev/ptmx` and `/dev/pts`, with `list` saying which pts numbers exist.
+    pub fn add_pts(&mut self, list: Arc<dyn Fn() -> Vec<u32> + Send + Sync>) {
+        self.pts = Some(list);
+    }
+
+    fn pts_node(&self, path: &str) -> Option<Metadata> {
+        let list = self.pts.as_ref()?;
+        let (ino, rdev, mode) = if path == "ptmx" {
+            (crate::pty::PTMX_INO, crate::pty::PTMX_RDEV, 0o666)
+        } else {
+            let n: u32 = path.strip_prefix("pts/")?.parse().ok()?;
+            if !list().contains(&n) {
+                return None;
+            }
+            (crate::pty::pts_ino(n), crate::pty::pts_rdev(n), 0o620)
+        };
+        Some(Metadata {
+            file_type: FileType::CharDevice,
+            size: 0,
+            mode,
+            ino,
+            mtime: 0,
+            nlink: 1,
+            rdev,
+            times: Default::default(),
+        })
     }
 
     /// Add a device the host provides. The handle is shared, not cloned per
@@ -154,7 +186,11 @@ impl FileSystem for DevFs {
         if path.is_empty() {
             return Ok(Arc::new(DevDir {
                 extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
+                pts: self.pts.is_some(),
             }));
+        }
+        if let (Some(list), "pts") = (self.pts.as_ref(), path) {
+            return Ok(Arc::new(PtsDir { numbers: list() }));
         }
         Err(Errno::ENOENT)
     }
@@ -177,6 +213,12 @@ impl FileSystem for DevFs {
                 rdev: rdev_of(device),
                 times: Default::default(),
             });
+        }
+        if path == "pts" && self.pts.is_some() {
+            return Ok(Metadata::dir());
+        }
+        if let Some(md) = self.pts_node(path) {
+            return Ok(md);
         }
         if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
             return Ok(Metadata {
@@ -208,6 +250,33 @@ impl FileSystem for DevFs {
 struct DevDir {
     /// Names the host added, so `ls /dev` shows them.
     extra: Vec<String>,
+    /// Whether `ptmx` and `pts` exist.
+    pts: bool,
+}
+
+/// `/dev/pts`: one character device per pseudoterminal in use.
+#[derive(Debug)]
+struct PtsDir {
+    numbers: Vec<u32>,
+}
+
+impl FileHandle for PtsDir {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EISDIR)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata::dir())
+    }
+    fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
+        let mut out = vec![
+            DirEntry { name: ".".into(), file_type: FileType::Directory, ino: 1 },
+            DirEntry { name: "..".into(), file_type: FileType::Directory, ino: 1 },
+        ];
+        for &n in &self.numbers {
+            out.push(DirEntry { name: n.to_string(), file_type: FileType::CharDevice, ino: crate::pty::pts_ino(n) });
+        }
+        Ok(out)
+    }
 }
 
 impl FileHandle for DevDir {
@@ -242,6 +311,10 @@ impl FileHandle for DevDir {
                 file_type: FileType::CharDevice,
                 ino: 1,
             });
+        }
+        if self.pts {
+            out.push(DirEntry { name: "ptmx".into(), file_type: FileType::CharDevice, ino: crate::pty::PTMX_INO });
+            out.push(DirEntry { name: "pts".into(), file_type: FileType::Directory, ino: 1 });
         }
         for name in ["stdin", "stdout", "stderr", "fd"] {
             out.push(DirEntry {
@@ -330,6 +403,24 @@ mod tests {
     /// A device the host adds is opened like any other, and the same handle
     /// comes back every time -- which is what lets one keep state across the
     /// several times a program opens it.
+    /// `ttyname` compares `fstat` of the descriptor with `stat` of the name
+    /// `/proc/self/fd` gives: `/dev/pts/N` must exist, as the same node.
+    #[test]
+    fn pts_lists_the_pairs_in_use_with_their_device_numbers() {
+        let mut fs = DevFs::new();
+        assert_eq!(fs.metadata("pts").err(), Some(Errno::ENOENT), "no pseudoterminals, no /dev/pts");
+        fs.add_pts(Arc::new(|| vec![0, 3]));
+        assert_eq!(fs.metadata("pts").unwrap().file_type, FileType::Directory);
+        let names: Vec<String> = fs.open("pts", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, [".", "..", "0", "3"]);
+        let md = fs.metadata("pts/3").unwrap();
+        assert_eq!((md.file_type, md.rdev, md.ino), (FileType::CharDevice, 0x8803, crate::pty::pts_ino(3)));
+        assert_eq!(fs.metadata("pts/1").err(), Some(Errno::ENOENT));
+        assert_eq!(fs.metadata("ptmx").unwrap().rdev, (5 << 8) | 2);
+        let root: Vec<String> = fs.open("", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(root.iter().any(|n| n == "pts") && root.iter().any(|n| n == "ptmx"));
+    }
+
     #[test]
     fn a_host_device_is_openable_and_shared() {
         #[derive(Debug)]
