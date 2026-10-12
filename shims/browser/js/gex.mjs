@@ -841,7 +841,46 @@ export class Gex {
    * How the run loop waited, by kind. `park` is a sleep on the shared word
    * another Worker ends; `turn` is a MessageChannel task; `nap` is a timer.
    */
-  waits = { park: 0, turn: 0, nap: 0 };
+  waits = { park: 0, turn: 0, nap: 0, net: 0 };
+
+  /** Resolves the network wait in progress (`#netWait`) on this Worker's own
+   *  network's activity. */
+  #netWake = null;
+  #kernelWords = null;
+
+  /** What ends a network wait, sampled before the guest is given another
+   *  chance (`gex_wake`): the global kernel's wake counter and the page
+   *  network's event count. */
+  #netSnap() {
+    const k = this.#kernel;
+    return { k: k?.k_wake_addr ? k.k_wake_seq() : null, n: this.#net?.activitySeq?.() ?? null };
+  }
+
+  /**
+   * Sleep, without blocking this Worker's event loop, until the network has
+   * something (this Worker's own network's `onActivity`, or the page's
+   * through the bridge's activity word), another Worker bumps the global
+   * kernel's wake counter (`Atomics.waitAsync` on it), or the waiting
+   * thread's own deadline is due (`gex_wait_bound_ms`, at most 50 ms). It
+   * replaces a MessageChannel turn loop that spun every network-waiting
+   * Worker at full speed, each turn taking the host lock four times (node's
+   * idle Workers in the page: ~2.2 s of KLock each over a 13 s run).
+   */
+  #netWait(e, snap) {
+    const ms = e.gex_wait_bound_ms ? e.gex_wait_bound_ms(50) : 1;
+    const k = this.#kernel;
+    const waits = [new Promise((r) => { this.#netWake = r; })];
+    if (k?.k_wake_addr && snap.k !== null) {
+      this.#kernelWords ??= new Int32Array(this.#kernelSpec.memory.buffer);
+      const w = Atomics.waitAsync(this.#kernelWords, k.k_wake_addr() >>> 2, snap.k, ms);
+      if (!w.async) return Promise.resolve();
+      waits.push(w.value);
+    } else {
+      waits.push(new Promise((r) => setTimeout(r, Math.min(ms, 4))));
+    }
+    if (snap.n !== null) waits.push(this.#net.activityWait(snap.n, ms));
+    return Promise.race(waits).finally(() => { this.#netWake = null; });
+  }
 
   // A MessageChannel first, then `setTimeout(_, 1)`: a bare timer nests and the
   // HTML spec clamps a nested timer to 4ms, but the level resets after a
@@ -2930,6 +2969,17 @@ export class Gex {
    */
   useNetwork(net) {
     this.#net = net;
+    // Its events end a network wait (`#netWait`). Chained: the single-thread
+    // build's scheduler wake is set before this.
+    if (net && 'onActivity' in net) {
+      const prev = net.onActivity;
+      net.onActivity = (...a) => {
+        prev?.apply(net, a);
+        const r = this.#netWake;
+        this.#netWake = null;
+        r?.();
+      };
+    }
     // Guarded, because this runs before the shim exists (a Worker is given its
     // devices between construction and `adoptProcess`); `load`/`attach` set it
     // from `#net` too.
@@ -4359,6 +4409,7 @@ export class Gex {
         // loop matters: one event-loop turn is no promise the wait is over.
         if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
           let woke = 0;
+          let snap = this.#netSnap();
           while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
             // Another Worker can execute exit_group while this one is parked.
             // The global-kernel wake it generates is not a resume request for
@@ -4401,6 +4452,11 @@ export class Gex {
                 // case, so it is the condition for turning.
                 const onLoop = !!e.gex_paused_for_host();
                 this.#netTurns = onLoop ? this.#netTurns + 1 : 0;
+                if (onLoop && e.gex_wait_bound_ms && this.#kernel?.k_wake_addr) {
+                  // Asleep until the network, another Worker or the clock.
+                  this.waits.net++;
+                  await this.#netWait(e, snap);
+                } else
                 // A nap every 1024th turn keeps an empty socket from spinning
                 // the Worker hot and lets timer-driven work run. Raising it
                 // from 64 did not change throughput -- the naps overlap with
@@ -4419,6 +4475,7 @@ export class Gex {
               }
             }
             if (e.gex_exited?.()) return e.gex_exit_code();
+            snap = this.#netSnap();
             woke = e.gex_wake();
             if (woke === 1) break;
           }

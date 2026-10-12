@@ -18,6 +18,10 @@ const RESULT = 5;
 // One channel and every process on it: claimed per call, holding the
 // claimant's own number (a stuck claim then says whose it is).
 const LOCK = 6;
+// Bumped and notified by the page on every network event (a stream opens,
+// receives or closes), so a Worker whose guest waits on a socket sleeps on it
+// (`NetProxy.activityWait`) rather than polling AVAILABLE in a turn loop.
+const ACTIVITY = 8;
 const IDLE = 0;
 const REQUEST = 1;
 const REPLY = 2;
@@ -51,6 +55,12 @@ export function serveNet(net, channel) {
   const data = new Uint8Array(channel.data);
   const dec = new TextDecoder();
   let active = true;
+  const prevActivity = net.onActivity;
+  net.onActivity = (...a) => {
+    prevActivity?.apply(net, a);
+    Atomics.add(ctl, ACTIVITY, 1);
+    Atomics.notify(ctl, ACTIVITY);
+  };
   const serve = () => {
     const op = ctl[OP];
     const id = ctl[A0];
@@ -92,6 +102,7 @@ export function serveNet(net, channel) {
   })();
   return () => {
     active = false;
+    net.onActivity = prevActivity;
     Atomics.notify(ctl, STATE);
   };
 }
@@ -107,6 +118,18 @@ export class NetProxy {
     this.#ctl = new Int32Array(channel.control);
     this.#data = new Uint8Array(channel.data);
     this.#me = me || 1;
+  }
+
+  /** The page's network event count (`ACTIVITY`), sampled before a wait. */
+  activitySeq() {
+    return Atomics.load(this.#ctl, ACTIVITY);
+  }
+
+  /** A promise that settles at the next network event after `seq`, or in
+   *  `ms`. */
+  activityWait(seq, ms) {
+    const w = Atomics.waitAsync(this.#ctl, ACTIVITY, seq, ms);
+    return w.async ? w.value : Promise.resolve(w.value);
   }
 
   #call(op, a0 = 0, a1 = 0, a2 = 0) {
