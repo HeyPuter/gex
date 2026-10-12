@@ -4095,6 +4095,9 @@ export class Gex {
     if (replyOff + 64 + replyMax > bufSize) { st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
+    // Poisoned (a door call died midway): no more doors; the pipes say the
+    // rest when the server goes.
+    if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
     let waitedMs = 0;
     for (let spins = 0; ; spins++) {
       const v = Atomics.compareExchange(i32, L, 0, 1);
@@ -4143,7 +4146,11 @@ export class Gex {
       }
     } catch (err) {
       this.#doorInst = null;
-      console.error(`[gex-door] the wineserver trapped in a door call: ${err?.stack ?? err}`);
+      // A handler cut off midway: the server is poisoned (area +124, the
+      // caller's tid), and its pump ends it at its next turn, as when
+      // wineserver dies. The caller takes the pipes, which then close.
+      Atomics.store(i32, (a + 124) >> 2, tid || -1);
+      console.error(`[gex-door] the wineserver trapped in a door call (pid ${pid} tid ${tid}); the server is poisoned: ${err?.stack ?? err}`);
       r = 1;
     }
     const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;

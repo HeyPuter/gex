@@ -425,7 +425,18 @@ export class ProcessHost {
       const t0 = Date.now();
       const again = () => {
         if (this.#inDoor(key) && Date.now() - t0 < 10000) { setTimeout(again, 1); return; }
-        if (this.#inDoor(key)) console.error(`[host] ${key}: still inside a wineserver door call after 10 s; stopped anyway (the door is stuck)`);
+        if (this.#inDoor(key)) {
+          // Stopped inside a door call: its handler is cut off midway, so
+          // the server is poisoned (area +124) and the lock given up; the
+          // pump takes it, sees the poison and ends the server, as when
+          // wineserver dies.
+          const i32 = new Int32Array(this.#door.memory.buffer);
+          const a = this.#door.area >> 2;
+          console.error(`[host] ${key}: still inside a wineserver door call after 10 s; stopped, and the server is poisoned`);
+          Atomics.store(i32, a + 31, i32[a + 29] || -1);
+          Atomics.store(i32, a, 0);
+          Atomics.notify(i32, a);
+        }
         this.#releaseNow(key, w);
       };
       setTimeout(again, 1);
