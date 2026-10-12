@@ -639,6 +639,14 @@ async function handle(msg) {
         closure: msg.closure ?? (await closureModules(msg.closureCount ?? 0)),
         wantLibrary,
       });
+      // On the forking thread's registers, which the child's kernel keeps
+      // where the parent had them (`gex_adopt_child`): `run`'s default is the
+      // first thread's. A fork from any other thread entered with the first
+      // thread's registers -- for W3, Wine's spawn from services.exe's RPC
+      // thread started the child's `__gex_thread_start` on that thread's
+      // stack, read a stack word as `clone_start`'s table index and trapped
+      // ("table index is out of bounds", rpcss and every service child).
+      if (msg.child?.ctx) ctx = Number(msg.child.ctx);
     } else {
       entry = await gex.load(
         msg.shim,

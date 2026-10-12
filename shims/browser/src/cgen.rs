@@ -1910,13 +1910,45 @@ pub(crate) fn guest_unix_call_hook() -> u32 {
     UNIX_DISPATCHERS[1].load(Ordering::Relaxed)
 }
 
-/// A native wasm32 program's guest fault hook (W3.1). Recorded; the page
-/// does not deliver faults to it yet (W3.7).
+/// A native wasm32 program's guest fault hook (W3.1). The page delivers a
+/// branch to non-executable memory to it (`gex_fault_take`), as natively.
 static FAULT_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[no_mangle]
 pub extern "C" fn gex_fault_hook_set(idx: u32) {
     FAULT_HOOK.store(idx, Ordering::Relaxed);
+}
+
+/// The fault hook's function-table index, or 0 (none).
+pub(crate) fn fault_hook() -> u32 {
+    FAULT_HOOK.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// A guest fault staged for the hook: (NTSTATUS code, address, kind:
+    /// Windows' ExceptionInformation[0], 0 read, 1 write, 8 execute).
+    static FAULT_PENDING: std::cell::Cell<Option<(u32, u64, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Stage a fault for the host to give the hook (`gex_fault_take`); the
+/// caller writes the faulting PC into the context and traps.
+pub(crate) fn fault_stage(code: u32, addr: u64, kind: u32) {
+    FAULT_PENDING.with(|f| f.set(Some((code, addr, kind))));
+}
+
+/// The staged fault, taken: the hook's table index (0: none staged), with
+/// its code, address and kind at `out` (u32, u64, u32, packed little-endian
+/// as 4 + 8 + 4 bytes).
+#[no_mangle]
+pub extern "C" fn gex_fault_take(out: u32) -> u32 {
+    let Some((code, addr, kind)) = FAULT_PENDING.with(|f| f.take()) else { return 0 };
+    let mut b = [0u8; 16];
+    b[..4].copy_from_slice(&code.to_le_bytes());
+    b[4..12].copy_from_slice(&addr.to_le_bytes());
+    b[12..].copy_from_slice(&kind.to_le_bytes());
+    // SAFETY: `out` is 16 bytes the host allocated in this module's memory.
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), std::ptr::with_exposed_provenance_mut::<u8>(out as usize), 16) };
+    fault_hook()
 }
 
 /// A native wasm32 program's signal hook (W3.1). Recorded, as the fault
