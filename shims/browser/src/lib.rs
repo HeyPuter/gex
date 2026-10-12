@@ -12931,11 +12931,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     .collect()
             })
         };
-        if retired_since.is_none()
-            || jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch.1
-        {
+        let execd = jitout::EXEC_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch.1;
+        if retired_since.is_none() || execd {
             for a in &fresh {
                 h.jit.translated.remove(a);
+            }
+            // And the pages it numbered. The translator gives a page its base
+            // in the page table it was handed, which came back with the
+            // result; the directory entry is written only when the unit is
+            // installed. Kept numbered with the entry never written, the next
+            // lift there sees an old page, writes no entry for it either, and
+            // every block of it that runs into that page (an instruction
+            // across the boundary) fails its page check against the empty
+            // entry, asks to be translated again, and gets the same check: a
+            // miss loop for ever (Undertale, frozen at its first frame, when
+            // any retire dropped the unit). After an `execve` the table is
+            // the new program's, and nothing of this unit is in it.
+            if !execd {
+                for (p, b) in &unit.dir_entries {
+                    if h.jit.page_table.lookup(*p) == Some(*b) {
+                        h.jit.page_table.forget(*p);
+                    }
+                }
             }
             static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
