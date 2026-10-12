@@ -353,11 +353,19 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
     let engine = caller.engine().clone();
     INST.with(|cell| -> Result<i32> {
         let mut slot = cell.borrow_mut();
+        s.lock();
+        // Started under the lock: an instance's start runs on the one door
+        // stack and context.
         if slot.as_ref().is_none_or(|i| i.id != s.id) {
-            *slot = Some(instantiate(&engine, &s)?);
+            match instantiate(&engine, &s) {
+                Ok(i) => *slot = Some(i),
+                Err(e) => {
+                    s.unlock();
+                    return Err(e);
+                }
+            }
         }
         let inst = slot.as_mut().unwrap();
-        s.lock();
         let sb = s.mem.bytes();
         let b0 = buf as usize;
         sb[b0..b0 + 64].copy_from_slice(&cm.bytes()[req as usize..req as usize + 64]);

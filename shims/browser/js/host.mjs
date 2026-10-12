@@ -84,6 +84,8 @@ export class ProcessHost {
   }
   #onOutput; #onFork; #onExit; #readStdin; #onOther;
   #workers = new Map();
+  /** The wineserver's door, once published (`doorPublish`). */
+  #door = null;
   #pending = new Map();
   #first = null;
   #forked = 0;
@@ -456,6 +458,8 @@ export class ProcessHost {
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
             sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
+            // the wineserver's door, if one is up (`doorPublish`)
+            door: this.#door ?? undefined,
           }, forkTransfer(msg.child));
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
@@ -472,6 +476,13 @@ export class ProcessHost {
           },
           );
         }
+        break;
+      }
+      case 'doorPublish': {
+        // The wineserver's door (docs/wineserver-kernel.md): every Worker of
+        // the session, now and later, gets the server's memory and module.
+        this.#door = m.door;
+        for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
         break;
       }
       case 'wantLibrary':
@@ -614,6 +625,7 @@ export class ProcessHost {
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
             // references, not a byte copy. See `#moduleCache`.
             sharedModules: this.#sharedFor(pid, true),
+            door: this.#door ?? undefined,
           }),
           );
         };

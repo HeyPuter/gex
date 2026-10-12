@@ -231,6 +231,13 @@ async function handle(msg) {
     workerGex?.addSharedModule(msg.key, msg.mod);
     return;
   }
+  // The wineserver's door, from the host: this Worker's door calls go to it
+  // from its next one. Before this Worker has a `Gex`, the start message
+  // carries it instead.
+  if (msg?.kind === 'door') {
+    workerGex?.setDoor(msg.door);
+    return;
+  }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
   // How many traps a forked child takes before installing its parent's
@@ -350,6 +357,11 @@ async function handle(msg) {
     shareModule(key, mod) {
       port.post({ kind: 'compiledModule', key, mod });
     }
+    // The wineserver published its door (docs/wineserver-kernel.md): up to
+    // the host, which hands it to every Worker of the session.
+    publishDoor(door) {
+      port.post({ kind: 'doorPublish', door });
+    }
     // A function-tier unit's files by key (`gex.useCgen`): `msg.cgen.root`, a
     // directory under Node (GEX_CGEN_CACHE's layout), or `msg.cgen.url`, read
     // with a synchronous request -- allowed in a Worker, and what lets the
@@ -408,6 +420,7 @@ async function handle(msg) {
   // and `?debug=1`, which does carry it, mirrors every guest write and changed
   // the fault it was being used to look at.
   if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
+  if (msg.doorStats) globalThis.GEX_DOOR_STATS = 1;
   if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
@@ -438,6 +451,7 @@ async function handle(msg) {
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
+  if (msg.door) gex.setDoor(msg.door);
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.

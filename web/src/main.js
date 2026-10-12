@@ -322,6 +322,7 @@ for (const [event, describe] of [
   // enough to turn an `unreachable` in a forked apt method into a different
   // fault, so the one switch could not be used to diagnose the other.
   if (params.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  if (params.get('doorstats')) globalThis.GEX_DOOR_STATS = 1;
   // `?forkskip=N`: a forked child does not copy any inherited region larger
   // than N MiB, leaving those pages zero. A diagnostic, and a destructive one:
   // if the guest reads one it gets zeros. It answers the question a real
