@@ -332,14 +332,17 @@ impl WaylandDevice {
     }
 
     /// Move bytes both ways for every client, hand the compositor this turn's
-    /// scene, and take its input. Run once per scheduler turn.
+    /// scene, and take its input. Run once per scheduler turn. Says whether it
+    /// sent any client anything: a reply written here is readiness no
+    /// syscall announced, so the caller wakes the parked Workers.
     ///
     /// `kernel`/`mem` are how a buffer is found: a client maps its `wl_shm`
     /// pool `MAP_SHARED`, which aliases a range of guest memory, so what the
     /// compositor is told is the address of that range -- nothing is copied
     /// here, and nothing is composited here either.
-    pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
+    pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) -> bool {
         let mut sessions = self.inner.sessions.lock().unwrap();
+        let mut sent_any = false;
         // Compositor input and control for this turn, addressed by client: a
         // process can host Xwayland and a native client at once, and an event
         // for one must not reach the other.
@@ -523,7 +526,10 @@ impl WaylandDevice {
             while s.sent < s.out.len() {
                 match s.socket.send(&s.out[s.sent..]) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => s.sent += n as usize,
+                    Ok(n) => {
+                        s.sent += n as usize;
+                        sent_any = true;
+                    }
                 }
             }
             if s.sent == s.out.len() {
@@ -582,6 +588,7 @@ impl WaylandDevice {
             let count = (scene.len() / REC) as u32;
             unsafe { wl_publish(scene.as_ptr() as u32, count) };
         }
+        sent_any
     }
 
     /// Write every client's surfaces into the scene arena.

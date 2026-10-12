@@ -10607,7 +10607,15 @@ fn schedule() -> i32 {
         let pick = with_host(|h| {
             if let Some(w) = h.wayland.clone() {
                 let gm = GuestMem::new(guest_bytes());
-                w.pump(&h.kernel, &gm);
+                // What the pump wrote to a client's socket (a frame callback,
+                // a buffer release, input) is readiness for a thread parked in
+                // `poll` on that socket in another Worker -- Wine's Wayland
+                // reader thread -- and no syscall bumped the wake word for it:
+                // it waited out its park bound, 20 ms (the park-late diag on
+                // mspaint, 24 times on that one thread).
+                if w.pump(&h.kernel, &gm) && unsafe { k_present() } != 0 {
+                    unsafe { k_wake() };
+                }
             }
             // Every thread gone ends this process, all this Worker has; the
             // status is in the shared table for whoever waits.
