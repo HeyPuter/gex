@@ -7449,6 +7449,10 @@ pub struct ProcState {
     pub maps_generation: u64,
     /// Which version of the descriptor table `fds` was listed from.
     pub fds_generation: u64,
+    /// The process table, for `/proc`'s view of the other processes.
+    pub procs: Option<Arc<ProcTable>>,
+    /// The image whose name and command line the table was last told.
+    pub info_exe: Option<String>,
 }
 
 /// A `/proc` source backed by a snapshot the kernel refreshes.
@@ -7478,18 +7482,12 @@ impl ProcSource for KernelProcSource {
     }
     fn stat(&self) -> String {
         let s = self.0.lock().unwrap();
-        // pid, comm, state, ppid, pgrp, session, then the rest, which nothing
-        // seen so far reads. `ps` and every "who is my parent" one-liner cut
-        // fields out of this by number, so the first six have to be right
-        // even when the remainder is zeroes.
-        format!(
-            "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0\n",
-            s.pid,
-            s.exe.rsplit('/').next().unwrap_or("gex"),
-            s.ppid,
-            s.pgid,
-            s.sid
-        )
+        let comm: String = s.exe.rsplit('/').next().unwrap_or("gex").chars().take(15).collect();
+        crate::vfs::procfs::stat_line(s.pid, &comm, 'R', s.ppid, s.pgid, s.sid)
+    }
+    fn others(&self) -> Vec<crate::proc::ProcEntry> {
+        let procs = self.0.lock().unwrap().procs.clone();
+        procs.map(|p| p.entries()).unwrap_or_default()
     }
     fn status(&self) -> String {
         let s = self.0.lock().unwrap();
@@ -7511,6 +7509,9 @@ impl Kernel {
         s.ppid = self.procs.ppid(self.pid);
         s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
         s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+        if s.procs.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &self.procs)) {
+            s.procs = Some(Arc::clone(&self.procs));
+        }
         // Only when the map has actually changed. Formatting the VMA tree is
         // the single most expensive thing this function does -- half of all
         // execution in a browser run of an X server, which polls in a tight
@@ -7526,6 +7527,9 @@ impl Kernel {
         // are already there.
         if s.exe != self.exe_path {
             s.exe = self.exe_path.clone();
+            // An exec: a new name and command line, for this process's /proc
+            // and for every other's.
+            s.cmdline.clear();
         }
         if s.cwd != self.vfs.cwd {
             s.cwd.clone_from(&self.vfs.cwd);
@@ -7547,6 +7551,17 @@ impl Kernel {
                 .iter()
                 .flat_map(|a| a.bytes().chain(std::iter::once(0)))
                 .collect();
+        }
+        // Said to the process table once per image, for the other processes'
+        // `/proc/<pid>` (`ps`, `htop`): the name, then the command line.
+        if s.info_exe.as_deref() != Some(s.exe.as_str()) {
+            let name = s.exe.rsplit('/').next().unwrap_or("gex");
+            let mut info = Vec::with_capacity(name.len() + 1 + s.cmdline.len());
+            info.extend_from_slice(name.as_bytes());
+            info.push(b'\n');
+            info.extend_from_slice(&s.cmdline);
+            self.procs.set_info(self.pid, &info);
+            s.info_exe = Some(s.exe.clone());
         }
     }
 }

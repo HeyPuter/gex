@@ -62,6 +62,81 @@ pub struct Remote {
     pub wait_ready: extern "C" fn(ppid: i32, want: i32) -> i32,
     pub request_halt: extern "C" fn(code: i32),
     pub halt_code: extern "C" fn() -> i32,
+    /// What `/proc/<pid>` says about a process: see [`ProcTable::set_info`].
+    pub set_info: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
+    /// Every process, encoded by [`encode_entries`], into `cap` bytes at `at`;
+    /// returns the full length (larger than `cap`: ask again with more room).
+    pub snapshot: extern "C" fn(at: crate::PAddr, cap: u32) -> i32,
+}
+
+/// One process as another process's `/proc` sees it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcEntry {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+    /// Exited and not yet collected by its parent.
+    pub zombie: bool,
+    /// What the process published: its name, a newline, then its command
+    /// line (NUL-separated arguments). Empty until it has said.
+    pub info: Vec<u8>,
+}
+
+impl ProcEntry {
+    /// The name `/proc/<pid>/comm` and `stat` give (at most 15 bytes).
+    pub fn comm(&self) -> String {
+        let end = self.info.iter().position(|&b| b == b'\n').unwrap_or(self.info.len());
+        let name = String::from_utf8_lossy(&self.info[..end]).into_owned();
+        if name.is_empty() {
+            return "gex".into();
+        }
+        name.chars().take(15).collect()
+    }
+    /// `/proc/<pid>/cmdline`.
+    pub fn cmdline(&self) -> &[u8] {
+        match self.info.iter().position(|&b| b == b'\n') {
+            Some(i) => &self.info[i + 1..],
+            None => &[],
+        }
+    }
+}
+
+/// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
+/// sid, zombie), the info's length, the info, padded to four bytes.
+pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in entries {
+        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.info.len() as i32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&e.info);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+    out
+}
+
+pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
+    let mut out = Vec::new();
+    let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+    while b.len() >= 24 {
+        let n = word(b, 5).max(0) as usize;
+        if b.len() < 24 + n {
+            break;
+        }
+        out.push(ProcEntry {
+            pid: word(b, 0),
+            ppid: word(b, 1),
+            pgid: word(b, 2),
+            sid: word(b, 3),
+            zombie: word(b, 4) != 0,
+            info: b[24..24 + n].to_vec(),
+        });
+        b = &b[(24 + n + 3) & !3..];
+    }
+    out
 }
 
 /// One process, as the table sees it.
@@ -87,6 +162,8 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// See [`ProcTable::set_info`].
+    info: Vec<u8>,
 }
 
 struct Table {
@@ -143,6 +220,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    info: Vec::new(),
                 }],
             }),
         }
@@ -175,8 +253,54 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            info: Vec::new(),
         });
         pid
+    }
+
+    /// What `/proc/<pid>` shows for `pid` in every other process: its name
+    /// and command line (see [`ProcEntry`]), said by the process itself when
+    /// it starts and again when it execs.
+    pub fn set_info(&self, pid: i32, info: &[u8]) {
+        let info = &info[..info.len().min(4096)];
+        if let Some(r) = self.remote {
+            return (r.set_info)(pid, info.as_ptr() as usize as crate::PAddr, info.len() as u32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.info = info.to_vec();
+        }
+    }
+
+    /// Every process in the table, for `/proc`'s listing.
+    pub fn entries(&self) -> Vec<ProcEntry> {
+        if let Some(r) = self.remote {
+            let mut cap = 16 * 1024usize;
+            for _ in 0..4 {
+                let mut buf = vec![0u8; cap];
+                let n = (r.snapshot)(buf.as_mut_ptr() as usize as crate::PAddr, cap as u32);
+                if n < 0 {
+                    return Vec::new();
+                }
+                if n as usize <= cap {
+                    buf.truncate(n as usize);
+                    return decode_entries(&buf);
+                }
+                cap = n as usize;
+            }
+            return Vec::new();
+        }
+        self.lock()
+            .procs
+            .iter()
+            .map(|p| ProcEntry {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: p.pgid,
+                sid: p.sid,
+                zombie: p.child.status.lock().map(|s| s.is_some()).unwrap_or(false),
+                info: p.info.clone(),
+            })
+            .collect()
     }
 
     /// The handle a host needs to publish `pid`'s exit status.
@@ -596,6 +720,21 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_table_lists_processes_with_what_they_said() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_info(a, b"sh\n/bin/sh\0-c\0x\0");
+        let e = t.entries();
+        assert_eq!(e.len(), 2);
+        let mine = e.iter().find(|e| e.pid == a).unwrap();
+        assert_eq!(mine.comm(), "sh");
+        assert_eq!(mine.cmdline(), b"/bin/sh\0-c\0x\0");
+        assert_eq!(decode_entries(&encode_entries(&e)), e);
+        t.exit(a, 0);
+        assert!(t.entries().iter().find(|e| e.pid == a).unwrap().zombie);
+    }
 
     #[test]
     fn a_child_inherits_its_parents_group_and_session() {

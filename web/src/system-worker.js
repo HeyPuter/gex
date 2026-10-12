@@ -7,6 +7,8 @@
 // large module synchronously and make synchronous requests (the page refuses
 // both above 8 MB / at all), and the runtime does both; and because a guest
 // that runs long stalls this thread, not the page's input and drawing.
+// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
+import './zfetch.js';
 import { enableSingle } from '../../shims/browser/js/single.mjs';
 
 enableSingle();

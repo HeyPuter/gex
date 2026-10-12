@@ -353,6 +353,13 @@ impl crate::vfs::FileHandle for RemotePty {
     }
 
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
+        // The descriptor's own ioctls are the kernel's to answer, as they are
+        // for any file. Answering them here with ENOTTY failed libuv's
+        // `uv__nonblock` (FIONBIO) on a pty: nvim's input stream never opened,
+        // so it drew in an xterm and took no keys.
+        if descriptor_level(request) {
+            return None;
+        }
         Some(self.do_ioctl(m, request, arg))
     }
 
@@ -363,6 +370,26 @@ impl crate::vfs::FileHandle for RemotePty {
             if self.master { "master" } else { "slave" },
             (self.remote.available)(self.id, self.m()).max(0),
         )
+    }
+}
+
+/// FIONBIO, FIONCLEX, FIOCLEX, FIOASYNC: properties of the descriptor, not
+/// the device.
+fn descriptor_level(request: u64) -> bool {
+    matches!(request, 0x5421 | 0x5450 | 0x5451 | 0x5452)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_descriptor_ioctls_are_left_to_the_kernel() {
+        for req in [0x5421, 0x5450, 0x5451, 0x5452] {
+            assert!(super::descriptor_level(req), "{req:#x}");
+        }
+        // TCGETS, TIOCGWINSZ, TIOCGPTN are the terminal's.
+        for req in [0x5401, 0x5413, 0x8004_5430] {
+            assert!(!super::descriptor_level(req), "{req:#x}");
+        }
     }
 }
 

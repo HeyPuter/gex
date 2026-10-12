@@ -1820,6 +1820,30 @@ pub extern "C" fn k_halt_code() -> i32 {
     procs().halt_code().unwrap_or(-1)
 }
 
+/// A process's name and command line, for the others' `/proc/<pid>`.
+#[no_mangle]
+pub extern "C" fn k_proc_set_info(pid: i32, at: gex_kmem::PAddr, len: u32) {
+    let len = len.min(4096);
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    procs().set_info(pid, &buf);
+}
+
+/// Every process, encoded (`gex_kernel::proc::encode_entries`), into up to
+/// `cap` bytes at `at`. Returns the whole length: more than `cap` means ask
+/// again with that much room.
+#[no_mangle]
+pub extern "C" fn k_proc_snapshot(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let b = gex_kernel::proc::encode_entries(&procs().entries());
+    let n = (b.len() as u32).min(cap);
+    if n > 0 {
+        unsafe { gex_kmem::push_checked(at, b.as_ptr(), n) };
+    }
+    b.len() as i32
+}
+
 // -- pipes -------------------------------------------------------------------
 //
 // A pipe crosses processes as a *number*: each file table holds an id and the

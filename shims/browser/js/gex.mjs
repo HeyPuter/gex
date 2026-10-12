@@ -1364,6 +1364,7 @@ export class Gex {
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+    if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
@@ -1853,6 +1854,7 @@ export class Gex {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
       // The unit cache and ELF export providers, as `load` gives a process its
       // own: a forked child's table starts empty while its GOT holds what
@@ -4121,15 +4123,18 @@ export class Gex {
   }
 
   /** Say how large the compositor's output is, before the guest runs. */
-  wlOutput(w, h) {
+  wlOutput(w, h, scale = 1) {
     // Kept, and given again to every shim instance this process makes: a
     // fresh instance (a fork child's, an exec's) starts at the default
     // 640x480, and W3 starts every Windows program by fork and exec.
     this.#wlOut = [w | 0, h | 0];
+    this.#wlScale = Math.max(1, scale | 0);
     this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
+    this.#shim?.exports?.gex_set_wl_scale?.(this.#wlScale);
   }
 
   #wlOut = null;
+  #wlScale = 1;
 
   /**
    * This process's name in the compositor's scene arena: its pid, which every

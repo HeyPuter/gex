@@ -183,6 +183,13 @@ pub struct SurfaceInfo {
     pub xid: u32,
     /// The pixels are not at `addr`: the host knows where they are.
     pub external: bool,
+    /// `wl_surface.set_buffer_scale`: buffer pixels per surface unit (1 unless
+    /// the client said otherwise).
+    pub buffer_scale: i32,
+    /// The output scale this client was told (`wl_output.scale`): device
+    /// pixels per surface unit. The host draws a surface at
+    /// `width * client_scale / buffer_scale` device pixels.
+    pub client_scale: i32,
 }
 
 /// Interfaces the registry advertises, with the version offered. A toolkit
@@ -417,6 +424,10 @@ struct SurfaceState {
     /// `wp_viewport.set_destination`: the size the surface is shown at, when
     /// the client set one.
     viewport: Option<(i32, i32)>,
+    /// `set_buffer_scale`, pending until commit, and the committed value
+    /// (0 is 1).
+    pending_scale: Option<i32>,
+    buffer_scale: i32,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -443,8 +454,11 @@ pub struct Client {
     /// Event serials, handed out with sync/configure/frame callbacks, counting
     /// up.
     next_serial: u32,
-    /// The size a toplevel is told it is.
+    /// The size a toplevel is told it is, in device pixels.
     default_size: (i32, i32),
+    /// Device pixels per surface unit: what `wl_output.scale` says. A
+    /// toplevel's configure is in surface units, so `default_size / scale`.
+    scale: i32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
     /// Surfaces whose scene state changed since the host last published it, so
@@ -510,6 +524,7 @@ impl Client {
             frames: Vec::new(),
             next_serial: 1,
             default_size: (640, 480),
+            scale: 1,
             positioners: HashMap::new(),
             dirty: false,
             failed: None,
@@ -530,6 +545,13 @@ impl Client {
     /// ask for a particular window.
     pub fn set_default_size(&mut self, w: i32, h: i32) {
         self.default_size = (w, h);
+    }
+
+    /// The output scale this client is told (`wl_output.scale`), for a host
+    /// whose output is in device pixels on a high-density display. Set before
+    /// the client binds the output.
+    pub fn set_scale(&mut self, scale: i32) {
+        self.scale = scale.clamp(1, 8);
     }
 
     /// Feed bytes and descriptors that arrived together.
@@ -847,7 +869,7 @@ impl Client {
                 // mode(flags=current|preferred, width, height, refresh mHz)
                 let ev = Writer::new(id, 1).uint(0b11).int(w_px).int(h_px).int(60000);
                 self.send(ev);
-                let ev = Writer::new(id, 3).int(1);
+                let ev = Writer::new(id, 3).int(self.scale);
                 self.send(ev);
                 let ev = Writer::new(id, 2);
                 self.send(ev);
@@ -1052,7 +1074,9 @@ impl Client {
                     return false;
                 };
                 if let Some(s) = self.surfaces.get_mut(&object) {
-                    let rect = Damage { x, y, w, h };
+                    // Surface units, and the host's damage is in buffer pixels.
+                    let k = s.pending_scale.unwrap_or(s.buffer_scale).max(1);
+                    let rect = Damage { x: x * k, y: y * k, w: w * k, h: h * k };
                     s.pending_damage = Some(match s.pending_damage {
                         Some(mut held) => {
                             held.merge(rect);
@@ -1079,8 +1103,17 @@ impl Client {
                 self.commit(object, buffers);
                 true
             }
-            // set_buffer_transform, set_buffer_scale, offset
-            7 | 8 | 10 => true,
+            // set_buffer_scale(scale): buffer pixels per surface unit, from
+            // the next commit.
+            8 => {
+                let Some(k) = r.int() else { return false };
+                if let Some(s) = self.surfaces.get_mut(&object) {
+                    s.pending_scale = Some(k.clamp(1, 8));
+                }
+                true
+            }
+            // set_buffer_transform, offset
+            7 | 10 => true,
             // damage_buffer(x, y, width, height), in buffer coordinates. The
             // same thing as `damage` at scale 1 and no transform, which is
             // every surface here -- and it is the one toolkits actually use.
@@ -1107,6 +1140,15 @@ impl Client {
 
     /// Apply a surface's pending state, the only moment anything becomes visible.
     fn commit(&mut self, surface: u32, buffers: &dyn Buffers) {
+        // The buffer scale is double-buffered state like the rest.
+        if let Some(s) = self.surfaces.get_mut(&surface) {
+            if let Some(k) = s.pending_scale.take() {
+                if k != s.buffer_scale.max(1) {
+                    self.dirty = true;
+                }
+                s.buffer_scale = k;
+            }
+        }
         let Some(state) = self.surfaces.get(&surface).cloned() else {
             return;
         };
@@ -1364,7 +1406,8 @@ impl Client {
                 // compositor sends, and a window that has just appeared is the
                 // active one.
                 let (w, h) = self.default_size;
-                self.send_toplevel_configure(id, object, w, h, true);
+                let k = self.scale.max(1);
+                self.send_toplevel_configure(id, object, w / k, h / k, true);
                 true
             }
             // get_popup(id, parent, positioner)
@@ -1994,6 +2037,8 @@ impl Client {
                 x11: s.x11,
                 xid: s.xid,
                 external: external.is_some(),
+                buffer_scale: s.buffer_scale.max(1),
+                client_scale: self.scale,
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -3107,6 +3152,31 @@ mod tests {
             1,
             "the cursor was counted as a window",
         );
+    }
+
+    #[test]
+    fn a_surface_carries_its_buffer_scale_and_its_clients_output_scale() {
+        // The cursor surface from above, drawn at 2x for a 2x output: the host
+        // shows it at width * client_scale / buffer_scale, 1:1 here.
+        let pool = Placed(0x8000, 4096);
+        let (mut c, _) = placed_window(64, 64, 256);
+        c.set_scale(2);
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(50).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(50, 0).new_id(51).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(52).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(53).int(0).int(24).int(24).int(96).uint(0).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 0).uint(1).object(52).int(4).int(3).finish(), &[], &pool);
+        c.receive(&Writer::new(52, 1).object(53).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(52, 8).int(2).finish(), &[], &pool); // set_buffer_scale(2)
+        let before = c.scene().into_iter().find(|s| s.surface == 52);
+        assert!(before.is_none() || before.unwrap().buffer_scale == 1, "pending until commit");
+        c.receive(&Writer::new(52, 6).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 52).expect("no cursor surface");
+        assert_eq!((s.buffer_scale, s.client_scale), (2, 2));
     }
 
     #[test]

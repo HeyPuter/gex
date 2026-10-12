@@ -250,6 +250,8 @@ extern "C" {
     fn k_setpgid(caller: i32, target: i32, pgid: i32) -> i32;
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
+    fn k_proc_set_info(pid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32;
 
     // The filesystem. Every address below is in *this* process's memory; the
     // other side copies across with `memory.copy`, which is the only way it
@@ -645,6 +647,12 @@ extern "C" fn r_request_halt(code: i32) {
 extern "C" fn r_halt_code() -> i32 {
     unsafe { k_halt_code() }
 }
+extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
+    unsafe { k_proc_set_info(pid, at, len) }
+}
+extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
+    unsafe { k_proc_snapshot(at, cap) }
+}
 
 /// The process table every process shares, if the host gave us one.
 ///
@@ -676,6 +684,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             setpgid: r_setpgid,
             request_halt: r_request_halt,
             halt_code: r_halt_code,
+            set_info: r_set_info,
+            snapshot: r_snapshot,
         },
     )))
 }

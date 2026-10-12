@@ -1596,3 +1596,152 @@ The cache saves the **global kernel's module store** and the slot numbering its 
 - On edger, in the page, measure cold `node -e 0` and `apt install ripgrep tcc libc6-dev`.
 - Load twice in one browser profile. The second load runs with `?xcache=1` for "after", and without it for "before". This needs site.mjs to have a mode that reloads with a persistent profile.
 - Report translation counts as well as times.
+
+## 9. The demo: a desktop, a small base, the rest on demand (plan, 2026-10-11)
+
+What a visitor opens is one page that looks like a desktop, not a list of
+demos. It is its own build target, `web/build-demo.sh` → `web/dist-demo`,
+always stripped, and no test runs on it (one smoke leg: the desktop comes
+up with both windows).
+
+**The page.** The compositor's output (`compositor.js`, WebGPU scene mode,
+which draws window decorations itself) fills the page. The shell chrome --
+a panel with the launcher button, a clock and the console toggle -- is DOM,
+drawn by the page: it costs the guest's rootfs nothing and needs no guest
+process. Two windows are open at start:
+
+- **xterm running bash.** Debian's arm64 xterm (translated) on the page's
+  X server (`hostX`, `web/public/gex/xwayland/`), its shell our wasm32 bash.
+- **The launcher**, a page-side window listing what can be added: gears,
+  the GTK 3 demo, foot, nvim, node, apt, and the programs of the old demo
+  list worth keeping. Choosing one downloads it (once), adds it to the
+  filesystem and runs it.
+
+pid 1 is bash reading commands from the page's terminal (hidden; the panel
+shows it as a console). The launcher starts a program by writing its command
+line there, so no guest-side launcher exists.
+
+**The base rootfs** is what bash and xterm need and nothing else:
+`mkrootfs.py --roots base-files,base-passwd,ncurses-base --extra xterm
+--ours bash,mawk,sysvinit-utils` (mawk and sysvinit-utils only satisfy
+base-files' and x11-common's dependencies), then pruned of the fonts xterm
+does not use (core fonts come from the X server; DejaVu Sans Mono stays for
+`-fa`), X11 locales other than C/en_US.UTF-8, and debconf's perl.
+
+**Everything else comes at run time** as zstd-compressed downloads, in one
+of two forms, and the numbers decide which the launcher uses:
+
+- (a) a **tar overlay** per launcher item: the item's closure minus the
+  base, built by `mkrootfs.py` as base+item and diffed against the base. The
+  page fetches `pkgs/ITEM.tar.zst`, decodes it with zstddec and writes the
+  files straight into the global kernel's filesystem from a Worker
+  (`k_fs_add`, `k_fs_symlink`, `k_fs_chmod`), while the guest runs. Its dpkg
+  status stanzas go along, so a later `apt` sees the item as installed.
+- (b) **.deb**: `dpkg -i` of prefetched .debs, or `apt install` from the
+  network (Wisp). apt and dpkg are themselves an overlay (they are not in
+  the base).
+
+Measured on edger for two or three items (apt from the network, dpkg -i of a
+prefetched .deb, the tar overlay); the expectation is tar overlays for the
+launcher and apt for what the user installs, but the measurement decides.
+
+**Stripped, always.** `wasm-tools strip` takes debug sections off every
+.wasm (the name section stays: a trap still names its function). Runtime
+.wasm files ship only as `.wasm.zst` (`zstd --ultra -22`) and a demo build's
+page decodes them with zstddec: one `fetch` wrapper in the page and in every
+Worker, so the shim, kernel, providers, Xwayland and Mesa all go through it.
+The base rootfs ships as `rootfs/base.tar.zst` (`--ultra -22`).
+
+**Milestones**, each served at a directly openable https URL (100.64.0.3):
+
+1. base rootfs and the stripped build (sizes, compressed and not);
+2. the desktop with both windows;
+3. the launcher and on-demand packages, with the apt / dpkg / tar numbers;
+4. time to desktop and download size, on edger.
+
+### 9.1 As built and measured (2026-10-11)
+
+`web/build-demo.sh` (items: `web/demo-items.json`, overlays:
+`tools/gexcc/debian/mkoverlay.py`); the smoke and every number below:
+`tests/demo/desktop.mjs` (`DEMO_STEPS`), headless Chromium on edger's
+Quadro P620, fresh profile per visit, the dist served from 127.0.0.1 (so
+fetch times are local-disk, not a real network).
+
+**Base rootfs** (user, same day: "the base first-load should have coreutils
+at least"): bash, dash, xterm and its arm64 closure, and ours coreutils,
+grep, sed, findutils, procps, less, ncurses-bin, gzip, tar, util-linux,
+hostname, nano, debianutils: **38.8 MiB tree / 38.8 MiB tar / 8.3 MiB zstd**
+(bash + xterm alone: 20.6 / 20.4 / 5.7). What each tool adds is listed in
+build-demo.sh; the rest (file, gawk, diffutils, zstd, xz, bsdextrautils,
+tree: 1.5 MiB) is the launcher's "More tools".
+
+**Runtime modules**, stripped (name section kept) then zstd -22: shim
+50.5 → 5.7 → 1.2 MiB, kernel 15.2 → 0.4 → 0.1, Xwayland 2.0 → 2.0 → 0.5,
+its bridge 11.9 → 0.2 → 0.05; Mesa (fetched on the first GL item only)
+19.6 → 19.6 → 3.3. **First load: 11.4 MiB** (runtime 1.9, rootfs 8.3, page
+JS about 1).
+
+**Time to desktop** (navigation → xterm mapped, launcher open): 4.4–5.1 s
+over 12 visits (median about 4.6 s). Downloads and unpack are done by about
+0.6 s and pid 1 starts by about 0.9 s; the rest is the X server and the
+translated xterm/libX11 coming up.
+
+**Launcher items, three ways** (same items, ms; tar = fetch + zstd decode +
+write into the running kernel; dpkg/apt = the guest's own clock, after the
+apt overlay, 10.1 MiB zstd, 0.4–0.5 s):
+
+| item | packages | tar overlay | dpkg -i of prefetched .debs | apt-get install (network) |
+|---|---|---|---|---|
+| htop | 1 | 26–41 (0.27 MB) | 1,176–1,381 (.debs 0.25 MB) | – (ours; pinned) |
+| x11-apps | 18 | 106–112 (2.5 MB) | 20,218–21,115 (4.8 MB) | 26,138–26,353 |
+| neovim | 12 | 317–352 (7.2 MB) | 13,420–13,449 (7.6 MB) | 28,617–28,737 |
+
+`apt-get update` alone (trixie arm64 indexes over Wisp): 9.1–9.3 s on
+wss://anura.pro/, 19.0–26.0 s on wss://wisp.mercurywork.shop/. dpkg -i takes 29 to 199 times as long as the overlay
+for the same files (maintainer scripts, triggers and dpkg itself run
+translated), and apt adds the network on top. So: **the launcher uses tar
+overlays; apt stays for what the user installs themselves.** Overlays also
+record their packages in dpkg's status, so apt sees launcher items as
+installed.
+
+Two fixes the measurements forced: the base needs dash (dpkg refuses to
+run without `sh`), and the trees keep debconf (`man-db`'s postinst sources
+`/usr/share/debconf/confmodule`). apt installing a Debian package that
+depends on one only we build (man-db → bsdextrautils) needs our .debs:
+the apt overlay registers the whole pool (56 MB) as lazy files under
+/var/lib/gex-apt, fetched from the page only when apt reads one.
+
+### 9.2 What the first users hit, and the fixes (2026-10-12)
+
+- **Blurry output.** The canvas was sized in CSS pixels. It is now sized in
+  device pixels, and guest Wayland clients are told the rounded
+  devicePixelRatio as `wl_output.scale`. `set_buffer_scale` is honoured, and
+  each record carries the buffer and client scales in its flags word, bits
+  8–15 and 16–23. X windows stay at scale 1 in device pixels, and xterm is
+  sized through `/root/.Xdefaults` (`Xft.dpi`). Where nothing is scaled, a
+  draw samples nearest, so a terminal's glyphs are its own pixels.
+- **Two pointers.** No cursor is composited any more. The client's cursor
+  surface (or Xwayland's) becomes the canvas's CSS cursor as a `url()` with
+  its hotspot, cached by content; a null cursor becomes `none`, and the
+  desktop and window frames get `default`.
+- **glxgears from the xterm: "couldn't get an RGB, Double-buffered visual".**
+  Debian's glvnd `libGL` had no vendor library, because the Mesa drivers were
+  pruned from the trees. The gears item maps gex's marshallers onto
+  Debian's `libGL.so.1`, `libEGL.so.1` and `libGLESv2.so.2`, and the page
+  starts Mesa on a guest's first GL request (`glLazy`).
+- **htop with no processes.** `/proc` listed only `self`. Each process now
+  tells the process table its name and command line once per image, and
+  `/proc` lists every pid with `stat` (all 52 fields), `status`, `statm`,
+  `cmdline` and `comm`, plus `loadavg`.
+- **nvim ignored typing.** The pty answered FIONBIO with ENOTTY, so libuv's
+  `uv_pipe_open` failed on the terminal. FIONBIO and the close-on-exec
+  ioctls (FIONCLEX, FIOCLEX, FIOASYNC) are now left to the kernel.
+- **xterm not presenting until refocused: open.** With no input, the
+  compositor draws one frame per line the xterm prints, and the page's canvas
+  holds each of them; `tests/demo/desktop.mjs`'s presentation leg checks
+  that by drawing the canvas into a 2D canvas. Headless Chromium's
+  screenshots never contain a worker's WebGPU canvas, so what a person's
+  browser displays is not covered by any test here.
+
+Legs: `node tests/demo/desktop.mjs web/dist-demo` (the desktop, then the
+cursor and presentation legs; `DEMO_DPR=2` for the device-pixel output).
