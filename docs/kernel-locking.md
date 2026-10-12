@@ -339,21 +339,32 @@ same box.
 | 0 | Census: per `with_host` site, time held and time waited (`GEX_KLOCKDIAG=1`, a report every 10 s, as fbdiag does). Diagnostic, not landed. | none | where the remaining 4.5+1.3 ms/frame of Undertale and the network Workers' 0.1 s go |
 | 1 | `gex_kernel::sync` lock types (§4.0); the trap-out held-lock check (§4.1); the epoch array (§4.2). No behaviour change. | unit tests for the three lock flavours; a held-across-trap test that must fail without the check | none expected |
 | 2 | Split `Kernel` into `Process` and `ThreadCtx`; remove `enter_thread`. Mechanical, still under KLock. | all existing tests; the W3 page echo; the native thread suites | no change expected |
-| 3 | The nothing-shared syscalls (§3.1) answered without KLock; `clock_call` folded in. | a test that each of them is answered with KLock held by another Worker (it must not wait) | Undertale KLock ms/frame |
-| 4 | Sharded `FutexTable` (§3.2); futex syscalls without KLock. | `check-futex-wake.mjs` extended to 8 Workers on 64 futexes with requeue; a native futex stress test; Noita jobs natively | Undertale, Noita job threads |
-| 5 | fd snapshot and fd mutex (§3.4); read/write/poll/recv/send and friends without KLock. | a close-while-reading test; node -e 0 site legs; pipe and socket stress in both hosts | node -e 0 network Workers' KLock should reach about 0 |
-| 6 | mm mutex and VMA snapshot (§3.5). | an mmap/munmap storm against translation on 4 threads, natively and in the page; the fork tests | dispatch_miss time per frame |
-| 7 | Translation without KLock (§3.6): lock-free lookups, CAS publication, per-registry mutexes. | the fjit legs (W3 echo with fjit, Undertale with fjit); units-only Undertale; an SMC test with 2 threads | dispatch_miss ms/frame; Unity HK/Muck presents/s |
-| 8 | Signals (§3.8) and the thread table (§3.7); targeted wakes everywhere (§3.3). | the signal suites; the nullcall fault leg; a tgkill storm; W3 legs (Wine uses SIGUSR and SIGALRM heavily) | idle Workers' CPU |
+| 3 | Targeted wakes (§3.3) and the idle loop (§3.7, its part): an idle Worker parks on its own wake slot or the futex it waits on, not the global `WAKE` word, and is woken only by what it waits for; `wasm32_wait`/`schedule`/`gex_park` take the lock once a pass, not seven times. Built on w/ut-page-tw2's targeted wake. | a test that a syscall in one process wakes no idle Worker in another; `check-futex-wake.mjs`; the W3 legs | Undertale takes and wait per frame per process; the wined3d thread's KLock in the GL ioctl |
+| 4 | Translation registry reads without KLock (§3.6, the read half): `gex_table_need` and the `gex_module_*` getters read published state, and JS asks once a batch, not once an index or field. | the fjit legs; units-only Undertale; node -e 0 | node -e 0 wait at those sites |
+| 5 | Translation outside KLock (§3.6, the write half): lock-free lookups, CAS publication, per-registry mutexes. | the fjit legs (W3 echo with fjit, Undertale with fjit); an SMC test with 2 threads; a Muck census | node -e 0 dispatch_miss held time; Unity HK/Muck presents/s |
+| 6 | Syscalls: the nothing-shared ones (§3.1, `clock_call` folded in), then the sharded `FutexTable` (§3.2), then the fd snapshot and fd mutex (§3.4). | a test that each nothing-shared call is answered while another Worker holds KLock; `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue; a close-while-reading test; pipe and socket stress in both hosts | Undertale syscall wait per frame; node -e 0 network Workers' KLock |
+| 7 | mm mutex and VMA snapshot (§3.5). | an mmap/munmap storm against translation on 4 threads, natively and in the page; the fork tests | dispatch_miss time per frame |
+| 8 | Signals (§3.8) and the rest of the thread table (§3.7). | the signal suites; the nullcall fault leg; a tgkill storm; W3 legs (Wine uses SIGUSR and SIGALRM heavily) | idle Workers' CPU |
 | 9 | Lifecycle, devices, introspection and NT (§3.9, §3.10). `with_host` and `KLock` deleted. | fork/exec/wait stress in the page; the xcache save; the whole gate | Undertale KLock: 0; the full table again |
 | 10 | Native: `Mutex<Kernel>` gone (steps 2-9 already changed gex-kernel, so this is the host glue). | native suites under TSan, where they build | native Noita/HK, as a check only |
 
 - Steps 3 to 8 each remove KLock from a class of calls while every other
   call still takes it. So any step can stop without leaving a half-locked
   structure: whatever is not yet converted stays under KLock as now.
-- The order is by measured cost (Undertale: syscalls, then futexes and
-  waits, then dispatch_miss) and by dependency (fds and mm before
-  translation, translation before the thread table).
+- The order is by the step 0 census (2026-10-11):
+  - **Undertale** (worldmachine, units-ut3, 600 s): every Wine process's
+    idle Workers pass through `wasm32_wait`, `schedule` and `gex_park` about
+    550 times a frame, taking KLock 7 times a pass: 80-130k takes a second
+    per process, against about 520 real syscalls a frame in the game's
+    process. Each syscall bumps the global wake word and wakes them all.
+    Hence step 3 first.
+  - **node -e 0** (edger, warm run, 14 processes; 1.71 M takes, 10.5 s
+    waited, 11.8 s held): registry reads from JS (`gex_table_need`, 498k
+    takes, and `gex_module_*`, 357k) waited 7.2 s; `gex_dispatch_miss`
+    held 5.35 s over 7,200 takes; syscalls held 2.6 s. Hence steps 4 and 5
+    next.
+  - Registry reads touch neither fds nor mm, so step 4 needs neither first;
+    step 5's write half publishes what steps 6 and 7 then stop guarding.
 
 ## 6. Risks
 
