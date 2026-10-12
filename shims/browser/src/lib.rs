@@ -10163,15 +10163,23 @@ fn any_signal(h: &mut Host) -> bool {
 /// other processes too (what lets the scheduler cross a process boundary): all
 /// it consults is reference-counted and outside guest memory.
 fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
+    wait_ready(&t.waiting, t.blocked_on.as_ref(), now, signalled)
+}
+
+/// [`thread_ready`] on a thread's wait as parts: what an idle turn's snapshot
+/// (`IDLE_SNAP`) keeps and asks again without the lock. Everything it
+/// consults is atomics, the clock, or a handle's own lock (`FileHandle` is
+/// `Sync`; pipes and unix sockets ask the global kernel).
+fn wait_ready(waiting: &Waiting, blocked_on: Option<&gex_kernel::BlockOp>, now: u64, signalled: bool) -> bool {
     // A signal ends a wait -- every interruptible one, all here but a thread
     // exited or running in another Worker. Becoming runnable is all that is
     // needed: the picked thread finishes its parked call, and the code after
     // already asks `deliver_pending`,
     // which either builds the handler's frame or ends the process.
-    if SIGNAL_ENDS_WAIT && signalled && !matches!(t.waiting, Waiting::Exited | Waiting::Elsewhere) {
+    if SIGNAL_ENDS_WAIT && signalled && !matches!(waiting, Waiting::Exited | Waiting::Elsewhere) {
         return true;
     }
-    match &t.waiting {
+    match waiting {
         Waiting::Runnable => true,
         Waiting::Futex { parked, deadline, val, wake_gen } => {
             // Four ways this wait ends. `woken()` is a same-Worker wake; the
@@ -10210,7 +10218,7 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
         Waiting::Write(handle) => handle.poll_writable(),
         Waiting::Net(deadline) => {
             deadline.is_some_and(|d| now >= d)
-                || match &t.blocked_on {
+                || match blocked_on {
                     Some(gex_kernel::BlockOp::Connect { socket }) => {
                         socket.status() != gex_kernel::net::Status::Connecting
                     }
@@ -10223,7 +10231,7 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
         // Ready when one of the children this call can collect has a status
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
-        Waiting::Child => match &t.blocked_on {
+        Waiting::Child => match blocked_on {
             Some(gex_kernel::BlockOp::WaitChild {
                 children,
                 procs,
@@ -10597,12 +10605,14 @@ fn thread_table_changed() {
 const IDLE_FAST_MAX: u32 = 16;
 
 /// What an idle turn saw under the lock, kept so the next turns can ask
-/// whether this Worker's thread became ready without the lock: its wait (a
-/// futex or a sleep, the two whose readiness is atomics and the clock), the
-/// rest of the turn's answer, and the counters that say nothing else moved.
+/// whether this Worker's thread became ready without the lock: its wait and
+/// the call it parked in (asked again with `wait_ready`: atomics, the clock,
+/// and handles that carry their own locks), the rest of the turn's answer,
+/// and the counters that say nothing else moved.
 struct IdleSnap {
     thread: usize,
     waiting: Waiting,
+    blocked_on: Option<gex_kernel::BlockOp>,
     look: IdleLook,
     wayland: Option<crate::wl::WaylandDevice>,
     signal_seq: i32,
@@ -10628,9 +10638,10 @@ fn idle_counters() -> (i32, u32, u32) {
 
 /// An idle turn without the kernel's lock (docs/kernel-locking.md, step 6:
 /// the pick reads only its own thread). Answers when the last turn found this
-/// Worker's thread in a futex wait or a sleep and nothing since could have
-/// changed that but the futex's generation or the clock, which are asked
-/// here: no signal counter moved and no timer is armed, the thread table
+/// Worker's thread waiting and nothing since could have changed that but what
+/// the wait itself watches (a futex's generation, the clock, a pipe or a
+/// socket), which is asked here: no signal counter moved and no timer is
+/// armed, the thread table
 /// (exits, exec) did not change, the process has not exited, and the
 /// compositor has nothing to pump. `None`: take the lock and look.
 fn idle_fast(counters: (i32, u32, u32)) -> Option<IdleLook> {
@@ -10653,17 +10664,7 @@ fn idle_fast(counters: (i32, u32, u32)) -> Option<IdleLook> {
             *c = None;
             return None;
         }
-        let now = now_ns();
-        let ready = match &snap.waiting {
-            Waiting::Futex { parked, deadline, wake_gen, .. } => {
-                parked.woken()
-                    || deadline.is_some_and(|d| now >= d)
-                    || unsafe { k_futex_gen(parked.addr()) } != *wake_gen
-            }
-            Waiting::Sleep(d) => now >= *d,
-            _ => true,
-        };
-        if ready {
+        if wait_ready(&snap.waiting, snap.blocked_on.as_ref(), now_ns(), false) {
             *c = None;
             return None;
         }
@@ -10672,10 +10673,34 @@ fn idle_fast(counters: (i32, u32, u32)) -> Option<IdleLook> {
 }
 
 /// Keep what an idle turn saw for `idle_fast`, when this Worker's thread
-/// waits on a futex or sleeps and the turn is not watching for a deadlock.
+/// waits on something any Worker may ask about and the turn is not watching
+/// for a deadlock.
 fn idle_snapshot(h: &Host, look: &IdleLook, counters: (i32, u32, u32)) {
     let Some(t) = h.threads.get(cur()) else { return };
-    if look.all_blocked || !matches!(t.waiting, Waiting::Futex { .. } | Waiting::Sleep(_)) {
+    // A deadlock watch counts turns under the lock; a thread that is not
+    // waiting, or is not this Worker's to run, has nothing to keep.
+    if look.all_blocked || matches!(t.waiting, Waiting::Runnable | Waiting::Exited | Waiting::Elsewhere) {
+        return;
+    }
+    // Only handles whose readiness is safe to ask from any Worker: a pipe or
+    // a socket (the global kernel's, or a handle with its own lock). The
+    // page's terminal is not -- `StdinQueue` is a `RefCell` the lock alone
+    // guards, and a `Tty` asks it -- nor is anything else `idle_why` would
+    // call a keystroke.
+    let shareable = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        use gex_kernel::vfs::FileType;
+        Arc::as_ptr(handle) as *const () != Arc::as_ptr(&*STDIN) as *const ()
+            && (handle.peer_wakes()
+                || matches!(handle.metadata().map(|m| m.file_type), Ok(FileType::Socket) | Ok(FileType::Fifo)))
+    };
+    let ok = match (&t.waiting, &t.blocked_on) {
+        (Waiting::Read(hd) | Waiting::Write(hd) | Waiting::Accept(hd), _) => shareable(hd),
+        (Waiting::Net(_), Some(gex_kernel::BlockOp::Poll { fds, .. })) => {
+            fds.iter().all(|p| p.handle.as_ref().is_none_or(shareable))
+        }
+        _ => true,
+    };
+    if !ok {
         return;
     }
     let (signal_seq, local_signals, table_gen) = counters;
@@ -10683,6 +10708,7 @@ fn idle_snapshot(h: &Host, look: &IdleLook, counters: (i32, u32, u32)) {
         *c.borrow_mut() = Some(IdleSnap {
             thread: cur(),
             waiting: t.waiting.clone(),
+            blocked_on: t.blocked_on.clone(),
             look: *look,
             wayland: h.wayland.clone(),
             signal_seq,
