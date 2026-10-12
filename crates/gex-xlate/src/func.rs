@@ -1449,6 +1449,7 @@ fn recover_seeded(
         if !changed {
             let covered = coverage_index(&functions);
             let case_targets = switch_cases(&functions);
+            let guessed = guessed_cases(&functions);
             // The code inside a switch's own block: `adr x10, .` anchors a
             // relative table there, and is not an entry anyone takes.
             let switch_blocks: Vec<(u64, u64)> = functions
@@ -1468,6 +1469,16 @@ fn recover_seeded(
                 .collect();
             for (w, typed, pad_of) in weak {
                 if case_targets.contains(&w) || in_switch(w) {
+                    continue;
+                }
+                // A pointer to it is relocated and a virtual call's tail
+                // reaches it (`one_case_guess`): a function, whoever's
+                // blocks it also is.
+                if typed && guessed.contains(&w) && !starts[&w].has(Source::Orphan) {
+                    if plausible_start(&code, w, typed) {
+                        starts.get_mut(&w).unwrap().add(Source::Orphan);
+                        changed = true;
+                    }
                     continue;
                 }
                 let mut owners = covered.owners(w);
@@ -1571,11 +1582,35 @@ fn switch_cases(functions: &BTreeMap<u64, Function>) -> HashSet<u64> {
         .values()
         .flat_map(|f| f.blocks.iter())
         .filter_map(|b| match &b.term {
-            FTerm::Switch { cases, .. } => Some(cases.iter().map(|c| c.0)),
+            FTerm::Switch { cases, table, .. } if !one_case_guess(table) => Some(cases.iter().map(|c| c.0)),
             _ => None,
         })
         .flatten()
         .collect()
+}
+
+/// The cases of [`one_case_guess`] switches.
+fn guessed_cases(functions: &BTreeMap<u64, Function>) -> HashSet<u64> {
+    functions
+        .values()
+        .flat_map(|f| f.blocks.iter())
+        .filter_map(|b| match &b.term {
+            FTerm::Switch { cases, table, .. } if one_case_guess(table) => Some(cases.iter().map(|c| c.0)),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// A "switch" of one case read through writable memory: a virtual call's
+/// tail (`mov eax, [obj]; jmp [eax + 16]` with `obj` in `.data`) resolved
+/// from the initial bytes, not a jump table. Its case is the callee, a
+/// function of its own; it does not stop that start from being promoted
+/// (Win7's uiribbon.dll: the vtable functions such tails reach were blocks
+/// of the tail and nobody's entry, called a few thousand times at start-up
+/// through the function table's fallback).
+fn one_case_guess(t: &gex_ir::func::JumpTable) -> bool {
+    t.count == 1 && t.entry_bytes == 0 && !t.complete
 }
 
 /// Whether an uncovered weak start is worth a function of its own: its

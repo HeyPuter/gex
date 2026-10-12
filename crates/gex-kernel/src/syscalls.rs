@@ -666,6 +666,15 @@ pub struct Kernel {
     /// simply runs the wrong function. A long-running X server does exactly
     /// this every time its last client disconnects and it resets.
     pub retired_code: Vec<(u64, u64)>,
+    /// Ranges made executable again by `mprotect` (read+execute, no write):
+    /// the function tier compares its units' pages there (a loader that lifted
+    /// `.text` to fill an import table and put it back, `cgen::on_retire`).
+    /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
+    /// could have changed the code was retired when the page became writable,
+    /// and forgetting the dispatch pages here dropped the bridges of the units
+    /// and native modules on them for good (a native Wine DLL's `ud2` stub
+    /// then ran as code: SIGILL in Undertale's GL start).
+    pub recheck_code: Vec<(u64, u64)>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -1589,6 +1598,7 @@ impl Kernel {
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
+            recheck_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             rlimits: default_rlimits(),
@@ -1837,6 +1847,7 @@ impl Kernel {
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
+            recheck_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             rlimits: self.rlimits,
@@ -3014,7 +3025,24 @@ impl Kernel {
                 if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
                     self.retire_code(a[0], a[1]);
                 }
-                self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
+                let r = self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
+                // Executable again (a loader filling an import table in
+                // `.text`, a JIT done writing): what is there now is checked
+                // against the function tier's units (`cgen::on_retire`
+                // compares the pages; a page made non-executable for a while
+                // is not gone: `cgen::in_pe_image`). A check, not a retire
+                // (`recheck_code`).
+                if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
+                    let (start, end) = (
+                        crate::mem::page_align_down(a[0]),
+                        crate::mem::page_align_up(a[0].saturating_add(a[1])),
+                    );
+                    if end > start {
+                        self.recheck_code.push((start, end));
+                        crate::note_code_change();
+                    }
+                }
+                r
             }
             nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 

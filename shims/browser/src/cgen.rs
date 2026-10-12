@@ -239,15 +239,38 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
 
 /// A hash of guest page `page` as it is now (the native host's `page_hash`).
 fn page_hash(memory: &[u8], page: u64) -> u64 {
-    let lo = (page * gex_abi::DISPATCH_PAGE) as usize;
-    let hi = (lo + gex_abi::DISPATCH_PAGE as usize).min(memory.len());
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for c in memory.get(lo..hi).unwrap_or(&[]).chunks(8) {
-        let mut b = [0u8; 8];
-        b[..c.len()].copy_from_slice(c);
-        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x0100_0000_01b3);
+    let slots = lock(&IMPORT_SLOTS);
+    gex_xlate::masked_page_hash(memory, page, gex_abi::DISPATCH_PAGE, &slots)
+}
+
+/// The import slots of every PE image placed (absolute, sorted): bytes the
+/// loader writes that are not code ([`page_hash`]).
+static IMPORT_SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn note_import_slots(base: u64, pe: &gex_ld::pe::PeImage) {
+    let end = base + pe.image_size as u64;
+    {
+        let mut v = lock(&IMPORT_SLOTS);
+        v.retain(|&(a, _)| a < base || a >= end);
+        v.extend(gex_xlate::pe_import_slots(pe).into_iter().map(|(a, b)| (base + a, base + b)));
+        v.sort_unstable();
     }
-    h
+    let mut v = lock(&PE_IMAGES);
+    v.retain(|&(a, b)| b <= base || a >= end);
+    v.push((base, end));
+}
+
+/// Where the PE images with units are (start, end).
+static PE_IMAGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Whether `addr` is inside a PE image a unit was placed for: a page of one
+/// made non-executable for a while (Wine's loader lifts `.text` to fill an
+/// import table there, then puts it back) is not gone (the hosts'
+/// `gone_code`). Its units stay; its bytes are compared when it is
+/// executable again (the kernel retires it then), and a changed page reads
+/// as patched.
+pub(crate) fn in_pe_image(addr: u64) -> bool {
+    lock(&PE_IMAGES).iter().any(|&(a, b)| a <= addr && addr < b)
 }
 
 fn is_wine(path: &str) -> bool {
@@ -303,7 +326,7 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
         return false;
     }
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
-    if !w3_matches(&image) {
+    if !w3_matches(&image, base, pe, true) {
         lock(&W3_DEFERRED).push(Pending { path: path.to_string(), base, pe: Arc::new(pe.clone()) });
         W3_ANY_DEFERRED.store(true, Ordering::Release);
         return false;
@@ -317,11 +340,18 @@ static W3_DEFERRED: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 static W3_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the mapped code is `image`'s.
-fn w3_matches(image: &gex_ld::Image) -> bool {
+/// At the mapping (`at_map`) every byte counts, the import slots too: until
+/// the loader has filled them (and put back the protection it lifts to do
+/// it, which retires the page and the unit's functions on it) the unit must
+/// wait for the image's first miss.
+fn w3_matches(image: &gex_ld::Image, base: u64, pe: &gex_ld::pe::PeImage, at_map: bool) -> bool {
     let memory = crate::guest_bytes();
+    let mask = if at_map { None } else { Some(pe) };
     image.segments.iter().filter(|s| s.executable).all(|seg| {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
-        memory.get(lo..lo + n).is_some_and(|live| live == &seg.bytes[..])
+        memory
+            .get(lo..lo + n)
+            .is_some_and(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, mask).is_none())
     })
 }
 
@@ -342,7 +372,7 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
         p
     };
     let Ok((image, _)) = gex_xlate::func::pe_input(&p.pe, p.base) else { return false };
-    if !w3_matches(&image) {
+    if !w3_matches(&image, p.base, &p.pe, false) {
         crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", p.path, p.base));
         return false;
     }
@@ -360,10 +390,13 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
     // A native wasm32 Wine DLL's skeleton has no x86 code (no unit is ever
     // built for it: its `ud2` stubs are bound to Wine's PE module).
     let skeleton = pe.is_some_and(wasmdll::is_skeleton);
+    if let Some(pe) = pe.filter(|_| !skeleton) {
+        note_import_slots(base, pe);
+    }
     for seg in image.segments.iter().filter(|s| s.executable && !skeleton) {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
         let live = memory.get(lo..lo + n);
-        if let Some(i) = live.and_then(|live| (0..n).find(|&i| live[i] != seg.bytes[i])) {
+        if let Some(i) = live.and_then(|live| gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, live, base, pe)) {
             crate::warn_line(&format!(
                 "gex-cgen: {path}: the mapped code at {:#x} differs from the image (guest {:#04x}, image {:#04x}); refusing its unit\n",
                 seg.vaddr + i as u64,
@@ -1362,7 +1395,14 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         ));
         crate::nt::end_process(0xc000_001d);
     }
-    if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
+    // The awaited return itself, reached with the stack moved: a callee that
+    // returns having changed `esp` (MSVC's `__chkstk`, `__SEH_prolog4`), whose
+    // `ret` goes through the table. A call-out from there would wait for a
+    // second return to the place it starts and never end (uiribbon's
+    // `__chkstk` call at 0x2f157b02, docs/mspaint.md §8). Leave instead: the
+    // caller's return check sees its return address with the stack moved and
+    // resumes there (`gex_resume`).
+    if ret as u64 == gex_abi::ftab::NO_RETURN || t == ret as u64 || !CALLOUT_ON.load(Ordering::Relaxed) {
         return gex_abi::ftab::RET_LEFT;
     }
     if libprov::provider_return(ret as u64) {
