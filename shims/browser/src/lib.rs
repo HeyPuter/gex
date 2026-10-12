@@ -5564,7 +5564,7 @@ pub extern "C" fn gex_stdin_eof() {
 /// to tell "wait for a keystroke" from "the program is over".
 #[no_mangle]
 pub extern "C" fn gex_paused_for_input() -> i32 {
-    with_host(|h| (paused() & 1 != 0) as i32)
+    (paused() & 1 != 0) as i32
 }
 
 /// Whether the guest stopped because it is waiting on the network. The page
@@ -5572,7 +5572,7 @@ pub extern "C" fn gex_paused_for_input() -> i32 {
 /// data it is waiting for can arrive -- and then call [`gex_wake`].
 #[no_mangle]
 pub extern "C" fn gex_paused_for_net() -> i32 {
-    with_host(|h| (paused() & 2 != 0) as i32)
+    (paused() & 2 != 0) as i32
 }
 
 /// Whether ending this wait needs the page's own event loop to turn: a guest
@@ -5580,7 +5580,7 @@ pub extern "C" fn gex_paused_for_net() -> i32 {
 /// on a network callback that runs on *this* Worker's event loop cannot.
 #[no_mangle]
 pub extern "C" fn gex_paused_for_host() -> i32 {
-    with_host(|h| (paused() & 4 != 0) as i32)
+    (paused() & 4 != 0) as i32
 }
 
 thread_local! {
@@ -5852,6 +5852,39 @@ fn park_until_ready() {
     }
 }
 
+/// What [`gex_park`] needs to know about this Worker's waiting thread: its
+/// own deadline, and the futex address and generation it parked at if a
+/// futex is all it waits on.
+#[derive(Clone, Copy)]
+struct ParkPlan {
+    soonest: Option<u64>,
+    futex: Option<(u64, u32)>,
+}
+
+fn park_plan(h: &Host) -> ParkPlan {
+    let waiting = h.threads.get(cur()).map(|t| &t.waiting);
+    let soonest = match waiting {
+        Some(Waiting::Sleep(at)) => Some(*at),
+        Some(Waiting::Futex { deadline, .. }) => *deadline,
+        Some(Waiting::Net(deadline)) => *deadline,
+        _ => None,
+    };
+    let futex = match waiting {
+        Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
+        _ => None,
+    };
+    ParkPlan { soonest, futex }
+}
+
+thread_local! {
+    /// The park plan the last scheduler turn read while finding nothing to
+    /// run, for the [`gex_park`] that follows it. Only this Worker changes its
+    /// own thread's wait, and only by running it, which goes through
+    /// `schedule` (it clears this) or a syscall (likewise); a wake from
+    /// another Worker moves the futex slot or the wake counter, not the plan.
+    static PARK_PLAN: std::cell::Cell<Option<ParkPlan>> = const { std::cell::Cell::new(None) };
+}
+
 /// Sleep until another Worker does something, or `max_ms` passes. Blocks on a
 /// word in the global kernel's memory that every syscall bumps, rather than
 /// polling round the event loop. Bounded so a Worker still returns for what only
@@ -5876,20 +5909,13 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     // that wake loop (dm19), the main thread 22%. And -- read under the same
     // lock -- whether this Worker's thread is simply waiting on a futex, with
     // the address and the generation it parked at.
+    //
+    // The scheduler turn that found nothing to run already read all of that,
+    // under the lock it held to decide (`PARK_PLAN`), so a park straight after
+    // one takes no lock of its own.
     let now = now_ns();
-    let (soonest, futex) = with_host(|h| {
-        let soonest = h.threads.get(cur()).and_then(|t| match &t.waiting {
-            Waiting::Sleep(at) => Some(*at),
-            Waiting::Futex { deadline, .. } => *deadline,
-            Waiting::Net(deadline) => *deadline,
-            _ => None,
-        });
-        let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
-            Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
-            _ => None,
-        };
-        (soonest, futex)
-    });
+    let ParkPlan { soonest, futex } =
+        PARK_PLAN.with(|c| c.take()).unwrap_or_else(|| with_host(|h| park_plan(h)));
     if let Some(at) = soonest {
         ns = ns.min(at.saturating_sub(now));
     }
@@ -6215,6 +6241,9 @@ fn count_syscall() {
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // The thread runs again: whatever its last idle turn read about its wait
+    // is out of date (see `PARK_PLAN`).
+    PARK_PLAN.with(|c| c.set(None));
     // A Windows process's every syscall is an NT call, made before the kernel
     // is taken: the NT layer takes it itself, briefly, and blocks without it.
     if let Some(p) = nt::process() {
@@ -7422,11 +7451,16 @@ fn wasm32_wait(pc: u64) -> i32 {
     // 90 console.debug lines a second on Undertale; its wined3d thread spent
     // 1.4 ms a frame in them under the profiler. The check also took the
     // kernel's lock on every pass of the loop; it is made on the first pass.
+    //
+    // A pass of this loop takes the kernel's lock once, in `schedule`: a turn
+    // that finds nothing to run leaves what it saw for the rest of the pass
+    // (`PARK_PLAN`, and `paused()`), where each question used to take the
+    // lock again (docs/kernel-locking.md, step 3).
     let mut said = PAGE_WAIT_SAID.with(|c| c.get());
     loop {
         let picked = schedule();
-        let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         if picked == 1 {
+            let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
             if resume() == Some(pc + gex_abi::SYSCALL_INST_BYTES) && resume_ctx().unwrap_or(here) == here {
                 set_resume_none();
                 set_resume_ctx_none();
@@ -7434,10 +7468,16 @@ fn wasm32_wait(pc: u64) -> i32 {
             }
             return picked;
         }
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)) {
+        // An idle turn saw this Worker's thread still waiting, under the lock;
+        // any other way out of `schedule` must be asked.
+        let idle = PARK_PLAN.with(|c| c.get()).is_some();
+        if EXITED.load(std::sync::atomic::Ordering::Relaxed)
+            || (!idle && with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)))
+        {
             return picked;
         }
-        if !said && with_host(|h| h.threads.iter().any(|t| wait_needs_page(t, &h.kernel))) {
+        // Bit 4 of `paused()`: the idle turn found a wait only the page ends.
+        if !said && idle && paused() & 4 != 0 {
             // A wait on the page itself (its keyboard, the Worker's own
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
@@ -9824,13 +9864,30 @@ fn now_ns() -> u64 {
     unsafe { now() as u64 }
 }
 
+/// What a scheduler turn that found nothing to run saw, under the one lock
+/// it took to decide: everything the idle path then acts on, so that a pass
+/// of a waiting Worker's loop takes the kernel's lock once rather than seven
+/// times (docs/kernel-locking.md, step 3).
+struct IdleLook {
+    /// What the page must supply, as `paused()` bits (see `idle_why`).
+    why: u8,
+    /// Every thread parked on an untimed futex and none of them ready: a
+    /// deadlock if it persists. Only asked when `why` is 0.
+    all_blocked: bool,
+    /// This Worker's thread is in a wait that ends without the page.
+    ends_by_itself: bool,
+    /// For the `gex_park` that follows.
+    park: ParkPlan,
+}
+
 /// What the scheduler decided.
 enum Pick {
     /// Run this thread: which one, whether its deadline passed, and whether
     /// what woke it was a signal rather than the thing it was waiting for.
     Thread(usize, bool, bool),
-    /// Nothing in this process can run yet.
-    Idle,
+    /// Nothing in this process can run yet, and what the same look found
+    /// about why (see [`IdleLook`]).
+    Idle(IdleLook),
     /// This process has finished.
     Over,
 }
@@ -10160,10 +10217,128 @@ fn report_idle(why: u8) {
     ));
 }
 
+/// The idle half of a scheduler turn, asked under the same lock as the pick.
+fn idle_look(h: &mut Host) -> IdleLook {
+    let why = idle_why(h);
+    // Every thread parked on a futex AND not one of them already
+    // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
+    // a sibling marks its waiter `woken` (or bumps the shared
+    // generation) but leaves `waiting` as `Futex` until the thread is
+    // picked, so a check on the variant alone counts an already-woken
+    // thread as blocked. During thread startup that is exactly the
+    // window -- one thread runs a `pthread_once` init and wakes the
+    // others, which sit `Futex`-typed-but-woken for an instant -- and
+    // declaring deadlock there killed the process's Workers ("nothing
+    // could wake it") while a wake was in hand. `thread_ready` sees
+    // the wake, so a ready thread means this is not a deadlock: fall
+    // through, let its Worker pick it, and only the genuinely
+    // all-blocked case (no thread ready) reaches the report.
+    let all_blocked = why == 0 && {
+        let now = now_ns();
+        let k = &mut h.kernel;
+        h.threads
+            .iter()
+            .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
+            && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
+    };
+    // A wait that ends by itself: a sleep (the clock), a `wait4` (the child,
+    // in another Worker, exits), a futex (another Worker wakes it). This
+    // Worker's thread only: a Worker owns exactly one.
+    let ends_by_itself = h.threads.get(cur()).is_none_or(|t| {
+        matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
+    });
+    IdleLook { why, all_blocked, ends_by_itself, park: park_plan(h) }
+}
+
+/// What the page must supply for this process's waits to end, as `paused()`
+/// bits: 1 a keystroke, 2 the event loop to turn, 4 only the page can end it.
+fn idle_why(h: &Host) -> u8 {
+    // Only a terminal is a keystroke; a pipe or socket is written by
+    // another process (apt's http method, a pipeline) and wants the
+    // event loop, not a key.
+    // Bit 1 means "the page has to supply a keystroke", and the JS
+    // side answers it by *awaiting* one -- with no timeout when
+    // nothing else is set. So it must be reserved for the page's own
+    // terminal. A pty is not that: it is two ends in the global
+    // kernel, and the end that will write is a program in another
+    // Worker. Classed as a keyboard, a `select` on one waited for a
+    // keystroke into the page that was never coming, which is what
+    // made an interactive bash in xterm go deaf after one character
+    // -- readline waits in `select` where a plain shell waits in
+    // `read`, and a read happened to also set bit 2 and be retried.
+    let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        use gex_kernel::vfs::FileType;
+        let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
+        if Arc::as_ptr(handle) as *const () == stdin_p {
+            return 1;
+        }
+        if handle.peer_wakes() {
+            return 2;
+        }
+        match handle.metadata().map(|m| m.file_type) {
+            Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
+            _ => 1,
+        }
+    };
+    let mut mask = 0u8;
+    // Bit 2: only the page can end this wait (a network callback on
+    // this Worker's event loop, so it cannot be slept on, unlike a
+    // wait another Worker's notify ends). Always set with bit 1,
+    // never alone -- alone it answers "paused for input?" and
+    // "paused for net?" both no, a silent death read as a clean
+    // exit. Per wait, not per process: apt has a network, but its
+    // pipe to the http method is filled by another Worker.
+    if h.threads.iter().any(|t| wait_needs_page(t, &h.kernel)) {
+        mask |= 2 | 4;
+    }
+    for t in h.threads.iter() {
+        match &t.waiting {
+            // Like a read: a pipe or socket is drained by another
+            // process, a terminal by the page.
+            Waiting::Write(handle) => mask |= by_kind(handle),
+            // A listener's client connects from outside the guest,
+            // so the event loop must turn.
+            Waiting::Accept(_) => mask |= 2,
+            Waiting::Read(handle) => {
+                mask |= by_kind(handle);
+            }
+            // Every timed wait and poll parks as `Net`, but most are
+            // not the network -- an interactive shell polls its
+            // terminal -- so a poll is classified by what it polls.
+            Waiting::Net(deadline) => {
+                match &t.blocked_on {
+                    Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
+                        let mut saw = false;
+                        for p in fds {
+                            if let Some(handle) = &p.handle {
+                                mask |= by_kind(handle);
+                                saw = true;
+                            }
+                        }
+                        if !saw {
+                            mask |= 2;
+                        }
+                    }
+                    _ => mask |= 2,
+                }
+                // A wait that can time out needs the clock to
+                // move, and only the page can move it, so it
+                // wants the event loop whatever else it wants.
+                if deadline.is_some() {
+                    mask |= 2;
+                }
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
 /// Choose the next guest thread to run, and finish whatever syscall it was in
 /// the middle of. It no longer chooses between *processes*: there is one per
 /// Worker, and the others run elsewhere.
 fn schedule() -> i32 {
+    PARK_PLAN.with(|c| c.set(None));
     // What the wake counter read *before* anything was asked about what is
     // runnable, so that a wake arriving while this makes up its mind cannot
     // be slept through. `gex_park` sleeps only while the counter is still
@@ -10192,13 +10367,11 @@ fn schedule() -> i32 {
         // kernel (to find a buffer's shared mapping) and guest memory (the
         // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
-        with_host(|h| {
+        let pick = with_host(|h| {
             if let Some(w) = h.wayland.clone() {
                 let gm = GuestMem::new(guest_bytes());
                 w.pump(&h.kernel, &gm);
             }
-        });
-        let pick = with_host(|h| {
             // Every thread gone ends this process, all this Worker has; the
             // status is in the shared table for whoever waits.
             if h.threads
@@ -10240,7 +10413,7 @@ fn schedule() -> i32 {
             } else {
                 // Nothing this Worker owns can run; everything else is a Worker
                 // the engine already runs.
-                Pick::Idle
+                Pick::Idle(idle_look(h))
             }
         });
         // Going round again is what picks a thread and, crucially, finishes the
@@ -10250,124 +10423,24 @@ fn schedule() -> i32 {
             return 2;
         }
         let Pick::Thread(i, timed_out, by_signal) = pick else {
+            let Pick::Idle(look) = pick else { unreachable!() };
             // Nothing can run, but not everything that cannot run is stuck. A
             // thread wanting a keystroke needs the page (bit 0); one waiting on
             // the network needs its event loop to turn (bit 1). Both mean
             // giving the stack back, and the two are not exclusive -- a shell in
             // one process and a download in another want both -- so this is a
             // pair of bits classified from each handle.
-            let why = with_host(|h| {
-                // Only a terminal is a keystroke; a pipe or socket is written by
-                // another process (apt's http method, a pipeline) and wants the
-                // event loop, not a key.
-                // Bit 1 means "the page has to supply a keystroke", and the JS
-                // side answers it by *awaiting* one -- with no timeout when
-                // nothing else is set. So it must be reserved for the page's own
-                // terminal. A pty is not that: it is two ends in the global
-                // kernel, and the end that will write is a program in another
-                // Worker. Classed as a keyboard, a `select` on one waited for a
-                // keystroke into the page that was never coming, which is what
-                // made an interactive bash in xterm go deaf after one character
-                // -- readline waits in `select` where a plain shell waits in
-                // `read`, and a read happened to also set bit 2 and be retried.
-                let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
-                    use gex_kernel::vfs::FileType;
-                    let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
-                    if Arc::as_ptr(handle) as *const () == stdin_p {
-                        return 1;
-                    }
-                    if handle.peer_wakes() {
-                        return 2;
-                    }
-                    match handle.metadata().map(|m| m.file_type) {
-                        Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
-                        _ => 1,
-                    }
-                };
-                let mut mask = 0u8;
-                // Bit 2: only the page can end this wait (a network callback on
-                // this Worker's event loop, so it cannot be slept on, unlike a
-                // wait another Worker's notify ends). Always set with bit 1,
-                // never alone -- alone it answers "paused for input?" and
-                // "paused for net?" both no, a silent death read as a clean
-                // exit. Per wait, not per process: apt has a network, but its
-                // pipe to the http method is filled by another Worker.
-                if h.threads.iter().any(|t| wait_needs_page(t, &h.kernel)) {
-                    mask |= 2 | 4;
-                }
-                for t in h.threads.iter() {
-                    match &t.waiting {
-                        // Like a read: a pipe or socket is drained by another
-                        // process, a terminal by the page.
-                        Waiting::Write(handle) => mask |= by_kind(handle),
-                        // A listener's client connects from outside the guest,
-                        // so the event loop must turn.
-                        Waiting::Accept(_) => mask |= 2,
-                        Waiting::Read(handle) => {
-                            mask |= by_kind(handle);
-                        }
-                        // Every timed wait and poll parks as `Net`, but most are
-                        // not the network -- an interactive shell polls its
-                        // terminal -- so a poll is classified by what it polls.
-                        Waiting::Net(deadline) => {
-                            match &t.blocked_on {
-                                Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
-                                    let mut saw = false;
-                                    for p in fds {
-                                        if let Some(handle) = &p.handle {
-                                            mask |= by_kind(handle);
-                                            saw = true;
-                                        }
-                                    }
-                                    if !saw {
-                                        mask |= 2;
-                                    }
-                                }
-                                _ => mask |= 2,
-                            }
-                            // A wait that can time out needs the clock to
-                            // move, and only the page can move it, so it
-                            // wants the event loop whatever else it wants.
-                            if deadline.is_some() {
-                                mask |= 2;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                mask
-            });
+            let IdleLook { why, all_blocked, ends_by_itself, park } = look;
             if why != 0 {
                 // Counted, the case that hides: handing the stack back for a
                 // wait the page satisfies is right, but doing it a thousand
                 // times a second for one nothing satisfies is a silent hang.
                 report_idle(why);
                 set_paused_to(why);
+                PARK_PLAN.with(|c| c.set(Some(park)));
                 return 2;
             }
-            if with_host(|h| {
-                let now = now_ns();
-                let sig = any_signal(h);
-                // Every thread parked on a futex AND not one of them already
-                // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
-                // a sibling marks its waiter `woken` (or bumps the shared
-                // generation) but leaves `waiting` as `Futex` until the thread is
-                // picked, so a check on the variant alone counts an already-woken
-                // thread as blocked. During thread startup that is exactly the
-                // window -- one thread runs a `pthread_once` init and wakes the
-                // others, which sit `Futex`-typed-but-woken for an instant -- and
-                // declaring deadlock there killed the process's Workers ("nothing
-                // could wake it") while a wake was in hand. `thread_ready` sees
-                // the wake, so a ready thread means this is not a deadlock: fall
-                // through, let its Worker pick it, and only the genuinely
-                // all-blocked case (no thread ready) reaches the report below.
-                let _ = sig;
-                let k = &mut h.kernel;
-                h.threads
-                    .iter()
-                    .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
-            }) && {
+            if all_blocked && {
                 // Confirm it persists before acting. A single all-blocked instant
                 // is not a deadlock -- during startup one is routine -- so require
                 // a run of them at a wake seq that never moves (a real deadlock
@@ -10427,15 +10500,11 @@ fn schedule() -> i32 {
             // long child reported itself "idle" every power of two.
             // (This Worker's thread: a Worker owns exactly one, and the
             // others' entries are their own Workers' business.)
-            let ends_by_itself = with_host(|h| {
-                h.threads.get(cur()).is_none_or(|t| {
-                    matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
-                })
-            });
             if !ends_by_itself {
                 report_idle(0);
             }
             set_paused_to(2);
+            PARK_PLAN.with(|c| c.set(Some(park)));
             return 2;
         };
         IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
