@@ -681,6 +681,28 @@ proxied calls a second, which wait 0.2-3.1 ms in total. The proxies that
 dominate boot (readlink from musl's `realpath` in `open_fd`, pread,
 statx, open and close) are rare once the program runs.
 
+**Undertale** (Chromium, `scratch/K/ut/run-ut.sh 300`, W's w3d dist with
+K's loader and server over it, two runs each, alternating):
+
+| | pipes (`WINEGEX_DOOR=0`) | doors |
+|---|---|---|
+| fps over the last 120 s | 21.6, 22.9 | 24.3, 22.8 |
+| frames in 300 s | 2595, 2748 | 2906, 2737 |
+| first frame | 34.3 s, 33.8 s | 36.0 s, 34.9 s |
+
+Within run-to-run noise, Undertale's frame rate does not change. Once
+the game runs it makes few server requests: its time goes to drawing,
+not to waiting on the server. (W's own stack measured 25.1 fps in the
+same harness.)
+
+Undertale with doors first needed a shim fix that has nothing to do with
+doors (`173a2c30`). When a Wine thread exits under its start routine's
+call-out, the run loop entered a stale resume at the call-out's return
+pad. That breakpoint killed the process with status 133. It killed
+winedevice in every page run, pipes too. With doors, services also lost
+a thread that way before setting `__wine_SvcctlStarted`, and wineboot
+hung. The leg for it is `tests/w3/threadexit.sh`.
+
 ## 11. Risks
 
 - **Instantiating the server module in every Worker.** That is a wasm32
