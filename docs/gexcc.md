@@ -1736,6 +1736,20 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
 - **nvim ignored typing.** The pty answered FIONBIO with ENOTTY, so libuv's
   `uv_pipe_open` failed on the terminal. FIONBIO and the close-on-exec
   ioctls (FIONCLEX, FIOCLEX, FIOASYNC) are now left to the kernel.
+- **Terminals and fork.** A fork's child keeps its parent's epoll sets.
+  `/dev/pts` and `/dev/ptmx` exist; `ttyname` and `tty` work; `/proc/<pid>/stat`
+  carries `tty_nr` and `tpgid`, so ps's TTY column shows `pts/N`. The pty
+  master reads EIO once every slave has closed, as on Linux. Before, it
+  waited until the session leader was reaped, so a reader that only
+  reaps after EIO (`pty.fork`, read until EIO, then `waitpid`) never
+  stopped.
+- **Known gap: epoll across fork is a copy.** The child rebuilds the set from
+  its registrations (the same descriptor numbers name the same files). Linux
+  shares one instance between parent and child. Here an `epoll_ctl` on
+  either side after the fork is not seen by the other, and the two
+  `epoll_wait`s do not share wakeups. Real sharing needs the set in the global
+  kernel, keyed by open file description; it comes with W's kernel-locking
+  step 2 (per-object wait queues in the global kernel, docs/kernel-locking.md).
 - **xterm not presenting until refocused: open.** With no input, the
   compositor draws one frame per line the xterm prints, and the page's canvas
   holds each of them; `tests/demo/desktop.mjs`'s presentation leg checks

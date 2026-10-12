@@ -2216,9 +2216,13 @@ pub extern "C" fn k_pty_forget(pid: i32) -> u32 {
 /// above opens *before* `TIOCSCTTY`, when no session owns it yet. Either one
 /// alive means the slave is merely between descriptors.
 fn hangup_is_real(p: &gex_kernel::pty::Pty, id: i32) -> bool {
+    // Alive, not merely in the table: a session leader that exited is a
+    // zombie until its parent waits, and the parent waiting is often the very
+    // reader that needs the hangup to stop reading (`pty.fork`, then read the
+    // master until EIO, then `waitpid`).
     let sid = p.tty.sid();
     if sid > 0 {
-        return !procs().exists(sid);
+        return !procs().alive(sid);
     }
     let who = last_slave_closer()
         .lock()
@@ -2226,7 +2230,7 @@ fn hangup_is_real(p: &gex_kernel::pty::Pty, id: i32) -> bool {
         .get(&id)
         .copied();
     match who {
-        Some(pid) if pid > 0 => !procs().exists(pid),
+        Some(pid) if pid > 0 => !procs().alive(pid),
         // Nobody has closed one yet, or the closer is unknown: the old rule.
         _ => true,
     }
@@ -2267,10 +2271,10 @@ pub extern "C" fn k_pty_read(id: i32, master: i32, at: gex_kmem::PAddr, len: u32
     let mut buf = vec![0u8; len as usize];
     let r = if master != 0 {
         match p.master_read(&mut buf) {
-            // End of file, but the session that owns the slave is still there:
+            // Hung up, but the session that owns the slave is still there:
             // this is the reopen window, not a hangup. See
             // `hangup_is_real`.
-            Ok(0) if !hangup_is_real(&p, id) => Err(gex_kernel::errno::Errno(11)),
+            Err(e) if e == gex_kernel::errno::Errno::EIO && !hangup_is_real(&p, id) => Err(gex_kernel::errno::Errno(11)),
             other => other,
         }
     } else {

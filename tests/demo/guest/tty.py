@@ -53,7 +53,20 @@ while time.time() < end and out.count(b'\n') < 3:
             out += os.read(mfd, 65536)
         except OSError:
             break
+# Then the shell exits, and the master reads EIO (not end-of-file, not
+# waiting): before waitpid, while the shell is a zombie, as on Linux.
+t0 = time.time()
+ended = None
+while time.time() - t0 < 15 and ended is None:
+    rr, _, _ = select.select([mfd], [], [], 0.3)
+    if rr:
+        try:
+            if not os.read(mfd, 65536):
+                ended = 'end-of-file'
+        except OSError as ex:
+            ended = f'errno {ex.errno}'
 os.waitpid(pid, 0)
+check('the master reads EIO once the shell is gone', ended == 'errno 5', f'{ended} after {time.time() - t0:.1f} s')
 lines = out.decode(errors='replace').split()
 check('tty(1) on a pty', bool(lines) and lines[0].startswith('/dev/pts/'), lines[:1])
 check("ps's TTY column", 'pts/' in out.decode(errors='replace').split('\n', 1)[1], out.decode(errors='replace').strip().replace('\r', ''))

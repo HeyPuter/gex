@@ -658,6 +658,15 @@ impl ProcTable {
         self.lock().procs.iter().any(|p| p.pid == pid)
     }
 
+    /// Whether `pid` is in the table and has not exited: [`ProcTable::exists`]
+    /// without the zombies, which are in the table until reaped.
+    pub fn alive(&self, pid: i32) -> bool {
+        self.lock()
+            .procs
+            .iter()
+            .any(|p| p.pid == pid && p.child.status.lock().map(|s| s.is_none()).unwrap_or(true))
+    }
+
     /// Whether a `wait4` by `ppid` for `want` would answer now: a child with a
     /// status ready, or no matching child at all (`ECHILD`). Separate from
     /// `collect`, which *takes* the child -- asking must not reap.

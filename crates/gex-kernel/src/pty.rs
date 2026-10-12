@@ -123,8 +123,11 @@ impl Pty {
     pub fn master_read(&self, buf: &mut [u8]) -> SysResult {
         let mut s = self.lock();
         if s.to_master.is_empty() {
+            // Every slave closed: a hangup, which Linux reports to the master
+            // as EIO rather than end-of-file (`os.read` on a pty.fork child
+            // that has exited, xterm noticing its shell is gone).
             return if s.slave_ever && s.slave_open == 0 {
-                Ok(0)
+                Err(Errno::EIO)
             } else {
                 Err(Errno::EAGAIN)
             };
@@ -425,6 +428,21 @@ fn descriptor_level(request: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The master sees the slave side going away as EIO, as on Linux: once
+    /// its output is read, not before, and not before a slave was ever open.
+    #[test]
+    fn the_master_reads_eio_once_every_slave_has_closed() {
+        let p = super::Pty::new(0);
+        let mut buf = [0u8; 8];
+        assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EAGAIN), "no slave yet: wait");
+        p.open_slave();
+        p.slave_write(b"bye");
+        p.close_slave();
+        assert_eq!(p.master_read(&mut buf), Ok(3), "what it wrote first");
+        assert_eq!(p.master_read(&mut buf), Err(crate::errno::Errno::EIO));
+        assert!(p.master_readable(), "a hangup is readable, so poll wakes the reader");
+    }
+
     #[test]
     fn a_pty_end_has_the_name_a_program_can_stat() {
         assert_eq!(super::link_name("pty:[4:s]"), "/dev/pts/4");
