@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 596 of them whose target this
+ * claimed -- so here are the 598 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -97,6 +97,8 @@ extern __typeof(glCopyTexSubImage2D) glCopyTexSubImage2DEXT __attribute__((alias
 extern __typeof(glCopyTexSubImage3D) glCopyTexSubImage3DEXT __attribute__((alias("glCopyTexSubImage3D")));
 extern __typeof(glCreateProgram) glCreateProgramObjectARB __attribute__((alias("glCreateProgram")));
 extern __typeof(glCreateShader) glCreateShaderObjectARB __attribute__((alias("glCreateShader")));
+extern __typeof(glDebugMessageCallback) glDebugMessageCallbackARB __attribute__((alias("glDebugMessageCallback")));
+extern __typeof(glDebugMessageCallback) glDebugMessageCallbackKHR __attribute__((alias("glDebugMessageCallback")));
 extern __typeof(glDebugMessageControl) glDebugMessageControlARB __attribute__((alias("glDebugMessageControl")));
 extern __typeof(glDebugMessageControl) glDebugMessageControlKHR __attribute__((alias("glDebugMessageControl")));
 extern __typeof(glDebugMessageInsert) glDebugMessageInsertARB __attribute__((alias("glDebugMessageInsert")));
