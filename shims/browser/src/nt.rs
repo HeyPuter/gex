@@ -1167,6 +1167,12 @@ mod imp {
                     retire(h, &retired);
                 }
             }
+            // Made executable again: compared, not forgotten
+            // (`Kernel::recheck_code`).
+            let recheck = std::mem::take(&mut h.kernel.recheck_code);
+            if !recheck.is_empty() {
+                crate::cgen::on_retire(&recheck, &[]);
+            }
         });
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {

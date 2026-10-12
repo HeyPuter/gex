@@ -53,6 +53,82 @@ pub mod jumptable;
 pub mod summary;
 pub mod validate;
 
+/// The import address table slots of `pe` (imports and delay imports), as
+/// sorted, merged RVA ranges: the bytes the loader overwrites with the
+/// imports' addresses, which [`func::pe_input`] zeroes. (Here rather than in
+/// `func.rs`: this file is not a function-tier key input, so a host-side
+/// check never re-keys the unit caches.)
+pub fn pe_import_slots(pe: &gex_ld::pe::PeImage) -> Vec<(u64, u64)> {
+    let ptr = if pe.is64 { 8 } else { 4 };
+    let mut r: Vec<u64> = pe.imports.iter().flat_map(|d| d.symbols.iter().map(|s| s.iat_rva as u64)).collect();
+    r.extend(pe.delay_imports.iter().flat_map(|d| d.symbols.iter().map(|s| s.iat_rva as u64)));
+    r.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(r.len());
+    for lo in r {
+        let hi = lo + ptr;
+        match out.last_mut() {
+            Some(l) if lo <= l.1 => l.1 = l.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// The hash the function tier keeps of a dispatch page (`page_size` bytes
+/// at `page * page_size`), with the bytes of `slots` (absolute, sorted
+/// ranges: [`pe_import_slots`] placed at an image's base) counted as zero.
+/// A loader that fills an import address table inside `.text` after a unit
+/// was placed has not rewritten code: without the mask, the page read as
+/// patched, and every function on it (MSVC's `__SEH_prolog4` next to the
+/// table) left for tier-1 through a call-out that never ended.
+pub fn masked_page_hash(memory: &[u8], page: u64, page_size: u64, slots: &[(u64, u64)]) -> u64 {
+    let lo = page * page_size;
+    let hi = lo + page_size;
+    let range = memory.get(lo as usize..(hi as usize).min(memory.len())).unwrap_or(&[]);
+    let first = slots.partition_point(|r| r.1 <= lo);
+    let hits = &slots[first..slots[first..].partition_point(|r| r.0 < hi) + first];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut step = |c: &[u8]| {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x0100_0000_01b3);
+    };
+    if hits.is_empty() {
+        range.chunks(8).for_each(&mut step);
+    } else {
+        let mut copy = range.to_vec();
+        for &(a, b) in hits {
+            let (a, b) = (a.max(lo) - lo, b.min(hi) - lo);
+            if let Some(x) = copy.get_mut(a as usize..(b as usize).min(range.len())) {
+                x.fill(0);
+            }
+        }
+        copy.chunks(8).for_each(&mut step);
+    }
+    h
+}
+
+/// The first byte where the mapped code `live` of the segment at `vaddr`
+/// differs from the image's `bytes` (as [`func::pe_input`] made them), or
+/// `None`. Bytes in an import slot of `pe` mapped at `base` do not count:
+/// Microsoft's linker puts the import address table at the start of `.text`,
+/// the loader has written the imports' addresses there, and `pe_input`
+/// zeroed them -- a unit reads a slot at run time, it never embeds one.
+pub fn pe_code_difference(vaddr: u64, bytes: &[u8], live: &[u8], base: u64, pe: Option<&gex_ld::pe::PeImage>) -> Option<usize> {
+    if live.len() != bytes.len() {
+        return Some(live.len().min(bytes.len()));
+    }
+    if live == bytes {
+        return None;
+    }
+    let slots = pe.map(pe_import_slots).unwrap_or_default();
+    let in_slot = |a: u64| {
+        let i = slots.partition_point(|r| base + r.1 <= a);
+        slots.get(i).is_some_and(|r| base + r.0 <= a)
+    };
+    (0..bytes.len()).find(|&i| live[i] != bytes[i] && !in_slot(vaddr + i as u64))
+}
+
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]
 pub struct Options {

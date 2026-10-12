@@ -385,6 +385,25 @@ fn bound_imports_are_rebound() {
     assert!(e.to_string().contains("bound imports from KERNEL32.dll"), "{e}");
 }
 
+/// A bound-import directory that is not one (Windows 7's mspaint.exe names
+/// header bytes that never terminate) is ignored, as Windows ignores it.
+#[test]
+fn garbage_bound_imports_are_ignored() {
+    let mut files = arch_files("x86");
+    let exe = files.0.get_mut("/x86/uses.exe").unwrap();
+    let img = pe::parse(exe).unwrap();
+    let slack = 0x380usize;
+    assert!(exe[slack..slack + 0x40].iter().all(|&b| b == 0));
+    // One descriptor claiming 0x4000 forwarder refs, in a 16-byte directory.
+    exe[slack..slack + 8].copy_from_slice(&[1, 2, 3, 4, 0x10, 0, 0, 0x40]);
+    let dd = img.opt_offset + 96 + pe::dir::BOUND_IMPORT * 8;
+    exe[dd..dd + 4].copy_from_slice(&(slack as u32).to_le_bytes());
+    exe[dd + 4..dd + 8].copy_from_slice(&16u32.to_le_bytes());
+    let img = pe::parse(exe).unwrap();
+    assert!(img.bound_imports.is_empty());
+    assert!(!img.imports.is_empty());
+}
+
 /// A relocation type gex does not apply is refused by name.
 #[test]
 fn unknown_relocation_types_fail_loudly() {

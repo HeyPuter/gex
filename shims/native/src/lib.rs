@@ -3698,6 +3698,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if !retired.is_empty() {
                 retire_translations(&mut caller, &retired)?;
             }
+            recheck_units(&mut caller);
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
@@ -5698,7 +5699,11 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            if !k.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0) {
+            let vma = k.mem.vma_at(a);
+            // A PE image's page made non-executable for a while keeps its
+            // unit (`nt_cgen::in_pe_image`).
+            let dormant = vma.is_some_and(|v| v.prot != 0) && nt_cgen::in_pe_image(a);
+            if !vma.is_some_and(|v| v.prot & prot::EXEC != 0) && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
                     _ => out.push((a, a + page)),
@@ -5719,6 +5724,19 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// addresses in `translated` (so discovery does not skip them). Old slots are
 /// abandoned, not reused: replay safety (newest wins) needs a base to belong
 /// to one page for the whole run.
+/// Ranges made executable again (`Kernel::recheck_code`): the units' pages
+/// there are compared with what they were built from; no translation is
+/// forgotten (the write that could have changed them retired them already).
+fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
+    let recheck = caller.as_context_mut().data_mut().with_kernel(|k| std::mem::take(&mut k.recheck_code));
+    if recheck.is_empty() {
+        return;
+    }
+    if let Some(memory) = caller.as_context().data().memory.clone() {
+        nt_cgen::on_retire(&memory, &recheck, &[]);
+    }
+}
+
 fn retire_translations(
     caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
     ranges: &[(u64, u64)],
