@@ -18,6 +18,7 @@ import {
   readScene,
   ackBlock,
   sendEvent,
+  setKernelMemory,
   setOutputSize,
   ROLE_TOPLEVEL,
   ROLE_POPUP,
@@ -472,8 +473,9 @@ class Compositor {
    * first window of a session appeared and the second never did, because its
    * buffer was "past the end of memory".
    */
-  addMemory(token, memory) {
+  addMemory(token, memory, kernel) {
     this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
+    setKernelMemory(this.#channel, kernel);
   }
 
   /** The current view of a process's memory, re-derived if it has grown. */
@@ -1498,7 +1500,7 @@ const onMessage = ({ data: m }) => {
       startGl(m, canvas).catch((e) =>
         post({ kind: 'gl-failed', error: e?.message || String(e) }));
     } else if (m.kind === 'memory') {
-      comp?.addMemory(m.token, m.memory);
+      comp?.addMemory(m.token, m.memory, m.kernel);
     } else if (m.kind === 'drop-memory') {
       comp?.dropMemory(m.token);
       // That process is gone: its GL context, its windows and their frames go

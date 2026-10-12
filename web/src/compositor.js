@@ -283,8 +283,8 @@ export class Compositor {
   }
 
   /** A guest process's memory: where its surfaces' pixels are. */
-  addMemory(token, memory) {
-    this.#worker.postMessage({ kind: 'memory', token, memory });
+  addMemory(token, memory, kernel) {
+    this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
   }
 
   resize(width, height) {

@@ -1016,6 +1016,14 @@ export class Gex {
 
   get memory() { return this.#memory; }
 
+  /** The global kernel's memory and its wake word's address, or null: what
+   *  a compositor bumps to wake this process's parked Workers. */
+  kernelWake() {
+    const k = this.#kernel;
+    if (!k?.k_wake_addr || !this.#kernelSpec?.memory) return null;
+    return { memory: this.#kernelSpec.memory, addr: k.k_wake_addr() };
+  }
+
   /**
    * Every guest block PC translated in this process so far, as a BigUint64Array
    * (a fresh copy, safe to keep). The profile a sandbox run dumps to seed a

@@ -488,9 +488,10 @@ async function handle(msg) {
     // The memory object, not its buffer: a shared memory that grows gives out a
     // new buffer, and the compositor has to be able to see the new length.
     gex.onWlToken = (token) => {
-      port.post({ kind: 'wl-memory', token, memory: gex.memory });
+      port.post({ kind: 'wl-memory', token, memory: gex.memory, kernel: gex.kernelWake()?.memory });
     };
     proxy.onToken = gex.onWlToken;
+    proxy.wakeAddr = () => gex.kernelWake()?.addr ?? 0;
   } else if (msg.wlStub) {
     // A headless compositor for node: the shim's gex-wayland runs and binds
     // `wayland-0`, so a guest connects and inits exactly as in the browser, but
