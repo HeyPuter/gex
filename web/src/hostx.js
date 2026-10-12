@@ -199,10 +199,13 @@ export class HostX {
 
     // -- the arena ---------------------------------------------------------
     this.#proxy = new WlProxy(msg.wlChannel, () => this.emit({ kind: 'wl' }), () => this.#token);
+    // The server waits on the global kernel's wake word (`wait` below), which
+    // the compositor bumps when it puts input in this block's ring.
+    this.#proxy.wakeAddr = () => this.#k?.k_wake_addr?.() ?? 0;
     // The compositor Worker reads an X window's pixels out of this memory, so
     // it needs the memory itself -- the object, not a buffer, since a shared
     // memory that grows hands out a new one.
-    this.emit({ kind: 'wl-memory', token: this.#token, memory: this.#x.wasmMemory });
+    this.emit({ kind: 'wl-memory', token: this.#token, memory: this.#x.wasmMemory, kernel: msg.kernel.memory });
 
     // -- the transport the server will use ---------------------------------
     this.#x.gexos = this.#gexos();

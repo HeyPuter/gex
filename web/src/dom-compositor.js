@@ -47,6 +47,7 @@ import {
   readScene,
   ackBlock,
   sendEvent,
+  setKernelMemory,
   setOutputSize,
   EV_MOTION,
   EV_BUTTON,
@@ -390,8 +391,9 @@ export class DomDesktop {
    * megabytes of a process that has grown to hundreds. Every surface past
    * that point reads as zero -- a window that is simply blank, with nothing
    * to say for itself. */
-  addMemory(token, memory) {
+  addMemory(token, memory, kernel) {
     this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
+    setKernelMemory(this.#channel, kernel);
   }
 
   /** The current view of a process's memory, re-derived if it has grown. */

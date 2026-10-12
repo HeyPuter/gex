@@ -99,6 +99,9 @@ const B_HEARTBEAT = 1;
 const B_COUNT = 2;
 const B_GEN = 3;
 const B_ACK = 4;
+/** Where the global kernel's wake word is (`k_wake_addr`), or zero: what the
+ * compositor bumps after putting an event in this block's ring. */
+const B_WAKE = 5;
 const B_WORDS = 8;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
@@ -218,6 +221,11 @@ export function ackBlock(channel, block, gen) {
   Atomics.store(a, blockBase(block) + B_ACK, gen);
 }
 
+/** The global kernel's memory, for `sendEvent`'s wake. One per page. */
+export function setKernelMemory(channel, memory) {
+  if (memory && !channel.kernelMemory) channel.kernelMemory = memory;
+}
+
 /** Write one event into a process's ring, for its guest to pick up. */
 export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, client = 0, surface = 0) {
   const a = new Int32Array(channel.arena);
@@ -233,6 +241,17 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
+  // And a wake, as another guest's syscall would give: with every thread of
+  // the process parked, nothing drains the ring until a park's bound (20 ms)
+  // runs out. The Worker that wakes takes a scheduler turn, whose compositor
+  // pump delivers the event and wakes the client's reader in turn.
+  const wake = Atomics.load(a, blockBase(block) + B_WAKE);
+  const k = channel.kernelMemory;
+  if (wake && k && typeof SharedArrayBuffer === 'function' && k.buffer instanceof SharedArrayBuffer) {
+    const w = new Int32Array(k.buffer);
+    Atomics.add(w, wake >>> 2, 1);
+    Atomics.notify(w, wake >>> 2);
+  }
 }
 
 /**
@@ -265,6 +284,9 @@ export class WlProxy {
   #tokenFn;
   /** Called with the token once it is known, so the host can send the memory. */
   onToken = null;
+  /** The global kernel's wake word address (`k_wake_addr`), or 0; asked when
+   *  the block is claimed. See `B_WAKE`. */
+  wakeAddr = null;
 
   /** Claim a block if this process does not have one yet. Returns whether it has. */
   #ready() {
@@ -294,6 +316,7 @@ export class WlProxy {
       this.#block = b;
       this.#base = base;
       this.#ring = ringBase(b);
+      this.#noteWake();
       return;
     }
     for (let pass = 0; pass < 2; pass++) {
@@ -310,9 +333,15 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_GEN, 0);
         Atomics.store(this.#a, base + B_ACK, 0);
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
+        this.#noteWake();
         return;
       }
     }
+  }
+
+  #noteWake() {
+    const at = this.wakeAddr?.() | 0;
+    if (at) Atomics.store(this.#a, this.#base + B_WAKE, at);
   }
 
   get token() {
