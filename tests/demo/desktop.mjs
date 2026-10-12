@@ -20,6 +20,9 @@
 //   {"move": [X, Y]}                     the pointer to CSS pixel X, Y
 //   {"click": [X, Y]}                    a left click there
 //   {"keys": ["Escape", ...]}            named keys (KeyboardEvent.code)
+//   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
+//                                        copy of it (xwd) with the compositor's output
+//                                        (needs the python and xeyes overlays)
 // A run step with "show": true prints the command's output tail even on success.
 // Env: CHROME, DEMO_WALL (s, default 300), DEMO_WEBGPU=sw (SwiftShader),
 // DEMO_QUERY (appended to the URL), DEMO_PROFILE (a profile dir to keep),
@@ -105,7 +108,7 @@ const consoleLines = [];
 b.on('Runtime.consoleAPICalled', (p) => {
   const line = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
   consoleLines.push(line);
-  if (/\[desktop\]|error|Error/.test(line) && p.type !== 'debug') log(`console: ${line.slice(0, 300)}`);
+  if (/\[desktop\]|\[hostx-count\]|error|Error/.test(line) && p.type !== 'debug') log(`console: ${line.slice(0, 300)}`);
 });
 b.on('Runtime.exceptionThrown', (p) => log(`exception: ${p.exceptionDetails?.exception?.description?.slice(0, 400)}`));
 await b.send('Runtime.enable', {}, s);
@@ -196,6 +199,126 @@ async function canvasHash() {
     return h + ':' + lit;
   })()`);
 }
+/** One key into the focused window, as the page gets it from a person. */
+async function typeKey(ch) {
+  if (ch === '\n') {
+    const k = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
+    await b.send('Input.dispatchKeyEvent', { type: 'keyDown', ...k, text: '\r' }, s);
+    await b.send('Input.dispatchKeyEvent', { type: 'keyUp', ...k }, s);
+    return;
+  }
+  const [code, shift] = keyCode(ch);
+  const m = shift ? 8 : 0;
+  await b.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch, code, modifiers: m }, s);
+  await b.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch, code, modifiers: m }, s);
+}
+async function click(x, y) {
+  await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, s);
+  await b.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, s);
+  await b.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, s);
+}
+/** A command in pid 1's session (not the xterm's); its output's lines. */
+async function guestRun(cmd, wall = 120000) {
+  const tag = `g${Math.floor(Math.random() * 1e9)}`;
+  await ev(`globalThis.gexDesktop.run(${JSON.stringify(`{ ${cmd} ; } >/tmp/${tag}.out 2>&1; echo "${tag} rc=$?"; cat /tmp/${tag}.out; echo "${tag} end"`)})`);
+  await until(`globalThis.gexTerminalText().includes(${JSON.stringify(`${tag} end`)})`, cmd.slice(0, 40), wall);
+  const t = (await ev('globalThis.gexTerminalText()')) || '';
+  const body = t.slice(t.search(new RegExp(`${tag} rc=`)));
+  const rc = Number(/rc=(\d+)/.exec(body)[1]);
+  return { rc, lines: body.split('\n').slice(1).filter((l) => !l.includes(`${tag} end`)) };
+}
+const SIG_COLS = 16, SIG_ROWS = 8, SIG_EDGE = 2;
+/** The same signature as tests/demo/guest/xsig.py, of what the compositor
+ *  composed where the window is. */
+async function composedSig(x, y, w, h) {
+  const r = await ev('globalThis.__gexCompositor.readoutBase64()');
+  const px = Buffer.from(r.b64, 'base64');
+  const cells = new Array(SIG_COLS * SIG_ROWS).fill(0);
+  let exact = 2166136261;
+  for (let j = 0; j < h; j++) {
+    const cy = Math.floor(j * SIG_ROWS / h) * SIG_COLS;
+    for (let i = 0; i < w; i++) {
+      const o = ((y + j) * r.w + (x + i)) * 4;
+      const dark = Math.max(px[o], px[o + 1], px[o + 2]) < 128 ? 1 : 0;
+      if (dark) cells[cy + Math.floor(i * SIG_COLS / w)]++;
+      exact = Math.imul(exact ^ dark, 16777619) >>> 0;
+    }
+  }
+  cells.exact = exact;
+  return cells;
+}
+/**
+ * Bug 3 as a leg: what the xterm drew is what the page shows. Type into the
+ * focused xterm at a person's pace -- each key a frame, so Xwayland draws into
+ * the buffers it already has rather than making new ones -- then leave it
+ * alone, and compare the X server's own copy of the window (xwd, in the guest)
+ * with the compositor's output where the window is.
+ */
+async function truth(step) {
+  const script = (await import('node:fs')).readFileSync(new URL('./guest/xsig.py', import.meta.url)).toString('base64');
+  const put = await guestRun(`echo ${script} | base64 -d > /tmp/xsig.py`);
+  if (put.rc) throw new Error('could not write /tmp/xsig.py');
+  const p = await places();
+  await click(...p.win);
+  await new Promise((r) => setTimeout(r, 1000));
+  let bad = 0;
+  const rounds = step.rounds ?? 4;
+  for (let n = 0; n < rounds; n++) {
+    for (const ch of `echo round ${n} the quick brown fox ${'x'.repeat(n * 3)}\n`) {
+      await typeKey(ch);
+      await new Promise((r) => setTimeout(r, step.pace ?? 60));
+    }
+    // The pointer across the window's edge and back: the X server makes a
+    // cursor pool for each shape it shows, between the xterm's frames.
+    for (let i = 0; i < (step.wiggle ?? 3); i++) {
+      await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.desk[0], y: p.desk[1] }, s);
+      await new Promise((r) => setTimeout(r, 150));
+      await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.win[0], y: p.win[1] }, s);
+      await new Promise((r) => setTimeout(r, 150));
+      await typeKey(String.fromCharCode(97 + i));
+    }
+    await new Promise((r) => setTimeout(r, step.settle ?? 2000));
+    const d = await ev('globalThis.__gexCompositor.describe()');
+    const line = d.list.find((l) => / role=1 /.test(l));
+    const [, w, h, x, y] = /(\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(line).map(Number);
+    const title = d.titles[0];
+    const got = await guestRun(`python3.13 /tmp/xsig.py ${JSON.stringify(title)}`);
+    const size = got.lines.find((l) => l.startsWith('xsize'));
+    if (got.rc || !size) throw new Error(`xsig: rc=${got.rc} ${got.lines.slice(0, 4).join(' | ')}`);
+    const drawn = [];
+    for (let r = 0; r < SIG_ROWS; r++) {
+      const l = got.lines.find((v) => v.startsWith(`xs${r} `));
+      drawn.push(...l.slice(l.indexOf(' ') + 1).split(',').map(Number));
+    }
+    // The X window inside the surface: Xwayland's buffer carries the
+    // window's border, which xwd leaves out -- so the best of a few offsets.
+    const [xw, xh, xexact] = size.split(' ').slice(1).map(Number);
+    let best = null;
+    for (const [dx, dy] of [[0, 0], [1, 1], [-1, -1], [1, 0], [0, 1], [2, 2]]) {
+      const sig = await composedSig(x + dx + SIG_EDGE, y + dy + SIG_EDGE, xw - 2 * SIG_EDGE, xh - 2 * SIG_EDGE);
+      const d = drawn.reduce((a, v, i) => a + Math.abs(v - sig[i]), 0) + (sig.exact === xexact ? 0 : 0.5);
+      if (!best || d < best.d) best = { d, sig, at: `${dx},${dy}` };
+      if (!d) break;
+    }
+    const shown = best.sig;
+    const diff = best.d;
+    const cells = drawn.filter((v, i) => v !== shown[i]).length;
+    // Equal counts and an equal bitmap: a cursor block one character along
+    // stays in its cell, and only the bitmap tells.
+    const ok = cells === 0 && shown.exact === xexact;
+    if (!ok) bad++;
+    if (!ok && process.env.DEMO_SIG) {
+      for (let r = 0; r < SIG_ROWS; r++) {
+        log(`    X ${drawn.slice(r * SIG_COLS, (r + 1) * SIG_COLS).join(',')}`);
+        log(`    C ${shown.slice(r * SIG_COLS, (r + 1) * SIG_COLS).join(',')}`);
+      }
+    }
+    log(`  round ${n}: X window ${size.split(' ').slice(1).join('x')} vs composed ${w}x${h}@${x},${y}: `
+      + `${ok ? 'same' : `${cells} of ${drawn.length} cells differ (${Math.floor(diff)} dark pixels), bitmaps ${shown.exact === xexact ? 'equal' : 'differ'}`} at +${best.at} (serial ${/serial=(\d+)/.exec(line)[1]})`);
+  }
+  if (bad) failed = true;
+  log(`${bad ? 'FAIL' : 'ok'} xterm shows what it drew: ${rounds - bad} of ${rounds} rounds`);
+}
 async function legs() {
   const p = await places();
   if (!p) throw new Error('no window to point at');
@@ -257,6 +380,11 @@ async function legs() {
   if (!okShown) failed = true;
   log(`${okShown ? 'ok' : 'FAIL'} presentation leg: the page's canvas changed ${changes} times in 4 s of the xterm printing with no input`
     + ` (compositor: ${d1.frames - d0.frames} frames drawn in ${d1.turns - d0.turns} turns; screenshots changed ${shots} times)`);
+  // What the xterm drew is what the page shows (bug 3): xwd and python come
+  // as overlays, the way a person adds them from the launcher.
+  await new Promise((r) => setTimeout(r, 3000));
+  for (const id of ['python', 'xeyes']) await ev(`globalThis.gexDesktop.install(${JSON.stringify(id)})`);
+  await truth({ rounds: 3 });
 }
 function dump() {
   ev('globalThis.gexTerminalText?.()').then((t) => {
@@ -281,7 +409,8 @@ try {
   if (process.env.DEMO_SHOT) await shot(process.env.DEMO_SHOT, 1500);
   // The legs every run has (DEMO_LEGS=0 skips them): the xterm's cursor is
   // the page's CSS cursor and none is composited; what the xterm prints with
-  // no input reaches the screen (the page's own screenshot, not a readback).
+  // no input reaches the page's canvas; what it draws as it is typed into is
+  // what the compositor shows (the X server's copy against the output).
   if (process.env.DEMO_LEGS !== '0') await legs();
   let n = 0;
   let lastHash = null;
@@ -337,6 +466,8 @@ try {
       const ok = kind === step.cursor;
       if (!ok) failed = true;
       log(`${ok ? 'ok' : 'FAIL'} cursor ${JSON.stringify(css.slice(0, 80))} (want ${step.cursor})`);
+    } else if (step.truth) {
+      await truth(step);
     } else if (step.keys) {
       await ev("document.getElementById('out').focus()");
       for (const code of step.keys) {

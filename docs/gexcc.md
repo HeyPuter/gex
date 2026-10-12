@@ -1750,12 +1750,29 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
   `epoll_wait`s do not share wakeups. Real sharing needs the set in the global
   kernel, keyed by open file description; it comes with W's kernel-locking
   step 2 (per-object wait queues in the global kernel, docs/kernel-locking.md).
-- **xterm not presenting until refocused: open.** With no input, the
-  compositor draws one frame per line the xterm prints, and the page's canvas
-  holds each of them; `tests/demo/desktop.mjs`'s presentation leg checks
-  that by drawing the canvas into a 2D canvas. Headless Chromium's
-  screenshots never contain a worker's WebGPU canvas, so what a person's
-  browser displays is not covered by any test here.
+- **xterm showing the frame before the one it drew.** The X server in the
+  page closes a pool's descriptor as soon as it has sent it to the
+  compositor, and its next pool gets the same number. The compositor was
+  handed the number, so a buffer of an older pool was located, at its next
+  commit, in whichever pool held the number now. Typing into the xterm
+  reuses its two buffers, which then shared one pool's memory: the window
+  showed the frame before the last until something made a fresh pool
+  (clicking off and back on did). A cursor pool on the reused number made the
+  commit fail its size check and be dropped. `web/src/hostx.js` now gives the
+  compositor its own handle per descriptor sent, as `SCM_RIGHTS` would.
+  The leg types into the xterm, waits, and compares the X server's copy of
+  the window (`xwd`, through `tests/demo/guest/xsig.py`) with the
+  compositor's output. Before the fix every round differed by the last
+  character and the cursor: 47 dark pixels at dpr 1, 228 at dpr 2. After
+  the fix every round matches exactly. `?hostxcount=1` logs, once a second,
+  the bytes the X server took from and sent to each client, its bytes to the
+  compositor and its scenes published.
+- **Known gap: pool memory.** A pool's pixels are never freed: the
+  compositor may still read them after the X server closes the descriptor.
+  Xwayland drops a buffer after a second unused and makes a new one, so an
+  xterm printing a line every 1.3 s allocates about 0.9 MB per line.
+  Freeing needs the mapping's lifetime (`gex_shm_unmap` in
+  `web/xwayland/gexos.c` is a no-op) and a release from the compositor.
 
 Legs: `node tests/demo/desktop.mjs web/dist-demo` (the desktop, then the
-cursor and presentation legs; `DEMO_DPR=2` for the device-pixel output).
+cursor, presentation and xterm-contents legs; `DEMO_DPR=2` for the device-pixel output).

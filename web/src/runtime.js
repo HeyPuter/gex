@@ -796,10 +796,14 @@ async function runProgramHere(
     // global kernel that only exists once the server has bound it.
     let listening = null;
     const up = new Promise((resolve) => (listening = resolve));
+    const countX = !!flag('hostxcount');
     xServer.onmessage = (e) => {
       const m = e.data;
-      if (m.kind === 'log') term.writeln(m.text);
-      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory);
+      if (m.kind === 'log') {
+        term.writeln(m.text);
+        // `?hostxcount=1`: to the console too, timed, for a harness.
+        if (countX) console.log(`${(performance.now() / 1000).toFixed(2)} ${m.text}`);
+      } else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory);
       else if (m.kind === 'ready') listening(true);
       else if (m.kind === 'failed') {
         term.writeln(`gex: the X server failed: ${m.why}`);
@@ -824,6 +828,7 @@ async function runProgramHere(
       verbose: globalThis.GEX_HOSTX_VERBOSE || Number(new URLSearchParams(location.search).get('xverbose')) || undefined,
       trace: globalThis.GEX_HOSTX_TRACE || undefined,
       wlTrace: flag('wltrace') ? 1 : undefined,
+      count: flag('hostxcount') ? 1 : undefined,
     });
     // Two modules and a kernel to instantiate; a slow machine takes a few
     // seconds. A run that goes ahead without the display is worse than one that
