@@ -11,7 +11,7 @@
 use crate::{k_present, k_signal_seq};
 use gex_kernel::proc::ProcTable;
 use gex_kernel::signal::{self, Delivery, ProcSig, Signals, ThreadSig};
-use gex_kernel::syscalls::ClockFn;
+use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -142,4 +142,31 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         view.set_blocked(mask);
     }
     delivery
+}
+
+/// The call of the lock-free class `call` (`syscalls::free_class`) for this
+/// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
+/// and its signal included, without the kernel.
+pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool) -> FreeOutcome {
+    let home = home().expect("a syscall before its process was published");
+    let view = view(home).expect("a syscall from a Worker with no thread bound");
+    let fds = crate::fds_free().expect("a syscall before its descriptor table was published");
+    gather(home);
+    let f = Free {
+        io: FdIo { fds, compat },
+        signals: &view,
+        procs: &home.procs,
+        pid: home.pid,
+        uid: home.uid,
+        wasm32: crate::WASM32.load(Ordering::Acquire),
+    };
+    syscalls::free_call(&f, gm, ctx_addr, call)
+}
+
+/// How long until this process's next interval timer fires, by its own
+/// clock; `None` with none armed. No kernel lock (`Kernel::timer_in_ns`).
+pub(crate) fn timer_in_ns() -> Option<u64> {
+    let home = home()?;
+    let (secs, nanos) = (home.clock)();
+    home.sig.timer_in_ns(secs as u128 * 1_000_000_000 + nanos as u128)
 }

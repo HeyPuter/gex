@@ -518,6 +518,34 @@ in the scheduler pick after each wake of the global WAKE word: about
     and the deadlock watch; process exit stays the kernel's. The context
     address and tid a Worker runs (`MY_CTX`, `MY_TID`) replaced twenty
     sites that took the lock to read them.
+  - **The lock-free syscall class (as built):** `read`, `write`, `readv`,
+    `writev`, `pread64`, `pwrite64`, `lseek` and `rt_sigprocmask` are a
+    class decided by number (`syscalls::free_class`; the 32-bit ABI's
+    positioned calls and `_llseek` are not in it). A call in the class never
+    takes KLock, blocking included. The page makes the whole call from its
+    Worker (`free_syscall`, `sigs::free_call`). The descriptor half
+    (`FdIo`: the call, the park before it and the park after an `EAGAIN`)
+    and `sigprocmask` are the same code the kernel runs. Before delivering,
+    the call collects signals sent from elsewhere and fires due timers
+    (`sigs::gather`). Its `SIGPIPE` is raised on the thread's own signal
+    state.
+
+    A call that waits:
+    - puts its wait into the thread's run state;
+    - makes the scheduler's first turn itself (`pick_mine`): it finishes
+      the call if the stream is ready, or registers the slot on the
+      stream's queue and says why nothing runs.
+
+    That "why" (`wait_why`) is now the Worker's own thread's alone, asked
+    without the kernel. The process's network is `HAVE_NET`, which the
+    kernel's `net` is made from. A global-kernel socket says so itself
+    (`FileHandle::is_global_socket`). Registering a wait and publishing the
+    process's next timer (`waitq::enter`, `publish_timer`) read the
+    process's signal state, not the kernel.
+
+    The kernel still takes over when the process ends: a signal's default
+    action or a halted machine (`killed`, `exit_process`). The compositor's
+    pump stays a locked scheduler turn when it has work.
   - **Known failure, native, not KLock's:** `gexc run --fjit` livelocks
     ("retranslation livelock") once a page of a long direct-jump chain is
     retired under it, as `tests/x86-programs/retire-during-lift` does

@@ -336,7 +336,7 @@ impl Post {
 /// descriptor or a pid arrives zero-extended from a 32-bit register and must
 /// become a negative 64-bit one when it was negative (`-1`, `AT_FDCWD`).
 #[inline]
-fn sext(v: u64) -> u64 {
+pub(crate) fn sext(v: u64) -> u64 {
     v as u32 as i32 as i64 as u64
 }
 

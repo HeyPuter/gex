@@ -202,7 +202,7 @@ static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// data and code page its parent made (a child must not start a provider
 /// over: an open `z_stream` points into its heap). Returns a unit to serve.
 pub(crate) fn rescan_if_new() -> Option<usize> {
-    let pid = crate::with_host(|h| h.kernel.pid);
+    let pid = crate::my_pid();
     let was = PID.swap(pid, Ordering::AcqRel);
     if was == pid || (lock(&DLLS).is_empty() && !AUTO.load(Ordering::Relaxed)) {
         return None;
@@ -232,7 +232,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
         return None;
     }
     if PID.load(Ordering::Acquire) == 0 {
-        PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
+        PID.store(crate::my_pid(), Ordering::Release);
     }
     let mut queued = None;
     for m in mapped {

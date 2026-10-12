@@ -956,6 +956,363 @@ pub fn clock_call(
     true
 }
 
+// -- The descriptor half --------------------------------------------------
+//
+// `read`, `write`, their vectored and positioned forms and `lseek` need the
+// descriptor table and nothing else of a kernel, blocking included: the
+// full call and a host calling without the kernel lock ([`free_call`]) run
+// the same code (docs/kernel-locking.md step 9).
+
+/// The descriptor table, and the ABI its `iovec`s are in.
+#[derive(Clone, Copy)]
+pub struct FdIo<'a> {
+    pub fds: &'a FdTable,
+    pub compat: bool,
+}
+
+impl FdIo<'_> {
+    /// A `readv`'s vectors when there is more than one with room in it,
+    /// for a parked read to fill in one go.
+    fn readv_vectors(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[(u64, u64)]>> {
+        let vecs = Kernel::read_iovecs(m, a[1], a[2], self.compat).ok()?;
+        (vecs.iter().filter(|v| v.1 > 0).count() > 1).then(|| Arc::from(vecs))
+    }
+
+    /// A `writev`'s bytes when they are few enough to be written whole
+    /// ([`gather_small`]).
+    fn small_writev(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[u8]>> {
+        let vecs = Kernel::read_iovecs(m, a[1], a[2], self.compat).ok()?;
+        gather_small(m, &vecs).map(Arc::from)
+    }
+
+    /// A vectored call's first non-empty vector (`a[1]`, `a[2]`), where a
+    /// blocked `readv`/`writev` parks.
+    fn first_iovec(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<(u64, u64)> {
+        Kernel::read_iovecs(m, a[1], a[2], self.compat).ok()?.into_iter().find(|v| v.1 > 0)
+    }
+
+    /// The park a stream `read`, `readv`, `write` or `writev` makes before
+    /// it runs: nothing to read, or no room for the write.
+    fn blocking_op(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        match n {
+            nr::WRITE => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.write_is_atomic() {
+                    return None;
+                }
+                // A handle that can report its room takes the direct path
+                // when the write fits (the common case). A pipe cannot --
+                // another Worker can change the answer between the claim and
+                // the write, so `write_room` returns `None` -- so when the
+                // room is unknown, park only if the descriptor is not writable
+                // at all; writable takes the short count, which callers retry.
+                // Getting this wrong sent a full-pipe write straight through
+                // to `EAGAIN`, truncating a `gzip -dc | sha256sum` stream.
+                match file.handle.write_room() {
+                    Some(room) if a[2] <= room => return None,
+                    Some(_) => {}
+                    None if !file.write_would_block() => return None,
+                    None => {}
+                }
+                Some(BlockOp::WriteStream {
+                    handle: Arc::clone(&file.handle),
+                    buf: a[1],
+                    len: a[2].min(1 << 24) as usize,
+                    gathered: None,
+                })
+            }
+            // `writev` and `readv` on a stream block as `write` and `read` do,
+            // on their first non-empty vector: the parked call is finished
+            // with that vector alone, a short count the caller already loops
+            // on. Without this a full pipe answered `writev` with `EAGAIN` on
+            // a blocking descriptor: coreutils' `head` writes with it and died
+            // "Resource temporarily unavailable" once its reader was slower
+            // than it, and Wine's `send_request` writes the server's requests
+            // with it (a thread that found the request pipe full died with
+            // "wine client error: write: Resource temporarily unavailable").
+            nr::WRITEV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.write_is_atomic() {
+                    return None;
+                }
+                // Or, at most PIPE_BUF bytes in all, on the whole of it,
+                // gathered: such a write is never split.
+                let (buf, len) = self.first_iovec(m, a)?;
+                let gathered = self.small_writev(m, a);
+                let len = gathered.as_ref().map_or(len, |g| g.len() as u64);
+                match file.handle.write_room() {
+                    Some(room) if len <= room => return None,
+                    Some(_) => {}
+                    None if !file.write_would_block() => return None,
+                    None => {}
+                }
+                Some(BlockOp::WriteStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: len.min(1 << 24) as usize,
+                    gathered,
+                })
+            }
+            nr::READV => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.would_block() {
+                    return None;
+                }
+                let (buf, len) = self.first_iovec(m, a)?;
+                let vectors = self.readv_vectors(m, a);
+                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>());
+                Some(BlockOp::ReadStream {
+                    handle: Arc::clone(&file.handle),
+                    buf,
+                    len: len.min(1 << 24) as usize,
+                    vectors,
+                })
+            }
+            nr::READ => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.would_block() {
+                    return None;
+                }
+                Some(BlockOp::ReadStream {
+                    handle: Arc::clone(&file.handle),
+                    buf: a[1],
+                    len: a[2].min(1 << 24) as usize,
+                    vectors: None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The park for a `read`/`readv` or `write`/`writev` that returned
+    /// `EAGAIN` on a stream descriptor that should block.
+    fn eagain_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let file = self.fds.get(a[0] as i32).ok()?;
+        let (buf, len) = match n {
+            nr::READ | nr::WRITE => (a[1], a[2]),
+            nr::READV | nr::WRITEV => self.first_iovec(m, a)?,
+            _ => return None,
+        };
+        let handle = Arc::clone(&file.handle);
+        let len = len.min(1 << 24) as usize;
+        match n {
+            nr::READ | nr::READV
+                if file.readable
+                    && file.flags() & crate::fs::oflags::O_NONBLOCK == 0
+                    && file.handle.is_stream() =>
+            {
+                let vectors = if n == nr::READV { self.readv_vectors(m, a) } else { None };
+                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>().min(1 << 24) as usize);
+                Some(BlockOp::ReadStream { handle, buf, len, vectors })
+            }
+            nr::WRITEV if file.write_is_atomic() => {
+                let gathered = self.small_writev(m, a);
+                let len = gathered.as_ref().map_or(len, |g| g.len());
+                Some(BlockOp::WriteStream { handle, buf, len, gathered })
+            }
+            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None }),
+            _ => None,
+        }
+    }
+
+    /// The call itself, for the calls of this half; `None` for any other.
+    fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        let fds = self.fds;
+        Some(match n {
+            nr::READ => io_read(fds, m, a[0] as i32, a[1], a[2]),
+            nr::WRITE => io_write(fds, m, a[0] as i32, a[1], a[2]),
+            nr::READV => io_readv(fds, m, a[0] as i32, a[1], a[2], self.compat),
+            nr::WRITEV => io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat),
+            nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3]),
+            nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3]),
+            nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
+            _ => return None,
+        })
+    }
+}
+
+/// `rt_sigprocmask` on `signals`, the calling thread's: the whole call,
+/// which needs nothing else of a kernel.
+pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, old: u64) -> SysResult {
+        const SIG_BLOCK: u32 = 0;
+        const SIG_UNBLOCK: u32 = 1;
+        const SIG_SETMASK: u32 = 2;
+        if old != 0 {
+            m.write_bits64(old, signals.blocked())?;
+        }
+        if set != 0 {
+            let mask = m.read_bits64(set)?;
+            let blocked = signals.blocked();
+            let blocked = match how {
+                SIG_BLOCK => blocked | mask,
+                SIG_UNBLOCK => blocked & !mask,
+                SIG_SETMASK => mask,
+                _ => return Err(Errno::EINVAL),
+            };
+            // Neither of these can ever be blocked.
+            let unblockable =
+                (1u64 << (signal::sig::SIGKILL - 1)) | (1u64 << (signal::sig::SIGSTOP - 1));
+            signals.set_blocked(blocked & !unblockable);
+        }
+        Ok(0)
+}
+
+/// What a call [`free_call`] answers needs of its process, none of it
+/// behind a kernel lock.
+pub struct Free<'a> {
+    pub io: FdIo<'a>,
+    /// The calling thread's signal state.
+    pub signals: &'a Signals,
+    pub procs: &'a ProcTable,
+    pub pid: i32,
+    pub uid: u32,
+    /// A wasm32 program, whose own code runs a handler's frame.
+    pub wasm32: bool,
+}
+
+/// How a call [`free_call`] answers ended.
+pub enum FreeOutcome {
+    /// Answered, its result in the context; and what a pending signal does
+    /// now (`Delivery::Resume` only where the host must go to the handler).
+    Done(Delivery),
+    /// It waits for its descriptor: park on this, as for
+    /// [`SyscallOutcome::Blocking`].
+    Blocking(BlockOp),
+    /// The machine has been halted: the process ends with this status.
+    Exit(i32),
+}
+
+/// The canonical number of a call [`free_call`] answers, from the number
+/// in the context as the caller's ABI has it.
+fn free_number(raw: u64, compat: bool) -> Option<u64> {
+    let n = if compat {
+        use crate::i386::raw as x;
+        match raw {
+            x::READ => nr::READ,
+            x::WRITE => nr::WRITE,
+            x::READV => nr::READV,
+            x::WRITEV => nr::WRITEV,
+            x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
+            _ => return None,
+        }
+    } else if gex_abi::X86 {
+        use crate::x86::raw as x;
+        match raw {
+            x::READ => nr::READ,
+            x::WRITE => nr::WRITE,
+            x::READV => nr::READV,
+            x::WRITEV => nr::WRITEV,
+            x::PREAD64 => nr::PREAD64,
+            x::PWRITE64 => nr::PWRITE64,
+            x::LSEEK => nr::LSEEK,
+            x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
+            _ => return None,
+        }
+    } else {
+        match raw {
+            nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
+            | nr::RT_SIGPROCMASK => raw,
+            _ => return None,
+        }
+    };
+    Some(n)
+}
+
+/// A call [`free_call`] answers, as read from its thread's context.
+#[derive(Clone, Copy, Debug)]
+pub struct FreeCall {
+    /// The canonical number, and the number as the caller's ABI has it.
+    n: u64,
+    raw: u64,
+    a: [u64; 6],
+}
+
+/// Whether the call in the context at `ctx_addr` is one [`free_call`]
+/// answers, decided by its number alone: `read`, `write`, `readv`,
+/// `writev`, `pread64`, `pwrite64`, `lseek` and `rt_sigprocmask` (the
+/// 32-bit ABI's positioned calls and `_llseek` are not in it).
+pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
+    if gex_abi::PPC {
+        return None;
+    }
+    let raw = if compat {
+        m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
+    } else {
+        m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
+    };
+    let n = free_number(raw, compat)?;
+    let mut a = [0u64; 6];
+    for (i, v) in a.iter_mut().enumerate() {
+        *v = if compat {
+            m.read_u64(ctx_addr + crate::i386::ARG_SLOTS[i] as u64).unwrap_or(0) & 0xffff_ffff
+        } else {
+            m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0)
+        };
+    }
+    if compat && n != nr::RT_SIGPROCMASK {
+        a[0] = crate::i386::sext(a[0]);
+    }
+    Some(FreeCall { n, raw, a })
+}
+
+impl FreeCall {
+    /// Its canonical number.
+    pub fn number(&self) -> u64 {
+        self.n
+    }
+
+    /// Its first three arguments.
+    pub fn args(&self) -> [u64; 3] {
+        [self.a[0], self.a[1], self.a[2]]
+    }
+}
+
+/// The call [`free_class`] found, whole, for a host that makes it without a
+/// kernel lock (docs/kernel-locking.md step 9): the same code as the full
+/// call ([`FdIo`], [`sigprocmask`]), the park included, and the signal that
+/// is due at a syscall's end.
+pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
+    let FreeCall { n, raw, a } = call;
+    let compat = f.io.compat;
+    // The number's register doubles as the result register on x86-64.
+    if gex_abi::X86 {
+        let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+    }
+    if let Some(code) = f.procs.halt_code() {
+        return FreeOutcome::Exit(code);
+    }
+    let r = if n == nr::RT_SIGPROCMASK {
+        sigprocmask(f.signals, m, a[0] as u32, a[1], a[2])
+    } else {
+        if let Some(op) = f.io.blocking_op(m, n, a) {
+            return FreeOutcome::Blocking(op);
+        }
+        let Some(r) = f.io.call(m, n, a) else { unreachable!("free_class admitted a call FdIo does not make") };
+        // Lost the room or the bytes to another Worker since the check:
+        // park, as the full call does.
+        if r == Err(Errno::EAGAIN) {
+            if let Some(op) = f.io.eagain_park(m, n, a) {
+                return FreeOutcome::Blocking(op);
+            }
+        }
+        r
+    };
+    if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
+        // Linux sends it as the writer itself sending it (SI_USER).
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.uid });
+    }
+    let _ = set_result(m, ctx_addr, encode(r));
+    let d = if f.signals.has_pending() {
+        signal::dispatch(f.signals, m, ctx_addr, compat).unwrap_or(Delivery::None)
+    } else {
+        Delivery::None
+    };
+    FreeOutcome::Done(match d {
+        Delivery::Resume(_) if f.wasm32 => Delivery::None,
+        d => d,
+    })
+}
+
 // -- I/O on a descriptor table ----------------------------------------------
 //
 // The bodies of `read`, `write`, `pread64`, `pwrite64`, `readv` and `writev`:
@@ -2564,32 +2921,7 @@ impl Kernel {
         if n == nr::FUTEX {
             return self.lock_pi_op(m, a);
         }
-        let file = self.fds.get(a[0] as i32).ok()?;
-        let (buf, len) = match n {
-            nr::READ | nr::WRITE => (a[1], a[2]),
-            nr::READV | nr::WRITEV => self.first_iovec(m, a)?,
-            _ => return None,
-        };
-        let handle = Arc::clone(&file.handle);
-        let len = len.min(1 << 24) as usize;
-        match n {
-            nr::READ | nr::READV
-                if file.readable
-                    && file.flags() & crate::fs::oflags::O_NONBLOCK == 0
-                    && file.handle.is_stream() =>
-            {
-                let vectors = if n == nr::READV { self.readv_vectors(m, a) } else { None };
-                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>().min(1 << 24) as usize);
-                Some(BlockOp::ReadStream { handle, buf, len, vectors })
-            }
-            nr::WRITEV if file.write_is_atomic() => {
-                let gathered = self.small_writev(m, a);
-                let len = gathered.as_ref().map_or(len, |g| g.len());
-                Some(BlockOp::WriteStream { handle, buf, len, gathered })
-            }
-            nr::WRITE if file.write_is_atomic() => Some(BlockOp::WriteStream { handle, buf, len, gathered: None }),
-            _ => None,
-        }
+        self.fd_io().eagain_park(m, n, a)
     }
 
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
@@ -2620,24 +2952,9 @@ impl Kernel {
         })
     }
 
-    /// A `readv`'s vectors when there is more than one with room in it,
-    /// for a parked read to fill in one go.
-    fn readv_vectors(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[(u64, u64)]>> {
-        let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
-        (vecs.iter().filter(|v| v.1 > 0).count() > 1).then(|| Arc::from(vecs))
-    }
-
-    /// A `writev`'s bytes when they are few enough to be written whole
-    /// ([`gather_small`]).
-    fn small_writev(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[u8]>> {
-        let vecs = Self::read_iovecs(m, a[1], a[2], self.compat).ok()?;
-        gather_small(m, &vecs).map(Arc::from)
-    }
-
-    /// A vectored call's first non-empty vector (`a[1]`, `a[2]`), where a
-    /// blocked `readv`/`writev` parks.
-    fn first_iovec(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<(u64, u64)> {
-        Self::read_iovecs(m, a[1], a[2], self.compat).ok()?.into_iter().find(|v| v.1 > 0)
+    /// The descriptor half of this kernel ([`FdIo`]).
+    pub fn fd_io(&self) -> FdIo<'_> {
+        FdIo { fds: &self.fds, compat: self.compat }
     }
 
     /// The blocking half of a syscall, if it has one.
@@ -2769,79 +3086,6 @@ impl Kernel {
                     report,
                 })
             }
-            nr::WRITE => {
-                let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.write_is_atomic() {
-                    return None;
-                }
-                // A handle that can report its room takes the direct path
-                // when the write fits (the common case). A pipe cannot --
-                // another Worker can change the answer between the claim and
-                // the write, so `write_room` returns `None` -- so when the
-                // room is unknown, park only if the descriptor is not writable
-                // at all; writable takes the short count, which callers retry.
-                // Getting this wrong sent a full-pipe write straight through
-                // to `EAGAIN`, truncating a `gzip -dc | sha256sum` stream.
-                match file.handle.write_room() {
-                    Some(room) if a[2] <= room => return None,
-                    Some(_) => {}
-                    None if !file.write_would_block() => return None,
-                    None => {}
-                }
-                Some(BlockOp::WriteStream {
-                    handle: Arc::clone(&file.handle),
-                    buf: a[1],
-                    len: a[2].min(1 << 24) as usize,
-                    gathered: None,
-                })
-            }
-            // `writev` and `readv` on a stream block as `write` and `read` do,
-            // on their first non-empty vector: the parked call is finished
-            // with that vector alone, a short count the caller already loops
-            // on. Without this a full pipe answered `writev` with `EAGAIN` on
-            // a blocking descriptor: coreutils' `head` writes with it and died
-            // "Resource temporarily unavailable" once its reader was slower
-            // than it, and Wine's `send_request` writes the server's requests
-            // with it (a thread that found the request pipe full died with
-            // "wine client error: write: Resource temporarily unavailable").
-            nr::WRITEV => {
-                let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.write_is_atomic() {
-                    return None;
-                }
-                // Or, at most PIPE_BUF bytes in all, on the whole of it,
-                // gathered: such a write is never split.
-                let (buf, len) = self.first_iovec(m, a)?;
-                let gathered = self.small_writev(m, a);
-                let len = gathered.as_ref().map_or(len, |g| g.len() as u64);
-                match file.handle.write_room() {
-                    Some(room) if len <= room => return None,
-                    Some(_) => {}
-                    None if !file.write_would_block() => return None,
-                    None => {}
-                }
-                Some(BlockOp::WriteStream {
-                    handle: Arc::clone(&file.handle),
-                    buf,
-                    len: len.min(1 << 24) as usize,
-                    gathered,
-                })
-            }
-            nr::READV => {
-                let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
-                    return None;
-                }
-                let (buf, len) = self.first_iovec(m, a)?;
-                let vectors = self.readv_vectors(m, a);
-                let len = vectors.as_ref().map_or(len, |v| v.iter().map(|v| v.1).sum::<u64>());
-                Some(BlockOp::ReadStream {
-                    handle: Arc::clone(&file.handle),
-                    buf,
-                    len: len.min(1 << 24) as usize,
-                    vectors,
-                })
-            }
             nr::ACCEPT | nr::ACCEPT4 => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
@@ -2852,18 +3096,7 @@ impl Kernel {
                 self.retry_accept = Some((a[0] as i32, a[1], a[2], flags));
                 Some(BlockOp::AcceptWait { socket })
             }
-            nr::READ => {
-                let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() {
-                    return None;
-                }
-                Some(BlockOp::ReadStream {
-                    handle: Arc::clone(&file.handle),
-                    buf: a[1],
-                    len: a[2].min(1 << 24) as usize,
-                    vectors: None,
-                })
-            }
+            nr::READ | nr::READV | nr::WRITE | nr::WRITEV => self.fd_io().blocking_op(m, n, a),
             // A transfer whose input is an empty blocking stream (`cat f |
             // grep x`: GNU grep splices its stdin pipe) waits for it to be
             // readable and then does the real transfer (`retry_transfer`).
@@ -3741,27 +3974,7 @@ impl Kernel {
         set: u64,
         old: u64,
     ) -> SysResult {
-        const SIG_BLOCK: u32 = 0;
-        const SIG_UNBLOCK: u32 = 1;
-        const SIG_SETMASK: u32 = 2;
-        if old != 0 {
-            m.write_bits64(old, self.signals.blocked())?;
-        }
-        if set != 0 {
-            let mask = m.read_bits64(set)?;
-            let blocked = self.signals.blocked();
-            let blocked = match how {
-                SIG_BLOCK => blocked | mask,
-                SIG_UNBLOCK => blocked & !mask,
-                SIG_SETMASK => mask,
-                _ => return Err(Errno::EINVAL),
-            };
-            // Neither of these can ever be blocked.
-            let unblockable =
-                (1u64 << (signal::sig::SIGKILL - 1)) | (1u64 << (signal::sig::SIGSTOP - 1));
-            self.signals.set_blocked(blocked & !unblockable);
-        }
-        Ok(0)
+        sigprocmask(&self.signals, m, how, set, old)
     }
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
@@ -8704,6 +8917,122 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::LSEEK, &[dup, 0, 1]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), 4);
+    }
+
+    /// `free_call`, the lock-free class, answers as the full call does:
+    /// the same results and bytes, the same park on an empty pipe, the same
+    /// mask, the same `SIGPIPE`; and it declines every other call by number.
+    #[test]
+    fn free_call_answers_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        set_args(&mut m, at, nr::PIPE2, &[0x20000, 0]);
+        k.syscall(&mut m, 0);
+        let rfd = m.read_u32(0x20000).unwrap() as u64;
+        let wfd = m.read_u32(0x20004).unwrap() as u64;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+
+        // Not in the class: declined before anything is done.
+        set_args(&mut m, at, nr::GETPID, &[]);
+        assert!(free(&k, &mut m, at).is_none());
+        set_args(&mut m, at, nr::CLOSE, &[rfd]);
+        assert!(free(&k, &mut m, at).is_none());
+
+        // An empty pipe parks both ways, on the same stream.
+        set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
+        assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::ReadStream { len: 16, .. }))));
+        set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::ReadStream { len: 16, .. })));
+
+        // Written lock-free, read by the kernel; and the other way round.
+        m.write(0x21000, b"through").unwrap();
+        set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 7]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 7);
+        set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 7);
+        assert_eq!(m.read(0x22000, 7).unwrap(), b"through");
+        set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 7]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, at, nr::READ, &[rfd, 0x23000, 16]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 7);
+        assert_eq!(m.read(0x23000, 7).unwrap(), b"through");
+
+        // Vectored, both ways: two vectors out, two in.
+        m.write(0x24000, b"gather").unwrap();
+        for (i, (base, len)) in [(0x24000u64, 3u64), (0x24003, 3)].into_iter().enumerate() {
+            m.write_u64(0x25000 + i as u64 * 16, base).unwrap();
+            m.write_u64(0x25008 + i as u64 * 16, len).unwrap();
+        }
+        for (i, (base, len)) in [(0x26000u64, 2u64), (0x26100, 8)].into_iter().enumerate() {
+            m.write_u64(0x25100 + i as u64 * 16, base).unwrap();
+            m.write_u64(0x25108 + i as u64 * 16, len).unwrap();
+        }
+        set_args(&mut m, at, nr::WRITEV, &[wfd, 0x25000, 2]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 6);
+        set_args(&mut m, at, nr::READV, &[rfd, 0x25100, 2]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 6);
+        assert_eq!(m.read(0x26000, 2).unwrap(), b"ga");
+        assert_eq!(m.read(0x26100, 4).unwrap(), b"ther");
+
+        // A file: positioned and seeking calls agree with the kernel's.
+        let tmp = TmpFs::new();
+        tmp.add_file("f", b"0123456789".to_vec());
+        k.vfs.mount("/d", Arc::new(tmp));
+        put_str(&mut m, 0x27000, "/d/f");
+        set_args(&mut m, at, nr::OPENAT, &[(-100i64) as u64, 0x27000, 0, 0]);
+        k.syscall(&mut m, 0);
+        let fd = ret(&m, at) as u64;
+        set_args(&mut m, at, nr::PREAD64, &[fd, 0x28000, 3, 4]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 3);
+        assert_eq!(m.read(0x28000, 3).unwrap(), b"456");
+        set_args(&mut m, at, nr::LSEEK, &[fd, 7, 0]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 7);
+        set_args(&mut m, at, nr::READ, &[fd, 0x28100, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 3);
+        assert_eq!(m.read(0x28100, 3).unwrap(), b"789");
+
+        // The mask: set lock-free, read back by the kernel's own call.
+        m.write_u64(0x29000, 1 << (signal::sig::SIGPIPE - 1)).unwrap();
+        set_args(&mut m, at, nr::RT_SIGPROCMASK, &[0, 0x29000, 0, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        set_args(&mut m, at, nr::RT_SIGPROCMASK, &[0, 0, 0x29100, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(m.read_u64(0x29100).unwrap(), 1 << (signal::sig::SIGPIPE - 1));
+        // SIGKILL cannot be blocked, here as there.
+        m.write_u64(0x29000, 1 << (signal::sig::SIGKILL - 1)).unwrap();
+        set_args(&mut m, at, nr::RT_SIGPROCMASK, &[2, 0x29000, 0x29100, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(m.read_u64(0x29100).unwrap(), 1 << (signal::sig::SIGPIPE - 1));
+        assert_eq!(k.signals.blocked(), 0);
+
+        // A write with no reader: EPIPE, and SIGPIPE's default ends the
+        // process, as the full call's does.
+        set_args(&mut m, at, nr::CLOSE, &[rfd]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 7]);
+        assert!(matches!(
+            free(&k, &mut m, at),
+            Some(FreeOutcome::Done(Delivery::Terminate { signal: signal::sig::SIGPIPE, .. }))
+        ));
+        set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 7]);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Killed { signal: signal::sig::SIGPIPE, .. }));
     }
 
     #[test]

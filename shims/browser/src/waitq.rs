@@ -97,9 +97,10 @@ pub(crate) fn begin_turn() {
     }
 }
 
-/// Publish when this process's next timer fires.
-pub(crate) fn publish_timer(h: &Host) {
-    let at = h.kernel.timer_in_ns().map_or(u64::MAX, |d| now_ns().saturating_add(d));
+/// Publish when this process's next timer fires, from its signal state
+/// (`sigs::timer_in_ns`): no kernel lock.
+pub(crate) fn publish_timer() {
+    let at = crate::sigs::timer_in_ns().map_or(u64::MAX, |d| now_ns().saturating_add(d));
     let was = TIMER_AT.swap(at, std::sync::atomic::Ordering::Relaxed);
     // Sooner than the threads parked in other Workers sleep to: they look
     // again (`park_ns` reads it when they park).
@@ -175,16 +176,16 @@ fn unqueued(h: &Arc<dyn gex_kernel::vfs::FileHandle>) {
     }
 }
 
-/// The locked half of an idle turn: this Worker's thread `i` is waiting and
-/// not ready. Register its slot for the wait if this is a new one (and say
-/// so: the caller checks readiness again, now that a change will notify).
-pub(crate) fn enter(h: &mut Host, i: usize, why: u8, all_blocked: bool, ends_by_itself: bool) -> bool {
+/// An idle turn found this Worker's thread `i`, whose run state is `t`,
+/// waiting and not ready. Register its slot for the wait if this is a new
+/// one (and say so: the caller checks readiness again, now that a change
+/// will notify). Needs no kernel lock: the run state is the thread's own.
+pub(crate) fn enter(i: usize, t: &Run, why: u8, all_blocked: bool, ends_by_itself: bool) -> bool {
     if unsafe { k_present() } == 0 {
         return false;
     }
     let now = now_ns();
-    publish_timer(h);
-    let t = h.threads[i].run();
+    publish_timer();
     let fresh = WAIT.with(|w| {
         let mut w = w.borrow_mut();
         if let Some(m) = w.as_mut().filter(|m| m.thread == i && same_wait(&m.waiting, &t.waiting)) {

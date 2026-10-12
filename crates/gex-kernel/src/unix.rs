@@ -1468,6 +1468,10 @@ impl Drop for RemoteUnix {
 }
 
 impl crate::vfs::FileHandle for RemoteUnix {
+    fn is_global_socket(&self) -> bool {
+        true
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.listening {
             return Err(Errno::ENOTCONN);

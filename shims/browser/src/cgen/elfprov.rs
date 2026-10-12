@@ -65,7 +65,7 @@ pub(crate) fn provided(addr: u64) -> bool {
 /// A new process (a forked child): start over from what its kernel has
 /// mapped. Returns whether something was queued.
 fn rescan_if_new() -> bool {
-    let pid = crate::with_host(|h| h.kernel.pid);
+    let pid = crate::my_pid();
     let was = PID.swap(pid, Ordering::AcqRel);
     if was == pid {
         return false;
@@ -98,7 +98,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         return unit || !lock(&QUEUE).is_empty();
     }
     if PID.load(Ordering::Acquire) == 0 {
-        PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
+        PID.store(crate::my_pid(), Ordering::Release);
     }
     let trace = std::env::var_os("GEX_PROVIDER_TRACE").is_some();
     for m in mapped {

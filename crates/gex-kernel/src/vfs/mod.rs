@@ -295,6 +295,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether this is a socket in the global kernel (`unix::RemoteUnix`):
+    /// what a host asks of a parked thread's handle without the kernel's
+    /// table of them (`Kernel::remote_sockets`).
+    fn is_global_socket(&self) -> bool {
+        false
+    }
+
     /// Whether a read on this handle, made now, can end nobody's wait. Asked
     /// *before* the read, of a stream only (a read of anything else never
     /// ends a wait). A read ends a writer's wait by making room, and a writer
