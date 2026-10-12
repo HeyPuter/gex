@@ -21,6 +21,9 @@
 //   {"click": [X, Y]}                    a left click there
 //   {"keys": ["Escape", ...]}            named keys (KeyboardEvent.code)
 //   {"eval": "EXPR"}                     EXPR in the page, its value printed
+//   {"gl": true}                         the glxgears legs: from the xterm, then the launcher
+//   {"animates": "TITLE"}                a window titled TITLE appears and its own pixels
+//                                        change ("samples", "every" ms, "min" changes)
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
 //                                        copy of it (xwd) with the compositor's output
 //                                        (needs the python and xeyes overlays)
@@ -31,7 +34,9 @@
 // DEMO_QUERY (appended to the URL), DEMO_PROFILE (a profile dir to keep),
 // DEMO_DPR (--force-device-scale-factor), DEMO_CONSOLE (a file for every
 // console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
-// DEMO_COUNT=1 (print the X server's ?hostxcount lines).
+// DEMO_STDERR (a file for the browser's whole stderr), DEMO_COUNT=1 (print
+// the X server's ?hostxcount lines), DEMO_GL=0 (skip the
+// glxgears legs).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdtempSync, rmSync } from 'node:fs';
@@ -258,11 +263,22 @@ async function guestRun(cmd, wall = 120000) {
   const rc = Number(/rc=(\d+)/.exec(body)[1]);
   return { rc, lines: body.split('\n').slice(1).filter((l) => !l.includes(`${tag} end`)) };
 }
+/** The composited output, `{ w, h, b64 }`. A readout can time out while the
+ *  machine is busy (5 s), so three tries; then the compositor's own log says
+ *  why it gave none. */
+async function readout() {
+  for (let i = 0; i < 3; i++) {
+    const r = await ev('globalThis.__gexCompositor.readoutBase64()');
+    if (r) return r;
+  }
+  const d = await ev('globalThis.__gexCompositor.describe()');
+  throw new Error(`the compositor gave no readout in three tries; its log: ${JSON.stringify(d?.log ?? d)}`);
+}
 const SIG_COLS = 16, SIG_ROWS = 8, SIG_EDGE = 2;
 /** The same signature as tests/demo/guest/xsig.py, of what the compositor
  *  composed where the window is. */
 async function composedSig(x, y, w, h) {
-  const r = await ev('globalThis.__gexCompositor.readoutBase64()');
+  const r = await readout();
   const px = Buffer.from(r.b64, 'base64');
   const cells = new Array(SIG_COLS * SIG_ROWS).fill(0);
   let exact = 2166136261;
@@ -350,6 +366,53 @@ async function truth(step) {
   if (bad) failed = true;
   log(`${bad ? 'FAIL' : 'ok'} xterm shows what it drew: ${rounds - bad} of ${rounds} rounds`);
 }
+/** A hash of what the compositor shows where the window titled `title` is. */
+async function windowHash(title) {
+  const d = await ev('globalThis.__gexCompositor.describe()');
+  const line = d.list.find((l) => / role=1 /.test(l) && l.endsWith(`"${title}"`));
+  if (!line) return null;
+  const [, w, h, x, y] = /(\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(line).map(Number);
+  const r = await readout();
+  const px = Buffer.from(r.b64, 'base64');
+  let hash = 2166136261;
+  for (let j = Math.max(0, y); j < Math.min(r.h, y + h); j++) {
+    for (let i = Math.max(0, x); i < Math.min(r.w, x + w); i++) {
+      const o = (j * r.w + i) * 4;
+      hash = Math.imul(hash ^ (px[o] | (px[o + 1] << 8) | (px[o + 2] << 16)), 16777619) >>> 0;
+    }
+  }
+  return hash;
+}
+/**
+ * A window titled `animates` appears within `wall` seconds and its own pixels
+ * (not the rest of the screen: a terminal printing frame rates changes too)
+ * change from one readout to the next.
+ */
+async function animates(step) {
+  const title = step.animates;
+  const end = Date.now() + (step.wall ?? 30) * 1000;
+  let first = null;
+  while (Date.now() < end && (first = await windowHash(title)) === null) await new Promise((r) => setTimeout(r, 500));
+  if (first === null) {
+    failed = true;
+    const d = await ev('globalThis.__gexCompositor.describe()');
+    const ps = await guestRun('ps ax -o pid,stat,tty,comm; cat /tmp/gears.rc 2>/dev/null').catch(() => ({ lines: [] }));
+    log(`FAIL ${step.label ?? title}: no window titled ${JSON.stringify(title)} in ${step.wall ?? 30} s;`
+      + ` windows ${JSON.stringify(d.list)}; processes ${JSON.stringify(ps.lines.map((l) => l.trim()).filter(Boolean))}`);
+    return;
+  }
+  const seen = [first];
+  for (let i = 0; i < (step.samples ?? 5); i++) {
+    await new Promise((r) => setTimeout(r, step.every ?? 600));
+    seen.push(await windowHash(title));
+  }
+  const changes = seen.slice(1).filter((h, i) => h !== seen[i]).length;
+  const ok = changes >= (step.min ?? 3);
+  if (!ok) failed = true;
+  const d = await ev('globalThis.__gexCompositor.describe()');
+  log(`${ok ? 'ok' : 'FAIL'} ${step.label ?? `${title} animates`}: its window's pixels changed ${changes} times in ${seen.length - 1} readouts`
+    + `${ok ? '' : `; compositor log: ${JSON.stringify(d.log.slice(-6))}`}`);
+}
 async function legs() {
   const p = await places();
   if (!p) throw new Error('no window to point at');
@@ -417,6 +480,78 @@ async function legs() {
   for (const id of ['python', 'xeyes']) await ev(`globalThis.gexDesktop.install(${JSON.stringify(id)})`);
   await truth({ rounds: 3 });
   await poolLeg({});
+  if (process.env.DEMO_GL !== '0') await glLeg();
+}
+/**
+ * glxgears from the xterm, typed, and then from the launcher: both are the
+ * same path (the launcher runs the command as a shell would), and each must
+ * show a window whose own pixels move -- frame rates printed in the xterm do
+ * not count. The second is also the second GL client to take the same X
+ * window id, which is what once left it with no window at all.
+ */
+async function glLeg() {
+  await ev(`globalThis.gexDesktop.install('gears')`);
+  const p = await places();
+  await click(...p.win);
+  await new Promise((r) => setTimeout(r, 500));
+  // Its exit status, for a run where no window comes: typed as a shell runs it.
+  for (const ch of '\nrm -f /tmp/gears.rc; glxgears; echo $? > /tmp/gears.rc\n') await typeKey(ch);
+  await animates({ animates: 'glxgears', label: 'glxgears from the xterm animates', wall: 60 });
+  await guestRun('kill $(pidof glxgears); sleep 2');
+  await glForgotten('the xterm\'s glxgears');
+  await ev(`globalThis.gexDesktop.launch('gears')`);
+  await animates({ animates: 'glxgears', label: 'glxgears from the launcher, after it, animates', wall: 60 });
+  await guestRun('kill $(pidof glxgears); sleep 1');
+  await glForgotten('the launcher\'s glxgears');
+}
+/** Where each of the page's Workers is, for a Worker that stopped answering:
+ *  paused over CDP, its innermost frames. One that will not pause in 3 s is
+ *  blocked (Atomics.wait), not spinning. */
+async function workerStacks(match = /compositor/) {
+  const attached = [];
+  const onAttach = (p) => {
+    if (p.targetInfo?.type === 'worker' && match.test(p.targetInfo.url)) attached.push(p);
+  };
+  b.on('Target.attachedToTarget', onAttach);
+  await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, s);
+  await new Promise((r) => setTimeout(r, 1000));
+  for (const a of attached) {
+    const sid = a.sessionId;
+    const paused = new Promise((resolve) => {
+      b.on('Debugger.paused', (p, from) => { if (from === sid) resolve(p); });
+      setTimeout(() => resolve(null), 3000);
+    });
+    try {
+      await b.send('Debugger.enable', {}, sid);
+      await b.send('Debugger.pause', {}, sid);
+    } catch (e) {
+      log(`  ${a.targetInfo.url.split('/').pop()}: ${e.message}`);
+      continue;
+    }
+    const p = await paused;
+    log(`  ${a.targetInfo.url.split('/').pop()}: ${p ? 'paused at' : 'did not pause in 3 s (blocked, not spinning)'}`);
+    for (const f of (p?.callFrames ?? []).slice(0, 24)) {
+      log(`    ${f.functionName || '(anonymous)'} ${f.url.split('/').pop()}:${f.location.lineNumber}`);
+    }
+    try {
+      await b.send('Debugger.resume', {}, sid);
+    } catch { /* gone */ }
+  }
+}
+/** Once a GL program has exited, the host's Mesa holds none of its windows.
+ *  It used to keep every one: nothing told the compositor a process had gone,
+ *  so a second glxgears, with the first one's X window id, matched both. */
+async function glForgotten(who) {
+  let held = null;
+  for (let i = 0; i < 10; i++) {
+    held = (await ev('globalThis.__gexCompositor.describe()'))?.glWindows ?? null;
+    if (held && held.length === 0) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  const ok = held !== null && held.length === 0;
+  if (!ok) failed = true;
+  if (held === null) await workerStacks();
+  log(`${ok ? 'ok' : 'FAIL'} ${who} exited and the host's Mesa holds ${held === null ? 'an unknown number of' : held.length} GL windows${ok ? '' : `: ${held?.join(' ')}`}`);
 }
 /**
  * The X server frees what it no longer draws from: an xterm printing a line
@@ -428,7 +563,7 @@ async function poolLeg(step) {
   const p = await places();
   await click(...p.win);
   await new Promise((r) => setTimeout(r, 500));
-  for (const ch of `\nfor i in $(seq ${secs}); do echo pool$i; sleep 1; done\n`) await typeKey(ch);
+  for (const ch of `\nrm -f /tmp/pool.done; for i in $(seq ${secs}); do echo pool$i; sleep 1; done; touch /tmp/pool.done\n`) await typeKey(ch);
   await new Promise((r) => setTimeout(r, 2500));
   const from = xPools;
   await new Promise((r) => setTimeout(r, secs * 1000));
@@ -436,6 +571,8 @@ async function poolLeg(step) {
   const ok = from !== null && to !== null && to - from <= 2;
   if (!ok) failed = true;
   log(`${ok ? 'ok' : 'FAIL'} pool leg: the X server held ${from} pools, then ${to} after ${secs} s of the xterm printing a line a second`);
+  // The loop's end, so whatever is typed next is a command of its own.
+  await guestRun('for i in $(seq 60); do [ -e /tmp/pool.done ] && break; sleep 1; done');
 }
 function dump() {
   ev('globalThis.gexTerminalText?.()').then((t) => {
@@ -519,6 +656,10 @@ try {
       log(`${ok ? 'ok' : 'FAIL'} cursor ${JSON.stringify(css.slice(0, 80))} (want ${step.cursor})`);
     } else if (step.eval) {
       log(`eval ${step.eval}: ${JSON.stringify(await ev(step.eval)).slice(0, 400)}`);
+    } else if (step.gl) {
+      await glLeg();
+    } else if (step.animates) {
+      await animates(step);
     } else if (step.truth) {
       await truth(step);
     } else if (step.pools) {
@@ -587,6 +728,9 @@ try {
 clearTimeout(wall);
 // DEMO_CONSOLE=PATH: every console line the page logged, for a trace.
 if (process.env.DEMO_CONSOLE) (await import('node:fs')).writeFileSync(process.env.DEMO_CONSOLE, consoleLines.join('\n'));
+// DEMO_STDERR=PATH: the browser's whole stderr, which has the Workers' console
+// lines and the GPU process's own (a lost device says why only there).
+if (process.env.DEMO_STDERR) (await import('node:fs')).writeFileSync(process.env.DEMO_STDERR, stderr);
 const errs = stderr.split('\n').filter((l) => /Uncaught|RuntimeError|\[gex-console-error\]/.test(l));
 for (const l of errs.slice(0, 10)) log(`stderr: ${l.slice(0, 300)}`);
 b.close();

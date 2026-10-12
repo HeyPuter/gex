@@ -293,6 +293,12 @@ export class Compositor {
     this.#worker.postMessage({ kind: 'memory', token, memory });
   }
 
+  /** That process has exited: its memory, its GL context and its GL windows
+   *  go (compositor-worker.js 'drop-memory'). */
+  dropMemory(token) {
+    this.#worker.postMessage({ kind: 'drop-memory', token });
+  }
+
   resize(width, height) {
     this.#worker.postMessage({ kind: 'resize', width, height });
   }

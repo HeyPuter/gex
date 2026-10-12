@@ -622,6 +622,11 @@ class Compositor {
     sendEvent(this.#channel, win.block, EV_MOVED, win.x, win.y, 0, 0, win.client, win.surface);
   }
 
+  /** A line in the log `describe` returns. */
+  note(line) {
+    this.#note(line);
+  }
+
   #note(line) {
     this.#log.push(`${this.#frames} ${line}`);
     if (this.#log.length > 64) this.#log.splice(0, 32);
@@ -1289,7 +1294,10 @@ class Compositor {
   async readout() {
     try {
       return await this.#painter.read();
-    } catch {
+    } catch (e) {
+      // Said, so a harness that gets null can tell why (`describe().log`).
+      this.#note(`readout failed: ${e?.message ?? e}`);
+      console.error('[compositor] readout failed:', e);
       return null;
     }
   }
@@ -1349,6 +1357,9 @@ class Compositor {
       // The GL device's counters (submits, their time, readbacks): the
       // compositor side of a frame's cost.
       gl: glDevice?.glState?.() ?? null,
+      // The GL windows the host's Mesa holds, as `kind:id@token`: a process
+      // that has exited must have none (its 'drop-memory').
+      glWindows: glDevice ? glDevice.surfaces().map((s) => `${s.kind}:${s.id}@${s.token}`) : [],
       turns,
     };
   }
@@ -1557,7 +1568,12 @@ const onMessage = ({ data: m }) => {
       // That process is gone: its GL context, its windows and their frames go
       // with it. Nothing else will ever say so -- a client that exits is not
       // there to send a detach.
-      glDevice?.forgetClient?.(m.token);
+      if (glDevice) {
+        const t0 = performance.now();
+        comp?.note?.(`forget client ${m.token}`);
+        glDevice.forgetClient(m.token);
+        comp?.note?.(`forgot client ${m.token} in ${(performance.now() - t0).toFixed(1)} ms`);
+      }
       glSurfaceFrame = -1;
     } else if (m.kind === 'resize') {
       comp?.resize(m.width, m.height);

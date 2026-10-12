@@ -1026,6 +1026,15 @@ async function runProgramHere(
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
       term.write(text);
     },
+    // A process has exited (a thread's end is keyed "pid:tid" and is not
+    // one): the compositor lets go of its memory, and the host's Mesa of its
+    // GL context and windows. Nothing said so before, so every Wayland or GL
+    // client's whole memory stayed held by the compositor for the life of
+    // the page, and a GL program's windows stayed in Mesa's list: a second
+    // glxgears, given the first one's X window id, matched both.
+    onExit: (m, pid) => {
+      if (typeof pid === 'number') compositor?.dropMemory?.(pid);
+    },
     readStdin: (lflag) => {
       if (lflag !== undefined) tenv.lflag = lflag;
       return tenv.readStdin();
