@@ -100,11 +100,22 @@ async function packed(path, entry, build, onBytes = null) {
     }
     if (n !== entry.size) throw new Error(`${path}: decoded ${n} of ${entry.size} bytes`);
     const ext = path.split('.').pop();
-    const response = new Response(out, {
-      headers: { 'Content-Type': TYPES[ext] ?? 'application/octet-stream', 'Content-Length': String(entry.size) },
-    });
-    await cache.put(key, response.clone());
-    return response;
+    const headers = { 'Content-Type': TYPES[ext] ?? 'application/octet-stream', 'Content-Length': String(entry.size) };
+    try {
+      await cache.put(key, new Response(out, { headers }));
+    } catch (e) {
+      console.warn(`[sw] ${path}: not cached (${e?.message ?? e})`);
+      return new Response(out, { headers });
+    }
+    // Served from the cache from now on, and the decoded bytes let go of
+    // at once: held until this worker next collects, which an idle service
+    // worker may not do for the page's whole life, they stayed resident
+    // beside the page's own copy (459 MiB for the mspaint bundle).
+    out.buffer.transfer?.(0);
+    out = null;
+    const hit = await cache.match(key);
+    if (!hit) throw new Error(`${path}: gone from the cache just after it was put there`);
+    return hit;
   })();
   inflight.set(key, p);
   try {
