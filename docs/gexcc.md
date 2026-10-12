@@ -1767,12 +1767,19 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
   the fix every round matches exactly. `?hostxcount=1` logs, once a second,
   the bytes the X server took from and sent to each client, its bytes to the
   compositor and its scenes published.
-- **Known gap: pool memory.** A pool's pixels are never freed: the
-  compositor may still read them after the X server closes the descriptor.
-  Xwayland drops a buffer after a second unused and makes a new one, so an
-  xterm printing a line every 1.3 s allocates about 0.9 MB per line.
-  Freeing needs the mapping's lifetime (`gex_shm_unmap` in
-  `web/xwayland/gexos.c` is a no-op) and a release from the compositor.
+- **The X server's pools are freed.** Each pool had stayed for good.
+  Xwayland drops a buffer unused for a second and makes a new pool, so an
+  xterm printing a line a second kept about 0.9 MB per line. A pool now
+  counts its references:
+  - the server's descriptor;
+  - its mappings (`gex_shm_unmap` in `web/xwayland/gexos.c` now reports them);
+  - the compositor's handle, which `shims/hostwl` gives back once no pool,
+    buffer or surface on screen names it (`Client::fds_in_use`).
+
+  With none left, the pixels are freed once the page has drawn a scene
+  published after that. On edger the pool leg (12 s of a line a second) went
+  from 4 to 14 live pools without the free, and stays at 4 with it.
+  `?hostxcount=1` prints `pools=N`.
 
 Legs: `node tests/demo/desktop.mjs web/dist-demo` (the desktop, then the
-cursor, presentation and xterm-contents legs; `DEMO_DPR=2` for the device-pixel output).
+cursor, presentation, xterm-contents and pool legs; `DEMO_DPR=2` for the device-pixel output).

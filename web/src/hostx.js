@@ -93,8 +93,24 @@ export class HostX {
   #k = null;
   /** What each descriptor means. */
   #fds = new Map();
-  /** Pools of pixels, by descriptor: where they are in the server's memory. */
+  /**
+   * Pools of pixels, by descriptor: where they are in the server's memory.
+   *
+   * A pool is freed when nothing refers to it: `refs` counts the server's
+   * descriptor, its mappings (`gex_shm_map`/`gex_shm_unmap` in gexos.c) and
+   * the compositor's handles (`#held`, given back by `host_release`). Then
+   * it waits in `#dying` until the page has drawn a scene published after
+   * that, so a frame already on its way is never read out of freed memory.
+   * Xwayland makes a new pool for a window that has not drawn for a second
+   * (about 0.9 MB for an xterm), and before this every one of them stayed.
+   */
   #pools = new Map();
+  /** Mapped pools, by address: what `gex_shm_unmap` names. */
+  #mapped = new Map();
+  /** Pools nothing refers to, with the scene generation they died after. */
+  #dying = [];
+  /** Pools made and not yet freed, for `?hostxcount=1`. */
+  #live = 0;
   /**
    * The pools the compositor holds, by its own handle for each: what a
    * descriptor sent on the Wayland connection became when it arrived.
@@ -183,6 +199,12 @@ export class HostX {
     const hw = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       gex_host: {
         host_locate: (fd, out) => this.#locate(fd, out),
+        host_release: (fd) => {
+          const pool = this.#held.get(fd);
+          if (!pool) return;
+          this.#held.delete(fd);
+          this.#drop(pool);
+        },
         host_trace: (ptr, len) => this.log(this.#hwText(ptr, len).replace(/\n$/, '')),
       },
     });
@@ -377,6 +399,30 @@ export class HostX {
     return 1;
   }
 
+  /** One reference to `pool` fewer; with none left, free it once it is safe. */
+  #drop(pool) {
+    if (--pool.refs > 0) return;
+    if (this.#mapped.get(pool.addr) === pool) this.#mapped.delete(pool.addr);
+    this.#dying.push({ pool, gen: this.#proxy?.ok ? this.#proxy.generation : -1 });
+  }
+
+  /** Free the pools that died before a scene the page has drawn since. */
+  #reap() {
+    if (!this.#dying.length) return;
+    const drawn = this.#proxy?.ok ? this.#proxy.drawnGeneration : Infinity;
+    const keep = [];
+    for (const d of this.#dying) {
+      if (drawn > d.gen) {
+        this.#x._free(d.pool.addr);
+        this.#live--;
+        if (this.#count) this.#bump('freed', d.pool.size);
+      } else {
+        keep.push(d);
+      }
+    }
+    this.#dying = keep;
+  }
+
   #once(key, text) {
     if (this.#said.has(key)) return;
     this.#said.add(key);
@@ -420,13 +466,15 @@ export class HostX {
         if (!ep) return 0;
         if (ep.kind === 'kernel' || ep.kind === 'listen') self.#k.k_sock_close(ep.id);
         // A pool's descriptor is closed as soon as the server has handed it to
-        // wl_shm, and the pixels have to outlive that: the compositor is still
-        // reading them. So the allocation stays -- freeing it here is the one
-        // way to make an X window's contents vanish mid-frame.
+        // wl_shm, and the pixels have to outlive that: the server draws
+        // through its mapping and the compositor is still reading them. So
+        // closing it is one reference fewer, not a free (see `#pools`).
         self.#fds.delete(fd);
-        // The server's name for a pool goes with the descriptor; the compositor
-        // has its own (`#held`), and the memory stays (see above).
-        self.#pools.delete(fd);
+        const pool = self.#pools.get(fd);
+        if (pool) {
+          self.#pools.delete(fd);
+          self.#drop(pool);
+        }
         try {
           self.#x.FS.close(self.#x.FS.getStream(fd));
         } catch {
@@ -492,6 +540,7 @@ export class HostX {
             if (pool) {
               word = self.#nextHeld++;
               self.#held.set(word, pool);
+              pool.refs++;
             }
             self.#hwWords[((p + pad) >> 2) + i] = word;
           }
@@ -540,12 +589,28 @@ export class HostX {
       /** A pool of pixels the compositor will read where it lies. */
       shm(addr, size) {
         const fd = self.#reserve({ kind: 'pool' });
-        self.#pools.set(fd, { addr, size });
+        self.#pools.set(fd, { addr, size, refs: 1, maps: 0 });
+        self.#live++;
         return fd;
       },
 
+      /** `mmap` of a pool: its address, and a reference until `shmUnmap`. */
       shmAddr(fd) {
-        return self.#pools.get(fd)?.addr ?? 0;
+        const pool = self.#pools.get(fd);
+        if (!pool) return 0;
+        pool.refs++;
+        pool.maps++;
+        self.#mapped.set(pool.addr, pool);
+        return pool.addr;
+      },
+
+      /** `munmap` of a pool the server mapped. */
+      shmUnmap(addr) {
+        const pool = self.#mapped.get(addr);
+        if (!pool || !pool.maps) return 0;
+        if (--pool.maps === 0) self.#mapped.delete(addr);
+        self.#drop(pool);
+        return 0;
       },
 
       /**
@@ -622,7 +687,9 @@ export class HostX {
     const addr = this.#x._malloc(n);
     this.#x.HEAPU8.set(this.#hwView().subarray(p, p + n), addr);
     const fd = this.#reserve({ kind: 'pool' });
-    this.#pools.set(fd, { addr, size: n });
+    // Never freed: one per keymap, and the server does not map it through
+    // `shmAddr`, so nothing would count its last reader.
+    this.#pools.set(fd, { addr, size: n, refs: Infinity, maps: 0 });
     this.#owed.push(fd);
     this.log(`[hostx] keymap event: ${n} bytes as fd ${fd}`);
   }
@@ -643,7 +710,7 @@ export class HostX {
       c.polls++;
       if (Date.now() - c.at >= 1000) {
         const parts = [...c.n].map(([k, v]) => `${k}=${v}`).join(' ');
-        this.log(`[hostx-count] turns=${c.polls} pub=${this.#published} ${parts}`);
+        this.log(`[hostx-count] turns=${c.polls} pub=${this.#published} pools=${this.#live} ${parts}`);
         c.n.clear();
         c.polls = 0;
         c.at = Date.now();
@@ -653,6 +720,7 @@ export class HostX {
     // server's `main` has the thread. See web/test/hostx.mjs.
     globalThis.GEX_HOSTX_TICK?.();
     const hw = this.#hw;
+    this.#reap();
     hw.hw_tick();
     this.#takeKeymap();
 

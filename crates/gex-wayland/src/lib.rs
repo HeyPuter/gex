@@ -417,6 +417,11 @@ struct SurfaceState {
     /// nothing to draw -- so it says how big it is and the compositor finds
     /// the pixels by other means.
     external: Option<(i32, i32)>,
+    /// The descriptor of the pool behind what this surface shows, while it
+    /// shows it. A client may destroy a buffer, and its pool, once the buffer
+    /// is released -- which is at commit here -- and the surface still shows
+    /// those pixels: the host must not free them while it may read them again.
+    shown_fd: Option<u32>,
     /// A NULL buffer was attached: this commit unmaps the surface.
     pending_null: bool,
     /// Subsurfaces of this surface, in bottom-to-top order.
@@ -565,6 +570,27 @@ impl Client {
             self.inbox.drain(..size);
             self.dispatch(h.object, h.opcode, &body, buffers);
         }
+    }
+
+    /// Every descriptor the compositor still needs: a live `wl_shm_pool` or
+    /// `wl_buffer` names it, or a surface shows pixels from it. A host that
+    /// holds a reference per descriptor received (the page's X server) drops
+    /// it once its descriptor is no longer here.
+    pub fn fds_in_use(&self) -> std::collections::HashSet<u32> {
+        let mut out = std::collections::HashSet::new();
+        for o in self.objects.values() {
+            match o {
+                Object::ShmPool { fd, .. } => {
+                    out.insert(*fd);
+                }
+                Object::Buffer(spec) => {
+                    out.insert(spec.fd);
+                }
+                _ => {}
+            }
+        }
+        out.extend(self.surfaces.values().filter_map(|s| s.shown_fd));
+        out
     }
 
     /// Bytes the host should send to the client.
@@ -1161,6 +1187,7 @@ impl Client {
                 s.committed_buffer = None;
                 s.pending_buffer = None;
                 s.addr = 0;
+                s.shown_fd = None;
             }
             self.dirty = true;
             return;
@@ -1244,6 +1271,7 @@ impl Client {
                         }
                         if let Some(s) = self.surfaces.get_mut(&surface) {
                             s.addr = addr;
+                            s.shown_fd = Some(spec.fd);
                             s.stride = spec.stride;
                             s.width = spec.width;
                             s.height = spec.height;
@@ -2926,6 +2954,36 @@ mod tests {
         assert_eq!(s.addr, 0x10_0000, "the descriptor points at the pool");
         assert_eq!(s.role, Role::Toplevel);
         assert_eq!(s.title, "a window");
+    }
+
+    #[test]
+    fn a_descriptor_is_in_use_while_a_surface_shows_its_pixels() {
+        let (mut c, _) = placed_window(64, 32, 256);
+        let pool = Placed(0x20_0000, 256 * 32 + 64);
+        assert!(c.fds_in_use().contains(&77), "pool 9 and buffer 10 hold it");
+        // What Xwayland does: the pool goes at once, the buffer later, while
+        // the surface still shows it.
+        c.receive(&Writer::new(9, 1).finish(), &[], &pool); // wl_shm_pool.destroy
+        c.receive(&Writer::new(10, 0).finish(), &[], &pool); // wl_buffer.destroy
+        assert!(c.fds_in_use().contains(&77), "the surface still shows it");
+        // A second pool and buffer, attached and committed: the first is free.
+        c.receive(&Writer::new(4, 0).new_id(11).int(256 * 32).finish(), &[78], &pool);
+        c.receive(
+            &Writer::new(11, 0).new_id(12).int(0).int(64).int(32).int(256).uint(1).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(6, 1).object(12).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let used = c.fds_in_use();
+        assert!(!used.contains(&77), "nothing needs the first pool: {used:?}");
+        assert!(used.contains(&78));
+        // Unmapped: a NULL attach and a commit, and the buffer destroyed.
+        c.receive(&Writer::new(11, 1).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 1).object(0).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        c.receive(&Writer::new(12, 0).finish(), &[], &pool);
+        assert!(c.fds_in_use().is_empty(), "{:?}", c.fds_in_use());
     }
 
     #[test]

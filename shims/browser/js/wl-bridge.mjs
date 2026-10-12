@@ -329,6 +329,16 @@ export class WlProxy {
     return this.#block >= 0;
   }
 
+  /** Publishes so far (the block's generation). */
+  get generation() {
+    return Atomics.load(this.#a, this.#base + B_GEN);
+  }
+
+  /** The last generation the compositor has drawn. */
+  get drawnGeneration() {
+    return Atomics.load(this.#a, this.#base + B_ACK);
+  }
+
   /**
    * Mirror `count` records the shim wrote at `ptr` into this process's block.
    *

@@ -43,6 +43,9 @@ extern "C" {
     fn host_locate(fd: u32, out: u32) -> i32;
     /// A line for the page's console.
     fn host_trace(ptr: u32, len: u32);
+    /// The compositor no longer needs the pool behind this descriptor (one
+    /// the server sent): the reference the host took when it arrived goes.
+    fn host_release(fd: u32);
 }
 
 fn trace(s: &str) {
@@ -126,8 +129,43 @@ struct State {
     /// calls a buffer's "fd" is an index into this, not a number the server
     /// chose.
     fds: Vec<u32>,
+    /// Indices into `fds` that have arrived and that nothing has used yet: a
+    /// message can arrive in pieces, so a descriptor whose `create_pool` is
+    /// still in flight is not one the compositor is done with.
+    fresh: Vec<u32>,
+    /// Indices into `fds` the compositor has used and may still need.
+    live: Vec<u32>,
     /// Whether the scene changed since the page last took it.
     dirty: bool,
+}
+
+impl State {
+    /// Give back every descriptor the compositor has finished with: no pool,
+    /// no buffer and no surface on screen names it any more.
+    fn release_unused(&mut self) {
+        if self.fresh.is_empty() && self.live.is_empty() {
+            return;
+        }
+        let used = self.client.fds_in_use();
+        let fresh = std::mem::take(&mut self.fresh);
+        for t in fresh {
+            if used.contains(&t) {
+                self.live.push(t);
+            } else {
+                self.fresh.push(t);
+            }
+        }
+        let fds = &self.fds;
+        self.live.retain(|t| {
+            if used.contains(t) {
+                return true;
+            }
+            if let Some(&id) = fds.get(*t as usize) {
+                unsafe { host_release(id) };
+            }
+            false
+        });
+    }
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -186,6 +224,8 @@ pub extern "C" fn hw_init(w: i32, h: i32) {
         wm,
         out: VecDeque::new(),
         fds: Vec::new(),
+        fresh: Vec::new(),
+        live: Vec::new(),
         dirty: true,
     });
 }
@@ -222,6 +262,8 @@ pub extern "C" fn hw_wayland_receive(ptr: u32, len: u32, fds: u32, nfds: u32) {
         let tokens: Vec<u32> = (first..st.fds.len()).map(|i| i as u32).collect();
         let view = Pools { fds: &st.fds };
         st.client.receive(bytes, &tokens, &view);
+        st.fresh.extend_from_slice(&tokens);
+        st.release_unused();
         let events = st.client.take_outgoing();
         st.out.extend(events);
     });

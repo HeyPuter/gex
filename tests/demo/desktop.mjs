@@ -23,11 +23,14 @@
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
 //                                        copy of it (xwd) with the compositor's output
 //                                        (needs the python and xeyes overlays)
+//   {"pools": true, "seconds": N}        the xterm prints a line a second for N s; the
+//                                        X server's live pools must not grow
 // A run step with "show": true prints the command's output tail even on success.
 // Env: CHROME, DEMO_WALL (s, default 300), DEMO_WEBGPU=sw (SwiftShader),
 // DEMO_QUERY (appended to the URL), DEMO_PROFILE (a profile dir to keep),
 // DEMO_DPR (--force-device-scale-factor), DEMO_CONSOLE (a file for every
-// console line), DEMO_CHROME_FLAGS (more browser flags, space-separated).
+// console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
+// DEMO_COUNT=1 (print the X server's ?hostxcount lines).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdtempSync, rmSync } from 'node:fs';
@@ -60,7 +63,9 @@ const server = createServer((req, res) => {
   createReadStream(p).pipe(res);
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const url = `http://127.0.0.1:${server.address().port}/${process.env.DEMO_QUERY ? `?${process.env.DEMO_QUERY}` : ''}`;
+// hostxcount=1 always: the pool leg reads the X server's live pools from it.
+const query = ['hostxcount=1', process.env.DEMO_QUERY].filter(Boolean).join('&');
+const url = `http://127.0.0.1:${server.address().port}/?${query}`;
 const prof = process.env.DEMO_PROFILE || mkdtempSync(join(tmpdir(), 'gex-desktop-'));
 const port = 9400 + Math.floor(Math.random() * 500);
 const sw = process.env.DEMO_WEBGPU === 'sw';
@@ -105,10 +110,18 @@ for (let i = 0; i < 50 && !page; i++) {
 if (!page) page = { targetId: (await b.send('Target.createTarget', { url: 'about:blank' })).targetId };
 const { sessionId: s } = await b.send('Target.attachToTarget', { targetId: page.targetId, flatten: true });
 const consoleLines = [];
+/** The X server's pools made and not freed, from its last `?hostxcount` line. */
+let xPools = null;
 b.on('Runtime.consoleAPICalled', (p) => {
   const line = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
   consoleLines.push(line);
-  if (/\[desktop\]|\[hostx-count\]|error|Error/.test(line) && p.type !== 'debug') log(`console: ${line.slice(0, 300)}`);
+  const pools = /\[hostx-count\].* pools=(\d+)/.exec(line);
+  if (pools) {
+    xPools = Number(pools[1]);
+    if (process.env.DEMO_COUNT) log(`console: ${line.slice(0, 300)}`);
+    return;
+  }
+  if (/\[desktop\]|error|Error/.test(line) && p.type !== 'debug') log(`console: ${line.slice(0, 300)}`);
 });
 b.on('Runtime.exceptionThrown', (p) => log(`exception: ${p.exceptionDetails?.exception?.description?.slice(0, 400)}`));
 await b.send('Runtime.enable', {}, s);
@@ -385,6 +398,26 @@ async function legs() {
   await new Promise((r) => setTimeout(r, 3000));
   for (const id of ['python', 'xeyes']) await ev(`globalThis.gexDesktop.install(${JSON.stringify(id)})`);
   await truth({ rounds: 3 });
+  await poolLeg({});
+}
+/**
+ * The X server frees what it no longer draws from: an xterm printing a line
+ * every second or so gets a new pool per line (Xwayland drops a buffer unused
+ * for a second), and before, each stayed -- about 0.9 MB a line.
+ */
+async function poolLeg(step) {
+  const secs = step.seconds ?? 12;
+  const p = await places();
+  await click(...p.win);
+  await new Promise((r) => setTimeout(r, 500));
+  for (const ch of `\nfor i in $(seq ${secs}); do echo pool$i; sleep 1; done\n`) await typeKey(ch);
+  await new Promise((r) => setTimeout(r, 2500));
+  const from = xPools;
+  await new Promise((r) => setTimeout(r, secs * 1000));
+  const to = xPools;
+  const ok = from !== null && to !== null && to - from <= 2;
+  if (!ok) failed = true;
+  log(`${ok ? 'ok' : 'FAIL'} pool leg: the X server held ${from} pools, then ${to} after ${secs} s of the xterm printing a line a second`);
 }
 function dump() {
   ev('globalThis.gexTerminalText?.()').then((t) => {
@@ -468,6 +501,8 @@ try {
       log(`${ok ? 'ok' : 'FAIL'} cursor ${JSON.stringify(css.slice(0, 80))} (want ${step.cursor})`);
     } else if (step.truth) {
       await truth(step);
+    } else if (step.pools) {
+      await poolLeg(step);
     } else if (step.keys) {
       await ev("document.getElementById('out').focus()");
       for (const code of step.keys) {
