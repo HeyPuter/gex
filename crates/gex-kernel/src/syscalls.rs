@@ -7886,6 +7886,12 @@ mod tests {
         if gex_abi::PPC {
             return;
         }
+        // The monotonic clocks' base is one per host process, set by the
+        // first monotonic reading. Set it from the real clock before `fixed`
+        // can: from 2023's `fixed` it made every later reading in this test
+        // binary an uptime of years (the_monotonic_clock_counts_from_boot_
+        // not_the_epoch failed when this test ran first).
+        monotonic_from(system_clock());
         let (mut mem, mut k) = setup();
         k.clock = fixed;
         let buf = 0x3000u64;
