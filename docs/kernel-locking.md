@@ -385,6 +385,13 @@ same box.
     13.65 s for B): the cold process's lifting was never the critical path's
     lock wait, only its own. Undertale tier-1 on worldmachine, 200 s, last
     120 s: 21.9-22.9 fps against 22.3-22.5 for step 4.
+  - **Known failure, for step 8:** `tests/x86-programs/thread-signals` in
+    the page tier (x86-64, mem64 seed; not in the default `PAGE_PROGRAMS`)
+    prints "blocked thread took it while blocked: yes" and "still pending
+    in the blocked thread: no": a `pthread_kill` to a thread blocking every
+    signal runs the handler on it. It fails the same way on a tree without
+    steps 3-5 (integ-1012b, 2026-10-12), so it predates them. Native tiers
+    pass.
   - Registry reads touch neither fds nor mm, so step 4 needs neither first;
     step 5's write half publishes what steps 6 and 7 then stop guarding.
 
