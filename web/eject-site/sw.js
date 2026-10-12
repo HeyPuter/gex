@@ -65,21 +65,40 @@ async function packed(path, entry, build, onBytes = null) {
   const p = (async () => {
     const res = await fetch(`${scope}${path}.zst?v=${build}`);
     if (!res.ok) throw new Error(`${path}.zst: ${res.status}`);
-    // Whole, then decoded at once: the largest file is a few tens of MB
-    // compressed, and the vendored decoder's one-shot path is its fast one.
-    const z = new Uint8Array(entry.zsize);
+    // Decoded as it streams, a network chunk at a time: the decoder's wasm
+    // memory is module-wide and never shrinks, so a one-shot decode of the
+    // mspaint bundle (459 MiB from 40 MiB) left a 498 MiB heap resident for
+    // the service worker's life, beside the page's own copy of the bundle.
+    const parts = [];
     let at = 0;
     const reader = res.body.getReader();
     for (;;) {
       const r = await reader.read();
       if (r.done) break;
-      z.set(r.value, at);
+      parts.push(r.value);
       at += r.value.length;
       onBytes?.(r.value.length);
     }
     if (at !== entry.zsize) throw new Error(`${path}.zst: ${at} of ${entry.zsize} bytes`);
-    const out = (await decoder()).decode(z, entry.size);
-    if (out.length !== entry.size) throw new Error(`${path}: decoded ${out.length} of ${entry.size} bytes`);
+    const d = await decoder();
+    let out = new Uint8Array(entry.size);
+    let n = 0;
+    try {
+      for (const part of d.decodeStreaming(parts)) {
+        if (n + part.length > out.length) throw new Error('longer than packed');
+        out.set(part, n);
+        n += part.length;
+      }
+    } catch (e) {
+      // The one-shot path, as before, if the stream would not finish.
+      console.warn(`[sw] ${path}: streaming decode failed (${e?.message ?? e}); decoding at once`);
+      const z = new Uint8Array(entry.zsize);
+      let o = 0;
+      for (const p of parts) { z.set(p, o); o += p.length; }
+      out = d.decode(z, entry.size);
+      n = out.length;
+    }
+    if (n !== entry.size) throw new Error(`${path}: decoded ${n} of ${entry.size} bytes`);
     const ext = path.split('.').pop();
     const response = new Response(out, {
       headers: { 'Content-Type': TYPES[ext] ?? 'application/octet-stream', 'Content-Length': String(entry.size) },
