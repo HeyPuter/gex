@@ -359,6 +359,17 @@ fn widen_time(m: &mut GuestMem<'_>, p: u64, scratch: u64, scale: u64) -> u64 {
     scratch
 }
 
+/// The canonical number an i386 call `raw` is served as (what [`translate`]
+/// returns), without its arguments: for a host deciding, before the kernel
+/// runs, what kind of call this is (whether it can wake anyone, whether it
+/// can read `/proc`).
+pub fn canonical_number(raw: u64) -> u64 {
+    let mut a = [0u64; 6];
+    let mut scratch = [0u8; 256];
+    let mut m = GuestMem::new(&mut scratch);
+    translate(raw & 0xffff_ffff, &mut a, &mut m, 0, 0).0
+}
+
 /// Translate an i386 call into the canonical one. `scratch` is the thread's
 /// 64-byte scratch area in its context (the same one [`crate::x86`] uses);
 /// `ctx_addr` is the context itself, for `set_thread_area`.
@@ -1140,5 +1151,20 @@ mod tests {
         assert_eq!(post.finish(&mut m, 0), 0);
         let words: Vec<u32> = (0..4).map(|i| m.read_u32(0x3000 + i * 4).unwrap()).collect();
         assert_eq!(words, vec![1, 2, 3, 4]);
+    }
+
+    /// Every i386 number maps without arguments, and the calls a host sorts by
+    /// number map to the canonical ones it lists.
+    #[test]
+    fn canonical_number_needs_no_arguments() {
+        for raw in 0..512 {
+            let _ = canonical_number(raw);
+        }
+        assert_eq!(canonical_number(raw::GETRUSAGE), nr::GETRUSAGE);
+        assert_eq!(canonical_number(raw::CLOCK_GETTIME64), nr::CLOCK_GETTIME);
+        assert_eq!(canonical_number(raw::CLOCK_GETTIME), nr::CLOCK_GETTIME);
+        assert_eq!(canonical_number(raw::SCHED_YIELD), nr::SCHED_YIELD);
+        assert_eq!(canonical_number(raw::READ), nr::READ);
+        assert_eq!(canonical_number(raw::OPEN), nr::OPENAT);
     }
 }
