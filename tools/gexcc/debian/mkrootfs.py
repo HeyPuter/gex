@@ -325,6 +325,7 @@ def main():
     ap.add_argument('--roots', default=','.join(ROOTS))
     ap.add_argument('--extra', default='', help='more arm64 packages (and their closure)')
     ap.add_argument('--exclude', default='', help='our packages to leave out of the image (still in the repo)')
+    ap.add_argument('--ours', default='', help='only these of our packages in the image (still all in the repo)')
     ap.add_argument('--full', action='store_true', help='keep documentation and translations')
     a = ap.parse_args()
     global a_minimal
@@ -336,6 +337,9 @@ def main():
         ours.append((deb, control(deb)))
     excluded = set(filter(None, a.exclude.split(',')))
     image_ours = [(d, c) for d, c in ours if c['Package'] not in excluded]
+    if a.ours:
+        only = set(a.ours.split(','))
+        image_ours = [(d, c) for d, c in image_ours if c['Package'] in only]
     our_names = {c['Package'] for _, c in ours}
     for _, c in ours:
         for item in c.get('Provides', '').split(','):

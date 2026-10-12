@@ -7,6 +7,8 @@
 // through the shared arena instead, which is exactly how a guest process's
 // compositor gets them too.
 
+// Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
+import './zfetch.js';
 import { HostX } from './hostx.js';
 
 let host = null;

@@ -384,6 +384,23 @@ export class ProcessHost {
     return this.#stacks.area + n * this.#stacks.size;
   }
 
+  /**
+   * A kernel stack slice for something that is not a guest Worker but calls
+   * into the global kernel from a realm of its own (the demo's overlay
+   * Worker, `web/src/overlay.js`). Undefined until the first Worker has said
+   * where the stacks are. Give it back with `releaseKernelStack(key)`.
+   */
+  takeKernelStack(key) {
+    return this.#nextKernelStack(`ext:${key}`);
+  }
+
+  releaseKernelStack(key) {
+    const slice = this.#stackOf.get(`ext:${key}`);
+    if (slice === undefined) return;
+    this.#stackOf.delete(`ext:${key}`);
+    this.#stacksFree.push(slice);
+  }
+
   /** A Worker has ended: stop it, and put its kernel stack back. */
   #release(key, w) {
     this.#workers.delete(key);

@@ -478,7 +478,7 @@ async function handle(msg) {
     gex.useWl(proxy);
     // The output size a toplevel is configured to, before the guest runs.
     const out = outputSize(msg.wlChannel);
-    gex.wlOutput(out.w, out.h);
+    gex.wlOutput(out.w, out.h, out.scale);
     // The compositor reads this process's pixels out of this memory, so it
     // needs the memory itself. Sent once, with the token that names this
     // process's block in the arena.

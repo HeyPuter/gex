@@ -1035,6 +1035,38 @@ impl EpollSet {
         }
     }
 
+    /// A set already holding `watches`: a fork's child's copy of its
+    /// parent's (see [`EpollSet::describe`]).
+    pub fn with_watches(watches: Vec<Watch>) -> EpollSet {
+        EpollSet { watched: Mutex::new(watches) }
+    }
+
+    /// The registrations as text, `fd,events,data` joined by `;`, for a set
+    /// that travels to another process by name.
+    pub fn describe(&self) -> String {
+        self.watches()
+            .iter()
+            .map(|w| format!("{},{},{}", w.fd, w.events, w.data))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// The other half of [`EpollSet::describe`]. `None` for text it did not write.
+    pub fn parse(text: &str) -> Option<Vec<Watch>> {
+        if text.is_empty() {
+            return Some(Vec::new());
+        }
+        text.split(';')
+            .map(|w| {
+                let mut it = w.split(',');
+                let fd = it.next()?.parse().ok()?;
+                let events = it.next()?.parse().ok()?;
+                let data = it.next()?.parse().ok()?;
+                Some(Watch { fd, events, data })
+            })
+            .collect()
+    }
+
     pub fn watches(&self) -> Vec<Watch> {
         self.watched
             .lock()
@@ -1065,6 +1097,21 @@ impl FileHandle for EpollSet {
 #[cfg(test)]
 mod epoll_tests {
     use super::*;
+
+    #[test]
+    fn a_set_travels_by_its_description() {
+        let e = EpollSet::new();
+        e.ctl(epoll_op::ADD, 3, 1, 0xaa).unwrap();
+        e.ctl(epoll_op::ADD, 9, 5, u64::MAX).unwrap();
+        let text = e.describe();
+        let copy = EpollSet::with_watches(EpollSet::parse(&text).unwrap());
+        let w = copy.watches();
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].fd, w[0].events, w[0].data), (3, 1, 0xaa));
+        assert_eq!((w[1].fd, w[1].events, w[1].data), (9, 5, u64::MAX));
+        assert!(EpollSet::parse("").unwrap().is_empty());
+        assert!(EpollSet::parse("x").is_none());
+    }
 
     #[test]
     fn add_modify_and_delete() {

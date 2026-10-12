@@ -96,6 +96,24 @@ export class HostX {
   /** Pools of pixels, by descriptor: where they are in the server's memory. */
   #pools = new Map();
   /**
+   * The pools the compositor holds, by its own handle for each: what a
+   * descriptor sent on the Wayland connection became when it arrived.
+   *
+   * A descriptor is the server's name for a pool only until the server closes
+   * it, and Xwayland closes a pool's descriptor as soon as it has sent it --
+   * then the next pool it makes gets the same number. Handing the compositor
+   * the number made every buffer of the old pool resolve, at its next commit,
+   * to whichever pool had the number now. Typing into the xterm reuses its
+   * two buffers, and with both pools on one number both showed the second's
+   * memory: the window was a frame behind what it drew until something made
+   * a fresh pool (clicking off it and back on did). A cursor pool on the
+   * number was too small to hold the frame, and the commit was dropped. Over
+   * a socket `SCM_RIGHTS` gives the receiver its own descriptor for the same
+   * memory, and this is that: a handle per descriptor sent, never reused.
+   */
+  #held = new Map();
+  #nextHeld = 1;
+  /**
    * Descriptors owed to the server on its Wayland connection.
    *
    * Some events carry one: `wl_keyboard.keymap` is a length and a descriptor,
@@ -117,10 +135,17 @@ export class HostX {
   #trace = 0;
   /** Publishes so far, for the note in `#tick`. */
   #published = 0;
+  /**
+   * `?hostxcount=1`: once a second, what moved through the server -- bytes in
+   * from and out to each X client, bytes to the compositor, scenes published.
+   * Where a picture stops between a client drawing and the page composing it.
+   */
+  #count = null;
 
   async start(msg) {
     this.#channel = msg.wlChannel;
     this.#trace = msg.trace | 0;
+    if (msg.count) this.#count = { at: Date.now(), n: new Map(), polls: 0 };
     this.#token = msg.token;
     const size = outputSize(msg.wlChannel);
     this.#out = { w: size.w, h: size.h };
@@ -333,7 +358,7 @@ export class HostX {
 
   /** Where the pool this descriptor names lives, for the compositor. */
   #locate(fd, out) {
-    const pool = this.#pools.get(fd);
+    const pool = this.#held.get(fd);
     this.#hwView();
     const w = this.#hwWords;
     if (!pool) {
@@ -342,7 +367,7 @@ export class HostX {
       // healthy -- the surface is there, the commits arrive, the scene is
       // published with an address of zero.
       this.#once(`pool:${fd}`, `[hostx] descriptor ${fd} is not a pool`
-        + ` (pools: ${[...this.#pools.keys()].join(',') || 'none'})`);
+        + ` (held: ${this.#held.size})`);
       w[out >> 2] = 0;
       w[(out >> 2) + 1] = 0;
       return 0;
@@ -399,6 +424,9 @@ export class HostX {
         // reading them. So the allocation stays -- freeing it here is the one
         // way to make an X window's contents vanish mid-frame.
         self.#fds.delete(fd);
+        // The server's name for a pool goes with the descriptor; the compositor
+        // has its own (`#held`), and the memory stays (see above).
+        self.#pools.delete(fd);
         try {
           self.#x.FS.close(self.#x.FS.getStream(fd));
         } catch {
@@ -442,7 +470,12 @@ export class HostX {
       send(fd, buf, len, fds, nfds) {
         const ep = self.#fds.get(fd);
         if (!ep) return -EBADF;
-        if (ep.kind === 'kernel') return self.#k.k_sock_write(ep.id, buf, len);
+        if (ep.kind === 'kernel') {
+          const r = self.#k.k_sock_write(ep.id, buf, len);
+          if (self.#count && r > 0) self.#bump(`out${fd}`, r);
+          return r;
+        }
+        if (self.#count) self.#bump(ep.kind, len);
         if (ep.kind === 'wl' || ep.kind === 'wm') {
           // Into the compositor module's memory, which is a different address
           // space: a protocol message, never a frame.
@@ -450,7 +483,17 @@ export class HostX {
           const p = self.#hw.hw_scratch(pad + nfds * 4);
           self.#hwView().set(self.#x.HEAPU8.subarray(buf, buf + len), p);
           for (let i = 0; i < nfds; i++) {
-            self.#hwWords[((p + pad) >> 2) + i] = self.#x.HEAP32[(fds >> 2) + i];
+            // The compositor's own reference to the pool (see `#held`), not
+            // the server's descriptor number, which the server is about to
+            // close and reuse.
+            const sent = self.#x.HEAP32[(fds >> 2) + i];
+            const pool = ep.kind === 'wl' ? self.#pools.get(sent) : null;
+            let word = sent;
+            if (pool) {
+              word = self.#nextHeld++;
+              self.#held.set(word, pool);
+            }
+            self.#hwWords[((p + pad) >> 2) + i] = word;
           }
           if (nfds && self.#trace) {
             const got = [];
@@ -472,6 +515,7 @@ export class HostX {
         if (nfds) self.#x.HEAP32[nfds >> 2] = 0;
         if (ep.kind === 'kernel') {
           const n = self.#k.k_sock_read(ep.id, buf, len);
+          if (self.#count && n > 0) self.#bump(`in${fd}`, n);
           return n;
         }
         if (ep.kind === 'wl' || ep.kind === 'wm') {
@@ -583,11 +627,28 @@ export class HostX {
     this.log(`[hostx] keymap event: ${n} bytes as fd ${fd}`);
   }
 
+  /** `?hostxcount=1`: `n` more bytes under `key` this second. */
+  #bump(key, n) {
+    const m = this.#count.n;
+    m.set(key, (m.get(key) ?? 0) + n);
+  }
+
   /**
    * Between two turns of the server's loop: run the window manager, take the
    * page's input, publish the scene.
    */
   #tick() {
+    if (this.#count) {
+      const c = this.#count;
+      c.polls++;
+      if (Date.now() - c.at >= 1000) {
+        const parts = [...c.n].map(([k, v]) => `${k}=${v}`).join(' ');
+        this.log(`[hostx-count] turns=${c.polls} pub=${this.#published} ${parts}`);
+        c.n.clear();
+        c.polls = 0;
+        c.at = Date.now();
+      }
+    }
     // A hook for a harness: this is the only turn anything else gets once the
     // server's `main` has the thread. See web/test/hostx.mjs.
     globalThis.GEX_HOSTX_TICK?.();
