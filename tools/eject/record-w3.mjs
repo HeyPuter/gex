@@ -86,6 +86,7 @@ const { sessionId: page } = await browser.send('Target.attachToTarget', { target
 const units = new Map();     // key -> { path, hit }
 const processes = new Map(); // main image -> cmdline
 const modules = new Map();   // path -> content key
+const bases = new Map();     // unit key -> load base, for the images without one
 const errors = [];
 browser.on('Runtime.consoleAPICalled', (p) => {
   const t = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
@@ -97,7 +98,12 @@ browser.on('Runtime.consoleAPICalled', (p) => {
     processes.set(m[1], m[2]);
   } else if ((m = /^\[gex-record\] module (.*) (\S+)$/.exec(t))) {
     modules.set(m[1], m[2]);
-  } else if (p.type === 'error') errors.push(t.slice(0, 300));
+  } else {
+    // The page's own word for an image without a unit, with where it was
+    // loaded: a unit is built for an image at a base (gexc cgen-image --pe-base).
+    if ((m = /gex-nt: image (.*) at base (0x[0-9a-f]+): no function-tier unit \(key ([0-9a-f]{64})\)/.exec(t))) bases.set(m[3], m[2]);
+    if (p.type === 'error') errors.push(t.slice(0, 300));
+  }
 });
 browser.on('Target.attachedToTarget', async (p) => {
   const s = p.sessionId;
@@ -155,7 +161,7 @@ const session = {
       .map((m) => ({ image: m.slice(8), cmdline: null })),
   ],
   units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path })),
-  unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path })),
+  unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path, ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
 };
 writeFileSync(join(out, 'w3-session.json'), `${JSON.stringify(session, null, 2)}\n`);
