@@ -7,6 +7,7 @@
 //            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t][&hostx=1]
 //            [&cgen=2&cgenurl=/project/build/web/cgen&aot=1]   (an ejected project)
 //            [&persist=/guest/dir&persistdb=NAME]   (that directory in IndexedDB)
+//            [&compositor=0]   (no scene compositor: a canvas per window, bare-desktop.js)
 //
 // The exe may also be a Linux ELF (an i386 or x86-64 program with its
 // libraries in the bundle); `hostx=1` gives it the page's X server
@@ -19,6 +20,8 @@ import { runProgram, globalKernel } from './runtime.js';
 import { restore, persist } from './persist.js';
 
 globalThis.GEX_ARCH = 'x86';
+/** Whether this build has the scene compositor: see runtime.js. */
+const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
 const q = new URLSearchParams(location.search);
 const logEl = document.getElementById('log');
 const state = { out: '', status: null, error: null, phase: 'loading' };
@@ -165,6 +168,20 @@ async function main() {
   canvas.height = h;
   canvas.style.width = `${w}px`;
   canvas.style.height = `${h}px`;
+  // `compositor=0`, and always in a build without the scene compositor
+  // (gex-eject's `"compositor": false`): each window is its own canvas in the
+  // page, laid out by bare-desktop.js, with no WebGPU scene and no
+  // decorations (a Windows program draws its own frame).
+  const bare = !GEX_COMPOSITOR || q.get('compositor') === '0';
+  let desk = null;
+  let bareDesktop = null;
+  if (bare) {
+    desk = document.createElement('div');
+    desk.id = 'desk';
+    desk.style.cssText = `position: relative; overflow: hidden; width: ${w}px; height: ${h}px; background: #3a6ea5; outline: none;`;
+    canvas.replaceWith(desk);
+    ({ bareDesktop } = await import('./bare-desktop.js'));
+  }
   state.phase = 'fetching';
   mark('fetching');
   // `preload=URL`: the units to compile while the bundle downloads (a JSON
@@ -261,8 +278,9 @@ async function main() {
     tty: false,
     gl: gl ? 'compositor' : null,
     glBackend: q.get('glbackend') || 'wgpu',
-    wl: canvas,
-    wlInput: canvas,
+    wl: bare ? desk : canvas,
+    wlInput: bare ? desk : canvas,
+    onDesktop: bare ? (d) => { globalThis.__gexCompositor = bareDesktop(d, desk); } : null,
     hostX: q.get('hostx') === '1',
     preModules,
     // Once the kernel holds its own copy of every file, nothing here may view

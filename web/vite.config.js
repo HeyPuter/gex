@@ -21,6 +21,12 @@ export default defineConfig({
     fs: { allow: [fileURLToPath(new URL('..', import.meta.url))] },
   },
   preview: { headers: ISOLATED },
+  // gex-eject's feature selection (docs/eject.md, "Features"):
+  // GEX_FEATURES_OFF=compositor,... builds the page without them, the code
+  // behind each constant dropped from the bundle.
+  define: {
+    __GEX_COMPOSITOR__: JSON.stringify(!(process.env.GEX_FEATURES_OFF || '').split(',').includes('compositor')),
+  },
   // web/build-all.sh builds each flavour's dist from its own staged public
   // tree: GEX_PUBLIC_DIR (default public/) into GEX_OUT_DIR (default dist/).
   publicDir: process.env.GEX_PUBLIC_DIR || 'public',
