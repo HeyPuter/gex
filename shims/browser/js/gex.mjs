@@ -454,6 +454,25 @@ function isW3Program(elf) {
   return false;
 }
 
+/** The epoch every Worker's high-resolution clock shares, in nanoseconds:
+ * `performance.timeOrigin` is when this realm started, on the wall clock, so
+ * `timeOrigin + now()` reads the same in every Worker. Whole microseconds,
+ * exact in a double. */
+const ORIGIN_NS = BigInt(Math.round(performance.timeOrigin * 1000)) * 1000n;
+
+/**
+ * Nanoseconds since the Unix epoch, as the guest's clocks and deadlines read
+ * them: monotonic and fine-grained (about 5 us with cross-origin isolation),
+ * where `Date.now()` steps by a millisecond and follows the wall clock
+ * backwards. A delta-time loop saw 0 ms frames, and Wine's
+ * QueryPerformanceCounter, which sits on CLOCK_MONOTONIC, ticked by 1 ms.
+ * The same base in every Worker: park deadlines, futex timeouts and the
+ * lock-free clock calls compare one Worker's reading with another's.
+ */
+export function hostNowNs() {
+  return ORIGIN_NS + BigInt(Math.round(performance.now() * 1e6));
+}
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -462,7 +481,7 @@ export class Env {
     else console.log(text);
   }
   /** Nanoseconds since an arbitrary epoch. */
-  now() { return BigInt(Math.round(performance.now() * 1e6)); }
+  now() { return hostNowNs(); }
   /**
    * Block until everything `write` has been handed is delivered. Called just
    * before the process's exit is published. Synchronous output needs nothing.
