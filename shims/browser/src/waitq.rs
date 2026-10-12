@@ -55,8 +55,6 @@ pub(crate) struct MyWait {
     /// The thread's own deadline, and what its descriptors become ready at
     /// by the clock alone (a timerfd).
     soonest: Option<u64>,
-    /// `LOCAL_SIGNALS` as the last locked turn saw it.
-    local_sig: u32,
 }
 
 /// This Worker's slot. The slot is the Worker's kernel stack's number, so
@@ -186,7 +184,6 @@ pub(crate) fn enter(h: &mut Host, i: usize, why: u8, all_blocked: bool, ends_by_
     }
     let now = now_ns();
     publish_timer(h);
-    let local_sig = LOCAL_SIGNALS.load(std::sync::atomic::Ordering::Acquire);
     let t = &h.threads[i];
     let fresh = WAIT.with(|w| {
         let mut w = w.borrow_mut();
@@ -194,7 +191,6 @@ pub(crate) fn enter(h: &mut Host, i: usize, why: u8, all_blocked: bool, ends_by_
             m.why = why;
             m.all_blocked = all_blocked;
             m.ends_by_itself = ends_by_itself;
-            m.local_sig = local_sig;
             return false;
         }
         if let Some(old) = w.take() {
@@ -214,7 +210,6 @@ pub(crate) fn enter(h: &mut Host, i: usize, why: u8, all_blocked: bool, ends_by_
             all_blocked,
             ends_by_itself,
             soonest,
-            local_sig,
         });
         true
     });
@@ -273,13 +268,11 @@ pub(crate) fn idle_turn() -> Option<(u8, bool)> {
         if crate::wl::pump_wanted() {
             return None;
         }
-        // A signal for this process, from another (`kill`), from one of its
-        // own threads (`tgkill`), or from its timer: asked under the lock,
-        // where the signal state is.
-        if LOCAL_SIGNALS.load(std::sync::atomic::Ordering::Acquire) != m.local_sig
-            || unsafe { k_has_signals(my_pid()) } != 0
-            || TIMER_AT.load(std::sync::atomic::Ordering::Relaxed) <= now_ns()
-        {
+        // A signal for this thread, from another process (`kill`), from
+        // one of its own threads (`tgkill`), or from its timer, that would
+        // do something: asked of the signal state itself (`sigs`). Ending
+        // the wait is the locked turn's.
+        if crate::sigs::ready() {
             return None;
         }
         if wait_ready(&m.waiting, &m.blocked_on, now_ns(), false) {

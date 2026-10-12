@@ -2626,9 +2626,8 @@ fn exec_program(
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
     // And the handlers, which are addresses in the image being replaced.
-    kernel.signals.exec();
     // Every other thread is gone; their signal state with them.
-    kernel.thread_signals.clear();
+    kernel.exec_signals();
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).

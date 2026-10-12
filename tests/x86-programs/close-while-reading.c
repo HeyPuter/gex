@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -42,12 +43,13 @@ static void nap_ms(int ms) {
 /* -- files ---------------------------------------------------------------- */
 
 #define TARGET 100
-static atomic_int stop;
+static atomic_int stop, readers_up;
 static atomic_long reads_ok, reads_badf, bad;
 
 static void *file_reader(void *arg) {
     (void)arg;
     char buf[64];
+    atomic_fetch_add(&readers_up, 1);
     while (!atomic_load(&stop)) {
         ssize_t r = pread(TARGET, buf, sizeof buf, 0);
         if (r > 0) {
@@ -84,7 +86,12 @@ static const char *files(void) {
     if (dup2(fa, TARGET) != TARGET) return "dup2 failed";
     pthread_t t[4];
     for (int i = 0; i < 4; i++) pthread_create(&t[i], 0, file_reader, 0);
-    for (int i = 0; i < 3000; i++) {
+    /* The readers running before the closing starts (a page starts a
+     * thread's Worker in its own time), and the closing going on until at
+     * least one read got through: 3000 rounds could otherwise all pass
+     * before a reader's first read. */
+    while (atomic_load(&readers_up) < 4) sched_yield();
+    for (int i = 0; i < 3000 || (atomic_load(&reads_ok) == 0 && i < 3000000); i++) {
         close(TARGET);
         if (dup2(i & 1 ? fa : fb, TARGET) != TARGET) atomic_fetch_add(&bad, 1);
         if (i % 3 == 0) {

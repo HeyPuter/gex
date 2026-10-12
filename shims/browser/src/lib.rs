@@ -47,6 +47,7 @@ mod cgen;
 mod dense;
 mod fjit;
 mod waitq;
+mod sigs;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -3039,6 +3040,9 @@ fn set_host(host: Host) {
             .as_mut()
             .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable);
         FDS.store(fds, std::sync::atomic::Ordering::Release);
+        if let Some(h) = h.borrow_mut().as_mut() {
+            publish_signals(h);
+        }
     });
 }
 
@@ -3060,6 +3064,20 @@ fn set_host(host: Host) {
             .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable)
     };
     FDS.store(fds, std::sync::atomic::Ordering::Release);
+    // SAFETY: as above.
+    if let Some(h) = unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut() } {
+        publish_signals(h);
+    }
+}
+
+/// The new process's signal state, for the checks and deliveries that take
+/// no kernel lock (`sigs`), and its one thread as the one this Worker runs.
+fn publish_signals(h: &mut Host) {
+    sigs::publish(&h.kernel);
+    if let Some(t) = h.threads.first() {
+        let tid = t.kstate.tid;
+        sigs::bind(&mut h.kernel, tid);
+    }
 }
 
 /// Whether this Worker has a kernel yet.
@@ -5884,35 +5902,11 @@ const SIGNAL_ENDS_WAIT: bool = true;
 /// flipped while bisecting the hottest path; asked once, the answer was no.
 const SAFEPOINT_SIGNALS: bool = true;
 
-/// The global signal counter as this Worker last saw it at a safepoint. See the
-/// two-step check in `gex_safepoint`.
-// Per Worker: set on the way into a trap or a check and read back by the
-// same Worker (see `CTX_ADDR` for what a process-wide one did).
 thread_local! {
-    static SIGNAL_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-    /// Safepoints since this Worker last asked under the lock; see `SWEEP_EVERY`.
-    static SAFEPOINT_SWEEP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// `LOCAL_SIGNALS` as this Worker last saw it at a safepoint.
-    static LOCAL_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Where a handler frame a safepoint built (`sigs::deliver`) starts,
+    /// for the next `schedule` to resume this Worker's thread at.
+    static HANDLER_AT: Cell<Option<u64>> = const { Cell::new(None) };
 }
-
-/// Kill-family syscalls this process has made: a `tgkill` to one of its own
-/// threads raises the signal in this process's kernel, which the global
-/// counter never sees. Per process, as `TIMERS_ARMED`.
-static LOCAL_SIGNALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Whether this process has an interval timer armed, as its last syscall left
-/// it (`alarm` and `setitimer` are syscalls). Per process: the shim's data is
-/// the process's. A safepoint asks the kernel about a due timer only while
-/// this is set.
-static TIMERS_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// A safepoint with no hint of a signal (the global counter unmoved, no timer
-/// armed) still asks under the lock every this many: what the hints do not
-/// see -- a signal raised in this process some other way than a syscall, a
-/// timer an `exec` kept -- is late by at most this many back-edge polls, not
-/// lost.
-const SWEEP_EVERY: u32 = 64;
 
 /// Whether the page, rather than another Worker, is what ends this wait.
 ///
@@ -6736,12 +6730,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             let canon = h.kernel.syscall_nr;
             let is_kill = matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL);
             let sig = if canon == knr::TGKILL { a2 } else { a1 };
-            // A signal for a thread of this process is raised here, not in
-            // the global kernel, so the global counter does not move: this
-            // one tells the other threads' safepoints to look.
+            // A signal for a thread of this process is raised here, on that
+            // thread's own pending word, which its safepoints read (`sigs`);
+            // the thread may be parked in another Worker.
             if is_kill {
-                LOCAL_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::Release);
-                // The thread it is for may be parked in another Worker.
                 waitq::wake_process();
             }
             if is_kill && sig == 6 {
@@ -7172,7 +7164,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // own after every syscall.
         retire_unmapped_code_in(h);
         mapped = std::mem::take(&mut h.kernel.new_code);
-        TIMERS_ARMED.store(h.kernel.timers_armed(), std::sync::atomic::Ordering::Relaxed);
         waitq::publish_timer(h);
         stop
     });
@@ -8155,10 +8146,14 @@ fn cur() -> usize {
     CURRENT.with(|c| c.get())
 }
 
-/// Run thread `i` from here on. `h` is not read; it is taken to keep every
-/// caller honest about holding the kernel when it switches threads.
-fn set_current(_h: &mut Host, i: usize) {
+/// Run thread `i` from here on, its signal state this Worker's (`sigs`).
+/// Under the kernel lock, which `h` keeps every caller honest about.
+fn set_current(h: &mut Host, i: usize) {
     CURRENT.with(|c| c.set(i));
+    if let Some(t) = h.threads.get(i) {
+        let tid = t.kstate.tid;
+        sigs::bind(&mut h.kernel, tid);
+    }
 }
 
 /// A thread `clone` has made that the host has not made a Worker for:
@@ -8604,8 +8599,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     };
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
-    h.kernel.signals.exec();
-    h.kernel.thread_signals.clear();
+    h.kernel.exec_signals();
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its
@@ -8708,7 +8702,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
     // Signal handlers do not survive an exec; the mask does.
-    h.kernel.signals = gex_kernel::signal::Signals::new();
+    h.kernel.signals.reset();
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
@@ -10507,6 +10501,12 @@ fn schedule() -> i32 {
         // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
         let pick = with_host(|h| {
+            // A handler frame a safepoint built, without the kernel: this
+            // thread runs on at the handler.
+            if let Some(target) = HANDLER_AT.with(|c| c.take()) {
+                h.threads[cur()].pc = target;
+                h.threads[cur()].waiting = Waiting::Runnable;
+            }
             // Only when it has anything to move (`needs_pump`): most turns it
             // has not. What it writes to a client's socket (a frame callback,
             // a buffer release, input) notifies the socket's waiters -- Wine's
@@ -11825,101 +11825,57 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // A signal, if one is pending: without this a signal was only noticed
     // leaving a syscall, so a loop with no syscall (`while :; do :; done`)
     // could not be `^C`'d.
-    if SAFEPOINT_SIGNALS {
-    // Two steps, because this runs once per thousand back edges in every Worker.
-    // `k_signal_seq` is one relaxed load every `kill` bumps; the table walk
-    // behind its lock is asked only when that counter moved.
-    let sent = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
-    // Or an interval timer that has expired: `alarm`/`setitimer` become a
-    // signal only when the kernel checks them, which `deliver_pending` does --
-    // so a due timer has to count as "something to deliver" here, or a
-    // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
-    //
-    // Asking about this process's own pending signals and timers took the
-    // kernel's lock at every safepoint, twice: about 35,000 takes a second
-    // in Undertale's process, the most of any site (docs/kernel-locking.md,
-    // step 3). The lock is taken now only on a hint: the counter moved, a
-    // timer is armed (`TIMERS_ARMED`), this process signalled itself
-    // (`LOCAL_SIGNALS`), or the periodic sweep.
-    let local = LOCAL_SIGNALS.load(std::sync::atomic::Ordering::Acquire);
-    let moved = (SIGNAL_SEEN.with(|c| c.replace(sent)) != sent)
-        | (LOCAL_SEEN.with(|c| c.replace(local)) != local);
-    let sweep = SAFEPOINT_SWEEP.with(|c| {
-        let n = c.get().wrapping_add(1);
-        c.set(n);
-        n.is_multiple_of(SWEEP_EVERY)
-    });
-    let hinted = moved || sweep || TIMERS_ARMED.load(std::sync::atomic::Ordering::Relaxed);
-    // A thread table with this thread in it: a safepoint can fire in a child
-    // still being built, where an empty table would panic.
-    //
-    // And asked about *this* thread: `signals` is whichever thread last
-    // entered the kernel, so a `pthread_kill` to a thread spinning in its own
-    // code sat in `thread_signals` unseen, and a join on it never returned.
-    if hinted
-        && with_host(|h| match h.threads.get(cur()).map(|t| t.kstate.tid) {
-            Some(tid) => h.kernel.signal_pending_for(tid),
-            None => false,
-        })
-    {
-        let delivered = with_host(|h| {
-            let a = h.threads[cur()].kstate.ctx_addr;
-            let mut gm = GuestMem::new(guest_bytes());
-            // The context pc must be exact before a handler frame is built on
-            // it: the frame records where to return, and a branch stores no pc.
-            let _ = gm.write_u64(a + ctx::PC as u64, pc as u64);
-            h.threads[cur()].pc = pc as u64;
-            h.kernel.enter_thread(&h.threads[cur()].kstate);
-            let d = h.kernel.deliver_pending(&mut gm);
-            // Which signals a process actually takes, capped. A signal that
-            // should never have been sent looks like a program misbehaving:
-            // xterm tearing down a live session, a shell exiting for no reason.
-            // Where it came from is in `k_last_kill`.
-            if !matches!(d, gex_kernel::signal::Delivery::None) {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static SAID: AtomicU32 = AtomicU32::new(0);
-                if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
-                    let last = if unsafe { k_present() } != 0 {
-                        let v = unsafe { k_last_kill() };
-                        format!(
-                            " (last sent: {} from pid {} to {})",
-                            v & 0xff,
-                            (v >> 40) as i32,
-                            ((v >> 8) & 0xffff_ffff) as i32
-                        )
-                    } else {
-                        String::new()
-                    };
-                    warn_line(&format!(
-                        "[sig] pid {} takes a signal{last}\n",
-                        h.kernel.pid
-                    ));
+    // A signal, asked about and delivered without the kernel lock (`sigs`):
+    // this Worker's own thread's pending word and mask, its process's
+    // shared word, dispositions and timers, and the inbox other processes
+    // fill, collected when anyone has sent anything since this Worker last
+    // looked.
+    if SAFEPOINT_SIGNALS && sigs::ready() {
+        let ctx_addr = ctx as u32 as u64;
+        let mut gm = GuestMem::new(guest_bytes());
+        // The context pc must be exact before a handler frame is built on
+        // it: the frame records where to return, and a branch stores no pc.
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc as u64);
+        let d = sigs::deliver(&mut gm, ctx_addr);
+        // Which signals a process actually takes, capped. A signal that
+        // should never have been sent looks like a program misbehaving:
+        // xterm tearing down a live session, a shell exiting for no reason.
+        // Where it came from is in `k_last_kill`.
+        if !matches!(d, gex_kernel::signal::Delivery::None) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SAID: AtomicU32 = AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                let last = if unsafe { k_present() } != 0 {
+                    let v = unsafe { k_last_kill() };
+                    format!(
+                        " (last sent: {} from pid {} to {})",
+                        v & 0xff,
+                        (v >> 40) as i32,
+                        ((v >> 8) & 0xffff_ffff) as i32
+                    )
+                } else {
+                    String::new()
+                };
+                warn_line(&format!("[sig] pid {} takes a signal{last}\n", my_pid()));
+            }
+        }
+        match d {
+            gex_kernel::signal::Delivery::None => {}
+            // Where the handler starts, left for `schedule` to turn into a
+            // resume (`HANDLER_AT`): setting resume state here skips the
+            // wake bookkeeping and thread choice at the top of `schedule`.
+            gex_kernel::signal::Delivery::Resume(target) => {
+                HANDLER_AT.with(|c| c.set(Some(target)));
+                if schedule() != 0 {
+                    trap();
                 }
             }
-            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
-            match d {
-                gex_kernel::signal::Delivery::None => 0,
-                // Where the handler starts, left for `schedule` to turn into a
-                // resume: setting resume state here skips the wake bookkeeping
-                // and thread choice at the top of `schedule`.
-                gex_kernel::signal::Delivery::Resume(target) => {
-                    h.threads[cur()].pc = target;
-                    h.threads[cur()].waiting = Waiting::Runnable;
-                    1
-                }
-                gex_kernel::signal::Delivery::Terminate { signal, .. } => {
-                    exit_process(h, -(signal as i32));
-                    2
-                }
+            // The process ends, which is the kernel's.
+            gex_kernel::signal::Delivery::Terminate { signal, .. } => {
+                with_host(|h| exit_process(h, -(signal as i32)));
+                trap();
             }
-        });
-        if delivered == 1 && schedule() != 0 {
-            trap();
         }
-        if delivered == 2 {
-            trap();
-        }
-    }
     }
     // Preemption is the engine's job now: there is no other thread here to hand
     // the stack to, since each is a Worker already running.

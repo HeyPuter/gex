@@ -385,13 +385,28 @@ same box.
     13.65 s for B): the cold process's lifting was never the critical path's
     lock wait, only its own. Undertale tier-1 on worldmachine, 200 s, last
     120 s: 21.9-22.9 fps against 22.3-22.5 for step 4.
-  - **Known failure, for step 8:** `tests/x86-programs/thread-signals` in
-    the page tier (x86-64, mem64 seed; not in the default `PAGE_PROGRAMS`)
-    prints "blocked thread took it while blocked: yes" and "still pending
-    in the blocked thread: no": a `pthread_kill` to a thread blocking every
-    signal runs the handler on it. It fails the same way on a tree without
-    steps 3-5 (integ-1012b, 2026-10-12), so it predates them. Native tiers
-    pass.
+  - **Step 8, the thread-signals "failure"** was the test's: it slept
+    100 ms for its two threads to reach their condition-variable wait, and
+    a page starts a thread's Worker later than that, so the blocker took the
+    signal meant for it before it had blocked anything. It now waits for
+    both under the mutex, and is in `PAGE_PROGRAMS` with `signal-storm`.
+  - **Step 8, signal words (as built):** `Signals` is two `Arc`s, the
+    process's `ProcSig` (dispositions behind an `RwLock`, the shared
+    pending word, the interval timers with their earliest deadline as an
+    atomic) and the running thread's `ThreadSig` (pending and mask as
+    atomic words, sources and handler state behind small mutexes). Which
+    thread runs is a pointer swap, not a copy in and out. Each page Worker
+    holds its own thread's `ThreadSig` (`sigs`), so a safepoint asks
+    whether a signal would do something, collects the inbox (when the
+    proc table's signal sequence moved, which is now bumped after the bit
+    is set) and fires due timers, and builds the handler frame, with no
+    kernel lock and no hints: the global and local signal counters, the
+    timer flag and the every-64th sweep are gone. A delivery claims its
+    signal with one atomic `fetch_and` before building the frame, so two
+    threads never take one process-directed signal; collecting raises each
+    signal once, with its sender, for the same reason. The thread table
+    (a resume after a handler frame) and process exit stay the kernel's
+    until §3.7 and step 9.
   - **Known failure, native, not KLock's:** `gexc run --fjit` livelocks
     ("retranslation livelock") once a page of a long direct-jump chain is
     retired under it, as `tests/x86-programs/retire-during-lift` does

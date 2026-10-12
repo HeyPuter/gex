@@ -1615,7 +1615,6 @@ pub extern "C" fn k_has_children(ppid: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     if signo != 0 {
-        note_signal();
         note_kill(caller, target, signo);
     }
     match procs().kill(caller, target, signo) {
@@ -1623,13 +1622,6 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
         Err(e) => -(e.0 as i32),
     }
 }
-
-/// How many signals have been *sent* to anyone, ever. A safepoint fires once per
-/// thousand back edges in every Worker at once, so it cannot take this module's
-/// lock and walk every process each time; one relaxed load of this counter says
-/// "has anybody sent anything since I last looked", and only a change pays for
-/// the real check.
-static SIGNAL_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// The last signal this kernel handed to anyone: caller, target, number.
 ///
@@ -1664,14 +1656,16 @@ pub extern "C" fn k_last_kill() -> u64 {
         | (signo as u64 & 0xff)
 }
 
-fn note_signal() {
-    SIGNAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
 
-/// The counter above, for a safepoint to compare against what it last saw.
+/// How many signals have been left in any process's inbox, ever
+/// (`gex_kernel::proc::signal_seq`, moved once the bit is set). A safepoint
+/// fires once per thousand back edges in every Worker at once, so it cannot
+/// take this module's lock and walk every process each time; one load of this
+/// counter says "has anybody sent anything since I last looked", and only a
+/// change pays for collecting.
 #[no_mangle]
 pub extern "C" fn k_signal_seq() -> i32 {
-    SIGNAL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+    gex_kernel::proc::signal_seq() as i32
 }
 
 /// Signal every process in a group, naming the group positively. `k_kill`
@@ -1680,9 +1674,6 @@ pub extern "C" fn k_signal_seq() -> i32 {
 #[no_mangle]
 pub extern "C" fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
     note_kill(caller, -pgid, signo);
-    if signo != 0 {
-        note_signal();
-    }
     match procs().kill_group(caller, pgid, signo) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),

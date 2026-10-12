@@ -488,8 +488,6 @@ pub struct Kernel {
     pub ppid: i32,
     /// How to read the wall clock.
     pub clock: ClockFn,
-    /// The interval timers, indexed by `which`. See [`Kernel::check_timers`].
-    pub itimers: [Option<Itimer>; 3],
     /// An `accept` that waited, and the arguments to finish it with.
     ///
     /// A blocking operation is performed by the host with the kernel
@@ -635,7 +633,7 @@ pub struct Kernel {
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
-    pub thread_signals: std::collections::HashMap<i32, crate::signal::ThreadSignals>,
+    pub thread_signals: std::collections::HashMap<i32, Arc<crate::signal::ThreadSig>>,
     /// The thread whose part `signals` holds now.
     pub sig_tid: i32,
     /// Every other thread's half-finished blocking call (`PendingCall`),
@@ -705,18 +703,7 @@ pub struct Kernel {
     pub tty: Arc<crate::tty::TtyRef>,
 }
 
-/// One armed interval timer.
-///
-/// Times are absolute nanoseconds on the same clock the guest reads, because
-/// a deadline compared against a clock that can be replaced per host has to
-/// be in that clock's terms.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Itimer {
-    /// When it next fires.
-    pub next: u128,
-    /// What to reload on firing. Zero is a one-shot timer, which disarms.
-    pub interval: u128,
-}
+pub use crate::signal::Itimer;
 
 /// The three interval timers, in the order `which` names them.
 /// Resource limits (prlimit64): Linux's numbering and its defaults for a
@@ -1644,10 +1631,9 @@ impl Kernel {
         // thread it has, whatever its tid: the first thread in adopts it.
         if self.sig_tid == 0 {
             self.sig_tid = tid;
+            self.thread_signals.insert(tid, Arc::clone(self.signals.thread()));
             return;
         }
-        let saved = self.signals.save_thread();
-        self.thread_signals.insert(self.sig_tid, saved);
         let call = PendingCall {
             retry_accept: self.retry_accept.take(),
             write_blocked: std::mem::take(&mut self.write_blocked),
@@ -1664,12 +1650,45 @@ impl Kernel {
         self.retry_recvmsg = call.retry_recvmsg;
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
+        let blocked = self.signals.blocked();
         let next = self
             .thread_signals
-            .remove(&tid)
-            .unwrap_or_else(|| crate::signal::ThreadSignals::new_thread(self.signals.blocked));
-        self.signals.load_thread(next);
+            .entry(tid)
+            .or_insert_with(|| Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
+        self.signals.switch_to(Arc::clone(next));
         self.sig_tid = tid;
+    }
+
+    /// Thread `tid`'s signal state, for a host that asks about it or
+    /// delivers to it without the kernel ([`signal::ThreadSig`]). The first
+    /// thread to ask of a new kernel adopts the state it holds, as
+    /// [`Self::switch_signals`] does.
+    pub fn thread_sig(&mut self, tid: i32) -> Arc<signal::ThreadSig> {
+        if self.sig_tid == 0 {
+            self.sig_tid = tid;
+        }
+        if tid == self.sig_tid {
+            let cur = Arc::clone(self.signals.thread());
+            self.thread_signals.entry(tid).or_insert_with(|| Arc::clone(&cur));
+            return cur;
+        }
+        let blocked = self.signals.blocked();
+        Arc::clone(
+            self.thread_signals
+                .entry(tid)
+                .or_insert_with(|| Arc::new(signal::ThreadSig::new_thread(blocked))),
+        )
+    }
+
+    /// The signal state after `execve` ([`Signals::exec`]): the other
+    /// threads are gone, and their state with them.
+    pub fn exec_signals(&mut self) {
+        self.signals.exec();
+        let cur = Arc::clone(self.signals.thread());
+        self.thread_signals.clear();
+        if self.sig_tid != 0 {
+            self.thread_signals.insert(self.sig_tid, cur);
+        }
     }
 
     /// Whether a signal is ready for thread `tid` (the host's wait loops ask
@@ -1687,7 +1706,7 @@ impl Kernel {
             return self.signals.would_deliver();
         }
         match self.thread_signals.get(&tid) {
-            Some(t) => t.would_deliver(&self.signals),
+            Some(t) => t.ready(self.signals.process()),
             None => self.signals.would_deliver(),
         }
     }
@@ -1740,7 +1759,6 @@ impl Kernel {
             ptys: None,
             ppid: 0,
             clock: system_clock,
-            itimers: [None; 3],
             retry_accept: None,
             write_blocked: false,
             retry_recvmsg: None,
@@ -1986,7 +2004,6 @@ impl Kernel {
             ppid: self.pid,
             clock: self.clock,
             // A fork does not inherit its parent's timers.
-            itimers: [None; 3],
             retry_accept: None,
             write_blocked: false,
             retry_recvmsg: None,
@@ -2102,7 +2119,7 @@ impl Kernel {
         }
         self.live_threads += 1;
         // The new thread's signal state: its creator's mask, nothing pending.
-        self.thread_signals.insert(tid, crate::signal::ThreadSignals::new_thread(self.signals.blocked));
+        self.thread_signals.insert(tid, Arc::new(crate::signal::ThreadSig::new_thread(self.signals.blocked())));
         Ok(SpawnRequest {
             ctx_addr: child,
             tid,
@@ -2209,7 +2226,7 @@ impl Kernel {
                 &mut a,
                 m,
                 self.ctx_addr + ctx::SCRATCH as u64,
-                self.signals.blocked,
+                self.signals.blocked(),
             )
         } else {
             raw
@@ -2226,7 +2243,7 @@ impl Kernel {
                     if self.trace {
                         eprintln!(
                             "[gex:{}.{}] rt_sigreturn -> 0x{pc:x}, blocked {:#x}",
-                            self.pid, self.tid, self.signals.blocked
+                            self.pid, self.tid, self.signals.blocked()
                         );
                     }
                     // The restored context is in ctx, PC included.
@@ -2611,11 +2628,11 @@ impl Kernel {
             // 1.6 million syscalls' worth, until the child ended by itself.
             nr::RT_SIGSUSPEND => {
                 let want = m.read_bits64(a[0]).ok()?;
-                let restore_mask = self.signals.blocked;
+                let restore_mask = self.signals.blocked();
                 // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
                 // anywhere else.
                 const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
-                self.signals.blocked = want & !UNBLOCKABLE;
+                self.signals.set_blocked(want & !UNBLOCKABLE);
                 self.restore_sigmask = Some(restore_mask);
                 Some(BlockOp::SigSuspend { restore_mask })
             }
@@ -3044,12 +3061,12 @@ impl Kernel {
         let ret = encode(r);
         let _ = set_result(m, self.ctx_addr, ret);
         if let Some(mask) = suspended {
-            self.signals.suspend_restore = Some(mask);
+            self.signals.set_suspend_restore(Some(mask));
         }
         let delivery = self.deliver_pending(m);
         // Nothing was delivered, so no frame took the mask: put it back here.
-        if let Some(mask) = self.signals.suspend_restore.take() {
-            self.signals.blocked = mask;
+        if let Some(mask) = self.signals.take_suspend_restore() {
+            self.signals.set_blocked(mask);
         }
         if self.trace {
             eprintln!(
@@ -3058,7 +3075,7 @@ impl Kernel {
                 self.tid,
                 delivery,
                 self.signals.pending_raw(),
-                self.signals.blocked
+                self.signals.blocked()
             );
         }
         match delivery {
@@ -3679,20 +3696,21 @@ impl Kernel {
         const SIG_UNBLOCK: u32 = 1;
         const SIG_SETMASK: u32 = 2;
         if old != 0 {
-            m.write_bits64(old, self.signals.blocked)?;
+            m.write_bits64(old, self.signals.blocked())?;
         }
         if set != 0 {
             let mask = m.read_bits64(set)?;
-            self.signals.blocked = match how {
-                SIG_BLOCK => self.signals.blocked | mask,
-                SIG_UNBLOCK => self.signals.blocked & !mask,
+            let blocked = self.signals.blocked();
+            let blocked = match how {
+                SIG_BLOCK => blocked | mask,
+                SIG_UNBLOCK => blocked & !mask,
                 SIG_SETMASK => mask,
                 _ => return Err(Errno::EINVAL),
             };
             // Neither of these can ever be blocked.
             let unblockable =
                 (1u64 << (signal::sig::SIGKILL - 1)) | (1u64 << (signal::sig::SIGSTOP - 1));
-            self.signals.blocked &= !unblockable;
+            self.signals.set_blocked(blocked & !unblockable);
         }
         Ok(0)
     }
@@ -3700,7 +3718,7 @@ impl Kernel {
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
         // The 32-bit stack_t is { u32 sp; i32 flags; u32 size }.
         if old != 0 {
-            let a = self.signals.alt_stack;
+            let a = self.signals.alt_stack();
             if self.compat {
                 m.write_u32(old, a.sp as u32)?;
                 m.write_u32(old + 4, a.flags)?;
@@ -3712,7 +3730,7 @@ impl Kernel {
             }
         }
         if new != 0 {
-            self.signals.alt_stack = if self.compat {
+            self.signals.set_alt_stack(if self.compat {
                 SigAltStack {
                     sp: m.read_u32(new)? as u64,
                     flags: m.read_u32(new + 4)?,
@@ -3724,7 +3742,7 @@ impl Kernel {
                     flags: m.read_u32(new + 8)?,
                     size: m.read_u64(new + 16)?,
                 }
-            };
+            });
         }
         Ok(0)
     }
@@ -3747,7 +3765,7 @@ impl Kernel {
                 self.sig_tid,
                 self.signals.peek_deliverable().unwrap_or(0),
                 self.signals.pending_raw(),
-                self.signals.blocked
+                self.signals.blocked()
             );
         }
         signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
@@ -3759,20 +3777,11 @@ impl Kernel {
     /// -- so it leaves the signal on a shared per-process word and the target
     /// picks it up here. This is what makes `timeout`, job control and every
     /// supervisor work.
-    pub fn collect_signals(&mut self) {
-        let inbox = self.procs.take_signals(self.pid);
-        if inbox == 0 {
-            return;
-        }
-        if self.trace {
+    pub fn collect_signals(&self) {
+        let inbox = self.signals.process().collect(&self.procs, self.pid, self.uid);
+        if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
         }
-        for signo in 1..=64u32 {
-            if inbox & (1u64 << (signo - 1)) != 0 {
-                self.signals.raise_shared(signo, None);
-            }
-        }
-        self.note_kill_senders(inbox);
     }
 
     /// Whether anything is waiting to be delivered, counting what other
@@ -3791,7 +3800,7 @@ impl Kernel {
                 self.pid,
                 self.sig_tid,
                 self.signals.pending_raw(),
-                self.signals.blocked
+                self.signals.blocked()
             );
         }
         ready
@@ -3810,7 +3819,7 @@ impl Kernel {
         fault_address: u64,
     ) -> Delivery {
         let action = self.signals.action(signo);
-        let blocked = self.signals.blocked & (1u64 << (signo - 1)) != 0;
+        let blocked = self.signals.blocked() & (1u64 << (signo - 1)) != 0;
         // A synchronous fault that is blocked or ignored is fatal, because
         // returning would re-execute the faulting instruction forever.
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN || blocked {
@@ -5612,7 +5621,7 @@ impl Kernel {
         let now = self.now_nanos();
         // What is left, which both calls may be asked to report.
         if old != 0 {
-            let (interval, remaining) = match self.itimers[which] {
+            let (interval, remaining) = match self.signals.process().timer(which) {
                 Some(t) => (t.interval, t.next.saturating_sub(now)),
                 None => (0, 0),
             };
@@ -5628,14 +5637,17 @@ impl Kernel {
         let interval = read_timeval(m, new)?;
         let value = read_timeval(m, new + 16)?;
         // A zero `it_value` disarms, whatever the interval says.
-        self.itimers[which] = if value == 0 {
-            None
-        } else {
-            Some(Itimer {
-                next: now + value,
-                interval,
-            })
-        };
+        self.signals.process().set_timer(
+            which,
+            if value == 0 {
+                None
+            } else {
+                Some(Itimer {
+                    next: now + value,
+                    interval,
+                })
+            },
+        );
         Ok(0)
     }
 
@@ -5659,21 +5671,16 @@ impl Kernel {
         !(read && file.handle.read_frees_nothing())
     }
 
-    /// Whether any interval timer is armed: the hint a safepoint reads,
-    /// without the kernel's lock, before asking [`Kernel::timer_due`] under it.
+    /// Whether any interval timer is armed.
     pub fn timers_armed(&self) -> bool {
-        self.itimers.iter().any(|t| t.is_some())
+        self.signals.process().timers_armed()
     }
 
     /// How long until the next interval timer fires, if one is armed: a
     /// parked thread's host sleeps no longer than that, since the timer's
     /// signal may be what ends its wait.
     pub fn timer_in_ns(&self) -> Option<u64> {
-        if self.itimers.iter().all(|t| t.is_none()) {
-            return None;
-        }
-        let now = self.now_nanos();
-        self.itimers.iter().flatten().map(|t| t.next.saturating_sub(now).min(u64::MAX as u128) as u64).min()
+        self.signals.process().timer_in_ns(self.now_nanos())
     }
 
     /// Whether an interval timer has expired and has yet to raise its signal.
@@ -5681,52 +5688,15 @@ impl Kernel {
     /// the kernel (a shell's `timeout` spinning on `wait4`/`sigsuspend`) would
     /// otherwise never have its `alarm` delivered, because delivery is only
     /// attempted once a signal is already pending.
-    pub fn timer_due(&mut self) -> bool {
-        if self.itimers.iter().all(|t| t.is_none()) {
-            return false;
-        }
-        let now = self.now_nanos();
-        self.itimers.iter().flatten().any(|t| now >= t.next)
+    pub fn timer_due(&self) -> bool {
+        self.signals.process().timer_due(self.now_nanos())
     }
 
-    /// Fire any timer whose deadline has passed, and reload it if it repeats.
-    ///
-    /// Called at every back-edge safepoint -- so a timer does not fire while
-    /// the guest is blocked in the host (no back-edges until the call
-    /// returns). `ITIMER_VIRTUAL`/`ITIMER_PROF` should count CPU time but are
-    /// driven from the same wall clock as the rest.
-    pub fn check_timers(&mut self) {
-        if self.itimers.iter().all(|t| t.is_none()) {
-            return;
-        }
-        let now = self.now_nanos();
-        for which in 0..3 {
-            let Some(timer) = self.itimers[which] else {
-                continue;
-            };
-            if now < timer.next {
-                continue;
-            }
-            self.itimers[which] = if timer.interval == 0 {
-                None
-            } else {
-                // Skip whole missed periods rather than firing once per
-                // period afterwards: a guest that was away for a second with
-                // a millisecond timer does not want a thousand signals.
-                let missed = (now - timer.next) / timer.interval + 1;
-                Some(Itimer {
-                    next: timer.next + missed * timer.interval,
-                    interval: timer.interval,
-                })
-            };
-            self.signals.raise_shared(
-                match which {
-                    ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
-                    ITIMER_PROF => signal::sig::SIGPROF,
-                    _ => signal::sig::SIGALRM,
-                },
-                None,
-            );
+    /// Fire any timer whose deadline has passed, and reload it if it repeats
+    /// ([`signal::ProcSig::fire_timers`]).
+    pub fn check_timers(&self) {
+        if self.signals.process().timers_armed() {
+            self.signals.process().fire_timers(self.now_nanos());
         }
     }
 
@@ -5764,7 +5734,7 @@ impl Kernel {
                 self.signals.raise_from(signo, source);
             }
         } else {
-            let Some(t) = self.thread_signals.get_mut(&tid) else { return Err(Errno::ESRCH) };
+            let Some(t) = self.thread_signals.get(&tid) else { return Err(Errno::ESRCH) };
             if signo > 0 {
                 t.raise_from(signo, source);
             }
@@ -6079,25 +6049,7 @@ impl Kernel {
         if !self.procs.has_signals(self.pid) {
             return;
         }
-        let taken = self.procs.take_signals(self.pid);
-        let mut sent = taken;
-        while sent != 0 {
-            let signo = sent.trailing_zeros() + 1;
-            sent &= sent - 1;
-            self.signals.raise_shared(signo, None);
-        }
-        self.note_kill_senders(taken);
-    }
-
-    /// Of the signals just taken from the process table, mark those `kill`
-    /// sent as from their sender (`SI_USER`, `si_pid`), not the kernel.
-    fn note_kill_senders(&mut self, taken: u64) {
-        for (signo, pid) in self.procs.take_kill_senders(self.pid, taken) {
-            self.signals.raise_shared(
-                signo,
-                Some(crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid }),
-            );
-        }
+        self.signals.process().collect(&self.procs, self.pid, self.uid);
     }
 
     /// `getresuid` and `getresgid`: real, effective and saved, all the same

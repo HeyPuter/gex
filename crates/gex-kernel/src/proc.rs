@@ -9,7 +9,7 @@
 //! Not modelled: controlling terminals, orphaned-process-group handling, and
 //! session keyrings. A guest that asks gets plausible answers, not Linux's.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 /// The signal a parent is owed when a child ends.
 const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
@@ -98,6 +98,19 @@ struct Proc {
 struct Table {
     next_pid: i32,
     procs: Vec<Proc>,
+}
+
+/// Moved after every signal left in a process's inbox (`kill`, a group's
+/// signal, a child's SIGCHLD), once the bit is set: a thread that saw it
+/// unmoved has nothing new to collect ([`ProcTable::take_signals`]), and one
+/// that saw it move finds the bit there. For the threads that ask without
+/// the kernel lock; the table's own (a page's kernel module) is the one that
+/// counts.
+static SIGNAL_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// [`SIGNAL_SEQ`].
+pub fn signal_seq() -> u32 {
+    SIGNAL_SEQ.load(Ordering::Acquire)
 }
 
 /// The system's processes.
@@ -236,6 +249,7 @@ impl ProcTable {
                     parent
                         .pending
                         .fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                    SIGNAL_SEQ.fetch_add(1, Ordering::Release);
                 }
             }
             for p in t.procs.iter_mut() {
@@ -418,6 +432,7 @@ impl ProcTable {
                 p.senders[signo as usize - 1] = caller;
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
             // A signal ends a wait: wake each target's waiting threads.
             for &i in &hits {
                 t.procs[i].queue.notify();
@@ -445,6 +460,9 @@ impl ProcTable {
             let bit = 1u64 << (signo - 1);
             for p in &hits {
                 p.pending.fetch_or(bit, Ordering::AcqRel);
+            }
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            for p in &hits {
                 p.queue.notify();
             }
         }
