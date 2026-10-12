@@ -20,6 +20,7 @@
 //   {"move": [X, Y]}                     the pointer to CSS pixel X, Y
 //   {"click": [X, Y]}                    a left click there
 //   {"keys": ["Escape", ...]}            named keys (KeyboardEvent.code)
+//   {"eval": "EXPR"}                     EXPR in the page, its value printed
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
 //                                        copy of it (xwd) with the compositor's output
 //                                        (needs the python and xeyes overlays)
@@ -499,6 +500,8 @@ try {
       const ok = kind === step.cursor;
       if (!ok) failed = true;
       log(`${ok ? 'ok' : 'FAIL'} cursor ${JSON.stringify(css.slice(0, 80))} (want ${step.cursor})`);
+    } else if (step.eval) {
+      log(`eval ${step.eval}: ${JSON.stringify(await ev(step.eval)).slice(0, 400)}`);
     } else if (step.truth) {
       await truth(step);
     } else if (step.pools) {
