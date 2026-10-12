@@ -8599,7 +8599,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     };
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
-    h.kernel.exec_signals();
+    let leader = h.kernel.pid;
+    h.kernel.exec_signals(leader);
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its
@@ -8701,8 +8702,6 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
-    // Signal handlers do not survive an exec; the mask does.
-    h.kernel.signals.reset();
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static

@@ -28,7 +28,8 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # thread-signals, signal-storm: signals asked about and delivered by each
 # thread itself at its safepoints, without the kernel lock (step 8): masks
 # and targets per thread, a process-directed signal taken exactly once.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm"}
+# exec-signals: the mask, ignored signals and pending ones survive execve.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -56,13 +57,16 @@ for src in "$HERE"/*.c; do
         # and fixing its guard, so the writer's stores land in between.
         envs=""
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
+        # exec-signals execs itself: in the page, from the guest's filesystem.
+        pageopts=""
+        [ $name = exec-signals ] && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
         if [ $tier = page ]; then
-            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
             # 125: run-node's flaky "nothing could wake it" after a threaded
             # program has finished (OPTIMIZATION-BACKLOG.md); once more.
             if [ $gs = 125 ]; then
                 echo "     $name (page): exit 125, once more"
-                env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+                env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
             fi
             gex=$(grep -v '^\[host\]' "$WORK/$name.page")
         else

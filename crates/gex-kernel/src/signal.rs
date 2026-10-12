@@ -535,19 +535,6 @@ impl Signals {
         own.suspend_restore = None;
     }
 
-    /// Everything back to a new process's: default dispositions, nothing
-    /// pending, no mask, no alternate stack, not in a handler. The timers
-    /// stay. In place, because a host reads the state without the kernel.
-    pub fn reset(&self) {
-        *self.proc.actions.write() = [SigAction::default(); NSIG];
-        self.proc.shared.store(0, Ordering::Release);
-        *self.proc.shared_sources.lock() = [None; NSIG];
-        self.cur.pending.store(0, Ordering::Release);
-        self.cur.blocked.store(0, Ordering::Release);
-        *self.cur.sources.lock() = [None; NSIG];
-        *self.cur.own.lock() = Own::default();
-    }
-
     pub fn action(&self, signal: u32) -> SigAction {
         self.proc.action(signal)
     }

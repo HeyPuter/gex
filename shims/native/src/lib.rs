@@ -2627,7 +2627,8 @@ fn exec_program(
     kernel.close_on_exec();
     // And the handlers, which are addresses in the image being replaced.
     // Every other thread is gone; their signal state with them.
-    kernel.exec_signals();
+    let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
+    kernel.exec_signals(tid);
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).

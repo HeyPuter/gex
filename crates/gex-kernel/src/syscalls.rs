@@ -1681,14 +1681,15 @@ impl Kernel {
     }
 
     /// The signal state after `execve` ([`Signals::exec`]): the other
-    /// threads are gone, and their state with them.
-    pub fn exec_signals(&mut self) {
+    /// threads are gone, and their state with them. The calling thread's
+    /// (its mask and pending signals, which survive) goes on as thread
+    /// `tid`: the process's leader, whichever thread called.
+    pub fn exec_signals(&mut self, tid: i32) {
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
         self.thread_signals.clear();
-        if self.sig_tid != 0 {
-            self.thread_signals.insert(self.sig_tid, cur);
-        }
+        self.thread_signals.insert(tid, cur);
+        self.sig_tid = tid;
     }
 
     /// Whether a signal is ready for thread `tid` (the host's wait loops ask
