@@ -184,7 +184,7 @@ pub(crate) fn enter(h: &mut Host, i: usize, why: u8, all_blocked: bool, ends_by_
     }
     let now = now_ns();
     publish_timer(h);
-    let t = &h.threads[i];
+    let t = h.threads[i].run();
     let fresh = WAIT.with(|w| {
         let mut w = w.borrow_mut();
         if let Some(m) = w.as_mut().filter(|m| m.thread == i && same_wait(&m.waiting, &t.waiting)) {
@@ -255,31 +255,44 @@ pub(crate) fn leave() {
 /// ready -- `why` the `paused()` bits to set. `None` when the turn must take
 /// the lock: the wait may be over, a signal may have arrived, the
 /// compositor has work, or there is no wait in hand.
-pub(crate) fn idle_turn() -> Option<(u8, bool)> {
+pub(crate) fn idle_turn() -> Turn {
     if unsafe { k_present() } == 0 || EXITED.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
+        return Turn::Locked;
     }
     WAIT.with(|w| {
         let w = w.borrow();
-        let m = w.as_ref()?;
+        let Some(m) = w.as_ref() else { return Turn::Locked };
         if m.thread != cur() || m.all_blocked {
-            return None;
+            return Turn::Locked;
         }
         if crate::wl::pump_wanted() {
-            return None;
+            return Turn::Locked;
         }
         // A signal for this thread, from another process (`kill`), from
         // one of its own threads (`tgkill`), or from its timer, that would
-        // do something: asked of the signal state itself (`sigs`). Ending
-        // the wait is the locked turn's.
+        // do something: asked of the signal state itself (`sigs`). It ends
+        // the wait.
         if crate::sigs::ready() {
-            return None;
+            return Turn::Ready(true);
         }
         if wait_ready(&m.waiting, &m.blocked_on, now_ns(), false) {
-            return None;
+            return Turn::Ready(false);
         }
-        Some((m.why, m.ends_by_itself))
+        Turn::Idle(m.why, m.ends_by_itself)
     })
+}
+
+/// What an idle turn without the kernel lock found ([`idle_turn`]).
+pub(crate) enum Turn {
+    /// Still waiting: the `paused()` bits to set, and whether the wait
+    /// ends by itself.
+    Idle(u8, bool),
+    /// The wait is over (`true`: a signal that would do something ended
+    /// it): the thread's own Worker finishes its call (`finish_mine`).
+    Ready(bool),
+    /// The turn is the kernel's: the compositor has work, a deadlock is
+    /// being confirmed, or there is no wait in hand.
+    Locked,
 }
 
 /// How long this Worker's thread may sleep: until its own deadline, a

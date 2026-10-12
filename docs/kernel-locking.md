@@ -501,6 +501,23 @@ in the scheduler pick after each wake of the global WAKE word: about
     signal once, with its sender, for the same reason. The thread table
     (a resume after a handler frame) and process exit stay the kernel's
     until §3.7 and step 9.
+  - **Step 8, the thread's run state (§3.7, as built):** each thread-table
+    entry keeps its pc, its wait, the call it parked in and what that call
+    still owes (`Run`: `rt_sigsuspend`'s mask, a write's `SIGPIPE`, a call
+    to make again) behind an `Arc<Mutex>` of its own, and its Worker holds
+    that `Arc` (`MY_RUN`). The kernel's per-call leftovers (`restore_sigmask`,
+    `write_blocked`, the `retry_*` of `accept`, `recvmsg` and transfers) are
+    taken out of it as the call parks. An idle turn that finds its wait
+    over (`waitq::Turn::Ready`) finishes the call with no kernel lock
+    (`finish_mine`, `finish_wait`): the answer into its context, the signal
+    half through `sigs::finish`, and an `accept`, `recvmsg` or transfer is
+    made again from its instruction (in place, for a wasm32 program or a
+    provider) instead of being redone inside the kernel. A safepoint's
+    handler frame resumes without `schedule`. The locked turn stays for a
+    blocking call's first look (under its own take), the compositor's pump
+    and the deadlock watch; process exit stays the kernel's. The context
+    address and tid a Worker runs (`MY_CTX`, `MY_TID`) replaced twenty
+    sites that took the lock to read them.
   - **Known failure, native, not KLock's:** `gexc run --fjit` livelocks
     ("retranslation livelock") once a page of a long direct-jump chain is
     retired under it, as `tests/x86-programs/retire-during-lift` does

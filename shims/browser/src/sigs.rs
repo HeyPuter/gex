@@ -100,13 +100,46 @@ pub(crate) fn ready() -> bool {
 /// ends. No kernel lock.
 pub(crate) fn deliver(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Delivery {
     let Some(home) = home() else { return Delivery::None };
-    let Some(view) = MINE.with(|m| {
-        m.borrow().as_ref().map(|(_, t)| Signals::view(Arc::clone(&home.sig), Arc::clone(t)))
-    }) else {
-        return Delivery::None;
-    };
+    let Some(view) = view(home) else { return Delivery::None };
+    dispatch(&view, gm, ctx_addr)
+}
+
+/// This Worker's thread's signal state as one `Signals`.
+fn view(home: &Home) -> Option<Signals> {
+    MINE.with(|m| m.borrow().as_ref().map(|(_, t)| Signals::view(Arc::clone(&home.sig), Arc::clone(t))))
+}
+
+fn dispatch(view: &Signals, gm: &mut GuestMem<'_>, ctx_addr: u64) -> Delivery {
     // The ABI the frame is in: an i386 process's, or the native one's
     // (`clock_constants` publishes it at load and exec).
     let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
-    signal::dispatch(&view, gm, ctx_addr, compat).unwrap_or(Delivery::None)
+    signal::dispatch(view, gm, ctx_addr, compat).unwrap_or(Delivery::None)
+}
+
+/// The signal half of finishing this Worker's thread's parked call, whose
+/// answer is already in its context at `ctx_addr` (what the kernel's
+/// `finish_blocking` does, without it): a write that met a closed pipe
+/// raises `SIGPIPE` (`sigpipe`), `rt_sigsuspend`'s mask goes back through
+/// the handler's frame or, with no frame, here (`suspended`), and a pending
+/// signal is delivered. No kernel lock.
+pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64>, sigpipe: bool) -> Delivery {
+    let Some(home) = home() else { return Delivery::None };
+    let Some(view) = view(home) else { return Delivery::None };
+    gather(home);
+    if sigpipe {
+        // Linux sends it as the writer itself sending it (SI_USER).
+        view.raise_from(
+            signal::sig::SIGPIPE,
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.uid },
+        );
+    }
+    if suspended.is_some() {
+        view.set_suspend_restore(suspended);
+    }
+    let delivery = if view.has_pending() { dispatch(&view, gm, ctx_addr) } else { Delivery::None };
+    // Nothing was delivered, so no frame took the mask: put it back here.
+    if let Some(mask) = view.take_suspend_restore() {
+        view.set_blocked(mask);
+    }
+    delivery
 }

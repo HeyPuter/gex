@@ -1246,7 +1246,7 @@ mod imp {
                     }
                     end_process(p.exit_code.load(Ordering::Acquire));
                 }
-                with_host(|h| h.threads[cur()].waiting = Waiting::Exited);
+                with_host(|h| h.threads[cur()].run().waiting = Waiting::Exited);
                 set_resume_none();
                 set_resume_ctx_none_and_trap();
             }
@@ -1255,12 +1255,7 @@ mod imp {
                 with_host(|h| {
                     // A Worker of its own, as a Linux clone gets: the entry
                     // is this process's, the thread runs elsewhere.
-                    h.threads.push(Thread {
-                        kstate: ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 },
-                        pc: start,
-                        waiting: Waiting::Elsewhere,
-                        blocked_on: None,
-                    });
+                    h.threads.push(Thread::new(ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 }, start, Waiting::Elsewhere));
                     if !h.jit.ever_threaded {
                         backfill_registry(h);
                         h.jit.ever_threaded = true;
