@@ -587,6 +587,7 @@ export class ProcessHost {
             pc: m.thread.pc,
             memory: m.thread.memory,
             moduleStore: m.thread.moduleStore,
+            procOpts: m.thread.procOpts,
             kernelStack: this.#nextKernelStack(key),
             shim: shimMod,
             guest: this.#guest,

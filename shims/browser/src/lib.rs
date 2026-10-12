@@ -3417,6 +3417,7 @@ pub extern "C" fn gex_worker_init() -> u32 {
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
         WORKER.with(|w| w.set(i as u32));
+        gex_kernel::sync::set_thread_id(i as u32 + 1);
         // A guard at the bottom of the stack: a stack that outgrows its
         // megabyte runs on into whatever the arena handed out below it (a
         // heap span, so translations, the registry...). Checked at every NT
@@ -3493,6 +3494,7 @@ thread_local! {
 #[no_mangle]
 pub extern "C" fn gex_set_worker(id: u32) {
     WORKER.with(|w| w.set(id));
+    gex_kernel::sync::set_thread_id(id + 1);
 }
 
 
@@ -11067,6 +11069,12 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
+    // A kernel lock guard alive here never drops: a trap does not unwind, so
+    // the lock would stay taken for good (docs/kernel-locking.md §4.1). Lock
+    // regions are leaf computations; one that reaches a trap is a bug.
+    if let Err(n) = gex_kernel::sync::check_trap_out() {
+        warn_line(&format!("[gex] trapped out to JS holding {n} kernel lock guard(s)\n"));
+    }
     // This *is* how a syscall returns when it redirects, so the guest is no
     // longer inside one.
     //
@@ -12258,6 +12266,23 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     });
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
+    }
+    // A process with a guest fault hook (Wine's ntdll.so, W3): an access
+    // violation, executing, handed to the hook by the host, which resumes
+    // where the hook leaves the context (shims/native's
+    // `deliver_guest_fault_kind`). Without it a W3 program's own null call
+    // (Windows 7's comctl32 calls LpkEditControl's table, null without
+    // lpk.dll, and expects the exception to be caught) ended the thread.
+    if wild && cgen::fault_hook() != 0 {
+        with_host(|h| {
+            let mut gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let _ = gm.write_u64(c + ctx::PC as u64, pc);
+            cgen::fault_stage(0xc000_0005, pc, 8);
+            set_resume(pc);
+            set_resume_ctx(c);
+        });
+        trap();
     }
     if wild {
         with_host(|h| {

@@ -4,7 +4,7 @@
  * command with a wire plan that gexgl.c and gl44-generated.inc do not
  * define, each a call to gexgen_call (gexgl.c) with its plan. Aliases
  * of exported commands come from gl-aliases-generated.inc. */
-/* 1602 entry points. */
+/* 1599 entry points. */
 
 void glAccum(unsigned op_, float value_) {
     uint64_t args__[2] = {(uint64_t)(uint32_t)op_, (uint64_t)as_bits(value_)};
@@ -854,17 +854,9 @@ void glCurrentPaletteMatrixARB(int index_) {
     uint64_t args__[1] = {(uint64_t)(uint32_t)(int32_t)index_};
     gexgen_call(8637u, "v w", args__);
 }
-void glDebugMessageControl(unsigned source_, unsigned type_, unsigned severity_, int count_, const unsigned * ids_, unsigned char enabled_) {
-    uint64_t args__[6] = {(uint64_t)(uint32_t)source_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)severity_, (uint64_t)(uint32_t)(int32_t)count_, (uint64_t)(uintptr_t)ids_, (uint64_t)(uint32_t)enabled_};
-    gexgen_call(8643u, "v w w w w i4:p3 w", args__);
-}
 void glDebugMessageEnableAMD(unsigned category_, unsigned severity_, int count_, const unsigned * ids_, unsigned char enabled_) {
     uint64_t args__[5] = {(uint64_t)(uint32_t)category_, (uint64_t)(uint32_t)severity_, (uint64_t)(uint32_t)(int32_t)count_, (uint64_t)(uintptr_t)ids_, (uint64_t)(uint32_t)enabled_};
     gexgen_call(8646u, "v w w w i4:p2 w", args__);
-}
-void glDebugMessageInsert(unsigned source_, unsigned type_, unsigned id_, unsigned severity_, int length_, const char * buf_) {
-    uint64_t args__[6] = {(uint64_t)(uint32_t)source_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)severity_, (uint64_t)(uint32_t)(int32_t)length_, (uint64_t)(uintptr_t)buf_};
-    gexgen_call(8647u, "v w w w w w i1:S4", args__);
 }
 void glDebugMessageInsertAMD(unsigned category_, unsigned severity_, unsigned id_, int length_, const char * buf_) {
     uint64_t args__[5] = {(uint64_t)(uint32_t)category_, (uint64_t)(uint32_t)severity_, (uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)(int32_t)length_, (uint64_t)(uintptr_t)buf_};
@@ -1441,10 +1433,6 @@ void glGetConvolutionParameterivEXT(unsigned target_, unsigned pname_, int * par
 void glGetConvolutionParameterxvOES(unsigned target_, unsigned pname_, int * params_) {
     uint64_t args__[3] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)pname_, (uint64_t)(uintptr_t)params_};
     gexgen_call(9105u, "v w w o4:e1", args__);
-}
-unsigned glGetDebugMessageLog(unsigned count_, int bufSize_, unsigned * sources_, unsigned * types_, unsigned * ids_, unsigned * severities_, int * lengths_, char * messageLog_) {
-    uint64_t args__[8] = {(uint64_t)(uint32_t)count_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)sources_, (uint64_t)(uintptr_t)types_, (uint64_t)(uintptr_t)ids_, (uint64_t)(uintptr_t)severities_, (uint64_t)(uintptr_t)lengths_, (uint64_t)(uintptr_t)messageLog_};
-    return (unsigned)gexgen_call(9107u, "w w w o4:p0 o4:p0 o4:p0 o4:p0 o4:p0 o1:p1", args__);
 }
 unsigned glGetDebugMessageLogAMD(unsigned count_, int bufSize_, unsigned * categories_, unsigned * severities_, unsigned * ids_, int * lengths_, char * message_) {
     uint64_t args__[7] = {(uint64_t)(uint32_t)count_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)categories_, (uint64_t)(uintptr_t)severities_, (uint64_t)(uintptr_t)ids_, (uint64_t)(uintptr_t)lengths_, (uint64_t)(uintptr_t)message_};
