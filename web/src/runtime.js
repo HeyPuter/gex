@@ -906,7 +906,8 @@ async function runProgramHere(
       // the page is not visible there.
       trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
       // `?doorstats=1`: wineserver door call counts every 10 s (docs/wineserver-kernel.md).
-      doorStats: globalThis.GEX_DOOR_STATS ? 1 : undefined,
+      // (a number past 1: the line's period in ms)
+      doorStats: globalThis.GEX_DOOR_STATS || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for

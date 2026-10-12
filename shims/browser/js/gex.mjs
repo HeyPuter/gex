@@ -3914,7 +3914,7 @@ export class Gex {
   #doorInst = null;
   #doorViews = null;
   /** Census: door calls, fallbacks, proxies. */
-  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0 };
+  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0, tProxy: 0, byNr: {} };
 
   /** The server: `area` is its door area, in this process's memory. */
   #doorPublish(area) {
@@ -4054,13 +4054,16 @@ export class Gex {
     const stats = dv.getUint32(a + 96, true);
     if (stats && nr < 512) Atomics.add(i32, (stats >> 2) + nr, 1);
     Atomics.add(i32, (a + 100) >> 2, 1);
-    this.#doorStats.proxies++;
+    const st = this.#doorStats;
+    st.proxies++;
+    const tp = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
     Atomics.store(i32, (a + 4) >> 2, 1);
     Atomics.notify(i32, a >> 2);
     this.#doorKick();
     while (Atomics.load(i32, (a + 4) >> 2) !== 2) Atomics.wait(i32, (a + 4) >> 2, 1, 5);
     const r = i32[(a + 36) >> 2];
     Atomics.store(i32, (a + 4) >> 2, 0);
+    if (tp) { st.tProxy += performance.now() - tp; (st.byNr[nr] = (st.byNr[nr] ?? 0) + 1); }
     ret(r);
   }
 
@@ -4142,7 +4145,7 @@ export class Gex {
       const now = performance.now();
       if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
       if (!st.t0) st.t0 = now;
-      else if (now - st.t0 >= 10000 || st.calls + st.fallbacks >= 50000) {
+      else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
         const sa = dv.getUint32(a + 96, true) >> 2;
         const top = [];
         if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
@@ -4150,8 +4153,11 @@ export class Gex {
         console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
           + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 8).map(([c, n]) => `${n}:${c}`).join(' ')});`
           + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
-          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each)`);
-        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = 0;
+          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
+          + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
+          + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
+        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
+        st.byNr = {};
         st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
       }
     }

@@ -420,7 +420,7 @@ async function handle(msg) {
   // and `?debug=1`, which does carry it, mirrors every guest write and changed
   // the fault it was being used to look at.
   if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
-  if (msg.doorStats) globalThis.GEX_DOOR_STATS = 1;
+  if (msg.doorStats) globalThis.GEX_DOOR_STATS = msg.doorStats;
   if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
