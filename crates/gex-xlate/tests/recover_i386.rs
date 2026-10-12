@@ -312,3 +312,57 @@ fn an_instruction_ending_text_in_a_zero_byte_lifts_whole() {
     assert!(matches!(thunk.blocks[0].term, FTerm::Unresolved { .. }), "{text}");
     assert!(text.contains(&format!("{:#x}", base + 0x5030)), "the slot, rebased: {text}");
 }
+
+/// Microsoft's linker puts the import address table at the start of
+/// `.text`: once the loader has written the imports' addresses there, the
+/// mapped code still counts as the image's (`pe_code_difference`), but any
+/// other byte that differs does not.
+#[test]
+fn import_slots_written_by_the_loader_are_not_a_code_difference() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/switch32.exe")).unwrap();
+    let pe = gex_ld::pe::parse(&bytes).unwrap();
+    let base = pe.preferred_base;
+    let (img, _) = gex_xlate::func::pe_input(&pe, base).unwrap();
+    let slots = gex_xlate::pe_import_slots(&pe);
+    let (lo, _) = slots[0];
+    let seg = img.segments.iter().find(|s| s.vaddr <= base + lo && base + lo < s.vaddr + s.bytes.len() as u64).unwrap();
+    let at = (base + lo - seg.vaddr) as usize;
+    assert_eq!(&seg.bytes[at..at + 4], &[0; 4]);
+    let mut live = seg.bytes.clone();
+    live[at..at + 4].copy_from_slice(&0x7b01_2345u32.to_le_bytes());
+    assert_eq!(gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, &live, base, Some(&pe)), None);
+    assert_eq!(gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, &live, base, None), Some(at));
+    let other = if at > 0 { 0 } else { 4 };
+    live[other] ^= 0xff;
+    assert_eq!(gex_xlate::pe_code_difference(seg.vaddr, &seg.bytes, &live, base, Some(&pe)), Some(other));
+}
+
+/// A page's hash leaves the import slots out: the loader filling them after
+/// a unit was placed does not make the page read as patched.
+#[test]
+fn a_page_hash_leaves_import_slots_out() {
+    let mut mem = vec![0x90u8; 0x3000];
+    let slots = [(0x1010u64, 0x1018u64)];
+    let h = |m: &[u8]| gex_xlate::masked_page_hash(m, 1, 0x1000, &slots);
+    let before = h(&mem);
+    assert_eq!(gex_xlate::masked_page_hash(&mem, 1, 0x1000, &[]), gex_xlate::masked_page_hash(&mem, 1, 0x1000, &[(0x2000, 0x2004)]));
+    mem[0x1010..0x1018].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(h(&mem), before);
+    mem[0x1018] = 0xcc;
+    assert_ne!(h(&mem), before);
+}
+
+/// A vtable kept in `.text` (Microsoft merges `.rdata` there): the relocated
+/// pointer to the table seeds a weak start whose decode runs on into
+/// `get_b`, which only the table names. `get_b` is a function of its own
+/// all the same, not an interior entry of that garbage (uiribbon.dll's
+/// 0x2f15153d, called through its vtable a few thousand times at start-up).
+#[test]
+fn a_virtual_tail_s_callee_after_a_vtable_in_text_is_a_function() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/vtext32.exe")).unwrap();
+    let pe = gex_ld::pe::parse(&bytes).unwrap();
+    let (img, extra) = gex_xlate::func::pe_input(&pe, pe.preferred_base).unwrap();
+    let prog = recover_pe(&img, &extra, &RecoverOptions::default());
+    let found: Vec<u64> = prog.functions.keys().copied().collect();
+    assert!(found.contains(&0x401010), "get_b not a function: {found:x?}");
+}
