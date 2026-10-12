@@ -2612,13 +2612,21 @@ rm -rf tests/unity-dotnet/smoke/obj
 ### Hollow Knight and Muck in the page
 
 Edger only, through the bench lock (`scratch/bench/bench.sh`, `BENCH_TIMEOUT` bounds the run inside
-the lock). The scripts are in `tools/unity-dotnet/page`. They expect edger's layout: the worktree is
-synced to `~/gex-sandbox/wt/unity`, and the staging is in `~/gex-sandbox/scratch/unity/page`.
+the lock). The scripts are in `tools/unity-dotnet/page`. They run the checkout they are in (or
+`TREE=`), and the staging is in `~/gex-sandbox/scratch/unity/page`.
+
+- **Guest GL:** the x86-64 guest GL comes from the tree's own sources (`guest-gl.sh TREE`, into
+  `TREE/target/guest-gl-x64`, rebuilt when `guest/gl` or `crates/gex-gl/src/proto.rs` changes; `GL64=`
+  overrides). Run `guest-gl.sh` on the build host before syncing the tree to a bench box. The old default,
+  the prebuilt `scratch/unity/gl64-new` (2026-10-07), lacked the frame-query cache and the async present,
+  and halved page Muck: 13.5 against 23.5 presents/s on the same tree (edger, 2026-10-11).
+- **Function JIT:** `muck-page.sh` passes `--fjit` itself (`FJIT=0` for without; 10.1 against 13.2 presents/s
+  without it).
 
 - **BCL directory** (`page/muck-bcl-NAME`): copy `muck-bcl`, which holds .NET 10's shared framework
   assemblies and the native `libSystem.*` libraries. Then put this build's `OUT/lib/System.Private.CoreLib.dll`
   and `OUT/provider/mono.wasm` into the copy. CoreLib must match the build, because 0002 patches GCHandle.
-- **Muck:** `BCL=... bash tools/unity-dotnet/page/muck-page.sh NAME MINUTES --fjit`. This needs
+- **Muck:** `bash tools/unity-dotnet/page/muck-page.sh NAME MINUTES`. This needs
   `muck-files.txt`, the host files from a native `--strace` run.
 - **Hollow Knight:**
   - Stage it once with `hk-stage.py STRACE_RUN page/hk`. This writes `hk/game` (the 115 files HK opens)
