@@ -105,20 +105,35 @@ process.** This keeps the separate libc problem. Its syscalls still need
 an fd table, a memory map and file access, which today only a process
 has.
 
-**C. A kernel-hosted server process whose memory every Worker of the
-session can map (chosen).** wineserver becomes its own gex process
-again, as it is upstream: `wineserver.wasm`, a native wasm32 program
-built with our musl and started by `start_server`.
+**C. A kernel-hosted server process on a runtime-owned server memory
+(chosen).** wineserver becomes its own gex process again, as it is
+upstream: `wineserver.wasm`, a native wasm32 program built with our musl
+and started by `start_server`.
 
-- The kernel marks it as the session's server, P_s. Its linear memory,
-  the **server memory** (SM), is the global shared memory that the
-  server's state lives in.
+- **The server memory (SM)** is a `WebAssembly.Memory` (natively a
+  `wasmtime::SharedMemory`) that the runtime creates and owns, with the
+  kernel module's lifecycle: made when the global kernel is, per Wine
+  session (prefix), and dropped with the kernel or at the session's end.
+  It is not a guest mapping:
+  - no guest `mmap` can name it;
+  - it appears in no process's address space;
+  - only the server module and the door glue import it.
+
+  So it is runtime memory, as the kernel module's is, and never a
+  guest-visible `MAP_SHARED` region (coordinator, 2026-10-12). Whether a
+  build shares it across processes is then a build option (§9).
+- **P_s.** The kernel marks the server process as the session's server.
+  P_s is instantiated on SM as its linear memory, in place of a fresh
+  memory. P_s's own shim, the code it translates and its mappings live
+  in a process memory of their own as usual; SM holds only the wasm32
+  server image (data, heap, stacks). P_s exiting does not free SM; the
+  next P_s of the same session would start on a fresh SM.
 - Every Worker of every Windows process in the session can instantiate
   the server's module on SM, as a thread of P_s would.
 - P_s has a normal pid, fd table and memory map, so the server's
   syscalls need nothing new.
 - C is B, built from machinery that already exists: a process and its
-  per-Worker instances.
+  per-Worker instances, on a memory the runtime provides.
 
 ### 3.2 How a request is served
 
@@ -159,7 +174,7 @@ measured, and as the place where P's spin work lands if D falls short.
 ## 4. The chosen design
 
 ```
- client process (own memory)            server memory SM (P_s's memory)
+ client process (own memory)            server memory SM (runtime-owned)
  ┌──────────────────────────┐           ┌──────────────────────────────┐
  │ ntdll.so server_call ────┼─ door ───▶│ server lock │ door buffer     │
  │ win32u shared reads ─────┼─ copy ───▶│ session block (16 MiB)        │
@@ -180,14 +195,17 @@ measured, and as the place where P's spin work lands if D falls short.
     buffer and the door stack.
 - **Start.** ntdll's `start_server` forks and execs `wineserver -f`, as
   upstream does.
-  - In the page, P_s is an ordinary process with one Worker (its main
-    thread).
+  - In the page, P_s is a process with one Worker (its main thread).
+    The exec of a program marked as a door server (a GEXWASM header flag,
+    as `isW3Program` reads the i386 flag) asks the runtime for the
+    session's SM and instantiates the wasm32 image on it.
   - Once its master socket is up, P_s publishes itself as the door
-    server with `gex_door_publish(memory, module)`: a call into the
-    shim, which reaches the page runtime.
-  - The runtime records the server's `WebAssembly.Memory` and compiled
-    `Module` per session (per prefix). It hands both to every Worker it
-    creates from then on, in the Worker's init message.
+    server with `gex_door_publish()`: a call into the shim, which tells
+    the runtime that SM now holds a live server and which module it
+    runs.
+  - The runtime already holds SM; it records the server's compiled
+    `Module` beside it, per session (per prefix). It hands both to every
+    Worker it creates from then on, in the Worker's init message.
   - A Worker created earlier (pid 1's, which started the server) gets
     them as a message at its next trip to JS. Until then it uses the
     pipes (§4.6).
@@ -220,13 +238,18 @@ export of the **door glue**. The glue is a small wasm module per Worker.
 It imports the client's memory, SM and the kernel module's memory, so
 the call is wasm to wasm with no JS on the path. Its steps:
 
-1. **Lock.** CAS on the SM server lock. If the lock is taken, spin about
-   2 µs, then `memory.atomic.wait32` on the lock word with a 1 ms bound,
-   and loop.
-   - This is a raw wait in wasm, not a gex park. It never traps to JS
-     and holds no gex lock, so W's rule 4.1 holds.
+1. **Lock.** The server lock is a robust futex-style word in SM: the
+   owner's wait slot (`k_ws_self()`) and a waiter count. CAS it to this
+   Worker's slot. If it is taken, spin about 2 µs, then wait as a
+   step-2 waiter on the lock's queue (`k_wq_add`, re-check,
+   `k_ws_park`), and loop.
+   - `k_ws_park` is the same instruction as a raw `memory.atomic.wait32`
+     and never traps, so rule 4.1 holds (W, 2026-10-12). In the SP build
+     the same `k_ws_park` suspends through JSPI (`sched.parkSlot`); a raw
+     wait32 there would deadlock the one realm.
    - The pump holds the lock only while it handles events, never across
      `epoll_wait`.
+   - The page's main thread never makes door calls (it runs no guest).
 2. **Request in.** `memory.copy` of the request header (64 bytes) and its
    data vectors from client memory into the **door buffer** in SM. There
    is one door buffer, since the lock admits one caller; it is 64 KiB
@@ -256,11 +279,20 @@ reaches the caller mid-call.
 (`worker.terminate()` on SIGKILL or process exit) while inside a door
 would leave the lock held and the server half-updated. So the glue keeps
 a per-Worker **in-door word** in the kernel's memory. Termination of a
-process (`k_exit`, `k_kill` with SIGKILL, and the runtime's
-`terminate`) sets a pending flag and waits for that word to clear, with
-a bound; the glue checks the flag at door exit and ends its thread
-itself. Natively, threads are not killed asynchronously, so only the
-page needs this.
+process sets a pending flag and waits for that word to clear, with a
+bound; the glue checks the flag at door exit and ends its thread itself.
+The check goes where a process actually ends (W): the shim's
+`exit_process` and `set_exit` paths, the kernel's `k_exit`, and
+host.mjs where it calls `worker.terminate`. W's lifecycle steps 8-9 will
+call the same check rather than add another.
+
+A bounded wait still leaves a Worker that trapped or crashed inside the
+door. The lock word records its owner's slot, robust-futex style. The
+exit path, or the next locker that finds the owner's Worker gone (its
+slot freed), takes the lock over and marks the server poisoned (§11):
+a handler cut off midway cannot be repaired, so the session ends as it
+does today when wineserver dies. Natively, threads are not killed
+asynchronously, so only the page needs the in-door word.
 
 **What `door_fits` excludes:**
 
@@ -307,22 +339,38 @@ bound by the glue:
   `pread`, `mmap` of a file mapping, `sendmsg` and `recvmsg` with fds,
   `ftruncate` and `fstat`. The call proceeds in four steps:
   1. The glue writes the call (number, arguments, and data copied into
-     an SM buffer) into a proxy slot and kicks.
-  2. It waits with a raw `memory.atomic.wait32` on the slot. The server
-     lock stays held, which is safe because the pump does not need it
-     to serve a proxy.
-  3. The pump, woken by the kick, makes the syscall as P_s on its own
-     shim, writes the result and notifies.
+     an SM buffer) into a proxy slot, notifies the pump's wait slot and
+     kicks.
+  2. It waits on its own wait slot (`k_ws_park`) for the result. The
+     server lock stays held: the handler is mid-flight on the one door
+     stack, so it cannot be given up and re-taken the way a condvar
+     would.
+  3. The pump makes the syscall as P_s on its own shim, writes the
+     result and notifies the caller's slot.
   4. The glue copies the results back.
+
+  **No deadlock: the pump serves proxies without the server lock, from
+  every place it can wait** (W pointed out that a pump waiting for the
+  lock would otherwise deadlock against a caller waiting for the pump).
+  Outside the lock the pump is only ever in one of two waits:
+  - `epoll_wait`, which the kick pipe ends;
+  - acquiring the server lock. Here the pump waits on its own slot,
+    which both an unlock and a proxy post notify; it serves any posted
+    proxy and then tries the lock again.
+
+  A proxied syscall itself never needs the server lock: it is P_s's own
+  syscall on P_s's shim. The server's fds are non-blocking, so it cannot
+  wait on a client either. No client needs the pump to finish a door
+  call except through the proxy, which the pump serves from either
+  wait.
 
   A proxy costs about two wake hops, today's round trip, so it must stay
   rare on hot paths. `GEX_DOOR_STATS=1` counts proxies per request code
   and syscall. The prototype's first job is that census on P's mspaint
   clicks and on Undertale (§10).
-- **Raw parking under the server lock.** The proxy wait is the only
-  place a door caller parks with the server lock held. It never traps
-  and never takes KLock. W's rule ("nobody parks while holding it") is
-  about gex parks; this one is flagged to W in §7.
+- **Parking under the server lock.** The proxy wait is the only place
+  a door caller parks with the server lock held. It never traps and
+  never takes KLock, and the pump never needs the lock to end it (above).
 
 ### 4.5 Waits, wakeups and APCs
 
@@ -449,29 +497,29 @@ The design keeps the shape and replaces the pipe:
   question (wine-native.md §3.5, "Known gap"). They are not in scope
   here. The design does not make them worse.
 
-## 7. KLock interaction (from W's step 2; points for W to confirm below)
+## 7. KLock interaction (agreed with W, 2026-10-12)
 
 - **A door call takes no KLock.** The client's side is not a syscall: it
   never enters the client's shim. The server side runs on the server
   lock, which lives in SM and is not KLock, any process's.
-- **The server lock** is a C word with three flavours, as
-  kernel-locking.md §4.0's types:
-  - MP page: CAS plus `memory.atomic.wait32` and notify;
-  - native: the same wasm atomics on the wasmtime shared memory;
-  - SP: a no-op. The pump never yields to the JSPI scheduler while
-    holding the lock, so no door caller can find it held.
+- **The server lock** is a robust word (owner slot, waiter count) waited
+  on through step 2's slots and a queue of its own:
+  - MP page and native: `k_ws_park`, which never traps (rule 4.1 holds);
+  - SP: the same calls, which suspend through JSPI. Uncontended, the lock
+    is one CAS and costs SP nothing else; the smoke leg (busybox, gears)
+    must keep passing.
 - **Proxied syscalls** run on the pump as P_s's own syscalls. They take
   whatever P_s's shim takes, so they inherit each KLock step as it lands.
+  The pump serves them from both of its waits, never under the server
+  lock (§4.4), which is W's deadlock condition.
 - **Waits** use step 2's wait slots and per-object queues: one queue per
   server thread, notified at door exit and at the end of the pump's turn.
   The pump's epoll is a gex wait like any other; its kick pipe is a
   global pipe with its own queue (step 6b's per-object slots once
   landed).
-- **For W to confirm:**
-  - the raw wait32 of a door caller on the server lock, or on a proxy
-    slot, while it holds the server lock (never a gex park, never a
-    trap);
-  - the in-door word that process termination honours (§4.2).
+- **Termination.** The in-door word is checked at the shim's
+  `exit_process`/`set_exit`, `k_exit` and host.mjs's `worker.terminate`;
+  W's steps 8-9 call the same check (§4.2).
 
 ## 8. Expected cost per request
 
@@ -508,31 +556,27 @@ census in step 2 of §10 checks that before the numbers are trusted.
 ## 9. Eject
 
 **gex-eject ships no cross-process shared memory** (user, 2026-10-07).
-How this design fits:
+SM is runtime-owned memory with the kernel module's lifecycle, never a
+guest-visible `MAP_SHARED` region (§3.1). So whether it is shared is a
+build option, not a design fork (coordinator, 2026-10-12; the user is
+being asked which default eject takes):
 
-- **The web eject runtime today** is one process and one thread
-  (eject.md, "Limits of the web build"). A Wine program cannot be
-  ejected at all yet: Wine always runs at least the program and its
-  server.
-- **What the design gives eject.** The server's memory is a second
-  memory owned by one process, with no sharing at all, if eject folds
-  the server in:
-  - the program's single Worker instantiates the server module on SM;
-  - every request is a door call, with no pump Worker;
-  - the pump's work (timeouts, fd events) runs at door entry and at the
-    program's own waits, as the SP build does.
+- **Private SM (the build option eject can always take).**
+  - The process's Workers alone import SM.
+  - Every request is a door call, with no pump Worker. The pump's work
+    (timeouts, fd events, proxies) runs at door entry and at the
+    program's own waits, as in the SP build.
+  - This fits a one-process eject today: the web eject runtime is one
+    process and one thread (eject.md, "Limits of the web build"), and a
+    Wine program cannot be ejected yet at all.
+- **Shared SM (the page and native default).**
+  - SM is imported by the Workers of every process in the session, as
+    the kernel module's memory is.
+  - An eject build of several Windows processes needs this, if the user
+    allows runtime-owned shared memory in eject.
 
-  SM is then private to the process, not shared memory between
-  processes.
-- **Several Windows processes in eject.** SM would be shared by the
-  processes' Workers. That is the kernel's own global memory pattern
-  (the kernel module's memory is shared by every Worker), not a
-  `MAP_SHARED` the program asked for.
-  - Whether eject's "no cross-process shm" allows a runtime-owned shared
-    memory of that kind is **for the coordinator and the user to
-    decide**.
-  - The design does not depend on the answer for the single-process
-    case.
+The code is the same in both; the option chooses which Workers receive
+SM and whether a pump Worker exists.
 
 ## 10. Plan
 
