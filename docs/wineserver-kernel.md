@@ -624,6 +624,63 @@ SM and whether a pump Worker exists.
      - the nt tests;
      - the SP smoke.
 
+### 10.1 Prototype status (2026-10-12)
+
+Built on `wskern/main` (gex) and `wskern/wine` (Wine, off `mspaint/wine`).
+Request and reply go through doors natively (gexc) and on the page (MP
+build). How it differs from §4:
+
+- **The server memory is P_s's own linear memory**, held by the runtime
+  for the door's lifetime: the page broadcasts it (`doorPublish`) and
+  every Worker instantiates the server program on it; natively every
+  process sees it. A runtime-owned memory made before P_s exists is the
+  next step; nothing in the door ABI depends on which it is.
+- **The first process.** The Worker of the process that started the
+  server never sees the broadcast: a busy Worker takes no messages. That
+  process runs its program again as a child, which starts with the door,
+  and passes its exit on (`wineserver_relaunch`, `gex.door_missing`). The
+  server signals "ready" only after the door is published.
+- **The clock.** The door host passes the time and CLOCK_BOOTTIME into
+  `__wine_door_dispatch`, so `set_current_time` makes no system calls
+  out of the door.
+- **No blocked signals.** `wine_server_call` runs a door call without its
+  two `sigprocmask` calls: one host call cannot be interrupted by a
+  signal handler that reuses the request pipe.
+- **The page's door instance** gets its own function table, sized from
+  the program's `dylink.0` and its binding list (`X` slots, GOT), and it
+  starts under the door lock (the start runs on the one door stack).
+- **Not yet done:**
+  - waits still go through the wait pipes;
+  - session reads are still `read_session_data` requests, now through
+    the door;
+  - no in-door word: a trap releases the lock without poisoning the
+    server;
+  - the SP build keeps the pipes (`door_missing` returns 0 there).
+- **Census tools:** `?doorstats=MS` or `GEX_DOOR_STATS=MS` prints one line
+  per Worker every MS. It gives per-call copy-in, dispatch and copy-out
+  times, the in-door system calls, and the proxied calls with their wait.
+
+Measurements (edger, bench.sh; numbers are per request unless marked):
+
+| | pipe | door |
+|---|---|---|
+| nullcall (`get_thread_info`), page under Node, first door cut | 26.1-38.0 us | 5.9-8.3 us |
+| nullcall, Chromium, with the clock passed in | 28.2-37.8 us | 4.6-6.4 us |
+| nullcall, Chromium, also without sigprocmask | 29.0-36.0 us | 2.1-3.7 us |
+| mspaint click-to-present, tool-fill median | 103-122 ms | 58-77 ms |
+| mspaint tool-pencil | 117-118 ms | 57-62 ms |
+| mspaint tab-view | 359-374 ms | 211-212 ms |
+| mspaint tab-home | 652-674 ms | 480-697 ms (noisy) |
+
+On the same box a request-free unix call (`NtQueryPerformanceCounter`)
+costs 0.55-1.5 us, so a door request is about 1.5-2.5 us above the
+floor. Census during the mspaint clicks (Chromium, 1 s lines): the UI
+thread makes about 1300-4100 door calls a second at about 7 us each (copy
+in 1.9-3.4 us, dispatch 2.2-5.3 us, copy out 0.9-2.7 us), and 1-19
+proxied calls a second, which wait 0.2-3.1 ms in total. The proxies that
+dominate boot (readlink from musl's `realpath` in `open_fd`, pread,
+statx, open and close) are rare once the program runs.
+
 ## 11. Risks
 
 - **Instantiating the server module in every Worker.** That is a wasm32
