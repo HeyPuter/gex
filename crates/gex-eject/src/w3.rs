@@ -202,7 +202,7 @@ fn template(off: &[String]) -> String {
                opened in the site's bundle and the rest as lazy files, fetched when the program \
                first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
                \"The bundle split\". \"start\": defaults for the app library's start() \
-               (args, env, cwd, size, mtimes, strace, trapstack, persist), over the \
+               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (docs/eject.md, \"The web build\")."),
         ),
         (

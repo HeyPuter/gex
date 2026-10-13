@@ -411,7 +411,33 @@ build names `"features": {"compositor": true}` in user/eject.json). Options:
 | `debug` | any other runtime switch, `{name: value}` (the table below) |
 | `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out); `compositor: false` draws the windows straight into the page in a build that has both |
 | `onLog(text)`, `onExit(status)` | the program's terminal output; its exit |
+| `onProgress(p)` | the start-up's progress, for the page's loading screen (below); none by default |
+| `ready` | `'frame'` (the default): the start-up is over at the first frame shown; `'manual'`: when the page calls the handle's `ready()` |
 | `baseUrl` | where app.mjs's files are (default: beside app.mjs) |
+
+**The loading screen.** The library draws nothing over the desktop while it
+starts; it says how far along it is, and the page draws that.
+`onProgress(p)` is called whenever the start-up moves (a few times a second
+at most while bytes arrive, at once on a phase change), and the handle's
+`state.progress` holds the same, for a page that polls:
+
+| `p.` | What |
+| --- | --- |
+| `phase` | `'download'`, `'compile'`, `'boot'`, `'first-frame'`, `'ready'`, in that order and never back; then `'exited'` or `'failed'` |
+| `download` | `{done, total}` bytes as sent (compressed), `{filesDone, files}` |
+| `compile` | `{done, total}` units compiled ahead (they compile as they arrive) |
+| `at` | each phase's start, ms since `start()` |
+| `elapsed` | ms since `start()`, at this call |
+| `error` | with `'failed'`: why |
+
+`'boot'` is the program's first process started, `'first-frame'` a
+window's first pixels in the page. `'ready'` is the first frame unless the
+build's `"start": {"ready": "manual"}` or the page's `ready: 'manual'` says
+the page decides: a program whose first window is a splash, or Windows'
+desktop, which paints its wallpaper long before its taskbar, calls
+`handle.ready()` when what it waits for is there (`describe()` says what
+the windows are). The example page's loading screen (user/index.html) is
+one way to draw it.
 
 The library never reads the page's URL: the runtime's switches come from
 these options (`GEX_PAGE_SEARCH`, web/src/page-env.js), and its files from
@@ -421,7 +447,7 @@ these options (`GEX_PAGE_SEARCH`, web/src/page-env.js), and its files from
 what ships) is `user/eject.json`, at build time. Everything else is a
 `start()` option, whose default the build records: user/eject.json
 `"start"` (`args`, `env`, `cwd`, `size`, `mtimes`, `strace`, `trapstack`,
-`persist`) over the recording's, and the page's options over both. A
+`persist`, `ready`) over the recording's, and the page's options over both. A
 `"start"` key for a build setting (`"compositor"`, say) fails the build and
 says where it goes. Each of gex's test page's parameters, and where it went:
 
