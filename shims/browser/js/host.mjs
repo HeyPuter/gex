@@ -63,6 +63,15 @@ const PAGE_MODULES = 64;
 const PAGE_MODULE_BYTES = 192 << 20;
 /** The most wasm the page-wide unit cache (`#unitModules`) keeps compiled. */
 const UNIT_MODULE_BYTES = 256 << 20;
+/** The most wasm one process's relay cache (`#moduleCache`) keeps: a pc
+ *  translated again and again (a dispatch that does not converge; Paint's
+ *  startup stall, scratch/P/stall85) made a fresh key each time, and an
+ *  unbounded cache held every one, 10 GiB of renderer within minutes. Past
+ *  it the oldest are dropped from the cache (Workers that installed them
+ *  keep theirs; a thread started later compiles what it needs). */
+const PROCESS_MODULE_BYTES = 256 << 20;
+/** A registry key's module size: `LENGTH:HASH:HASH` (or `u:LENGTH:...`). */
+const regKeyBytes = (k) => Number(String(k).replace(/^u:/, '').split(':')[0]) || 0;
 /** A `wasm:` key's module size: the key is `wasm:LENGTH:HASH:HASH`. */
 const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 
@@ -583,6 +592,16 @@ export class ProcessHost {
         }
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
+          cache.bytes = (cache.bytes ?? 0) + regKeyBytes(m.key);
+          while (cache.bytes > PROCESS_MODULE_BYTES && cache.size > 1) {
+            const oldest = cache.keys().next().value;
+            cache.bytes -= regKeyBytes(oldest);
+            cache.delete(oldest);
+            if (!cache.capped) {
+              cache.capped = true;
+              console.error(`[host] process ${proc}'s compiled-module relay passed ${PROCESS_MODULE_BYTES >> 20} MiB: dropping the oldest (a pc translated over and over? see the "LIVELOCK?" line)`);
+            }
+          }
           if (this.#extra?.shareTrace) console.warn(`[share] host cached ${m.key.slice(0, 30)} from ${pid} (${cache.size} for process ${proc})`);
           for (const [key, other] of this.#workers) {
             if (other !== w && String(key).split(':')[0] === proc) {

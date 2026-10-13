@@ -1741,6 +1741,9 @@ export class Gex {
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
+    // left numbered with no directory entry.
+    if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
     if (opts.fjit && e.gex_set_fjit) {
@@ -4503,7 +4506,12 @@ export class Gex {
       this.#cgenProviders(u);
       return;
     }
-    this.#cgenPublish(u, key, path, got);
+    if (this.#cgenPublish(u, key, path, got) === 1) {
+      // Another thread of this process took the same wanted unit first and
+      // publishes it (and its providers and region entries); installed here.
+      console.error(`gex-nt: function tier for ${path}: placed by another thread`);
+      return;
+    }
     this.#cgenProviders(u);
     console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
@@ -4521,6 +4529,7 @@ export class Gex {
     if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
     this.#cgenCatchUp();
     e.gex_cgen_installed(u);
+    return r;
   }
 
   /** The unit cache's link groups (`groups/index.txt`: a group key, then its

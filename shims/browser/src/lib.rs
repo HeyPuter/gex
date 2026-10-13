@@ -2893,7 +2893,7 @@ struct Jit {
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
-    /// Misses at already-translated pcs, by pc (`remiss`).
+    /// Translations by pc (`remiss`): a pc translated again and again is a livelock.
     remiss: std::collections::HashMap<u64, u32>,
     /// How the shared-slot lookup went. Three outcomes: the page had a base in
     /// this process's table, the identity map knew it, or it did not. See
@@ -6533,6 +6533,7 @@ fn count_syscall() {
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // A recording of which unit functions ran (`?covrec=1`): reported now and then.
     // A Windows process's every syscall is an NT call, made before the kernel
     // is taken: the NT layer takes it itself, briefly, and blocks without it.
     if let Some(p) = nt::process() {
@@ -12101,6 +12102,55 @@ fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
 /// `gex_cache_op`'s `IC_INVALIDATE` handling.
 static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Directory entries `heal_dirs` wrote (the NT stats line).
+pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of those, the ones in a unit's install window (`cgen::in_install_window`),
+/// which are not a bug.
+pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For a block at `start` that failed its page check: its page and the next
+/// (an instruction across the boundary), wherever the page table numbers the
+/// page and the directory does not name that base, get the directory entry
+/// the page table says. Every heal outside a unit's install window is said:
+/// since units are published once (`cgen::CLAIMED`) and list every page they
+/// cover (`cgen::bridges`), none should happen, so a heal line is a bug
+/// report (something numbered a page and left its entry unwritten).
+fn heal_dirs(start: u64) {
+    let first = gex_abi::dispatch_page(start);
+    let healed: Vec<(u64, u32, u32)> = with_jit(|h| {
+        let mut gm = GuestMem::new(guest_bytes());
+        let mut out = Vec::new();
+        for page in [first, first + 1] {
+            if page >= gex_abi::DISPATCH_MAX_PAGES {
+                continue;
+            }
+            let Some(base) = h.jit.page_table.lookup(page) else { continue };
+            let at = gex_abi::DISPATCH_DIR + page * 4;
+            let dir = gm.read_u32(at).unwrap_or(u32::MAX);
+            if dir != base {
+                dense::note_entry(base);
+                let _ = gm.write_u32(at, base);
+                out.push((page, dir, base));
+            }
+        }
+        out
+    });
+    for (page, was, base) in healed {
+        // A unit being published while another thread already runs its code
+        // (two threads loading one DLL): the claimant's install writes this
+        // entry shortly. Counted, not said.
+        if was == 0 && cgen::in_install_window(page) {
+            DIRS_HEALED_EARLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let n = DIRS_HEALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        warn_line(&format!(
+            "gex: heal: pid {} pc {start:#x} page {page:#x}: directory entry {was:#x}, the page table numbers it {base:#x}; entry written (heal {n}; a bug: something numbered the page and left its entry unwritten)\n",
+            my_pid()
+        ));
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     let _pc = fault_pc(_pc);
@@ -12133,6 +12183,15 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             c.set((start, addr as u64));
             same
         });
+        // A page the block runs onto (or starts on) that the page table
+        // numbers but whose directory entry says otherwise: a numbering
+        // whose entry was never written (the publisher's install had not
+        // come, or never did). Every translation of the block checks the
+        // page table's base, so retranslating alone never converges; write
+        // the entry (its slots not filled here yet only miss and catch up).
+        // Paint's startup stall: uiribbon's function at 0x604eefff,
+        // translated about 155 times a second for minutes.
+        heal_dirs(start);
         let again = with_jit(|h| {
             let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
@@ -12441,10 +12500,10 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// translated ahead of time, and the rest arrives here as needed. The shim
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
-/// A pc already translated that misses dispatch again and again is a
-/// retranslation livelock (S3 found natively that a page retired between a
-/// translation and its publish came back without its directory entry): say
-/// what dispatch sees there, once per pc, the 64th time.
+/// A pc that comes to translation again and again is a retranslation
+/// livelock (S3 found natively that a page retired between a translation and
+/// its publish came back without its directory entry): say what dispatch
+/// sees there, once per pc, the 64th time.
 thread_local! {
     /// Set by `cache_op` SLOT_CONFLICT / FTAB_TIER1, whose caller drops the
     /// next dispatch miss's answer: that miss must not answer
@@ -12465,10 +12524,12 @@ fn miss_count(k: usize) {
 }
 
 fn remiss(pc: u64) {
+    // Every miss that reaches translation counts, whether or not `translated`
+    // still has the pc: a stale page check (`PAGE_STALE`) and the bridge's
+    // hand-over (`FTAB_TIER1`) clear it before they come here, and a pc
+    // translated again and again that way was never counted (Paint's
+    // startup stall at 0x604eefff, scratch/P/stall85).
     let said = with_jit(|h| {
-        if !h.jit.translated.contains(&pc) {
-            return None;
-        }
         let n = h.jit.remiss.entry(pc).or_insert(0);
         *n += 1;
         if *n != 64 {
@@ -12477,7 +12538,7 @@ fn remiss(pc: u64) {
         let page = pc / gex_abi::DISPATCH_PAGE;
         let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
         Some(format!(
-            "gex: {pc:#x} is translated but missed dispatch 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} misses at translated pcs so far\n",
+            "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} translations so far\n",
             h.jit.page_table.lookup(page),
             h.jit.retired_pages.contains(&page),
             h.jit.remiss.values().sum::<u32>()
@@ -12486,6 +12547,86 @@ fn remiss(pc: u64) {
     if let Some(s) = said {
         warn_line(&s);
     }
+}
+
+/// Misses at one pc this many times within [`LIVELOCK_WINDOW`] misses of a
+/// Worker: a dispatch that does not converge. Said loudly, once per pc, with
+/// what dispatch sees there and how the miss path last dealt with it (a
+/// diagnostic: nothing here changes what the miss does). A Paint startup
+/// spun for minutes re-translating one AOT entry (0x604eefff, uiribbon;
+/// scratch/P/stall85), and no line said so.
+const LIVELOCK_MISSES: u32 = 256;
+const LIVELOCK_WINDOW: u32 = 8192;
+
+/// Pcs the livelock check has warned about (the NT stats line).
+pub(crate) static LIVELOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Misses in this window, and per pc in it.
+    static LIVE_WINDOW: std::cell::RefCell<(u32, std::collections::HashMap<u64, u32>)> =
+        std::cell::RefCell::new((0, std::collections::HashMap::new()));
+    /// The pcs warned about already.
+    static LIVE_SAID: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// How the miss path last dealt with a miss, per pc, for the warning:
+    /// (pc, way, how many times running).
+    static MISS_WAY: std::cell::Cell<(u64, u8, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// The ways out of `gex_dispatch_miss`, for the livelock warning.
+const MISS_WAYS: [&str; 14] = [
+    "none yet", "unit catch-up (behind)", "exception escape", "call-out return", "dense catch-up",
+    "(unused)", "function JIT", "provider re-bridge", "W3 relocated image", "?", "closure fill",
+    "AOT catch-up (ftab knows it)", "recompile", "tier-1 translation",
+];
+
+fn miss_way(pc: u64, way: u8) {
+    MISS_WAY.with(|c| {
+        let (p, w, n) = c.get();
+        c.set((pc, way, if p == pc && w == way { n.saturating_add(1) } else { 1 }));
+    });
+}
+
+fn livelock_note(pc: u64) {
+    let n = LIVE_WINDOW.with(|w| {
+        let mut w = w.borrow_mut();
+        w.0 += 1;
+        if w.0 > LIVELOCK_WINDOW {
+            w.0 = 1;
+            w.1.clear();
+        }
+        let n = w.1.entry(pc).or_insert(0);
+        *n += 1;
+        *n
+    });
+    if n != LIVELOCK_MISSES || !LIVE_SAID.with(|s| s.borrow_mut().insert(pc)) {
+        return;
+    }
+    LIVELOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (wpc, way, wn) = MISS_WAY.with(|c| c.get());
+    let way = if wpc == pc { format!("{} ({wn} times running)", MISS_WAYS.get(way as usize).unwrap_or(&"?")) } else { format!("last miss here was not dealt with; the last one was at {wpc:#x}") };
+    let mut pages = Vec::new();
+    for page in [gex_abi::dispatch_page(pc), gex_abi::dispatch_page(pc) + 1] {
+        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+        let (pt, retired) = with_jit(|h| (h.jit.page_table.lookup(page), h.jit.retired_pages.contains(&page)));
+        pages.push(format!("page {page:#x}: directory {dir:#x}, page table {pt:x?}, retired {retired}"));
+    }
+    let (translated, remiss) = with_jit(|h| (h.jit.translated.contains(&pc), h.jit.remiss.get(&pc).copied().unwrap_or(0)));
+    let line = format!(
+        "gex: LIVELOCK? pid {} missed dispatch at {pc:#x} {LIVELOCK_MISSES} times in {LIVELOCK_WINDOW} misses ({}); \
+         the miss path: {way}; {}; dense index {}; function table: knows {}, index {:?}, unit serves {}, behind {}; \
+         translated {translated}, translations of it {remiss}; aot {}\n",
+        my_pid(),
+        with_host(|h| object_off_at(h, pc)),
+        pages.join("; "),
+        dense::lookup(pc),
+        cgen::knows(pc),
+        cgen::index_of(pc),
+        cgen::unit_serves(pc),
+        cgen::behind(),
+        aot(),
+    );
+    warn_line(&line);
 }
 
 /// The pc of the most recent dispatch miss, for the host's install check.
@@ -12540,12 +12681,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
     miss_count(0);
+    livelock_note(pc);
     // A miss a slot conflict or the bridge asks for (they drop the answer
     // and dispatch again): never left by returning.
     let no_leave = NO_LEAVE.with(|c| c.replace(false));
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
+        miss_way(pc, 1);
         miss_count(1);
         // AOT-only: catch up inside the call and dispatch again, keeping the
         // thread's frames (leaving would resume at continuations no unit
@@ -12560,12 +12703,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     // Control leaving an exception dispatched nested (nt::exc_escape).
     if nt::exc_escape(_ctx, pc) {
+        miss_way(pc, 2);
         set_resume_none();
         trap();
     }
     // The return a call-out of this Worker waits for, untranslated: that
     // call-out is done (cgen::returned; JS's nested loop ends it).
     if cgen::returned(pc, _ctx as u32 as u64) {
+        miss_way(pc, 3);
         miss_count(2);
         if !no_leave && cgen::may_leave() {
             return gex_emit::module::DISPATCH_MISS_LEAVE;
@@ -12578,6 +12723,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Worker has not instantiated: JavaScript catches up, then the dispatch
     // is retried (`dense::missing`).
     if dense::missing(pc) {
+        miss_way(pc, 4);
         miss_count(3);
         dense::want(pc);
         if in_place(_ctx, pc) {
@@ -12608,6 +12754,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if fjit::serve(pc) {
+        miss_way(pc, 6);
         miss_count(4);
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
@@ -12619,6 +12766,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // An address an ELF export provider (or a replaced library's provider)
     // holds whose slot lost its bridge.
     if cgen::elfprov::rebridge(pc) {
+        miss_way(pc, 7);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
@@ -12630,11 +12778,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
     // guest goes on at this pc.
     if cgen::w3_miss(pc) {
+        miss_way(pc, 8);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();
     }
     remiss(pc);
+    miss_way(pc, 13);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -12794,6 +12944,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
         let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
         if fresh {
+            miss_way(pc, 10);
             FILL_FROM.with(|c| c.set(from));
             FILL_PC.with(|c| c.set(pc));
             FILL_WANTED.with(|c| c.set(page as i64));
@@ -12820,6 +12971,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             n
         });
         if n <= 3 {
+            miss_way(pc, 11);
             miss_count(5);
             nt::serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
@@ -12951,6 +13103,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
     }
     if maybe_recompile_at(pc) {
+        miss_way(pc, 12);
         // The same resume the ordinary path uses: come back at the address
         // that missed, once JavaScript has instantiated what was queued and
         // the address resolves.
@@ -13786,6 +13939,15 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
     retire_ranges(h, ranges);
 }
 
+/// `gex_test_unpublished_retire(1)` (GEX_TEST_UNPUBLISHED_RETIRE): see
+/// `retire_ranges`. A test switch, off in every real run.
+static TEST_UNPUBLISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_unpublished_retire(on: i32) {
+    TEST_UNPUBLISHED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `retire_code`'s work on the JIT state, without the bookkeeping.
 fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -13808,6 +13970,13 @@ fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
             unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+            // TEST(gex_test_unpublished_retire): the retired page numbered
+            // again at once and its entry left unwritten, as a publisher
+            // that numbered pages and has not installed (or never will)
+            // leaves them (tests/x86-programs/page-cross-entry.c).
+            if TEST_UNPUBLISHED.load(Ordering::Relaxed) {
+                let _ = h.jit.page_table.base(page);
+            }
         }
     }
 }
