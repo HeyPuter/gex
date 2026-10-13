@@ -26,6 +26,12 @@ pub const MANIFEST: &str = "build/web/manifest.json";
 
 /// The browser runtime's JavaScript, as built into this gexc.
 pub const GEX_MJS: &str = include_str!("../../../shims/browser/js/gex.mjs");
+/// The modules `gex.mjs` imports, vendored beside it.
+pub const GEX_MJS_DEPS: [(&str, &str); 3] = [
+    ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
+    ("xcache.mjs", include_str!("../../../shims/browser/js/xcache.mjs")),
+    ("single.mjs", include_str!("../../../shims/browser/js/single.mjs")),
+];
 
 /// Why this project cannot have a web build, if it cannot.
 pub fn unsupported(project: &Project) -> Option<String> {
@@ -401,9 +407,10 @@ createServer(async (req, res) => {
   const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
   if (path.includes('..')) { res.writeHead(403).end(); return; }
   try {
-    const body = await readFile(join(here, path === '/' || path === '/index.html' ? 'user/index.html' : path));
+    const file = path === '/' || path === '/index.html' ? 'user/index.html' : path;
+    const body = await readFile(join(here, file));
     res.writeHead(200, {
-      'Content-Type': types[extname(path)] ?? 'application/octet-stream',
+      'Content-Type': types[extname(file)] ?? 'application/octet-stream',
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     });

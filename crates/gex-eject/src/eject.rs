@@ -394,6 +394,9 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
     write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
     write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
+    for (f, text) in crate::web::GEX_MJS_DEPS {
+        write_file(&out.join("runtime/web").join(f), text.as_bytes(), false)?;
+    }
     if let (Some(shim), true) = (&o.web_shim, nt.is_some()) {
         // A Windows program runs on the shared-memory x86 shim with its
         // kernel and seed (the browser's NT layer), named by their directory
