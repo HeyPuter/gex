@@ -3691,7 +3691,7 @@ export class Gex {
       const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
       const bytes = this.#env.loadFile?.(file) ?? null;
       if (!bytes) {
-        console.error(`gex-cgen: no provider module ${file} in the unit cache (build it natively: a run of the program, or gexc cgen-prefix)`);
+        console.error(`gex-nt: missing unit: no provider module ${file} in the unit cache, so ${this.#cgenStr(e.gex_cgen_path, u)} runs without its providers; build them with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --providers (or natively: a run of the program, or gexc cgen-prefix)`);
         continue;
       }
       const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);

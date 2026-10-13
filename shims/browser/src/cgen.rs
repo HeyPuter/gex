@@ -647,6 +647,17 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
         ));
         return 1;
     }
+    // A unit gexc builds apart from any image (the NT trampolines: every
+    // system call and Unix call goes through them): no "unitless" image
+    // line names it, and without it every trampoline misses into tier-1.
+    if x.path.starts_with('[') {
+        crate::warn_line(&format!(
+            "gex-nt: missing unit: {} (key {}) has no function-tier unit, so every call through it misses into tier-1; \
+             build it with GEX_CGEN_CACHE=<the unit cache> gexc cgen-image --nt-trampolines32\n",
+            x.path, x.key
+        ));
+        return 0;
+    }
     // Loudly, as natively: a unit built at another base (or under another
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
