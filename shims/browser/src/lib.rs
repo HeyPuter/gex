@@ -7118,6 +7118,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].waiting = Waiting::Exited;
+                // Nowhere to resume this thread. A resume left from before
+                // (a call-out's return, `cgen::returned`, which a call-out
+                // that was not the one returned to leaves set) would be
+                // entered by the run loop: a Wine thread's pthread_exit under
+                // its start routine's call-out went back to the call-out's
+                // return pad and the process died of its breakpoint (133).
+                set_resume_none();
+                set_resume_ctx_none();
                 3
             }
             SyscallOutcome::Blocking(op) => {
