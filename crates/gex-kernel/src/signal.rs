@@ -14,6 +14,9 @@
 use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
+use crate::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Signal numbers.
 pub mod sig {
@@ -126,18 +129,226 @@ pub enum Delivery {
     Terminate { signal: u32, core: bool },
 }
 
-/// Per-process signal state.
-#[derive(Debug, Clone)]
-pub struct Signals {
-    actions: [SigAction; sig::MAX as usize + 1],
-    /// Signals raised but not yet delivered.
-    pending: u64,
-    /// Who sent each pending signal, when a process did (`kill`, `tgkill`):
-    /// what its siginfo reports instead of `SI_KERNEL`. `None` for one the
-    /// kernel raised itself.
-    sources: [Option<Source>; sig::MAX as usize + 1],
-    /// Signals the guest has blocked.
-    pub blocked: u64,
+/// Slots in a per-signal table: index 0 is unused, as in a `sigset_t`.
+const NSIG: usize = sig::MAX as usize + 1;
+
+/// One armed interval timer.
+///
+/// Times are absolute nanoseconds on the same clock the guest reads, because
+/// a deadline compared against a clock that can be replaced per host has to
+/// be in that clock's terms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Itimer {
+    /// When it next fires.
+    pub next: u128,
+    /// What to reload on firing. Zero is a one-shot timer, which disarms.
+    pub interval: u128,
+}
+
+/// No timer armed, in [`ProcSig`]'s `timer_next`.
+const NO_TIMER: u64 = u64::MAX;
+
+/// The process's part of the signal state, shared by its threads and read
+/// without the kernel lock (docs/kernel-locking.md §3.8): dispositions behind
+/// an `RwLock`, the process-directed pending set as one atomic word (with
+/// its senders behind a `Mutex`), and the interval timers, whose earliest
+/// deadline is an atomic word so asking "is one due" takes no lock.
+pub struct ProcSig {
+    actions: RwLock<[SigAction; NSIG]>,
+    /// Process-directed signals (another process's `kill`, a timer, a
+    /// child's exit): any thread that does not block one may take it. A
+    /// thread's own (`tgkill`, faults) are its [`ThreadSig`]'s. Linux keeps
+    /// the two sets apart the same way.
+    shared: AtomicU64,
+    shared_sources: Mutex<[Option<Source>; NSIG]>,
+    /// The interval timers, indexed by `which`.
+    timers: Mutex<[Option<Itimer>; 3]>,
+    /// The earliest armed timer's deadline, clamped to `u64`; [`NO_TIMER`]
+    /// when none is armed. Written under `timers`.
+    timer_next: AtomicU64,
+}
+
+impl std::fmt::Debug for ProcSig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcSig")
+            .field("shared", &format_args!("{:#x}", self.shared.load(Ordering::Relaxed)))
+            .field("timer_next", &self.timer_next.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProcSig {
+    fn with_actions(actions: [SigAction; NSIG]) -> ProcSig {
+        ProcSig {
+            actions: RwLock::new(actions),
+            shared: AtomicU64::new(0),
+            shared_sources: Mutex::new([None; NSIG]),
+            timers: Mutex::new([None; 3]),
+            timer_next: AtomicU64::new(NO_TIMER),
+        }
+    }
+
+    /// Mark a process-directed signal pending: whichever thread does not
+    /// block it takes it.
+    pub fn raise(&self, signal: u32, source: Option<Source>) {
+        if signal > 0 && signal <= sig::MAX {
+            self.shared_sources.lock()[signal as usize] = source;
+            self.shared.fetch_or(bit(signal), Ordering::AcqRel);
+        }
+    }
+
+    /// The process-directed pending set.
+    pub fn shared(&self) -> u64 {
+        self.shared.load(Ordering::Acquire)
+    }
+
+    pub fn action(&self, signal: u32) -> SigAction {
+        self.actions.read()[(signal as usize).min(sig::MAX as usize)]
+    }
+
+    /// Whether a signal that would do something is ready for a thread whose
+    /// own pending set and mask are `pending` and `blocked`, counting this
+    /// process's shared set. An ignored one, or one whose default is to be
+    /// ignored, does not count: see [`Signals::would_deliver`].
+    pub fn would_deliver_with(&self, pending: u64, blocked: u64) -> bool {
+        let mut ready = (pending | self.shared()) & !blocked;
+        if ready == 0 {
+            return false;
+        }
+        let actions = self.actions.read();
+        while ready != 0 {
+            let signal = ready.trailing_zeros() + 1;
+            ready &= ready - 1;
+            let action = actions[signal as usize];
+            if action.handler == SIG_IGN {
+                continue;
+            }
+            if action.handler == SIG_DFL && default_action(signal) == DefaultAction::Ignore {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Interval timer `which`.
+    pub fn timer(&self, which: usize) -> Option<Itimer> {
+        self.timers.lock().get(which).copied().flatten()
+    }
+
+    /// Arm or disarm interval timer `which`.
+    pub fn set_timer(&self, which: usize, t: Option<Itimer>) {
+        let mut timers = self.timers.lock();
+        if let Some(slot) = timers.get_mut(which) {
+            *slot = t;
+        }
+        self.timer_next.store(earliest(&timers), Ordering::Release);
+    }
+
+    /// Whether any interval timer is armed.
+    pub fn timers_armed(&self) -> bool {
+        self.timer_next.load(Ordering::Acquire) != NO_TIMER
+    }
+
+    /// Whether an interval timer has expired at `now` and has yet to raise
+    /// its signal.
+    pub fn timer_due(&self, now: u128) -> bool {
+        let next = self.timer_next.load(Ordering::Acquire);
+        next != NO_TIMER && now >= next as u128
+    }
+
+    /// How long from `now` until the next interval timer fires, if one is
+    /// armed.
+    pub fn timer_in_ns(&self, now: u128) -> Option<u64> {
+        let next = self.timer_next.load(Ordering::Acquire);
+        (next != NO_TIMER).then(|| (next as u128).saturating_sub(now).min(u64::MAX as u128) as u64)
+    }
+
+    /// Fire any timer whose deadline has passed at `now`, and reload it if
+    /// it repeats.
+    ///
+    /// `ITIMER_VIRTUAL`/`ITIMER_PROF` should count CPU time but are driven
+    /// from the same wall clock as the rest.
+    pub fn fire_timers(&self, now: u128) {
+        if !self.timer_due(now) {
+            return;
+        }
+        let mut timers = self.timers.lock();
+        for which in 0..3 {
+            let Some(timer) = timers[which] else {
+                continue;
+            };
+            if now < timer.next {
+                continue;
+            }
+            timers[which] = if timer.interval == 0 {
+                None
+            } else {
+                // Skip whole missed periods rather than firing once per
+                // period afterwards: a guest that was away for a second with
+                // a millisecond timer does not want a thousand signals.
+                let missed = (now - timer.next) / timer.interval + 1;
+                Some(Itimer {
+                    next: timer.next + missed * timer.interval,
+                    interval: timer.interval,
+                })
+            };
+            self.raise(
+                match which {
+                    1 => sig::SIGVTALRM,
+                    2 => sig::SIGPROF,
+                    _ => sig::SIGALRM,
+                },
+                None,
+            );
+        }
+        self.timer_next.store(earliest(&timers), Ordering::Release);
+    }
+
+    /// Move signals other processes have sent this one (`pid`) into its
+    /// shared pending set, with who sent each that `kill` sent. Returns what
+    /// arrived.
+    ///
+    /// `kill` cannot reach into another process's kernel -- each has its own
+    /// -- so it leaves the signal on a shared per-process word and the target
+    /// picks it up here. This is what makes `timeout`, job control and every
+    /// supervisor work.
+    pub fn collect(&self, procs: &crate::proc::ProcTable, pid: i32, uid: u32) -> u64 {
+        let inbox = procs.take_signals(pid);
+        if inbox == 0 {
+            return 0;
+        }
+        // Each signal raised once, with its sender: raised twice, a thread
+        // delivering between the two (without the kernel lock) would see it
+        // pending again after taking it.
+        let mut sources = [None; NSIG];
+        for (signo, pid) in procs.take_kill_senders(pid, inbox) {
+            if let Some(slot) = sources.get_mut(signo as usize) {
+                *slot = Some(Source { code: SI_USER, pid, uid });
+            }
+        }
+        for signo in 1..=64u32 {
+            if inbox & (1u64 << (signo - 1)) != 0 {
+                self.raise(signo, sources[signo as usize]);
+            }
+        }
+        inbox
+    }
+}
+
+fn earliest(timers: &[Option<Itimer>; 3]) -> u64 {
+    timers
+        .iter()
+        .flatten()
+        .map(|t| t.next.min(NO_TIMER as u128 - 1) as u64)
+        .min()
+        .unwrap_or(NO_TIMER)
+}
+
+/// The handler state of one thread that only that thread reads or writes:
+/// its alternate stack and what the frame it is in looks like.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Own {
     pub alt_stack: SigAltStack,
     /// Set while a handler runs, so `rt_sigreturn` knows a frame exists.
     pub in_handler: bool,
@@ -154,58 +365,111 @@ pub struct Signals {
     /// and `sigreturn` restores it -- without it the woken signal stays blocked
     /// and pending forever (`timeout` spun 2.2 million times).
     pub suspend_restore: Option<u64>,
-    /// Process-directed signals (another process's `kill`, a timer, a child's
-    /// exit): any thread that does not block one may take it. `pending`
-    /// above is the current thread's own (`tgkill`, faults). Linux keeps the
-    /// two sets apart the same way.
-    shared: u64,
-    shared_sources: [Option<Source>; sig::MAX as usize + 1],
 }
 
-/// The part of [`Signals`] that belongs to one thread, which the kernel
-/// swaps in for whichever thread is running (`Kernel::enter_thread`): its
-/// own pending signals, mask, alternate stack and handler state. The
-/// dispositions and process-directed pending set are the process's.
-#[derive(Debug, Clone)]
-pub struct ThreadSignals {
-    pending: u64,
-    sources: [Option<Source>; sig::MAX as usize + 1],
-    pub blocked: u64,
-    alt_stack: SigAltStack,
-    in_handler: bool,
-    legacy_frame: bool,
-    suspend_restore: Option<u64>,
+/// One thread's signal state, shared (`Arc`) between the thread and whoever
+/// sends it a signal or asks whether it has one ready
+/// (docs/kernel-locking.md §3.8). Its pending set and mask are atomic words
+/// any thread reads without a lock; only the thread itself writes the mask
+/// and [`Own`].
+pub struct ThreadSig {
+    /// Signals raised for this thread alone (`tgkill`, faults) and not yet
+    /// delivered.
+    pending: AtomicU64,
+    /// Signals the thread has blocked.
+    blocked: AtomicU64,
+    /// Who sent each pending signal, when a process did (`kill`, `tgkill`):
+    /// what its siginfo reports instead of `SI_KERNEL`. `None` for one the
+    /// kernel raised itself.
+    sources: Mutex<[Option<Source>; NSIG]>,
+    own: Mutex<Own>,
 }
 
-impl ThreadSignals {
+impl std::fmt::Debug for ThreadSig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadSig")
+            .field("pending", &format_args!("{:#x}", self.pending()))
+            .field("blocked", &format_args!("{:#x}", self.blocked()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadSig {
     /// A new thread's: its creator's mask, nothing pending, no alternate
     /// stack (a thread sets its own), not in a handler.
-    pub fn new_thread(blocked: u64) -> ThreadSignals {
-        ThreadSignals {
-            pending: 0,
-            sources: [None; sig::MAX as usize + 1],
-            blocked,
-            alt_stack: SigAltStack::default(),
-            in_handler: false,
-            legacy_frame: false,
-            suspend_restore: None,
+    pub fn new_thread(blocked: u64) -> ThreadSig {
+        ThreadSig {
+            pending: AtomicU64::new(0),
+            blocked: AtomicU64::new(blocked),
+            sources: Mutex::new([None; NSIG]),
+            own: Mutex::new(Own::default()),
         }
     }
 
-    /// Mark a thread-directed signal pending on a thread that is not the one
-    /// running (`tgkill` to another thread).
-    pub fn raise_from(&mut self, signal: u32, source: Source) {
+    /// Mark a signal pending for this thread, sent by `source` (`None`: the
+    /// kernel raised it). A standard signal does not queue, so the last
+    /// sender is the one reported.
+    pub fn raise(&self, signal: u32, source: Option<Source>) {
         if signal > 0 && signal <= sig::MAX {
-            self.pending |= bit(signal);
-            self.sources[signal as usize] = Some(source);
+            self.sources.lock()[signal as usize] = source;
+            self.pending.fetch_or(bit(signal), Ordering::AcqRel);
         }
+    }
+
+    /// Mark a thread-directed signal pending, as sent by a process
+    /// (`tgkill` to another thread).
+    pub fn raise_from(&self, signal: u32, source: Source) {
+        self.raise(signal, Some(source));
+    }
+
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    pub fn blocked(&self) -> u64 {
+        self.blocked.load(Ordering::Acquire)
     }
 
     /// Whether a signal that would do something is ready for this thread,
-    /// counting the process's shared set (`Signals::would_deliver`'s rule).
-    pub fn would_deliver(&self, process: &Signals) -> bool {
-        process.would_deliver_with(self.pending, self.blocked)
+    /// counting its process's shared set ([`ProcSig::would_deliver_with`]).
+    /// Takes no lock unless an unblocked signal is pending.
+    pub fn ready(&self, process: &ProcSig) -> bool {
+        process.would_deliver_with(self.pending(), self.blocked())
     }
+}
+
+/// The calling thread's mask and [`Own`] state, copied out to be read and
+/// changed by a frame being built or unwound, and stored back when dropped.
+/// Only the thread itself writes them, so the copy cannot go stale.
+pub struct OwnView<'a> {
+    thread: &'a ThreadSig,
+    pub blocked: u64,
+    pub alt_stack: SigAltStack,
+    pub in_handler: bool,
+    pub legacy_frame: bool,
+    pub suspend_restore: Option<u64>,
+}
+
+impl Drop for OwnView<'_> {
+    fn drop(&mut self) {
+        self.thread.blocked.store(self.blocked, Ordering::Release);
+        *self.thread.own.lock() = Own {
+            alt_stack: self.alt_stack,
+            in_handler: self.in_handler,
+            legacy_frame: self.legacy_frame,
+            suspend_restore: self.suspend_restore,
+        };
+    }
+}
+
+/// A process's signal state as one thread sees it: the process's
+/// [`ProcSig`] and the running thread's [`ThreadSig`]. Which thread is
+/// running is a pointer to swap ([`Signals::switch_to`]), not state to copy
+/// in and out.
+#[derive(Debug)]
+pub struct Signals {
+    proc: Arc<ProcSig>,
+    cur: Arc<ThreadSig>,
 }
 
 impl Default for Signals {
@@ -215,66 +479,39 @@ impl Default for Signals {
 }
 
 impl Signals {
-    /// The signal state a forked child starts with.
-    ///
-    /// Dispositions and the blocked mask are inherited; the pending set is
-    /// not, and neither is a handler frame -- the child begins between
-    /// instructions, not inside a handler.
-    pub fn fork(&self) -> Signals {
+    pub fn new() -> Signals {
         Signals {
-            actions: self.actions,
-            pending: 0,
-            sources: [None; sig::MAX as usize + 1],
-            blocked: self.blocked,
-            suspend_restore: None,
-            alt_stack: self.alt_stack,
-            in_handler: false,
-            legacy_frame: false,
-            shared: 0,
-            shared_sources: [None; sig::MAX as usize + 1],
+            proc: Arc::new(ProcSig::with_actions([SigAction::default(); NSIG])),
+            cur: Arc::new(ThreadSig::new_thread(0)),
         }
     }
 
-    /// The running thread's part, to keep while another runs.
-    pub fn save_thread(&self) -> ThreadSignals {
-        ThreadSignals {
-            pending: self.pending,
-            sources: self.sources,
-            blocked: self.blocked,
-            alt_stack: self.alt_stack,
-            in_handler: self.in_handler,
-            legacy_frame: self.legacy_frame,
-            suspend_restore: self.suspend_restore,
-        }
+    /// The process's part.
+    pub fn process(&self) -> &Arc<ProcSig> {
+        &self.proc
+    }
+
+    /// The running thread's part.
+    pub fn thread(&self) -> &Arc<ThreadSig> {
+        &self.cur
     }
 
     /// Make `t` the running thread's part.
-    pub fn load_thread(&mut self, t: ThreadSignals) {
-        self.pending = t.pending;
-        self.sources = t.sources;
-        self.blocked = t.blocked;
-        self.alt_stack = t.alt_stack;
-        self.in_handler = t.in_handler;
-        self.legacy_frame = t.legacy_frame;
-        self.suspend_restore = t.suspend_restore;
+    pub fn switch_to(&mut self, t: Arc<ThreadSig>) {
+        self.cur = t;
     }
 
-    /// Mark a process-directed signal pending: whichever thread does not
-    /// block it takes it.
-    pub fn raise_shared(&mut self, signal: u32, source: Option<Source>) {
-        if signal > 0 && signal <= sig::MAX {
-            self.shared |= bit(signal);
-            self.shared_sources[signal as usize] = source;
-        }
-    }
-
-    /// Clear `signal` as delivered or taken: the thread's own first, else
-    /// the process's.
-    pub fn clear_pending(&mut self, signal: u32) {
-        if self.pending & bit(signal) != 0 {
-            self.pending &= !bit(signal);
-        } else {
-            self.shared &= !bit(signal);
+    /// The signal state a forked child starts with.
+    ///
+    /// Dispositions, the blocked mask and the alternate stack are inherited;
+    /// the pending set is not, nor are the timers, and neither is a handler
+    /// frame -- the child begins between instructions, not inside a handler.
+    pub fn fork(&self) -> Signals {
+        let cur = ThreadSig::new_thread(self.blocked());
+        cur.own.lock().alt_stack = self.alt_stack();
+        Signals {
+            proc: Arc::new(ProcSig::with_actions(*self.proc.actions.read())),
+            cur: Arc::new(cur),
         }
     }
 
@@ -286,19 +523,206 @@ impl Signals {
     /// handler). Ignored stays ignored, the blocked mask and pending signals
     /// carry over, per POSIX; the alternate stack does not -- it too pointed into
     /// the old image.
-    pub fn exec(&mut self) {
-        for action in self.actions.iter_mut() {
+    pub fn exec(&self) {
+        for action in self.proc.actions.write().iter_mut() {
             if action.handler != SIG_DFL && action.handler != SIG_IGN {
                 *action = SigAction::default();
             }
         }
-        self.alt_stack = SigAltStack::default();
-        self.in_handler = false;
-        self.suspend_restore = None;
+        let mut own = self.cur.own.lock();
+        own.alt_stack = SigAltStack::default();
+        own.in_handler = false;
+        own.suspend_restore = None;
+    }
+
+    pub fn action(&self, signal: u32) -> SigAction {
+        self.proc.action(signal)
+    }
+
+    pub fn set_action(&self, signal: u32, action: SigAction) -> Result<(), Errno> {
+        // SIGKILL and SIGSTOP cannot be caught or ignored.
+        if signal == 0 || signal > sig::MAX || signal == sig::SIGKILL || signal == sig::SIGSTOP {
+            return Err(Errno::EINVAL);
+        }
+        // Nor blocked, by a handler's mask either (Linux strips them).
+        let mut action = action;
+        action.mask &= !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
+        self.proc.actions.write()[signal as usize] = action;
+        Ok(())
+    }
+
+    /// The running thread's mask.
+    pub fn blocked(&self) -> u64 {
+        self.cur.blocked()
+    }
+
+    /// Set the running thread's mask.
+    pub fn set_blocked(&self, mask: u64) {
+        self.cur.blocked.store(mask, Ordering::Release);
+    }
+
+    pub fn alt_stack(&self) -> SigAltStack {
+        self.cur.own.lock().alt_stack
+    }
+
+    pub fn set_alt_stack(&self, a: SigAltStack) {
+        self.cur.own.lock().alt_stack = a;
+    }
+
+    /// Whether the running thread is in a handler.
+    pub fn in_handler(&self) -> bool {
+        self.cur.own.lock().in_handler
+    }
+
+    /// Leave `mask` for the next frame to record (`rt_sigsuspend`); see
+    /// [`Own::suspend_restore`].
+    pub fn set_suspend_restore(&self, mask: Option<u64>) {
+        self.cur.own.lock().suspend_restore = mask;
+    }
+
+    pub fn take_suspend_restore(&self) -> Option<u64> {
+        self.cur.own.lock().suspend_restore.take()
+    }
+
+    /// The running thread's mask and handler state, to change and store
+    /// back on drop.
+    pub fn own(&self) -> OwnView<'_> {
+        let own = *self.cur.own.lock();
+        OwnView {
+            thread: &self.cur,
+            blocked: self.cur.blocked(),
+            alt_stack: own.alt_stack,
+            in_handler: own.in_handler,
+            legacy_frame: own.legacy_frame,
+            suspend_restore: own.suspend_restore,
+        }
+    }
+
+    /// Mark a process-directed signal pending: whichever thread does not
+    /// block it takes it.
+    pub fn raise_shared(&self, signal: u32, source: Option<Source>) {
+        self.proc.raise(signal, source);
+    }
+
+    /// Mark a signal pending, as the kernel raising it itself (`SI_KERNEL`).
+    pub fn raise(&self, signal: u32) {
+        self.cur.raise(signal, None);
+    }
+
+    /// Mark a signal pending, as sent by a process: `kill` (`SI_USER`) or
+    /// `tkill`/`tgkill` (`SI_TKILL`). A standard signal does not queue, so the
+    /// last sender is the one reported.
+    pub fn raise_from(&self, signal: u32, source: Source) {
+        self.cur.raise(signal, Some(source));
+    }
+
+    /// Clear `signal` as delivered or taken: the thread's own first, else
+    /// the process's.
+    pub fn clear_pending(&self, signal: u32) {
+        let b = bit(signal);
+        if self.cur.pending.fetch_and(!b, Ordering::AcqRel) & b == 0 {
+            self.proc.shared.fetch_and(!b, Ordering::AcqRel);
+        }
+    }
+
+    /// Take `signal` off the pending sets to deliver it, with who sent it:
+    /// the thread's own first, else the process's. `None` when it is no
+    /// longer pending, because another thread took it first.
+    pub fn claim(&self, signal: u32) -> Option<Option<Source>> {
+        let b = bit(signal);
+        let i = (signal as usize).min(sig::MAX as usize);
+        if self.cur.pending.fetch_and(!b, Ordering::AcqRel) & b != 0 {
+            return Some(self.cur.sources.lock()[i].take());
+        }
+        if self.proc.shared.fetch_and(!b, Ordering::AcqRel) & b != 0 {
+            return Some(self.proc.shared_sources.lock()[i].take());
+        }
+        None
+    }
+
+    /// A process's signal state as thread `cur` sees it: for a host that
+    /// delivers to its own thread without the kernel.
+    pub fn view(proc: Arc<ProcSig>, cur: Arc<ThreadSig>) -> Signals {
+        Signals { proc, cur }
+    }
+
+    /// Forget who sent `signal`: a synchronous fault reports itself, whatever
+    /// a process may also have sent.
+    pub fn forget_source(&self, signal: u32) {
+        if signal > 0 && signal <= sig::MAX {
+            self.cur.sources.lock()[signal as usize] = None;
+        }
+    }
+
+    /// Take who sent `signal`, as its delivery reports it.
+    pub fn take_source(&self, signal: u32) -> Option<Source> {
+        let i = (signal as usize).min(sig::MAX as usize);
+        if self.cur.pending() & bit(signal) != 0 {
+            self.cur.sources.lock()[i].take()
+        } else {
+            self.proc.shared_sources.lock()[i].take()
+        }
+    }
+
+    /// Take the lowest-numbered pending signal in `set`, blocked or not.
+    ///
+    /// `sigwaitinfo` is used precisely on signals the caller has blocked, so
+    /// this deliberately ignores the mask [`Signals::next_deliverable`] respects.
+    pub fn take_pending_in(&self, set: u64) -> Option<u32> {
+        let ready = self.pending_raw() & set;
+        if ready == 0 {
+            return None;
+        }
+        let signal = ready.trailing_zeros() + 1;
+        self.clear_pending(signal);
+        Some(signal)
+    }
+
+    /// Everything raised, deliverable or not. For diagnostics only.
+    pub fn pending_raw(&self) -> u64 {
+        self.cur.pending() | self.proc.shared()
+    }
+
+    /// Thread `t`'s pending signals with this process's shared set.
+    pub fn pending_raw_for(&self, t: &ThreadSig) -> u64 {
+        t.pending() | self.proc.shared()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending_raw() & !self.blocked() != 0
+    }
+
+    /// Whether a pending signal would actually *do* something -- a handler, or a
+    /// non-`Ignore` default. `has_pending` only asks whether an unblocked bit is
+    /// set, which is wrong for ending a wait: `SIGCHLD` is ignored by default and
+    /// arrives on every child exit, and would otherwise interrupt a shell's wait
+    /// for nothing.
+    pub fn would_deliver(&self) -> bool {
+        self.cur.ready(&self.proc)
+    }
+
+    /// [`Self::would_deliver`] for a thread whose own pending set and mask
+    /// are `pending` and `blocked` (with this process's dispositions and
+    /// shared set).
+    pub fn would_deliver_with(&self, pending: u64, blocked: u64) -> bool {
+        self.proc.would_deliver_with(pending, blocked)
+    }
+
+    /// [`Self::next_deliverable`], for a trace.
+    pub fn peek_deliverable(&self) -> Option<u32> {
+        self.next_deliverable()
+    }
+
+    /// The lowest-numbered deliverable signal, if any.
+    fn next_deliverable(&self) -> Option<u32> {
+        let ready = self.pending_raw() & !self.blocked();
+        if ready == 0 {
+            return None;
+        }
+        Some(ready.trailing_zeros() + 1)
     }
 }
 
-/// Bit for a signal in a `sigset_t`. Signal 1 is bit 0.
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Source {
@@ -313,150 +737,12 @@ pub const SI_USER: i32 = 0;
 /// `si_code` for a signal sent by `tkill` or `tgkill`.
 pub const SI_TKILL: i32 = -6;
 
+/// Bit for a signal in a `sigset_t`. Signal 1 is bit 0.
 fn bit(signal: u32) -> u64 {
     if signal == 0 || signal > 64 {
         0
     } else {
         1u64 << (signal - 1)
-    }
-}
-
-impl Signals {
-    pub fn new() -> Signals {
-        Signals {
-            actions: [SigAction::default(); sig::MAX as usize + 1],
-            pending: 0,
-            sources: [None; sig::MAX as usize + 1],
-            blocked: 0,
-            suspend_restore: None,
-            alt_stack: SigAltStack::default(),
-            in_handler: false,
-            legacy_frame: false,
-            shared: 0,
-            shared_sources: [None; sig::MAX as usize + 1],
-        }
-    }
-
-    pub fn action(&self, signal: u32) -> SigAction {
-        self.actions[(signal as usize).min(sig::MAX as usize)]
-    }
-
-    pub fn set_action(&mut self, signal: u32, action: SigAction) -> Result<(), Errno> {
-        // SIGKILL and SIGSTOP cannot be caught or ignored.
-        if signal == 0 || signal > sig::MAX || signal == sig::SIGKILL || signal == sig::SIGSTOP {
-            return Err(Errno::EINVAL);
-        }
-        // Nor blocked, by a handler's mask either (Linux strips them).
-        let mut action = action;
-        action.mask &= !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
-        self.actions[signal as usize] = action;
-        Ok(())
-    }
-
-    /// Mark a signal pending, as the kernel raising it itself (`SI_KERNEL`).
-    pub fn raise(&mut self, signal: u32) {
-        if signal > 0 && signal <= sig::MAX {
-            self.pending |= bit(signal);
-            self.sources[signal as usize] = None;
-        }
-    }
-
-    /// Mark a signal pending, as sent by a process: `kill` (`SI_USER`) or
-    /// `tkill`/`tgkill` (`SI_TKILL`). A standard signal does not queue, so the
-    /// last sender is the one reported.
-    pub fn raise_from(&mut self, signal: u32, source: Source) {
-        if signal > 0 && signal <= sig::MAX {
-            self.pending |= bit(signal);
-            self.sources[signal as usize] = Some(source);
-        }
-    }
-
-    /// Forget who sent `signal`: a synchronous fault reports itself, whatever
-    /// a process may also have sent.
-    pub fn forget_source(&mut self, signal: u32) {
-        if signal > 0 && signal <= sig::MAX {
-            self.sources[signal as usize] = None;
-        }
-    }
-
-    /// Take who sent `signal`, as its delivery reports it.
-    pub fn take_source(&mut self, signal: u32) -> Option<Source> {
-        if self.pending & bit(signal) != 0 {
-            self.sources.get_mut(signal as usize).and_then(Option::take)
-        } else {
-            self.shared_sources.get_mut(signal as usize).and_then(Option::take)
-        }
-    }
-
-    /// Take the lowest-numbered pending signal in `set`, blocked or not.
-    ///
-    /// `sigwaitinfo` is used precisely on signals the caller has blocked, so
-    /// this deliberately ignores the mask [`Signals::next_deliverable`] respects.
-    pub fn take_pending_in(&mut self, set: u64) -> Option<u32> {
-        let ready = (self.pending | self.shared) & set;
-        if ready == 0 {
-            return None;
-        }
-        let signal = ready.trailing_zeros() + 1;
-        self.clear_pending(signal);
-        Some(signal)
-    }
-
-    /// Everything raised, deliverable or not. For diagnostics only.
-    pub fn pending_raw(&self) -> u64 {
-        self.pending | self.shared
-    }
-
-    /// Thread `t`'s pending signals with this process's shared set.
-    pub fn pending_raw_for(&self, t: &ThreadSignals) -> u64 {
-        t.pending | self.shared
-    }
-
-    pub fn has_pending(&self) -> bool {
-        (self.pending | self.shared) & !self.blocked != 0
-    }
-
-    /// Whether a pending signal would actually *do* something -- a handler, or a
-    /// non-`Ignore` default. `has_pending` only asks whether an unblocked bit is
-    /// set, which is wrong for ending a wait: `SIGCHLD` is ignored by default and
-    /// arrives on every child exit, and would otherwise interrupt a shell's wait
-    /// for nothing.
-    pub fn would_deliver(&self) -> bool {
-        self.would_deliver_with(self.pending, self.blocked)
-    }
-
-    /// [`Self::would_deliver`] for a thread whose own pending set and mask
-    /// are `pending` and `blocked` (with this process's dispositions and
-    /// shared set).
-    pub fn would_deliver_with(&self, pending: u64, blocked: u64) -> bool {
-        let mut ready = (pending | self.shared) & !blocked;
-        while ready != 0 {
-            let signal = ready.trailing_zeros() + 1;
-            ready &= ready - 1;
-            let action = self.action(signal);
-            if action.handler == SIG_IGN {
-                continue;
-            }
-            if action.handler == SIG_DFL && default_action(signal) == DefaultAction::Ignore {
-                continue;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// [`Self::next_deliverable`], for a trace.
-    pub fn peek_deliverable(&self) -> Option<u32> {
-        self.next_deliverable()
-    }
-
-    /// The lowest-numbered deliverable signal, if any.
-    fn next_deliverable(&self) -> Option<u32> {
-        let ready = (self.pending | self.shared) & !self.blocked;
-        if ready == 0 {
-            return None;
-        }
-        Some(ready.trailing_zeros() + 1)
     }
 }
 
@@ -544,29 +830,54 @@ pub mod xframe {
 /// Returns the address to resume at. The caller has already established that
 /// a handler is installed.
 pub fn setup_frame(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     signal: u32,
     fault_address: u64,
     compat: bool,
 ) -> Result<u64, Errno> {
+    build_frame(signals, m, ctx_addr, signal, fault_address, compat, Taken::Fault)
+}
+
+/// Whose a signal a frame is built for is, and who sent it.
+#[derive(Clone, Copy, Debug)]
+enum Taken {
+    /// A synchronous fault, raised by the running instruction: its siginfo
+    /// reports the fault, and whatever is pending of it is cleared once the
+    /// frame is built.
+    Fault,
+    /// A pending signal [`Signals::claim`] already took off the pending
+    /// sets, with its sender.
+    Claimed(Option<Source>),
+}
+
+fn build_frame(
+    signals: &Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault_address: u64,
+    compat: bool,
+    taken: Taken,
+) -> Result<u64, Errno> {
     if gex_abi::PPC {
-        return setup_frame_ppc(signals, m, ctx_addr, signal, fault_address);
+        return setup_frame_ppc(signals, m, ctx_addr, signal, fault_address, taken);
     }
     if compat {
-        return setup_frame_i386(signals, m, ctx_addr, signal, fault_address);
+        return setup_frame_i386(signals, m, ctx_addr, signal, fault_address, taken);
     }
     if gex_abi::X86 {
-        return setup_frame_x86(signals, m, ctx_addr, signal, fault_address);
+        return setup_frame_x86(signals, m, ctx_addr, signal, fault_address, taken);
     }
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
 
     // An `SA_ONSTACK` handler runs on the alternate stack, but only if one is
     // installed and we are not already on it.
-    let base = if action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0 {
-        let alt = &signals.alt_stack;
+    let mut own = signals.own();
+    let base = if action.flags & sa::ONSTACK != 0 && own.alt_stack.size > 0 {
+        let alt = &own.alt_stack;
         let top = alt.sp + alt.size;
         if sp > alt.sp && sp <= top {
             sp
@@ -583,19 +894,19 @@ pub fn setup_frame(
 
     // siginfo: si_signo, si_errno, si_code, then the fault address for the
     // synchronous signals, which is what a crash handler reads.
-    write_siginfo(signals, m, frame_addr, signal, fault_address, true)?;
+    write_siginfo(signals, m, frame_addr, signal, fault_address, true, taken)?;
 
     let uc = frame_addr + frame::UCONTEXT as u64;
     m.write_u64(uc + frame::UC_FLAGS as u64, 0)?;
     m.write_u64(uc + frame::UC_LINK as u64, 0)?;
     // uc_stack describes the stack the handler is running on.
-    m.write_u64(uc + frame::UC_STACK as u64, signals.alt_stack.sp)?;
-    m.write_u32(uc + frame::UC_STACK as u64 + 8, signals.alt_stack.flags)?;
-    m.write_u64(uc + frame::UC_STACK as u64 + 16, signals.alt_stack.size)?;
+    m.write_u64(uc + frame::UC_STACK as u64, own.alt_stack.sp)?;
+    m.write_u32(uc + frame::UC_STACK as u64 + 8, own.alt_stack.flags)?;
+    m.write_u64(uc + frame::UC_STACK as u64 + 16, own.alt_stack.size)?;
     // The mask to restore on return is the one in force right now.
     m.write_u64(
         uc + frame::UC_SIGMASK as u64,
-        signals.suspend_restore.take().unwrap_or(signals.blocked),
+        own.suspend_restore.take().unwrap_or(own.blocked),
     )?;
 
     // The machine context: every general register, sp, pc and pstate, taken
@@ -613,12 +924,14 @@ pub fn setup_frame(
 
     // Block this signal for the duration of the handler unless asked not to,
     // plus whatever the action's mask names.
-    signals.blocked |= action.mask;
+    own.blocked |= action.mask;
     if action.flags & sa::NODEFER == 0 {
-        signals.blocked |= bit(signal);
+        own.blocked |= bit(signal);
     }
-    signals.clear_pending(signal);
-    signals.in_handler = true;
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
 
     // A one-shot handler reverts before it runs, as `SA_RESETHAND` requires.
     if action.flags & sa::RESETHAND != 0 {
@@ -642,18 +955,20 @@ pub fn setup_frame(
 
 /// The x86-64 frame builder. See [`xframe`] for the layout.
 fn setup_frame_x86(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     signal: u32,
     fault_address: u64,
+    taken: Taken,
 ) -> Result<u64, Errno> {
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
 
-    let on_alt = action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0;
+    let mut own = signals.own();
+    let on_alt = action.flags & sa::ONSTACK != 0 && own.alt_stack.size > 0;
     let base = if on_alt {
-        let alt = &signals.alt_stack;
+        let alt = &own.alt_stack;
         let top = alt.sp + alt.size;
         if sp > alt.sp && sp <= top {
             sp
@@ -682,18 +997,16 @@ fn setup_frame_x86(
     m.write_u64(frame_addr + xframe::PRETCODE as u64, ret)?;
 
     let info = frame_addr + xframe::SIGINFO as u64;
-    write_siginfo(signals, m, info, signal, fault_address, true)?;
+    write_siginfo(signals, m, info, signal, fault_address, true, taken)?;
 
     let uc = frame_addr + xframe::UCONTEXT as u64;
     m.write_u64(uc + xframe::UC_FLAGS as u64, 0)?;
     m.write_u64(uc + xframe::UC_LINK as u64, 0)?;
-    m.write_u64(uc + xframe::UC_STACK as u64, signals.alt_stack.sp)?;
-    m.write_u32(uc + xframe::UC_STACK as u64 + 8, signals.alt_stack.flags)?;
-    m.write_u64(uc + xframe::UC_STACK as u64 + 16, signals.alt_stack.size)?;
-    m.write_u64(
-        uc + xframe::UC_SIGMASK as u64,
-        signals.suspend_restore.take().unwrap_or(signals.blocked),
-    )?;
+    m.write_u64(uc + xframe::UC_STACK as u64, own.alt_stack.sp)?;
+    m.write_u32(uc + xframe::UC_STACK as u64 + 8, own.alt_stack.flags)?;
+    m.write_u64(uc + xframe::UC_STACK as u64 + 16, own.alt_stack.size)?;
+    let saved_mask = own.suspend_restore.take().unwrap_or(own.blocked);
+    m.write_u64(uc + xframe::UC_SIGMASK as u64, saved_mask)?;
 
     let mc = uc + xframe::UC_MCONTEXT as u64;
     for (i, reg) in xframe::GPR_ORDER.iter().enumerate() {
@@ -706,7 +1019,7 @@ fn setup_frame_x86(
     // cs = __USER_CS (0x33), the other selectors zero.
     m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
     m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
-    m.write_u64(mc + xframe::MC_OLDMASK as u64, signals.blocked)?;
+    m.write_u64(mc + xframe::MC_OLDMASK as u64, saved_mask)?;
     m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
     m.write_u64(mc + xframe::MC_FPSTATE as u64, fpstate)?;
 
@@ -721,12 +1034,14 @@ fn setup_frame_x86(
         }
     }
 
-    signals.blocked |= action.mask;
+    own.blocked |= action.mask;
     if action.flags & sa::NODEFER == 0 {
-        signals.blocked |= bit(signal);
+        own.blocked |= bit(signal);
     }
-    signals.clear_pending(signal);
-    signals.in_handler = true;
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
     }
@@ -743,7 +1058,7 @@ fn setup_frame_x86(
 
 /// The x86-64 `rt_sigreturn`. The handler's `ret` popped the return address,
 /// so the frame starts one word below the stack pointer.
-fn sigreturn_x86(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+fn sigreturn_x86(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
     let frame_addr = m.read_u64(ctx_addr + ctx::SP as u64)? - 8;
     let uc = frame_addr + xframe::UCONTEXT as u64;
     let mc = uc + xframe::UC_MCONTEXT as u64;
@@ -766,8 +1081,9 @@ fn sigreturn_x86(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> 
             }
         }
     }
-    signals.blocked = m.read_u64(uc + xframe::UC_SIGMASK as u64)?;
-    signals.in_handler = false;
+    let mut own = signals.own();
+    own.blocked = m.read_u64(uc + xframe::UC_SIGMASK as u64)?;
+    own.in_handler = false;
     Ok(pc)
 }
 
@@ -833,20 +1149,22 @@ mod iframe {
 }
 
 fn setup_frame_i386(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     signal: u32,
     fault_address: u64,
+    taken: Taken,
 ) -> Result<u64, Errno> {
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::sp_slot(true) as u64)? & 0xffff_ffff;
     let rt = action.flags & sa::SIGINFO != 0;
-    signals.legacy_frame = !rt;
+    let mut own = signals.own();
+    own.legacy_frame = !rt;
 
-    let on_alt = action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0;
+    let on_alt = action.flags & sa::ONSTACK != 0 && own.alt_stack.size > 0;
     let base = if on_alt {
-        let alt = &signals.alt_stack;
+        let alt = &own.alt_stack;
         let top = alt.sp + alt.size;
         if sp > alt.sp && sp <= top {
             sp
@@ -872,27 +1190,26 @@ fn setup_frame_i386(
     };
     m.write_u32(frame_addr, ret as u32)?;
 
+    // The mask sigreturn puts back: the one a sigsuspend or pwait-style
+    // call replaced for its duration, otherwise the current one.
+    let saved_mask = own.suspend_restore.take().unwrap_or(own.blocked);
     let sc = if rt {
         m.write_u32(frame_addr + iframe::RT_SIG, signal)?;
         let info = frame_addr + iframe::RT_INFO;
         let uc = frame_addr + iframe::RT_UC;
         m.write_u32(frame_addr + iframe::RT_PINFO, info as u32)?;
         m.write_u32(frame_addr + iframe::RT_PUC, uc as u32)?;
-        write_siginfo(signals, m, info, signal, fault_address, false)?;
+        write_siginfo(signals, m, info, signal, fault_address, false, taken)?;
         m.write_u32(uc, 0)?;
         m.write_u32(uc + 4, 0)?;
-        m.write_u32(uc + iframe::UC_STACK, signals.alt_stack.sp as u32)?;
-        m.write_u32(uc + iframe::UC_STACK + 4, signals.alt_stack.flags)?;
-        m.write_u32(uc + iframe::UC_STACK + 8, signals.alt_stack.size as u32)?;
-        m.write_u64(
-            uc + iframe::UC_SIGMASK,
-            signals.suspend_restore.take().unwrap_or(signals.blocked),
-        )?;
+        m.write_u32(uc + iframe::UC_STACK, own.alt_stack.sp as u32)?;
+        m.write_u32(uc + iframe::UC_STACK + 4, own.alt_stack.flags)?;
+        m.write_u32(uc + iframe::UC_STACK + 8, own.alt_stack.size as u32)?;
+        m.write_u64(uc + iframe::UC_SIGMASK, saved_mask)?;
         uc + iframe::UC_MCONTEXT
     } else {
         m.write_u32(frame_addr + iframe::SF_SIG, signal)?;
-        let mask = signals.suspend_restore.take().unwrap_or(signals.blocked);
-        m.write_u32(frame_addr + iframe::SF_EXTRAMASK, (mask >> 32) as u32)?;
+        m.write_u32(frame_addr + iframe::SF_EXTRAMASK, (saved_mask >> 32) as u32)?;
         frame_addr + iframe::SF_SC
     };
 
@@ -913,7 +1230,7 @@ fn setup_frame_i386(
     m.write_u32(sc + iframe::SC_ESP_AT_SIGNAL, sp as u32)?;
     m.write_u32(sc + iframe::SC_SS, iframe::USER_DS)?;
     m.write_u32(sc + iframe::SC_FPSTATE, fpstate as u32)?;
-    m.write_u32(sc + iframe::SC_OLDMASK, signals.blocked as u32)?;
+    m.write_u32(sc + iframe::SC_OLDMASK, saved_mask as u32)?;
     m.write_u32(sc + iframe::SC_CR2, fault_address as u32)?;
 
     // The FP image: x87 control word, MXCSR and the eight xmm registers.
@@ -929,12 +1246,14 @@ fn setup_frame_i386(
         }
     }
 
-    signals.blocked |= action.mask;
+    own.blocked |= action.mask;
     if action.flags & sa::NODEFER == 0 {
-        signals.blocked |= bit(signal);
+        own.blocked |= bit(signal);
     }
-    signals.clear_pending(signal);
-    signals.in_handler = true;
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
     }
@@ -964,7 +1283,7 @@ fn setup_frame_i386(
 /// `sig`, so the frame is two words below `esp`) and `rt_sigreturn` (one
 /// word below).
 fn sigreturn_i386(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     legacy: bool,
@@ -1010,8 +1329,9 @@ fn sigreturn_i386(
             }
         }
     }
-    signals.blocked = mask;
-    signals.in_handler = false;
+    let mut own = signals.own();
+    own.blocked = mask;
+    own.in_handler = false;
     Ok(pc)
 }
 
@@ -1058,7 +1378,7 @@ fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno
 /// `compat` selects the i386 frames, and `legacy` the non-rt `sigreturn`
 /// form of those (a handler installed without `SA_SIGINFO`).
 pub fn sigreturn(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     compat: bool,
@@ -1070,7 +1390,7 @@ pub fn sigreturn(
     if compat {
         // The frame's own kind decides; the entry number is a cross-check.
         let _ = legacy;
-        let kind = signals.legacy_frame;
+        let kind = signals.own().legacy_frame;
         return sigreturn_i386(signals, m, ctx_addr, kind);
     }
     if gex_abi::X86 {
@@ -1093,28 +1413,35 @@ pub fn sigreturn(
     m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
     write_pstate(m, ctx_addr, pstate)?;
 
-    signals.blocked = m.read_u64(uc + frame::UC_SIGMASK as u64)?;
-    signals.in_handler = false;
+    let mut own = signals.own();
+    own.blocked = m.read_u64(uc + frame::UC_SIGMASK as u64)?;
+    own.in_handler = false;
     Ok(pc)
 }
 
 /// Consider the highest-priority pending signal.
 pub fn dispatch(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     compat: bool,
 ) -> Result<Delivery, Errno> {
-    let Some(signal) = signals.next_deliverable() else {
-        return Ok(Delivery::None);
+    // Taken off the pending sets before anything else: another thread of the
+    // process may be delivering at the same time, without the kernel lock,
+    // and a process-directed signal is for one of them only.
+    let (signal, source) = loop {
+        let Some(signal) = signals.next_deliverable() else {
+            return Ok(Delivery::None);
+        };
+        if let Some(source) = signals.claim(signal) {
+            break (signal, source);
+        }
     };
     let action = signals.action(signal);
     if action.handler == SIG_IGN {
-        signals.clear_pending(signal);
         return Ok(Delivery::None);
     }
     if action.handler == SIG_DFL {
-        signals.clear_pending(signal);
         return Ok(match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
             // The three a terminal raises, with no handler and no scheduler to
@@ -1134,8 +1461,14 @@ pub fn dispatch(
             },
         });
     }
-    let resume = setup_frame(signals, m, ctx_addr, signal, 0, compat)?;
-    Ok(Delivery::Resume(resume))
+    match build_frame(signals, m, ctx_addr, signal, 0, compat, Taken::Claimed(source)) {
+        Ok(resume) => Ok(Delivery::Resume(resume)),
+        Err(e) => {
+            // No frame: the signal stays pending, as it was.
+            signals.cur.raise(signal, source);
+            Err(e)
+        }
+    }
 }
 
 /// The `siginfo_t` head at `info`: signo, code, and then either the sender
@@ -1144,16 +1477,21 @@ pub fn dispatch(
 /// the 64-bit layout, where the union after the three ints is 8-aligned (at
 /// 16 rather than 12). Takes the signal's [`Source`].
 fn write_siginfo(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     info: u64,
     signal: u32,
     fault_address: u64,
     wide: bool,
+    taken: Taken,
 ) -> Result<(), Errno> {
     let fields = info + if wide { 16 } else { 12 };
     m.write_u32(info, signal)?;
-    if let Some(src) = signals.take_source(signal) {
+    let source = match taken {
+        Taken::Fault => signals.take_source(signal),
+        Taken::Claimed(source) => source,
+    };
+    if let Some(src) = source {
         m.write_u32(info + 8, src.code as u32)?;
         m.write_u32(fields, src.pid as u32)?;
         m.write_u32(fields + 4, src.uid)?;
@@ -1265,17 +1603,19 @@ fn write_xer_ppc(m: &mut GuestMem<'_>, ctx_addr: u64, x: u32) -> Result<(), Errn
 }
 
 fn setup_frame_ppc(
-    signals: &mut Signals,
+    signals: &Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
     signal: u32,
     fault_address: u64,
+    taken: Taken,
 ) -> Result<u64, Errno> {
     use pframe::*;
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
-    let base = if action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0 {
-        let alt = &signals.alt_stack;
+    let mut own = signals.own();
+    let base = if action.flags & sa::ONSTACK != 0 && own.alt_stack.size > 0 {
+        let alt = &own.alt_stack;
         let top = alt.sp + alt.size;
         if sp > alt.sp && sp <= top {
             sp
@@ -1290,14 +1630,14 @@ fn setup_frame_ppc(
     m.zero(newsp, (SIZE + CALLER) as usize)?;
 
     let info = frame + INFO;
-    write_siginfo(signals, m, info, signal, fault_address, false)?;
+    write_siginfo(signals, m, info, signal, fault_address, false, taken)?;
     let uc = frame + UC;
-    m.write_u32(uc + UC_STACK, signals.alt_stack.sp as u32)?;
-    m.write_u32(uc + UC_STACK + 4, signals.alt_stack.flags)?;
-    m.write_u32(uc + UC_STACK + 8, signals.alt_stack.size as u32)?;
+    m.write_u32(uc + UC_STACK, own.alt_stack.sp as u32)?;
+    m.write_u32(uc + UC_STACK + 4, own.alt_stack.flags)?;
+    m.write_u32(uc + UC_STACK + 8, own.alt_stack.size as u32)?;
     let mc = uc + UC_MCONTEXT;
     m.write_u32(uc + UC_REGS, mc as u32)?;
-    m.write_bits64(uc + UC_SIGMASK, signals.suspend_restore.take().unwrap_or(signals.blocked))?;
+    m.write_bits64(uc + UC_SIGMASK, own.suspend_restore.take().unwrap_or(own.blocked))?;
 
     let g = |i: u64| mc + i * 4;
     for n in 0..32u8 {
@@ -1329,12 +1669,14 @@ fn setup_frame_ppc(
     // The back chain of the handler's caller frame.
     m.write_u32(newsp, sp as u32)?;
 
-    signals.blocked |= action.mask;
+    own.blocked |= action.mask;
     if action.flags & sa::NODEFER == 0 {
-        signals.blocked |= bit(signal);
+        own.blocked |= bit(signal);
     }
-    signals.clear_pending(signal);
-    signals.in_handler = true;
+    if let Taken::Fault = taken {
+        signals.clear_pending(signal);
+    }
+    own.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
     }
@@ -1357,7 +1699,7 @@ fn setup_frame_ppc(
 /// `rt_sigreturn`: the frame is above the handler's r1 by the caller frame
 /// the kernel left, and its `uc_regs` names the registers to restore (a
 /// handler may point it elsewhere, as `swapcontext`-style code does).
-fn sigreturn_ppc(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+fn sigreturn_ppc(signals: &Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
     use pframe::*;
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
     let frame = sp + CALLER;
@@ -1381,8 +1723,9 @@ fn sigreturn_ppc(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> 
     }
     let fpscr = m.read_u64(mc + MC_FREGS + 32 * 8)? as u32;
     m.write_u32(ctx_addr + ctx::PPC_FPSCR as u64, fpscr)?;
-    signals.blocked = mask;
-    signals.in_handler = false;
+    let mut own = signals.own();
+    own.blocked = mask;
+    own.in_handler = false;
     Ok(pc)
 }
 
@@ -1409,7 +1752,7 @@ mod tests {
 
     #[test]
     fn kill_and_stop_cannot_be_caught() {
-        let mut s = Signals::new();
+        let s = Signals::new();
         assert_eq!(
             s.set_action(sig::SIGKILL, SigAction::default()).err(),
             Some(Errno::EINVAL)
@@ -1423,11 +1766,11 @@ mod tests {
 
     #[test]
     fn blocked_signals_stay_pending() {
-        let mut s = Signals::new();
-        s.blocked = bit(sig::SIGUSR1);
+        let s = Signals::new();
+        s.set_blocked(bit(sig::SIGUSR1));
         s.raise(sig::SIGUSR1);
         assert!(!s.has_pending());
-        s.blocked = 0;
+        s.set_blocked(0);
         assert!(s.has_pending());
     }
 
@@ -1495,9 +1838,9 @@ mod tests {
             m.read_u64(CTX + ctx::x(30) as u64).unwrap(),
             SIGRETURN_TRAMPOLINE
         );
-        assert!(s.in_handler);
+        assert!(s.in_handler());
         // The signal is blocked while its own handler runs.
-        assert_ne!(s.blocked & bit(sig::SIGUSR1), 0);
+        assert_ne!(s.blocked() & bit(sig::SIGUSR1), 0);
         // The stack moved below the original.
         let handler_sp = m.read_u64(CTX + ctx::SP as u64).unwrap();
         assert!(handler_sp < 0x40000);
@@ -1508,8 +1851,8 @@ mod tests {
         assert_eq!(resume, 0x400100);
         assert_eq!(m.read_u64(CTX + ctx::SP as u64).unwrap(), 0x40000);
         assert_eq!(m.read_u64(CTX + ctx::x(5) as u64).unwrap(), 0x1005);
-        assert_eq!(s.blocked, 0);
-        assert!(!s.in_handler);
+        assert_eq!(s.blocked(), 0);
+        assert!(!s.in_handler());
     }
 
     #[test]
@@ -1558,11 +1901,11 @@ mod tests {
     fn an_alternate_stack_is_used_when_requested() {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
-        s.alt_stack = SigAltStack {
+        s.set_alt_stack(SigAltStack {
             sp: 0x60000,
             flags: 0,
             size: 0x8000,
-        };
+        });
         s.set_action(
             sig::SIGSEGV,
             SigAction {

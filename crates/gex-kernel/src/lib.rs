@@ -58,6 +58,7 @@ pub mod syscalls;
 pub mod timerfd;
 pub mod tty;
 pub mod vfs;
+pub mod wait;
 pub mod unix;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
 /// IR interpreter and the code generators).

@@ -233,8 +233,9 @@ pub(crate) fn skeleton_code() -> Vec<(u64, u64)> {
 #[no_mangle]
 pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     let base = base as u64;
-    let Some((path, bytes)) = crate::with_host(|h| {
-        let f = h.kernel.fds.get(fd).ok()?;
+    // The table needs no kernel lock (step 3), and the read is the file's.
+    let Some((path, bytes)) = crate::fds_free().and_then(|fds| {
+        let f = fds.get(fd).ok()?;
         let size = f.handle.metadata().ok()?.size as usize;
         let mut b = vec![0u8; size];
         let mut at = 0;

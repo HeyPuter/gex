@@ -16,6 +16,10 @@ use std::sync::{Condvar, Mutex};
 /// Linux's pipe capacity.
 pub const PIPE_BUF: usize = 65536;
 
+/// Linux's `PIPE_BUF`: a write of at most this many bytes goes in whole or
+/// not at all, so no other writer's bytes land inside it.
+pub const PIPE_ATOMIC: usize = 4096;
+
 #[derive(Debug, Default)]
 struct State {
     buf: VecDeque<u8>,
@@ -43,7 +47,8 @@ struct State {
 pub struct Pipe {
     state: Mutex<State>,
     ready: Condvar,
-
+    /// Who waits on either end (`crate::wait`): notified wherever `ready` is.
+    queue: crate::wait::Queue,
 }
 
 impl Default for Pipe {
@@ -67,9 +72,14 @@ impl Pipe {
                 broken: 0,
             }),
             ready: Condvar::new(),
+            queue: crate::wait::Queue::new(),
         }
     }
 
+    /// The wait queue both ends' waiters register on.
+    pub fn wait_queue(&self) -> u32 {
+        self.queue.id()
+    }
 
 
     /// Note that another descriptor now refers to one end.
@@ -93,6 +103,27 @@ impl Pipe {
         // Waking both sides is what turns the last close into an EOF or an
         // EPIPE rather than a hang.
         self.ready.notify_all();
+                self.queue.notify();
+    }
+
+    /// Read up to `max` bytes into a buffer of what was there, sized under
+    /// the pipe's own lock: a size taken from [`Pipe::buffered`] first can be
+    /// stale by the time of the read (another reader drained it, a writer
+    /// filled it), and a one-byte read of a pipe that then received a whole
+    /// record tears that record.
+    pub fn read_vec(&self, max: usize) -> Result<Vec<u8>, Errno> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut s = self.state.lock().unwrap();
+        if s.buf.is_empty() {
+            return if s.writers == 0 { Ok(Vec::new()) } else { Err(Errno::EAGAIN) };
+        }
+        let n = max.min(s.buf.len());
+        let out: Vec<u8> = s.buf.drain(..n).collect();
+        self.ready.notify_all();
+        self.queue.notify();
+        Ok(out)
     }
 
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
@@ -111,6 +142,7 @@ impl Pipe {
                 buf[k..n].copy_from_slice(&back[..n - k]);
                 s.buf.drain(..n);
                 self.ready.notify_all();
+                self.queue.notify();
                 return Ok(n as u64);
             }
             // No data: end of file once no writer can ever supply any.
@@ -142,6 +174,12 @@ impl Pipe {
                 };
             }
             let room = PIPE_BUF.saturating_sub(s.buf.len());
+            // A small write waits for room for all of it (`EAGAIN` here; the
+            // syscall layer parks a blocking one and tries it whole again).
+            if buf.len() <= PIPE_ATOMIC && room < buf.len() {
+                s.refused += 1;
+                return Err(Errno::EAGAIN);
+            }
             if room > 0 {
                 let n = room.min(buf.len() - written);
                 s.buf.extend(&buf[written..written + n]);
@@ -153,6 +191,7 @@ impl Pipe {
                 s.last.extend(buf[written..written + n].iter().take(160));
                 written += n;
                 self.ready.notify_all();
+                self.queue.notify();
                 if written == buf.len() {
                     return Ok(written as u64);
                 }
@@ -233,9 +272,14 @@ impl Pipe {
     }
 
     /// True when a writer would not block.
+    /// Room for any write of at most [`PIPE_ATOMIC`] bytes (or no reader
+    /// left, which a write must hear about), as Linux reports `POLLOUT`
+    /// once a page of the pipe is free. Less room than that is not
+    /// writable: a small write would be refused, and its waiter would only
+    /// wake to be refused again.
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
-        s.buf.len() < PIPE_BUF || s.readers == 0
+        PIPE_BUF.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
     }
 }
 
@@ -243,6 +287,18 @@ impl Pipe {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `read_vec` takes up to what is there, sized under the lock: never a
+    /// stale size that splits a record.
+    #[test]
+    fn read_vec_takes_whole_records() {
+        let p = Pipe::new();
+        assert_eq!(p.read_vec(64), Err(Errno::EAGAIN));
+        p.write(&[3u8; 64]).unwrap();
+        p.write(&[4u8; 64]).unwrap();
+        assert_eq!(p.read_vec(64).unwrap(), vec![3u8; 64]);
+        assert_eq!(p.read_vec(1000).unwrap(), vec![4u8; 64]);
+    }
 
     #[test]
     fn write_then_read_roundtrips() {
@@ -323,6 +379,20 @@ mod tests {
         assert_eq!(p.read(&mut buf).unwrap(), PIPE_BUF as u64);
         assert_eq!(p.write(b"x").unwrap(), 1);
     }
+
+    #[test]
+    fn a_small_write_goes_in_whole_or_not_at_all() {
+        // At most PIPE_ATOMIC bytes: never split, so no other writer's
+        // bytes can land inside it (Linux's PIPE_BUF rule).
+        let p = Pipe::new();
+        p.write(&vec![1u8; PIPE_BUF - 10]).unwrap();
+        assert_eq!(p.write(&[2u8; 32]).err(), Some(Errno::EAGAIN));
+        assert_eq!(p.buffered(), PIPE_BUF - 10);
+        assert_eq!(p.write(&[2u8; 10]).unwrap(), 10);
+        let mut buf = vec![0u8; 64];
+        p.read(&mut buf).unwrap();
+        assert_eq!(p.write(&[3u8; 32]).unwrap(), 32);
+    }
 }
 
 /// A pipe that lives in another wasm module.
@@ -357,6 +427,8 @@ pub struct Remote {
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub buffered: extern "C" fn(id: i32) -> i32,
+    /// The pipe's wait queue (`crate::wait`).
+    pub queue: extern "C" fn(id: i32) -> u32,
 }
 
 /// One end of a pipe in the global kernel. Dropping closes that end there, so
@@ -433,6 +505,10 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         !self.write || (self.remote.writable)(self.id) != 0
     }
 
+    fn wait_queue(&self) -> u32 {
+        (self.remote.queue)(self.id)
+    }
+
     /// The read end of a pipe with room in it: no writer is parked on it.
     /// (One that fills it between this question and the read sleeps to its
     /// park's bound, or the next wake, not for ever.)
@@ -489,4 +565,5 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             (self.remote.buffered)(self.id)
         )
     }
+
 }

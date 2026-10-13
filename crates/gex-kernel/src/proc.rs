@@ -9,7 +9,7 @@
 //! Not modelled: controlling terminals, orphaned-process-group handling, and
 //! session keyrings. A guest that asks gets plausible answers, not Linux's.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 /// The signal a parent is owed when a child ends.
 const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
@@ -62,6 +62,8 @@ pub struct Remote {
     pub wait_ready: extern "C" fn(ppid: i32, want: i32) -> i32,
     pub request_halt: extern "C" fn(code: i32),
     pub halt_code: extern "C" fn() -> i32,
+    /// The process's wait queue. See [`ProcTable::queue`].
+    pub queue: extern "C" fn(pid: i32) -> u32,
     /// What `/proc/<pid>` says about a process: see [`ProcTable::set_info`].
     pub set_info: extern "C" fn(pid: i32, at: crate::PAddr, len: u32),
     /// Every process, encoded by [`encode_entries`], into `cap` bytes at `at`;
@@ -162,6 +164,10 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// The process's own wait queue (`crate::wait`), on which each of its
+    /// threads keeps its wait slot registered for as long as it runs: a
+    /// signal for the process, a child's exit or a halt notifies it.
+    queue: crate::wait::Queue,
     /// See [`ProcTable::set_info`].
     info: Vec<u8>,
 }
@@ -169,6 +175,19 @@ struct Proc {
 struct Table {
     next_pid: i32,
     procs: Vec<Proc>,
+}
+
+/// Moved after every signal left in a process's inbox (`kill`, a group's
+/// signal, a child's SIGCHLD), once the bit is set: a thread that saw it
+/// unmoved has nothing new to collect ([`ProcTable::take_signals`]), and one
+/// that saw it move finds the bit there. For the threads that ask without
+/// the kernel lock; the table's own (a page's kernel module) is the one that
+/// counts.
+static SIGNAL_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// [`SIGNAL_SEQ`].
+pub fn signal_seq() -> u32 {
+    SIGNAL_SEQ.load(Ordering::Acquire)
 }
 
 /// The system's processes.
@@ -220,6 +239,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    queue: crate::wait::Queue::new(),
                     info: Vec::new(),
                 }],
             }),
@@ -253,6 +273,7 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            queue: crate::wait::Queue::new(),
             info: Vec::new(),
         });
         pid
@@ -340,7 +361,7 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
         }
-        let (cell, done) = {
+        let (cell, done, parent_q) = {
             let mut t = self.lock();
             // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
             // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
@@ -352,6 +373,7 @@ impl ProcTable {
                     parent
                         .pending
                         .fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                    SIGNAL_SEQ.fetch_add(1, Ordering::Release);
                 }
             }
             for p in t.procs.iter_mut() {
@@ -359,8 +381,11 @@ impl ProcTable {
                     p.ppid = INIT_PID;
                 }
             }
+            let parent_q = ppid
+                .and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid))
+                .map_or(0, |p| p.queue.id());
             match t.procs.iter().find(|p| p.pid == pid) {
-                Some(p) => (Arc::clone(&p.child.status), Arc::clone(&p.child.done)),
+                Some(p) => (Arc::clone(&p.child.status), Arc::clone(&p.child.done), parent_q),
                 None => return,
             }
         };
@@ -368,6 +393,8 @@ impl ProcTable {
         // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         done.notify_all();
+        // The parent's `wait4`, and its SIGCHLD.
+        crate::wait::notify(parent_q);
     }
 
     /// Forget a collected process, so a long-lived init doesn't accumulate a
@@ -529,6 +556,11 @@ impl ProcTable {
                 p.senders[signo as usize - 1] = caller;
                 p.pending.fetch_or(bit, Ordering::AcqRel);
             }
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            // A signal ends a wait: wake each target's waiting threads.
+            for &i in &hits {
+                t.procs[i].queue.notify();
+            }
         }
         Ok(hits.len())
     }
@@ -544,15 +576,18 @@ impl ProcTable {
             return Err(Errno::EINVAL);
         }
         let t = self.lock();
-        let hits: Vec<&Arc<AtomicU64>> =
-            t.procs.iter().filter(|p| p.pgid == pgid).map(|p| &p.pending).collect();
+        let hits: Vec<&Proc> = t.procs.iter().filter(|p| p.pgid == pgid).collect();
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
             for p in &hits {
-                p.fetch_or(bit, Ordering::AcqRel);
+                p.pending.fetch_or(bit, Ordering::AcqRel);
+            }
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            for p in &hits {
+                p.queue.notify();
             }
         }
         Ok(hits.len())
@@ -638,6 +673,19 @@ impl ProcTable {
         }
         self.halt_code.store(code, Ordering::Release);
         self.halting.store(true, Ordering::Release);
+        // Every waiter notices the halt on its way out of its wait.
+        for p in self.lock().procs.iter() {
+            p.queue.notify();
+        }
+    }
+
+    /// `pid`'s wait queue, 0 for none: a thread of `pid` keeps its wait slot
+    /// on it while it runs (see [`Proc::queue`]).
+    pub fn queue(&self, pid: i32) -> u32 {
+        if let Some(r) = self.remote {
+            return (r.queue)(pid);
+        }
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.queue.id())
     }
 
     /// The exit code the machine is halting with, if it is.

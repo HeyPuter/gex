@@ -317,6 +317,18 @@ function debugLine(text) {
 // is the guest's own output there (an ejected program's, a test's compared
 // output). In a page it stays on the debug console.
 export function narrate(text) {
+  // Synchronously where there is a file descriptor to write to. A node
+  // Worker's `process.stderr` is flushed by its event loop. A Worker parked
+  // in wasm on its wait slot until its process ends never turns that loop, so
+  // the lines were lost when it was terminated: item3's "libsqlite3.so.0
+  // replaced by" lines were all lost after the first child process.
+  const fs = typeof process !== 'undefined' ? process.getBuiltinModule?.('fs') : null;
+  if (fs?.writeSync) {
+    try {
+      fs.writeSync(2, `${text}\n`);
+      return;
+    } catch {}
+  }
   const stderr = typeof process !== 'undefined' ? process.stderr : null;
   if (stderr?.write) stderr.write(`${text}\n`);
   else console.debug(text);
@@ -871,18 +883,18 @@ export class Gex {
   #kernelWords = null;
 
   /** What ends a network wait, sampled before the guest is given another
-   *  chance (`gex_wake`): the global kernel's wake counter and the page
-   *  network's event count. */
+   *  chance (`gex_wake`): the page network's event count. (This Worker's wait
+   *  slot is sampled by the shim itself, at the start of each scheduler turn:
+   *  `gex_wait_seq`.) */
   #netSnap() {
-    const k = this.#kernel;
-    return { k: k?.k_wake_addr ? k.k_wake_seq() : null, n: this.#net?.activitySeq?.() ?? null };
+    return { n: this.#net?.activitySeq?.() ?? null };
   }
 
   /**
    * Sleep, without blocking this Worker's event loop, until the network has
    * something (this Worker's own network's `onActivity`, or the page's
-   * through the bridge's activity word), another Worker bumps the global
-   * kernel's wake counter (`Atomics.waitAsync` on it), or the waiting
+   * through the bridge's activity word), something the thread waits for is
+   * notified (`Atomics.waitAsync` on this Worker's wait slot), or the waiting
    * thread's own deadline is due (`gex_wait_bound_ms`, at most 50 ms). It
    * replaces a MessageChannel turn loop that spun every network-waiting
    * Worker at full speed, each turn taking the host lock four times (node's
@@ -890,11 +902,11 @@ export class Gex {
    */
   #netWait(e, snap) {
     const ms = e.gex_wait_bound_ms ? e.gex_wait_bound_ms(50) : 1;
-    const k = this.#kernel;
     const waits = [new Promise((r) => { this.#netWake = r; })];
-    if (k?.k_wake_addr && snap.k !== null) {
+    const word = e.gex_wait_word?.() >>> 0;
+    if (word) {
       this.#kernelWords ??= new Int32Array(this.#kernelSpec.memory.buffer);
-      const w = Atomics.waitAsync(this.#kernelWords, k.k_wake_addr() >>> 2, snap.k, ms);
+      const w = Atomics.waitAsync(this.#kernelWords, word >>> 2, e.gex_wait_seq(), ms);
       if (!w.async) return Promise.resolve();
       waits.push(w.value);
     } else {
@@ -1034,6 +1046,16 @@ export class Gex {
   }
 
   get memory() { return this.#memory; }
+
+  /** The global kernel's memory, this process's wait queue's address in it
+   *  and where the wait slots' words start, or null: what a compositor walks
+   *  to wake this process's parked threads after an input event
+   *  (`wl-bridge.mjs` `sendEvent`). */
+  kernelWake() {
+    const e = this.#shim?.exports;
+    if (!this.#kernel || !e?.gex_proc_queue_addr || !this.#kernelSpec?.memory) return null;
+    return { memory: this.#kernelSpec.memory, addr: e.gex_proc_queue_addr() >>> 0, slots: e.gex_slots_addr() >>> 0 };
+  }
 
   /**
    * Every guest block PC translated in this process so far, as a BigUint64Array
@@ -1196,8 +1218,13 @@ export class Gex {
    */
   #hostImports() {
     return {
-        write: (fd, ptr, len) =>
-          this.#env.write(fd, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
+        // `ptr` is an i64 (a BigInt) from the wasm64 shim, whose thread
+        // stacks sit above 4 GiB: cut to 32 bits, a thread's stderr printed
+        // as NUL bytes from the wrong place.
+        write: (fd, ptr, len) => {
+          const at = typeof ptr === 'bigint' ? Number(ptr) : ptr >>> 0;
+          this.#env.write(fd, this.#bytes().subarray(at, at + (len >>> 0)));
+        },
         // The shim's own narration, to the console -- never to the guest's
         // output, which shares fd 2 with a terminal a person is reading.
         debug: (ptr, len) => debugLine(
@@ -1324,6 +1351,8 @@ export class Gex {
         // surface the compositor's own hit test picked.
         wl_poll_input: (ptr, max) =>
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
+        // Whether that ring holds anything, without draining it.
+        wl_input_pending: () => (this.#wl?.inputPending() ? 1 : 0),
     };
   }
 
@@ -2181,7 +2210,10 @@ export class Gex {
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
       'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable', 'k_sock_hup',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
-      'k_wake_seq', 'k_wake', 'k_park',
+      'k_ws_self', 'k_ws_seq', 'k_ws_park', 'k_ws_addr',
+      'k_wq_new', 'k_wq_free', 'k_wq_notify', 'k_wq_chain', 'k_wq_unchain',
+      'k_wq_add', 'k_wq_del', 'k_wq_addr',
+      'k_pipe_queue', 'k_sock_queue', 'k_pty_queue', 'k_proc_queue', 'k_stdin_queue', 'k_futex_queue',
       // Which dispatch slots an identity's code is in, system-wide rather than
       // per Worker. Without a kernel these answer zero: one process has no
       // sibling to share with, and the shim keeps its own map.
@@ -2225,25 +2257,25 @@ export class Gex {
         throw new Error('gex (single-thread build): a blocking call inside a nested guest call '
           + `(${this.#nest.join(' > ')}) cannot suspend`);
       };
-      out.k_park = new WebAssembly.Suspending((seq, ns) => {
-        if (k.k_wake_seq() !== seq) return 1;
+      // A wait slot's word is in the kernel's (plain) memory, which can
+      // grow: the view is asked for each time.
+      const words = () => new Int32Array(this.#kernelSpec.memory.buffer);
+      out.k_ws_park = new WebAssembly.Suspending((slot, seq, ns) => {
+        if (k.k_ws_seq(slot) !== seq) return 1;
         if (this.#hardNested()) nested();
         this.#where = `park(${ns})`;
-        return sched.park(ns);
+        return sched.parkSlot(words, (k.k_ws_addr(slot) >>> 0) >>> 2, seq, ns);
       });
-      out.k_park_futex = new WebAssembly.Suspending((addr, gen, ns) => {
-        if ((k.k_futex_gen(addr) >>> 0) !== (gen >>> 0)) return 1;
-        if (this.#hardNested()) nested();
-        this.#where = `futex(${addr},${ns})`;
-        return sched.parkFutex(addr, ns);
-      });
-      out.k_wake = () => {
-        k.k_wake();
-        sched.wake();
+      // A notify moved slot words nobody `Atomics.wait`s on here; the fibers
+      // parked on them look (and every park and yield looks too, for the
+      // notifies inside the kernel's own calls).
+      out.k_wq_notify = (id) => {
+        k.k_wq_notify(id);
+        sched.checkSlots();
       };
       out.k_futex_wake = (addr) => {
         k.k_futex_wake(addr);
-        sched.wakeFutex(addr);
+        sched.checkSlots();
       };
     }
     return out;
@@ -4506,7 +4538,7 @@ export class Gex {
                 // case, so it is the condition for turning.
                 const onLoop = !!e.gex_paused_for_host();
                 this.#netTurns = onLoop ? this.#netTurns + 1 : 0;
-                if (onLoop && e.gex_wait_bound_ms && this.#kernel?.k_wake_addr) {
+                if (onLoop && e.gex_wait_bound_ms && e.gex_wait_word?.()) {
                   // Asleep until the network, another Worker or the clock.
                   this.waits.net++;
                   await this.#netWait(e, snap);
@@ -4934,7 +4966,7 @@ export class Gex {
   // --- The single-thread build (single.mjs, docs/single-thread.md) ---------
   //
   // Every guest thread is a fiber of one realm, its guest on a JSPI stack. A
-  // blocking call suspends that stack (`k_park`, below) where the default
+  // blocking call suspends that stack (`k_ws_park`, below) where the default
   // build waits in `Atomics.wait`, so wherever JS calls into wasm that may
   // block it calls through `WebAssembly.promising`, and wherever wasm calls
   // JS that calls back into wasm that may block, that JS is a
@@ -4950,7 +4982,7 @@ export class Gex {
     return this.#enterPf(ctx, pc);
   }
   #parkPf = null;
-  /** `gex_park`, on a stack of its own (it suspends in `k_park`). */
+  /** `gex_park`, on a stack of its own (it suspends in `k_ws_park`). */
   #parkP(ms) {
     this.#parkPf ??= WebAssembly.promising(this.#shim.exports.gex_park);
     return this.#parkPf(ms);

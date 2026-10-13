@@ -16,6 +16,8 @@
 // and is the only writer of it, plus a ring the compositor writes input into.
 // No locks -- one writer per word, and the compositor polls at frame rate.
 
+import { single, sched } from './single.mjs';
+
 /** Processes that can publish surfaces at once. */
 const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
@@ -101,6 +103,12 @@ const B_HEARTBEAT = 1;
 const B_COUNT = 2;
 const B_GEN = 3;
 const B_ACK = 4;
+/** Where the process's wait queue is in the global kernel's memory
+ * (`gex_proc_queue_addr`), or zero, and where the wait slots' words start
+ * (`gex_slots_addr`): what the compositor notifies after putting an event in
+ * this block's ring (docs/kernel-locking.md §5.2 step 2). */
+const B_WAKE = 5;
+const B_SLOTS = 6;
 const B_WORDS = 8;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
@@ -223,6 +231,11 @@ export function ackBlock(channel, block, gen) {
   Atomics.store(a, blockBase(block) + B_ACK, gen);
 }
 
+/** The global kernel's memory, for `sendEvent`'s wake. One per page. */
+export function setKernelMemory(channel, memory) {
+  if (memory && !channel.kernelMemory) channel.kernelMemory = memory;
+}
+
 /** Write one event into a process's ring, for its guest to pick up. */
 export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, client = 0, surface = 0) {
   const a = new Int32Array(channel.arena);
@@ -238,6 +251,41 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
+  // And a notify on the process's wait queue: with every thread of the
+  // process parked, nothing drains the ring otherwise. The thread that wakes
+  // takes a scheduler turn, whose compositor pump delivers the event and
+  // notifies the client's reader in turn.
+  const q = Atomics.load(a, blockBase(block) + B_WAKE);
+  const slots = Atomics.load(a, blockBase(block) + B_SLOTS);
+  const k = channel.kernelMemory;
+  if (q && slots && k) {
+    notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
+    // The single-thread build: the fibers parked on those words look.
+    if (single.on) sched.checkSlots();
+  }
+}
+
+/** Queue words: a bitmap of the slots registered on it, 8 words
+ *  (shims/kernel/src/wait.rs `Queue`). */
+const Q_BITS = 8;
+
+/**
+ * Notify the wait queue at byte address `q` in the kernel's memory `w`, as
+ * `k_wq_notify` does: bump and wake the word of every slot registered on it,
+ * the slots' words starting at `slots`. Not the queues chained to it -- a
+ * process queue has none.
+ */
+export function notifyQueue(w, q, slots) {
+  for (let i = 0; i < Q_BITS; i++) {
+    let bits = Atomics.load(w, (q >>> 2) + i) >>> 0;
+    while (bits) {
+      const b = 31 - Math.clz32(bits & -bits);
+      bits &= bits - 1;
+      const at = (slots >>> 2) + i * 32 + b;
+      Atomics.add(w, at, 1);
+      if (w.buffer instanceof SharedArrayBuffer) Atomics.notify(w, at);
+    }
+  }
 }
 
 /**
@@ -270,6 +318,10 @@ export class WlProxy {
   #tokenFn;
   /** Called with the token once it is known, so the host can send the memory. */
   onToken = null;
+  /** This process's wait queue's address in the global kernel's memory and
+   *  where the slot words start, as `{ addr, slots }`, or null; asked when
+   *  the block is claimed. See `B_WAKE`. */
+  wakeAddr = null;
 
   /** Claim a block if this process does not have one yet. Returns whether it has. */
   #ready() {
@@ -299,6 +351,7 @@ export class WlProxy {
       this.#block = b;
       this.#base = base;
       this.#ring = ringBase(b);
+      this.#noteWake();
       return;
     }
     for (let pass = 0; pass < 2; pass++) {
@@ -315,8 +368,17 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_GEN, 0);
         Atomics.store(this.#a, base + B_ACK, 0);
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
+        this.#noteWake();
         return;
       }
+    }
+  }
+
+  #noteWake() {
+    const w = this.wakeAddr?.();
+    if (w?.addr && w?.slots) {
+      Atomics.store(this.#a, this.#base + B_SLOTS, w.slots | 0);
+      Atomics.store(this.#a, this.#base + B_WAKE, w.addr | 0);
     }
   }
 
@@ -393,6 +455,13 @@ export class WlProxy {
     }
     Atomics.store(a, base + K_TAIL, tail);
     return count;
+  }
+
+  /** Whether this process's input ring holds an event. */
+  inputPending() {
+    if (this.#block < 0) return false;
+    const a = this.#a;
+    return Atomics.load(a, this.#ring + K_HEAD) !== Atomics.load(a, this.#ring + K_TAIL);
   }
 
   /** Give the block back, so a later process can have it. */

@@ -67,7 +67,8 @@ fn gave() {
     HELD.with(|h| h.set(h.get().saturating_sub(1)));
 }
 
-fn me() -> u32 {
+/// This thread's id ([`set_thread_id`]), or 0.
+pub fn me() -> u32 {
     ME.with(|m| m.get())
 }
 

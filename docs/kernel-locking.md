@@ -479,13 +479,73 @@ in the scheduler pick after each wake of the global WAKE word: about
     13.65 s for B): the cold process's lifting was never the critical path's
     lock wait, only its own. Undertale tier-1 on worldmachine, 200 s, last
     120 s: 21.9-22.9 fps against 22.3-22.5 for step 4.
-  - **Known failure, for §5.2 step 5 (signal masks):** `tests/x86-programs/thread-signals` in
-    the page tier (x86-64, mem64 seed; not in the default `PAGE_PROGRAMS`)
-    prints "blocked thread took it while blocked: yes" and "still pending
-    in the blocked thread: no": a `pthread_kill` to a thread blocking every
-    signal runs the handler on it. It fails the same way on a tree without
-    steps 3-5 (integ-1012b, 2026-10-12), so it predates them. Native tiers
-    pass.
+  - **Step 8, the thread-signals "failure"** was the test's: it slept
+    100 ms for its two threads to reach their condition-variable wait, and
+    a page starts a thread's Worker later than that, so the blocker took the
+    signal meant for it before it had blocked anything. It now waits for
+    both under the mutex, and is in `PAGE_PROGRAMS` with `signal-storm`.
+  - **Step 8, signal words (as built):** `Signals` is two `Arc`s, the
+    process's `ProcSig` (dispositions behind an `RwLock`, the shared
+    pending word, the interval timers with their earliest deadline as an
+    atomic) and the running thread's `ThreadSig` (pending and mask as
+    atomic words, sources and handler state behind small mutexes). Which
+    thread runs is a pointer swap, not a copy in and out. Each page Worker
+    holds its own thread's `ThreadSig` (`sigs`), so a safepoint asks
+    whether a signal would do something, collects the inbox (when the
+    proc table's signal sequence moved, which is now bumped after the bit
+    is set) and fires due timers, and builds the handler frame, with no
+    kernel lock and no hints: the global and local signal counters, the
+    timer flag and the every-64th sweep are gone. A delivery claims its
+    signal with one atomic `fetch_and` before building the frame, so two
+    threads never take one process-directed signal; collecting raises each
+    signal once, with its sender, for the same reason. The thread table
+    (a resume after a handler frame) and process exit stay the kernel's
+    until §3.7 and step 9.
+  - **Step 8, the thread's run state (§3.7, as built):** each thread-table
+    entry keeps its pc, its wait, the call it parked in and what that call
+    still owes (`Run`: `rt_sigsuspend`'s mask, a write's `SIGPIPE`, a call
+    to make again) behind an `Arc<Mutex>` of its own, and its Worker holds
+    that `Arc` (`MY_RUN`). The kernel's per-call leftovers (`restore_sigmask`,
+    `write_blocked`, the `retry_*` of `accept`, `recvmsg` and transfers) are
+    taken out of it as the call parks. An idle turn that finds its wait
+    over (`waitq::Turn::Ready`) finishes the call with no kernel lock
+    (`finish_mine`, `finish_wait`): the answer into its context, the signal
+    half through `sigs::finish`, and an `accept`, `recvmsg` or transfer is
+    made again from its instruction (in place, for a wasm32 program or a
+    provider) instead of being redone inside the kernel. A safepoint's
+    handler frame resumes without `schedule`. The locked turn stays for a
+    blocking call's first look (under its own take), the compositor's pump
+    and the deadlock watch; process exit stays the kernel's. The context
+    address and tid a Worker runs (`MY_CTX`, `MY_TID`) replaced twenty
+    sites that took the lock to read them.
+  - **The lock-free syscall class (as built):** `read`, `write`, `readv`,
+    `writev`, `pread64`, `pwrite64`, `lseek` and `rt_sigprocmask` are a
+    class decided by number (`syscalls::free_class`; the 32-bit ABI's
+    positioned calls and `_llseek` are not in it). A call in the class never
+    takes KLock, blocking included. The page makes the whole call from its
+    Worker (`free_syscall`, `sigs::free_call`). The descriptor half
+    (`FdIo`: the call, the park before it and the park after an `EAGAIN`)
+    and `sigprocmask` are the same code the kernel runs. Before delivering,
+    the call collects signals sent from elsewhere and fires due timers
+    (`sigs::gather`). Its `SIGPIPE` is raised on the thread's own signal
+    state.
+
+    A call that waits:
+    - puts its wait into the thread's run state;
+    - makes the scheduler's first turn itself (`pick_mine`): it finishes
+      the call if the stream is ready, or registers the slot on the
+      stream's queue and says why nothing runs.
+
+    That "why" (`wait_why`) is now the Worker's own thread's alone, asked
+    without the kernel. The process's network is `HAVE_NET`, which the
+    kernel's `net` is made from. A global-kernel socket says so itself
+    (`FileHandle::is_global_socket`). Registering a wait and publishing the
+    process's next timer (`waitq::enter`, `publish_timer`) read the
+    process's signal state, not the kernel.
+
+    The kernel still takes over when the process ends: a signal's default
+    action or a halted machine (`killed`, `exit_process`). The compositor's
+    pump stays a locked scheduler turn when it has work.
   - **Known failure, native, not KLock's:** `gexc run --fjit` livelocks
     ("retranslation livelock") once a page of a long direct-jump chain is
     retired under it, as `tests/x86-programs/retire-during-lift` does

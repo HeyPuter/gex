@@ -187,6 +187,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
 pub(super) fn exe_path() -> String {
     crate::with_host(|h| {
         h.kernel.wasm32 = true;
+        crate::WASM32.store(true, std::sync::atomic::Ordering::Release);
         h.kernel.exe_path.clone()
     })
 }

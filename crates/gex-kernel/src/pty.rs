@@ -54,6 +54,8 @@ pub struct Pty {
     /// the line discipline itself.
     pub tty: Tty,
     st: Mutex<State>,
+    /// Who waits on either end (`crate::wait`).
+    queue: crate::wait::Queue,
 }
 
 impl Pty {
@@ -71,7 +73,19 @@ impl Pty {
                 slave_ever: false,
                 slave_eof: false,
             }),
+            queue: crate::wait::Queue::new(),
         }
+    }
+
+    /// The pair's wait queue.
+    pub fn queue_id(&self) -> u32 {
+        self.queue.id()
+    }
+
+    /// Something changed that a reader on either end may be waiting for: the
+    /// terminal's foreground group, say, which decides whose read may go on.
+    pub fn notify(&self) {
+        self.queue.notify();
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -104,6 +118,8 @@ impl Pty {
         if r.eof {
             s.slave_eof = true;
         }
+        drop(s);
+        self.queue.notify();
         r.signals
     }
 
@@ -116,6 +132,8 @@ impl Pty {
             Some(v) => s.to_master.extend(v),
             None => s.to_master.extend(bytes.iter().copied()),
         }
+        drop(s);
+        self.queue.notify();
     }
 
     /// The master reads echo and program output. Empty and every slave gone is
@@ -177,6 +195,7 @@ impl Pty {
         }
         drop(s);
         self.tty.flush_line();
+        self.queue.notify();
     }
 
     pub fn open_master(&self) {
@@ -192,11 +211,16 @@ impl Pty {
     pub fn close_master(&self) -> bool {
         let mut s = self.lock();
         s.master_open = s.master_open.saturating_sub(1);
-        s.master_open == 0
+        let last = s.master_open == 0;
+        drop(s);
+        self.queue.notify();
+        last
     }
     pub fn close_slave(&self) {
         let mut s = self.lock();
         s.slave_open = s.slave_open.saturating_sub(1);
+        drop(s);
+        self.queue.notify();
     }
     pub fn master_count(&self) -> u32 {
         self.lock().master_open
@@ -293,6 +317,8 @@ pub struct Remote {
     pub sid: extern "C" fn(id: i32) -> i32,
     pub set_sid: extern "C" fn(id: i32, sid: i32),
     pub flush: extern "C" fn(id: i32, which: i32),
+    /// The pair's wait queue (`crate::wait`).
+    pub queue: extern "C" fn(id: i32) -> u32,
 }
 
 /// One end of a pty in the global kernel. Dropping closes that end there, so a
@@ -375,6 +401,10 @@ impl crate::vfs::FileHandle for RemotePty {
 
     fn poll_readable(&self) -> bool {
         (self.remote.readable)(self.id, self.m()) != 0
+    }
+
+    fn wait_queue(&self) -> u32 {
+        (self.remote.queue)(self.id)
     }
 
     fn available(&self) -> Option<u64> {

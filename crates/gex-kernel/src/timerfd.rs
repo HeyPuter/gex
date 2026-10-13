@@ -7,11 +7,11 @@
 //! time-based -- [`poll_readable`] asks the clock -- so the handle carries its
 //! own [`ClockFn`].
 //!
-//! Not wired: a *blocking* read does not wake precisely at the deadline; the
-//! supported path is `TFD_NONBLOCK` plus `epoll`, where the loop's own
-//! `epoll_wait` timeout carries the timing.
+//! A waiter parks until the next expiry ([`ready_in_ns`]); arming the timer
+//! notifies its wait queue, so a waiter parked to an old expiry takes the new.
 //!
 //! [`poll_readable`]: crate::vfs::FileHandle::poll_readable
+//! [`ready_in_ns`]: crate::vfs::FileHandle::ready_in_ns
 //! [`ClockFn`]: crate::syscalls::ClockFn
 
 use gex_abi::GuestEndian;
@@ -40,6 +40,9 @@ pub struct TimerFd {
     /// read from `clock_gettime` on the same clock.
     map: Option<fn((u64, u32)) -> (u64, u32)>,
     state: Mutex<State>,
+    /// Who waits on it (`crate::wait`): arming or disarming it. Its expiry
+    /// is a deadline the waiter parks to ([`FileHandle::ready_in_ns`]).
+    queue: crate::wait::Queue,
 }
 
 impl std::fmt::Debug for TimerFd {
@@ -54,6 +57,7 @@ impl TimerFd {
             clock,
             map: None,
             state: Mutex::new(State::default()),
+            queue: crate::wait::Queue::new(),
         }
     }
 
@@ -98,6 +102,9 @@ impl TimerFd {
             s.next = if abstime { value } else { now.saturating_add(value) };
             s.interval = interval;
         }
+        drop(s);
+        // A waiter parked to the old expiry must take the new one.
+        self.queue.notify();
         prev
     }
 
@@ -168,6 +175,16 @@ impl FileHandle for TimerFd {
     fn poll_readable(&self) -> bool {
         let now = self.now_ns();
         Self::expirations_at(&self.state.lock().unwrap(), now) > 0
+    }
+
+    fn wait_queue(&self) -> u32 {
+        self.queue.id()
+    }
+
+    fn ready_in_ns(&self) -> Option<u64> {
+        let now = self.now_ns();
+        let s = self.state.lock().unwrap();
+        (s.next != 0).then(|| s.next.saturating_sub(now))
     }
 
     fn available(&self) -> Option<u64> {

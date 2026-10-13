@@ -367,7 +367,7 @@ mod imp {
             // Through the guest's stderr, not the console: a Worker's console
             // output can be lost when the run ends, and tests/nt reads this.
             let line = format!("gex-nt: arena self-check: {}\n", crate::arena_selftest());
-            unsafe { crate::write(2, line.as_ptr() as u32, line.len() as u32) };
+            unsafe { crate::write(2, line.as_ptr() as usize, line.len() as u32) };
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
@@ -1246,7 +1246,7 @@ mod imp {
                     }
                     end_process(p.exit_code.load(Ordering::Acquire));
                 }
-                with_host(|h| h.threads[cur()].waiting = Waiting::Exited);
+                with_host(|h| h.threads[cur()].run().waiting = Waiting::Exited);
                 set_resume_none();
                 set_resume_ctx_none_and_trap();
             }
@@ -1255,12 +1255,7 @@ mod imp {
                 with_host(|h| {
                     // A Worker of its own, as a Linux clone gets: the entry
                     // is this process's, the thread runs elsewhere.
-                    h.threads.push(Thread {
-                        kstate: ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 },
-                        pc: start,
-                        waiting: Waiting::Elsewhere,
-                        blocked_on: None,
-                    });
+                    h.threads.push(Thread::new(ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 }, start, Waiting::Elsewhere));
                     if !h.jit.ever_threaded {
                         backfill_registry(h);
                         h.jit.ever_threaded = true;
