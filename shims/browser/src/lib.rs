@@ -6969,7 +6969,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // thread runs on another stack, and `Elsewhere` is the state
                 // that says "not me". Without it two Workers would run the
                 // same context.
-                thread_table_changed();
                 h.threads.push(Thread::new(
                     ThreadState { ctx_addr, tid, clear_child_tid },
                     start,
@@ -8386,7 +8385,6 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
         let Some(i) = h.threads.iter().position(|t| t.kstate.tid == tid) else {
             return 0;
         };
-        thread_table_changed();
         h.threads[i].run().waiting = Waiting::Runnable;
         set_current(h, i);
         h.threads[i].run().pc as i64
@@ -8621,7 +8619,6 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
         r.waiting = Waiting::Exited;
         r.blocked_on = None;
     }
-    thread_table_changed();
     // See `gex_exited`: tells a program that finished from one that abandoned
     // the wasm stack with no status set.
     EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9053,7 +9050,6 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     write_u64(data, c + ctx::MON_SIZE, 0);
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
-    thread_table_changed();
     h.threads = vec![Thread::new(ThreadState::new(ctx_addr, h.kernel.pid), entry, Waiting::Runnable)];
     set_current(h, 0);
     if let (Some(p), None) = (&program, &restored) {
@@ -10064,7 +10060,6 @@ fn now_ns() -> u64 {
 /// it took to decide: everything the idle path then acts on, so that a pass
 /// of a waiting Worker's loop takes the kernel's lock once rather than seven
 /// times (docs/kernel-locking.md, step 3).
-#[derive(Clone, Copy)]
 struct IdleLook {
     /// What the page must supply, as `paused()` bits (see `idle_why`).
     why: u8,
@@ -10573,145 +10568,6 @@ fn wait_why(r: &Run) -> u8 {
     mask
 }
 
-/// Bumped whenever a thread's entry changes other than by its own Worker
-/// running it: `exit_process` (an `exit_group` in any thread marks them all
-/// exited), exec's new table, a thread added, a Worker adopting its thread.
-/// Per process, as `LOCAL_SIGNALS`. An idle turn's snapshot (`IDLE_SNAP`)
-/// holds only while it has not moved.
-static THREAD_TABLE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-fn thread_table_changed() {
-    THREAD_TABLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
-/// Idle turns answered from a snapshot before one takes the lock again
-/// anyway: what the snapshot cannot see (another thread's wait, which
-/// `idle_why` classifies, a signal sent with no counter moving) is looked at
-/// at least this often.
-const IDLE_FAST_MAX: u32 = 16;
-
-/// What an idle turn saw under the lock, kept so the next turns can ask
-/// whether this Worker's thread became ready without the lock: its wait and
-/// the call it parked in (asked again with `wait_ready`: atomics, the clock,
-/// and handles that carry their own locks), the rest of the turn's answer,
-/// and the counters that say nothing else moved.
-struct IdleSnap {
-    thread: usize,
-    waiting: Waiting,
-    blocked_on: Option<gex_kernel::BlockOp>,
-    look: IdleLook,
-    wayland: Option<crate::wl::WaylandDevice>,
-    signal_seq: i32,
-    local_signals: u32,
-    table_gen: u32,
-    turns: u32,
-}
-
-thread_local! {
-    static IDLE_SNAP: RefCell<Option<IdleSnap>> = const { RefCell::new(None) };
-    /// Idle turns answered without the lock, and with it (`gex_pick_counts`).
-    static PICK_FAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The counters an idle snapshot is checked against, read before the turn
-/// looks at anything, as `WAKE_SEEN` is: a signal or exit landing while the
-/// turn decides moves them after this read, and the next turn sees it.
-fn idle_counters() -> (i32, u32, u32) {
-    use std::sync::atomic::Ordering;
-    let seq = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
-    (seq, LOCAL_SIGNALS.load(Ordering::Acquire), THREAD_TABLE_GEN.load(Ordering::Acquire))
-}
-
-/// An idle turn without the kernel's lock (docs/kernel-locking.md, step 6:
-/// the pick reads only its own thread). Answers when the last turn found this
-/// Worker's thread waiting and nothing since could have changed that but what
-/// the wait itself watches (a futex's generation, the clock, a pipe or a
-/// socket), which is asked here: no signal counter moved and no timer is
-/// armed, the thread table
-/// (exits, exec) did not change, the process has not exited, and the
-/// compositor has nothing to pump. `None`: take the lock and look.
-fn idle_fast(counters: (i32, u32, u32)) -> Option<IdleLook> {
-    use std::sync::atomic::Ordering;
-    if unsafe { k_present() } == 0
-        || EXITED.load(Ordering::Relaxed)
-        || TIMERS_ARMED.load(Ordering::Relaxed)
-    {
-        return None;
-    }
-    IDLE_SNAP.with(|c| {
-        let mut c = c.borrow_mut();
-        let snap = c.as_mut()?;
-        snap.turns += 1;
-        if snap.turns > IDLE_FAST_MAX
-            || snap.thread != cur()
-            || (snap.signal_seq, snap.local_signals, snap.table_gen) != counters
-            || snap.wayland.as_ref().is_some_and(|w| w.needs_pump())
-        {
-            *c = None;
-            return None;
-        }
-        if wait_ready(&snap.waiting, snap.blocked_on.as_ref(), now_ns(), false) {
-            *c = None;
-            return None;
-        }
-        Some(snap.look)
-    })
-}
-
-/// Keep what an idle turn saw for `idle_fast`, when this Worker's thread
-/// waits on something any Worker may ask about and the turn is not watching
-/// for a deadlock.
-fn idle_snapshot(h: &Host, look: &IdleLook, counters: (i32, u32, u32)) {
-    let Some(t) = h.threads.get(cur()) else { return };
-    // A deadlock watch counts turns under the lock; a thread that is not
-    // waiting, or is not this Worker's to run, has nothing to keep.
-    if look.all_blocked || matches!(t.waiting, Waiting::Runnable | Waiting::Exited | Waiting::Elsewhere) {
-        return;
-    }
-    // Only handles whose readiness is safe to ask from any Worker: a pipe or
-    // a socket (the global kernel's, or a handle with its own lock). The
-    // page's terminal is not -- `StdinQueue` is a `RefCell` the lock alone
-    // guards, and a `Tty` asks it -- nor is anything else `idle_why` would
-    // call a keystroke.
-    let shareable = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
-        use gex_kernel::vfs::FileType;
-        Arc::as_ptr(handle) as *const () != Arc::as_ptr(&*STDIN) as *const ()
-            && (handle.peer_wakes()
-                || matches!(handle.metadata().map(|m| m.file_type), Ok(FileType::Socket) | Ok(FileType::Fifo)))
-    };
-    let ok = match (&t.waiting, &t.blocked_on) {
-        (Waiting::Read(hd) | Waiting::Write(hd) | Waiting::Accept(hd), _) => shareable(hd),
-        (Waiting::Net(_), Some(gex_kernel::BlockOp::Poll { fds, .. })) => {
-            fds.iter().all(|p| p.handle.as_ref().is_none_or(shareable))
-        }
-        _ => true,
-    };
-    if !ok {
-        return;
-    }
-    let (signal_seq, local_signals, table_gen) = counters;
-    IDLE_SNAP.with(|c| {
-        *c.borrow_mut() = Some(IdleSnap {
-            thread: cur(),
-            waiting: t.waiting.clone(),
-            blocked_on: t.blocked_on.clone(),
-            look: *look,
-            wayland: h.wayland.clone(),
-            signal_seq,
-            local_signals,
-            table_gen,
-            turns: 0,
-        })
-    });
-}
-
-/// Idle scheduler turns this Worker answered without the kernel's lock
-/// (`idle_fast`), for the census.
-#[no_mangle]
-pub extern "C" fn gex_pick_fast_count() -> u64 {
-    PICK_FAST.with(|c| c.get())
-}
-
 /// Choose the next guest thread to run, and finish whatever syscall it was in
 /// the middle of. It no longer chooses between *processes*: there is one per
 /// Worker, and the others run elsewhere.
@@ -10763,13 +10619,6 @@ fn schedule() -> i32 {
         waitq::Turn::Locked => {}
     }
     loop {
-        let counters = idle_counters();
-        let fast = idle_fast(counters);
-        if fast.is_some() {
-            PICK_FAST.with(|c| c.set(c.get() + 1));
-        } else {
-            IDLE_SNAP.with(|c| *c.borrow_mut() = None);
-        }
         // Before anything is chosen, the compositor: a wayland client writes
         // a request then blocks on the reply, so it must run here, the one
         // place every thread passes through on its way to waiting. Needs the
