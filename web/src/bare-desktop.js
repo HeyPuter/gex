@@ -24,29 +24,58 @@ export function bareDesktop(desktop, mount) {
   let z = 1;
   let cascade = 0;
   const keyOfParent = (win) => `${win.token}:${win.client}:${win.parent}`;
+  // A window its client places (`gex_window_placement_v1`: every Win32
+  // window under Wine) has real coordinates: Wine centres a dialog on its
+  // owner, runs the caption drag and the border resize itself (SC_MOVE,
+  // SC_SIZE) and says where the window went. The page puts it there and
+  // stacks it as told; it never cascades, raises or moves one.
   const at = (win) => {
+    if (win.placed) return { x: win.relX | 0, y: win.relY | 0 };
     if (win.role === ROLE_TOPLEVEL || !win.parent) return placed.get(win.key) ?? { x: 0, y: 0 };
     const p = placed.get(keyOfParent(win)) ?? { x: 0, y: 0 };
     return { x: p.x + (win.relX | 0), y: p.y + (win.relY | 0) };
   };
   const move = (win) => {
-    const p = win.role === ROLE_TOPLEVEL ? placed.get(win.key) : at(win);
+    const p = win.role === ROLE_TOPLEVEL && !win.placed ? placed.get(win.key) : at(win);
     placed.set(win.key, p);
     win.canvas.style.left = `${p.x}px`;
     win.canvas.style.top = `${p.y}px`;
     // Children follow: a popup's place is its parent's plus its offset.
-    for (const w of desktop.windows()) if (w.role !== ROLE_TOPLEVEL && w.parent && keyOfParent(w) === win.key) move(w);
+    for (const w of desktop.windows()) if (w.role !== ROLE_TOPLEVEL && w.parent && !w.placed && keyOfParent(w) === win.key) move(w);
   };
   const size = (win) => {
     win.canvas.style.width = `${win.canvas.width}px`;
     win.canvas.style.height = `${win.canvas.height}px`;
+  };
+  // Placed windows' stacking, bottom to top, per layer (0 normal, 1 topmost,
+  // 2 menus); every layer above every unplaced window.
+  const stacks = [[], [], []];
+  const restack = () => {
+    stacks.forEach((list, layer) => list.forEach((w, i) => { w.canvas.style.zIndex = String(2000000 + layer * 100000 + i); }));
+  };
+  const unstack = (win) => { for (const list of stacks) { const i = list.indexOf(win); if (i >= 0) list.splice(i, 1); } };
+  // `below`: the stack id of the window this one is directly under; 0 the top
+  // of its layer, 0xffffffff its bottom.
+  const stackUnder = (win, below) => {
+    unstack(win);
+    const list = stacks[Math.min(2, Math.max(0, win.layer | 0))];
+    if (below === 0xffffffff) list.unshift(win);
+    else {
+      const i = below ? list.findIndex((w) => w.stackId === below) : -1;
+      if (i >= 0) list.splice(i, 0, win);
+      else list.push(win);
+    }
+    restack();
   };
   desktop.onwindow = (win) => {
     if (win.role === ROLE_CURSOR) return;
     const c = win.canvas;
     c.style.position = 'absolute';
     size(win);
-    if (win.role === ROLE_TOPLEVEL) {
+    if (win.placed) {
+      stackUnder(win, 0);
+      win.onrestack = (below) => stackUnder(win, below);
+    } else if (win.role === ROLE_TOPLEVEL) {
       // The first window at the corner, the next ones cascaded: a toplevel
       // has no position in Wayland, and Wine's own frame is the decoration.
       const step = 28;
@@ -55,7 +84,7 @@ export function bareDesktop(desktop, mount) {
       const roomY = Math.max(1, mount.clientHeight - win.height);
       placed.set(win.key, { x: (n * step) % roomX, y: (n * step) % roomY });
       c.style.zIndex = String(z++);
-      c.addEventListener('pointerdown', () => { c.style.zIndex = String(z++); });
+      c.addEventListener('pointerdown', () => { if (!win.placed) c.style.zIndex = String(z++); });
       win.place(placed.get(win.key).x, placed.get(win.key).y);
     } else {
       // Popups and subsurfaces above every toplevel.
@@ -63,7 +92,7 @@ export function bareDesktop(desktop, mount) {
     }
     win.onplace = () => move(win);
     win.onresized = () => size(win);
-    win.onclosed = () => { c.remove(); placed.delete(win.key); };
+    win.onclosed = () => { c.remove(); placed.delete(win.key); unstack(win); };
     mount.append(c);
     move(win);
   };
