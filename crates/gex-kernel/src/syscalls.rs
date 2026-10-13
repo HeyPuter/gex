@@ -2785,6 +2785,25 @@ impl Kernel {
             return SyscallOutcome::ThreadExit;
         }
 
+        // `epoll_pwait`, `ppoll` and `pselect6` with a signal mask: it is the
+        // thread's mask for the call, as `rt_sigsuspend`'s is. A call that
+        // waits takes the old one back through the handler's frame, or when
+        // it finishes (`finish_blocking`, the hosts' `restore_sigmask`); one
+        // that answers at once, below, puts it back before any signal is
+        // looked at. foot blocks SIGTERM and takes it only in `epoll_pwait`:
+        // without this it never heard one.
+        let call_mask = match self.call_sigmask(m, n, &a) {
+            Ok(set) => set,
+            Err(e) => {
+                let _ = set_result(m, self.ctx_addr, e.as_return());
+                return SyscallOutcome::Continue;
+            }
+        };
+        if let Some(want) = call_mask {
+            const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+            self.restore_sigmask = Some(self.signals.blocked());
+            self.signals.set_blocked(want & !UNBLOCKABLE);
+        }
         // A syscall that sleeps must do so with the kernel unlocked, or the
         // thread that would wake it can never get in.
         if let Some(op) = self.blocking_op(m, n, a) {
@@ -2831,6 +2850,14 @@ impl Kernel {
         } else {
             self.dispatch(m, n, a)
         };
+        // A call with a mask of its own that answered without waiting: the
+        // old mask is back before any signal is delivered (Linux's
+        // `restore_saved_sigmask_unless`, for a call that is not `EINTR`).
+        if call_mask.is_some() {
+            if let Some(old) = self.restore_sigmask.take() {
+                self.signals.set_blocked(old);
+            }
+        }
         // A blocking write that still found no room: the check in
         // `blocking_op` and the write are not one step, and with a pipe in
         // the global kernel another Worker's writer can fill it in between
@@ -2955,6 +2982,34 @@ impl Kernel {
     /// The descriptor half of this kernel ([`FdIo`]).
     pub fn fd_io(&self) -> FdIo<'_> {
         FdIo { fds: &self.fds, compat: self.compat }
+    }
+
+    /// The signal mask `epoll_pwait`, `epoll_pwait2`, `ppoll` or `pselect6`
+    /// (`n`, canonical, its arguments `a`) asks to wait with: `Ok(None)` when
+    /// the call has none (a null pointer, or another call), `EINVAL` for a
+    /// set size that is not 8 bytes, `EFAULT` for a set that cannot be read.
+    fn call_sigmask(&self, m: &GuestMem<'_>, n: u64, a: &[u64; 6]) -> Result<Option<u64>, Errno> {
+        let (set, size) = match n {
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => (a[4], a[5]),
+            nr::PPOLL => (a[3], a[4]),
+            // The sixth argument points at `{ const sigset_t *ss; size_t
+            // ss_len; }`, with 64-bit fields here: a 32-bit ABI's are widened
+            // by its translation (`i386::translate`).
+            nr::PSELECT6 => {
+                if a[5] == 0 {
+                    return Ok(None);
+                }
+                (m.read_u64(a[5])?, m.read_u64(a[5] + 8)?)
+            }
+            _ => return Ok(None),
+        };
+        if set == 0 {
+            return Ok(None);
+        }
+        if size != 8 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Some(m.read_bits64(set)?))
     }
 
     /// The blocking half of a syscall, if it has one.

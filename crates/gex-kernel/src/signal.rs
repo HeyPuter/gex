@@ -1005,10 +1005,8 @@ fn setup_frame_x86(
     m.write_u64(uc + xframe::UC_STACK as u64, own.alt_stack.sp)?;
     m.write_u32(uc + xframe::UC_STACK as u64 + 8, own.alt_stack.flags)?;
     m.write_u64(uc + xframe::UC_STACK as u64 + 16, own.alt_stack.size)?;
-    m.write_u64(
-        uc + xframe::UC_SIGMASK as u64,
-        own.suspend_restore.take().unwrap_or(own.blocked),
-    )?;
+    let saved_mask = own.suspend_restore.take().unwrap_or(own.blocked);
+    m.write_u64(uc + xframe::UC_SIGMASK as u64, saved_mask)?;
 
     let mc = uc + xframe::UC_MCONTEXT as u64;
     for (i, reg) in xframe::GPR_ORDER.iter().enumerate() {
@@ -1021,7 +1019,7 @@ fn setup_frame_x86(
     // cs = __USER_CS (0x33), the other selectors zero.
     m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
     m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
-    m.write_u64(mc + xframe::MC_OLDMASK as u64, own.blocked)?;
+    m.write_u64(mc + xframe::MC_OLDMASK as u64, saved_mask)?;
     m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
     m.write_u64(mc + xframe::MC_FPSTATE as u64, fpstate)?;
 
@@ -1192,6 +1190,9 @@ fn setup_frame_i386(
     };
     m.write_u32(frame_addr, ret as u32)?;
 
+    // The mask sigreturn puts back: the one a sigsuspend or pwait-style
+    // call replaced for its duration, otherwise the current one.
+    let saved_mask = own.suspend_restore.take().unwrap_or(own.blocked);
     let sc = if rt {
         m.write_u32(frame_addr + iframe::RT_SIG, signal)?;
         let info = frame_addr + iframe::RT_INFO;
@@ -1204,15 +1205,11 @@ fn setup_frame_i386(
         m.write_u32(uc + iframe::UC_STACK, own.alt_stack.sp as u32)?;
         m.write_u32(uc + iframe::UC_STACK + 4, own.alt_stack.flags)?;
         m.write_u32(uc + iframe::UC_STACK + 8, own.alt_stack.size as u32)?;
-        m.write_u64(
-            uc + iframe::UC_SIGMASK,
-            own.suspend_restore.take().unwrap_or(own.blocked),
-        )?;
+        m.write_u64(uc + iframe::UC_SIGMASK, saved_mask)?;
         uc + iframe::UC_MCONTEXT
     } else {
         m.write_u32(frame_addr + iframe::SF_SIG, signal)?;
-        let mask = own.suspend_restore.take().unwrap_or(own.blocked);
-        m.write_u32(frame_addr + iframe::SF_EXTRAMASK, (mask >> 32) as u32)?;
+        m.write_u32(frame_addr + iframe::SF_EXTRAMASK, (saved_mask >> 32) as u32)?;
         frame_addr + iframe::SF_SC
     };
 
@@ -1233,7 +1230,7 @@ fn setup_frame_i386(
     m.write_u32(sc + iframe::SC_ESP_AT_SIGNAL, sp as u32)?;
     m.write_u32(sc + iframe::SC_SS, iframe::USER_DS)?;
     m.write_u32(sc + iframe::SC_FPSTATE, fpstate as u32)?;
-    m.write_u32(sc + iframe::SC_OLDMASK, own.blocked as u32)?;
+    m.write_u32(sc + iframe::SC_OLDMASK, saved_mask as u32)?;
     m.write_u32(sc + iframe::SC_CR2, fault_address as u32)?;
 
     // The FP image: x87 control word, MXCSR and the eight xmm registers.
