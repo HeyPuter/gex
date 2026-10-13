@@ -765,6 +765,10 @@ What §10 item 3 has built so far, on `wskern/main` and `wskern/wine`:
     in the page under Node, and natively, instead of hanging.
   - Test hooks: `WINEGEX_DOOR_TRAP=N` (the Nth door call traps) and
     `WINEGEX_SERVER_DIE=N` (the Nth request exits).
+  - `tests/w3/killdoor.sh` kills processes whose threads make requests
+    without pause; the server stays whole, natively and in the page. A
+    SIGKILL ends a thread at a system call, never inside a door, so in
+    12 kills the host never had to defer a Worker's end.
 - **A door bug found on the way: the door's register context was too
   small.** `door_init` allocated 34 slots (272 bytes), only the
   system-call registers. gex's kernel writes past them: `clock_call`
