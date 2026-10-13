@@ -311,6 +311,12 @@ export class DomDesktop {
     return d;
   }
 
+  /** The output's size from now on (app.js `resize()`): what a client asks
+   *  for the screen's size sees this. Windows already up keep their places. */
+  resizeOutput(w, h) {
+    setOutputSize(this.#channel, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
+  }
+
   /** Run the guest's OpenGL for this desktop.
    *
    * The device is built here and now, before any client has drawn: the guest's

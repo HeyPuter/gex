@@ -106,7 +106,16 @@ pub struct Config {
     /// from the host when a guest first reads them; `"whole"` (the default
     /// for a config without the setting) ships everything.
     pub bundle_split: bool,
+    /// The web build's start defaults (`"start"`): what the app library's
+    /// `start()` uses when the page passes no such option. Only options
+    /// that change nothing in the build's output belong here (docs/eject.md,
+    /// "The web build"); each is checked by name.
+    /// As written (a JSON object's text), "{}" when absent.
+    pub start: String,
 }
+
+/// `"start"`'s settings: app.js `start()` options a build may default.
+pub const START_OPTIONS: &[&str] = &["args", "env", "cwd", "size", "mtimes", "strace", "trapstack", "persist"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -122,6 +131,7 @@ impl Default for Config {
             link_groups: Vec::new(),
             features_off: Vec::new(),
             bundle_split: false,
+            start: "{}".to_string(),
         }
     }
 }
@@ -179,7 +189,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -296,6 +306,22 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>>>()?,
             Some(_) => bail!("{what}: \"link_groups\" is not a list of lists"),
+        };
+        c.start = match v.get("start") {
+            None | Some(Json::Null) => "{}".to_string(),
+            Some(Json::Obj(kv)) => {
+                for (k, _) in kv {
+                    if !START_OPTIONS.contains(&k.as_str()) {
+                        let build_side = matches!(k.as_str(), "compositor" | "gl" | "translation" | "fjit" | "multiprocess" | "units" | "bundle" | "hostx" | "mem64");
+                        if build_side {
+                            bail!("{what}: \"start\": \"{k}\" changes the build's output, so it is a build setting (\"features\" or \"bundle\"), not a start default");
+                        }
+                        bail!("{what}: \"start\": unknown option \"{k}\" (known: {})", START_OPTIONS.join(", "));
+                    }
+                }
+                json::write(&Json::Obj(kv.clone()))
+            }
+            Some(_) => bail!("{what}: \"start\" is not an object"),
         };
         c.features_off = match v.get("features") {
             None | Some(Json::Null) => Vec::new(),

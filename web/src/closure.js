@@ -2,6 +2,7 @@
 // translated ahead of time) into a page.
 import { fetchBytes } from './runtime.js';
 import { metadataSection } from '../../shims/browser/js/gex.mjs';
+import { pageParams } from './page-env.js';
 
 /**
  * Fetch and compile a closure described by a manifest.
@@ -25,7 +26,7 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
   // are absolute and baked in at build time, so leaving some out is safe: the
   // pages they would claim are never claimed and the runtime translator meets
   // that code instead.
-  const only = Number(new URLSearchParams(location.search).get('libs') || 0);
+  const only = Number(pageParams().get('libs') || 0);
   if (only > 0) {
     manifest.libs = manifest.libs.slice(0, only);
     if (manifest.metas) manifest.metas = manifest.metas.slice(0, only);

@@ -3,7 +3,7 @@
 // (docs/eject.md, "W3 pages") reaches its window in headless Chromium, built
 // with the features its project left out really gone.
 //
-//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH] [--placed]
+//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH] [--placed] [--shell PAGE]
 //
 // Checks, in order:
 //   1. the site's nt.json says kind w3, and for each feature it says is off,
@@ -15,7 +15,9 @@
 //   3. with "compositor" off, what draws it is the page's bare desktop
 //      (`describe().compositor === 'none'`), and the window has pixels;
 //   4. no service worker: the site ships no sw.js, none is registered, and
-//      the first load is the only one (the launcher once, nt.html once);
+//      the first load is the only one: the site's page (the project's
+//      user/index.html, which imports app.mjs and calls start()) once, and
+//      gex's test page (nt.html) neither shipped, named nor loaded;
 //   5. with --placed (Paint, "compositor" off): the bare desktop leaves a
 //      window its client places (gex_window_placement_v1) to Wine. A caption
 //      drag moves it by the drag, a border drag past its edge grows it and
@@ -23,6 +25,10 @@
 //      held by the canvas), and a click on Paint leaves its owned dialog
 //      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
 //      raises a placed window.
+//   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
+//      the site's page instead, a hand-written one with its own container,
+//      size, arguments and onExit. The desktop is its box's size, inside the
+//      box; then kill() ends the run, `exited` and onExit say 137.
 // Prints PASS or FAIL lines; exits 0 only when all pass.
 
 import { spawn } from 'node:child_process';
@@ -34,7 +40,8 @@ import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
-const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome'].includes(av[i - 1])) ?? '');
+const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome', '--shell'].includes(av[i - 1])) ?? '');
+const shell = opt('--shell', null) ? resolve(opt('--shell', null)) : null;
 const placedChecks = av.includes('--placed');
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
 const timeout = Number(opt('--timeout', '400')) * 1000;
@@ -56,6 +63,21 @@ if (off.includes('compositor')) {
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
+// The app library, and no test page: nt.html is gex's, never an ejected build's.
+check(existsSync(join(site, 'app.mjs')), 'the site has the app library (app.mjs)');
+{
+  const named = [];
+  const scan = (d, rel = '') => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (r.startsWith('project/build/web/lazy')) continue;
+      if (e.isDirectory()) scan(join(d, e.name), r);
+      else if (e.name === 'nt.html' || (/\.(m?js|html|json)$/.test(e.name) && readFileSync(join(d, e.name)).includes('nt.html'))) named.push(r);
+    }
+  };
+  scan(site);
+  check(named.length === 0, `no nt.html in the site, and nothing names it${named.length ? ` (${named.slice(0, 4).join(', ')})` : ''}`);
+}
 // "bundle": "split": the files the recorded run never opened are lazy files,
 // each in the store under its hash.
 if (nt.bundle?.split) {
@@ -75,8 +97,9 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/ja
 let lazyReads = 0;
 const server = http.createServer((req, res) => {
   if (req.url.includes('/build/web/lazy/')) lazyReads++;
-  let p = join(site, decodeURIComponent(new URL(req.url, 'http://x').pathname));
-  if (!p.startsWith(site)) { res.writeHead(403).end(); return; }
+  const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  let p = shell && (path === '/' || path === '/index.html') ? shell : join(site, path);
+  if (!p.startsWith(site) && p !== shell) { res.writeHead(403).end(); return; }
   let st = null;
   try { st = statSync(p); if (st.isDirectory()) { p = join(p, 'index.html'); st = statSync(p); } } catch { st = null; }
   const h = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin' };
@@ -117,7 +140,7 @@ const { targetId } = await browser.send('Target.createTarget', { url: 'about:bla
 const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
 await browser.send('Runtime.enable', {}, page);
 const ev = async (e) => (await browser.send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }, page).catch(() => ({})))?.result?.value;
-// Every load of the top frame: the launcher, then nt.html, and nothing again.
+// Every load of the top frame: the site's page, and nothing again.
 const loads = [];
 await browser.send('Page.enable', {}, page);
 browser.on('Page.frameNavigated', (p) => { if (!p.frame.parentId) loads.push(new URL(p.frame.url).pathname); });
@@ -128,8 +151,9 @@ while (Date.now() - t0 < timeout) {
   const s = await ev('(async () => { const c = globalThis.__gexCompositor; return c ? JSON.stringify(await c.describe()) : null; })()');
   d = s ? JSON.parse(s) : null;
   if (d?.titles?.some((t) => titleRe.test(t))) break;
-  const st = await ev('JSON.stringify({ phase: globalThis.__nt?.phase, error: globalThis.__nt?.error })');
-  if (st && JSON.parse(st).phase === 'failed') { check(false, `the page failed: ${JSON.parse(st).error}`); done(); }
+  const st = await ev('JSON.stringify({ phase: globalThis.__nt?.phase, error: globalThis.__nt?.error, start: globalThis.startError, shown: document.getElementById("error")?.textContent })');
+  const sv = st ? JSON.parse(st) : {};
+  if (sv.phase === 'failed' || sv.start || sv.shown) { check(false, `the page failed: ${sv.error ?? sv.start ?? sv.shown}`); done(); }
   await sleep(500);
 }
 const secs = ((Date.now() - t0) / 1000).toFixed(1);
@@ -146,13 +170,23 @@ if (off.includes('compositor')) {
 // 4. No service worker, and no second load.
 const regs = await ev('navigator.serviceWorker.getRegistrations().then((r) => r.length)');
 check(regs === 0, `no service worker registered (${regs})`);
-const launcher = loads.filter((u) => u === '/' || u.endsWith('/index.html')).length;
-const ntLoads = loads.filter((u) => u.endsWith('/nt.html')).length;
-check(launcher === 1 && ntLoads === 1, `one load, no reload (top-frame loads: ${loads.join(' ')})`);
+check(loads.length === 1 && (loads[0] === '/' || loads[0].endsWith('/index.html')), `one load of the site's page, no reload (top-frame loads: ${loads.join(' ')})`);
 await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
 if (nt.bundle?.split) console.log(`info: ${lazyReads} lazy read(s) to the window`);
+
+// 6. A page of its own: the desktop in its box, at the box's size; kill().
+if (shell) {
+  const box = JSON.parse(await ev(`(() => { const s = document.getElementById('stage'); const r = s.getBoundingClientRect();
+    const d = s.querySelector('.gex-desktop'); const dr = d?.getBoundingClientRect();
+    return JSON.stringify({ box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], desk: dr ? [Math.round(dr.left), Math.round(dr.top), Math.round(dr.width), Math.round(dr.height)] : null }); })()`) ?? '{}');
+  check(box.desk && box.desk.join() === box.box.join(), `the desktop fills the page's own box (box ${box.box}, desktop ${box.desk})`);
+  check(d.output === `${box.box[2]}x${box.box[3]}`, `the guest's output is the box's size (${d.output})`);
+  const st = await ev('(async () => { globalThis.app.kill(); return JSON.stringify({ status: await globalThis.app.exited, onExit: globalThis.exitedWith, title: document.title }); })()');
+  const k = st ? JSON.parse(st) : {};
+  check(k.status === 137 && k.onExit === 137, `kill() ends the run: exited ${k.status}, onExit ${k.onExit} (title "${k.title}")`);
+}
 
 // 5. Placed windows: Wine moves, sizes and stacks them; the page follows.
 if (placedChecks) {

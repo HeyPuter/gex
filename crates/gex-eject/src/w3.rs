@@ -177,6 +177,8 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
     if !out.join(crate::config::CONFIG_FILE).exists() {
         write_file(&out.join(crate::config::CONFIG_FILE), template(&o.features_off).as_bytes(), false)?;
     }
+    // The page: the user's, an example to start from (app.mjs's start()).
+    crate::web::write_shell(out)?;
     Ok(sum)
 }
 
@@ -199,13 +201,16 @@ fn template(off: &[String]) -> String {
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
                first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
-               \"The bundle split\"."),
+               \"The bundle split\". \"start\": defaults for the app library's start() \
+               (args, env, cwd, size, mtimes, strace, trapstack, persist), over the \
+               recording's; the page's own options win (docs/eject.md, \"The web build\")."),
         ),
         (
             "features",
             obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(!off.iter().any(|x| x == f.name)))).collect()),
         ),
         ("bundle", s("split")),
+        ("start", obj(vec![])),
     ]))
 }
 
@@ -270,6 +275,10 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             }
         }
     }
+    if !page.join("app.mjs").is_file() {
+        bail!("{}/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
+    }
+    crate::web::check_no_test_page(&page)?;
     let mut page_files = 0;
     let mut stack = vec![page.clone()];
     while let Some(d) = stack.pop() {
@@ -330,6 +339,9 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         ("features_off", strs(&off)),
         ("units", Json::Arr(units.to_vec())),
         ("bundle", bundle),
+        // user/eject.json "start": the app library's start() defaults, over
+        // the recording's (docs/eject.md, "The web build").
+        ("start", Json::parse(&config.start).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?),
     ]);
     write_file(&web.join("w3.json"), json::write(&launch).as_bytes(), false)?;
     write_file(

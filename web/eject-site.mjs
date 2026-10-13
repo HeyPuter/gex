@@ -5,10 +5,10 @@
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
-//   index.html     the launcher (web/eject-site/index.html): checks the
-//                  browser, opens nt.html on the build
-//   nt.html, assets/, gex/   the page (runtime/web/page), runtime and Mesa,
-//                  as plain files
+//   index.html     the project's page (user/index.html, the user's), which
+//                  imports app.mjs and calls its start()
+//   app.mjs, assets/, gex/, vendor/   the app library (runtime/web/page, or
+//                  a W3 build's build/web/page), runtime and Mesa, plain files
 //   project/build/web/nt.json, project/build/web/rootfs.tar.zst, and the
 //                  units the browser loads (project/build/units/...)
 //   pack.json      every packed file: size, compressed size; the build id
@@ -17,7 +17,7 @@
 //   README.txt     hosting notes
 // Every file of the bundle and the units over 64 KiB is zstd-compressed (-19
 // --long=27, cached beside OUT in OUT.zcache by content) as FILE.zst, which
-// the page fetches and decodes itself (nt-page.js `pack=`). No service
+// the library fetches and decodes itself (app.js, pack.json). No service
 // worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
 // (scripted input, the 4x clock); without it they are dropped, so a player
 // gets the real clock and their own input. --drop removes a guest path from
@@ -137,7 +137,7 @@ walk(units, (p, rel) => {
   if (!want) return;
   unitBytes += statSync(p).size;
   place(p, join('project', cgen, rel));
-  // What the page compiles while the bundle downloads (nt.html ?preload=):
+  // What the library compiles while the bundle downloads (its preload list):
   // module names as gex.mjs keys them.
   const url = `/project/${cgen}/${rel}`;
   if (name === 'c.wasm') preload.push([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, url]);
@@ -178,16 +178,16 @@ const ntOut = { ...nt, settings, args, direct: !!nt.gl && !flag('--no-direct') }
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
-// The launcher and the page's decoder.
-// The build: everything served, packed or not (a page-only change is a new build too).
+// The page (the user's). The build: everything served, packed or not (a
+// page-only change is a new build too).
+page();
 const smallHash = createHash('sha256');
 walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
 const build = sha(JSON.stringify(files) + JSON.stringify(ntOut) + smallHash.digest('hex')).slice(0, 12);
-writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
-cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
 
 writeHosting();
+noTestPage();
 
 const total = Object.values(files).reduce((a, f) => a + f.size, 0);
 const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
@@ -273,6 +273,35 @@ createServer((req, res) => {
 }
 function mb(n) { return (n / 1048576).toFixed(1); }
 
+/** The project's page, user/index.html (gexc eject writes an example once;
+ *  it is the user's), at the site's root. */
+function page() {
+  const src = join(project, 'user/index.html');
+  if (!existsSync(src)) {
+    console.error(`eject-site: ${src} is missing: the page is the project's own (gexc eject writes an example; re-eject to get it)`);
+    process.exit(1);
+  }
+  copyFileSync(src, join(out, 'index.html'));
+  if (!existsSync(join(out, 'app.mjs'))) {
+    console.error('eject-site: the build has no app.mjs (the app library: web/build-eject-page.sh)');
+    process.exit(1);
+  }
+}
+
+/** gex's test page (nt.html) is never part of an ejected site. */
+function noTestPage() {
+  const bad = [];
+  walk(out, (p, rel) => {
+    if (rel.startsWith('project/build/web/lazy/')) return;
+    if (rel.split('/').pop() === 'nt.html') bad.push(rel);
+    else if (/\.(m?js|html|json)$/.test(rel) && readFileSync(p).includes('nt.html')) bad.push(rel);
+  });
+  if (bad.length) {
+    console.error(`eject-site: the site has or names nt.html (gex's test page): ${bad.slice(0, 5).join(', ')}`);
+    process.exit(1);
+  }
+}
+
 /** The site of a W3 page's project: its page (built with the project's
  *  features, as plain files), its bundle and units (packed, decoded by the
  *  page), the launcher and the hosting files. No service worker. */
@@ -291,7 +320,7 @@ function w3Site() {
   };
   // The page as plain files: nothing between it and the server decodes, so
   // only what the page itself fetches and decodes (the bundle, the units:
-  // nt-page.js `pack=`) is packed. A host's own compression still applies.
+  // app.js, pack.json) is packed. A host's own compression still applies.
   walk(join(web, 'page'), (p, rel) => {
     const dst = join(out, rel);
     mkdirSync(dirname(dst), { recursive: true });
@@ -300,7 +329,7 @@ function w3Site() {
   // The bundle.
   let tar = join(web, 'rootfs.tar');
   // `"bundle": "split"` (user/eject.json): the files the recorded run opened
-  // stay in the bundle; every other file is a lazy file (nt-page.js `lazy=`),
+  // stay in the bundle; every other file is a lazy file (app.js `lazy`),
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
   const split = w3.bundle?.split ? new Set(w3.bundle.read ?? []) : null;
@@ -365,16 +394,16 @@ function w3Site() {
   preload.sort((a, b) => b[2] - a[2]);
   writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
   writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
-  // The launcher and the page's decoder. No service worker: the host sends
-  // the isolation headers (COOP/COEP), and the page decodes what is packed.
+  // The page (the user's). No service worker: the host sends the isolation
+  // headers (COOP/COEP), and the library decodes what is packed.
+  page();
   const smallHash = createHash('sha256');
   // The lazy store is named by its content (lazy.json's hashes).
   walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/')) return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
   const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
-  writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
-  cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
   writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
   writeHosting();
+  noTestPage();
   rmSync(work, { recursive: true, force: true });
   const total = Object.values(files).reduce((a, f) => a + f.size, 0);
   const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);

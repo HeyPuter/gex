@@ -33,7 +33,8 @@ prog-project/
   run.sh              the native launcher                           generated
   .gitignore          ignores build/                                generated
   user/               yours                                         created once
-    eject.json          settings: replacements, coverage, arguments
+    eject.json          settings: replacements, coverage, arguments, start() defaults
+    index.html          the web build's page: an example that calls app.mjs's start()
     src/*.c             replacement functions
     files/              extra files for the guest's filesystem
   build/              build output (build.sh)
@@ -368,6 +369,92 @@ user/src/decompiled_ack.c: 1 function of C; bind it in user/eject.json with:
 
 ## The web build (Node and the browser)
 
+The web build is a **library**, not a page. Whatever the project (a Linux
+program, an NT-layer Windows program, a W3 page), the browser half is
+`app.mjs` exporting `start()`, and the page that calls it is the user's.
+`gexc eject` writes an example, `user/index.html`, once and never again:
+
+```html
+<script type="module">
+  import { start } from './app.mjs';
+  const app = await start({ container: document.body });
+  // app.exited (a promise of the exit status), app.kill(), app.resize('fit' | {w, h})
+</script>
+```
+
+plus a line that shows an error. Nothing about the page is special: any
+page that imports `app.mjs` and gives `start()` an element runs the program
+(tests/eject/w3-shell-min.html is a hand-written one, with its own box,
+arguments and onExit). gex's own test page, `web/nt.html`, is a test page
+only: an ejected build never ships or names it. `web/build-eject-page.sh`,
+`gexc eject build` (W3), `gexc eject` (`--web-page`) and
+`web/eject-site.mjs` each fail if their output has or names it.
+
+**`start(options)`** (web/src/app.js) resolves once the program runs, with
+`{ exited, kill(), resize(size), state, describe() }`. It rejects with a
+message when the run cannot start: no cross-origin isolation, no WebGPU for
+a build that draws with it, a download that failed, or an option for a piece
+the build left out (`start({ compositor: true })` on a `"compositor": false`
+build names `"features": {"compositor": true}` in user/eject.json). Options:
+
+| Option | What |
+| --- | --- |
+| `container` / `canvas` | the element the desktop fills (a canvas or a box is made in it), or the canvas to draw into |
+| `size` | `'fit'` (the container's size), `{w, h}` or `'WxH'` |
+| `args` | the program's arguments, an array, instead of the recorded ones |
+| `env` | more environment, `['K=V']` or `{K: V}`; a name given replaces the build's |
+| `cwd`, `exe` | the working directory, the program (a path in the bundle) |
+| `mtimes` | the bundle's file times for the guest |
+| `persist` | `false`, or `{dir, db}`: a guest directory kept in IndexedDB |
+| `strace` | `true` (every process) or a pid |
+| `trapstack` | a trap's wasm frames |
+| `debug` | any other runtime switch, `{name: value}` (the table below) |
+| `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out); `compositor: false` draws the windows straight into the page in a build that has both |
+| `onLog(text)`, `onExit(status)` | the program's terminal output; its exit |
+| `baseUrl` | where app.mjs's files are (default: beside app.mjs) |
+
+The library never reads the page's URL: the runtime's switches come from
+these options (`GEX_PAGE_SEARCH`, web/src/page-env.js), and its files from
+`baseUrl` (`GEX_ASSET_BASE`), so a site can live under any path.
+
+**Build or start.** What changes the build's output (its wasm, its bundle,
+what ships) is `user/eject.json`, at build time. Everything else is a
+`start()` option, whose default the build records: user/eject.json
+`"start"` (`args`, `env`, `cwd`, `size`, `mtimes`, `strace`, `trapstack`,
+`persist`) over the recording's, and the page's options over both. A
+`"start"` key for a build setting (`"compositor"`, say) fails the build and
+says where it goes. Each of gex's test page's parameters, and where it went:
+
+| nt.html parameter | Side | Why |
+| --- | --- | --- |
+| `tar`, `lazy`, `pack`, `preload`, `zstd` | build | the bundle, its split, its packing and the preload list are what the site ships (`"bundle"`) |
+| `cgen`, `cgenurl`, `unguarded`, `elfunits`, `wasmdlls`, `pins`, `dense`, `unitcache` | build | the units and providers: which wasm runs |
+| `aot`, `fjit`, `fjitlibs` | build | run-time translation or not (`"translation"`); `start({ translation: true })` only where the build has it |
+| `compositor` | build | `"features"`: the scene compositor in or out; `start({ compositor: false })` may still choose the bare desktop |
+| `gl`, `glbackend` | build | `"features": {"gl"}`: Mesa shipped or not (wgpu is the only backend) |
+| `hostx` | build | ships Xwayland |
+| `mem64` | build | a different shim, seed and kernel |
+| `exe`, `args`, `argv`, `env`, `cwd` | start | how the program starts; nothing in the build changes (`exe`, `args`, `env`, `cwd`) |
+| `size` | start | the desktop's size (`size`; `resize()` later) |
+| `mtimes` | start | file times for the guest (`mtimes`) |
+| `persist`, `persistdb` | start | saves in IndexedDB (`persist`) |
+| `persistms` | start | `debug.persistms` |
+| `strace`, `stracepid`, `trapstack` | start | traces (`strace`, `trapstack`) |
+| `direct`, `present`, `pointerlock`, `gllimits`, `mesaenv`, `wgslcache`, `glcapture`, `wgpustats`, `gltrace`, `glcanvas`, `sharetrace`, `xverbose`, `libs`, `single` | start | presentation and diagnostics: `debug.NAME` |
+| `exittrace`, `callouttrace`, `heartbeat`, `doorstats`, `densedebug`, `tracemisses`, `attachtrace`, `liftmax`, `t1fold`, `xlatereport`, `inlinedispatch` | start | runtime diagnostics: `debug.NAME` |
+
+**Where it lives.** A W3 or NT-layer project's library is
+`web/build-eject-page.sh`'s output (app.mjs, its chunks under assets/, the
+runtime's wasm under gex/, the zstd decoder under vendor/): `build/web/page`
+(W3) or `runtime/web/page` (NT layer, `--web-page`). It reads the build's
+launch file, `project/build/web/nt.json` beside it. `web/eject-site.mjs` lays
+a site out that way (the page at `/`, the library beside it, the project's
+files under `project/`), and so does the project's own `serve.mjs`. A Linux
+program's `app.mjs` (generated, the single-Worker runtime below) has the same
+`start()`, and its `serve.mjs` serves user/index.html at `/`.
+
+### A Linux program's web build
+
 `gexc eject ... --web-shim gex_browser.wasm` vendors gex's browser runtime
 into `runtime/web/`: the shim you give it (built from the same source, for
 the same guest: `shims/browser`, `wasm32-unknown-unknown`, with
@@ -387,8 +474,13 @@ Launchers, sharing `runtime/web/eject.mjs`:
 
 ```sh
 node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
-node serve.mjs 8000        # then open http://localhost:8000/?args=5
+node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
+
+`app.mjs`'s `start()` takes `container` (its output goes to a `<pre>` there
+unless `onLog`), `args`, `env`, `cwd`, `strace`, `translation` (the JIT
+fallback), `onExit`; `kill()` stops waiting for and hearing the run (it is
+on the page's thread), `resize()` does nothing (a terminal program).
 
 The page needs cross-origin isolation (gex's runtime uses
 `SharedArrayBuffer`); `serve.mjs` sends the two headers. Replacements run
@@ -465,9 +557,9 @@ with a feature off fails its build.
 
 A W3 program (Wine as native wasm32: every Wine process a guest process
 running `wine`, its PE side in `winepe.wasm`, the Windows images'
-code in function-tier units) runs in the same page (`nt.html`) as any
-demo. Ejecting one makes that page a standalone site, with the features
-the user keeps:
+code in function-tier units) runs on the same runtime as any demo.
+Ejecting one makes it the app library (above), built with the features the
+user keeps, and a standalone site around the project's page:
 
 ```sh
 # 1. record: run the page to its window (headless Chromium)
@@ -480,6 +572,7 @@ mspaint-project/build.sh
 node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
 node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
 node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks its windows
+node tests/eject/w3-page.mjs site --shell tests/eject/w3-shell-min.html   # a hand-written page
 ```
 
 - **The recording** (`w3-session.json`) is how the page was started (its
@@ -491,19 +584,21 @@ node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks 
 - **The project** holds the recording (`session/`), the bundle
   (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
   browser shim, kernel and seed (`runtime/web/gex/`) and `gex-project.json`
-  (`"kind": "w3"`). `page_source` names the gex checkout's `web/`: the page
-  is built at build time, because the features decide what goes into it.
+  (`"kind": "w3"`), and the page, `user/index.html` (written once, the
+  user's). `page_source` names the gex checkout's `web/`: the library is
+  built at build time, because the features decide what goes into it.
 - **The build** (`gexc eject build`) runs `web/build-eject-page.sh` with
   `GEX_FEATURES_OFF`, puts the project's runtime wasm in it, drops what a
   feature off ships (Mesa for `gl`), checks the bundler really left out
-  what `compositor` off names, and writes `build/web/` (`page/`,
-  `rootfs.tar`, `units/`, `w3.json`: the launch).
-- **The site** (`web/eject-site.mjs`) is the page as plain files, the
-  bundle and the units as `FILE.zst` with a preload list, `pack.json` (their
-  sizes and the build id), the launcher (which starts nt.html as recorded)
-  and the hosting files (`serve.mjs`, `_headers`). There is **no service
-  worker**: the host sends the isolation headers (COOP `same-origin`, COEP
-  `require-corp`), and nt.html (`pack=`) fetches each packed file and
+  what `compositor` off names, checks the library has no test page in it,
+  and writes `build/web/` (`page/`: the app library, `rootfs.tar`, `units/`,
+  `w3.json`: the launch, with user/eject.json `"start"`).
+- **The site** (`web/eject-site.mjs`) is the project's page at `/`
+  (user/index.html), the app library as plain files, the bundle and the
+  units as `FILE.zst` with a preload list, `pack.json` (their sizes and the
+  build id) and the hosting files (`serve.mjs`, `_headers`). There is **no
+  service worker**: the host sends the isolation headers (COOP
+  `same-origin`, COEP `require-corp`), and the library fetches each packed file and
   decodes it itself, straight into the one buffer that is then moved to
   pid 1's Worker, which lets go of it once the kernel has the files (moved
   on to a closed `MessagePort`: `ArrayBuffer.prototype.transfer(0)` alone
@@ -523,14 +618,14 @@ A W3 bundle is a whole Wine prefix plus Wine itself: for Paint 2509 files
 `"whole"`) ships only those in the site's bundle:
 
 - **Recording:** the kernel marks every file something opens
-  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the page reads the set
+  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the test page reads the set
   from a side Worker (`__ntOpened()`, web/src/fs-opened.js) and
   record-w3.mjs keeps it as the session's `files_read`.
 - **Build:** `gexc eject build` puts that list in build/web/w3.json
   (`"bundle": {"split": true, "read": [...]}`); a split without a read set
   (an older recording) fails the build and says so.
 - **Site:** web/eject-site.mjs keeps the read files (and the loader) in
-  rootfs.tar and makes every other file a lazy file (nt-page.js `lazy=`):
+  rootfs.tar and makes every other file a lazy file (app.js `lazy`):
   stored once by content as `project/build/web/lazy/SHA`, listed with its
   size and time in `lazy.json`. A guest that reads one gets it from the host
   in 1 MiB ranges, synchronously, the first time; the site's serve.mjs

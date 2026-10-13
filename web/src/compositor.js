@@ -7,6 +7,8 @@
 // scrollbar and the dropdown responsive. What stays here is what only the page
 // can do: DOM events, and the canvas's size.
 
+import { assetUrl, pageParams } from './page-env.js';
+
 /** `KeyboardEvent.code` -> Linux evdev keycode, which is what Wayland carries. */
 const EVDEV = {
   Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7,
@@ -72,7 +74,7 @@ export class Compositor {
       // (MESA_DEBUG=incomplete_fbo, say), for finding what it refuses.
       // `?glcapture=BYTES`: record the GL stream in the worker and POST it
       // to /__gex_capture when the ceiling is reached (gl-capture.js).
-      const q = globalThis.location ? new URLSearchParams(location.search) : null;
+      const q = pageParams();
       const mesaEnv = q?.get('mesaenv');
       const glCapture = q?.get('glcapture');
       // `?wgslcache=all|site|0`: which shader translations Mesa starts with
@@ -81,7 +83,7 @@ export class Compositor {
       // `?wgpustats=1`: count Mesa's WebGPU calls for the stats line
       // (mesa-gl.js countWebGpu); off by default, it costs time.
       const wgpuStats = q?.get('wgpustats') === '1';
-      this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
+      this.#worker.postMessage({ kind: 'gl', channel, url: assetUrl('/gex/gex-wgpu-replay.js'), ...opts, ...(mesaEnv ? { mesaEnv } : {}),
         ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}),
         ...(wgpuStats ? { wgpuStats } : {}) });
     });
@@ -140,7 +142,7 @@ export class Compositor {
     });
     // `?present=canvas|readback`: how the scene reaches the canvas (see
     // presentMode in compositor-worker.js); by default, by the adapter.
-    const pq = globalThis.location ? new URLSearchParams(location.search) : null;
+    const pq = pageParams();
     const present = pq?.get('present') ?? null;
     // `?direct=1`: direct present (compositor-worker.js): a single GL window
     // is the canvas, fitted to the viewport; compositing only when needed.

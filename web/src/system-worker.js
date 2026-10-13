@@ -10,6 +10,7 @@
 // Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
 import './zfetch.js';
 import { enableSingle } from '../../shims/browser/js/single.mjs';
+import { assetUrl } from './page-env.js';
 
 enableSingle();
 // After `enableSingle`: these compile modules as they load.
@@ -121,7 +122,7 @@ self.onmessage = async (ev) => {
             kind: 'gl',
             channel: null,
             api: 'core',
-            url: q.get('glurl') || '/gex/st/gex-wgpu-replay.js',
+            url: q.get('glurl') || assetUrl('/gex/st/gex-wgpu-replay.js'),
             ...(q.get('mesaenv') ? { mesaEnv: q.get('mesaenv') } : {}),
             ...(q.get('wgslcache') ? { wgslCache: q.get('wgslcache') } : {}),
           });
