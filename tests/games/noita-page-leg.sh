@@ -32,7 +32,9 @@
 # The provider modules go in too, with the same gexc and GEX_CGEN_CACHE:
 # `gexc cgen-image --providers` (units/providers; no image's unit carries
 # them). The page names a missing one as "missing unit:", and the leg fails on
-# it at once. (So does the NT shim's trampoline unit, `--nt-trampolines32`,
+# it at once, as on any image with code that has no unit at the base it landed
+# at (NOITA_UNITLESS_OK: a regex of images without code, default tzres and
+# normaliz). (So does the NT shim's trampoline unit, `--nt-trampolines32`,
 # which W3 runs do not place.)
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
@@ -111,6 +113,7 @@ shots="env NOITA_WORLD_BY_MIN=${NOITA_WORLD_BY_MIN:-12}"
 [ -n "${NOITA_PROF:-}" ] && shots="$shots NOITA_PROF=$NOITA_PROF"
 [ -n "${NOITA_Q:-}" ] && shots="$shots NOITA_Q=$NOITA_Q"
 [ -n "${NOITA_KEEP:-}" ] && shots="$shots NOITA_KEEP=$NOITA_KEEP"
+[ -n "${NOITA_UNITLESS_OK:-}" ] && shots="$shots NOITA_UNITLESS_OK=$NOITA_UNITLESS_OK"
 BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} $B -s $T -s $A/units -- $shots bash $R/tree/tests/games/noita-page-leg.sh --remote $R/tree Noita/noita.exe $R/units ${LEG_SECS:-300} > $A/last.txt 2>&1
 [ -n "${NOITA_SHOTS:-}" ] && { rm -rf $A/shots; rsync -a claude@edger:gex-sandbox/$R/shots/ $A/shots/; ssh claude@edger "rm -rf gex-sandbox/$R/shots"; }
 res=$(grep -m1 '^== noita' $A/last.txt)

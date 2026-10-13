@@ -39,6 +39,8 @@ const WORLD = 0x122374c;
 const IMAGE = 0x400000;
 // Minutes from the page's start to the world, at most (tier-1 or a hang).
 const worldBy = Number(process.env.NOITA_WORLD_BY_MIN || 12) * 60000;
+// Images that have no code to build a unit from (NOITA_UNITLESS_OK, a regex).
+const unitlessOk = new RegExp(process.env.NOITA_UNITLESS_OK || '/(tzres|normaliz)\\.dll$');
 
 // noita.exe's PE signature and file header (24 bytes at e_lfanew: machine,
 // sections, link time stamp...), as mapped at its base.
@@ -134,6 +136,11 @@ for (;;) {
   // unit) runs, but slower, or at a crawl that looks like a hang.
   const lacking = consoleLines.find((l) => /missing unit: /.test(l));
   if (lacking) { why = `the unit cache is incomplete: ${lacking.replace(/^.*missing unit: /, '').slice(0, 400)}`; break; }
+  // So is an image with code that has no unit at the base it landed at
+  // (Wine's builtins are all relocated, so a base can move between builds):
+  // it runs on tier-1. Data-only images (no unit can be built) excepted.
+  const unitless = consoleLines.map((l) => /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l)).find((m) => m && !unitlessOk.test(m[1]));
+  if (unitless) { why = `${unitless[1]} at ${unitless[2]} has no function-tier unit (rebuild the units for its base)`; break; }
   if (tRun === null && s && s.phase !== 'loading' && s.phase !== 'fetching') tRun = now;
   const n = tRun === null ? 0 : await produced();
   if (steps.length && n >= steps[0].at) {
