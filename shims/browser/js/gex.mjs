@@ -720,6 +720,20 @@ class ProviderThrow extends Error {
   }
 }
 
+/** posix_spawn children run in their parent's Worker, narrated
+ *  (GEX_VFORK_TRACE, `?vforktrace=1`): to the console, or appended to the
+ *  file it names under Node (a Worker's console output is lost when the run
+ *  ends first). */
+function vforkTrace(line) {
+  const to = globalThis.GEX_VFORK_TRACE || globalThis.process?.env?.GEX_VFORK_TRACE;
+  if (!to) return;
+  if (typeof to === 'string' && to.includes('/') && globalThis.process?.getBuiltinModule) {
+    globalThis.process.getBuiltinModule('fs').appendFileSync(to, `${line}\n`);
+  } else {
+    console.error(line);
+  }
+}
+
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
@@ -2381,7 +2395,59 @@ export class Gex {
     }
   }
 
+  /**
+   * posix_spawn's child, whose exec was staged while it ran in its parent's
+   * Worker (`#vforkChild`): a fresh memory, the kernel a forked child gets
+   * with its descriptors and signal state, and the exec run here. The
+   * entry, or 0n when the program could not be loaded (the process has
+   * then exited).
+   */
+  async #adoptExec(shimWasm, guestWasm, child, opts) {
+    this.#windowsSpace = 0;
+    await this.attach(shimWasm, guestWasm);
+    const e = this.#shim.exports;
+    this.#setMetadata(guestWasm);
+    const o = child.opts ?? {};
+    const uid = o.uid ?? child.uid;
+    if (uid !== undefined) e.gex_set_identity(uid, o.gid ?? child.gid ?? uid);
+    if (child.cwd) this.#putBytes(new TextEncoder().encode(child.cwd), e.gex_set_cwd);
+    if (child.state?.length) this.#putBytes(child.state, e.gex_set_child_state);
+    e.gex_adopt_child(child.pid, child.ctx, 0n, 0n, 0n, 0n);
+    this.#dense = !!o.dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    e.gex_set_dense?.(this.#dense ? (o.dense === 2 ? 2 : 1) : 0);
+    this.#opts = o;
+    syncSlotShift(e);
+    this.#childOpts(e, o, child.pid);
+    if (child.fds?.length) this.#putBytes(child.fds, e.gex_adopt_fds);
+    this.#closureModules = opts?.closure ?? this.#closureModules;
+    this.#wantLibrary = opts?.wantLibrary ?? this.#wantLibrary;
+    await this.#installClosure();
+    return this.#putBytes(child.exec, e.gex_adopted_exec);
+  }
+
+  /** A child's run options, said to its kernel (`adoptProcess`). */
+  #childOpts(e, o, pid) {
+    // `?strace=1` narrates every process; `?stracepid=N` only that one, which
+    // is what a run that must stay alive can afford.
+    if (o.strace || (o.stracePid && o.stracePid === pid)) e.gex_set_trace(1);
+    if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
+    if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
+    if (o.traceMisses) e.gex_set_trace_misses?.(1);
+    if (o.checkSp) e.gex_set_check_sp?.(1);
+    if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
+    if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
+    if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
+    if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
+    if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
+    if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
+    if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
+    if (o.t1Fold) e.gex_set_t1_fold?.(1);
+    if (o.tty) e.gex_set_tty(1);
+  }
+
   async adoptProcess(shimWasm, guestWasm, child, opts = {}) {
+    // posix_spawn's child, run in its parent's Worker until its exec: no image.
+    if (child.exec) return this.#adoptExec(shimWasm, guestWasm, child, opts);
     // Narrated and timed when asked: every step is a place a child can stop
     // dead, and a hang is indistinguishable from a slow start otherwise.
     const began = performance.now();
@@ -2544,22 +2610,7 @@ export class Gex {
     const o = child.opts ?? {};
     this.#opts = o;
     syncSlotShift(e);
-    // `?strace=1` narrates every process; `?stracepid=N` only that one, which
-    // is what a run that must stay alive can afford.
-    if (o.strace || (o.stracePid && o.stracePid === child.pid)) e.gex_set_trace(1);
-    if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
-    if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
-    if (o.traceMisses) e.gex_set_trace_misses?.(1);
-    if (o.checkSp) e.gex_set_check_sp?.(1);
-    if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
-    if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
-    if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
-    if (o.liftMax) e.gex_set_lift_max?.(o.liftMax);
-    if (o.inlineDispatch) e.gex_set_inline_dispatch?.(1);
-    if (o.xlateReport) e.gex_set_xlate_report?.(o.xlateReport);
-    if (o.discoverSkip) e.gex_set_discover_skip?.(o.discoverSkip);
-    if (o.t1Fold) e.gex_set_t1_fold?.(1);
-    if (o.tty) e.gex_set_tty(1);
+    this.#childOpts(e, o, child.pid);
     // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first
     // `mmap` hands out an address its own image is already at.
@@ -2802,6 +2853,108 @@ export class Gex {
     // its entry is a bridge into one.
     this.#cgenCatchUp();
     return { entry, ctx: Number(thread.ctx) };
+  }
+
+  /**
+   * posix_spawn's child (a wasm32 program's CLONE_VM | CLONE_VFORK clone),
+   * run here before the parent's `clone` returns, as Linux runs it: in the
+   * parent's memory, the parent suspended (shims/browser/src/vfork.rs). The
+   * child's frames end when it exits or execs, an exec going on in a new
+   * Worker; the parent's process state comes back, and so do the program's
+   * globals, which the child's entry set. Whether a child ran.
+   */
+  #vforkChild() {
+    const e = this.#shim.exports;
+    const saved = {
+      shimSp: e.__stack_pointer.value,
+      progSp: this.#wasmprogSp?.value,
+      async: this.#wasmprogAsync?.map((g) => g.value),
+      muts: this.#wasmprogMuts.map((g) => g.value),
+    };
+    const t0 = performance.now();
+    const entry = e.gex_vfork_begin();
+    if (!entry) return false;
+    const pid = e.gex_vfork_pid();
+    const ctx = Number(e.gex_fork_ctx());
+    let why = 'exit';
+    let crash = null;
+    try {
+      this.#guest.exports.enter(ctx, entry);
+    } catch (err) {
+      if (!e.gex_handoff?.()) {
+        why = 'crash';
+        crash = err;
+      } else {
+        const w = e.gex_vfork_why();
+        why = w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
+      }
+    }
+    // A trap abandons the shim's frames without restoring its stack pointer.
+    e.__stack_pointer.value = saved.shimSp;
+    // Frames that ended with no exit said: nothing will tell the parent.
+    if (why === 'exit' && !e.gex_exited?.()) {
+      why = 'crash';
+      crash = new Error('its frames ended without an exit');
+    }
+    let exec = null;
+    if (why === 'exec') {
+      exec = this.#vforkExecRecord(pid, ctx);
+      e.gex_vfork_exec_done();
+    } else if (why === 'crash') {
+      if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
+      // As a trapped Worker is reported.
+      try { e.gex_process_gone?.(137); } catch {}
+    }
+    e.gex_vfork_end();
+    if (this.#wasmprogSp && saved.progSp !== undefined) this.#wasmprogSp.value = saved.progSp;
+    saved.async?.forEach((v, i) => { this.#wasmprogAsync[i].value = v; });
+    saved.muts.forEach((v, i) => { this.#wasmprogMuts[i].value = v; });
+    if (exec) {
+      this.#env.spawnProcess(exec).catch((err) => console.error(`[gex] starting pid ${pid} after its exec: ${err.message ?? err}`));
+    }
+    this.#vforks++;
+    vforkTrace(`[vfork] pid ${pid}: ${why} after ${(performance.now() - t0).toFixed(1)}ms`);
+    return true;
+  }
+
+  /** The record of an exec a vfork child staged (`vfork::stage_exec`): a
+   *  fork record with no image, which the host starts as any child, and
+   *  whose Worker runs the exec (`#adoptExec`). */
+  #vforkExecRecord(pid, ctx) {
+    const e = this.#shim.exports;
+    const part = (i) => {
+      const p = e.gex_vfork_exec_ptr(i) >>> 0;
+      return this.#bytes().slice(p, p + (e.gex_vfork_exec_len(i) >>> 0));
+    };
+    return {
+      pid,
+      ctx: BigInt(ctx),
+      pc: 0n,
+      sp: 0n,
+      tls: 0n,
+      compat: 0,
+      wasm32: 0n,
+      brk: 0n,
+      windowsSpace: 0,
+      image: [],
+      vmaBlob: null,
+      slots: 0,
+      pages: null,
+      shared: null,
+      modules: [],
+      opts: this.#opts,
+      exec: part(0),
+      fds: part(1),
+      cwd: new TextDecoder().decode(part(2)),
+      state: part(3),
+      exe: null,
+    };
+  }
+
+  /** How many posix_spawn children ran in this Worker (`#vforkChild`). */
+  #vforks = 0;
+  get vforks() {
+    return this.#vforks;
   }
 
   async #drainFork() {
@@ -3875,6 +4028,9 @@ export class Gex {
   /** This Worker's asyncify state and data globals, which a program's
    *  modules built with relocatable asyncify share. */
   #wasmprogAsync = null;
+  /** The mutable globals the program's modules were bound to (`G`), which
+   *  a vfork child's run may change (`#vforkChild`). */
+  #wasmprogMuts = [];
 
   /** Apply provider module `prov`'s binding list (cgen/dylink.rs's format)
    *  to `imports`; the table slots to fill with exports after
@@ -3906,9 +4062,12 @@ export class Gex {
             set('env', f[2], this.#wasmprogAsync[f[2] === '__asyncify_state' ? 0 : 1]);
           }
           break;
-        case 'G':
-          set(f[1], f[2], new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0));
+        case 'G': {
+          const g = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
+          if (f[4] === '1') this.#wasmprogMuts.push(g);
+          set(f[1], f[2], g);
           break;
+        }
         case 'E': {
           const from = st.dyl.get(Number(f[3]));
           const x = from?.exports[f[4]];
@@ -3955,6 +4114,13 @@ export class Gex {
     };
     const staged = () => {
       if (e.gex_wasmprog_staged()) {
+        // posix_spawn's child first, here, when it can be (`#vforkChild`);
+        // any other child is started below.
+        if (!single.on) {
+          const ok = e.gex_vfork_ok?.() ?? 0;
+          if (ok > 0) this.#vforkChild();
+          else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+        }
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
       }
@@ -4671,6 +4837,9 @@ export class Gex {
       try {
         // Address zero is never a guest instruction: entering there is how a
         // lost resume address shows up, far from whatever forgot to set it.
+        // An exec handed over from posix_spawn's child whose program could
+        // not be loaded: the process has already exited.
+        if (!pc && this.#shim.exports.gex_exited?.()) return this.#shim.exports.gex_exit_code();
         if (!pc) {
           throw new Error(
             `gex: nothing said where to resume (ctx=0x${ctx.toString(16)}). ` +

@@ -48,6 +48,7 @@ mod dense;
 mod fjit;
 mod waitq;
 mod sigs;
+mod vfork;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -6631,6 +6632,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         n
     };
+    // posix_spawn's child running in its parent's Worker: not the calls
+    // that would change the memory map it shares (vfork.rs).
+    if vfork::active() {
+        vfork::check(this_nr);
+    }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = my_ctx();
@@ -7244,6 +7250,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                    // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run
+                    // in this Worker (vfork.rs). The flags are the first
+                    // argument: ebx for a wasm32 program (the i386 ABI).
+                    let flags = if h.kernel.compat {
+                        gm.read_u64(kstate.ctx_addr + ctx::x(3) as u64).unwrap_or(0) & 0xffff_ffff
+                    } else {
+                        gm.read_u64(kstate.ctx_addr + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0)
+                    };
+                    vfork::note_clone(flags);
                     do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
                     WASM32_STAGED.with(|c| c.set(true));
                     return 0;
@@ -7255,6 +7270,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // several syscalls later, with a context already saved over.
                 set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                1
+            }
+            SyscallOutcome::Exec { path, argv, envp } if vfork::active() => {
+                // posix_spawn's child, in its parent's memory: the new
+                // program gets a Worker of its own (vfork.rs).
+                vfork::stage_exec(h, &path, &argv, &envp);
                 1
             }
             SyscallOutcome::Exec { path, argv, envp } => {
@@ -7984,7 +8005,11 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
     let Ok(text) = std::str::from_utf8(shim_slice(ptr, len)) else {
         return -1;
     };
-    let text = text.to_string();
+    adopt_fds_text(&text.to_string())
+}
+
+/// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
+fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
     let n = with_host(|h| {
         let mut n = 0;
@@ -8577,10 +8602,40 @@ pub extern "C" fn gex_adopt_child(
     brk: i64,
 ) -> i64 {
     phase(1);
+    // The state this Worker started from is a *copy* of the parent's, and the
+    // descriptors in it are the parent's: pipe and pty ends it still holds,
+    // sockets it is still using. Every one of those handles closes its end in
+    // the global kernel when it drops (that is how a process leaving by a trap
+    // still releases them), so letting the copy drop here closes descriptors
+    // that belong to another process -- and it is charged to whichever pid this
+    // Worker answers as. That is what killed a terminal's session: the shell's
+    // slave end went with the copy, the master read end of file, and the whole
+    // foreground group took a SIGHUP one command in. The child's own ends are
+    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
+    // dropped -- into memory that is this process's own image anyway.
+    if gex_has_host() != 0 {
+        with_host(|h| {
+            std::mem::forget(std::mem::replace(
+                &mut h.kernel.fds,
+                gex_kernel::file::FdTable::new(),
+            ));
+            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
+        });
+    }
     // The slot maps the copied low region names are the parent's.
     dense::child();
     // So is the probe cache, which names the parent's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
+    set_host(child_host(pid, ctx_addr, pc, sp, tls, brk));
+    pc
+}
+
+/// The process state a forked child starts with: in a Worker of its own
+/// holding a copy of the parent's image (`gex_adopt_child`), or for
+/// posix_spawn's child in its parent's (`vfork`). Its working directory,
+/// program and signal state are what was staged (`gex_set_cwd`,
+/// `gex_set_child_exe`, `gex_set_child_state`).
+fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> Host {
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -8687,27 +8742,7 @@ pub extern "C" fn gex_adopt_child(
             apply_state(&mut kernel, &state);
         }
     }
-    // The state this Worker started from is a *copy* of the parent's, and the
-    // descriptors in it are the parent's: pipe and pty ends it still holds,
-    // sockets it is still using. Every one of those handles closes its end in
-    // the global kernel when it drops (that is how a process leaving by a trap
-    // still releases them), so letting the copy drop here closes descriptors
-    // that belong to another process -- and it is charged to whichever pid this
-    // Worker answers as. That is what killed a terminal's session: the shell's
-    // slave end went with the copy, the master read end of file, and the whole
-    // foreground group took a SIGHUP one command in. The child's own ends are
-    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
-    // dropped -- into memory that is this process's own image anyway.
-    if gex_has_host() != 0 {
-        with_host(|h| {
-            std::mem::forget(std::mem::replace(
-                &mut h.kernel.fds,
-                gex_kernel::file::FdTable::new(),
-            ));
-            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
-        });
-    }
-    set_host(Host {
+    Host {
         magic_head: HOST_MAGIC,
         kernel,
         wayland,
@@ -8760,8 +8795,7 @@ pub extern "C" fn gex_adopt_child(
             nanos: 0,
         }},
         magic_tail: HOST_MAGIC,
-    });
-    pc
+    }
 }
 
 /// Record one of the parent's mappings in the adopted child's memory map.
