@@ -3484,6 +3484,32 @@ pub extern "C" fn gex_worker_init() -> u32 {
 
 #[cfg(feature = "shared-memory")]
 const STACK_GUARD: u32 = 0x5747_5d0d;
+/// A forked child's first instance, before it claims: the memory it was
+/// given is its parent's, and so are the slot bits -- held by the parent's
+/// Workers, none of which run here. The child starts with every slot free
+/// (their arena spans stay, for reuse); a parent with many live threads
+/// otherwise left its child too few to start its own.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_slots_reset() {
+    SLOT_USED.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// A forked child's inherited region ending at `end`, told before its first
+/// arena claim (`gex_worker_init` takes a stack there, before
+/// `gex_adopt_vma_blob` has run). Only regions under the arena's ceiling
+/// matter: the arena never hands out above it. Without this the first claim
+/// floored at the child's memory size -- its parent's, grown over every
+/// inherited mapping -- and a mem64 parent's threads' stacks above 4 GiB put
+/// that over the ceiling: the child got no slot and ran with no
+/// thread-locals.
+#[no_mangle]
+pub extern "C" fn gex_note_inherited(end: u64) {
+    if end <= nt::arena_ceiling() {
+        ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Give this instance's slot back (`gex_worker_init`): the last call the
 /// Worker makes into this instance, once its run is over or it trapped. The
 /// next instance to claim the slot runs on the same stack, so nothing of

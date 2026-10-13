@@ -840,6 +840,10 @@ export class Gex {
   #kernel = null;
   // This Worker's shim stack, claimed on the way in. See `#workerStack`.
   #stackTop = null;
+  /** This instance is a forked child's first: its slot bits are its parent's. */
+  #forkChild = false;
+  /** A forked child's inherited regions' ends, for its first arena claim. */
+  #inheritedEnds = [];
 
   /**
    * One turn of the event loop, to deliver messages that arrived while this
@@ -962,7 +966,16 @@ export class Gex {
       // which there is the top of the 2 GiB.
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
-      const at = this.#shim.exports.gex_worker_init?.();
+      // A forked child's memory carries its parent's slot bits (`adoptProcess`).
+      if (this.#forkChild) {
+        this.#forkChild = false;
+        this.#shim.exports.gex_worker_slots_reset?.();
+        // Where its inherited mappings end, before the claim below picks its
+        // arena floor (`gex_note_inherited`).
+        for (const end of this.#inheritedEnds) this.#shim.exports.gex_note_inherited?.(BigInt(end));
+        this.#inheritedEnds = [];
+      }
+      const at = this.#shim.exports.gex_worker_init?.(); 
       // No slot: every one of the process's 64 is held by a live instance.
       // Running on would put this instance's thread-locals at address zero
       // (`__tls_base` unset), over the guest's memory.
@@ -2411,6 +2424,8 @@ export class Gex {
     };
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
+    this.#forkChild = true;
+    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + r.bytes.byteLength));
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;

@@ -25,7 +25,9 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # function JIT livelocks on its chain natively (gexc --fjit, 2026-10-12).
 # clock-monotonic: the page's CLOCK_MONOTONIC never goes back, within a thread
 # or between two Workers, and is finer than a millisecond.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift clock-monotonic"}
+# thread-churn: more threads over a process's life than the page has Worker
+# slots, and a fork child starting threads while its parent holds 40.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-smc mem64-reserve retire-during-lift clock-monotonic thread-churn"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
