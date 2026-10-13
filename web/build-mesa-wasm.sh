@@ -193,11 +193,18 @@ if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
 fi
 PUB="$ROOT/web/public/gex"
 [ "$THREADS" = 0 ] && [ -d "$PUB" ] && PUB="$PUB/st" && mkdir -p "$PUB"
-if [ -d "$PUB" ] && [ -f "$TGT/split/gex-wgpu-replay.wasm" ]; then
+# A link without -sSPLIT_MODULE=1 (the mesa-wink tree's) leaves no
+# .wasm.orig and so no split: its .wasm is the plain module, and that is what
+# is published. Before, nothing was, and the page went on loading whatever
+# module had last been copied by hand -- a fix to web/mesa/gexgl-mesa.cpp
+# rebuilt here and never reached a test.
+FROM=$TGT/split
+[ -f "$FROM/gex-wgpu-replay.wasm" ] || FROM=$TGT
+if [ -d "$PUB" ] && [ -f "$FROM/gex-wgpu-replay.wasm" ]; then
     rm -f "$PUB/gex-wgpu-replay.deferred.wasm"
     for f in gex-wgpu-replay.js gex-wgpu-replay.wasm gex-wgpu-replay.deferred.wasm; do
-        [ -f "$TGT/split/$f" ] || continue
-        cp "$TGT/split/$f" "$PUB/$f"
+        [ -f "$FROM/$f" ] || continue
+        cp "$FROM/$f" "$PUB/$f"
         echo "  published $PUB/$f"
     done
 fi

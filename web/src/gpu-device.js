@@ -7,10 +7,110 @@
 
 let pending = null;
 
+/**
+ * Every GPUTexture and GPUBuffer this realm created and has not destroyed,
+ * by kind and shape, with bytes: `gpuLive()`. VRAM a page cannot see any
+ * other way -- nvidia-smi on the host is the only outside view -- and a leak
+ * shows up here as a shape whose count climbs per frame. Objects that are
+ * only dropped (no destroy()) stay counted: their memory comes back only
+ * when the collector runs, which in a Worker that allocates little may be
+ * never.
+ */
+const live = new Map(); // object -> key
+const shapes = new Map(); // key -> { n, bytes, made, destroyed }
+let tracking = false;
+const calls = new Map(); // method -> [calls, bytes]
+const FORMAT_BYTES = { rgba8unorm: 4, bgra8unorm: 4, 'rgba8unorm-srgb': 4, 'bgra8unorm-srgb': 4,
+  depth24plus: 4, 'depth24plus-stencil8': 4, depth32float: 4, 'depth32float-stencil8': 8,
+  rgba16float: 8, rgba32float: 16, r8unorm: 1, rg8unorm: 2, r32float: 4, depth16unorm: 2 };
+function trackGpu() {
+  if (tracking || typeof GPUDevice === 'undefined') return;
+  tracking = true;
+  const note = (obj, key, bytes) => {
+    let e = shapes.get(key);
+    if (!e) shapes.set(key, (e = { n: 0, bytes: 0, made: 0, destroyed: 0, each: bytes }));
+    e.n++; e.made++; e.bytes += bytes;
+    live.set(obj, key);
+  };
+  const gone = (obj) => {
+    const key = live.get(obj);
+    if (key === undefined) return;
+    live.delete(obj);
+    const e = shapes.get(key);
+    e.n--; e.destroyed++; e.bytes -= e.each;
+  };
+  const ct = GPUDevice.prototype.createTexture;
+  GPUDevice.prototype.createTexture = function (d) {
+    const t = ct.call(this, d);
+    const [w, h = 1, l = 1] = Array.isArray(d.size) ? d.size : [d.size.width, d.size.height ?? 1, d.size.depthOrArrayLayers ?? 1];
+    const bytes = w * h * l * (FORMAT_BYTES[d.format] ?? 4) * (d.sampleCount ?? 1) * ((d.mipLevelCount ?? 1) > 1 ? 1.34 : 1);
+    note(t, `texture ${w}x${h}x${l} ${d.format} usage 0x${d.usage.toString(16)}${(d.sampleCount ?? 1) > 1 ? ` x${d.sampleCount}` : ''}`, Math.round(bytes));
+    return t;
+  };
+  const cb = GPUDevice.prototype.createBuffer;
+  GPUDevice.prototype.createBuffer = function (d) {
+    const b = cb.call(this, d);
+    note(b, `buffer ${d.size} usage 0x${d.usage.toString(16)}`, d.size);
+    return b;
+  };
+  // Calls by name, with bytes where a call carries them: a leak that is not
+  // a texture or a buffer (a canvas frame, an upload's staging) shows up as
+  // the one count that climbs with it. Only when asked for
+  // (`globalThis.GEX_GPU_CALLS`, set before the device is made): these wrap
+  // Mesa's per-draw calls, and a wrapper there costs frame time.
+  const count = (proto, name, bytesOf) => {
+    const f = proto?.[name];
+    if (typeof f !== 'function' || !globalThis.GEX_GPU_CALLS) return;
+    proto[name] = function (...a) {
+      let e = calls.get(name);
+      if (!e) calls.set(name, (e = [0, 0]));
+      e[0]++;
+      if (bytesOf) { try { e[1] += bytesOf(a) || 0; } catch {} }
+      return f.apply(this, a);
+    };
+  };
+  const ext = (a) => { const s = a[2] ?? a[3]; return Array.isArray(s) ? s[0] * (s[1] ?? 1) * 4 : (s?.width ?? 0) * (s?.height ?? 1) * 4; };
+  count(GPUQueue.prototype, 'writeBuffer', (a) => (a[4] !== undefined ? a[4] * (a[2]?.BYTES_PER_ELEMENT ?? 1) : a[2]?.byteLength ?? 0));
+  count(GPUQueue.prototype, 'writeTexture', (a) => a[1]?.byteLength ?? 0);
+  count(GPUQueue.prototype, 'copyExternalImageToTexture', ext);
+  count(GPUQueue.prototype, 'submit');
+  count(globalThis.GPUCanvasContext?.prototype, 'getCurrentTexture');
+  count(GPUTexture.prototype, 'createView');
+  count(GPUBuffer.prototype, 'mapAsync');
+  count(GPUBuffer.prototype, 'getMappedRange');
+  count(GPUCommandEncoder.prototype, 'copyTextureToTexture', ext);
+  count(GPUCommandEncoder.prototype, 'copyTextureToBuffer', ext);
+  count(GPUCommandEncoder.prototype, 'copyBufferToTexture', ext);
+  count(GPUCommandEncoder.prototype, 'beginRenderPass');
+  count(GPUCommandEncoder.prototype, 'beginComputePass');
+  for (const m of ['createBindGroup', 'createCommandEncoder', 'createQuerySet', 'createSampler', 'createShaderModule',
+    'createRenderPipeline', 'createComputePipeline', 'importExternalTexture', 'createBindGroupLayout', 'createPipelineLayout'])
+    count(GPUDevice.prototype, m);
+  for (const proto of [GPUTexture.prototype, GPUBuffer.prototype]) {
+    const destroy = proto.destroy;
+    proto.destroy = function () {
+      gone(this);
+      return destroy.call(this);
+    };
+  }
+}
+
+/** What `trackGpu` holds: the live total and the shapes with the most
+ *  bytes, as lines. */
+export function gpuLive(top = 8) {
+  let n = 0, bytes = 0;
+  for (const e of shapes.values()) { n += e.n; bytes += e.bytes; }
+  const rows = [...shapes.entries()].filter(([, e]) => e.n > 0).sort((a, b) => b[1].bytes - a[1].bytes).slice(0, top)
+    .map(([k, e]) => `${k}: ${e.n} live (${(e.bytes / 1048576).toFixed(1)} MiB), ${e.made} made, ${e.destroyed} destroyed`);
+  const counts = Object.fromEntries([...calls.entries()].map(([k, [c, b]]) => [k, b ? [c, +(b / 1048576).toFixed(1)] : c]));
+  return { tracking, objects: n, mib: +(bytes / 1048576).toFixed(1), calls: counts, rows };
+}
+
 /** The device, made once per Worker: { adapter, device }. */
 export function requestGexDevice() {
   pending ??= (async () => {
     if (!navigator.gpu) throw new Error('navigator.gpu unavailable');
+    trackGpu();
     // The first request can return null while Chromium's GPU process is
     // still starting (seen on slower hosts); retry for up to ~5 s.
     let adapter = null;

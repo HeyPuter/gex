@@ -231,6 +231,13 @@ async function handle(msg) {
     workerGex?.addSharedModule(msg.key, msg.mod);
     return;
   }
+  // The wineserver's door, from the host: this Worker's door calls go to it
+  // from its next one. Before this Worker has a `Gex`, the start message
+  // carries it instead.
+  if (msg?.kind === 'door') {
+    workerGex?.setDoor(msg.door);
+    return;
+  }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
   // How many traps a forked child takes before installing its parent's
@@ -243,7 +250,18 @@ async function handle(msg) {
   // cannot reach the page's reporter. Guarded so it is applied once.
   if (!globalThis.__gexMarkedConsole) {
     globalThis.__gexMarkedConsole = true;
-    const realError = console.error.bind(console);
+    // Under Node, straight to fd 2: a Worker's console is a stream its event
+    // loop drains to the parent, so a process that parks in the shim (wait
+    // queues, d26f0d41: no park bound brings it back to JS) and then exits
+    // lost every line it logged meanwhile -- unitcache-fork's GEX_DENSE_DEBUG
+    // adopts among them.
+    const fs = globalThis.process?.getBuiltinModule?.('fs');
+    const realError = fs
+      ? (...a) => {
+          const t = a.map((x) => (typeof x === 'string' ? x : x?.stack || String(x))).join(' ') + '\n';
+          try { fs.writeSync(2, t); } catch { console.error(...a); }
+        }
+      : console.error.bind(console);
     // One marker per *line*, not per call: Chrome's `--enable-logging=stderr`
     // writes a console message up to its first newline and drops the rest, so a
     // multi-line diagnostic (a `killed by signal` report with its thread,
@@ -350,6 +368,11 @@ async function handle(msg) {
     shareModule(key, mod) {
       port.post({ kind: 'compiledModule', key, mod });
     }
+    // The wineserver published its door (docs/wineserver-kernel.md): up to
+    // the host, which hands it to every Worker of the session.
+    publishDoor(door) {
+      port.post({ kind: 'doorPublish', door });
+    }
     // A function-tier unit's files by key (`gex.useCgen`): `msg.cgen.root`, a
     // directory under Node (GEX_CGEN_CACHE's layout), or `msg.cgen.url`, read
     // with a synchronous request -- allowed in a Worker, and what lets the
@@ -408,6 +431,7 @@ async function handle(msg) {
   // and `?debug=1`, which does carry it, mirrors every guest write and changed
   // the fault it was being used to look at.
   if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
+  if (msg.doorStats) globalThis.GEX_DOOR_STATS = msg.doorStats;
   if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
@@ -438,6 +462,7 @@ async function handle(msg) {
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
+  if (msg.door) gex.setDoor(msg.door);
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.
@@ -781,6 +806,13 @@ async function handle(msg) {
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
+      // Who sent the last signal anywhere (the global kernel's record): a
+      // signal death names its sender.
+      try {
+        const k = gex.kernel;
+        const v = BigInt.asUintN(64, BigInt(k?.k_last_kill?.() ?? 0));
+        console.warn(`[gex] pid ${msg.pid ?? '?'} ended with ${status}; last signal sent: ${Number(v & 0xffn)} from pid ${Number(BigInt.asIntN(24, v >> 40n))} to ${Number(BigInt.asIntN(32, (v >> 8n) & 0xffffffffn))} (#${k?.k_last_kill_seq?.() ?? '?'})`);
+      } catch {}
       ex.gex_set_trace?.(1);
       ex.gex_dump_state?.();
       ex.gex_set_trace?.(0);

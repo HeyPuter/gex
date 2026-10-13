@@ -3313,7 +3313,7 @@ static mut STDERR_LEN: usize = 0;
 
 /// A write to standard output or error (`a1`, `a2` as `write` or `writev`
 /// has them), kept for a later abort's report, and said when it fell short.
-fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64) {
+fn stderr_capture(gm: &GuestMem<'_>, fd: u64, vectored: bool, a1: u64, a2: u64, ret: u64) {
     // (base, length) pairs: one for `write`, `a2` of them for
     // `writev`, so the two cases differ only in where the list is.
     let parts: Vec<(u64, u64)> = if !vectored {
@@ -3341,13 +3341,25 @@ fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64)
     if !said.is_empty() {
         stderr_note(&said);
     }
-    if ret != want {
+    let lost = (ret as i64) < 0 && ret as i64 != -(Errno::EAGAIN.0 as i64);
+    if want > 0 && (lost || ret == 0) {
+        // Printable text as is, anything else escaped, so a binary
+        // write cannot fill the console with replacement characters.
+        let text: String = said
+            .iter()
+            .flat_map(|&c| match c {
+                b' '..=b'~' => vec![c as char],
+                b'\n' => vec!['\\', 'n'],
+                _ => format!("\\x{c:02x}").chars().collect(),
+            })
+            .collect();
         warn_line(&format!(
-            "[gex] pid {} could not reach stderr ({} of {want} bytes in {} parts): {}",
+            "[gex] pid {} could not write to {} ({} for {want} bytes in {} part{}): {text}",
             my_pid(),
+            if fd == 1 { "stdout" } else { "stderr" },
             ret as i64,
-            a2,
-            String::from_utf8_lossy(&said).trim_end(),
+            parts.len(),
+            if parts.len() == 1 { "" } else { "s" },
         ));
     }
 }
@@ -3680,6 +3692,32 @@ pub extern "C" fn gex_worker_init() -> u32 {
 
 #[cfg(feature = "shared-memory")]
 const STACK_GUARD: u32 = 0x5747_5d0d;
+/// A forked child's first instance, before it claims: the memory it was
+/// given is its parent's, and so are the slot bits -- held by the parent's
+/// Workers, none of which run here. The child starts with every slot free
+/// (their arena spans stay, for reuse); a parent with many live threads
+/// otherwise left its child too few to start its own.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_slots_reset() {
+    SLOT_USED.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// A forked child's inherited region ending at `end`, told before its first
+/// arena claim (`gex_worker_init` takes a stack there, before
+/// `gex_adopt_vma_blob` has run). Only regions under the arena's ceiling
+/// matter: the arena never hands out above it. Without this the first claim
+/// floored at the child's memory size -- its parent's, grown over every
+/// inherited mapping -- and a mem64 parent's threads' stacks above 4 GiB put
+/// that over the ceiling: the child got no slot and ran with no
+/// thread-locals.
+#[no_mangle]
+pub extern "C" fn gex_note_inherited(end: u64) {
+    if end <= nt::arena_ceiling() {
+        ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Give this instance's slot back (`gex_worker_init`): the last call the
 /// Worker makes into this instance, once its run is over or it trapped. The
 /// next instance to claim the slot runs on the same stack, so nothing of
@@ -6529,6 +6567,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     }
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
+        // A wasm32 program has no safepoints of its own: its loops reach
+        // the kernel through a call like these (gexcc's `__gex_poll` makes a
+        // `getpid`), so a signal is delivered here, as at any call's return
+        // (a translated guest's safepoints do it for it). The handler's
+        // frame goes into the context, which the program's stub runs; a
+        // default that ends the process ends it. gexcc's alarmloop spun for
+        // ever without this.
+        if WASM32.load(std::sync::atomic::Ordering::Acquire) && sigs::ready() {
+            let at = ctx as u32 as u64;
+            let mut gm = GuestMem::new(guest_bytes());
+            if let gex_kernel::signal::Delivery::Terminate { signal, .. } = sigs::deliver(&mut gm, at) {
+                let pc_at = gm.read_u64(at + ctx::PC as u64).unwrap_or(0);
+                if exit_here(-(signal as i32), Some(pc_at)) != 0 {
+                    trap();
+                }
+            }
+        }
         return;
     }
     // This Worker's reader slot in the descriptor table's epoch array
@@ -6860,6 +6915,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
+        // The page finishes its own waits (`finish_wait`, which asks the op
+        // for its restart class): the kernel's note for `finish_blocking`,
+        // left, would follow the thread through every switch.
+        h.kernel.block_restart = gex_kernel::signal::Restart::Never;
+        h.kernel.block_pc = 0;
         // The clocks never come here (`clock_syscall`); one that does is a
         // regression, said once, as an error every page test fails on.
         if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !EXITED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6946,10 +7006,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
-        // go through whole turns a named failure into "killed by signal 6".
-        // Only on a short write, so a working program is silent.
+        // go through turns a named failure into "killed by signal 6".
+        // Only when nothing went through (an error, or 0 of a non-empty
+        // write). A short positive count is not a loss: a full pipe on a
+        // blocking descriptor takes what fits and the caller writes the rest
+        // (`Pipe::write`, `BlockOp::WriteStream`). Warning on that once sent
+        // 4.5 MB of xwd's image, written to stdout through a pipe, to the
+        // console as "could not reach stderr".
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
-            stderr_capture(&gm, nr == 66, a1, a2, ret);
+            stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
         h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {
@@ -7818,6 +7883,14 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 }
 
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
+/// The global kernel's id of the pipe end descriptor `fd` is, or -1: the
+/// wineserver's door kick pipe, which a door call in another process
+/// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
+#[no_mangle]
+pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
+    with_host(|h| h.kernel.fds.get(fd).ok().and_then(|f| pipe_id(&f.path)).unwrap_or(-1))
+}
+
 fn pipe_id(path: &str) -> Option<i32> {
     path.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
 }
@@ -10936,8 +11009,8 @@ fn finish_mine(signalled: bool) -> i32 {
 }
 
 /// A call of the lock-free class (`gex_kernel::syscalls::free_class`:
-/// `read`, `write`, their vectored and positioned forms, `lseek` and
-/// `rt_sigprocmask`), made with no kernel lock, blocking included
+/// `read`, `write`, their vectored and positioned forms, `lseek`,
+/// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included
 /// (docs/kernel-locking.md step 9); `None` for any other call, decided by
 /// its number before anything is done. `gex_syscall`'s stop value.
 fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
@@ -10964,7 +11037,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
         if !gex_abi::X86 && !compat && (a0 == 1 || a0 == 2) && (n == nr::WRITE || n == nr::WRITEV) {
-            stderr_capture(&gm, n == nr::WRITEV, a1, a2, ret);
+            stderr_capture(&gm, a0, n == nr::WRITEV, a1, a2, ret);
         }
     }
     Some(match outcome {
@@ -10980,7 +11053,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
             exit_here(-(signal as i32), Some(at))
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
-        FreeOutcome::Blocking(op) => park_free(op, pc as u64),
+        FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
     })
 }
 
@@ -10988,7 +11061,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
 /// the wait goes into the thread's own run state, and the scheduler's first
 /// turn is made here (`FIRST_PICK`), as the locked `Blocking` arm makes it
 /// under its take. `gex_syscall`'s stop value.
-fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
+fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> i32 {
     let waiting = match &op {
         gex_kernel::BlockOp::ReadStream { handle, .. } => {
             if tracing() {
@@ -10997,7 +11070,10 @@ fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
             Waiting::Read(Arc::clone(handle))
         }
         gex_kernel::BlockOp::WriteStream { handle, .. } => Waiting::Write(Arc::clone(handle)),
-        _ => unreachable!("a class call parks only on a stream"),
+        // As the kernel's park: re-checked on the scheduler's way round,
+        // woken by the descriptors' queues (`waitq::queues_of`).
+        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64)),
+        _ => unreachable!("a class call parks only on a stream or a poll"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     // A new wait: whatever this Worker's thread was registered for is over.
@@ -11010,7 +11086,7 @@ fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = waiting;
         r.blocked_on = Some(op);
-        r.owed = Owed { write_blocked, ..Owed::default() };
+        r.owed = Owed { restore_sigmask, write_blocked, ..Owed::default() };
     }
     waitq::begin_turn();
     let pick = pick_mine(&run);
@@ -11188,6 +11264,23 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // longer counted as waiting (`sys_futex`).
     if let gex_kernel::BlockOp::FutexLockPi { table, uaddr, .. } = &op {
         table.pi_done(*uaddr);
+    }
+    // A wait a signal ended that Linux would restart (signal(7)): the
+    // handler runs, then the call again (`restart_call`).
+    if by_signal && sigs::restarts(op.restart()) {
+        let wasm32 = WASM32.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(back) = gex_kernel::syscalls::restart_call(&mut gm, ctx_addr, pc, wasm32) {
+            match sigs::finish(&mut gm, ctx_addr, None, false) {
+                // A wasm32 program's handler runs from the frame its own
+                // code finds, and its sigreturn makes the call again.
+                gex_kernel::signal::Delivery::Resume(_) if wasm32 => return Done::At(ctx_addr, pc),
+                gex_kernel::signal::Delivery::Resume(target) => return Done::At(ctx_addr, target),
+                gex_kernel::signal::Delivery::Terminate { signal, .. } => return Done::Ends(-(signal as i32)),
+                gex_kernel::signal::Delivery::None if !wasm32 => return Done::At(ctx_addr, back),
+                // `EINTR` after all (`restart_call`).
+                gex_kernel::signal::Delivery::None => gex_kernel::syscalls::restart_undo(&mut gm, ctx_addr),
+            }
+        }
     }
     let res = finish_parked(&op, timed_out, by_signal, &mut gm);
     // The syscall again, from its instruction (the registers are as the

@@ -68,7 +68,9 @@ pub struct Compositor {
     /// Where read-back lands. Sized once, because it is as large as the
     /// screen and reallocating it every frame is a stall.
     readback: wgpu::Buffer,
-    surfaces: HashMap<u32, Cached>,
+    /// Textures by the caller's key: the surface id for `draw`, the
+    /// caller's own (client and surface) for `draw_at`.
+    surfaces: HashMap<u64, Cached>,
     width: u32,
     height: u32,
     /// What the adapter turned out to be, for anyone asking whether this is
@@ -251,14 +253,14 @@ impl Compositor {
     /// Upload a frame's pixels into the surface's texture, making one if the
     /// size changed. Rows arrive with the client's (possibly padded) stride,
     /// which `write_texture` takes directly rather than stripping here.
-    fn upload(&mut self, frame: &Frame) -> Result<(), GpuError> {
+    fn upload(&mut self, key: u64, frame: &Frame) -> Result<(), GpuError> {
         let width = frame.width.max(0) as u32;
         let height = frame.height.max(0) as u32;
         if width == 0 || height == 0 {
             return Ok(());
         }
         let stride = frame.stride.max(0) as u32;
-        let entry = self.surfaces.entry(frame.surface);
+        let entry = self.surfaces.entry(key);
         let cached = match entry {
             std::collections::hash_map::Entry::Occupied(e)
                 if e.get().width == width && e.get().height == height =>
@@ -326,8 +328,16 @@ impl Compositor {
     /// manager, each surface is centred (larger-than-screen ones pinned to the
     /// corner) and a later one draws over an earlier one.
     pub fn draw(&mut self, frames: &[Frame]) -> Result<(), GpuError> {
-        for frame in frames {
-            self.upload(frame)?;
+        let items: Vec<_> = frames.iter().map(|f| (u64::from(f.surface), f, None)).collect();
+        self.draw_at(&items)
+    }
+
+    /// Draw surfaces bottom to top, each keyed by the caller (a texture is kept
+    /// per key between frames) and either at a position on the screen -- a
+    /// placed window -- or, with `None`, centred as `draw` does.
+    pub fn draw_at(&mut self, items: &[(u64, &Frame, Option<(i32, i32)>)]) -> Result<(), GpuError> {
+        for (key, frame, _) in items {
+            self.upload(*key, frame)?;
         }
         let mut encoder = self
             .device
@@ -336,12 +346,17 @@ impl Compositor {
             });
         // Bind groups have to outlive the render pass that uses them.
         let mut groups = Vec::new();
-        for frame in frames {
-            let Some(cached) = self.surfaces.get(&frame.surface) else {
+        for (key, frame, at) in items {
+            let Some(cached) = self.surfaces.get(key) else {
                 continue;
             };
-            let x = ((self.width as f32 - cached.width as f32) / 2.0).max(0.0).floor();
-            let y = ((self.height as f32 - cached.height as f32) / 2.0).max(0.0).floor();
+            let (x, y) = match at {
+                Some((x, y)) => (*x as f32, *y as f32),
+                None => (
+                    ((self.width as f32 - cached.width as f32) / 2.0).max(0.0).floor(),
+                    ((self.height as f32 - cached.height as f32) / 2.0).max(0.0).floor(),
+                ),
+            };
             let uniform = SurfaceUniform {
                 rect: [x, y, cached.width as f32, cached.height as f32],
                 screen: [self.width as f32, self.height as f32],
@@ -609,6 +624,19 @@ mod tests {
             assert_eq!(at(&out, 16, x, 7).0, 0xff, "row pixel {x} is red");
         }
         assert_eq!(at(&out, 16, 10, 7), (0, 0, 0, 0xff), "the padding is not drawn");
+    }
+
+    #[test]
+    fn a_placed_surface_is_drawn_where_it_was_put() {
+        let Some(mut c) = compositor(32, 32) else { return };
+        let back = solid(6, 32, 32, 0, 0, 0xff);
+        let bar = solid(6, 32, 4, 0, 0xff, 0);
+        // Same surface id from two clients: told apart by key.
+        c.draw_at(&[(1, &back, Some((0, 0))), (2, &bar, Some((0, 28)))]).unwrap();
+        let out = c.read_back().unwrap();
+        assert_eq!(at(&out, 32, 5, 27).0, 0xff, "red above the bar");
+        assert_eq!(at(&out, 32, 5, 28).1, 0xff, "the green bar at the bottom edge");
+        assert_eq!(at(&out, 32, 31, 31).1, 0xff);
     }
 
     #[test]

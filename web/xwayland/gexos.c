@@ -57,6 +57,7 @@ EM_JS(int, gexjs_wait, (int ms), { return Module.gexos.wait(ms); });
 #endif
 EM_JS(int, gexjs_shm, (int addr, int size), { return Module.gexos.shm(addr, size); });
 EM_JS(int, gexjs_shm_addr, (int fd), { return Module.gexos.shmAddr(fd); });
+EM_JS(int, gexjs_shm_unmap, (int addr), { return Module.gexos.shmUnmap(addr); });
 
 
 /* -- errno, in two dialects ------------------------------------------------ */
@@ -619,9 +620,12 @@ gex_shm_map(int fd, size_t size)
 int
 gex_shm_unmap(void *addr, size_t size)
 {
-    (void) addr; (void) size;
-    /* The pool outlives the mapping: the descriptor is what owns it, and
-     * `gex_close` on that descriptor is what frees the pixels. */
+    (void) size;
+    /* A mapping is one of the pool's references (web/src/hostx.js `#pools`):
+     * the server closes the descriptor right after making the pool and draws
+     * through the mapping until the pixmap goes, and the compositor holds its
+     * own. The pixels are freed when the last of them lets go. */
+    gexjs_shm_unmap((int) (uintptr_t) addr);
     return 0;
 }
 

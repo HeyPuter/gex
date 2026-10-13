@@ -144,6 +144,15 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
     delivery
 }
 
+/// Whether this Worker's thread's parked call of restart class `class`,
+/// ended by a signal, starts again ([`Signals::restarts`]). No kernel lock.
+pub(crate) fn restarts(class: signal::Restart) -> bool {
+    let Some(home) = home() else { return false };
+    let Some(view) = view(home) else { return false };
+    gather(home);
+    view.restarts(class)
+}
+
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
 /// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
 /// and its signal included, without the kernel.

@@ -54,7 +54,7 @@ const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
-const REC: usize = 28;
+const REC: usize = 37;
 /// Words in one input event record.
 const EV: usize = 8;
 /// The most surfaces published in one pump. A desktop session with a dozen
@@ -72,7 +72,7 @@ enum InputEvent {
     Mods { client: u32, depressed: u32, latched: u32, locked: u32, group: u32 },
     PointerClear { client: u32 },
     KeyboardFocus { client: u32, surface: u32 },
-    Configure { client: u32, surface: u32, w: i32, h: i32, activated: bool },
+    Configure { client: u32, surface: u32, w: i32, h: i32, states: u32 },
     Close { client: u32, surface: u32 },
     DismissPopup { client: u32, surface: u32 },
     /// The compositor moved a window. For an X window this has to reach the X
@@ -151,7 +151,7 @@ fn poll_input() -> Vec<InputEvent> {
                     surface,
                     w: q[1],
                     h: q[2],
-                    activated: q[4] != 0,
+                    states: gex_wayland::configure_states(q[3], q[4]),
                 },
                 8 => InputEvent::Close { client, surface },
                 9 => InputEvent::DismissPopup { client, surface },
@@ -464,8 +464,16 @@ impl WaylandDevice {
                                 }
                             }
                         }
-                        InputEvent::Configure { surface, w, h, activated, .. } => {
-                            s.client.configure(surface, w, h, activated)
+                        InputEvent::Configure { surface, w, h, states, .. } => {
+                            // An X window is sized by the X server, through
+                            // the manager.
+                            let x11 = surface != 0 && s.client.is_x11(surface);
+                            match (x11, s.xwm.as_mut()) {
+                                (true, Some(xwm)) => {
+                                    xwm.resized(surface, w, h);
+                                }
+                                _ => s.client.configure(surface, w, h, states),
+                            }
                         }
                         InputEvent::Close { surface, .. } => {
                             // An X window has no xdg_toplevel to close: the
@@ -736,9 +744,7 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1)
-        | ((info.buffer_scale & 0xff) << 8)
-        | ((info.client_scale & 0xff) << 16);
+    r[16] = info.flags();
     // Which X window this is, for a host that knows a drawable and not a
     // surface -- an OpenGL client naming what it draws into.
     r[17] = info.xid as i32;
@@ -754,6 +760,10 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
         word[..chunk.len()].copy_from_slice(chunk);
         r[18 + i] = i32::from_le_bytes(word);
     }
+    // Where its client placed it, if it did (`gex_window_placement_v1`).
+    r[28..33].copy_from_slice(&info.placement.record_words());
+    // Where it takes the pointer, when its client said (`flags` bit 7).
+    r[33..37].copy_from_slice(&info.input_words());
 }
 
 impl HostListener for WaylandDevice {

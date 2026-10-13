@@ -38,7 +38,12 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # SIGTERM); i386 also checks the legacy frame's saved mask.
 # main-thread-exit, pi-mutex, tcp-loopback: the process outlives its first
 # thread; a contended PI mutex; a forked child's loopback TCP to its parent.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask"}
+# sa-restart: a handler installed with SA_RESTART restarts wait4, read and
+# an untimed futex wait; poll and nanosleep still say EINTR (gex said EINTR
+# for all of them); i386 also checks setitimer's microseconds.
+# thread-churn: more threads over a process's life than the page has Worker
+# slots, and a fork child starting threads while its parent holds 40.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

@@ -84,6 +84,8 @@ export class ProcessHost {
   }
   #onOutput; #onFork; #onExit; #readStdin; #onOther;
   #workers = new Map();
+  /** The wineserver's door, once published (`doorPublish`). */
+  #door = null;
   #pending = new Map();
   #first = null;
   #forked = 0;
@@ -402,8 +404,50 @@ export class ProcessHost {
     this.#stacksFree.push(slice);
   }
 
+  /** Whether the Worker `key` is inside a wineserver door call: it holds
+   *  the door lock (docs/wineserver-kernel.md §4.2). */
+  #inDoor(key) {
+    const d = this.#door;
+    if (!d) return false;
+    const i32 = new Int32Array(d.memory.buffer);
+    const a = d.area >> 2;
+    const parts = String(key).split(':');
+    return Atomics.load(i32, a) !== 0 && i32[a + 30] === Number(parts[0]) && i32[a + 29] === Number(parts[parts.length - 1]);
+  }
+
   /** A Worker has ended: stop it, and put its kernel stack back. */
   #release(key, w) {
+    // Not inside a door call: a Worker stopped there would leave the door
+    // lock held and the server's pump waiting for it forever (a process the
+    // server kills from inside its own request, as `terminate_process`
+    // does). It finishes the call first; the guest it then goes back to
+    // runs a moment longer, as a signal's target does.
+    if (this.#inDoor(key)) {
+      const t0 = Date.now();
+      if (globalThis.GEX_DOOR_STATS || globalThis.process?.env?.GEX_DOOR_STATS) console.error(`[host] ${key}: ended inside a wineserver door call; stopped when it leaves`);
+      const again = () => {
+        if (this.#inDoor(key) && Date.now() - t0 < 10000) { setTimeout(again, 1); return; }
+        if (this.#inDoor(key)) {
+          // Stopped inside a door call: its handler is cut off midway, so
+          // the server is poisoned (area +124) and the lock given up; the
+          // pump takes it, sees the poison and ends the server, as when
+          // wineserver dies.
+          const i32 = new Int32Array(this.#door.memory.buffer);
+          const a = this.#door.area >> 2;
+          console.error(`[host] ${key}: still inside a wineserver door call after 10 s; stopped, and the server is poisoned`);
+          Atomics.store(i32, a + 31, i32[a + 29] || -1);
+          Atomics.store(i32, a, 0);
+          Atomics.notify(i32, a);
+        }
+        this.#releaseNow(key, w);
+      };
+      setTimeout(again, 1);
+      return;
+    }
+    this.#releaseNow(key, w);
+  }
+
+  #releaseNow(key, w) {
     this.#workers.delete(key);
     // The last Worker of a process gone: drop its shared-module cache so a long
     // page does not accumulate every process's compiled modules forever.
@@ -457,6 +501,8 @@ export class ProcessHost {
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
             sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
+            // the wineserver's door, if one is up (`doorPublish`)
+            door: this.#door ?? undefined,
           // `transfer`: buffers the caller gives up (the page's bundle), moved
           // rather than copied, and freed by the Worker once loaded.
           }, [...forkTransfer(msg.child), ...(msg.transfer ?? [])]);
@@ -475,6 +521,14 @@ export class ProcessHost {
           },
           );
         }
+        break;
+      }
+      case 'doorPublish': {
+        // The wineserver's door (docs/wineserver-kernel.md): every Worker of
+        // the session, now and later, gets the server's memory and module.
+        this.#door = m.door;
+        console.error(`[host] wineserver pid ${m.door?.pid} published its door`);
+        for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
         break;
       }
       case 'wantLibrary':
@@ -565,6 +619,13 @@ export class ProcessHost {
         // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
+        // Each process's memory by pid (a thread's Worker is keyed `pid:tid`), weakly (an exited process's memory
+        // is not kept): what a harness reads a guest word from while the
+        // process's own Workers are busy in wasm (tests/games/noita-page.mjs,
+        // Noita's world frame counter). A threaded process registers here.
+        if (typeof WeakRef === 'function' && m.thread.memory) {
+          (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
+        }
         if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, making Worker (t=${Date.now()})`);
         const w2 = this.#makeWorker();
         this.#workers.set(key, w2);
@@ -617,6 +678,7 @@ export class ProcessHost {
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
             // references, not a byte copy. See `#moduleCache`.
             sharedModules: this.#sharedFor(pid, true),
+            door: this.#door ?? undefined,
           }),
           );
         };

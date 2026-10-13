@@ -514,7 +514,7 @@ mod imp {
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
-    const REC: usize = 28;
+    const REC: usize = 37;
     const EV: usize = 8;
     /// The client number NT windows go by in this process's block. A Windows
     /// process has no Wayland clients of its own, so there is nobody to
@@ -619,8 +619,13 @@ mod imp {
                     3 => E::Key { window, code: q[1] as u32, pressed: q[2] != 0 },
                     6 if window != 0 => E::Focus { window },
                     // Only a real resize: the compositor configures on every
-                    // focus change too, with the size the window already has.
+                    // focus change too, with the size the window already has,
+                    // and with 0x0 (xdg_toplevel's "your own size") when it
+                    // has not chosen one.
                     7 => {
+                        if q[1] <= 0 || q[2] <= 0 {
+                            continue;
+                        }
                         let same = self.windows.lock().unwrap().get(&window).is_some_and(|(s, _)| {
                             s.width == q[1] && s.height == q[2]
                         });

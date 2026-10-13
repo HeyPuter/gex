@@ -124,6 +124,18 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
     {
         let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
         let inst = s.ftab.map.install(n).clone();
+        // What a door instance needs to run this program again on its memory
+        // (`door`: a wineserver).
+        crate::door::note_program(
+            store.data_mut().with_kernel(|k| k.pid) as u32,
+            crate::door::Prog {
+                module: s.ftab.modules[inst.module as usize].clone(),
+                memory_base: mem_base as u32,
+                table_base: inst.base,
+                table_len: len,
+                thread_start: inst.base + slot("__gex_thread_start")?,
+            },
+        );
         let extra = info.extra_slots().into_iter().map(|(k, name)| (inst.base + k, name)).collect();
         s.ftab.dylink.insert(inst.module, Arc::new(crate::dylink::Binds { path: path.clone(), imports: Vec::new(), extra }));
         s.ftab.dyproc = Some(crate::dylink::DyProcess {
