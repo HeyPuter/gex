@@ -4224,20 +4224,37 @@ export class Gex {
   }
 
   /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
-   *  1 use the pipes, 2 the thread died in the request. */
+   *  1 use the pipes, 2 the thread died in the request. The hot path is kept
+   *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
+   *  it stays optimised: every server request of a W3 process comes here
+   *  (docs/wine-overhead.md). */
   #doorCall(req, pid, tid) {
+    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid);
     const d = this.#door;
-    const st = this.#doorStats;
-    if (!d || single.on) {
-      if (globalThis.GEX_DOOR_STATS && !(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
-      return 1;
-    }
-    const T = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
+    if (!d || single.on) return 1;
+    return this.#doorRun(d, req, pid, tid, null);
+  }
+
+  /** GEX_DOOR_STATS, read once per Worker (a page sets it before it starts). */
+  #doorStatsOn = !!globalThis.GEX_DOOR_STATS;
+
+  /** The guest memory's DataView, rebuilt as `#bytes` is. */
+  #gdv = null;
+  #guestView() {
+    const cm = this.#bytes();
+    let v = this.#gdv;
+    if (!v || v.buffer !== cm.buffer || v.byteLength !== cm.byteLength) v = this.#gdv = new DataView(cm.buffer, 0, cm.byteLength);
+    return v;
+  }
+
+  /** One door call under the door lock (`st`: the statistics, or null). */
+  #doorRun(d, req, pid, tid, st) {
+    const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
     const cm = this.#bytes();
-    const cdv = new DataView(cm.buffer);
+    const cdv = this.#guestView();
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
@@ -4246,25 +4263,13 @@ export class Gex {
     const a = d.area;
     const buf = dv.getUint32(a + 44, true), bufSize = dv.getUint32(a + 48, true);
     const replyOff = (64 + reqSize + 7) & ~7;
-    if (replyOff + 64 + replyMax > bufSize) { st.fallbacks++; return 1; }
+    if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
     // Poisoned (a door call died midway): no more doors; the pipes say the
     // rest when the server goes.
     if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
-    let waitedMs = 0;
-    for (let spins = 0; ; spins++) {
-      const v = Atomics.compareExchange(i32, L, 0, 1);
-      if (v === 0) break;
-      if (spins < 200) continue;
-      if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
-      Atomics.wait(i32, L, 2, 1);
-      // A lock held this long is a stuck door (a Worker ended inside one,
-      // or a deadlock): say who holds it, every 5 s of waiting.
-      if (++waitedMs % 5000 === 0) {
-        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
-      }
-    }
+    if (Atomics.compareExchange(i32, L, 0, 1) !== 0) this.#doorLockSlow(i32, a, L, pid, tid);
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
     let r;
@@ -4281,21 +4286,21 @@ export class Gex {
         at += size;
       }
       di.sp.value = di.stackTop;
-      const T1 = T ? performance.now() : 0;
+      const T1 = st ? performance.now() : 0;
       // The time, as set_current_time would read it (gettimeofday,
       // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
       // of the door saved.
       const ns = this.#env.now();
       r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
-      if (T) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
-      if (r === 0xffffffff) { st.fallbacks++; r = 1; }
+      if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
+      if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
       else if (r === 0xfffffffe) r = 2;
       else {
         const ro = buf + r;
         cm.set(u8.subarray(ro, ro + 64), req);
         const size = Math.min(dv.getUint32(ro + 4, true), replyMax);
         if (size && replyData) cm.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
-        st.calls++;
+        if (st) st.calls++;
         r = 0;
       }
     } catch (err) {
@@ -4310,25 +4315,55 @@ export class Gex {
     const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;
     if (Atomics.exchange(i32, L, 0) === 2) Atomics.notify(i32, L);
     if (kick) this.#doorKick();
-    if (globalThis.GEX_DOOR_STATS) {
-      const now = performance.now();
-      if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
-      if (!st.t0) st.t0 = now;
-      else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
-        const sa = dv.getUint32(a + 96, true) >> 2;
-        const top = [];
-        if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
-        top.sort((x, y) => y[0] - x[0]);
-        console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
-          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
-          + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
-          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
-          + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
-          + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
-        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
-        st.byNr = {};
-        st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
+    return r;
+  }
+
+  /** The door lock, contended: spin, then wait (the lock word 2: waiters). */
+  #doorLockSlow(i32, a, L, pid, tid) {
+    let waitedMs = 0;
+    for (let spins = 0; ; spins++) {
+      const v = Atomics.compareExchange(i32, L, 0, 1);
+      if (v === 0) return;
+      if (spins < 200) continue;
+      if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
+      Atomics.wait(i32, L, 2, 1);
+      // A lock held this long is a stuck door (a Worker ended inside one,
+      // or a deadlock): say who holds it, every 5 s of waiting.
+      if (++waitedMs % 5000 === 0) {
+        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
       }
+    }
+  }
+
+  /** `#doorCall` with GEX_DOOR_STATS: the same call, timed, and a report
+   *  every GEX_DOOR_STATS ms (default 10 s) or 50,000 calls. */
+  #doorCallStats(req, pid, tid) {
+    const d = this.#door;
+    const st = this.#doorStats;
+    if (!d || single.on) {
+      if (!(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
+      return 1;
+    }
+    const r = this.#doorRun(d, req, pid, tid, st);
+    const { i32, dv } = this.#doorView();
+    const a = d.area;
+    const now = performance.now();
+    if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
+    if (!st.t0) st.t0 = now;
+    else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
+      const sa = dv.getUint32(a + 96, true) >> 2;
+      const top = [];
+      if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
+      top.sort((x, y) => y[0] - x[0]);
+      console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
+        + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
+        + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
+        + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
+        + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
+        + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
+      st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
+      st.byNr = {};
+      st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
     }
     return r;
   }
