@@ -143,8 +143,10 @@ pub(crate) fn publish(caller: &mut Caller<'_, HostState>, area_at: u32) -> Resul
         .with_kernel(|k| k.fds.get(kick_fd).map(|f| Arc::clone(&f.handle)))
         .map_err(|e| anyhow!("door kick fd {kick_fd}: {e:?}"))?;
     let version = u32::from_le_bytes(memory.bytes()[(area_at + area::VERSION) as usize..][..4].try_into().unwrap());
-    if version != 1 {
-        bail!("door area version {version} (want 1)");
+    // 2 adds the lazy clock (`dispatch(pid, tid, 0, 1)`), which this host
+    // does not use: it passes (0, 0), the server's own clock calls.
+    if version != 1 && version != 2 {
+        bail!("door area version {version} (want 1 or 2)");
     }
     // The door context must hold gex's whole register context: the kernel
     // writes past the system-call slots (LAST_SYSCALL), and a short one

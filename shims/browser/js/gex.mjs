@@ -4135,6 +4135,9 @@ export class Gex {
         wake_pipe: () => -1,
         wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),
         wake_close: () => {},
+        // The lazy clock of a DOOR_VERSION 2 server (door_time_refresh): the
+        // shim's export, a wasm-to-wasm call.
+        clock_ns: this.#shim.exports.gex_clock_ns,
       },
     };
     for (const f of got) (imports[f[1]] ??= {})[f[2]] = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
@@ -4158,7 +4161,11 @@ export class Gex {
       if (!(err instanceof DoorExit)) throw err;
     }
     const dispatch = table.get(v.dv.getUint32(a + 60, true));
-    return { door: d, dispatch, sp, stackTop, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
+    // DOOR_VERSION 2 (area +40): the server reads the clock itself, lazily
+    // (`dispatch(pid, tid, 0, 1)`), so a request that never looks at the
+    // time costs no clock read (Chrome: performance.now() alone is ~0.5 us).
+    const lazyTime = v.dv.getInt32(a + 40, true) >= 2;
+    return { door: d, dispatch, sp, stackTop, lazyTime, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
   }
 
   /** A system call from server code inside a door (i386 numbers, the
@@ -4294,8 +4301,11 @@ export class Gex {
       // The time, as set_current_time would read it (gettimeofday,
       // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
       // of the door saved.
-      const ns = this.#env.now();
-      r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      if (di.lazyTime) r = di.dispatch(pid, tid, 0n, 1n) >>> 0;
+      else {
+        const ns = this.#env.now();
+        r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      }
       if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
       else if (r === 0xfffffffe) r = 2;
