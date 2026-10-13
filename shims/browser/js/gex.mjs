@@ -2368,6 +2368,19 @@ export class Gex {
    * code branches into slots the parent allocated -- and without the same map
    * and modules those slots are empty or past the end of an ungrown table.
    */
+  /** `bytes` into the shim's heap for the length of `f(ptr, len)`. */
+  #putBytes(bytes, f) {
+    const e = this.#shim.exports;
+    const n = Math.max(1, bytes.length);
+    const p = e.gex_alloc(n) >>> 0;
+    this.#bytes().set(bytes, p);
+    try {
+      return f(p, bytes.length);
+    } finally {
+      e.gex_free?.(p, n);
+    }
+  }
+
   async adoptProcess(shimWasm, guestWasm, child, opts = {}) {
     // Narrated and timed when asked: every step is a place a child can stop
     // dead, and a hang is indistinguishable from a slow start otherwise.
@@ -2499,6 +2512,9 @@ export class Gex {
       e.gex_set_cwd(cp, c.length);
       e.gex_free?.(cp, c.length);
     }
+    // And the signal state, umask and limits, which `gex_adopt_child` builds
+    // the kernel with.
+    if (child.state?.length && e.gex_set_child_state) this.#putBytes(child.state, e.gex_set_child_state);
     const entry = e.gex_adopt_child(
       child.pid,
       child.ctx,
@@ -2854,6 +2870,13 @@ export class Gex {
         ? this.#bytes().slice(
             e.gex_fork_fds_ptr() >>> 0,
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
+          )
+        : null,
+      // The dispositions, mask, umask and limits the child inherits.
+      state: e.gex_fork_state_len?.()
+        ? this.#bytes().slice(
+            e.gex_fork_state_ptr() >>> 0,
+            (e.gex_fork_state_ptr() >>> 0) + (e.gex_fork_state_len() >>> 0),
           )
         : null,
       // The parent's exe path and argv, NUL-separated.
