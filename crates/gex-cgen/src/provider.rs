@@ -46,6 +46,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("msvcr120_concrt", include_str!("../providers/msvcr120_concrt.c")),
     ("crt_mem", include_str!("../providers/crt_mem.c")),
     ("crt_math", include_str!("../providers/crt_math.c")),
+    ("wine_libm", include_str!("../providers/wine_libm.c")),
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
@@ -109,6 +110,11 @@ pub struct Provider {
     pub stateful: bool,
     /// Not for Wine's build of the library (`nowine` on the first line).
     pub nowine: bool,
+    /// Only for Wine's build of the library (`wineonly`).
+    pub wineonly: bool,
+    /// Keeps the image's lifted body of every export it binds, as a twin
+    /// it can fall back to (`lifted`; provider.h `GP_LIFTED`).
+    pub lifted: bool,
     /// (C function, export), in source order.
     pub binds: Vec<(String, String)>,
     /// Exports that bind together or not at all (`GEX_GROUP`).
@@ -130,6 +136,16 @@ pub fn all() -> Vec<Provider> {
         .collect()
 }
 
+/// Exports no provider binds, comma-separated: `GEX_PROVIDER_SKIP`, or
+/// this for a host without an environment (the page's `?provskip=`).
+static SKIP: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Set the exports no provider binds where `GEX_PROVIDER_SKIP` cannot be
+/// read (the browser shim).
+pub fn set_skip(list: &str) {
+    *SKIP.lock().unwrap_or_else(|e| e.into_inner()) = list.to_string();
+}
+
 /// Whether providers are on (`GEX_PROVIDERS=0` turns them off).
 pub fn enabled() -> bool {
     std::env::var("GEX_PROVIDERS").map_or(true, |v| v != "0")
@@ -139,10 +155,12 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
-        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64|aarch64> [stateful] [nowine]`");
+        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64|aarch64> [stateful] [nowine|wineonly] [lifted]`");
     }
     let stateful = w[4..].contains(&"stateful");
     let nowine = w[4..].contains(&"nowine");
+    let wineonly = w[4..].contains(&"wineonly");
+    let lifted = w[4..].contains(&"lifted");
     let build_ids = w[4..]
         .iter()
         .filter_map(|x| x.strip_prefix("buildid="))
@@ -178,12 +196,12 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     if binds.is_empty() {
         bail!("provider {name} provides nothing");
     }
-    let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
+    let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_else(|_| SKIP.lock().unwrap_or_else(|e| e.into_inner()).clone());
     // A versioned export is skipped by its bare name too (`memcpy` skips
     // `memcpy@@GLIBC_2.14`).
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e || e.split('@').next() == Some(s)));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, arch, class32, stateful, nowine, binds, groups, build_ids })
+    Ok(Provider { name, text, dlls, arch, class32, stateful, nowine, wineonly, lifted, binds, groups, build_ids })
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
@@ -214,11 +232,11 @@ pub fn trampoline_exports(unix_call_32: u32) -> HashMap<String, u32> {
 }
 
 /// [`for_dll`] for an image whose file is `data`: without the `nowine`
-/// providers when it is Wine's own build.
+/// providers when it is Wine's own build, the `wineonly` ones when not.
 pub fn for_image(dll: &str, class32: bool, data: &[u8]) -> Vec<Provider> {
     let wine = data.get(0x40..0x50) == Some(&b"Wine builtin DLL"[..]);
     let mut v = for_dll(dll, class32);
-    v.retain(|p| !(p.nowine && wine));
+    v.retain(|p| !(p.nowine && wine) && !(p.wineonly && !wine));
     v
 }
 
@@ -255,6 +273,21 @@ pub fn stubs(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) 
         .iter()
         .flat_map(|p| p.binds.iter())
         .filter_map(|(_, e)| exports.get(e).map(|&rva| base + rva as u64))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The guest addresses among [`stubs`] whose unit keeps the lifted body as
+/// a twin (`lifted` providers' exports), marked `gex_abi::ftab::TWIN`: what
+/// `image::build_c_module` takes beside the stubs.
+pub fn twins(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) -> Vec<u64> {
+    let mut v: Vec<u64> = providers
+        .iter()
+        .filter(|p| p.lifted)
+        .flat_map(|p| p.binds.iter())
+        .filter_map(|(_, e)| exports.get(e).map(|&rva| (base + rva as u64) | gex_abi::ftab::TWIN))
         .collect();
     v.sort_unstable();
     v.dedup();

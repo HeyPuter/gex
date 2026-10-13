@@ -110,6 +110,9 @@ struct Provided {
     /// A native wasm32 Wine DLL's skeleton (`wasmdll`): Wine's PE module is
     /// its provider, installed at the first skeleton and bound at each.
     skeleton: Option<Arc<gex_ld::pe::PeImage>>,
+    /// Falls back to lifted twins (`lifted`): bound only where its unit
+    /// installed them.
+    lifted: bool,
 }
 
 /// Stateful providers by library (lower case) and module file under the
@@ -433,7 +436,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 }
             }
             let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
-            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None });
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None, lifted: false });
         }
     }
     // A native wasm32 Wine DLL: its exports are Wine's PE module's, not the
@@ -446,6 +449,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             stateful: None,
             data: false,
             skeleton: Some(Arc::new(pe.clone())),
+            lifted: false,
         }];
     }
     let identity = match known {
@@ -513,6 +517,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, 
             stateful: None,
             data: p.stateful,
             skeleton: None,
+            lifted: p.lifted,
         })
         .filter(|p| !p.binds.is_empty())
         .collect();
@@ -531,6 +536,7 @@ fn trampoline_providers() -> Vec<Provided> {
             stateful: None,
             data: p.stateful,
             skeleton: None,
+            lifted: false,
         })
         .filter(|p| !p.binds.is_empty())
         .collect()
@@ -681,7 +687,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     let raw = crate::shim_slice(entries, 8 * n);
     let slots: Vec<u64> = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
-    let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
+    // A lifted twin is no entry of its own address: no cache slot, no bridge.
+    let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0 && a & gex_abi::ftab::TWIN == 0).collect();
     let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
     {
@@ -854,11 +861,20 @@ pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> 
 /// provider's module number (an install names `PROVIDER | number`), or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
-    let (file, binds, stateful, data) = {
+    let (file, mut binds, stateful, data) = {
         let units = lock(&UNITS);
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
         (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data)
     };
+    if lock(&UNITS).get(u as usize).and_then(|x| x.providers.get(i as usize)).is_some_and(|p| p.lifted) {
+        // Only where its unit keeps the lifted twin it falls back to, as
+        // natively (`nt_cgen::install_providers`).
+        let had = binds.len();
+        binds.retain(|(_, a)| ftab(|m| m.twin(*a).is_some()));
+        if binds.len() < had {
+            crate::warn_line(&format!("gex-nt: provider {file}: {} of {had} exports left unbound (no lifted twin in its unit)\n", had - binds.len()));
+        }
+    }
     let wasm = crate::shim_slice(ptr, len);
     let names = match gex_cgen::provider::slot_names(wasm) {
         Ok(n) => n,
@@ -1197,6 +1213,37 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
 /// address, slot): its install's number.
 pub(crate) fn publish(len: u32, module: u32, tier: Tier, pairs: &[(u64, u32)]) -> u32 {
     ftab(|m| m.publish(len, module, tier, pairs))
+}
+
+/// `gex.ftab_twin(addr)`: the table index of the lifted twin of the export
+/// at `addr` (`gex_abi::ftab::TWIN`), 0 when its unit has none -- a
+/// provider's fallback (provider.h `gp_lifted`). Each address's first
+/// fallback is reported, every one counted (`TWIN_CALLS`), as natively.
+#[no_mangle]
+pub extern "C" fn gex_ftab_twin(addr: i64) -> i32 {
+    let addr = addr as u64;
+    TWIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    let idx = ftab(|m| m.twin(addr).map_or(0, |f| f.idx));
+    if lock(&TWIN_SEEN).insert(addr) {
+        crate::warn_line(&if idx == 0 {
+            format!("gex: provider at {addr:#x} fell back to its lifted body, but its unit has none\n")
+        } else {
+            format!("gex: provider at {addr:#x} fell back to its lifted body\n")
+        });
+    }
+    idx as i32
+}
+
+/// Fallbacks to lifted twins so far ([`gex_ftab_twin`]).
+pub(crate) static TWIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TWIN_SEEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// The exports no built-in provider binds (`?provskip=`, the native
+/// GEX_PROVIDER_SKIP): `len` bytes of comma-separated names at `ptr`.
+#[no_mangle]
+pub extern "C" fn gex_cgen_set_provider_skip(ptr: u32, len: u32) {
+    let s = String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned();
+    gex_cgen::provider::set_skip(&s);
 }
 
 /// The function table index serving `addr` now, if any.

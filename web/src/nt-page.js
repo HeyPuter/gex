@@ -149,6 +149,7 @@ async function main() {
   if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen')) | (q.get('unguarded') === '0' ? 0 : 4) | (q.get('icallcount') === '1' ? 16 : 0);
   // An ejected project's page (gexc eject): its units, and no translation.
   if (q.get('cgenurl')) globalThis.GEX_CGEN_URL = q.get('cgenurl');
+  if (q.get('provskip')) globalThis.GEX_PROVIDER_SKIP = q.get('provskip');
   if (q.get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   // `aot=record`: its training run (translation on, the rest as aot=1).
   if (q.get('aot')) globalThis.GEX_AOT = 1;

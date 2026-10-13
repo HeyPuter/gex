@@ -1438,6 +1438,7 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+    this.#providerSkipApply();
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
@@ -1940,6 +1941,7 @@ export class Gex {
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      this.#providerSkipApply();
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
@@ -3104,6 +3106,23 @@ export class Gex {
   }
 
   #cgenMode = 0;
+  /** Exports the built-in providers leave alone (`?provskip=a,b`, as
+   *  GEX_PROVIDER_SKIP natively): every process of the run, before the
+   *  shim keys its units. */
+  providerSkip(list) {
+    this.#providerSkip = String(list ?? '');
+    if (this.#shim) this.#providerSkipApply();
+  }
+  #providerSkip = '';
+  #providerSkipApply() {
+    const e = this.#shim.exports;
+    if (!this.#providerSkip || !e.gex_cgen_set_provider_skip) return;
+    const b = new TextEncoder().encode(this.#providerSkip);
+    const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+    this.#bytes().set(b, p);
+    e.gex_cgen_set_provider_skip(p, b.length);
+    e.gex_free?.(p, Math.max(8, b.length));
+  }
   /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
    *  the run (a forked child's Worker is told too). Before the shim exists. */
   /** `?wasmdlls=soname=path,...`: libraries this process replaces with wasm64
@@ -3305,6 +3324,8 @@ export class Gex {
         ...(prov >= 0 ? {
           // The shim's exports themselves: a wasm-to-wasm call, no JS.
           nt_qpc: e.gex_nt_qpc,
+          // A provider's fallback to the lifted body (provider.h gp_lifted).
+          ftab_twin: e.gex_ftab_twin,
           provider_alloc_top: e.gex_provider_alloc_top,
           // Wine's Unix side (W3.1): its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults
@@ -3635,6 +3656,7 @@ export class Gex {
         throw new ProviderThrow(code);
       },
       provider_ctx: () => e.gex_provider_ctx(),
+      ftab_twin: (addr) => e.gex_ftab_twin(addr),
       provider_time: (which) => (which === 0 ? Date.now() / 1000 : performance.now() / 1000),
       provider_missing: (addr) => e.gex_provider_missing(addr),
       provider_alloc: (size) => e.gex_provider_alloc(size),

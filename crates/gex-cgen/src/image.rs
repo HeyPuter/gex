@@ -452,6 +452,29 @@ pub struct ImageStats {
     pub devirt: usize,
     /// Calls to unit-private copies of small leaves (`FnUnit::leaves`).
     pub leaf_copies: usize,
+    /// Lifted twins kept for `lifted` providers' exports.
+    pub twins: usize,
+}
+
+/// A unit holding only the body of `entry`, made its lifted twin: the body
+/// (and its function-table reference) renamed `t_<entry>`, which
+/// [`funcs_section`] marks `gex_abi::ftab::TWIN` -- `f_<entry>` is the
+/// stub that leaves for the provider. Its loops and leaf copies are static.
+fn twin_source(src: &str, entry: u64) -> String {
+    let from = format!("f_{entry:x}");
+    let to = format!("t_{entry:x}");
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut rest = src;
+    while let Some(i) = rest.find(&from) {
+        let before = rest[..i].chars().next_back();
+        let after = rest[i + from.len()..].chars().next();
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(&rest[..i]);
+        out.push_str(if word(before) || word(after) { &from } else { &to });
+        rest = &rest[i + from.len()..];
+    }
+    out.push_str(rest);
+    out.replace(&format!("gex_refs_{entry:x}"), &format!("gex_refs_t{entry:x}"))
 }
 
 /// Stage 2: the recovery in `recovery` as one linked C module at `out`.
@@ -459,7 +482,9 @@ pub struct ImageStats {
 /// cache (shared across images and builds). `read` gives a byte of the
 /// image as placed (for [`func::ret_pops`]); `stubs` are entries an export
 /// provider serves (`crate::provider::stubs`), whose bodies re-enter the
-/// function table instead.
+/// function table instead; one also there marked `gex_abi::ftab::TWIN`
+/// (`crate::provider::twins`) keeps its own body as well, as its lifted
+/// twin.
 pub fn build_c_module(
     recovery: &Path,
     work: &Path,
@@ -515,7 +540,16 @@ pub fn build_group_module(
             return Ok(stats);
         }
         let mut more = Vec::new();
+        let mut dropped = Vec::new();
         for n in &users {
+            // A lifted twin clang wanted a shadow stack for (its `t_`, or a
+            // loop of it: `f_` is only a stub then) is dropped: its provider
+            // traps if it ever falls back.
+            let twin = n.strip_prefix("t_").and_then(|h| u64::from_str_radix(h, 16).ok());
+            if let Some(a) = twin.or_else(|| func::guest_entry_of(n).filter(|&a| skip.contains(&(a | gex_abi::ftab::TWIN)))) {
+                dropped.push(a | gex_abi::ftab::TWIN);
+                continue;
+            }
             let a = func::guest_entry_of(n).ok_or_else(|| {
                 anyhow!("C function {n} uses clang's shadow stack and belongs to no guest function")
             })?;
@@ -523,6 +557,16 @@ pub fn build_group_module(
                 bail!("{n} ({a:#x}) uses clang's shadow stack and is trap-free; it cannot be left to tier-1 here");
             }
             more.push(a);
+        }
+        if !dropped.is_empty() {
+            eprintln!("[cgen] lifted twins dropped (clang wanted a shadow stack): {dropped:x?}");
+            for a in &dropped {
+                skip.remove(a);
+            }
+            if more.is_empty() {
+                let _ = std::fs::remove_file(out);
+                continue;
+            }
         }
         if more.iter().all(|a| skip.contains(a)) {
             bail!("the shadow-stack users {users:?} remain after their functions became stubs");
@@ -609,9 +653,12 @@ fn emit_and_link(
                 let _ = std::fs::remove_file(&src);
             });
         }
-        let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats| -> Result<()> {
+        let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats, twin: Option<u64>| -> Result<()> {
             unit.add_leaf_copies(&known, &rec.sums, &rec.trapfree)?;
-            let src_text = unit.source();
+            let src_text = match twin {
+                Some(e) => twin_source(&unit.source(), e),
+                None => unit.source(),
+            };
             stats.c_bytes += src_text.len() as u64;
             let key = hash128(&[src_text.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
             let obj = objects.join(format!("{key}.o"));
@@ -635,6 +682,19 @@ fn emit_and_link(
         for recovery in recoveries {
         let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
+            if skip.contains(&(f.entry | gex_abi::ftab::TWIN)) {
+                // A `lifted` provider's export: its own body too, as the
+                // twin the provider falls back to, in a unit of its own
+                // (`twin_source` renames it there).
+                let mut tu = new_unit();
+                tu.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                tu.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
+                tu.add(&f, &known, &rec.sums, &rec.trapfree)
+                    .with_context(|| format!("emitting C for the lifted twin of {:#x}", f.entry))?;
+                emit(&mut tu, k, &mut objs, &mut stats, Some(f.entry))?;
+                k += 1;
+                stats.twins += 1;
+            }
             if let Some(sym) = providers.bodies.get(&f.entry) {
                 unit.add_provider_body(f.entry, sym);
             } else if skip.contains(&f.entry) {
@@ -646,7 +706,7 @@ fn emit_and_link(
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
             }
             if unit.len() >= UNIT_BYTES {
-                emit(&mut unit, k, &mut objs, &mut stats)?;
+                emit(&mut unit, k, &mut objs, &mut stats, None)?;
                 k += 1;
             }
             if !errors.lock().unwrap().is_empty() {
@@ -655,7 +715,7 @@ fn emit_and_link(
         }
         }
         if unit.len() > 0 {
-            emit(&mut unit, k, &mut objs, &mut stats)?;
+            emit(&mut unit, k, &mut objs, &mut stats, None)?;
         }
         // The providers' own translation units, cached by their C as units are.
         if !providers.sources.is_empty() {
@@ -729,6 +789,8 @@ pub fn funcs_section(wasm: &[u8]) -> Result<Vec<u64>> {
                         for naming in map.into_iter().flatten() {
                             if let Some(a) = naming.name.strip_prefix("f_").and_then(|h| u64::from_str_radix(h, 16).ok()) {
                                 names.insert(naming.index, a);
+                            } else if let Some(a) = naming.name.strip_prefix("t_").and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                                names.insert(naming.index, a | gex_abi::ftab::TWIN);
                             }
                         }
                     }

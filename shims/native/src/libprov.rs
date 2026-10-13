@@ -345,6 +345,34 @@ impl std::fmt::Display for Throw {
 
 impl std::error::Error for Throw {}
 
+/// `gex.ftab_twin(addr)`: the table index of the lifted twin of the export
+/// at `addr` (`gex_abi::ftab::TWIN`), 0 when its unit has none. A provider
+/// calls it only to fall back (provider.h `gp_lifted`); each address's
+/// first fallback is reported (`GEX_PROVIDER_TWIN_LOG=0` quiets it), every
+/// one counted.
+fn ftab_twin(caller: Caller<'_, HostState>, addr: i64) -> i32 {
+    let addr = addr as u64;
+    TWIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idx = caller
+        .data()
+        .jit
+        .as_ref()
+        .and_then(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.twin(addr))
+        .map_or(0, |f| f.idx);
+    if std::env::var("GEX_PROVIDER_TWIN_LOG").as_deref() != Ok("0") && TWIN_SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(addr) {
+        if idx == 0 {
+            eprintln!("gex: provider at {addr:#x} fell back to its lifted body, but its unit has none");
+        } else {
+            eprintln!("gex: provider at {addr:#x} fell back to its lifted body");
+        }
+    }
+    idx as i32
+}
+
+/// Fallbacks to lifted twins so far ([`ftab_twin`]).
+pub(crate) static TWIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TWIN_SEEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
 /// Where a provider's own threads start (`__gex_thread_start`, bound by
 /// [`install`]): musl's `clone` sets the child's PC to it.
 static THREAD_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -392,6 +420,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         caller.data().nt.as_ref().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;
     linker.func_wrap(IMPORT_MODULE, "provider_time", |_caller: Caller<'_, HostState>, which: i32| -> f64 {
         match which {
             0 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0),
@@ -607,6 +636,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         cx.throw(exn)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
+    linker.func_wrap(IMPORT_MODULE, gex_abi::ftab::TWIN_IMPORT, ftab_twin)?;
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
