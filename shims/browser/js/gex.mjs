@@ -2602,7 +2602,9 @@ export class Gex {
           + ` modules=${(child.modules ?? []).length}`,
       );
     }
-    if (performance.measureUserAgentSpecificMemory) {
+    // Only then: the measurement forces a GC in every child, which an
+    // ordinary run (apt's hundred forks) pays for and never reads.
+    if (globalThis.GEX_DEBUG_EXIT && performance.measureUserAgentSpecificMemory) {
       const imageBytes = (child.image ?? []).reduce(
         (n, r) => n + (r.bytes?.byteLength ?? 0), 0);
       performance
