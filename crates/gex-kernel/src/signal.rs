@@ -713,6 +713,30 @@ impl Signals {
         self.next_deliverable()
     }
 
+    /// Whether a call of restart class `class`, its wait ended by a signal,
+    /// starts again (from its instruction, as the guest made it) rather than
+    /// answering `EINTR`: Linux's `-ERESTARTSYS`, `-ERESTARTNOINTR` and
+    /// `-ERESTARTNOHAND` (signal(7), "Interruption of system calls"). The
+    /// signal is the one about to be delivered: a handler installed with
+    /// `SA_RESTART` restarts an [`Restart::SaRestart`] call, any handler ends
+    /// an [`Restart::NoHandler`] one, and with no handler to run (a default
+    /// that ends the process, or nothing deliverable after all) every class
+    /// but [`Restart::Never`] restarts.
+    pub fn restarts(&self, class: Restart) -> bool {
+        if class == Restart::Never {
+            return false;
+        }
+        if class == Restart::Always {
+            return true;
+        }
+        let Some(signal) = self.next_deliverable() else { return true };
+        let action = self.action(signal);
+        if action.handler == SIG_IGN || action.handler == SIG_DFL {
+            return true;
+        }
+        class == Restart::SaRestart && action.flags & sa::RESTART != 0
+    }
+
     /// The lowest-numbered deliverable signal, if any.
     fn next_deliverable(&self) -> Option<u32> {
         let ready = self.pending_raw() & !self.blocked();
@@ -721,6 +745,23 @@ impl Signals {
         }
         Some(ready.trailing_zeros() + 1)
     }
+}
+
+/// How a blocking call a signal interrupts ends ([`Signals::restarts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Restart {
+    /// `EINTR`, handler or not: a wait with a timeout the caller chose
+    /// (`poll`, `select`, `epoll_wait`, `nanosleep`, a timed futex wait,
+    /// `sigsuspend`). Linux restarts some of these when no handler runs, but
+    /// such a signal never ends a wait here.
+    #[default]
+    Never,
+    /// Restarted after a handler with `SA_RESTART`, and when no handler
+    /// runs; `EINTR` after any other handler (`-ERESTARTSYS`): `read`,
+    /// `write`, `wait4`, `accept`, an untimed futex wait.
+    SaRestart,
+    /// Restarted after a handler too (`-ERESTARTNOINTR`): `FUTEX_LOCK_PI`.
+    Always,
 }
 
 /// A process that sent a signal, for its siginfo.
@@ -1223,7 +1264,14 @@ fn setup_frame_i386(
     }
     let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
     m.write_u32(sc + iframe::SC_TRAPNO, if signal == sig::SIGSEGV { 14 } else { 0 })?;
-    m.write_u32(sc + iframe::SC_ERR, 0)?;
+    // A wasm32 program's call that restarts after this handler
+    // (`syscalls::restart_call`): said in the frame, where its sigreturn
+    // finds it, however many frames nest meanwhile.
+    let restart = m.read_u64(ctx_addr + ctx::x(RESTART_SLOT) as u64)? == RESTART_MARK;
+    if restart {
+        m.write_u64(ctx_addr + ctx::x(RESTART_SLOT) as u64, 0)?;
+    }
+    m.write_u32(sc + iframe::SC_ERR, if restart { RESTART_ERR } else { 0 })?;
     m.write_u32(sc + iframe::SC_EIP, pc as u32)?;
     m.write_u32(sc + iframe::SC_CS, iframe::USER32_CS)?;
     m.write_u32(sc + iframe::SC_EFLAGS, read_rflags(m, ctx_addr)? as u32)?;
@@ -1282,6 +1330,15 @@ fn setup_frame_i386(
 /// The i386 `sigreturn` (legacy: the restorer popped the return address and
 /// `sig`, so the frame is two words below `esp`) and `rt_sigreturn` (one
 /// word below).
+/// A wasm32 program's interrupted call that restarts once its handler
+/// returns (`syscalls::restart_call`): the context slot that says so
+/// (r8, which the i386 ABI its calls use never touches), what it holds
+/// then, and how the handler's frame keeps it (its `err` field, which only
+/// a fault's frame uses).
+pub const RESTART_SLOT: u8 = 8;
+pub const RESTART_MARK: u64 = 0x5245_5354_4152_5453;
+const RESTART_ERR: u32 = 0x5253_5452;
+
 fn sigreturn_i386(
     signals: &Signals,
     m: &mut GuestMem<'_>,
@@ -1316,6 +1373,9 @@ fn sigreturn_i386(
     }
     let pc = m.read_u32(sc + iframe::SC_EIP)? as u64;
     m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
+    if m.read_u32(sc + iframe::SC_ERR)? == RESTART_ERR {
+        m.write_u64(ctx_addr + ctx::x(RESTART_SLOT) as u64, RESTART_MARK)?;
+    }
     write_rflags(m, ctx_addr, m.read_u32(sc + iframe::SC_EFLAGS)? as u64)?;
     let fpstate = m.read_u32(sc + iframe::SC_FPSTATE)? as u64;
     if fpstate != 0 {

@@ -6843,6 +6843,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
+        // The page finishes its own waits (`finish_wait`, which asks the op
+        // for its restart class): the kernel's note for `finish_blocking`,
+        // left, would follow the thread through every switch.
+        h.kernel.block_restart = gex_kernel::signal::Restart::Never;
+        h.kernel.block_pc = 0;
         // The clocks never come here (`clock_syscall`); one that does is a
         // regression, said once, as an error every page test fails on.
         if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !EXITED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -11181,6 +11186,23 @@ fn finish_wait(r: &mut Run, i: usize, ctx_addr: u64, tid: i32, timed_out: bool, 
     // longer counted as waiting (`sys_futex`).
     if let gex_kernel::BlockOp::FutexLockPi { table, uaddr, .. } = &op {
         table.pi_done(*uaddr);
+    }
+    // A wait a signal ended that Linux would restart (signal(7)): the
+    // handler runs, then the call again (`restart_call`).
+    if by_signal && sigs::restarts(op.restart()) {
+        let wasm32 = WASM32.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(back) = gex_kernel::syscalls::restart_call(&mut gm, ctx_addr, pc, wasm32) {
+            match sigs::finish(&mut gm, ctx_addr, None, false) {
+                // A wasm32 program's handler runs from the frame its own
+                // code finds, and its sigreturn makes the call again.
+                gex_kernel::signal::Delivery::Resume(_) if wasm32 => return Done::At(ctx_addr, pc),
+                gex_kernel::signal::Delivery::Resume(target) => return Done::At(ctx_addr, target),
+                gex_kernel::signal::Delivery::Terminate { signal, .. } => return Done::Ends(-(signal as i32)),
+                gex_kernel::signal::Delivery::None if !wasm32 => return Done::At(ctx_addr, back),
+                // `EINTR` after all (`restart_call`).
+                gex_kernel::signal::Delivery::None => gex_kernel::syscalls::restart_undo(&mut gm, ctx_addr),
+            }
+        }
     }
     let res = finish_parked(&op, timed_out, by_signal, &mut gm);
     // The syscall again, from its instruction (the registers are as the
