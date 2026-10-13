@@ -6,7 +6,9 @@
 // for a window title, and writes OUT/w3-session.json: how the page was
 // started (nt-page.js's `__nt.session`), and from every Worker's
 // `[gex-record]` lines (gex.mjs) which processes ran, which function-tier
-// units each image used or missed, and which native wasm32 modules loaded.
+// units each image used or missed, and which native wasm32 modules loaded;
+// and, at the end, the files the run opened (nt-page.js `__ntOpened`, the
+// kernel's read set), which the site's bundle split keeps in the bundle.
 // `gexc eject OUT --out PROJECT` then makes a project of it.
 //
 //   node tools/eject/record-w3.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S]
@@ -144,6 +146,10 @@ await sleep(settle);
 const sess = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.session ?? null)')) ?? 'null');
 if (!sess) { console.error('record-w3: the page has no __nt.session (an nt-page.js from before the recorder)'); done(1); }
 const pageUrl = await ev('location.href');
+// The run's read set. A page from before `__ntOpened` gives none, and the
+// site then keeps its whole bundle.
+const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
+if (opened?.error) console.error(`record-w3: no read set: ${opened.error}`);
 
 const session = {
   format: 'gex-w3-session',
@@ -163,9 +169,11 @@ const session = {
   units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path })),
   unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path, ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
+  files_read: Array.isArray(opened) ? opened : null,
 };
 writeFileSync(join(out, 'w3-session.json'), `${JSON.stringify(session, null, 2)}\n`);
 console.log(`${out}/w3-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
-  + `${session.units.length} units (${session.unit_misses.length} images without one), ${session.modules.length} wasm modules`);
+  + `${session.units.length} units (${session.unit_misses.length} images without one), ${session.modules.length} wasm modules`
+  + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
 if (errors.length) console.log(`record-w3: ${errors.length} console errors, first: ${errors[0]}`);
 done(0);

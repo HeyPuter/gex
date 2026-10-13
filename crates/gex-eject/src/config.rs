@@ -101,6 +101,11 @@ pub struct Config {
     /// The runtime's features this build leaves out (`"features"`, each
     /// `false`; see [`crate::features`]). Empty: everything in.
     pub features_off: Vec<String>,
+    /// W3 pages: `"bundle": "split"` ships only the files the recorded run
+    /// opened in the site's bundle and serves the rest as lazy files, read
+    /// from the host when a guest first reads them; `"whole"` (the default
+    /// for a config without the setting) ships everything.
+    pub bundle_split: bool,
 }
 
 impl Default for Config {
@@ -116,6 +121,7 @@ impl Default for Config {
             jit_fallback: false,
             link_groups: Vec::new(),
             features_off: Vec::new(),
+            bundle_split: false,
         }
     }
 }
@@ -173,7 +179,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -308,6 +314,12 @@ impl Config {
                 off
             }
             Some(_) => bail!("{what}: \"features\" is not an object of true and false"),
+        };
+        c.bundle_split = match v.get("bundle") {
+            None | Some(Json::Null) => false,
+            Some(Json::Str(x)) if x == "whole" => false,
+            Some(Json::Str(x)) if x == "split" => true,
+            Some(_) => bail!("{what}: \"bundle\" is \"whole\" or \"split\""),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

@@ -41,6 +41,9 @@ pub struct FileNode {
     /// Access and change times and the nanoseconds (`Times`), once
     /// `utimensat` set any; until then every time is `mtime`.
     times: Mutex<super::Times>,
+    /// Whether anything has opened the file ([`TmpFs::opened`]): what a run
+    /// needed of its bundle, which gex-eject's split keeps in the bundle.
+    opened: core::sync::atomic::AtomicBool,
 }
 
 impl FileNode {
@@ -51,6 +54,7 @@ impl FileNode {
             ino,
             mtime: AtomicI64::new(now()),
             times: Mutex::new(Default::default()),
+            opened: core::sync::atomic::AtomicBool::new(false),
         }
     }
     fn touch(&self) {
@@ -296,6 +300,22 @@ impl TmpFs {
         let f = FileNode::new(Vec::new(), ino);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
+    }
+
+    /// Every file something has opened, by path (with its leading `/`; a
+    /// hard-linked file under each of its names), sorted. A recorded run's
+    /// read set: gex-eject's bundle split keeps these in the bundle and
+    /// serves the rest as lazy files.
+    pub fn opened(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .nodes
+            .iter()
+            .filter_map(|(p, n)| match n {
+                Node::File(f) if f.opened.load(core::sync::atomic::Ordering::Relaxed) => Some(format!("/{p}")),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn add_dir(&self, path: &str) {
@@ -601,7 +621,14 @@ impl FileSystem for TmpFs {
                         }
                     }
                     match inner.nodes.get(&path) {
-                        Some(Node::File(f)) => Some(Arc::clone(f)),
+                        Some(Node::File(f)) => {
+                            // A load first: a store to a line every Worker
+                            // reads would bounce it at each open.
+                            if !f.opened.load(core::sync::atomic::Ordering::Relaxed) {
+                                f.opened.store(true, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            Some(Arc::clone(f))
+                        }
                         _ => None,
                     }
                 }
@@ -974,6 +1001,21 @@ mod lazy_tests {
             *b = ((offset + k as u64) % 251) as u8;
         }
         true
+    }
+
+    #[test]
+    fn opened_lists_the_files_something_opened() {
+        let fs = TmpFs::new();
+        fs.add_file("/a/read", b"x".to_vec());
+        fs.add_file("/a/unread", b"y".to_vec());
+        fs.add_lazy("/a/lazy", 5, "/l");
+        fs.add_dir("/a/dir");
+        assert!(fs.opened().is_empty());
+        fs.open("a/read", 0, 0).unwrap();
+        fs.open("a/lazy", 0, 0).unwrap();
+        fs.open("a/dir", 0, 0).unwrap();
+        assert!(fs.open("a/missing", 0, 0).is_err());
+        assert_eq!(fs.opened(), vec!["/a/lazy".to_string(), "/a/read".to_string()]);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 import { untar } from './tar.js';
 import { runProgram, globalKernel } from './runtime.js';
+import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 
 globalThis.GEX_ARCH = 'x86';
@@ -313,11 +314,16 @@ async function main() {
   // bundle is made with -h.
   const hard = Object.fromEntries(Object.entries(tree.hard ?? {}).filter(([, t]) => files[t]));
   // `lazy=URL`: a manifest, {"base": URL prefix, "files": [[guest path, size,
-  // path under base], ...]}, of files the guest reads from the server as it
-  // reads them instead of from the bundle (a game's data).
+  // path under base, mtime?], ...]}, of files the guest reads from the server
+  // as it reads them instead of from the bundle (a game's data, or the part
+  // of a bundle its recorded run never read). A file's mtime (seconds), when
+  // given, joins the bundle's under `mtimes=1`: W3's wineboot compares
+  // wine.inf's with the prefix's.
   let lazy = [];
+  const lazyMtimes = {};
   if (q.get('lazy')) {
     const m = await (await fetch(q.get('lazy'))).json();
+    for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
     lazy = m.files.map(([path, size, rel]) => [path, size, m.base + rel.split('/').map(encodeURIComponent).join('/')]);
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
@@ -346,6 +352,9 @@ async function main() {
     tar: (q.get('tar') || '/gex/nt/bundle.tar').split(','),
     params: Object.fromEntries(q),
   };
+  // The files the run has opened so far (`await __ntOpened()`): the recorder's
+  // read set (record-w3.mjs), for gex-eject's bundle split.
+  globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   const preModules = await preloading;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
@@ -371,7 +380,7 @@ async function main() {
     // `mtimes=1`: the bundle's file times, for a program that compares them
     // (W3's wineboot updates a prefix whose wine.inf is newer than its
     // install). Off by default: a call per file.
-    mtimes: q.get('mtimes') === '1' ? tree.mtimes : undefined,
+    mtimes: q.get('mtimes') === '1' ? { ...lazyMtimes, ...tree.mtimes } : undefined,
     env,
     args,
     cwd: q.get('cwd') || exe.replace(/\/[^/]*$/, '') || '/',

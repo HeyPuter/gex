@@ -25,7 +25,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -231,6 +231,8 @@ function writeHosting() {
   Cache-Control: public, max-age=31536000, immutable
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
+/project/build/web/lazy/*
+  Cache-Control: public, max-age=31536000, immutable
 `);
   writeFileSync(join(out, 'serve.mjs'), `#!/usr/bin/env node
 // A static server for this site with the headers it wants (_headers). node serve.mjs [port]
@@ -247,12 +249,23 @@ createServer((req, res) => {
   const file = join(here, path.endsWith('/') ? path + 'index.html' : path);
   let st; try { st = statSync(file); } catch { st = null; }
   if (!st?.isFile()) { res.writeHead(404).end(); return; }
-  const immutable = path.endsWith('.zst') || path.startsWith('/assets/');
-  res.writeHead(200, {
-    'Content-Type': types[extname(file)] ?? 'application/octet-stream', 'Content-Length': st.size,
+  const immutable = path.endsWith('.zst') || path.startsWith('/assets/') || path.startsWith('/project/build/web/lazy/');
+  const h = {
+    'Content-Type': types[extname(file)] ?? 'application/octet-stream', 'Accept-Ranges': 'bytes',
     'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin',
     'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
-  });
+  };
+  // Ranges: a lazy file is read 1 MiB at a time (a bundle split's).
+  const r = /^bytes=(\\d+)-(\\d*)$/.exec(req.headers.range ?? '');
+  if (r) {
+    const a = Number(r[1]), b = Math.min(r[2] ? Number(r[2]) : st.size - 1, st.size - 1);
+    if (a > b) { res.writeHead(416, { ...h, 'Content-Range': \`bytes */\${st.size}\` }).end(); return; }
+    res.writeHead(206, { ...h, 'Content-Length': b - a + 1, 'Content-Range': \`bytes \${a}-\${b}/\${st.size}\` });
+    if (req.method === 'HEAD') { res.end(); return; }
+    createReadStream(file, { start: a, end: b }).pipe(res);
+    return;
+  }
+  res.writeHead(200, { ...h, 'Content-Length': st.size });
   if (req.method === 'HEAD') { res.end(); return; }
   createReadStream(file).pipe(res);
 }).listen(port, () => console.log(\`http://localhost:\${port}/\`));
@@ -286,12 +299,38 @@ function w3Site() {
   });
   // The bundle.
   let tar = join(web, 'rootfs.tar');
-  if (strip || flag('--prune') || flag('--dedupe')) {
+  // `"bundle": "split"` (user/eject.json): the files the recorded run opened
+  // stay in the bundle; every other file is a lazy file (nt-page.js `lazy=`),
+  // stored once by content under project/build/web/lazy/ and read from the
+  // host, in 1 MiB ranges, when a guest first reads it.
+  const split = w3.bundle?.split ? new Set(w3.bundle.read ?? []) : null;
+  let lazyFiles = 0, lazyBytes = 0;
+  if (strip || flag('--prune') || flag('--dedupe') || split) {
     const x = join(work, 'tarx');
     mkdirSync(x, { recursive: true });
     execFileSync('tar', ['-xf', tar, '-C', x]);
     if (strip) walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
     if (flag('--prune')) walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+    if (split) {
+      split.add(w3.exe); // the page reads the loader from the bundle itself
+      const store = join(out, 'project/build/web/lazy');
+      mkdirSync(store, { recursive: true });
+      const lazy = [];
+      walk(x, (p, rel) => {
+        const st = lstatSync(p);
+        if (!st.isFile() || split.has(`/${rel}`)) return;
+        const b = readFileSync(p);
+        const h = sha(b);
+        if (!existsSync(join(store, h))) writeFileSync(join(store, h), b);
+        // Its time, for `mtimes=1` (wineboot compares wine.inf's with the prefix's).
+        lazy.push([`/${rel}`, st.size, h, Math.trunc(st.mtimeMs / 1000)]);
+        rmSync(p);
+      });
+      lazyFiles = lazy.length;
+      lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
+      writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
+      w3.params = { ...(w3.params ?? {}), lazy: '/project/build/web/lazy.json' };
+    }
     tar = join(work, 'rootfs.tar');
     const dirs = [];
     const byHash = new Map();
@@ -310,6 +349,9 @@ function w3Site() {
     writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
     execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
   }
+  // What the split leaves in the bundle (the run's read set) is all the
+  // download has of it; nt.json carries the rest's manifest by URL.
+  if (w3.bundle) w3.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
   place(tar, 'project/build/web/rootfs.tar');
   // The units, largest first in the preload list.
   const preload = [];
@@ -326,7 +368,8 @@ function w3Site() {
   // The launcher and the page's decoder. No service worker: the host sends
   // the isolation headers (COOP/COEP), and the page decodes what is packed.
   const smallHash = createHash('sha256');
-  walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
+  // The lazy store is named by its content (lazy.json's hashes).
+  walk(out, (p, rel) => { if (rel.startsWith('project/build/web/lazy/')) return; smallHash.update(rel); smallHash.update(readFileSync(p)); });
   const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
   writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
   cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
@@ -336,8 +379,9 @@ function w3Site() {
   const total = Object.values(files).reduce((a, f) => a + f.size, 0);
   const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
   let small = 0;
-  walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small }, null, 1));
-  console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`);
+  walk(out, (p, rel) => { if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size; });
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null }, null, 1));
+  console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
+    + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
 }
 console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);

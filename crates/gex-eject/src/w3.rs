@@ -165,6 +165,9 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         ("units", Json::Arr(units.iter().map(|(k, p)| obj(vec![("key", s(k)), ("path", s(p))])).collect())),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
         ("modules", Json::Arr(modules.to_vec())),
+        // The files the run opened (the recorder's `files_read`; null from an
+        // older recorder): what `"bundle": "split"` keeps in the bundle.
+        ("files_read", v.get("files_read").cloned().unwrap_or(Json::Null)),
         ("page_source", s(web_src.display().to_string())),
         ("session", s(sha256(text.as_bytes()))),
     ]);
@@ -193,12 +196,16 @@ fn template(off: &[String]) -> String {
             "about",
             s("Your settings; gexc eject never rewrites this file. \"features\": the parts of gex's \
                runtime the build keeps, false leaves one out (docs/eject.md, \"Features\"); \
-               rebuild with ./build.sh."),
+               rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
+               opened in the site's bundle and the rest as lazy files, fetched when the program \
+               first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
+               \"The bundle split\"."),
         ),
         (
             "features",
             obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(!off.iter().any(|x| x == f.name)))).collect()),
         ),
+        ("bundle", s("split")),
     ]))
 }
 
@@ -297,6 +304,19 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             .collect(),
         _ => Vec::new(),
     };
+    // `"bundle": "split"`: the files the recorded run opened, which the site
+    // keeps in its bundle (web/eject-site.mjs).
+    let bundle = if config.bundle_split {
+        match v.get("files_read") {
+            Some(Json::Arr(read)) => obj(vec![("split", json::b(true)), ("read", Json::Arr(read.clone()))]),
+            _ => bail!(
+                "user/eject.json says \"bundle\": \"split\", but the recording has no files_read \
+                 (record with a tools/eject/record-w3.mjs and page that have the read set, or set \"bundle\": \"whole\")"
+            ),
+        }
+    } else {
+        obj(vec![("split", json::b(false))])
+    };
     let launch = obj(vec![
         ("kind", s(KIND)),
         ("exe", rec.get("exe").cloned().unwrap_or(Json::Null)),
@@ -309,6 +329,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         ("params", Json::Obj(params)),
         ("features_off", strs(&off)),
         ("units", Json::Arr(units.to_vec())),
+        ("bundle", bundle),
     ]);
     write_file(&web.join("w3.json"), json::write(&launch).as_bytes(), false)?;
     write_file(
@@ -320,6 +341,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             ("session", v.get("session").cloned().unwrap_or(Json::Null)),
             ("page_files", json::n(page_files as u64)),
             ("units", json::n(units.len() as u64)),
+            ("bundle_split", json::b(config.bundle_split)),
         ]))
         .as_bytes(),
         false,
