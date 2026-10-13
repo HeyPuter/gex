@@ -4,7 +4,9 @@
  * 0 (gex's msvcp120_thrd provider), and the process's handle count must not
  * grow. Prints "thrd ok THREADS CALLS zero=Z" (Z: calls that returned
  * handle 0, all of them when the provider is bound), after "msvcp120 at
- * BASE" (where its unit must be built for the provider to bind). */
+ * BASE" (where its unit must be built for the provider to bind). With a
+ * third argument T, also times T more calls on the main thread and prints
+ * "thrd ns PER-CALL" (the F1 microbenchmark; time it only on a bench box). */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,5 +52,17 @@ int main(int argc, char **argv)
     if (bad) { printf("%ld calls with the wrong id\n", bad); return 1; }
     printf("msvcp120 at %p\n", m);
     printf("thrd ok %d %d zero=%ld\n", n + 1, calls, zero);
+    if (argc > 3) {
+        int tn = atoi(argv[3]), r;
+        LARGE_INTEGER f, a, b;
+        volatile unsigned long long sink = 0;
+        QueryPerformanceFrequency(&f);
+        for (r = 0; r < 5; r++) {
+            QueryPerformanceCounter(&a);
+            for (i = 0; i < tn; i++) sink += thrd_current();
+            QueryPerformanceCounter(&b);
+            printf("thrd ns %.1f (round %d, %d calls)\n", (double)(b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / tn, r, tn);
+        }
+    }
     return 0;
 }
