@@ -1767,12 +1767,74 @@ the apt overlay registers the whole pool (56 MB) as lazy files under
   the fix every round matches exactly. `?hostxcount=1` logs, once a second,
   the bytes the X server took from and sent to each client, its bytes to the
   compositor and its scenes published.
-- **Known gap: pool memory.** A pool's pixels are never freed: the
-  compositor may still read them after the X server closes the descriptor.
-  Xwayland drops a buffer after a second unused and makes a new one, so an
-  xterm printing a line every 1.3 s allocates about 0.9 MB per line.
-  Freeing needs the mapping's lifetime (`gex_shm_unmap` in
-  `web/xwayland/gexos.c` is a no-op) and a release from the compositor.
+- **A second GL client had no window.** glxgears ran at about 45 fps, but
+  no window appeared when it was not the first X client to take its window
+  id: one started from the xterm after one from the launcher, or the
+  reverse. The window manager (`crates/gex-xwm`) remembered which window ids
+  it had Composite-redirected and never forgot one. The X server gives a new
+  client the id a gone one had, so the new window was taken for redirected
+  and never was, and rootless Xwayland makes no `wl_surface` for a window
+  that is not redirected. A destroyed window's id now leaves that set and the
+  pending pairings. The launcher also no longer starts the host's Mesa
+  itself: every program, launched or typed, starts it with its first GL
+  request, so a launch is the same command a shell runs. The legs start
+  glxgears from the xterm, then from the launcher, and require each one's
+  own window pixels to change. On b8 the launcher run after the xterm run
+  failed with no window in 60 s.
+- **An exited GL program was never forgotten, and forgetting one hung.**
+  Nothing told the compositor that a process had exited, so it held every
+  Wayland or GL client's whole memory, and the host's Mesa kept each GL
+  program's context and windows. `runtime.js` now sends `drop-memory` on a
+  process exit. That ran `gex_gl_forget_client` for the first time, and it
+  never returned: dropping the current surface re-points the context at
+  another, and with none left that is surface 0, made anew, so the loop never
+  emptied the map. The compositor Worker spun in `st_framebuffers_purge` and
+  drew nothing (the stack came from `workerStacks` in the test, over CDP).
+  The context now goes first, and the surfaces after it with nothing to
+  re-point to; `drop_surface` also removes the drawable from st/mesa's
+  table. After each glxgears exits, the legs require Mesa to hold no GL
+  windows. `{"glcycles": N}` reads the card's used memory (nvidia-smi) after
+  each of N clients exits.
+- **foot opened four screens wide at dpr 2.** Every new toplevel was
+  configured to the whole output, and no surface was ever sent
+  `wl_surface.enter`, so foot never learned the output's scale. At dpr 2 it
+  was shown at twice the size it meant. Surfaces now enter the output. A new
+  window's first configure is 0x0 ("you choose"), and `xdg_wm_base` 4 sends
+  `configure_bounds` (the output less the frame). The foot leg requires the
+  window to fit in the output at a terminal's size in CSS pixels.
+- **Windows resize, move and maximize.**
+  - A band of 6 CSS pixels either side of the frame's edge resizes from
+    that edge or corner, with resize cursors.
+  - Client-decorated windows ask with `xdg_toplevel.resize`, `move`,
+    `set_maximized` and `unset_maximized`. These are now numbered requests,
+    each acted on once. `move` was a flag nobody cleared, so every scene
+    read after the first move restarted a drag.
+  - A configure carries the maximized and resizing states. A drag sends its
+    next size once the client has acked the last (`configure_pending`), or
+    after 250 ms.
+  - An X window is resized by the window manager with ConfigureWindow
+    (`Xwm::resized`).
+  - A double-click on the title bar maximizes into the work area, and a
+    second one restores.
+  - The resize leg drags the corner of foot and of the xterm, and requires
+    the size the client drew to grow. For foot it also maximizes and
+    restores.
+- `web/build-all.sh`: the key that decides whether to rebuild Xwayland and
+  hostwl now covers `crates/gex-wayland` and `crates/gex-xwm`, which hostwl
+  is built from. Before, a change to either alone shipped the old hostwl.
+- **The X server's pools are freed.** Each pool had stayed for good.
+  Xwayland drops a buffer unused for a second and makes a new pool, so an
+  xterm printing a line a second kept about 0.9 MB per line. A pool now
+  counts its references:
+  - the server's descriptor;
+  - its mappings (`gex_shm_unmap` in `web/xwayland/gexos.c` now reports them);
+  - the compositor's handle, which `shims/hostwl` gives back once no pool,
+    buffer or surface on screen names it (`Client::fds_in_use`).
+
+  With none left, the pixels are freed once the page has drawn a scene
+  published after that. On edger the pool leg (12 s of a line a second) went
+  from 4 to 14 live pools without the free, and stays at 4 with it.
+  `?hostxcount=1` prints `pools=N`.
 
 Legs: `node tests/demo/desktop.mjs web/dist-demo` (the desktop, then the
-cursor, presentation and xterm-contents legs; `DEMO_DPR=2` for the device-pixel output).
+cursor, presentation, xterm-contents, pool and glxgears legs (`DEMO_GL=0` skips the last); `DEMO_DPR=2` for the device-pixel output).

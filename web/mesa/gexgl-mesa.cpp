@@ -450,16 +450,21 @@ unsigned surface_gone_generation = 0;
  * Without this a closed window's buffers stayed allocated for as long as the
  * client lived, and -- worse -- the page went on drawing the frame it had
  * kept for a window that no longer existed. */
-void drop_surface(uint32_t handle) {
+void drop_surface(uint32_t handle, bool repoint = true) {
     auto found = surfaces.find(handle);
     if (found == surfaces.end()) return;
     for (struct pipe_resource*& attachment : found->second.drawable.attachments)
         pipe_resource_reference(&attachment, nullptr);
+    /* And out of st/mesa's table of live drawables, so the next make-current
+     * lets go of the framebuffer built on it. Left there, the entry outlived
+     * the memory, and a later drawable at the same address with the same ID
+     * (the same handle in the next client) was taken for the old one. */
+    st_api_destroy_drawable(&found->second.drawable.base);
     const unsigned uid = found->second.uid;
     surfaces.erase(found);
     surface_gone_handle = uid;
     ++surface_gone_generation;
-    if (current_surface != handle) return;
+    if (current_surface != handle || !repoint) return;
     /* Whatever is left, or the default surface if nothing is: a context must
      * always have a framebuffer 0, and the client may well draw again. */
     sur = nullptr;
@@ -2919,14 +2924,20 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
     if (!known && client != current_client) return;
     const uint32_t was = current_client;
     use_client(client);
-    while (!surfaces.empty()) drop_surface(surfaces.begin()->first);
-    surfaces.clear();
-    sur = nullptr;
-    current_surface = 0;
+    /* The context first, while the drawables it was built on still exist,
+     * and then the surfaces with nothing to point at instead. Dropping the
+     * current surface the usual way points the context at another one, and
+     * with none left that is surface 0, made anew -- so `surfaces` was never
+     * empty and this looped for ever in the compositor's Worker, which then
+     * drew nothing and answered nothing (the second glxgears of a session,
+     * whichever way it was started). */
     if (mesa_context) {
         st_destroy_context(mesa_context);
         mesa_context = nullptr;
     }
+    sur = nullptr;
+    while (!surfaces.empty()) drop_surface(surfaces.begin()->first, false);
+    current_surface = 0;
     /* Back to whoever was running, unless that was this one. */
     use_client(was == client ? 0 : was);
     clients.erase(client);

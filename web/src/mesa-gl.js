@@ -210,6 +210,8 @@ export class MesaGlDevice {
   #readbackMs = 0;
   #maxSubmitMs = 0;
   #busy = false;
+  /** Clients that exited while a submit was suspended: forgotten after it. */
+  #forgetLater = [];
   #lastPresented = 0;
   #lastProduced = 0;
   static #reported = false;
@@ -500,13 +502,13 @@ export class MesaGlDevice {
     };
 
     this.#busy = true;
-    const done = (rc) => { this.#busy = false; return finish(rc); };
+    const done = (rc) => { this.#idle(); return finish(rc); };
     // The frame names only, on one line. A thrown stack is dozens of long
     // URLs; the harness captures a reflowing terminal and mangles them, which
     // is how the function under util_blitter_blit stayed unnamed. Names alone
     // fit, and they are the part that identifies the fault.
     const report = (e) => {
-      this.#busy = false;
+      this.#idle();
       if (!MesaGlDevice.#reported) {
         MesaGlDevice.#reported = true;
         // Innermost frames first, one short line each: long lines are
@@ -591,7 +593,23 @@ export class MesaGlDevice {
   forgetClient(client) {
     const m = this.#module;
     if (!m?._gex_gl_forget_client || !client) return;
+    // Not while a submit is suspended, for the reason `display` gives: it
+    // would re-enter the module on this thread while the submit holds its
+    // lock. A process exits whenever it likes, so this lands mid-submit as
+    // often as not; it waits for the submit to end instead.
+    if (this.#busy) {
+      console.log(`[mesa-gl] client ${client} exited mid-submit: forgotten after it`);
+      this.#forgetLater.push(client >>> 0);
+      return;
+    }
     m._gex_gl_forget_client(client >>> 0);
+  }
+
+  /** A submit has ended: what waited for it runs now. */
+  #idle() {
+    this.#busy = false;
+    const later = this.#forgetLater.splice(0);
+    for (const client of later) this.forgetClient(client);
   }
 
   /** Present whatever the guest last drew. */

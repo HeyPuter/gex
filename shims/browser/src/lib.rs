@@ -3313,7 +3313,7 @@ static mut STDERR_LEN: usize = 0;
 
 /// A write to standard output or error (`a1`, `a2` as `write` or `writev`
 /// has them), kept for a later abort's report, and said when it fell short.
-fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64) {
+fn stderr_capture(gm: &GuestMem<'_>, fd: u64, vectored: bool, a1: u64, a2: u64, ret: u64) {
     // (base, length) pairs: one for `write`, `a2` of them for
     // `writev`, so the two cases differ only in where the list is.
     let parts: Vec<(u64, u64)> = if !vectored {
@@ -3341,13 +3341,25 @@ fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64)
     if !said.is_empty() {
         stderr_note(&said);
     }
-    if ret != want {
+    let lost = (ret as i64) < 0 && ret as i64 != -(Errno::EAGAIN.0 as i64);
+    if want > 0 && (lost || ret == 0) {
+        // Printable text as is, anything else escaped, so a binary
+        // write cannot fill the console with replacement characters.
+        let text: String = said
+            .iter()
+            .flat_map(|&c| match c {
+                b' '..=b'~' => vec![c as char],
+                b'\n' => vec!['\\', 'n'],
+                _ => format!("\\x{c:02x}").chars().collect(),
+            })
+            .collect();
         warn_line(&format!(
-            "[gex] pid {} could not reach stderr ({} of {want} bytes in {} parts): {}",
+            "[gex] pid {} could not write to {} ({} for {want} bytes in {} part{}): {text}",
             my_pid(),
+            if fd == 1 { "stdout" } else { "stderr" },
             ret as i64,
-            a2,
-            String::from_utf8_lossy(&said).trim_end(),
+            parts.len(),
+            if parts.len() == 1 { "" } else { "s" },
         ));
     }
 }
@@ -6917,10 +6929,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
-        // go through whole turns a named failure into "killed by signal 6".
-        // Only on a short write, so a working program is silent.
+        // go through turns a named failure into "killed by signal 6".
+        // Only when nothing went through (an error, or 0 of a non-empty
+        // write). A short positive count is not a loss: a full pipe on a
+        // blocking descriptor takes what fits and the caller writes the rest
+        // (`Pipe::write`, `BlockOp::WriteStream`). Warning on that once sent
+        // 4.5 MB of xwd's image, written to stdout through a pipe, to the
+        // console as "could not reach stderr".
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
-            stderr_capture(&gm, nr == 66, a1, a2, ret);
+            stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
         h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {

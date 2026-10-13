@@ -65,8 +65,10 @@ export const ROLE_POPUP = 2;
 export const ROLE_SUBSURFACE = 3;
 export const ROLE_CURSOR = 4;
 
-/** `R_FLAGS` bits. */
-export const F_MOVE_REQUESTED = 1;
+/** `R_FLAGS` bits (`gex_wayland::SurfaceInfo::flags`). Bit 0 was a move
+ *  request, a flag nobody cleared; a request is now its kind, edges and
+ *  number (bits 3..6 the number, 24..30 the request). */
+export const F_CONFIGURE_PENDING = 4;
 /** The pixels are not at `addr`: the host has them. A client that renders
  *  through the host's OpenGL attaches no buffer -- its frames never come back
  *  to the guest -- so the record says how big the surface is and the
@@ -223,6 +225,28 @@ export function readScene(channel, { onlyChanged = false } = {}) {
     }
   }
   return { surfaces: out, blocks };
+}
+
+/**
+ * A process has exited: its block's surfaces go, and the block is free.
+ *
+ * A process that ends normally gives its block back (`release`), but one that
+ * is killed never runs that code, and its last published scene stayed on the
+ * screen: foot after SIGKILL kept its window, over the xterm the next leg
+ * tried to resize. The compositor learns of every exit ('drop-memory'), so it
+ * clears what the process left. Compare-and-swap, so a block some new process
+ * has already claimed is left alone.
+ */
+export function releaseToken(channel, token) {
+  const a = new Int32Array(channel.arena);
+  let n = 0;
+  for (let b = 0; b < BLOCKS; b++) {
+    const base = blockBase(b);
+    if (!token || Atomics.load(a, base + B_TOKEN) !== token) continue;
+    Atomics.store(a, base + B_COUNT, 0);
+    if (Atomics.compareExchange(a, base + B_TOKEN, token, 0) === token) n++;
+  }
+  return n;
 }
 
 /** Say that everything published up to `gen` has been drawn. */
@@ -389,6 +413,16 @@ export class WlProxy {
   /** Whether this process got a block at all. */
   get ok() {
     return this.#block >= 0;
+  }
+
+  /** Publishes so far (the block's generation). */
+  get generation() {
+    return Atomics.load(this.#a, this.#base + B_GEN);
+  }
+
+  /** The last generation the compositor has drawn. */
+  get drawnGeneration() {
+    return Atomics.load(this.#a, this.#base + B_ACK);
   }
 
   /**

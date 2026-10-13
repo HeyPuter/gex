@@ -78,6 +78,7 @@ async function openCompositor(width, height) {
     // What `runProgram` calls on a compositor.
     compositor: {
       addMemory: (token, memory, kernel) => send({ kind: 'memory', token, memory, kernel }),
+      dropMemory: (token) => send({ kind: 'drop-memory', token }),
       stop: () => {
         clearInterval(timer);
         send({ kind: 'stop' });
