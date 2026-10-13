@@ -514,6 +514,13 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
     const app = await start({ container: document.body, onProgress: progress });
     // A library that says nothing of its progress: no loading screen to keep.
     if (!app.state?.progress) hide();
+    // The desktop follows the window (a resize, a zoom): 'fit' again,
+    // once the window has settled.
+    let resizing = 0;
+    addEventListener('resize', () => {
+      clearTimeout(resizing);
+      resizing = setTimeout(() => app.resize?.('fit'), 250);
+    });
     app.exited.then((status) => { if (status) show(`The program exited (${status}).`); }, show);
   } catch (e) {
     progress({ phase: 'failed' });
