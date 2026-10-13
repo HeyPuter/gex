@@ -10954,7 +10954,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
         if !gex_abi::X86 && !compat && (a0 == 1 || a0 == 2) && (n == nr::WRITE || n == nr::WRITEV) {
-            stderr_capture(&gm, n == nr::WRITEV, a1, a2, ret);
+            stderr_capture(&gm, a0, n == nr::WRITEV, a1, a2, ret);
         }
     }
     Some(match outcome {
