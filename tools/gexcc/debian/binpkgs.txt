@@ -6,6 +6,9 @@
 # `predepends BINPKG ...` a Pre-Depends field; `arch BINPKG ARCH` labels a
 # package with another architecture (dpkg and apt: arm64, docs/gexcc.md
 # §6.1a). The rest of a depends/predepends line is one relation.
+# `alternative BINPKG NAME LINK PATH PRIORITY` registers an alternative in
+# the package's postinst (and removes it in its prerm), as Debian's
+# maintainer scripts do; mkrootfs.py sets the same up for the base rootfs.
 zlib      -             *
 libmd     -             *
 readline  -             *
@@ -23,6 +26,11 @@ sysvinit  sysvinit-utils *
 file      file          *
 depends file libmagic-mgc
 depends vim vim-common
+alternative vim vim /usr/bin/vim /usr/bin/vim.basic 30
+alternative vim vi /usr/bin/vi /usr/bin/vim.basic 30
+alternative vim view /usr/bin/view /usr/bin/vim.basic 30
+alternative vim ex /usr/bin/ex /usr/bin/vim.basic 30
+alternative vim editor /usr/bin/editor /usr/bin/vim.basic 30
 libonig   -             *
 libevent  -             *
 expat     -             *
@@ -128,3 +136,9 @@ multiarch perl          allowed
 depends   perl-modules-5.40 perl-base (= ${binary:Version})
 depends   libperl5.40   perl-base (= ${binary:Version})
 depends   perl          perl-base (= ${binary:Version}), perl-modules-5.40 (= ${binary:Version}), libperl5.40 (= ${binary:Version})
+# the rest of mkrootfs.py's alternatives, for the same packages installed by apt
+alternative gawk awk /usr/bin/awk /usr/bin/gawk 10
+alternative mawk awk /usr/bin/awk /usr/bin/mawk 5
+alternative nano editor /usr/bin/editor /usr/bin/nano 40
+alternative less pager /usr/bin/pager /usr/bin/less 77
+alternative util-linux pager /usr/bin/pager /usr/bin/more 50
