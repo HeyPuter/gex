@@ -176,16 +176,24 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
 /// clone, end the child (as a crash: `posix_spawn`'s child makes none).
 pub(crate) fn check(nr: u64) {
     use gex_kernel::syscalls::nr::*;
-    if matches!(nr, MMAP | MUNMAP | MREMAP | MPROTECT | BRK | CLONE | CLONE3) {
-        warn_line(&format!(
-            "[gex] pid {}: a vfork child made syscall {nr}, which would change its parent's memory map; ended",
-            ACTIVE.load(Relaxed)
-        ));
-        WHY.store(UNSUPPORTED, Relaxed);
-        set_resume_none();
-        set_resume_ctx_none();
-        trap();
-    }
+    let name = match nr {
+        MMAP => "mmap",
+        MUNMAP => "munmap",
+        MREMAP => "mremap",
+        MPROTECT => "mprotect",
+        BRK => "brk",
+        CLONE => "clone",
+        CLONE3 => "clone3",
+        _ => return,
+    };
+    warn_line(&format!(
+        "[gex] pid {}: a vfork child called {name}, which would change its parent's memory map; ended",
+        ACTIVE.load(Relaxed)
+    ));
+    WHY.store(UNSUPPORTED, Relaxed);
+    set_resume_none();
+    set_resume_ctx_none();
+    trap();
 }
 
 /// What a child that execs hands the Worker it goes on in: the command, its
