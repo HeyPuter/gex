@@ -23,7 +23,8 @@
 //   {"eval": "EXPR"}                     EXPR in the page, its value printed
 //   {"gl": true}                         the glxgears legs: from the xterm, then the launcher
 //   {"glcycles": N}                      glxgears from the launcher, killed, N times: GPU
-//                                        memory (nvidia-smi) must not grow per client
+//                                        memory (nvidia-smi) must not grow per client, nor
+//                                        while one animates ("hold" s, 30; "slack" MiB, 64)
 //   {"resize": "TITLE", "maximize": true}  drag the window's corner; it must redraw bigger;
 //                                        then a title double-click maximizes and restores
 //   {"fits": "ID"}                       the launcher's item ID opens inside the output, at a
@@ -44,7 +45,7 @@
 // console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
 // DEMO_STDERR (a file for the browser's whole stderr), DEMO_COUNT=1 (print
 // the X server's ?hostxcount lines), DEMO_GL=0 (skip the
-// glxgears legs), DEMO_FOOT=0 (skip the foot leg).
+// glxgears legs), DEMO_FOOT=0 (skip the foot leg), DEMO_VRAM=0 (skip the GPU memory leg).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdtempSync, rmSync } from 'node:fs';
@@ -271,36 +272,36 @@ async function guestRun(cmd, wall = 120000) {
   const rc = Number(/rc=(\d+)/.exec(body)[1]);
   return { rc, lines: body.split('\n').slice(1).filter((l) => !l.includes(`${tag} end`)) };
 }
-/** The composited output, `{ w, h, b64 }`. A readout can time out while the
- *  machine is busy (5 s), so three tries; then the compositor's own log says
- *  why it gave none. */
-async function readout() {
-  for (let i = 0; i < 3; i++) {
-    const r = await ev('globalThis.__gexCompositor.readoutBase64()');
-    if (r) return r;
-  }
-  const d = await ev('globalThis.__gexCompositor.describe()');
-  throw new Error(`the compositor gave no readout in three tries; its log: ${JSON.stringify(d?.log ?? d)}`);
-}
 const SIG_COLS = 16, SIG_ROWS = 8, SIG_EDGE = 2;
 /** The same signature as tests/demo/guest/xsig.py, of what the compositor
  *  composed where the window is. */
 async function composedSig(x, y, w, h) {
-  const r = await readout();
-  const px = Buffer.from(r.b64, 'base64');
-  const cells = new Array(SIG_COLS * SIG_ROWS).fill(0);
-  let exact = 2166136261;
-  for (let j = 0; j < h; j++) {
-    const cy = Math.floor(j * SIG_ROWS / h) * SIG_COLS;
-    for (let i = 0; i < w; i++) {
-      const o = ((y + j) * r.w + (x + i)) * 4;
-      const dark = Math.max(px[o], px[o + 1], px[o + 2]) < 128 ? 1 : 0;
-      if (dark) cells[cy + Math.floor(i * SIG_COLS / w)]++;
-      exact = Math.imul(exact ^ dark, 16777619) >>> 0;
+  // Computed in the page, like windowHash: only the signature crosses CDP.
+  for (let t = 0; t < 3; t++) {
+    const sig = await ev(`globalThis.__gexCompositor.readout().then((r) => {
+      if (!r) return null;
+      const [x, y, w, h, COLS, ROWS] = [${x}, ${y}, ${w}, ${h}, ${SIG_COLS}, ${SIG_ROWS}];
+      const cells = new Array(COLS * ROWS).fill(0);
+      let exact = 2166136261;
+      for (let j = 0; j < h; j++) {
+        const cy = Math.floor(j * ROWS / h) * COLS;
+        for (let i = 0; i < w; i++) {
+          const o = ((y + j) * r.w + (x + i)) * 4;
+          const dark = Math.max(r.px[o], r.px[o + 1], r.px[o + 2]) < 128 ? 1 : 0;
+          if (dark) cells[cy + Math.floor(i * COLS / w)]++;
+          exact = Math.imul(exact ^ dark, 16777619) >>> 0;
+        }
+      }
+      return { cells, exact };
+    })`);
+    if (sig) {
+      const cells = sig.cells;
+      cells.exact = sig.exact;
+      return cells;
     }
   }
-  cells.exact = exact;
-  return cells;
+  const d = await ev('globalThis.__gexCompositor.describe()');
+  throw new Error(`the compositor gave no readout in three tries; its log: ${JSON.stringify(d?.log ?? d)}`);
 }
 /**
  * Bug 3 as a leg: what the xterm drew is what the page shows. Type into the
@@ -380,16 +381,25 @@ async function windowHash(title) {
   const line = d.list.find((l) => / role=1 /.test(l) && l.endsWith(`"${title}"`));
   if (!line) return null;
   const [, w, h, x, y] = /(\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(line).map(Number);
-  const r = await readout();
-  const px = Buffer.from(r.b64, 'base64');
-  let hash = 2166136261;
-  for (let j = Math.max(0, y); j < Math.min(r.h, y + h); j++) {
-    for (let i = Math.max(0, x); i < Math.min(r.w, x + w); i++) {
-      const o = (j * r.w + i) * 4;
-      hash = Math.imul(hash ^ (px[o] | (px[o + 1] << 8) | (px[o + 2] << 16)), 16777619) >>> 0;
-    }
+  // Hashed in the page: only the number crosses CDP. Returning the whole
+  // output (12 MiB of base64 at dpr 2) for every sample is what grew the
+  // browser's GPU memory by ~500 MiB per GL client in the glcycles leg.
+  for (let t = 0; t < 3; t++) {
+    const hash = await ev(`globalThis.__gexCompositor.readout().then((r) => {
+      if (!r) return null;
+      let hash = 2166136261;
+      for (let j = Math.max(0, ${y}); j < Math.min(r.h, ${y + h}); j++) {
+        for (let i = Math.max(0, ${x}); i < Math.min(r.w, ${x + w}); i++) {
+          const o = (j * r.w + i) * 4;
+          hash = Math.imul(hash ^ (r.px[o] | (r.px[o + 1] << 8) | (r.px[o + 2] << 16)), 16777619) >>> 0;
+        }
+      }
+      return hash;
+    })`);
+    if (hash !== null && hash !== undefined) return hash;
   }
-  return hash;
+  const dd = await ev('globalThis.__gexCompositor.describe()');
+  throw new Error(`the compositor gave no readout in three tries; its log: ${JSON.stringify(dd?.log ?? dd)}`);
 }
 /**
  * A window titled `animates` appears within `wall` seconds and its own pixels
@@ -489,6 +499,9 @@ async function legs() {
   await truth({ rounds: 3 });
   await poolLeg({});
   if (process.env.DEMO_GL !== '0') await glLeg();
+  // GPU memory: back near where it was after each GL client, and flat while
+  // one animates (DEMO_VRAM=0 skips it).
+  if (process.env.DEMO_GL !== '0' && process.env.DEMO_VRAM !== '0') await glCycles({ glcycles: 4 });
   if (process.env.DEMO_FOOT !== '0') {
     await fitsLeg({ fits: 'foot', keep: true });
     await resizeLeg({ resize: 'foot', maximize: true });
@@ -801,6 +814,22 @@ async function glCycles(step) {
   if (!ok) failed = true;
   log(`${ok ? 'ok' : 'FAIL'} GPU memory across ${n} GL clients: ${seen.join(' -> ')} MiB`
     + ` (before any, then after each exits; ${gpuSource}); ${grew} MiB since the first, ${slack} allowed`);
+  // And one client animating: memory must not climb while it draws.
+  const hold = step.hold ?? 30;
+  if (!hold) return;
+  await ev(`globalThis.gexDesktop.launch('gears')`);
+  await animates({ animates: 'glxgears', label: 'glxgears (held) animates', wall: 60, samples: 2, min: 1 });
+  const at = [await gpuMiB()];
+  for (let t = 0; t < hold; t += 10) {
+    await new Promise((r) => setTimeout(r, 10000));
+    at.push(await gpuMiB());
+  }
+  await guestRun('kill $(pidof glxgears); sleep 2');
+  const climbed = at[at.length - 1] - at[0];
+  const held = climbed <= slack;
+  if (!held) failed = true;
+  log(`${held ? 'ok' : 'FAIL'} GPU memory while one GL client animates ${hold} s: ${at.join(' -> ')} MiB`
+    + ` (every 10 s; ${gpuSource}); ${climbed} MiB, ${slack} allowed`);
 }
 /** Once a GL program has exited, the host's Mesa holds none of its windows.
  *  It used to keep every one: nothing told the compositor a process had gone,
