@@ -476,7 +476,7 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
   const $ = (c) => loading.querySelector(c);
   const t0 = performance.now();
   const clock = setInterval(() => { $('.time').textContent = `${Math.floor((performance.now() - t0) / 1000)} s`; }, 250);
-  const mb = (n) => (n / 1048576).toFixed(n < 10485760 ? 1 : 0);
+  const mb = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0);
   const bar = (frac) => {
     $('.track').classList.toggle('busy', frac === null);
     $('.fill').style.width = frac === null ? '' : `${Math.min(100, frac * 100).toFixed(1)}%`;
