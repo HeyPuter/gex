@@ -423,6 +423,7 @@ export class ProcessHost {
     // runs a moment longer, as a signal's target does.
     if (this.#inDoor(key)) {
       const t0 = Date.now();
+      if (globalThis.GEX_DOOR_STATS || globalThis.process?.env?.GEX_DOOR_STATS) console.error(`[host] ${key}: ended inside a wineserver door call; stopped when it leaves`);
       const again = () => {
         if (this.#inDoor(key) && Date.now() - t0 < 10000) { setTimeout(again, 1); return; }
         if (this.#inDoor(key)) {
