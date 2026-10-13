@@ -16,12 +16,14 @@
 // and is the only writer of it, plus a ring the compositor writes input into.
 // No locks -- one writer per word, and the compositor polls at frame rate.
 
+import { single, sched } from './single.mjs';
+
 /** Processes that can publish surfaces at once. */
 const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 28;
+export const REC = 37;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -56,6 +58,26 @@ export const R_TITLE_WORDS = 8;
  * drawn by the program, and the GL picture only in the client area). */
 export const R_GL_ORIGIN = 26;
 export const R_GL_SIZE = 27;
+/** Where the client placed the surface (`gex_window_placement_v1`, and every
+ * X11 override-redirect window): `P_PLACED | P_UNMANAGED | layer << 8`. A
+ * placed surface is at `R_REL_X`/`R_REL_Y` in output pixels. */
+export const R_PLACE = 28;
+/** The client's stacking name for the surface (a Win32 window, an X window). */
+export const R_STACK_ID = 29;
+/** The last restack: directly below the surface with this stacking name, 0
+ * the top of its layer, -1 the bottom. Acted on when `R_RESTACK` changes. */
+export const R_STACK_BELOW = 30;
+export const R_RESTACK = 31;
+/** Bumped when the client asks for this surface to have the keyboard. */
+export const R_ACTIVATE = 32;
+/** With `F_INPUT_REGION`: the bounds of where the surface takes the pointer
+ * (`wl_surface.set_input_region`), in surface units. Zero-sized: nowhere. */
+export const R_INPUT_X = 33;
+export const R_INPUT_Y = 34;
+export const R_INPUT_W = 35;
+export const R_INPUT_H = 36;
+export const P_PLACED = 1;
+export const P_UNMANAGED = 2;
 
 /** Roles, as `gex_wayland::Role::code` writes them. */
 export const ROLE_TOPLEVEL = 1;
@@ -63,13 +85,18 @@ export const ROLE_POPUP = 2;
 export const ROLE_SUBSURFACE = 3;
 export const ROLE_CURSOR = 4;
 
-/** `R_FLAGS` bits. */
-export const F_MOVE_REQUESTED = 1;
+/** `R_FLAGS` bits (`gex_wayland::SurfaceInfo::flags`). Bit 0 was a move
+ *  request, a flag nobody cleared; a request is now its kind, edges and
+ *  number (bits 3..6 the number, 24..30 the request). */
+export const F_CONFIGURE_PENDING = 4;
 /** The pixels are not at `addr`: the host has them. A client that renders
  *  through the host's OpenGL attaches no buffer -- its frames never come back
  *  to the guest -- so the record says how big the surface is and the
  *  compositor finds the picture elsewhere. */
 export const F_EXTERNAL = 2;
+/** The client set an input region (`R_INPUT_X`..): without it the whole
+ *  surface takes the pointer. */
+export const F_INPUT_REGION = 128;
 
 /** Event kinds the compositor writes into a process's ring. */
 export const EV_MOTION = 0;
@@ -101,6 +128,12 @@ const B_HEARTBEAT = 1;
 const B_COUNT = 2;
 const B_GEN = 3;
 const B_ACK = 4;
+/** Where the process's wait queue is in the global kernel's memory
+ * (`gex_proc_queue_addr`), or zero, and where the wait slots' words start
+ * (`gex_slots_addr`): what the compositor notifies after putting an event in
+ * this block's ring (docs/kernel-locking.md §5.2 step 2). */
+const B_WAKE = 5;
+const B_SLOTS = 6;
 const B_WORDS = 8;
 const BLOCK_WORDS = B_WORDS + SLOTS * REC;
 
@@ -211,16 +244,53 @@ export function readScene(channel, { onlyChanged = false } = {}) {
           }
           : null,
         title: end ? decoder.decode(bytes.subarray(0, end)) : '',
+        placed: (a[r + R_PLACE] & P_PLACED) !== 0,
+        unmanaged: (a[r + R_PLACE] & P_UNMANAGED) !== 0,
+        layer: (a[r + R_PLACE] >> 8) & 0xff,
+        stackId: a[r + R_STACK_ID] >>> 0,
+        below: a[r + R_STACK_BELOW] >>> 0,
+        restack: a[r + R_RESTACK] >>> 0,
+        activate: a[r + R_ACTIVATE] >>> 0,
+        input: (a[r + R_FLAGS] & F_INPUT_REGION)
+          ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
+          : null,
       });
     }
   }
   return { surfaces: out, blocks };
 }
 
+/**
+ * A process has exited: its block's surfaces go, and the block is free.
+ *
+ * A process that ends normally gives its block back (`release`), but one that
+ * is killed never runs that code, and its last published scene stayed on the
+ * screen: foot after SIGKILL kept its window, over the xterm the next leg
+ * tried to resize. The compositor learns of every exit ('drop-memory'), so it
+ * clears what the process left. Compare-and-swap, so a block some new process
+ * has already claimed is left alone.
+ */
+export function releaseToken(channel, token) {
+  const a = new Int32Array(channel.arena);
+  let n = 0;
+  for (let b = 0; b < BLOCKS; b++) {
+    const base = blockBase(b);
+    if (!token || Atomics.load(a, base + B_TOKEN) !== token) continue;
+    Atomics.store(a, base + B_COUNT, 0);
+    if (Atomics.compareExchange(a, base + B_TOKEN, token, 0) === token) n++;
+  }
+  return n;
+}
+
 /** Say that everything published up to `gen` has been drawn. */
 export function ackBlock(channel, block, gen) {
   const a = new Int32Array(channel.arena);
   Atomics.store(a, blockBase(block) + B_ACK, gen);
+}
+
+/** The global kernel's memory, for `sendEvent`'s wake. One per page. */
+export function setKernelMemory(channel, memory) {
+  if (memory && !channel.kernelMemory) channel.kernelMemory = memory;
 }
 
 /** Write one event into a process's ring, for its guest to pick up. */
@@ -238,6 +308,41 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   a[slot + 6] = surface | 0;
   a[slot + 7] = 0;
   Atomics.store(a, base + K_HEAD, head + 1); // publish last
+  // And a notify on the process's wait queue: with every thread of the
+  // process parked, nothing drains the ring otherwise. The thread that wakes
+  // takes a scheduler turn, whose compositor pump delivers the event and
+  // notifies the client's reader in turn.
+  const q = Atomics.load(a, blockBase(block) + B_WAKE);
+  const slots = Atomics.load(a, blockBase(block) + B_SLOTS);
+  const k = channel.kernelMemory;
+  if (q && slots && k) {
+    notifyQueue(new Int32Array(k.buffer), q >>> 0, slots >>> 0);
+    // The single-thread build: the fibers parked on those words look.
+    if (single.on) sched.checkSlots();
+  }
+}
+
+/** Queue words: a bitmap of the slots registered on it, 8 words
+ *  (shims/kernel/src/wait.rs `Queue`). */
+const Q_BITS = 8;
+
+/**
+ * Notify the wait queue at byte address `q` in the kernel's memory `w`, as
+ * `k_wq_notify` does: bump and wake the word of every slot registered on it,
+ * the slots' words starting at `slots`. Not the queues chained to it -- a
+ * process queue has none.
+ */
+export function notifyQueue(w, q, slots) {
+  for (let i = 0; i < Q_BITS; i++) {
+    let bits = Atomics.load(w, (q >>> 2) + i) >>> 0;
+    while (bits) {
+      const b = 31 - Math.clz32(bits & -bits);
+      bits &= bits - 1;
+      const at = (slots >>> 2) + i * 32 + b;
+      Atomics.add(w, at, 1);
+      if (w.buffer instanceof SharedArrayBuffer) Atomics.notify(w, at);
+    }
+  }
 }
 
 /**
@@ -270,6 +375,10 @@ export class WlProxy {
   #tokenFn;
   /** Called with the token once it is known, so the host can send the memory. */
   onToken = null;
+  /** This process's wait queue's address in the global kernel's memory and
+   *  where the slot words start, as `{ addr, slots }`, or null; asked when
+   *  the block is claimed. See `B_WAKE`. */
+  wakeAddr = null;
 
   /** Claim a block if this process does not have one yet. Returns whether it has. */
   #ready() {
@@ -299,6 +408,7 @@ export class WlProxy {
       this.#block = b;
       this.#base = base;
       this.#ring = ringBase(b);
+      this.#noteWake();
       return;
     }
     for (let pass = 0; pass < 2; pass++) {
@@ -315,8 +425,17 @@ export class WlProxy {
         Atomics.store(this.#a, base + B_GEN, 0);
         Atomics.store(this.#a, base + B_ACK, 0);
         Atomics.store(this.#a, base + B_HEARTBEAT, now);
+        this.#noteWake();
         return;
       }
+    }
+  }
+
+  #noteWake() {
+    const w = this.wakeAddr?.();
+    if (w?.addr && w?.slots) {
+      Atomics.store(this.#a, this.#base + B_SLOTS, w.slots | 0);
+      Atomics.store(this.#a, this.#base + B_WAKE, w.addr | 0);
     }
   }
 
@@ -327,6 +446,16 @@ export class WlProxy {
   /** Whether this process got a block at all. */
   get ok() {
     return this.#block >= 0;
+  }
+
+  /** Publishes so far (the block's generation). */
+  get generation() {
+    return Atomics.load(this.#a, this.#base + B_GEN);
+  }
+
+  /** The last generation the compositor has drawn. */
+  get drawnGeneration() {
+    return Atomics.load(this.#a, this.#base + B_ACK);
   }
 
   /**
@@ -393,6 +522,13 @@ export class WlProxy {
     }
     Atomics.store(a, base + K_TAIL, tail);
     return count;
+  }
+
+  /** Whether this process's input ring holds an event. */
+  inputPending() {
+    if (this.#block < 0) return false;
+    const a = this.#a;
+    return Atomics.load(a, this.#ring + K_HEAD) !== Atomics.load(a, this.#ring + K_TAIL);
   }
 
   /** Give the block back, so a later process can have it. */

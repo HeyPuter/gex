@@ -97,7 +97,11 @@ xwl_key() { # xwl_key <mt|st>
     {
         echo "$1 ${XWAYLAND_TAG:-} ${WAYLAND_TAG:-}"
         cat "$HERE/build-xwayland-wasm.sh"
-        find "$HERE/xwayland" "$ROOT/shims/hostwl" -type f -not -path '*/target/*' | LC_ALL=C sort | xargs cat
+        # And the compositor and window manager hostwl is built from: a change
+        # to either that left this key alone shipped the old hostwl. (Not
+        # gex-kernel, which hostwl uses only for its vfs trait and errno.)
+        find "$HERE/xwayland" "$ROOT/shims/hostwl" "$ROOT/crates/gex-wayland" "$ROOT/crates/gex-xwm" \
+            -type f -not -path '*/target/*' | LC_ALL=C sort | xargs cat
     } | sha256sum | cut -c1-32
 }
 xwl_host_tools() {

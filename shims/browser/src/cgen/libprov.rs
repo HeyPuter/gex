@@ -202,7 +202,7 @@ static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// data and code page its parent made (a child must not start a provider
 /// over: an open `z_stream` points into its heap). Returns a unit to serve.
 pub(crate) fn rescan_if_new() -> Option<usize> {
-    let pid = crate::with_host(|h| h.kernel.pid);
+    let pid = crate::my_pid();
     let was = PID.swap(pid, Ordering::AcqRel);
     if was == pid || (lock(&DLLS).is_empty() && !AUTO.load(Ordering::Relaxed)) {
         return None;
@@ -232,7 +232,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
         return None;
     }
     if PID.load(Ordering::Acquire) == 0 {
-        PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
+        PID.store(crate::my_pid(), Ordering::Release);
     }
     let mut queued = None;
     for m in mapped {
@@ -714,7 +714,7 @@ fn wait_epoch(seen: u32, ns: i64) {
 }
 
 fn this_tid() -> u32 {
-    crate::with_host(|h| h.threads[crate::cur()].kstate.tid) as u32
+    crate::my_tid() as u32
 }
 
 /// Whether a collection is stopping the guest's threads.
@@ -807,7 +807,7 @@ pub extern "C" fn gex_libprov_guest_call(delta: i32) {
 }
 
 fn prov_check(delta: i32) {
-    let ctx = crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr);
+    let ctx = crate::my_ctx();
     let gm = crate::GuestMem::new(crate::guest_bytes());
     let reg = |o: usize| gm.read_u64(ctx + o as u64).unwrap_or(0);
     let sp = reg(gex_abi::ctx::x(4));

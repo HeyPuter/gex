@@ -22,6 +22,9 @@ static volatile int nhandled;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int go;
+/* How many of the two threads are in their condition-variable wait, with
+ * their masks set: counted under `mu`, which the wait gives back. */
+static int waiting;
 
 static void on_usr1(int s) {
     (void)s;
@@ -35,6 +38,7 @@ static void *blocker(void *arg) {
     sigfillset(&all);
     pthread_sigmask(SIG_BLOCK, &all, NULL);
     pthread_mutex_lock(&mu);
+    waiting++;
     while (!go) pthread_cond_wait(&cv, &mu);
     pthread_mutex_unlock(&mu);
     /* The signal sent to this thread while it blocked is still pending. */
@@ -46,6 +50,7 @@ static void *blocker(void *arg) {
 static void *waiter(void *arg) {
     (void)arg;
     pthread_mutex_lock(&mu);
+    waiting++;
     while (!go) pthread_cond_wait(&cv, &mu);
     pthread_mutex_unlock(&mu);
     return NULL;
@@ -76,7 +81,17 @@ int main(void) {
     pthread_t b, w;
     pthread_create(&b, NULL, blocker, NULL);
     pthread_create(&w, NULL, waiter, NULL);
-    usleep(100000); /* both are waiting on the condition variable now */
+    /* Both waiting on the condition variable: a thread can take longer
+       than any fixed sleep to start (a page starts a Worker for it), and
+       one that had not yet blocked its signals took the one meant for it
+       while blocked. */
+    for (;;) {
+        pthread_mutex_lock(&mu);
+        int n = waiting;
+        pthread_mutex_unlock(&mu);
+        if (n == 2) break;
+        usleep(1000);
+    }
     pthread_kill(w, SIGUSR1);
     sem_wait(&ack);
     pthread_kill(b, SIGUSR1);

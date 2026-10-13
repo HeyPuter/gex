@@ -14,7 +14,7 @@ use crate::errno::{Errno, SysResult};
 use crate::file::OpenFile;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How much a stream socket buffers before a write blocks. Sized so a slow
@@ -40,9 +40,22 @@ struct Stream {
 #[derive(Debug, Default)]
 struct Pipe {
     state: Mutex<Stream>,
+    /// The wait queues (`crate::wait`) of the end that reads this direction
+    /// and of the end that writes it: bytes arriving or the writer going
+    /// wakes the one, room freed or the reader going wakes the other.
+    reader_q: AtomicU32,
+    writer_q: AtomicU32,
 }
 
 impl Pipe {
+    fn notify_reader(&self) {
+        crate::wait::notify(self.reader_q.load(Ordering::SeqCst));
+    }
+
+    fn notify_writer(&self) {
+        crate::wait::notify(self.writer_q.load(Ordering::SeqCst));
+    }
+
     fn send(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> SysResult {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.closed {
@@ -62,6 +75,10 @@ impl Pipe {
         }
         s.bytes.extend(&buf[..n]);
         s.written += n as u64;
+        drop(s);
+        if n > 0 {
+            self.notify_reader();
+        }
         Ok(n as u64)
     }
 
@@ -97,6 +114,9 @@ impl Pipe {
                 _ => break,
             }
         }
+        drop(s);
+        // Room, for a writer parked on a full buffer.
+        self.notify_writer();
         Ok((n as u64, out))
     }
 
@@ -116,6 +136,8 @@ impl Pipe {
 
     fn close(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.notify_reader();
+        self.notify_writer();
     }
 
     fn is_closed(&self) -> bool {
@@ -157,6 +179,9 @@ pub struct UnixSocket {
     pending_send: Mutex<Vec<Arc<OpenFile>>>,
     /// Descriptors the last `recvmsg` took off the stream.
     pending_recv: Mutex<Vec<Arc<OpenFile>>>,
+    /// Who waits on this end (`crate::wait`): readers, writers, and for a
+    /// listener `accept`.
+    queue: crate::wait::Queue,
 }
 
 impl UnixSocket {
@@ -167,6 +192,42 @@ impl UnixSocket {
             stream,
             pending_send: Mutex::new(Vec::new()),
             pending_recv: Mutex::new(Vec::new()),
+            queue: crate::wait::Queue::new(),
+        }
+    }
+
+    /// This end's wait queue.
+    pub fn queue_id(&self) -> u32 {
+        self.queue.id()
+    }
+
+    /// Point a connection's two directions at this end's queue: it reads
+    /// `rx` and writes `tx`.
+    fn adopt(&self, rx: &Pipe, tx: &Pipe) {
+        rx.reader_q.store(self.queue.id(), Ordering::SeqCst);
+        tx.writer_q.store(self.queue.id(), Ordering::SeqCst);
+    }
+
+    /// The queue of the end connected to this one (which reads what this one
+    /// writes), or 0.
+    pub fn peer_queue(&self) -> u32 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { tx, .. } => tx.reader_q.load(Ordering::SeqCst),
+            _ => 0,
+        }
+    }
+
+    /// A host-serviced end (`HostListener`): what its peer writes is moved by
+    /// the host on a turn of one of the peer's own waiters (the browser's
+    /// compositor pump), so the peer's writes wake the peer's waiters rather
+    /// than this end's, which nobody waits on.
+    pub fn serviced_by_peer(&self) {
+        if let Role::Connected { rx, tx, .. } = &*self.role.lock().unwrap() {
+            let peer = tx.reader_q.load(Ordering::SeqCst);
+            rx.reader_q.store(peer, Ordering::SeqCst);
+            // And room the peer makes by reading is for the host to fill on
+            // the peer's next turn: the peer's waiters, again.
+            tx.writer_q.store(peer, Ordering::SeqCst);
         }
     }
 
@@ -176,12 +237,14 @@ impl UnixSocket {
         let a2b = Arc::new(Pipe::default());
         let b2a = Arc::new(Pipe::default());
         let a = UnixSocket::new(true);
+        a.adopt(&b2a, &a2b);
         *a.role.lock().unwrap() = Role::Connected {
             rx: Arc::clone(&b2a),
             tx: Arc::clone(&a2b),
             peer: None,
         };
         let b = UnixSocket::new(true);
+        b.adopt(&a2b, &b2a);
         *b.role.lock().unwrap() = Role::Connected {
             rx: a2b,
             tx: b2a,
@@ -247,6 +310,8 @@ impl UnixSocket {
             };
             backlog.lock().unwrap().push_back(theirs);
         }
+        // A connection is waiting for `accept`.
+        listener.queue.notify();
         // Take the pair's plumbing rather than the socket itself, because the
         // descriptor the caller holds is this one.
         let mut role = self.role.lock().unwrap();
@@ -254,6 +319,7 @@ impl UnixSocket {
         let Role::Connected { rx, tx, .. } = taken else {
             unreachable!("pair() makes connected sockets")
         };
+        self.adopt(&rx, &tx);
         *role = Role::Connected {
             rx,
             tx,
@@ -425,6 +491,10 @@ impl FileHandle for UnixSocket {
         }
     }
 
+    fn wait_queue(&self) -> u32 {
+        self.queue.id()
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
@@ -510,13 +580,13 @@ impl SocketNames {
             let (mine, theirs) = UnixSocket::pair();
             let taken = std::mem::replace(&mut *mine.role.lock().unwrap(), Role::Fresh);
             *client.role.lock().unwrap() = match taken {
-                Role::Connected { rx, tx, .. } => Role::Connected {
-                    rx,
-                    tx,
-                    peer: Some(path.to_string()),
-                },
+                Role::Connected { rx, tx, .. } => {
+                    client.adopt(&rx, &tx);
+                    Role::Connected { rx, tx, peer: Some(path.to_string()) }
+                }
                 _ => unreachable!("pair() makes connected sockets"),
             };
+            theirs.serviced_by_peer();
             host.accept(theirs);
             return Ok(0);
         }
@@ -979,9 +1049,18 @@ mod lock_tests {
 /// An `epoll` set: the descriptors a program watches and what it wants told
 /// about each. `epoll_wait` turns the registrations back into the list `poll`
 /// already knows how to answer.
+///
+/// The set keeps its own wait queue, chained onto the queue of every
+/// descriptor it watches (`crate::wait::chain`): a change on a watched
+/// descriptor notifies the set, which notifies the threads in `epoll_wait` on
+/// it -- and only them. A change to the interest list itself notifies the set
+/// too and moves [`EpollSet::generation`], so a waiter knows its list of
+/// descriptors is out of date.
 #[derive(Debug, Default)]
 pub struct EpollSet {
     watched: Mutex<Vec<Watch>>,
+    queue: crate::wait::Queue,
+    generation: AtomicU32,
 }
 
 /// One registration.
@@ -991,6 +1070,8 @@ pub struct Watch {
     pub events: u32,
     /// Opaque word handed back to the caller (usually a pointer to its state).
     pub data: u64,
+    /// The watched descriptor's wait queue this set is chained onto, 0 none.
+    pub source: u32,
 }
 
 /// `epoll_ctl`'s operations.
@@ -1006,25 +1087,41 @@ impl EpollSet {
     }
 
     pub fn ctl(&self, op: u64, fd: i32, events: u32, data: u64) -> SysResult {
+        self.ctl_queue(op, fd, events, data, 0)
+    }
+
+    /// `epoll_ctl`, with the watched descriptor's wait queue (`source`) to
+    /// chain this set onto.
+    pub fn ctl_queue(&self, op: u64, fd: i32, events: u32, data: u64, source: u32) -> SysResult {
         let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
-        match op {
+        let me = self.queue.id();
+        let r = match op {
             epoll_op::ADD => {
                 if w.iter().any(|x| x.fd == fd) {
                     return Err(Errno::EEXIST);
                 }
-                w.push(Watch { fd, events, data });
+                crate::wait::chain(source, me);
+                w.push(Watch { fd, events, data, source });
                 Ok(0)
             }
             epoll_op::MOD => match w.iter_mut().find(|x| x.fd == fd) {
                 Some(x) => {
                     x.events = events;
                     x.data = data;
+                    if source != 0 && x.source != source {
+                        crate::wait::unchain(x.source, me);
+                        crate::wait::chain(source, me);
+                        x.source = source;
+                    }
                     Ok(0)
                 }
                 None => Err(Errno::ENOENT),
             },
             epoll_op::DEL => {
                 let before = w.len();
+                for x in w.iter().filter(|x| x.fd == fd) {
+                    crate::wait::unchain(x.source, me);
+                }
                 w.retain(|x| x.fd != fd);
                 if w.len() == before {
                     return Err(Errno::ENOENT);
@@ -1032,13 +1129,35 @@ impl EpollSet {
                 Ok(0)
             }
             _ => Err(Errno::EINVAL),
+        };
+        drop(w);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.queue.notify();
+        r
+    }
+
+    /// Make sure this set is chained onto `source`, the queue descriptor
+    /// `fd` has now (a descriptor closed and its number reused names a new
+    /// object). Called as a waiter collects the set's descriptors.
+    pub fn rechain(&self, fd: i32, source: u32) {
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = w.iter_mut().find(|x| x.fd == fd) {
+            if x.source != source {
+                crate::wait::unchain(x.source, self.queue.id());
+                crate::wait::chain(source, self.queue.id());
+                x.source = source;
+            }
         }
     }
 
     /// A set already holding `watches`: a fork's child's copy of its
-    /// parent's (see [`EpollSet::describe`]).
+    /// parent's (see [`EpollSet::describe`]). Chained onto no descriptor's
+    /// queue yet: a waiter chains each as it collects them (`rechain`).
     pub fn with_watches(watches: Vec<Watch>) -> EpollSet {
-        EpollSet { watched: Mutex::new(watches) }
+        let set = EpollSet::new();
+        *set.watched.lock().unwrap_or_else(|e| e.into_inner()) =
+            watches.into_iter().map(|w| Watch { source: 0, ..w }).collect();
+        set
     }
 
     /// The registrations as text, `fd,events,data` joined by `;`, for a set
@@ -1062,7 +1181,7 @@ impl EpollSet {
                 let fd = it.next()?.parse().ok()?;
                 let events = it.next()?.parse().ok()?;
                 let data = it.next()?.parse().ok()?;
-                Some(Watch { fd, events, data })
+                Some(Watch { fd, events, data, source: 0 })
             })
             .collect()
     }
@@ -1073,11 +1192,38 @@ impl EpollSet {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// The set's own wait queue.
+    pub fn queue_id(&self) -> u32 {
+        self.queue.id()
+    }
+
+    /// Moves on every change to the interest list.
+    pub fn generation(&self) -> u32 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for EpollSet {
+    fn drop(&mut self) {
+        let me = self.queue.id();
+        for x in self.watched.get_mut().unwrap_or_else(|e| e.into_inner()).iter() {
+            crate::wait::unchain(x.source, me);
+        }
+    }
 }
 
 impl FileHandle for EpollSet {
+    fn as_epoll(self: Arc<Self>) -> Option<Arc<EpollSet>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
         Err(Errno::EINVAL)
+    }
+
+    fn wait_queue(&self) -> u32 {
+        self.queue.id()
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -1185,6 +1331,8 @@ pub struct Remote {
     pub describe: fn(&crate::syscalls::Kernel, &Arc<OpenFile>) -> Option<String>,
     /// The other half of [`Remote::describe`], in the receiving process.
     pub rebuild: fn(&mut crate::syscalls::Kernel, &str) -> Option<Arc<OpenFile>>,
+    /// The end's wait queue (`crate::wait`).
+    pub queue: extern "C" fn(id: i32) -> u32,
 }
 
 /// One end of a socket in the global kernel.
@@ -1324,6 +1472,10 @@ impl Drop for RemoteUnix {
 }
 
 impl crate::vfs::FileHandle for RemoteUnix {
+    fn is_global_socket(&self) -> bool {
+        true
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.listening {
             return Err(Errno::ENOTCONN);
@@ -1370,6 +1522,10 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn poll_writable(&self) -> bool {
         self.listening || (self.remote.writable)(self.id) != 0
+    }
+
+    fn wait_queue(&self) -> u32 {
+        (self.remote.queue)(self.id)
     }
 
     // Without these a peer's close showed in `poll` and `epoll` only as

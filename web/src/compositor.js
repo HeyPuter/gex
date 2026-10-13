@@ -289,8 +289,14 @@ export class Compositor {
   }
 
   /** A guest process's memory: where its surfaces' pixels are. */
-  addMemory(token, memory) {
-    this.#worker.postMessage({ kind: 'memory', token, memory });
+  addMemory(token, memory, kernel) {
+    this.#worker.postMessage({ kind: 'memory', token, memory, kernel });
+  }
+
+  /** That process has exited: its memory, its GL context and its GL windows
+   *  go (compositor-worker.js 'drop-memory'). */
+  dropMemory(token) {
+    this.#worker.postMessage({ kind: 'drop-memory', token });
   }
 
   resize(width, height) {

@@ -20,7 +20,7 @@
 // screen, exactly like a guest's own Wayland surface.
 //
 // The server blocks. `main()` never returns, and every wait goes through
-// `gex_poll` -> `wait()` here -> `k_park`, the same bounded park a guest
+// `gex_poll` -> `wait()` here -> `k_ws_park`, the same park a guest
 // process uses. That is why the housekeeping -- pumping the window manager,
 // publishing the scene, taking input -- happens inside `tick()`, which the
 // server calls every turn of its loop: after `callMain` there is no JavaScript
@@ -91,10 +91,28 @@ export class HostX {
   #hwWords = null;
   /** The global kernel, instantiated against the X server's memory. */
   #k = null;
+  /** Its memory. */
+  #kmem = null;
   /** What each descriptor means. */
   #fds = new Map();
-  /** Pools of pixels, by descriptor: where they are in the server's memory. */
+  /**
+   * Pools of pixels, by descriptor: where they are in the server's memory.
+   *
+   * A pool is freed when nothing refers to it: `refs` counts the server's
+   * descriptor, its mappings (`gex_shm_map`/`gex_shm_unmap` in gexos.c) and
+   * the compositor's handles (`#held`, given back by `host_release`). Then
+   * it waits in `#dying` until the page has drawn a scene published after
+   * that, so a frame already on its way is never read out of freed memory.
+   * Xwayland makes a new pool for a window that has not drawn for a second
+   * (about 0.9 MB for an xterm), and before this every one of them stayed.
+   */
   #pools = new Map();
+  /** Mapped pools, by address: what `gex_shm_unmap` names. */
+  #mapped = new Map();
+  /** Pools nothing refers to, with the scene generation they died after. */
+  #dying = [];
+  /** Pools made and not yet freed, for `?hostxcount=1`. */
+  #live = 0;
   /**
    * The pools the compositor holds, by its own handle for each: what a
    * descriptor sent on the Wayland connection became when it arrived.
@@ -183,6 +201,12 @@ export class HostX {
     const hw = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       gex_host: {
         host_locate: (fd, out) => this.#locate(fd, out),
+        host_release: (fd) => {
+          const pool = this.#held.get(fd);
+          if (!pool) return;
+          this.#held.delete(fd);
+          this.#drop(pool);
+        },
         host_trace: (ptr, len) => this.log(this.#hwText(ptr, len).replace(/\n$/, '')),
       },
     });
@@ -219,15 +243,21 @@ export class HostX {
         : 0);
       if (top) inst.exports.__stack_pointer.value = top | 0;
       this.#k = inst.exports;
+      this.#kmem = msg.kernel.memory;
     }
     if (!this.#k) throw new Error('the host X server needs the global kernel');
+    this.#waitInit();
 
     // -- the arena ---------------------------------------------------------
     this.#proxy = new WlProxy(msg.wlChannel, () => this.emit({ kind: 'wl' }), () => this.#token);
+    // The server waits on its wait slot (`wait` below), which the compositor
+    // notifies through the server's own queue when it puts input in this
+    // block's ring.
+    this.#proxy.wakeAddr = () => ({ addr: this.#k.k_wq_addr(this.#queue) >>> 0, slots: this.#k.k_ws_addr(0) >>> 0 });
     // The compositor Worker reads an X window's pixels out of this memory, so
     // it needs the memory itself -- the object, not a buffer, since a shared
     // memory that grows hands out a new one.
-    this.emit({ kind: 'wl-memory', token: this.#token, memory: this.#x.wasmMemory });
+    this.emit({ kind: 'wl-memory', token: this.#token, memory: this.#x.wasmMemory, kernel: msg.kernel.memory });
 
     // -- the transport the server will use ---------------------------------
     this.#x.gexos = this.#gexos();
@@ -329,7 +359,39 @@ export class HostX {
       this.log(`[hostx] cannot bind ${JSON.stringify(name)}: errno ${-id}`);
       return -1;
     }
+    this.#watch(id);
     return this.#reserve({ kind: 'listen', id });
+  }
+
+  // -- waiting (docs/kernel-locking.md §5.2 step 2) -------------------------
+  //
+  // The server waits as a guest thread does: on a wait slot of its own in the
+  // global kernel's memory, registered on the wait queue of every socket it
+  // holds and on a queue of its own the compositor notifies for input. A
+  // guest's write to one of its sockets notifies it, and nothing else does.
+
+  /** The server's wait slot, its own queue, and the slot's value when the
+   *  last wait returned (a notify since then ends the next wait at once). */
+  #slot = -1;
+  #queue = 0;
+  #seq = 0;
+
+  #waitInit() {
+    const k = this.#k;
+    this.#slot = k.k_ws_alloc();
+    if (this.#slot < 0) throw new Error('the host X server found no free wait slot');
+    this.#queue = k.k_wq_new();
+    k.k_wq_add(this.#queue, this.#slot);
+    this.#seq = k.k_ws_seq(this.#slot);
+  }
+
+  /** Register on kernel socket `id`'s queue, for as long as it is held. */
+  #watch(id) {
+    this.#k.k_wq_add(this.#k.k_sock_queue(id), this.#slot);
+  }
+
+  #unwatch(id) {
+    this.#k.k_wq_del(this.#k.k_sock_queue(id), this.#slot);
   }
 
   /** `k_sock_bind` wants the name in the process's memory. */
@@ -377,6 +439,30 @@ export class HostX {
     return 1;
   }
 
+  /** One reference to `pool` fewer; with none left, free it once it is safe. */
+  #drop(pool) {
+    if (--pool.refs > 0) return;
+    if (this.#mapped.get(pool.addr) === pool) this.#mapped.delete(pool.addr);
+    this.#dying.push({ pool, gen: this.#proxy?.ok ? this.#proxy.generation : -1 });
+  }
+
+  /** Free the pools that died before a scene the page has drawn since. */
+  #reap() {
+    if (!this.#dying.length) return;
+    const drawn = this.#proxy?.ok ? this.#proxy.drawnGeneration : Infinity;
+    const keep = [];
+    for (const d of this.#dying) {
+      if (drawn > d.gen) {
+        this.#x._free(d.pool.addr);
+        this.#live--;
+        if (this.#count) this.#bump('freed', d.pool.size);
+      } else {
+        keep.push(d);
+      }
+    }
+    this.#dying = keep;
+  }
+
   #once(key, text) {
     if (this.#said.has(key)) return;
     this.#said.add(key);
@@ -394,6 +480,7 @@ export class HostX {
         const name = new TextDecoder().decode(self.#x.HEAPU8.subarray(path, path + len));
         const id = self.#kSockBind(name);
         if (id < 0) return id;
+        self.#watch(id);
         self.#fds.set(fd, { kind: 'listen', id });
         return 0;
       },
@@ -401,6 +488,7 @@ export class HostX {
       connect(fd, path, len) {
         const id = self.#k.k_sock_connect(path, len);
         if (id < 0) return id;
+        self.#watch(id);
         self.#fds.set(fd, { kind: 'kernel', id });
         return 0;
       },
@@ -410,6 +498,7 @@ export class HostX {
         if (!ep || ep.kind !== 'listen') return -EBADF;
         const id = self.#k.k_sock_accept(ep.id);
         if (id < 0) return id;
+        self.#watch(id);
         const client = self.#reserve({ kind: 'kernel', id });
         self.log(`[hostx] a guest connected to the X display (fd ${client})`);
         return client;
@@ -418,15 +507,20 @@ export class HostX {
       close(fd) {
         const ep = self.#fds.get(fd);
         if (!ep) return 0;
-        if (ep.kind === 'kernel' || ep.kind === 'listen') self.#k.k_sock_close(ep.id);
+        if (ep.kind === 'kernel' || ep.kind === 'listen') {
+          self.#unwatch(ep.id);
+          self.#k.k_sock_close(ep.id);
+        }
         // A pool's descriptor is closed as soon as the server has handed it to
-        // wl_shm, and the pixels have to outlive that: the compositor is still
-        // reading them. So the allocation stays -- freeing it here is the one
-        // way to make an X window's contents vanish mid-frame.
+        // wl_shm, and the pixels have to outlive that: the server draws
+        // through its mapping and the compositor is still reading them. So
+        // closing it is one reference fewer, not a free (see `#pools`).
         self.#fds.delete(fd);
-        // The server's name for a pool goes with the descriptor; the compositor
-        // has its own (`#held`), and the memory stays (see above).
-        self.#pools.delete(fd);
+        const pool = self.#pools.get(fd);
+        if (pool) {
+          self.#pools.delete(fd);
+          self.#drop(pool);
+        }
         try {
           self.#x.FS.close(self.#x.FS.getStream(fd));
         } catch {
@@ -492,6 +586,7 @@ export class HostX {
             if (pool) {
               word = self.#nextHeld++;
               self.#held.set(word, pool);
+              pool.refs++;
             }
             self.#hwWords[((p + pad) >> 2) + i] = word;
           }
@@ -540,12 +635,28 @@ export class HostX {
       /** A pool of pixels the compositor will read where it lies. */
       shm(addr, size) {
         const fd = self.#reserve({ kind: 'pool' });
-        self.#pools.set(fd, { addr, size });
+        self.#pools.set(fd, { addr, size, refs: 1, maps: 0 });
+        self.#live++;
         return fd;
       },
 
+      /** `mmap` of a pool: its address, and a reference until `shmUnmap`. */
       shmAddr(fd) {
-        return self.#pools.get(fd)?.addr ?? 0;
+        const pool = self.#pools.get(fd);
+        if (!pool) return 0;
+        pool.refs++;
+        pool.maps++;
+        self.#mapped.set(pool.addr, pool);
+        return pool.addr;
+      },
+
+      /** `munmap` of a pool the server mapped. */
+      shmUnmap(addr) {
+        const pool = self.#mapped.get(addr);
+        if (!pool || !pool.maps) return 0;
+        if (--pool.maps === 0) self.#mapped.delete(addr);
+        self.#drop(pool);
+        return 0;
       },
 
       /**
@@ -562,30 +673,42 @@ export class HostX {
       },
 
       /**
-       * Wait, the way a guest process waits: on the global kernel's wake word.
-       * A Worker may block, which is what makes this possible at all -- and
-       * what makes the X server's loop look exactly like a native one.
+       * Wait, the way a guest process waits: on its wait slot, until one of
+       * its sockets (or its compositor input) is notified, or `ms` -- the
+       * server's own slice (gexos.c `gex_poll`). A Worker may block, which is
+       * what makes this possible at all -- and what makes the X server's loop
+       * look exactly like a native one.
        */
       wait(ms) {
+        const k = self.#k;
+        const slot = self.#slot;
+        const seq = self.#seq;
+        const ns = BigInt(Math.max(1, ms)) * 1000000n;
+        const done = () => {
+          self.#seq = k.k_ws_seq(slot);
+          return 0;
+        };
         // The single-thread build (docs/single-thread.md): the server is a
         // fiber of the system Worker, so it parks on the scheduler, and the
         // wait is a promise its stack suspends on (gexos.c GEX_XWL_JSPI).
-        if (single.on) return sched.park(Math.max(1, ms) * 1e6).then(() => 0);
-        const seq = self.#k.k_wake_seq();
-        self.#k.k_park(seq, BigInt(Math.max(1, ms)) * 1000000n);
-        return 0;
+        if (single.on) {
+          const words = () => new Int32Array(self.#kmem.buffer);
+          const r = sched.parkSlot(words, (k.k_ws_addr(slot) >>> 0) >>> 2, seq, ns);
+          return r === 1 ? done() : r.then(done);
+        }
+        k.k_ws_park(slot, seq, ns);
+        return done();
       },
     };
-    // And what it does to a guest's socket is a wake the guests' fibers must
-    // see: a guest process bumps the scheduler after every system call
-    // (gex.mjs `k_wake`), and this server makes its socket calls straight
-    // into the kernel module, which has no way to say so.
+    // And what it does to a guest's socket notifies that socket's waiters,
+    // whose words the guests' fibers do not `Atomics.wait` on in the
+    // single-thread build: they look.
     if (single.on) {
       for (const name of ['connect', 'accept', 'close', 'send', 'recv']) {
         const fn = raw[name];
         raw[name] = (...a) => {
           const r = fn(...a);
-          sched.wake();
+          sched.checkSlots();
           return r;
         };
       }
@@ -622,7 +745,9 @@ export class HostX {
     const addr = this.#x._malloc(n);
     this.#x.HEAPU8.set(this.#hwView().subarray(p, p + n), addr);
     const fd = this.#reserve({ kind: 'pool' });
-    this.#pools.set(fd, { addr, size: n });
+    // Never freed: one per keymap, and the server does not map it through
+    // `shmAddr`, so nothing would count its last reader.
+    this.#pools.set(fd, { addr, size: n, refs: Infinity, maps: 0 });
     this.#owed.push(fd);
     this.log(`[hostx] keymap event: ${n} bytes as fd ${fd}`);
   }
@@ -643,7 +768,7 @@ export class HostX {
       c.polls++;
       if (Date.now() - c.at >= 1000) {
         const parts = [...c.n].map(([k, v]) => `${k}=${v}`).join(' ');
-        this.log(`[hostx-count] turns=${c.polls} pub=${this.#published} ${parts}`);
+        this.log(`[hostx-count] turns=${c.polls} pub=${this.#published} pools=${this.#live} ${parts}`);
         c.n.clear();
         c.polls = 0;
         c.at = Date.now();
@@ -653,6 +778,7 @@ export class HostX {
     // server's `main` has the thread. See web/test/hostx.mjs.
     globalThis.GEX_HOSTX_TICK?.();
     const hw = this.#hw;
+    this.#reap();
     hw.hw_tick();
     this.#takeKeymap();
 

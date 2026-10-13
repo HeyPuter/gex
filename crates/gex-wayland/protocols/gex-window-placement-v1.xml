@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="gex_window_placement_v1">
+  <copyright>
+    Copyright 2026 the gex authors. Same terms as the rest of gex.
+  </copyright>
+
+  <description summary="client-chosen window positions and stacking">
+    A window system whose windows have real coordinates -- Win32 under Wine,
+    X11 override-redirect windows -- decides where each window is and what is
+    above what, and its programs depend on that being true on screen: a
+    taskbar at the bottom edge, a Start menu above it, a tooltip above the
+    window it describes, a click landing on the window the program believes
+    is there. xdg_shell has no positions and no cross-client stacking, so a
+    surface that needs both says so here.
+
+    A surface with a placement object is "placed": the compositor shows it at
+    the position its client set, stacks it where its client asked, does not
+    cascade it, size it, raise it on click or give it the keyboard on its own
+    initiative. A surface without one keeps the compositor's own layout.
+
+    Coordinates are in the output's pixels, (0, 0) its top-left corner -- the
+    same space the client's own window system uses for a single screen.
+  </description>
+
+  <interface name="gex_window_placement_manager_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Placement objects already made are unaffected.
+      </description>
+    </request>
+
+    <request name="get_placement">
+      <description summary="make a surface placed">
+        The surface keeps whatever role it has or will be given (an
+        xdg_toplevel, typically). It is placed from its next commit with a
+        buffer until the placement object is destroyed.
+      </description>
+      <arg name="id" type="new_id" interface="gex_window_placement_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="gex_window_placement_v1" version="1">
+    <enum name="layer">
+      <entry name="normal" value="0"/>
+      <entry name="topmost" value="1" summary="above every normal window"/>
+      <entry name="overlay" value="2" summary="above everything: menus, tooltips"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop placing the surface">
+        The surface goes back to the compositor's own layout.
+      </description>
+    </request>
+
+    <request name="set_position">
+      <description summary="where the surface's top-left corner is">
+        In output pixels. Takes effect at once: moving a window does not need
+        new contents.
+      </description>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+
+    <request name="set_layer">
+      <arg name="layer" type="uint" enum="layer"/>
+    </request>
+
+    <request name="set_stack_id">
+      <description summary="name the surface for stacking requests">
+        A number other placed surfaces -- of this client or another -- can
+        name in place_below. Ids are the client window system's own (a Win32
+        window handle, an X window id), so they are shared by every client
+        of one session. Zero is no id.
+      </description>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="place_below">
+      <description summary="restack directly below a sibling">
+        Put the surface directly below the placed surface whose stack id is
+        `sibling`, within the layer. Zero puts it at the top of its layer,
+        0xffffffff at the bottom. A sibling the compositor does not know (not
+        mapped yet, or gone) counts as zero.
+      </description>
+      <arg name="sibling" type="uint"/>
+    </request>
+
+    <request name="set_unmanaged">
+      <description summary="no decoration">
+        The client draws the whole window, frame included. Without this a
+        placed toplevel is still decorated by the compositor, around the
+        position given.
+      </description>
+    </request>
+
+    <request name="activate">
+      <description summary="give the surface the keyboard">
+        The client's window system activated this window. The compositor
+        moves the keyboard focus to it (and from whatever had it).
+      </description>
+    </request>
+  </interface>
+</protocol>

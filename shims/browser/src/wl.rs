@@ -44,11 +44,17 @@ extern "C" {
     /// 8 close, 9 dismiss popup. Coordinates are surface-local pixels;
     /// button/key codes are Linux `BTN_*`/evdev numbers.
     fn wl_poll_input(ptr: u32, max: u32) -> u32;
+    /// Whether this process's input ring holds an event, without taking it.
+    fn wl_input_pending() -> u32;
 }
+
+/// The floor under [`WaylandDevice::needs_pump`]: whatever it does not look
+/// at still gets a pump at least this often.
+const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
-const REC: usize = 28;
+const REC: usize = 37;
 /// Words in one input event record.
 const EV: usize = 8;
 /// The most surfaces published in one pump. A desktop session with a dozen
@@ -66,7 +72,7 @@ enum InputEvent {
     Mods { client: u32, depressed: u32, latched: u32, locked: u32, group: u32 },
     PointerClear { client: u32 },
     KeyboardFocus { client: u32, surface: u32 },
-    Configure { client: u32, surface: u32, w: i32, h: i32, activated: bool },
+    Configure { client: u32, surface: u32, w: i32, h: i32, states: u32 },
     Close { client: u32, surface: u32 },
     DismissPopup { client: u32, surface: u32 },
     /// The compositor moved a window. For an X window this has to reach the X
@@ -145,7 +151,7 @@ fn poll_input() -> Vec<InputEvent> {
                     surface,
                     w: q[1],
                     h: q[2],
-                    activated: q[4] != 0,
+                    states: gex_wayland::configure_states(q[3], q[4]),
                 },
                 8 => InputEvent::Close { client, surface },
                 9 => InputEvent::DismissPopup { client, surface },
@@ -220,6 +226,17 @@ pub extern "C" fn gex_set_wl_scale(scale: i32) {
 /// devices know nothing of each other. Process-wide rather than per-thread
 /// because the ioctl arrives on whichever thread the client called it from.
 static COMPOSITOR: std::sync::Mutex<Option<WaylandDevice>> = std::sync::Mutex::new(None);
+
+/// Whether this process's compositor has anything to move (`needs_pump`),
+/// for a scheduler turn that takes no lock (`waitq::idle_turn`): if so, the
+/// turn takes the lock and pumps. A compositor busy elsewhere is a yes.
+pub fn pump_wanted() -> bool {
+    let device = match COMPOSITOR.try_lock() {
+        Ok(d) => d.clone(),
+        Err(_) => return true,
+    };
+    device.is_some_and(|d| d.needs_pump())
+}
 
 /// Remember it at mount, so the GL device can find it later.
 pub fn set_compositor(device: &WaylandDevice) {
@@ -305,6 +322,8 @@ struct Inner {
     /// How many clients were live at the last publish, so a client going away
     /// is a scene change even when no one drew.
     published: Mutex<usize>,
+    /// When a pump last ran (host ns), for `PUMP_FLOOR_NS`.
+    last_pump: std::sync::atomic::AtomicU64,
 }
 
 /// The compositor as the guest sees it: a name that accepts connections.
@@ -341,14 +360,18 @@ impl WaylandDevice {
     }
 
     /// Move bytes both ways for every client, hand the compositor this turn's
-    /// scene, and take its input. Run once per scheduler turn.
+    /// scene, and take its input. Run once per scheduler turn. Says whether it
+    /// sent any client anything: a reply written here is readiness no
+    /// syscall announced, so the caller wakes the parked Workers.
     ///
     /// `kernel`/`mem` are how a buffer is found: a client maps its `wl_shm`
     /// pool `MAP_SHARED`, which aliases a range of guest memory, so what the
     /// compositor is told is the address of that range -- nothing is copied
     /// here, and nothing is composited here either.
-    pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
+    pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) -> bool {
+        self.inner.last_pump.store(crate::now_ns(), std::sync::atomic::Ordering::Relaxed);
         let mut sessions = self.inner.sessions.lock().unwrap();
+        let mut sent_any = false;
         // Compositor input and control for this turn, addressed by client: a
         // process can host Xwayland and a native client at once, and an event
         // for one must not reach the other.
@@ -441,8 +464,16 @@ impl WaylandDevice {
                                 }
                             }
                         }
-                        InputEvent::Configure { surface, w, h, activated, .. } => {
-                            s.client.configure(surface, w, h, activated)
+                        InputEvent::Configure { surface, w, h, states, .. } => {
+                            // An X window is sized by the X server, through
+                            // the manager.
+                            let x11 = surface != 0 && s.client.is_x11(surface);
+                            match (x11, s.xwm.as_mut()) {
+                                (true, Some(xwm)) => {
+                                    xwm.resized(surface, w, h);
+                                }
+                                _ => s.client.configure(surface, w, h, states),
+                            }
                         }
                         InputEvent::Close { surface, .. } => {
                             // An X window has no xdg_toplevel to close: the
@@ -532,7 +563,10 @@ impl WaylandDevice {
             while s.sent < s.out.len() {
                 match s.socket.send(&s.out[s.sent..]) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => s.sent += n as usize,
+                    Ok(n) => {
+                        s.sent += n as usize;
+                        sent_any = true;
+                    }
                 }
             }
             if s.sent == s.out.len() {
@@ -591,6 +625,35 @@ impl WaylandDevice {
             let count = (scene.len() / REC) as u32;
             unsafe { wl_publish(scene.as_ptr() as u32, count) };
         }
+        sent_any
+    }
+
+    /// Whether a pump now would do anything: a client socket with bytes or a
+    /// hang-up to read, bytes still owed to one, an X window manager to
+    /// drive, or input in the ring for a client that takes it -- or the floor
+    /// (`PUMP_FLOOR_NS`) has passed. Asked on every scheduler turn of every
+    /// Worker, under the lock as the pump was: Undertale's game process pumped 7,000
+    /// times a second, nearly all with nothing to move, and the pump was 311
+    /// of the 546 ms a 10 s window held the lock for the turn (census,
+    /// worldmachine) -- the turn that is 70% of the game's lock wait.
+    pub fn needs_pump(&self) -> bool {
+        let now = crate::now_ns();
+        if now.saturating_sub(self.inner.last_pump.load(std::sync::atomic::Ordering::Relaxed)) >= PUMP_FLOOR_NS {
+            return true;
+        }
+        // Held elsewhere (an accept, a GL attach): pump, as before.
+        let Ok(sessions) = self.inner.sessions.try_lock() else {
+            return true;
+        };
+        let mut wants = false;
+        for s in sessions.iter() {
+            if s.xwm.is_some() || s.sent < s.out.len() || s.socket.poll_readable() || s.socket.poll_hup() {
+                return true;
+            }
+            wants |= s.client.wants_input();
+        }
+        // SAFETY: a host import taking nothing.
+        wants && unsafe { wl_input_pending() } != 0
     }
 
     /// Write every client's surfaces into the scene arena.
@@ -681,9 +744,7 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1)
-        | ((info.buffer_scale & 0xff) << 8)
-        | ((info.client_scale & 0xff) << 16);
+    r[16] = info.flags();
     // Which X window this is, for a host that knows a drawable and not a
     // surface -- an OpenGL client naming what it draws into.
     r[17] = info.xid as i32;
@@ -699,6 +760,10 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
         word[..chunk.len()].copy_from_slice(chunk);
         r[18 + i] = i32::from_le_bytes(word);
     }
+    // Where its client placed it, if it did (`gex_window_placement_v1`).
+    r[28..33].copy_from_slice(&info.placement.record_words());
+    // Where it takes the pointer, when its client said (`flags` bit 7).
+    r[33..37].copy_from_slice(&info.input_words());
 }
 
 impl HostListener for WaylandDevice {

@@ -1073,7 +1073,7 @@ pub extern "C" fn gex_provider_alloc(size: u32) -> u32 {
 /// `gex.provider_ctx()`: the calling thread's context.
 #[no_mangle]
 pub extern "C" fn gex_provider_ctx() -> u32 {
-    crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr) as u32
+    crate::my_ctx() as u32
 }
 
 /// `gex.provider_missing(addr)`: the program called an export the provider

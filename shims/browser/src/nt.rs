@@ -367,7 +367,7 @@ mod imp {
             // Through the guest's stderr, not the console: a Worker's console
             // output can be lost when the run ends, and tests/nt reads this.
             let line = format!("gex-nt: arena self-check: {}\n", crate::arena_selftest());
-            unsafe { crate::write(2, line.as_ptr() as u32, line.len() as u32) };
+            unsafe { crate::write(2, line.as_ptr() as usize, line.len() as u32) };
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
@@ -514,7 +514,7 @@ mod imp {
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
-    const REC: usize = 28;
+    const REC: usize = 37;
     const EV: usize = 8;
     /// The client number NT windows go by in this process's block. A Windows
     /// process has no Wayland clients of its own, so there is nobody to
@@ -619,8 +619,13 @@ mod imp {
                     3 => E::Key { window, code: q[1] as u32, pressed: q[2] != 0 },
                     6 if window != 0 => E::Focus { window },
                     // Only a real resize: the compositor configures on every
-                    // focus change too, with the size the window already has.
+                    // focus change too, with the size the window already has,
+                    // and with 0x0 (xdg_toplevel's "your own size") when it
+                    // has not chosen one.
                     7 => {
+                        if q[1] <= 0 || q[2] <= 0 {
+                            continue;
+                        }
                         let same = self.windows.lock().unwrap().get(&window).is_some_and(|(s, _)| {
                             s.width == q[1] && s.height == q[2]
                         });
@@ -1246,7 +1251,7 @@ mod imp {
                     }
                     end_process(p.exit_code.load(Ordering::Acquire));
                 }
-                with_host(|h| h.threads[cur()].waiting = Waiting::Exited);
+                with_host(|h| h.threads[cur()].run().waiting = Waiting::Exited);
                 set_resume_none();
                 set_resume_ctx_none_and_trap();
             }
@@ -1255,12 +1260,7 @@ mod imp {
                 with_host(|h| {
                     // A Worker of its own, as a Linux clone gets: the entry
                     // is this process's, the thread runs elsewhere.
-                    h.threads.push(Thread {
-                        kstate: ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 },
-                        pc: start,
-                        waiting: Waiting::Elsewhere,
-                        blocked_on: None,
-                    });
+                    h.threads.push(Thread::new(ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 }, start, Waiting::Elsewhere));
                     if !h.jit.ever_threaded {
                         backfill_registry(h);
                         h.jit.ever_threaded = true;

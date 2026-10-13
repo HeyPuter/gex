@@ -202,6 +202,22 @@ impl FileHandle for OssHandle {
         false
     }
 
+    /// A full buffer drains by the clock, which no notify reports: a writer
+    /// waiting for room is ready when one byte has played.
+    fn ready_in_ns(&self) -> Option<u64> {
+        if self.node != OssNode::Dsp {
+            return None;
+        }
+        let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        s.drain();
+        if s.queued < BUFSIZE {
+            // Room now: a writer is ready, and a reader never is.
+            return None;
+        }
+        let bps = s.bytes_per_second().max(1);
+        Some((1_000_000_000 / bps).max(1))
+    }
+
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         let request = request as u32;
         // An int argument read and written back.
@@ -306,12 +322,20 @@ mod tests {
         }
         // 192000 bytes a second: the 32 KiB buffer fills, then drains in
         // about 171 ms.
+        let start = Instant::now();
         assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
         assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
         std::thread::sleep(std::time::Duration::from_millis(60));
         let n = h.write_at(0, &vec![0u8; 100_000]).unwrap();
-        // 60 ms played at least 11520 bytes, and less than the whole buffer.
-        assert!(n >= 11_520 && n < BUFSIZE, "{n}");
+        // Against the clock as it actually ran (a loaded machine sleeps
+        // longer than asked): at least the 60 ms asked for has played,
+        // no more than the time that passed, and while that was short of
+        // the whole buffer's 171 ms, less than all of it.
+        let played = start.elapsed().as_micros() as u64 * 192_000 / 1_000_000;
+        assert!(n >= 11_520 && n <= played.min(BUFSIZE) + 4, "{n} (played {played})");
+        if played + 4 < BUFSIZE {
+            assert!(n < BUFSIZE, "{n} (played {played})");
+        }
     }
 
     #[test]
