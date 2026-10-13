@@ -479,6 +479,7 @@ mspaint-project/build.sh
 # 4. the static site
 node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
 node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
+node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks its windows
 ```
 
 - **The recording** (`w3-session.json`) is how the page was started (its

@@ -3,7 +3,7 @@
 // (docs/eject.md, "W3 pages") reaches its window in headless Chromium, built
 // with the features its project left out really gone.
 //
-//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH]
+//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH] [--placed]
 //
 // Checks, in order:
 //   1. the site's nt.json says kind w3, and for each feature it says is off,
@@ -15,7 +15,14 @@
 //   3. with "compositor" off, what draws it is the page's bare desktop
 //      (`describe().compositor === 'none'`), and the window has pixels;
 //   4. no service worker: the site ships no sw.js, none is registered, and
-//      the first load is the only one (the launcher once, nt.html once).
+//      the first load is the only one (the launcher once, nt.html once);
+//   5. with --placed (Paint, "compositor" off): the bare desktop leaves a
+//      window its client places (gex_window_placement_v1) to Wine. A caption
+//      drag moves it by the drag, a border drag past its edge grows it and
+//      one inside shrinks it (Win32's own SC_MOVE/SC_SIZE loops, the pointer
+//      held by the canvas), and a click on Paint leaves its owned dialog
+//      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
+//      raises a placed window.
 // Prints PASS or FAIL lines; exits 0 only when all pass.
 
 import { spawn } from 'node:child_process';
@@ -28,6 +35,7 @@ import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome'].includes(av[i - 1])) ?? '');
+const placedChecks = av.includes('--placed');
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
 const timeout = Number(opt('--timeout', '400')) * 1000;
 const port = Number(opt('--port', '8731'));
@@ -125,4 +133,82 @@ check(launcher === 1 && ntLoads === 1, `one load, no reload (top-frame loads: ${
 await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
+
+// 5. Placed windows: Wine moves, sizes and stacks them; the page follows.
+if (placedChecks) {
+  // The placed windows' canvases (bare-desktop.js stacks them from z 2000000),
+  // bottom to top, in page coordinates.
+  const wins = async () => JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('canvas')]
+    .filter((c) => Number(c.style.zIndex) >= 2000000 && c.isConnected)
+    .map((c) => { const r = c.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: c.width, h: c.height, z: Number(c.style.zIndex) }; })
+    .sort((a, b) => a.z - b.z))`) ?? '[]');
+  const main = async () => (await wins()).reduce((a, w) => (!a || w.w * w.h > a.w * a.h ? w : a), null);
+  // A held button names itself on every move, as a real mouse's does
+  // (Chrome drops an element's pointer capture on a move with no button).
+  const mouse = (type, x, y, held) => browser.send('Input.dispatchMouseEvent',
+    { type, x, y, button: type === 'mouseMoved' && !held ? 'none' : 'left', buttons: held ? 1 : 0, clickCount: 1 }, page);
+  const drag = async (x, y, x2, y2) => {
+    await mouse('mouseMoved', x, y, false); await sleep(150);
+    await mouse('mousePressed', x, y, true); await sleep(150);
+    for (let k = 1; k <= 10; k++) { await mouse('mouseMoved', Math.round(x + (x2 - x) * k / 10), Math.round(y + (y2 - y) * k / 10), true); await sleep(60); }
+    await mouse('mouseReleased', x2, y2, false);
+  };
+  const key = async (k, code, vk, modifiers = 0) => {
+    if (modifiers & 2) await browser.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, modifiers: 2 }, page);
+    await browser.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: k, code, windowsVirtualKeyCode: vk, modifiers }, page);
+    await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk, modifiers }, page);
+    if (modifiers & 2) await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, modifiers: 0 }, page);
+  };
+  // Wait up to 15 s for `want(state)`, then for the state to hold still for
+  // a second (a size loop resizes as the drag's moves arrive).
+  const until = async (get, want) => {
+    let v, same = 0, last = '';
+    for (let i = 0; i < 60; i++) {
+      v = await get();
+      const k = JSON.stringify(v);
+      same = k === last ? same + 1 : 0; last = k;
+      if (v && want(v) && same >= 4) return v;
+      await sleep(250);
+    }
+    return v;
+  };
+  const fmt = (w) => w ? `${w.w}x${w.h} at ${w.x},${w.y}` : 'none';
+  let m = await main();
+  if (check(!!m, `a placed window (${fmt(m)}; the bare desktop and Wine's gex_window_placement_v1)`)) {
+    // Not cascaded: Paint's own placement (stage.sh: 0,0) is where it is.
+    check(m.x === 0 && m.y === 0, `the first window is where Wine put it, not cascaded (${fmt(m)})`);
+    // Caption drag: by (+40, +30).
+    const before = m;
+    await drag(before.x + Math.round(before.w / 2), before.y + 10, before.x + Math.round(before.w / 2) + 40, before.y + 40);
+    m = await until(main, (w) => w.x === before.x + 40 && w.y === before.y + 30);
+    check(m.x === before.x + 40 && m.y === before.y + 30 && m.w === before.w, `a caption drag moves it by the drag (${fmt(before)} -> ${fmt(m)})`);
+    // Right border: out by 30 (past the canvas: the pointer stays captured), then in by 60.
+    const at = m;
+    await drag(at.x + at.w - 3, at.y + Math.round(at.h / 2), at.x + at.w - 3 + 30, at.y + Math.round(at.h / 2));
+    m = await until(main, (w) => w.w > at.w);
+    check(m.w >= at.w + 25 && m.w <= at.w + 35 && m.x === at.x, `a border drag past its edge grows it (${fmt(at)} -> ${fmt(m)})`);
+    const grown = m;
+    await drag(grown.x + grown.w - 3, grown.y + Math.round(grown.h / 2), grown.x + grown.w - 3 - 60, grown.y + Math.round(grown.h / 2));
+    m = await until(main, (w) => w.w < grown.w);
+    check(m.w >= grown.w - 65 && m.w <= grown.w - 55 && m.x === grown.x, `a border drag inside it shrinks it (${fmt(grown)} -> ${fmt(m)})`);
+    // An owned dialog stays above its owner when the owner is clicked.
+    await key('w', 'KeyW', 87, 2);
+    let ws = await until(wins, (l) => l.length >= 2);
+    const dlg = ws.length >= 2 ? ws[ws.length - 1] : null;
+    if (check(!!dlg && dlg.w * dlg.h < m.w * m.h, `Ctrl+W opens a dialog above Paint (${fmt(dlg)})`)) {
+      // Click Paint's client area away from the dialog.
+      const cx = m.x + m.w - 40 > dlg.x + dlg.w ? m.x + m.w - 40 : m.x + 40;
+      const cy = m.y + m.h - 60;
+      await mouse('mouseMoved', cx, cy, false); await sleep(100);
+      await mouse('mousePressed', cx, cy, true); await mouse('mouseReleased', cx, cy, false);
+      await sleep(2000);
+      ws = await wins();
+      const top = ws[ws.length - 1];
+      check(top && top.w === dlg.w && top.h === dlg.h, `a click on Paint leaves its dialog on top (top ${fmt(top)})`);
+      await key('Escape', 'Escape', 27);
+      ws = await until(wins, (l) => l.length === 1);
+      check(ws.length === 1, `Escape closes the dialog (${ws.length} placed window(s))`);
+    }
+  }
+}
 done();
