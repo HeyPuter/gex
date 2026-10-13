@@ -240,7 +240,15 @@ async function main() {
   if (q.get('t1fold')) globalThis.GEX_T1_FOLD = Number(q.get('t1fold'));
   if (q.get('xlatereport')) globalThis.GEX_XLATE_REPORT = Number(q.get('xlatereport'));
   if (q.get('inlinedispatch')) globalThis.GEX_INLINE_DISPATCH = Number(q.get('inlinedispatch'));
-  const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
+  // `size=WxH`, or `size=fit`: the browser's viewport at load (a desktop
+  // the size of the window it is shown in, so that a maximized program fills
+  // the page). The desktop is then the whole page, which does not scroll: the
+  // log below it would otherwise add scrollbars and so overflow the viewport.
+  const fit = q.get('size') === 'fit';
+  if (fit) document.documentElement.style.overflow = 'hidden';
+  const [w, h] = fit
+    ? [Math.max(640, document.documentElement.clientWidth), Math.max(480, document.documentElement.clientHeight)]
+    : (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
   canvas.width = w;
   canvas.height = h;
