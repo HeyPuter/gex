@@ -1,6 +1,6 @@
 // Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
 import './zfetch.js';
-import { requestGexDevice, textureCanvas } from './gpu-device.js';
+import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -37,6 +37,7 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  releaseToken,
 } from '@gex/wl-bridge.mjs';
 
 // -- decoration metrics -----------------------------------------------------
@@ -506,6 +507,9 @@ class Compositor {
 
   dropMemory(token) {
     this.#memories.delete(token);
+    // Its windows too: a process that was killed never released its block.
+    const n = releaseToken(this.#channel, token);
+    if (n) this.#note(`released ${n} block(s) of exited process ${token}`);
   }
 
   /** The content size a window should have to fit the output with its frame. */
@@ -513,10 +517,14 @@ class Compositor {
     const maxW = Math.max(160, this.#outW - 2 * BORDER);
     const maxH = Math.max(120, this.#outH - TITLE_H - 2 * BORDER);
     // The size the compositor chose (a resize, a maximize) if it chose one,
-    // or the size the client drew.
-    const w = win.want?.w ?? win.width;
-    const h = win.want?.h ?? win.height;
-    return { w: Math.min(w || maxW, maxW), h: Math.min(h || maxH, maxH) };
+    // or 0x0: the client's own choice (xdg_toplevel.configure), within the
+    // bounds it was told. Never the size it last drew. That was racy: a
+    // commit seen before its buffer scale (foot's first frame at dpr 2) was
+    // read at twice its size, and sending that size back made the client
+    // adopt it. foot then opened at 1391x988 surface units, twice the size of
+    // the output.
+    if (!win.want) return { w: 0, h: 0 };
+    return { w: Math.min(win.want.w, maxW), h: Math.min(win.want.h, maxH) };
   }
 
   /** A client asked for a move, a resize or a maximize: `Request::code`. */
@@ -1072,6 +1080,8 @@ class Compositor {
   /** The CSS cursor the frame asks for under the pointer (a resize edge), or
    *  null over anything else. */
   #frameCursor = null;
+  /** What the pointer was last over, for a harness: `describe().pointer`. */
+  #lastHit = null;
 
   #updateCursor(byKey) {
     let css = 'default';
@@ -1341,6 +1351,7 @@ class Compositor {
       return;
     }
     const hit = this.#hit(x, y);
+    this.#lastHit = { x, y, key: hit?.key ?? null, part: hit?.part ?? null, edges: hit?.edges ?? 0 };
     this.#frameCursor = hit?.part === 'resize' ? RESIZE_CURSORS[hit.edges] ?? 'default' : null;
     const over = hit && hit.part === 'content' ? hit.key : null;
     if (this.#pointer.over && this.#pointer.over !== over) {
@@ -1507,7 +1518,7 @@ class Compositor {
       // appear twice rather than infer it from a screenshot.
       list: [...this.#windows.values()].map((w) =>
         `${w.key} role=${w.role} ${w.width}x${w.height}@${w.x},${w.y}`
-        + ` serial=${w.info?.serial ?? 0} "${w.title}"`),
+        + ` serial=${w.info?.serial ?? 0} scale=${w.bs ?? 1}/${w.cs ?? 1} "${w.title}"`),
       log: this.#log.slice(-24),
       staging: this.#stagingOk === false,
       titles: wins.map((w) => w.title || '(untitled)'),
@@ -1525,6 +1536,9 @@ class Compositor {
       // The GL windows the host's Mesa holds, as `kind:id@token`: a process
       // that has exited must have none (its 'drop-memory').
       glWindows: glDevice ? glDevice.surfaces().map((s) => `${s.kind}:${s.id}@${s.token}`) : [],
+      // The GPU objects this Worker made and has not destroyed (gpu-device.js).
+      gpu: gpuLive(),
+      pointer: this.#lastHit,
       turns,
     };
   }

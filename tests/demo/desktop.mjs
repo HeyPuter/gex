@@ -28,6 +28,7 @@
 //                                        then a title double-click maximizes and restores
 //   {"fits": "ID"}                       the launcher's item ID opens inside the output, at a
 //                                        terminal's size in CSS pixels at any dpr
+//   {"close": "NAME"}                   end program NAME; its window must go ("title")
 //   {"animates": "TITLE"}                a window titled TITLE appears and its own pixels
 //                                        change ("samples", "every" ms, "min" changes)
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
@@ -37,7 +38,8 @@
 //                                        X server's live pools must not grow
 // A run step with "show": true prints the command's output tail even on success.
 // Env: CHROME, DEMO_WALL (s, default 300), DEMO_WEBGPU=sw (SwiftShader),
-// DEMO_QUERY (appended to the URL), DEMO_PROFILE (a profile dir to keep),
+// DEMO_QUERY (appended to the URL), DEMO_SIGTERM=hard (a program that ignores
+// SIGTERM fails, rather than being a known failure), DEMO_PROFILE (a profile dir to keep),
 // DEMO_DPR (--force-device-scale-factor), DEMO_CONSOLE (a file for every
 // console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
 // DEMO_STDERR (a file for the browser's whole stderr), DEMO_COUNT=1 (print
@@ -490,7 +492,7 @@ async function legs() {
   if (process.env.DEMO_FOOT !== '0') {
     await fitsLeg({ fits: 'foot', keep: true });
     await resizeLeg({ resize: 'foot', maximize: true });
-    await guestRun('kill $(pidof foot) 2>/dev/null; sleep 1');
+    await closeProgram('foot');
   }
   if (process.env.DEMO_RESIZE !== '0') await resizeLeg({ resize: 'bash', label: 'the xterm' });
 }
@@ -591,7 +593,40 @@ async function fitsLeg(step) {
   if (!ok) failed = true;
   log(`${ok ? 'ok' : 'FAIL'} ${id} fits: ${w}x${h} at ${x},${y} in a ${outW}x${outH} output (dpr ${dpr}), ${css[0]}x${css[1]} CSS pixels`
     + `${inside ? '' : '; past the output'}${sane ? '' : '; not a terminal\'s size'}`);
-  if (!step.keep) await guestRun(`kill $(pidof ${step.process ?? id}) 2>/dev/null; sleep 1`);
+  if (!step.keep) await closeProgram(step.process ?? id, title);
+}
+/**
+ * End a program and wait for its window to go. `pidof` alone missed foot (its
+ * window stayed, and covered the xterm's corner in the resize leg that
+ * followed), so the process table is searched by name as well.
+ */
+async function closeProgram(name, title = name) {
+  const pids = `$(pidof ${name}) $(ps -eo pid=,comm= | awk '$2 == "${name}" {print $1}')`;
+  const gone = async (tries) => {
+    for (let i = 0; i < tries; i++) {
+      const d = await ev('globalThis.__gexCompositor.describe()');
+      if (!d?.list.some((l) => / role=1 /.test(l) && l.endsWith(`"${title}"`))) return true;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return false;
+  };
+  await guestRun(`kill ${pids} 2>/dev/null; sleep 1`).catch(() => {});
+  if (await gone(10)) return true;
+  // foot blocks SIGTERM and takes it in epoll_pwait's mask, which the kernel
+  // does not apply yet, so it never sees the signal. Said, then SIGKILL, so the
+  // legs after this one get a desktop without a stray window over it.
+  // A known failure until the kernel applies epoll_pwait's mask (routed to W);
+  // DEMO_SIGTERM=hard makes it a hard check, which it becomes once that lands.
+  const hard = process.env.DEMO_SIGTERM === 'hard';
+  if (hard) failed = true;
+  log(`${hard ? 'FAIL' : 'known failure:'} ${name} ignored SIGTERM (still running 5 s after it:`
+    + ' the kernel does not apply epoll_pwait\'s signal mask); sending SIGKILL');
+  await guestRun(`kill -9 ${pids} 2>/dev/null; sleep 1`).catch(() => {});
+  if (await gone(20)) return true;
+  failed = true;
+  const ps = await guestRun('ps -eo pid,comm,args').catch(() => ({ lines: [] }));
+  log(`FAIL ${name} exits: its window ${JSON.stringify(title)} is still there after SIGKILL; processes ${JSON.stringify(ps.lines?.map((l) => l.trim()).filter(Boolean))}`);
+  return false;
 }
 /** A window's line in describe(), as numbers, with the page's scale. */
 async function windowAt(title) {
@@ -655,6 +690,7 @@ async function resizeLeg(step) {
   await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: sx, y: sy }, s);
   await new Promise((r) => setTimeout(r, 300));
   const cursor = (await ev("getComputedStyle(document.getElementById('out')).cursor")) || '';
+  const under = (await ev('globalThis.__gexCompositor.describe()'))?.pointer ?? null;
   await mouse('mousePressed', sx, sy);
   const gx = pick.dir[0] * Math.min(160, pick.room[0]);
   const gy = pick.dir[1] * Math.min(100, pick.room[1]);
@@ -673,7 +709,7 @@ async function resizeLeg(step) {
   if (!grew) failed = true;
   log(`${grew ? 'ok' : 'FAIL'} ${label} resizes: its ${pick.name} corner dragged ${Math.round(gx)},${Math.round(gy)} CSS pixels,`
     + ` ${a.w}x${a.h} became ${z ? `${z.w}x${z.h}` : 'nothing'} (cursor over the corner ${JSON.stringify(cursor)})`
-    + `${grew ? '' : `; compositor log ${JSON.stringify((await ev('globalThis.__gexCompositor.describe()'))?.log.slice(-8))}`}`);
+    + `${grew ? '' : `; the compositor saw ${JSON.stringify(under)} under the pointer; windows ${JSON.stringify((await ev('globalThis.__gexCompositor.describe()'))?.list)}`}`);
   if (!step.maximize || !z) return;
   // The title bar, a double-click: the whole output, then back.
   const [tx, ty] = css(z.x + z.w / 3, z.y - 10);
@@ -709,10 +745,28 @@ async function resizeLeg(step) {
     + ` in a ${z.output} output, a second ${back ? `${back.w}x${back.h}` : 'nothing'} (was ${z.w}x${z.h})`);
 }
 /** The GPU's used memory in MiB (nvidia-smi), or null where there is none. */
+let gpuSource = 'the card\'s total';
 async function gpuMiB() {
   const { execFileSync } = await import('node:child_process');
+  // This browser's own, when the driver says per process (nvidia-smi lists a
+  // Vulkan/GL user as C+G): a correctness run shares the card with another
+  // stream's browser, and the card's total is then theirs plus ours.
   try {
-    const out = execFileSync('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { encoding: 'utf8' });
+    const procs = execFileSync('nvidia-smi', ['--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 10000 })
+      .trim().split('\n').filter(Boolean).map((l) => l.split(',').map((v) => Number(v.trim())));
+    const ps = execFileSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8' }).trim().split('\n')
+      .map((l) => l.trim().split(/\s+/).map(Number));
+    const ours = new Set([chrome.pid]);
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [pid, ppid] of ps) if (ours.has(ppid) && !ours.has(pid)) { ours.add(pid); grew = true; }
+    }
+    const mine = procs.filter(([pid]) => ours.has(pid));
+    if (mine.length) gpuSource = 'this browser\'s processes';
+    if (mine.length) return mine.reduce((t, [, mib]) => t + mib, 0);
+  } catch { /* the card's total, below */ }
+  try {
+    const out = execFileSync('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 10000 });
     return Number(out.trim().split('\n')[0]);
   } catch {
     return null;
@@ -746,7 +800,7 @@ async function glCycles(step) {
   const ok = grew <= slack;
   if (!ok) failed = true;
   log(`${ok ? 'ok' : 'FAIL'} GPU memory across ${n} GL clients: ${seen.join(' -> ')} MiB`
-    + ` (before any, then after each exits); ${grew} MiB since the first, ${slack} allowed`);
+    + ` (before any, then after each exits; ${gpuSource}); ${grew} MiB since the first, ${slack} allowed`);
 }
 /** Once a GL program has exited, the host's Mesa holds none of its windows.
  *  It used to keep every one: nothing told the compositor a process had gone,
@@ -910,6 +964,8 @@ try {
         }
       }
       log(`typed ${JSON.stringify(step.type)}`);
+    } else if (step.close) {
+      if (await closeProgram(step.close, step.title ?? step.close)) log(`ok ${step.close} exits`);
     } else if (step.install || step.launch) {
       const id = step.install || step.launch;
       const a = Date.now();

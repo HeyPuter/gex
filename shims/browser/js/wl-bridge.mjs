@@ -219,6 +219,28 @@ export function readScene(channel, { onlyChanged = false } = {}) {
   return { surfaces: out, blocks };
 }
 
+/**
+ * A process has exited: its block's surfaces go, and the block is free.
+ *
+ * A process that ends normally gives its block back (`release`), but one that
+ * is killed never runs that code, and its last published scene stayed on the
+ * screen: foot after SIGKILL kept its window, over the xterm the next leg
+ * tried to resize. The compositor learns of every exit ('drop-memory'), so it
+ * clears what the process left. Compare-and-swap, so a block some new process
+ * has already claimed is left alone.
+ */
+export function releaseToken(channel, token) {
+  const a = new Int32Array(channel.arena);
+  let n = 0;
+  for (let b = 0; b < BLOCKS; b++) {
+    const base = blockBase(b);
+    if (!token || Atomics.load(a, base + B_TOKEN) !== token) continue;
+    Atomics.store(a, base + B_COUNT, 0);
+    if (Atomics.compareExchange(a, base + B_TOKEN, token, 0) === token) n++;
+  }
+  return n;
+}
+
 /** Say that everything published up to `gen` has been drawn. */
 export function ackBlock(channel, block, gen) {
   const a = new Int32Array(channel.arena);
