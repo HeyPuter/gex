@@ -4506,7 +4506,12 @@ export class Gex {
       this.#cgenProviders(u);
       return;
     }
-    this.#cgenPublish(u, key, path, got);
+    if (this.#cgenPublish(u, key, path, got) === 1) {
+      // Another thread of this process took the same wanted unit first and
+      // publishes it (and its providers and region entries); installed here.
+      console.error(`gex-nt: function tier for ${path}: placed by another thread`);
+      return;
+    }
     this.#cgenProviders(u);
     console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
@@ -4524,6 +4529,7 @@ export class Gex {
     if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
     this.#cgenCatchUp();
     e.gex_cgen_installed(u);
+    return r;
   }
 
   /** The unit cache's link groups (`groups/index.txt`: a group key, then its

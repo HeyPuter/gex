@@ -176,6 +176,16 @@ static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 static WANTED: Mutex<std::collections::VecDeque<usize>> = Mutex::new(std::collections::VecDeque::new());
 /// Published units, in publish order: what every Worker installs.
 static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Units a Worker has started publishing. `gex_cgen_wanted` hands the queue's
+/// front to every Worker that asks until it is published, so two threads of a
+/// process can load and publish the same unit; the second publish found every
+/// page numbered already and replaced the unit's `dirs` with nothing, and
+/// whichever install read them after that wrote no directory entry at all
+/// (Paint's startup livelock, scratch/P/stall85, run 104: uiribbon placed
+/// twice). The first claim publishes; the others only install.
+static CLAIMED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+/// Publishes refused because another Worker had claimed the unit.
+pub(crate) static TWICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The pages installed units cover, hashed as built (`on_retire`).
 static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
 /// The process's function table, host side (`gex_kernel::ftab`): one for
@@ -593,7 +603,11 @@ fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
 #[no_mangle]
 pub extern "C" fn gex_cgen_wanted() -> i32 {
     drain();
-    lock(&WANTED).front().map_or(-1, |&u| u as i32)
+    // Not one another Worker is publishing (`CLAIMED`): it leaves the queue
+    // when that publish ends.
+    let w = lock(&WANTED);
+    let claimed = lock(&CLAIMED);
+    w.iter().find(|&&u| !claimed.contains(&(u as u32))).map_or(-1, |&u| u as i32)
 }
 
 /// `v` into a buffer of the shim's heap (above the guest's limit).
@@ -662,6 +676,10 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 /// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
+    if !lock(&CLAIMED).insert(u) {
+        TWICE.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
     let raw = crate::shim_slice(entries, 8 * n);
     let slots: Vec<u64> = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
     let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
