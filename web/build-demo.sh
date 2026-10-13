@@ -254,13 +254,21 @@ cp "$PUB/rootfs/base.tar.zst" "$STAGE/rootfs/"
 # Mesa (the host's GL, gex_wgpu), fetched only when a GL program starts.
 if [ -f "$PUB/gex/gex-wgpu-replay.wasm" ]; then
     cp "$PUB/gex/gex-wgpu-replay.js" "$PUB/gex/gex-wgpu-replay.wasm" "$STAGE/gex/"
+    # And its cold part, when the build split it (web/mesa-split.py). Plain,
+    # not .zst: a miss before the prefetch has landed loads it with a
+    # synchronous XHR (web/gex-wgpu-split.js), which zfetch.js cannot decode,
+    # and without the file the static server answers index.html -- every GL
+    # client then failed its first cold call and never drew a frame.
+    if [ -f "$PUB/gex/gex-wgpu-replay.deferred.wasm" ]; then
+        wasm-tools strip "$PUB/gex/gex-wgpu-replay.deferred.wasm" -o "$STAGE/gex/gex-wgpu-replay.deferred.wasm"
+    fi
 else
     echo "  no web/public/gex/gex-wgpu-replay.wasm (web/build-all.sh --mp --gl-only): GL items will not draw" >&2
 fi
 [ -d "$PUB/pkgs" ] && cp -r "$PUB/pkgs" "$STAGE/"
 [ -d "$PUB/gex-apt" ] && cp -r "$PUB/gex-apt" "$STAGE/"
 before=0 stripped=0 packed=0
-for w in $(find "$STAGE/gex" -name '*.wasm' -not -path '*/cgen/*'); do
+for w in $(find "$STAGE/gex" -name '*.wasm' -not -path '*/cgen/*' -not -name '*.deferred.wasm'); do
     b=$(size "$w"); before=$((before + b))
     case ${w##*/} in
     seed*.wasm) wasm-tools strip -d '^\.debug' "$w" -o "$w.s" ;;  # keeps gex.* and name
