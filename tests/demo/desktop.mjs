@@ -22,6 +22,12 @@
 //   {"keys": ["Escape", ...]}            named keys (KeyboardEvent.code)
 //   {"eval": "EXPR"}                     EXPR in the page, its value printed
 //   {"gl": true}                         the glxgears legs: from the xterm, then the launcher
+//   {"glcycles": N}                      glxgears from the launcher, killed, N times: GPU
+//                                        memory (nvidia-smi) must not grow per client
+//   {"resize": "TITLE", "maximize": true}  drag the window's corner; it must redraw bigger;
+//                                        then a title double-click maximizes and restores
+//   {"fits": "ID"}                       the launcher's item ID opens inside the output, at a
+//                                        terminal's size in CSS pixels at any dpr
 //   {"animates": "TITLE"}                a window titled TITLE appears and its own pixels
 //                                        change ("samples", "every" ms, "min" changes)
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
@@ -36,7 +42,7 @@
 // console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
 // DEMO_STDERR (a file for the browser's whole stderr), DEMO_COUNT=1 (print
 // the X server's ?hostxcount lines), DEMO_GL=0 (skip the
-// glxgears legs).
+// glxgears legs), DEMO_FOOT=0 (skip the foot leg).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdtempSync, rmSync } from 'node:fs';
@@ -481,6 +487,12 @@ async function legs() {
   await truth({ rounds: 3 });
   await poolLeg({});
   if (process.env.DEMO_GL !== '0') await glLeg();
+  if (process.env.DEMO_FOOT !== '0') {
+    await fitsLeg({ fits: 'foot', keep: true });
+    await resizeLeg({ resize: 'foot', maximize: true });
+    await guestRun('kill $(pidof foot) 2>/dev/null; sleep 1');
+  }
+  if (process.env.DEMO_RESIZE !== '0') await resizeLeg({ resize: 'bash', label: 'the xterm' });
 }
 /**
  * glxgears from the xterm, typed, and then from the launcher: both are the
@@ -537,6 +549,204 @@ async function workerStacks(match = /compositor/) {
       await b.send('Debugger.resume', {}, sid);
     } catch { /* gone */ }
   }
+}
+/**
+ * A Wayland program started from the launcher opens at a size that fits the
+ * output, drawn at the page's density. foot used to open four screens wide at
+ * dpr 2: every new window was told the whole output, and no surface was ever
+ * said to be on the output, so foot never learned its scale. Fits: its frame
+ * is inside the output. Sane: its size in CSS pixels is a terminal's, not
+ * double (or half) one -- the same at every dpr.
+ */
+async function fitsLeg(step) {
+  const id = step.fits;
+  await ev(`globalThis.gexDesktop.launch(${JSON.stringify(id)})`);
+  const title = step.title ?? id;
+  let d = null, line = null;
+  const end = Date.now() + (step.wall ?? 60) * 1000;
+  while (Date.now() < end) {
+    d = await ev('globalThis.__gexCompositor.describe()');
+    line = d?.list.find((l) => / role=1 /.test(l) && l.endsWith(`"${title}"`));
+    if (line) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!line) {
+    failed = true;
+    log(`FAIL ${id} fits: no window titled ${JSON.stringify(title)}; windows ${JSON.stringify(d?.list)}`);
+    return;
+  }
+  // Settled: a client may resize once it has its first configure.
+  await new Promise((r) => setTimeout(r, 2000));
+  d = await ev('globalThis.__gexCompositor.describe()');
+  line = d.list.find((l) => / role=1 /.test(l) && l.endsWith(`"${title}"`)) ?? line;
+  const [, w, h, x, y] = /(\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(line).map(Number);
+  const [outW, outH] = d.output.split('x').map(Number);
+  const dpr = await ev('devicePixelRatio');
+  const inside = x >= 0 && y >= 0 && x + w <= outW && y + h <= outH;
+  const css = [Math.round(w / dpr), Math.round(h / dpr)];
+  // foot's default is 700x500 surface units; a terminal of 80x24 cells of a
+  // normal font is 500-1000 by 300-700.
+  const sane = css[0] >= 300 && css[0] <= 1100 && css[1] >= 200 && css[1] <= 800;
+  const ok = inside && sane;
+  if (!ok) failed = true;
+  log(`${ok ? 'ok' : 'FAIL'} ${id} fits: ${w}x${h} at ${x},${y} in a ${outW}x${outH} output (dpr ${dpr}), ${css[0]}x${css[1]} CSS pixels`
+    + `${inside ? '' : '; past the output'}${sane ? '' : '; not a terminal\'s size'}`);
+  if (!step.keep) await guestRun(`kill $(pidof ${step.process ?? id}) 2>/dev/null; sleep 1`);
+}
+/** A window's line in describe(), as numbers, with the page's scale. */
+async function windowAt(title) {
+  return ev(`(() => {
+    const c = document.getElementById('out').getBoundingClientRect();
+    const k = c.width / document.getElementById('out').width || 1;
+    return globalThis.__gexCompositor.describe().then((d) => {
+      const line = d.list.find((l) => / role=1 /.test(l) && l.endsWith(${JSON.stringify(`"${title}"`)}));
+      if (!line) return null;
+      const [w, h, x, y] = /(\\d+)x(\\d+)@(-?\\d+),(-?\\d+)/.exec(line).slice(1).map(Number);
+      return { w, h, x, y, k, left: c.left, top: c.top, output: d.output };
+    });
+  })()`);
+}
+/**
+ * The frame resizes a window: its bottom-right corner dragged by the pointer
+ * (CDP), and the window's committed size -- what the client drew, not what
+ * it was asked -- must grow, which is the client laying itself out again.
+ * With "maximize": a double-click on the title bar fills the output, and a
+ * second puts it back.
+ */
+async function resizeLeg(step) {
+  const title = step.resize;
+  const label = step.label ?? title;
+  const a = await windowAt(title);
+  if (!a) {
+    failed = true;
+    log(`FAIL ${label} resizes: no window titled ${JSON.stringify(title)}`);
+    return;
+  }
+  const css = (dx, dy) => [a.left + dx * a.k, a.top + dy * a.k];
+  // A corner just outside the frame, in the resize band, that is on the
+  // page's canvas (the launcher is a page window and may cover one) and has
+  // room to be dragged outwards: bottom-right first.
+  const [vw, vh] = [await ev('innerWidth'), await ev('innerHeight')];
+  const g = 3 / a.k;
+  const corners = [
+    { name: 'bottom-right', at: css(a.x + a.w + g, a.y + a.h + g), dir: [1, 1] },
+    { name: 'bottom-left', at: css(a.x - g - 1, a.y + a.h + g), dir: [-1, 1] },
+    { name: 'top-right', at: css(a.x + a.w + g, a.y - 26 / a.k - g), dir: [1, -1] },
+    { name: 'top-left', at: css(a.x - g - 1, a.y - 26 / a.k - g), dir: [-1, -1] },
+  ];
+  let pick = null;
+  for (const c of corners) {
+    const [x, y] = c.at;
+    const room = [c.dir[0] > 0 ? vw - x - 20 : x - 20, c.dir[1] > 0 ? vh - y - 20 : y - 20];
+    const onCanvas = await ev(`document.elementFromPoint(${x}, ${y})?.id === 'out'`);
+    if (onCanvas && room[0] >= 50 && room[1] >= 40) {
+      pick = { ...c, room };
+      break;
+    }
+  }
+  if (!pick) {
+    failed = true;
+    log(`FAIL ${label} resizes: no corner of ${a.w}x${a.h}@${a.x},${a.y} is on the canvas with room to drag`);
+    return;
+  }
+  const [sx, sy] = pick.at;
+  const mouse = (type, x, y) => b.send('Input.dispatchMouseEvent',
+    { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1 }, s);
+  await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: sx, y: sy }, s);
+  await new Promise((r) => setTimeout(r, 300));
+  const cursor = (await ev("getComputedStyle(document.getElementById('out')).cursor")) || '';
+  await mouse('mousePressed', sx, sy);
+  const gx = pick.dir[0] * Math.min(160, pick.room[0]);
+  const gy = pick.dir[1] * Math.min(100, pick.room[1]);
+  for (let i = 1; i <= 8; i++) {
+    await mouse('mouseMoved', sx + (gx * i) / 8, sy + (gy * i) / 8);
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  await mouse('mouseReleased', sx + gx, sy + gy);
+  let z = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    z = await windowAt(title);
+    if (z && z.w > a.w + 20 && z.h > a.h + 20) break;
+  }
+  const grew = z && z.w > a.w + 20 && z.h > a.h + 20;
+  if (!grew) failed = true;
+  log(`${grew ? 'ok' : 'FAIL'} ${label} resizes: its ${pick.name} corner dragged ${Math.round(gx)},${Math.round(gy)} CSS pixels,`
+    + ` ${a.w}x${a.h} became ${z ? `${z.w}x${z.h}` : 'nothing'} (cursor over the corner ${JSON.stringify(cursor)})`
+    + `${grew ? '' : `; compositor log ${JSON.stringify((await ev('globalThis.__gexCompositor.describe()'))?.log.slice(-8))}`}`);
+  if (!step.maximize || !z) return;
+  // The title bar, a double-click: the whole output, then back.
+  const [tx, ty] = css(z.x + z.w / 3, z.y - 10);
+  const dbl = async (x, y) => {
+    await b.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, s);
+    await new Promise((r) => setTimeout(r, 300));
+    for (const c of [1, 2]) {
+      await b.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: c }, s);
+      await b.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: c }, s);
+    }
+  };
+  await dbl(tx, ty);
+  const [outW, outH] = z.output.split('x').map(Number);
+  let m = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    m = await windowAt(title);
+    if (m && m.w >= outW * 0.9 && m.h >= outH * 0.8) break;
+  }
+  const maxed = m && m.w >= outW * 0.9 && m.h >= outH * 0.8 && m.w <= outW && m.h <= outH;
+  await new Promise((r) => setTimeout(r, 500));
+  if (m) await dbl(...css(m.x + m.w / 3, m.y - 10));
+  let back = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    back = await windowAt(title);
+    if (back && Math.abs(back.w - z.w) < 24 && Math.abs(back.h - z.h) < 24) break;
+  }
+  const restored = back && Math.abs(back.w - z.w) < 24 && Math.abs(back.h - z.h) < 24;
+  const ok = maxed && restored;
+  if (!ok) failed = true;
+  log(`${ok ? 'ok' : 'FAIL'} ${label} maximizes: a double-click on its title made it ${m ? `${m.w}x${m.h}` : 'nothing'}`
+    + ` in a ${z.output} output, a second ${back ? `${back.w}x${back.h}` : 'nothing'} (was ${z.w}x${z.h})`);
+}
+/** The GPU's used memory in MiB (nvidia-smi), or null where there is none. */
+async function gpuMiB() {
+  const { execFileSync } = await import('node:child_process');
+  try {
+    const out = execFileSync('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { encoding: 'utf8' });
+    return Number(out.trim().split('\n')[0]);
+  } catch {
+    return null;
+  }
+}
+/**
+ * GPU memory must not grow per GL client: glxgears started from the launcher
+ * and killed, N times, with the card's used memory read after each exit.
+ * Fails if the last reading is more than `slack` MiB (default 64) above the
+ * one after the first cycle, which is what a texture or context left behind
+ * per client looks like on a 2 GB card that later loses its device.
+ */
+async function glCycles(step) {
+  const n = step.glcycles;
+  await ev(`globalThis.gexDesktop.install('gears')`);
+  const seen = [await gpuMiB()];
+  for (let i = 0; i < n; i++) {
+    await ev(`globalThis.gexDesktop.launch('gears')`);
+    await animates({ animates: 'glxgears', label: `glxgears cycle ${i + 1} animates`, wall: 60, samples: 3, min: 2 });
+    await guestRun('kill $(pidof glxgears); sleep 2');
+    await glForgotten(`glxgears cycle ${i + 1}`);
+    seen.push(await gpuMiB());
+    log(`  GPU memory after cycle ${i + 1}: ${seen.join(' -> ')} MiB`);
+  }
+  if (seen.some((v) => v === null)) {
+    log(`ok GPU memory across ${n} GL clients: not measured here (no nvidia-smi)`);
+    return;
+  }
+  const slack = step.slack ?? 64;
+  const grew = seen[n] - seen[1];
+  const ok = grew <= slack;
+  if (!ok) failed = true;
+  log(`${ok ? 'ok' : 'FAIL'} GPU memory across ${n} GL clients: ${seen.join(' -> ')} MiB`
+    + ` (before any, then after each exits); ${grew} MiB since the first, ${slack} allowed`);
 }
 /** Once a GL program has exited, the host's Mesa holds none of its windows.
  *  It used to keep every one: nothing told the compositor a process had gone,
@@ -658,6 +868,12 @@ try {
       log(`eval ${step.eval}: ${JSON.stringify(await ev(step.eval)).slice(0, 400)}`);
     } else if (step.gl) {
       await glLeg();
+    } else if (step.fits) {
+      await fitsLeg(step);
+    } else if (step.resize) {
+      await resizeLeg(step);
+    } else if (step.glcycles) {
+      await glCycles(step);
     } else if (step.animates) {
       await animates(step);
     } else if (step.truth) {
