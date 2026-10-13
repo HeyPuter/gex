@@ -106,6 +106,26 @@ impl Pipe {
                 self.queue.notify();
     }
 
+    /// Read up to `max` bytes into a buffer of what was there, sized under
+    /// the pipe's own lock: a size taken from [`Pipe::buffered`] first can be
+    /// stale by the time of the read (another reader drained it, a writer
+    /// filled it), and a one-byte read of a pipe that then received a whole
+    /// record tears that record.
+    pub fn read_vec(&self, max: usize) -> Result<Vec<u8>, Errno> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut s = self.state.lock().unwrap();
+        if s.buf.is_empty() {
+            return if s.writers == 0 { Ok(Vec::new()) } else { Err(Errno::EAGAIN) };
+        }
+        let n = max.min(s.buf.len());
+        let out: Vec<u8> = s.buf.drain(..n).collect();
+        self.ready.notify_all();
+        self.queue.notify();
+        Ok(out)
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
         if buf.is_empty() {
             return Ok(0);
@@ -267,6 +287,18 @@ impl Pipe {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `read_vec` takes up to what is there, sized under the lock: never a
+    /// stale size that splits a record.
+    #[test]
+    fn read_vec_takes_whole_records() {
+        let p = Pipe::new();
+        assert_eq!(p.read_vec(64), Err(Errno::EAGAIN));
+        p.write(&[3u8; 64]).unwrap();
+        p.write(&[4u8; 64]).unwrap();
+        assert_eq!(p.read_vec(64).unwrap(), vec![3u8; 64]);
+        assert_eq!(p.read_vec(1000).unwrap(), vec![4u8; 64]);
+    }
 
     #[test]
     fn write_then_read_roundtrips() {
@@ -533,4 +565,5 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             (self.remote.buffered)(self.id)
         )
     }
+
 }
