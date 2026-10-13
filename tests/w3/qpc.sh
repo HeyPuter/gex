@@ -1,9 +1,9 @@
 #!/bin/bash
 # The performance counter on W3 (qpc.c): frequency, monotonic within and
 # across threads, deltas agreeing with the system time. Prints "qpc ok N R".
-# Natively (gexc run) and in the page's runtime under Node (run-node.mjs);
-# each also with WINEGEX_FASTQPC=0 (the system call: A/B while F2 of
-# docs/wine-overhead.md is measured).
+# Natively (gexc run) and in the page's runtime under Node (run-node.mjs).
+# W3's NtQueryPerformanceCounter reads gex.clock_ns with no system call
+# (docs/wine-overhead.md F2), one call in 64 still making it.
 #
 #   tests/w3/qpc.sh DIST PREFIX [gexc]
 #
@@ -25,8 +25,8 @@ verdict() { # NAME LOG
 	if grep -q "^$want" "$2"; then pass=$((pass + 1)); echo "ok   $1"
 	else fail=$((fail + 1)); echo "FAIL $1"; grep -v '^\[host\]\|gex-console-error' "$2" | tail -8 | sed 's/^/  /'; fi
 }
-for mode in fast slow; do
-	extra=(); [ $mode = slow ] && extra=(--env WINEGEX_FASTQPC=0)
+for mode in fast; do
+	extra=()
 	if [ -x "$gexc" ]; then
 		rm -rf "$w/pfx-native"; cp -a "$prefix" "$w/pfx-native"; cp "$w/qpc.exe" "$w/pfx-native/drive_c/"
 		(cd "$w/pfx-native/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run \
