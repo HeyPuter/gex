@@ -975,6 +975,12 @@ export class Gex {
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       const at = this.#shim.exports.gex_worker_init?.();
+      // No slot: every one of the process's 64 is held by a live instance.
+      // Running on would put this instance's thread-locals at address zero
+      // (`__tls_base` unset), over the guest's memory.
+      if (at === 0 && (isShared(this.#memory.buffer) || single.on)) {
+        throw new Error('gex: no shim stack slot left for this Worker (64 instances of this process are live)');
+      }
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }
     return this.#stackTop;
@@ -1093,6 +1099,17 @@ export class Gex {
   }
 
   get shim() { return this.#shim; }
+
+  /**
+   * Give this instance's stack and thread-local slot back to the process
+   * (`gex_worker_release`). The last call into this instance: the slot's next
+   * holder runs on the same stack.
+   */
+  releaseWorker() {
+    if (this.#stackTop === null) return;
+    try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
+    this.#stackTop = null;
+  }
 
   /**
    * Translated modules this Worker has installed into its own dispatch tables.

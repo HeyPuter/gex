@@ -3597,36 +3597,57 @@ extern "C" {
     fn __wasm_init_tls(ptr: *mut u8);
 }
 
-/// Claim a slot for this Worker and return the top of its stack.
+/// Which slots a live instance holds (bit `i`), and where each slot's span
+/// of arena is once one was taken for it (0: never).
+#[cfg(feature = "shared-memory")]
+static SLOT_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "shared-memory")]
+static SLOT_BASE: [std::sync::atomic::AtomicU64; slots::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; slots::COUNT];
+
+/// Claim a slot for this Worker and return the top of its stack, or 0 when
+/// all `COUNT` are held.
 ///
-/// Called once per Worker before anything else. The caller writes the answer
-/// into `__stack_pointer` (a wasm global cannot be assigned from inside its own
-/// module). Slots are never given back: a process may not run more than
-/// `COUNT` threads at once, and the host recycles Workers.
+/// Called once per Worker instance before anything else. The caller writes
+/// the answer into `__stack_pointer` (a wasm global cannot be assigned from
+/// inside its own module). A slot is given back by `gex_worker_release` when
+/// the instance is done: a process that starts threads one after another
+/// (handles.exe's children make 150) gets a new instance per thread, and
+/// with slots never returned the 65th ran with no thread-local block --
+/// `__tls_base` zero, its thread-locals over the guest's low memory.
 #[cfg(feature = "shared-memory")]
 #[no_mangle]
 pub extern "C" fn gex_worker_init() -> u32 {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel) as usize;
-    if i >= slots::COUNT {
-        return 0;
-    }
-    // This Worker's own span of arena. The cursor is atomic and the bytes
-    // above it belong to nobody, so two Workers arriving together get two
-    // spans without a lock between them.
-    arena_note(2, (slots::STACK + slots::TLS) as u64);
-    let Some(base) = arena_take((slots::STACK + slots::TLS) as u64) else {
-        return 0;
-    };
-    // SAFETY: `base` is this Worker's alone -- the arena cursor handed it out
-    // and will not hand it out again -- and the memory behind it has been
-    // grown to cover it.
-    unsafe {
-        let at = base as u32 as *mut u8;
-        extern "C" {
-            static __heap_base: u8;
+    use std::sync::atomic::Ordering;
+    let i = loop {
+        let used = SLOT_USED.load(Ordering::Acquire);
+        let i = (!used).trailing_zeros() as usize;
+        if i >= slots::COUNT {
+            return 0;
         }
-        memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        if SLOT_USED.compare_exchange(used, used | 1 << i, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            break i;
+        }
+    };
+    let mut base = SLOT_BASE[i].load(Ordering::Acquire);
+    if base == 0 {
+        // This slot's own span of arena. The cursor is atomic and the bytes
+        // above it belong to nobody, so two Workers arriving together get two
+        // spans without a lock between them.
+        arena_note(2, (slots::STACK + slots::TLS) as u64);
+        let Some(b) = arena_take((slots::STACK + slots::TLS) as u64) else {
+            SLOT_USED.fetch_and(!(1 << i), Ordering::AcqRel);
+            return 0;
+        };
+        base = b;
+        SLOT_BASE[i].store(base, Ordering::Release);
+        // SAFETY: as below; the claims name the span once, when it is taken.
+        unsafe {
+            extern "C" {
+                static __heap_base: u8;
+            }
+            memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        }
         memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
         memmap::claim(
             memmap::Kind::Tls,
@@ -3635,7 +3656,14 @@ pub extern "C" fn gex_worker_init() -> u32 {
             base + (slots::STACK + slots::TLS) as u64,
             "thread-locals",
         );
+    }
+    // SAFETY: `base` is this Worker's alone -- its bit in `SLOT_USED` says so
+    // until `gex_worker_release` -- and the memory behind it has been grown to
+    // cover it.
+    unsafe {
+        let at = base as u32 as *mut u8;
         __wasm_init_tls(at.add(slots::STACK));
+        CLAIMED.with(|c| c.set(true));
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
         WORKER.with(|w| w.set(i as u32));
@@ -3652,6 +3680,20 @@ pub extern "C" fn gex_worker_init() -> u32 {
 
 #[cfg(feature = "shared-memory")]
 const STACK_GUARD: u32 = 0x5747_5d0d;
+/// Give this instance's slot back (`gex_worker_init`): the last call the
+/// Worker makes into this instance, once its run is over or it trapped. The
+/// next instance to claim the slot runs on the same stack, so nothing of
+/// this one may run after: this function keeps nothing on the shim stack.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_release() {
+    if !CLAIMED.with(|c| c.replace(false)) {
+        return;
+    }
+    let i = worker_id() as usize;
+    SLOT_USED.fetch_and(!(1u64 << i), std::sync::atomic::Ordering::AcqRel);
+}
+
 
 /// This Worker's id, as the lock knows it.
 #[cfg(feature = "shared-memory")]
@@ -3703,6 +3745,8 @@ pub(crate) fn stack_least() -> u32 {
 #[cfg(feature = "shared-memory")]
 thread_local! {
     static WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// This instance holds a `gex_worker_init` slot.
+    static CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// This Worker's kernel-lock recursion depth: a re-entrant `with_host`
     /// (the panic handler writing to fd 2) would otherwise self-deadlock.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
