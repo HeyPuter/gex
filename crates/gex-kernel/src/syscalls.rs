@@ -392,6 +392,62 @@ pub enum BlockOp {
     },
 }
 
+/// A parked call a signal ended that starts again ([`BlockOp::restart`],
+/// [`crate::signal::Signals::restarts`]), set up in its context at
+/// `ctx_addr`, its syscall's return at `pc`, before the host delivers the
+/// signal. The registers are as the guest made the call, so the host
+/// writes no result. The PC goes back to the call's instruction, so a
+/// handler's frame returns there; that PC, which the host resumes at when
+/// no frame is built. `None` when the context cannot be written (the call
+/// answers `EINTR`).
+///
+/// A wasm32 program's PC is its stub's (the handler, then its own again),
+/// so its context is marked instead ([`crate::signal::RESTART_MARK`]): the
+/// i386 frame keeps the mark, and the program's sigreturn makes the call
+/// again ([`Kernel::syscall`]'s `rt_sigreturn`). With no handler to run, its
+/// stub could not be sent back to the call: the host clears the mark
+/// ([`restart_undo`]) and answers `EINTR`.
+pub fn restart_call(m: &mut GuestMem<'_>, ctx_addr: u64, pc: u64, wasm32: bool) -> Option<u64> {
+    if wasm32 {
+        m.write_u64(ctx_addr + ctx::x(crate::signal::RESTART_SLOT) as u64, crate::signal::RESTART_MARK).ok()?;
+        return Some(pc);
+    }
+    let back = pc.wrapping_sub(gex_abi::SYSCALL_INST_BYTES);
+    m.write_u64(ctx_addr + ctx::PC as u64, back).ok()?;
+    Some(back)
+}
+
+/// A wasm32 program's restart that no handler frame took ([`restart_call`]).
+pub fn restart_undo(m: &mut GuestMem<'_>, ctx_addr: u64) {
+    let _ = m.write_u64(ctx_addr + ctx::x(crate::signal::RESTART_SLOT) as u64, 0);
+}
+
+/// Whether a wasm32 program's sigreturn, its context just restored, has a
+/// call to make again ([`restart_call`]); the mark is taken.
+fn restart_taken(m: &mut GuestMem<'_>, ctx_addr: u64) -> bool {
+    let at = ctx_addr + ctx::x(crate::signal::RESTART_SLOT) as u64;
+    m.read_u64(at).ok() == Some(crate::signal::RESTART_MARK) && m.write_u64(at, 0).is_ok()
+}
+
+impl BlockOp {
+    /// What a signal that ends this wait makes of the call
+    /// ([`crate::signal::Signals::restarts`]; signal(7)).
+    pub fn restart(&self) -> crate::signal::Restart {
+        use crate::signal::Restart;
+        match self {
+            BlockOp::FutexWait { deadline: None, .. } => Restart::SaRestart,
+            BlockOp::FutexWait { .. } | BlockOp::Sleep(_) | BlockOp::SigSuspend { .. } | BlockOp::Poll { .. } => Restart::Never,
+            BlockOp::FutexLockPi { .. } => Restart::Always,
+            // `connect` is not in signal(7)'s list: an interrupted connect
+            // goes on in the background and says `EINTR`.
+            BlockOp::Connect { .. } => Restart::Never,
+            BlockOp::ReadStream { .. } | BlockOp::WriteStream { .. } | BlockOp::AcceptWait { .. } | BlockOp::WaitChild { .. } => {
+                Restart::SaRestart
+            }
+        }
+    }
+}
+
 /// `clone` flags gex understands.
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
@@ -642,6 +698,11 @@ pub struct Kernel {
     /// The pc of the syscall being handled (docs/mem64.md: a mapping the
     /// dynamic loader asks for stays below 4 GiB, since it will hold code).
     pub syscall_pc: u64,
+    /// The restart class of the call that last parked
+    /// ([`BlockOp::restart`]) and its syscall's return pc, for
+    /// [`Self::finish_blocking`]; per thread (`PendingCall`).
+    pub block_restart: crate::signal::Restart,
+    pub block_pc: u64,
     /// The canonical number of the syscall being handled (for the host's
     /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
     pub syscall_nr: u64,
@@ -2211,6 +2272,10 @@ pub struct PendingCall {
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
+    /// The parked call's restart class and its syscall's return pc
+    /// ([`Kernel::finish_blocking`]).
+    pub block_restart: crate::signal::Restart,
+    pub block_pc: u64,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -2275,6 +2340,8 @@ impl Kernel {
             retry_recvmsg: self.retry_recvmsg.take(),
             retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
+            block_restart: std::mem::take(&mut self.block_restart),
+            block_pc: std::mem::take(&mut self.block_pc),
         };
         if call != PendingCall::default() {
             self.thread_calls.insert(self.sig_tid, call);
@@ -2285,6 +2352,8 @@ impl Kernel {
         self.retry_recvmsg = call.retry_recvmsg;
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
+        self.block_restart = call.block_restart;
+        self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
@@ -2405,6 +2474,8 @@ impl Kernel {
             place: None,
             armed_place: None,
             syscall_pc: 0,
+            block_restart: crate::signal::Restart::Never,
+            block_pc: 0,
             syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
@@ -2652,6 +2723,8 @@ impl Kernel {
             place: self.place.clone(),
             armed_place: None,
             syscall_pc: 0,
+            block_restart: crate::signal::Restart::Never,
+            block_pc: 0,
             syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
@@ -2783,6 +2856,16 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        let out = self.syscall_cwd(m, pc);
+        // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
+        if let SyscallOutcome::Blocking(op) = &out {
+            self.block_restart = op.restart();
+            self.block_pc = pc;
+        }
+        out
+    }
+
+    fn syscall_cwd(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         // A thread with a working directory of its own (`unshare(CLONE_FS)`)
         // has it in `vfs` while its call runs.
         if self.thread_cwd.is_empty() {
@@ -2882,6 +2965,13 @@ impl Kernel {
                     }
                     // The restored context is in ctx, PC included.
                     if self.wasm32 {
+                        // A call its handler interrupted that restarts
+                        // (`restart_call`): made again now, from the
+                        // registers the frame put back, its answer what the
+                        // program's stub returns.
+                        if restart_taken(m, self.ctx_addr) {
+                            return self.syscall(m, pc);
+                        }
                         return SyscallOutcome::Continue;
                     }
                     SyscallOutcome::Resume(pc)
@@ -3506,6 +3596,28 @@ impl Kernel {
             Some((n, a)) if r.is_ok() => self.transfer_syscall(m, n, &a),
             _ => r,
         };
+        // A wait a signal ended that Linux would restart (signal(7)): the
+        // handler runs, then the call again ([`restart_call`]).
+        let class = std::mem::replace(&mut self.block_restart, crate::signal::Restart::Never);
+        let ret_pc = std::mem::take(&mut self.block_pc).wrapping_add(gex_abi::SYSCALL_INST_BYTES);
+        if r == Err(Errno::EINTR) {
+            self.collect_signals();
+            self.check_timers();
+            if self.signals.restarts(class) {
+                if let Some(back) = restart_call(m, self.ctx_addr, ret_pc, self.wasm32) {
+                    self.restore_sigmask = None;
+                    self.write_blocked = false;
+                    match self.deliver_pending(m) {
+                        Delivery::Resume(_) if self.wasm32 => return SyscallOutcome::Continue,
+                        Delivery::Resume(target) => return SyscallOutcome::Resume(target),
+                        Delivery::Terminate { signal, core } => return SyscallOutcome::Killed { signal, core },
+                        Delivery::None if !self.wasm32 => return SyscallOutcome::Resume(back),
+                        // See `restart_call`: `EINTR` after all.
+                        Delivery::None => restart_undo(m, self.ctx_addr),
+                    }
+                }
+            }
+        }
         // `rt_sigsuspend` waited with a mask of the caller's choosing. The
         // old mask goes back *after* the handler runs, which means the frame
         // has to carry it -- restoring it here instead would block the very

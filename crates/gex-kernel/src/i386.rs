@@ -902,12 +902,14 @@ pub fn translate(
         x::SETITIMER => {
             // setitimer(which, &new32, &old32): the itimerval's two timevals
             // are widened into scratch; the old value is not reported back.
+            // Microseconds stay microseconds (`sys_itimer` reads timevals):
+            // scaled to nanoseconds, a 100 ms timer fired after 100 s.
             let p = a[1];
             let new = if p == 0 {
                 0
             } else {
-                widen_time(m, p, scratch, 1000);
-                widen_time(m, p + 8, scratch + 16, 1000);
+                widen_time(m, p, scratch, 1);
+                widen_time(m, p + 8, scratch + 16, 1);
                 scratch
             };
             *a = [a[0], new, 0, 0, 0, 0];
