@@ -38,6 +38,7 @@ mod area {
     pub const KICK_NEEDED: u32 = 80;
     pub const STATS: u32 = 96;
     pub const PROXIES: u32 = 100;
+    pub const POISONED: u32 = 124;
     pub const SESSION: u32 = 128;
     pub const SESSION_SIZE: u32 = 132;
 }
@@ -285,6 +286,20 @@ fn instantiate(engine: &Engine, s: &Arc<Server>) -> Result<Inst> {
     l.define(&mut store, "env", "__table_base", tb)?;
     let sv = Arc::clone(s);
     l.func_wrap("gex", "syscall", move |_c: Caller<'_, ()>, ctx: i32, _pc: i64| -> wasmtime::Result<()> { door_syscall(&sv, ctx as u32) })?;
+    // A thread's wait pipe is resolved by the pump only (init_thread); a
+    // wakeup is written in place.
+    l.func_wrap("gex", "wake_pipe", |_fd: i32| -> i32 { -1 })?;
+    let sv = Arc::clone(s);
+    l.func_wrap("gex", "wake_write", move |id: i32, buf: i32, len: i32| -> i32 {
+        let b = sv.mem.bytes();
+        let (at, n) = (buf as u32 as usize, len as u32 as usize);
+        if at.checked_add(n).is_none_or(|e| e > b.len()) {
+            return -14; // EFAULT
+        }
+        let v = b[at..at + n].to_vec();
+        wake_write(id, &v)
+    })?;
+    l.func_wrap("gex", "wake_close", |id: i32| wake_close(id))?;
     // musl's fork driver asks asyncify's state around every thread's
     // function: never unwinding here (the server is not fork-instrumented).
     l.func_wrap("gex", "asyncify", |_c: Caller<'_, ()>, op: i32, _arg: i32| -> wasmtime::Result<i32> {
@@ -335,6 +350,43 @@ fn instantiate(engine: &Engine, s: &Arc<Server>) -> Result<Inst> {
     Ok(Inst { id: s.id, store, dispatch, sp })
 }
 
+/// Client wait pipes the server writes in place (`gex.wake_pipe`,
+/// docs/wineserver-kernel.md §4.5), by the index `wake_pipe` returned.
+static WAKES: Mutex<Vec<Option<Arc<dyn gex_kernel::vfs::FileHandle>>>> = Mutex::new(Vec::new());
+
+/// `gex.wake_pipe(fd)` from the server process itself (the pump): its
+/// descriptor's file, kept for writes from any door; -1 for none.
+pub(crate) fn wake_pipe(caller: &mut Caller<'_, HostState>, fd: i32) -> i32 {
+    let Ok(h) = caller.data_mut().with_kernel(|k| k.fds.get(fd).map(|f| Arc::clone(&f.handle))) else { return -1 };
+    let mut w = WAKES.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match w.iter().position(Option::is_none) {
+        Some(i) => i,
+        None => {
+            w.push(None);
+            w.len() - 1
+        }
+    };
+    w[i] = Some(h);
+    i as i32
+}
+
+/// `gex.wake_write(id, buf, len)`: bytes written or -errno.
+pub(crate) fn wake_write(id: i32, bytes: &[u8]) -> i32 {
+    let h = WAKES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).cloned().flatten();
+    let Some(h) = h else { return -9 }; // EBADF
+    match h.write_at(0, bytes) {
+        Ok(n) => n as i32,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// `gex.wake_close(id)`: the thread's wait pipe closed.
+pub(crate) fn wake_close(id: i32) {
+    if let Some(e) = WAKES.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize) {
+        *e = None;
+    }
+}
+
 /// `gex.session_copy(dst, off, size)`: copies the server's session block
 /// (docs/wineserver-kernel.md §6.1) into the caller; the bytes copied, -1
 /// with no door session, the session's size for a size of 0.
@@ -371,6 +423,9 @@ pub(crate) fn session_seq(off: u32) -> i64 {
 /// the pipes, 2 the thread died in the request.
 pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: i32) -> Result<i32> {
     let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(1) };
+    if s.get(area::POISONED) != 0 {
+        return Ok(1);
+    }
     let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let rd = |at: u32| u32::from_le_bytes(cm.bytes()[at as usize..][..4].try_into().unwrap());
     let req_size = rd(req + 4);
@@ -415,7 +470,11 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
         let r = match r {
             Ok(r) => r as u32,
             Err(e) => {
+                // The handler was cut off midway: the server's state cannot
+                // be trusted (its pump exits at its next lock; §4.2).
+                s.put(area::POISONED, tid.max(1) as u32);
                 s.unlock();
+                s.kick();
                 *slot = None;
                 eprintln!("gex-door: the wineserver trapped in a door call: {e:?}");
                 bail!("wineserver door call: {e:?}");

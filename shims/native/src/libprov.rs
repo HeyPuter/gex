@@ -452,6 +452,18 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "session_copy", |mut caller: Caller<'_, HostState>, dst: i32, off: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::session_copy(&mut caller, dst as u32, off as u32, size as u32))
     })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_pipe", |mut caller: Caller<'_, HostState>, fd: i32| -> i32 { crate::door::wake_pipe(&mut caller, fd) })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_write", |caller: Caller<'_, HostState>, id: i32, ptr: i32, len: i32| -> i32 {
+        let Some(m) = caller.data().memory.clone() else { return -14 };
+        let (at, n) = (ptr as u32 as usize, len as u32 as usize);
+        let b = m.bytes();
+        if at.checked_add(n).is_none_or(|e| e > b.len()) {
+            return -14;
+        }
+        let v = b[at..at + n].to_vec();
+        crate::door::wake_write(id, &v)
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_close", |id: i32| crate::door::wake_close(id))?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map

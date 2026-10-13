@@ -3898,6 +3898,11 @@ export class Gex {
       // size for a size of 0.
       session_copy: (dst, off, size) => this.#sessionCopy(dst >>> 0, off >>> 0, size >>> 0),
       session_seq: (off) => this.#sessionSeq(off >>> 0),
+      // The server's own (the pump): a thread's wait pipe, which door calls
+      // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
+      wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
+      wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, buf >>> 0, len >>> 0) ?? -38,
+      wake_close: () => {},
     };
   }
 
@@ -4024,6 +4029,10 @@ export class Gex {
       gex: {
         syscall,
         asyncify: (op) => { if (op === 0) return 0; throw new Error('gex.asyncify: no fork inside a door call'); },
+        // a thread's wait pipe is resolved by the pump (init_thread); written in place
+        wake_pipe: () => -1,
+        wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),
+        wake_close: () => {},
       },
     };
     for (const f of got) (imports[f[1]] ??= {})[f[2]] = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
@@ -4100,6 +4109,17 @@ export class Gex {
     ret(r);
   }
 
+  #doorScratch = 0;
+
+  /** `gex.wake_write` inside a door: a client's wait pipe written from this
+   *  Worker (the pipes are the global kernel's), not proxied to the pump. */
+  #doorWake(id, buf, len) {
+    if (len > 64 || !this.#doorScratch) return -22;
+    const { u8 } = this.#doorView();
+    this.#bytes().set(u8.subarray(buf, buf + len), this.#doorScratch);
+    return this.#kernel?.k_pipe_write?.(id, this.#doorScratch, len) ?? -38;
+  }
+
   #doorKick() {
     // one byte, from anywhere in this process's memory: the pump only drains
     this.#kernel?.k_pipe_write?.(this.#door.kickId, 0, 1);
@@ -4115,6 +4135,9 @@ export class Gex {
       return 1;
     }
     const T = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
+    // The request's header is in the door buffer once copied in: its 64
+    // bytes are the scratch an in-place wakeup is written from (#doorWake).
+    this.#doorScratch = req;
     const cm = this.#bytes();
     const cdv = new DataView(cm.buffer);
     const reqSize = cdv.getUint32(req + 4, true);
@@ -4199,7 +4222,7 @@ export class Gex {
         if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
         top.sort((x, y) => y[0] - x[0]);
         console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
-          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 8).map(([c, n]) => `${n}:${c}`).join(' ')});`
+          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
           + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
           + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
           + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
