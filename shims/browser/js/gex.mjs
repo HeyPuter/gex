@@ -317,6 +317,18 @@ function debugLine(text) {
 // is the guest's own output there (an ejected program's, a test's compared
 // output). In a page it stays on the debug console.
 export function narrate(text) {
+  // Synchronously where there is a file descriptor to write to. A node
+  // Worker's `process.stderr` is flushed by its event loop. A Worker parked
+  // in wasm on its wait slot until its process ends never turns that loop, so
+  // the lines were lost when it was terminated: item3's "libsqlite3.so.0
+  // replaced by" lines were all lost after the first child process.
+  const fs = typeof process !== 'undefined' ? process.getBuiltinModule?.('fs') : null;
+  if (fs?.writeSync) {
+    try {
+      fs.writeSync(2, `${text}\n`);
+      return;
+    } catch {}
+  }
   const stderr = typeof process !== 'undefined' ? process.stderr : null;
   if (stderr?.write) stderr.write(`${text}\n`);
   else console.debug(text);
