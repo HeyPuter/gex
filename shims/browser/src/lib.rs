@@ -6483,6 +6483,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     }
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
+        // A wasm32 program has no safepoints of its own: its loops reach
+        // the kernel through a call like these (gexcc's `__gex_poll` makes a
+        // `getpid`), so a signal is delivered here, as at any call's return
+        // (a translated guest's safepoints do it for it). The handler's
+        // frame goes into the context, which the program's stub runs; a
+        // default that ends the process ends it. gexcc's alarmloop spun for
+        // ever without this.
+        if WASM32.load(std::sync::atomic::Ordering::Acquire) && sigs::ready() {
+            let at = ctx as u32 as u64;
+            let mut gm = GuestMem::new(guest_bytes());
+            if let gex_kernel::signal::Delivery::Terminate { signal, .. } = sigs::deliver(&mut gm, at) {
+                let pc_at = gm.read_u64(at + ctx::PC as u64).unwrap_or(0);
+                if exit_here(-(signal as i32), Some(pc_at)) != 0 {
+                    trap();
+                }
+            }
+        }
         return;
     }
     // This Worker's reader slot in the descriptor table's epoch array

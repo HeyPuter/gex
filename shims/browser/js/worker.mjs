@@ -243,7 +243,18 @@ async function handle(msg) {
   // cannot reach the page's reporter. Guarded so it is applied once.
   if (!globalThis.__gexMarkedConsole) {
     globalThis.__gexMarkedConsole = true;
-    const realError = console.error.bind(console);
+    // Under Node, straight to fd 2: a Worker's console is a stream its event
+    // loop drains to the parent, so a process that parks in the shim (wait
+    // queues, d26f0d41: no park bound brings it back to JS) and then exits
+    // lost every line it logged meanwhile -- unitcache-fork's GEX_DENSE_DEBUG
+    // adopts among them.
+    const fs = globalThis.process?.getBuiltinModule?.('fs');
+    const realError = fs
+      ? (...a) => {
+          const t = a.map((x) => (typeof x === 'string' ? x : x?.stack || String(x))).join(' ') + '\n';
+          try { fs.writeSync(2, t); } catch { console.error(...a); }
+        }
+      : console.error.bind(console);
     // One marker per *line*, not per call: Chrome's `--enable-logging=stderr`
     // writes a console message up to its first newline and drops the rest, so a
     // multi-line diagnostic (a `killed by signal` report with its thread,
