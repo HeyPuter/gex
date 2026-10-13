@@ -7735,6 +7735,9 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
     // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
     // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
+    // which a child inherits and keeps across its `execve`.
+    *FORK_STATE.0.borrow_mut() = state_bytes(&h.kernel, false);
     *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
@@ -7769,6 +7772,63 @@ static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(St
 static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 /// The parent's exe path then its argv, NUL-separated, staged at `fork`.
 static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's signal state, umask and limits at `fork` (`state_bytes`),
+/// staged for the child to inherit.
+static FORK_STATE: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_fork_state_ptr() -> u32 {
+    FORK_STATE.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_state_len() -> u32 {
+    FORK_STATE.0.borrow().len() as u32
+}
+
+/// The child's side of `gex_fork_state_*`, before `gex_adopt_child`.
+static CHILD_STATE: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
+    *CHILD_STATE.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+}
+
+/// The signal state, umask and resource limits a process passes on: to a
+/// fork's child (`pending` false), or with its pending signals across an
+/// exec that starts in another Worker.
+fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
+    let sig = k.signals.to_bytes(pending);
+    let mut v = Vec::with_capacity(8 + sig.len() + k.rlimits.len() * 16);
+    v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+    v.extend_from_slice(&sig);
+    v.extend_from_slice(&k.umask.to_le_bytes());
+    for [soft, hard] in k.rlimits {
+        v.extend_from_slice(&soft.to_le_bytes());
+        v.extend_from_slice(&hard.to_le_bytes());
+    }
+    v
+}
+
+/// [`state_bytes`] into a kernel being built. Bytes that are not one
+/// change nothing.
+fn apply_state(k: &mut Kernel, b: &[u8]) {
+    let Some(n) = b.get(..4).map(|w| u32::from_le_bytes(w.try_into().unwrap()) as usize) else { return };
+    let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
+    let rest = &b[4 + n..];
+    if rest.len() != 4 + k.rlimits.len() * 16 {
+        return;
+    }
+    k.signals = sig;
+    k.thread_signals.clear();
+    k.sig_tid = 0;
+    k.umask = u32::from_le_bytes(rest[..4].try_into().unwrap());
+    for (i, lim) in k.rlimits.iter_mut().enumerate() {
+        let at = 4 + i * 16;
+        lim[0] = u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
+        lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fork_exe_ptr() -> u32 {
@@ -8628,6 +8688,14 @@ pub extern "C" fn gex_adopt_child(
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    // The dispositions, mask, umask and limits the parent had (`do_fork`'s
+    // `FORK_STATE`, staged here by the host with `gex_set_child_state`).
+    {
+        let state = std::mem::take(&mut *CHILD_STATE.0.borrow_mut());
+        if !state.is_empty() {
+            apply_state(&mut kernel, &state);
+        }
+    }
     // The state this Worker started from is a *copy* of the parent's, and the
     // descriptors in it are the parent's: pipe and pty ends it still holds,
     // sockets it is still using. Every one of those handles closes its end in
