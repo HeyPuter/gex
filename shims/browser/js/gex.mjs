@@ -1218,8 +1218,13 @@ export class Gex {
    */
   #hostImports() {
     return {
-        write: (fd, ptr, len) =>
-          this.#env.write(fd, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
+        // `ptr` is an i64 (a BigInt) from the wasm64 shim, whose thread
+        // stacks sit above 4 GiB: cut to 32 bits, a thread's stderr printed
+        // as NUL bytes from the wrong place.
+        write: (fd, ptr, len) => {
+          const at = typeof ptr === 'bigint' ? Number(ptr) : ptr >>> 0;
+          this.#env.write(fd, this.#bytes().subarray(at, at + (len >>> 0)));
+        },
         // The shim's own narration, to the console -- never to the guest's
         // output, which shares fd 2 with a terminal a person is reading.
         debug: (ptr, len) => debugLine(

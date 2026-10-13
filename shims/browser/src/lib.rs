@@ -64,8 +64,9 @@ extern "C" {
     /// synchronously) and the miss traps out as before.
     fn jit_install(ctx: i32) -> i32;
     /// Write `len` bytes at `ptr` -- an address in the shared memory -- to the
-    /// host's console for `fd`.
-    fn write(fd: i32, ptr: u32, len: u32);
+    /// host's console for `fd`. A pointer-sized address: the wasm64 shim's
+    /// buffers (a thread's stack among them) can be above 4 GiB.
+    fn write(fd: i32, ptr: usize, len: u32);
     /// The shim's own narration, to the host's debug console -- not fd 2, so a
     /// trace never interleaves with the guest's own stderr.
     fn debug(ptr: u32, len: u32);
@@ -1613,7 +1614,7 @@ impl FileHandle for Console {
         // so it cannot be hard-coded in the page.
         if unsafe { STDIN_TTY } {
             if let Some(cooked) = console_tty().output(buf) {
-                unsafe { write(self.fd, cooked.as_ptr() as u32, cooked.len() as u32) };
+                unsafe { write(self.fd, cooked.as_ptr() as usize, cooked.len() as u32) };
                 // Return what the guest asked to write, not the translated
                 // length: a count above the input sends libc looping over a
                 // buffer that has already gone.
@@ -1622,7 +1623,7 @@ impl FileHandle for Console {
         }
         // The buffer is already in the shared memory the host can see, so its
         // address is all that has to cross.
-        unsafe { write(self.fd, buf.as_ptr() as u32, buf.len() as u32) };
+        unsafe { write(self.fd, buf.as_ptr() as usize, buf.len() as u32) };
         Ok(buf.len() as u64)
     }
 
@@ -3053,7 +3054,7 @@ fn guest_bytes() -> &'static mut [u8] {
 /// # Safety
 /// `write` only reads the bytes.
 pub(crate) unsafe fn write_stderr(text: &str) {
-    write(2, text.as_ptr() as u32, text.len() as u32);
+    write(2, text.as_ptr() as usize, text.len() as u32);
 }
 
 fn install_panic_hook() {
@@ -3082,7 +3083,7 @@ fn install_panic_hook() {
             // shows it -- but only after the console has it, because this is
             // the call that can die.
             // SAFETY: the bytes are read, not kept.
-            unsafe { write(2, text.as_ptr() as u32, text.len() as u32) };
+            unsafe { write(2, text.as_ptr() as usize, text.len() as u32) };
         }));
     });
 }
@@ -15638,5 +15639,5 @@ pub extern "C" fn gex_set_exc_trace(on: i32) {
 
 /// A line on the guest's standard error (delivered in order with its output).
 pub(crate) fn stderr_line(s: &str) {
-    unsafe { write(2, s.as_ptr() as u32, s.len() as u32) };
+    unsafe { write(2, s.as_ptr() as usize, s.len() as u32) };
 }
