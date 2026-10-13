@@ -11,7 +11,9 @@
 # rest of the prefix links to the x86 one (GEX_WINE_PREFIX, default
 # ~/.cache/gex/wine-11.15), so the DLLs not named stay i386 code. Its
 # layout pins are dropped: they are for the x86 DLLs. GEX_WASM_SYSROOT must
-# be set (tools/wine-wasm/build-sysroot.sh).
+# be set (tools/wine-wasm/build-sysroot.sh). Every i386 DLL in syswow64 ends
+# at its fixed base from w3-bases.txt (rebase.py): a W3 dist's
+# lib/wine/i386-windows takes its DLLs from here, never from the x86 prefix.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 4 ] || { sed -n 2,14p "$0" >&2; exit 2; }
@@ -61,4 +63,9 @@ for dll in "$@"; do
     "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
         --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
-echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module)"
+# Every i386 DLL at its fixed base (rebase.py, w3-bases.txt), so a DLL's
+# function-tier unit matches wherever and whenever a process loads it. A DLL
+# missing from the table fails the stage: add it (rebase.py table).
+python3 "$here/rebase.py" apply "$sys" "$here/w3-bases.txt" > "$tmp/rebase.log" 2>&1 ||
+    { echo "stage-native: rebase.py: $(head -3 "$tmp/rebase.log" | tr '\n' ' ')" >&2; exit 1; }
+echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module), $(tail -1 "$tmp/rebase.log" | sed 's/^rebase.py: //')"
