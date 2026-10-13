@@ -616,6 +616,13 @@ export class ProcessHost {
         // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
+        // Each process's memory by pid (a thread's Worker is keyed `pid:tid`), weakly (an exited process's memory
+        // is not kept): what a harness reads a guest word from while the
+        // process's own Workers are busy in wasm (tests/games/noita-page.mjs,
+        // Noita's world frame counter). A threaded process registers here.
+        if (typeof WeakRef === 'function' && m.thread.memory) {
+          (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
+        }
         if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, making Worker (t=${Date.now()})`);
         const w2 = this.#makeWorker();
         this.#workers.set(key, w2);

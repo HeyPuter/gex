@@ -8,15 +8,15 @@
 # Legs, each PASS/FAIL:
 #   gex-gl    the gex-gl host tests built from TREE, on edger's NVIDIA GL (the framebuffer-name test
 #             only fails there);
-#   muck      Muck on the .NET provider (DNC, default ~/gex-sandbox/scratch/unity/dnc) reaches
-#             "Initializing packets" and presents a non-black frame after it;
-#   hk        Hollow Knight reaches its menu (the unload after Menu_Title) and presents a
-#             non-black frame after it.
-# Muck runs with the .NET wasm JIT on (JIT=0 for the interpreter only). Hollow Knight runs on the
-# interpreter, its default since q81 (docs/unity-dotnet.md section 13; HK_JIT=1 for the JIT).
+#   hk        Hollow Knight on the .NET provider (DNC, default ~/gex-sandbox/scratch/unity/dnc)
+#             reaches its menu (the unload after Menu_Title) and presents a non-black frame after it.
+# Hollow Knight runs on the interpreter, its default since q81 (docs/unity-dotnet.md section 13;
+# HK_JIT=1 for the JIT). Muck is no longer a leg; Noita in the page is, as a script of its own
+# (tests/games/noita-page-leg.sh).
 # Each game leg keeps its summary and its last frame as PNG in OUT. Runs go through
 # scratch/bench/bench.sh (BENCH_HOST, edger by default), one at a time under its lock, with
-# tests/games/unity-bench.sh. Takes about 25 min with a warm GEX_FJIT_CACHE, 40 cold.
+# tests/games/unity-bench.sh. With Muck it took about 25 min with a warm GEX_FJIT_CACHE, 40
+# cold; Muck was 600 s of that.
 # Needs edger's staging (docs/unity-dotnet.md §12 item 21): the games, gl64, Xwayland and
 # LLVM 22 under scratch/unity/edger, .NET 10.0.10's shared framework.
 set -u
@@ -45,7 +45,7 @@ rc=0
 "$B" -s "$ST" -s "$TREE/tests/games" -- "$ST/gex-gl-tests" --test-threads 1 > "$OUT/gex-gl.txt" 2>&1
 if grep -q "^test result: ok" "$OUT/gex-gl.txt"; then echo "gex-gl: PASS ($(grep -o '[0-9]* passed' "$OUT/gex-gl.txt"))"
 else echo "gex-gl: FAIL"; grep -E "FAILED|panicked" "$OUT/gex-gl.txt" | head -5; rc=1; fi
-# 2. and 3. the games
+# 2. the game
 leg() { # NAME GAME SECS MARKER JIT
 	local name=$1 game=$2 secs=$3 marker=$4 jit=$5 run=$HOME/gex-sandbox/scratch/unity/edger-gate/run-$HEAD-$1
 	"$B" -- env GEXC="$ST/gexc" DNC="$ST/dnc" GEX_FJIT_CACHE=1 EVERY=600 \
@@ -70,6 +70,5 @@ leg() { # NAME GAME SECS MARKER JIT
 	sys.exit(0 if ok else 1)
 	EOF
 }
-r=$(leg muck muck 600 "Muck packets" "${JIT:-1}"); echo "muck: $r"; case $r in PASS*) ;; *) rc=1;; esac
 r=$(leg hk hk 660 "HK menu ready (post-unload)" "${HK_JIT:-0}"); echo "hk: $r"; case $r in PASS*) ;; *) rc=1;; esac
 exit $rc
