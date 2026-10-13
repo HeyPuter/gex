@@ -45,7 +45,8 @@
 // console line), DEMO_CHROME_FLAGS (more browser flags, space-separated),
 // DEMO_STDERR (a file for the browser's whole stderr), DEMO_COUNT=1 (print
 // the X server's ?hostxcount lines), DEMO_GL=0 (skip the
-// glxgears legs), DEMO_FOOT=0 (skip the foot leg), DEMO_VRAM=0 (skip the GPU memory leg).
+// glxgears legs), DEMO_FOOT=0 (skip the foot leg), DEMO_VRAM=0 (skip the GPU memory leg),
+// DEMO_GPU_TOTAL=1 (measure it by the card's total when nvidia-smi lists no process of ours).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdtempSync, rmSync } from 'node:fs';
@@ -777,7 +778,10 @@ async function gpuMiB() {
     const mine = procs.filter(([pid]) => ours.has(pid));
     if (mine.length) gpuSource = 'this browser\'s processes';
     if (mine.length) return mine.reduce((t, [, mib]) => t + mib, 0);
-  } catch { /* the card's total, below */ }
+  } catch { /* the card's total, below, if asked for */ }
+  // The card's total counts every browser on it: only when this run has the
+  // card alone (a timed bench run) and says so.
+  if (process.env.DEMO_GPU_TOTAL !== '1') return null;
   try {
     const out = execFileSync('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 10000 });
     return Number(out.trim().split('\n')[0]);
@@ -805,7 +809,7 @@ async function glCycles(step) {
     log(`  GPU memory after cycle ${i + 1}: ${seen.join(' -> ')} MiB`);
   }
   if (seen.some((v) => v === null)) {
-    log(`ok GPU memory across ${n} GL clients: not measured here (no nvidia-smi)`);
+    log(`ok GPU memory across ${n} GL clients: not measured here (nvidia-smi lists no process of this browser; DEMO_GPU_TOTAL=1 uses the card's total)`);
     return;
   }
   const slack = step.slack ?? 64;
@@ -825,6 +829,10 @@ async function glCycles(step) {
     at.push(await gpuMiB());
   }
   await guestRun('kill $(pidof glxgears); sleep 2');
+  if (at.some((v) => v === null)) {
+    log(`ok GPU memory while one GL client animates: not measured here`);
+    return;
+  }
   const climbed = at[at.length - 1] - at[0];
   const held = climbed <= slack;
   if (!held) failed = true;
