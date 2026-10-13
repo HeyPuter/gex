@@ -871,6 +871,8 @@ async function handle(msg) {
         ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
     });
+    // Last: nothing calls into this instance after (`releaseWorker`).
+    gex.releaseWorker?.();
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the
     // shim reaches the host as `unreachable`, and the guest pc and object are
@@ -933,6 +935,8 @@ async function handle(msg) {
       message: (e?.message ?? String(e)) + where,
       stack: e?.stack ?? '',
     });
+    // The trap abandoned this instance's stack; its slot is free for the next.
+    gex?.releaseWorker?.();
   }
 }
 
