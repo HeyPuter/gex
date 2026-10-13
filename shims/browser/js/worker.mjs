@@ -478,9 +478,16 @@ async function handle(msg) {
     // (web/src/compositor-worker.js `glInRealm`), and a submit is a promise
     // the Suspending `gl_submit` waits on. A batch is run straight out of
     // this process's memory: no copy, and no batch in flight unwaited.
+    // An unwaited batch is waited for all the same; its answer is what the
+    // Worker build's would be, the frames shown its PRESENT replied.
+    const { shownInReply } = await import('./gl-bridge.mjs');
     gex.useGl({
-      submit: (memory, ring, client) =>
-        globalThis.__gexGlInRealm ? globalThis.__gexGlInRealm.submit(memory, ring, client) : -1,
+      submit: (memory, ring, client, unwaited) => {
+        if (!globalThis.__gexGlInRealm) return -1;
+        const r = globalThis.__gexGlInRealm.submit(memory, ring, client);
+        if (!unwaited) return r;
+        return Promise.resolve(r).then((rc) => (rc < 0 ? rc : shownInReply(new Uint8Array(memory.buffer), ring)));
+      },
     });
   } else if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');

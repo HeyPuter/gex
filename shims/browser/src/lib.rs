@@ -6438,7 +6438,10 @@ pub extern "C" fn gex_sys_calls() -> u64 {
 /// Nanoseconds spent inside each syscall number, filled in by `gex_syscall`.
 static mut SYS_NS: [u64; 512] = [0; 512];
 
-fn count_syscall() {
+/// `nr` is the call's canonical number (`gex_syscall`'s `this_nr`: an
+/// i386-ABI process's own numbers mapped too), `ctx` the calling thread's
+/// context: no kernel lock to find either.
+fn count_syscall(nr: u64, ctx: u64) {
     if unsafe { HEARTBEAT } == 0 {
         return;
     }
@@ -6446,27 +6449,13 @@ fn count_syscall() {
     // past it is a guest asking for something that does not exist.
     static mut COUNTS: [u32; 512] = [0; 512];
     static mut TOTAL: u32 = 0;
-    let nr = with_host(|h| {
+    let (a0, a1) = {
         let gm = GuestMem::new(guest_bytes());
-        let at = h.threads[cur()].kstate.ctx_addr;
-        let n = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0);
-        // Canonical, so the census and the ring name x86-64 calls too.
-        if gex_abi::X86 {
-            gex_kernel::x86::canonical_number(n)
-        } else if gex_abi::PPC {
-            gex_kernel::ppc::canonical_number(n)
-        } else {
-            n
-        }
-    });
-    let (a0, a1) = with_host(|h| {
-        let gm = GuestMem::new(guest_bytes());
-        let at = h.threads[cur()].kstate.ctx_addr;
         (
-            gm.read_u64(at + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
-            gm.read_u64(at + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
+            gm.read_u64(ctx + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
+            gm.read_u64(ctx + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
         )
-    });
+    };
     let total = unsafe {
         if (nr as usize) < COUNTS.len() {
             COUNTS[nr as usize] = COUNTS[nr as usize].saturating_add(1);
@@ -6730,7 +6719,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     }
-    count_syscall();
+    count_syscall(this_nr, ctx as u32 as u64);
     watch_mem("syscall");
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
@@ -7309,7 +7298,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         if unsafe { HEARTBEAT } != 0 {
-            let nr = LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            // Canonical, as the census counts it (an i386-ABI process's
+            // own numbers name other calls in the canonical table).
+            let nr = this_nr as usize;
             if nr < 512 {
                 unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(took) };
             }
