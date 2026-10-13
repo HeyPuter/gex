@@ -569,8 +569,6 @@ pub struct Kernel {
     /// entry still pins its allocation, so its address is not reused while
     /// the entry stands; [`Kernel::note_remote_unix`] prunes them.
     pub remote_sockets: std::collections::HashMap<usize, std::sync::Weak<unix::RemoteUnix>>,
-    /// And for epoll sets.
-    pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// And for anonymous shared files, which have seals.
     pub memfds: std::collections::HashMap<usize, Arc<unix::MemFd>>,
     /// Which unix socket answers to which path. Shared system-wide, because
@@ -1115,6 +1113,198 @@ impl FdIo<'_> {
         }
     }
 
+    /// The epoll set behind a descriptor: `EINVAL` for any other.
+    pub(crate) fn epoll_of(&self, fd: i32) -> Result<Arc<unix::EpollSet>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_epoll().ok_or(Errno::EINVAL)
+    }
+
+    /// Read the guest's `pollfd` array into something the host can re-check.
+    fn collect_pollfds(&self, m: &GuestMem<'_>, fds: u64, nfds: u64) -> Option<Vec<PollFd>> {
+        let mut out = Vec::with_capacity(nfds.min(1024) as usize);
+        for i in 0..nfds.min(1024) {
+            let addr = fds + i * 8;
+            let fd = m.read_u32(addr).ok()? as i32;
+            let events = (m.read_u32(addr + 4).ok()? & 0xffff) as u16;
+            let file = self.fds.get(fd).ok();
+            out.push(PollFd {
+                addr,
+                fd,
+                events,
+                handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
+                // The open mode only. Whether a write would *block* is
+                // asked of the handle in `poll_revents`, every time, because
+                // a parked poll outlives the state it was built from.
+                writable: file.as_ref().is_some_and(|f| f.writable),
+            });
+        }
+        Some(out)
+    }
+
+    /// Read `select`'s three bitmaps into the same list `poll` uses.
+    ///
+    /// The two calls ask the same question. Only the reply differs, so only
+    /// the reply is written twice.
+    fn collect_selectfds(
+        &self,
+        m: &GuestMem<'_>,
+        nfds: u32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+    ) -> Result<Vec<PollFd>, Errno> {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        if (nfds as i32) < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let nfds = nfds.min(1024);
+        let mut want: std::collections::BTreeMap<i32, u16> = Default::default();
+        // (exceptfds: watched for nothing, but its descriptors must be open)
+        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT), (exceptfds, 0)] {
+            if set == 0 {
+                continue;
+            }
+            for w in 0..(nfds as usize).div_ceil(64) {
+                let word = m.read_bits64(set + (w as u64) * 8).map_err(|_| Errno::EFAULT)?;
+                if word == 0 {
+                    continue;
+                }
+                for bit in 0..64u32 {
+                    let fd = (w as u32) * 64 + bit;
+                    if fd >= nfds {
+                        break;
+                    }
+                    if word & (1 << bit) != 0 {
+                        *want.entry(fd as i32).or_default() |= ev;
+                    }
+                }
+            }
+        }
+        // An exceptional condition never happens here, so a descriptor named
+        // only in that set is watched for nothing and simply never fires. A
+        // descriptor in any set that is not open is EBADF, as on Linux.
+        if want.keys().any(|&fd| self.fds.get(fd).is_err()) {
+            return Err(Errno::EBADF);
+        }
+        Ok(
+            want.into_iter()
+                .map(|(fd, events)| {
+                    let file = self.fds.get(fd).ok();
+                    PollFd {
+                        addr: 0,
+                        fd,
+                        events,
+                        handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
+                        // The open mode only. Whether a write would *block* is
+                // asked of the handle in `poll_revents`, every time, because
+                // a parked poll outlives the state it was built from.
+                writable: file.as_ref().is_some_and(|f| f.writable),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// A set's registrations as the list the poll path understands.
+    fn epoll_pollfds(&self, set: &unix::EpollSet) -> Vec<PollFd> {
+        set.watches()
+            .iter()
+            .filter_map(|w| {
+                let file = self.fds.get(w.fd).ok()?;
+                set.rechain(w.fd, file.handle.wait_queue());
+                Some(PollFd {
+                    addr: 0,
+                    fd: w.fd,
+                    events: (w.events & 0xffff) as u16,
+                    handle: Some(Arc::clone(&file.handle)),
+                    writable: file.writable,
+                })
+            })
+            .collect()
+    }
+
+    /// The poll family's question (`ppoll`, `pselect6`, `epoll_pwait`,
+    /// `epoll_pwait2`: canonical `n`, arguments `a`): the descriptors, how
+    /// the answer is written, and how long the call may wait (`None`: not at
+    /// all; `Some(None)`: for ever).
+    #[allow(clippy::type_complexity)]
+    fn poll_question(
+        &self,
+        m: &GuestMem<'_>,
+        n: u64,
+        a: [u64; 6],
+    ) -> Result<(Vec<PollFd>, PollReport, Option<Option<std::time::Duration>>), Errno> {
+        // A `timespec` timeout: null waits for ever, zero not at all.
+        let timespec = |p: u64| -> Result<Option<Option<std::time::Duration>>, Errno> {
+            if p == 0 {
+                return Ok(Some(None));
+            }
+            let (secs, nanos) = (m.read_u64(p)?, m.read_u64(p + 8)?);
+            Ok((secs != 0 || nanos != 0)
+                .then(|| Some(std::time::Duration::new(secs, (nanos % 1_000_000_000) as u32))))
+        };
+        match n {
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
+                let set = self.epoll_of(a[0] as i32)?;
+                let generation = set.generation();
+                let fds = self.epoll_pollfds(&set);
+                // `epoll_pwait` takes milliseconds, negative for ever;
+                // `epoll_pwait2` a `timespec`.
+                let wait = if n == nr::EPOLL_PWAIT2 {
+                    timespec(a[3])?
+                } else {
+                    match a[3] as i32 {
+                        0 => None,
+                        ms if ms < 0 => Some(None),
+                        ms => Some(Some(std::time::Duration::from_millis(ms as u64))),
+                    }
+                };
+                let report = PollReport::Epoll {
+                    out: a[1],
+                    max: a[2] as u32,
+                    data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
+                    packed: gex_abi::X86 || self.compat,
+                    set,
+                    generation,
+                };
+                Ok((fds, report, wait))
+            }
+            nr::PPOLL => Ok((self.collect_pollfds(m, a[0], a[1]).ok_or(Errno::EFAULT)?, PollReport::Poll, timespec(a[2])?)),
+            nr::PSELECT6 => Ok((
+                self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
+                PollReport::Select { nfds: a[0] as u32, readfds: a[1], writefds: a[2], exceptfds: a[3] },
+                timespec(a[4])?,
+            )),
+            _ => Err(Errno::ENOSYS),
+        }
+    }
+
+    /// The park of a poll-family call that may wait and has nothing ready.
+    fn poll_park(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let (fds, report, wait) = self.poll_question(m, n, a).ok()?;
+        let deadline = wait?;
+        (!poll_ready(&fds)).then_some(BlockOp::Poll { fds, deadline, report })
+    }
+
+    /// A poll-family call answered now, with whatever is ready.
+    fn poll_now(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let (fds, report, _) = self.poll_question(m, n, a)?;
+        poll_finish(&fds, &report, m)
+    }
+
+    /// A poll-family call: its answer when something is ready or it may not
+    /// wait, otherwise its park; one look at the descriptors either way.
+    fn poll(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, BlockOp> {
+        let (fds, report, wait) = match self.poll_question(m, n, a) {
+            Ok(q) => q,
+            Err(e) => return Ok(Err(e)),
+        };
+        match wait {
+            Some(deadline) if !poll_ready(&fds) => Err(BlockOp::Poll { fds, deadline, report }),
+            _ => Ok(poll_finish(&fds, &report, m)),
+        }
+    }
+
     /// The call itself, for the calls of this half; `None` for any other.
     fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         let fds = self.fds;
@@ -1129,6 +1319,34 @@ impl FdIo<'_> {
             _ => return None,
         })
     }
+}
+
+/// The signal mask `epoll_pwait`, `epoll_pwait2`, `ppoll` or `pselect6`
+/// (`n`, canonical, its arguments `a`) asks to wait with: `Ok(None)` when
+/// the call has none (a null pointer, or another call), `EINVAL` for a
+/// set size that is not 8 bytes, `EFAULT` for a set that cannot be read.
+fn call_sigmask(m: &GuestMem<'_>, n: u64, a: &[u64; 6]) -> Result<Option<u64>, Errno> {
+    let (set, size) = match n {
+        nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => (a[4], a[5]),
+        nr::PPOLL => (a[3], a[4]),
+        // The sixth argument points at `{ const sigset_t *ss; size_t
+        // ss_len; }`, with 64-bit fields here: a 32-bit ABI's are widened
+        // by its translation (`i386::translate`).
+        nr::PSELECT6 => {
+            if a[5] == 0 {
+                return Ok(None);
+            }
+            (m.read_u64(a[5])?, m.read_u64(a[5] + 8)?)
+        }
+        _ => return Ok(None),
+    };
+    if set == 0 {
+        return Ok(None);
+    }
+    if size != 8 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(m.read_bits64(set)?))
 }
 
 /// `rt_sigprocmask` on `signals`, the calling thread's: the whole call,
@@ -1176,11 +1394,20 @@ pub enum FreeOutcome {
     /// now (`Delivery::Resume` only where the host must go to the handler).
     Done(Delivery),
     /// It waits for its descriptor: park on this, as for
-    /// [`SyscallOutcome::Blocking`].
-    Blocking(BlockOp),
+    /// [`SyscallOutcome::Blocking`]; with the mask to put back when the wait
+    /// is over (the poll family's own mask: `Kernel::restore_sigmask`).
+    Blocking(BlockOp, Option<u64>),
     /// The machine has been halted: the process ends with this status.
     Exit(i32),
 }
+
+/// `ppoll`, `pselect6`, `epoll_pwait` or `epoll_pwait2` (canonical).
+fn is_poll(n: u64) -> bool {
+    matches!(n, nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2)
+}
+
+/// SIGKILL and SIGSTOP, which no mask blocks.
+const UNBLOCKABLE: u64 = (1 << (signal::sig::SIGKILL - 1)) | (1 << (signal::sig::SIGSTOP - 1));
 
 /// The canonical number of a call [`free_call`] answers, from the number
 /// in the context as the caller's ABI has it.
@@ -1193,6 +1420,10 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::READV => nr::READV,
             x::WRITEV => nr::WRITEV,
             x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
+            x::POLL | x::PPOLL | x::PPOLL_TIME64 => nr::PPOLL,
+            x::NEWSELECT | x::PSELECT6 | x::PSELECT6_TIME64 => nr::PSELECT6,
+            x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
+            x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1206,12 +1437,16 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::PWRITE64 => nr::PWRITE64,
             x::LSEEK => nr::LSEEK,
             x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
+            x::POLL | x::PPOLL => nr::PPOLL,
+            x::SELECT | x::PSELECT6 => nr::PSELECT6,
+            x::EPOLL_WAIT | x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
+            x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
-            | nr::RT_SIGPROCMASK => raw,
+            | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => raw,
             _ => return None,
         }
     };
@@ -1229,8 +1464,10 @@ pub struct FreeCall {
 
 /// Whether the call in the context at `ctx_addr` is one [`free_call`]
 /// answers, decided by its number alone: `read`, `write`, `readv`,
-/// `writev`, `pread64`, `pwrite64`, `lseek` and `rt_sigprocmask` (the
-/// 32-bit ABI's positioned calls and `_llseek` are not in it).
+/// `writev`, `pread64`, `pwrite64`, `lseek`, `rt_sigprocmask`, and the poll
+/// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
+/// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms). The 32-bit ABI's
+/// positioned calls and `_llseek` are not in it.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1249,7 +1486,10 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
             m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0)
         };
     }
-    if compat && n != nr::RT_SIGPROCMASK {
+    // The poll family's arguments are the ABI's own until `free_call`
+    // translates them (into the thread's scratch, which needs the memory
+    // writable).
+    if compat && n != nr::RT_SIGPROCMASK && !is_poll(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1272,8 +1512,22 @@ impl FreeCall {
 /// call ([`FdIo`], [`sigprocmask`]), the park included, and the signal that
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
-    let FreeCall { n, raw, a } = call;
+    let FreeCall { n, raw, mut a } = call;
     let compat = f.io.compat;
+    // The poll family in the canonical form: `poll`, `select` and
+    // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
+    // `pselect6` mask argument widened (none of these has anything to do
+    // after the call: `Post::None`).
+    if is_poll(n) {
+        let t = if compat {
+            crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr).0
+        } else if gex_abi::X86 {
+            crate::x86::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, f.signals.blocked())
+        } else {
+            raw
+        };
+        debug_assert_eq!(t, n);
+    }
     // The number's register doubles as the result register on x86-64.
     if gex_abi::X86 {
         let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
@@ -1283,16 +1537,41 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     }
     let r = if n == nr::RT_SIGPROCMASK {
         sigprocmask(f.signals, m, a[0] as u32, a[1], a[2])
+    } else if is_poll(n) {
+        // The call's mask for its duration (as `Kernel::syscall_inner`):
+        // back at once when it answers now, before any signal is looked at;
+        // through the handler's frame or when the wait is finished
+        // otherwise (the host's `restore_sigmask`).
+        let mask = match call_sigmask(m, n, &a) {
+            Ok(mask) => mask,
+            Err(e) => {
+                let _ = set_result(m, ctx_addr, e.as_return());
+                return FreeOutcome::Done(Delivery::None);
+            }
+        };
+        let old = f.signals.blocked();
+        if let Some(want) = mask {
+            f.signals.set_blocked(want & !UNBLOCKABLE);
+        }
+        match f.io.poll(m, n, a) {
+            Err(op) => return FreeOutcome::Blocking(op, mask.map(|_| old)),
+            Ok(r) => {
+                if mask.is_some() {
+                    f.signals.set_blocked(old);
+                }
+                r
+            }
+        }
     } else {
         if let Some(op) = f.io.blocking_op(m, n, a) {
-            return FreeOutcome::Blocking(op);
+            return FreeOutcome::Blocking(op, None);
         }
         let Some(r) = f.io.call(m, n, a) else { unreachable!("free_class admitted a call FdIo does not make") };
         // Lost the room or the bytes to another Worker since the check:
         // park, as the full call does.
         if r == Err(Errno::EAGAIN) {
             if let Some(op) = f.io.eagain_park(m, n, a) {
-                return FreeOutcome::Blocking(op);
+                return FreeOutcome::Blocking(op, None);
             }
         }
         r
@@ -1596,7 +1875,6 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
 /// Both live in [`crate::tty`] now, next to the discipline that obeys them --
 /// there is no second definition here to fall out of step with it.
 pub use crate::tty::{lflag::ECHO, lflag::ICANON, COOKED as COOKED_TERMIOS, KERNEL_TERMIOS};
-
 
 /// One entry of a `poll` set, kept so the host can re-check it without going
 /// back through the kernel.
@@ -2150,7 +2428,6 @@ impl Kernel {
             ports: Arc::new(net::Ports::new()),
             sockets: Default::default(),
             remote_sockets: Default::default(),
-            epolls: Default::default(),
             memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             host_names: Arc::new(unix::SocketNames::new()),
@@ -2398,7 +2675,6 @@ impl Kernel {
             ports: Arc::clone(&self.ports),
             sockets: self.sockets.clone(),
             remote_sockets: self.remote_sockets.clone(),
-            epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
@@ -2792,7 +3068,7 @@ impl Kernel {
         // that answers at once, below, puts it back before any signal is
         // looked at. foot blocks SIGTERM and takes it only in `epoll_pwait`:
         // without this it never heard one.
-        let call_mask = match self.call_sigmask(m, n, &a) {
+        let call_mask = match call_sigmask(m, n, &a) {
             Ok(set) => set,
             Err(e) => {
                 let _ = set_result(m, self.ctx_addr, e.as_return());
@@ -2800,7 +3076,6 @@ impl Kernel {
             }
         };
         if let Some(want) = call_mask {
-            const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
             self.restore_sigmask = Some(self.signals.blocked());
             self.signals.set_blocked(want & !UNBLOCKABLE);
         }
@@ -2984,34 +3259,6 @@ impl Kernel {
         FdIo { fds: &self.fds, compat: self.compat }
     }
 
-    /// The signal mask `epoll_pwait`, `epoll_pwait2`, `ppoll` or `pselect6`
-    /// (`n`, canonical, its arguments `a`) asks to wait with: `Ok(None)` when
-    /// the call has none (a null pointer, or another call), `EINVAL` for a
-    /// set size that is not 8 bytes, `EFAULT` for a set that cannot be read.
-    fn call_sigmask(&self, m: &GuestMem<'_>, n: u64, a: &[u64; 6]) -> Result<Option<u64>, Errno> {
-        let (set, size) = match n {
-            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => (a[4], a[5]),
-            nr::PPOLL => (a[3], a[4]),
-            // The sixth argument points at `{ const sigset_t *ss; size_t
-            // ss_len; }`, with 64-bit fields here: a 32-bit ABI's are widened
-            // by its translation (`i386::translate`).
-            nr::PSELECT6 => {
-                if a[5] == 0 {
-                    return Ok(None);
-                }
-                (m.read_u64(a[5])?, m.read_u64(a[5] + 8)?)
-            }
-            _ => return Ok(None),
-        };
-        if set == 0 {
-            return Ok(None);
-        }
-        if size != 8 {
-            return Err(Errno::EINVAL);
-        }
-        Ok(Some(m.read_bits64(set)?))
-    }
-
     /// The blocking half of a syscall, if it has one.
     ///
     /// Recognised before dispatch, because these are exactly the calls whose
@@ -3056,91 +3303,7 @@ impl Kernel {
             // at once turned every event loop into a spin. Xwayland's is the
             // one that showed it: it made progress, but only when the timing
             // happened to suit it.
-            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
-                let set = self.epoll_of(a[0] as i32).ok()?;
-                let generation = set.generation();
-                let fds = self.epoll_pollfds(&set);
-                if poll_ready(&fds) {
-                    return None;
-                }
-                // `epoll_pwait` takes the timeout as a millisecond count with a
-                // negative for "forever"; `epoll_pwait2` takes a `timespec`
-                // pointer instead, null for "forever". Both fold to the same
-                // deadline, and a zero timeout is a non-blocking poll either way.
-                let deadline = if n == nr::EPOLL_PWAIT2 {
-                    if a[3] == 0 {
-                        None // null timespec: wait forever
-                    } else {
-                        let secs = m.read_u64(a[3]).ok()?;
-                        let nanos = m.read_u64(a[3] + 8).ok()?;
-                        if secs == 0 && nanos == 0 {
-                            return None; // {0,0}: non-blocking
-                        }
-                        Some(std::time::Duration::new(secs, (nanos % 1_000_000_000) as u32))
-                    }
-                } else {
-                    let millis = a[3] as i32;
-                    if millis == 0 {
-                        return None;
-                    }
-                    if millis < 0 {
-                        None
-                    } else {
-                        Some(std::time::Duration::from_millis(millis as u64))
-                    }
-                };
-                Some(BlockOp::Poll {
-                    fds,
-                    deadline,
-                    report: PollReport::Epoll {
-                        out: a[1],
-                        max: a[2] as u32,
-                        data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
-                        packed: gex_abi::X86 || self.compat,
-                        set: Arc::clone(&set),
-                        generation,
-                    },
-                })
-            }
-            nr::PPOLL | nr::PSELECT6 => {
-                let (fds, report, timeout) = if n == nr::PPOLL {
-                    (
-                        self.collect_pollfds(m, a[0], a[1])?,
-                        PollReport::Poll,
-                        a[2],
-                    )
-                } else {
-                    (
-                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3]).ok()?,
-                        PollReport::Select {
-                            nfds: a[0] as u32,
-                            readfds: a[1],
-                            writefds: a[2],
-                            exceptfds: a[3],
-                        },
-                        a[4],
-                    )
-                };
-                if poll_ready(&fds) {
-                    return None;
-                }
-                // A zero timeout is a question, not a wait.
-                let deadline = if timeout == 0 {
-                    None
-                } else {
-                    let secs = m.read_u64(timeout).ok()?;
-                    let nanos = m.read_u64(timeout + 8).ok()?;
-                    if secs == 0 && nanos == 0 {
-                        return None;
-                    }
-                    Some(std::time::Duration::new(secs, nanos as u32))
-                };
-                Some(BlockOp::Poll {
-                    fds,
-                    deadline,
-                    report,
-                })
-            }
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_park(m, n, a),
             nr::ACCEPT | nr::ACCEPT4 => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
@@ -3469,8 +3632,7 @@ impl Kernel {
             }
             nr::LINKAT => self.sys_linkat(m, a),
             nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[1] as i32, a[2]),
-            nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
-            nr::PSELECT6 => self.sys_pselect(m, a),
+            nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_now(m, n, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
             // Modification times are not settable here: tmpfs keeps one it
             // maintains itself and hostfs reports the host's. Accepting the
@@ -3688,7 +3850,7 @@ impl Kernel {
             nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
             nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
-            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0]),
             nr::SET_TID_ADDRESS => {
@@ -5777,93 +5939,6 @@ impl Kernel {
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
-    /// Read the guest's `pollfd` array into something the host can re-check.
-    fn collect_pollfds(&self, m: &GuestMem<'_>, fds: u64, nfds: u64) -> Option<Vec<PollFd>> {
-        let mut out = Vec::with_capacity(nfds.min(1024) as usize);
-        for i in 0..nfds.min(1024) {
-            let addr = fds + i * 8;
-            let fd = m.read_u32(addr).ok()? as i32;
-            let events = (m.read_u32(addr + 4).ok()? & 0xffff) as u16;
-            let file = self.fds.get(fd).ok();
-            out.push(PollFd {
-                addr,
-                fd,
-                events,
-                handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                // The open mode only. Whether a write would *block* is
-                // asked of the handle in `poll_revents`, every time, because
-                // a parked poll outlives the state it was built from.
-                writable: file.as_ref().is_some_and(|f| f.writable),
-            });
-        }
-        Some(out)
-    }
-
-    /// Read `select`'s three bitmaps into the same list `poll` uses.
-    ///
-    /// The two calls ask the same question. Only the reply differs, so only
-    /// the reply is written twice.
-    fn collect_selectfds(
-        &self,
-        m: &GuestMem<'_>,
-        nfds: u32,
-        readfds: u64,
-        writefds: u64,
-        exceptfds: u64,
-    ) -> Result<Vec<PollFd>, Errno> {
-        const POLLIN: u16 = 0x001;
-        const POLLOUT: u16 = 0x004;
-        if (nfds as i32) < 0 {
-            return Err(Errno::EINVAL);
-        }
-        let nfds = nfds.min(1024);
-        let mut want: std::collections::BTreeMap<i32, u16> = Default::default();
-        // (exceptfds: watched for nothing, but its descriptors must be open)
-        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT), (exceptfds, 0)] {
-            if set == 0 {
-                continue;
-            }
-            for w in 0..(nfds as usize).div_ceil(64) {
-                let word = m.read_bits64(set + (w as u64) * 8).map_err(|_| Errno::EFAULT)?;
-                if word == 0 {
-                    continue;
-                }
-                for bit in 0..64u32 {
-                    let fd = (w as u32) * 64 + bit;
-                    if fd >= nfds {
-                        break;
-                    }
-                    if word & (1 << bit) != 0 {
-                        *want.entry(fd as i32).or_default() |= ev;
-                    }
-                }
-            }
-        }
-        // An exceptional condition never happens here, so a descriptor named
-        // only in that set is watched for nothing and simply never fires. A
-        // descriptor in any set that is not open is EBADF, as on Linux.
-        if want.keys().any(|&fd| self.fds.get(fd).is_err()) {
-            return Err(Errno::EBADF);
-        }
-        Ok(
-            want.into_iter()
-                .map(|(fd, events)| {
-                    let file = self.fds.get(fd).ok();
-                    PollFd {
-                        addr: 0,
-                        fd,
-                        events,
-                        handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                        // The open mode only. Whether a write would *block* is
-                // asked of the handle in `poll_revents`, every time, because
-                // a parked poll outlives the state it was built from.
-                writable: file.as_ref().is_some_and(|f| f.writable),
-                    }
-                })
-                .collect(),
-        )
-    }
-
     /// Write a shared mapping's bytes back to the file behind it.
     fn flush_shared(&mut self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
         if self.shared_maps.is_empty() {
@@ -6101,34 +6176,6 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `pselect6`, for the case where something is ready already. The waiting
-    /// case is a [`BlockOp::Poll`], decided before this is reached.
-    fn sys_pselect(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?;
-        poll_finish(
-            &set,
-            &PollReport::Select {
-                nfds: a[0] as u32,
-                readfds: a[1],
-                writefds: a[2],
-                exceptfds: a[3],
-            },
-            m,
-        )
-    }
-
-    /// `ppoll`, for the case where something is ready already. The waiting
-    /// case is a [`BlockOp::Poll`], decided before this is reached.
-    ///
-    /// This used to report `POLLIN` for any descriptor open for reading,
-    /// which is true of a file and a lie about a socket: a caller polling for
-    /// data that has not arrived was told it had, read nothing, and polled
-    /// again. It asks the handle now.
-    fn sys_ppoll(&mut self, m: &mut GuestMem<'_>, fds: u64, nfds: u64) -> SysResult {
-        let set = self.collect_pollfds(m, fds, nfds).ok_or(Errno::EFAULT)?;
-        poll_finish(&set, &PollReport::Poll, m)
-    }
-
     // -- memory --------------------------------------------------------------
 
     /// `mremap`. The map decides where; this moves the bytes.
@@ -6358,7 +6405,6 @@ impl Kernel {
         Ok(start)
     }
 
-
     // -- sessions, credentials and mounts --------------------------------------
 
     /// Move anything another process has sent into this one's pending set.
@@ -6472,7 +6518,6 @@ impl Kernel {
             None => Err(Errno::EAGAIN),
         }
     }
-
 
     // -- sockets ---------------------------------------------------------------
 
@@ -6732,39 +6777,26 @@ impl Kernel {
     /// `epoll_create1`.
     fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
         const EPOLL_CLOEXEC: u64 = 0o2000000;
-        let set = Arc::new(unix::EpollSet::new());
-        let handle: Arc<dyn crate::vfs::FileHandle> = set.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::new());
         let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
-        let fd = self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)?;
-        self.epolls.insert(key, set);
-        Ok(fd)
+        self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)
     }
 
     /// The epoll set an open file is, if it is one.
     pub fn epoll_of_file(&self, file: &OpenFile) -> Option<Arc<unix::EpollSet>> {
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.epolls.get(&key).cloned()
+        Arc::clone(&file.handle).as_epoll()
     }
 
-    /// An open epoll set holding `watches`, registered here: what a fork's
-    /// child rebuilds its parent's set as.
+    /// An open epoll set holding `watches`: what a fork's child rebuilds its
+    /// parent's set as.
     pub fn adopt_epoll(&mut self, watches: Vec<unix::Watch>, flags: u64) -> Arc<OpenFile> {
-        let set = Arc::new(unix::EpollSet::with_watches(watches));
-        let handle: Arc<dyn crate::vfs::FileHandle> = set.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
-        self.epolls.insert(key, set);
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::with_watches(watches));
         OpenFile::new(handle, "anon_inode:[eventpoll]".into(), flags, true, true)
     }
 
     /// The epoll set behind a descriptor.
-    ///
-    /// Kept in a side table for the same reason sockets are: an
-    /// `Arc<dyn FileHandle>` cannot be asked what it really is.
     fn epoll_of(&self, fd: i32) -> Result<Arc<unix::EpollSet>, Errno> {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.epolls.get(&key).cloned().ok_or(Errno::EINVAL)
+        self.fd_io().epoll_of(fd)
     }
 
     /// `epoll_ctl`. A `struct epoll_event` on aarch64 is a 32-bit event mask,
@@ -6819,86 +6851,6 @@ impl Kernel {
             self.retired_code.push((start, end));
             crate::note_code_change();
         }
-    }
-
-    /// `epoll_pwait`, answered from the same readiness the `poll` path uses.
-    fn sys_epoll_wait(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        epfd: i32,
-        out: u64,
-        max: u32,
-    ) -> SysResult {
-        let set = self.epoll_of(epfd)?;
-        let ready = self.epoll_ready(&set);
-        let n = self.write_epoll_events(m, out, max, &ready)?;
-        Ok(n)
-    }
-
-    /// A set's registrations as the list the poll path understands.
-    fn epoll_pollfds(&self, set: &unix::EpollSet) -> Vec<PollFd> {
-        set.watches()
-            .iter()
-            .filter_map(|w| {
-                let file = self.fds.get(w.fd).ok()?;
-                set.rechain(w.fd, file.handle.wait_queue());
-                Some(PollFd {
-                    addr: 0,
-                    fd: w.fd,
-                    events: (w.events & 0xffff) as u16,
-                    handle: Some(Arc::clone(&file.handle)),
-                    writable: file.writable,
-                })
-            })
-            .collect()
-    }
-
-    /// Which of a set's descriptors are ready, and with what.
-    fn epoll_ready(&self, set: &unix::EpollSet) -> Vec<(u32, u64)> {
-        let mut out = Vec::new();
-        for w in set.watches() {
-            let Ok(file) = self.fds.get(w.fd) else {
-                // A closed descriptor is dropped from the answer rather than
-                // reported; Linux removes it from the set entirely.
-                continue;
-            };
-            let p = PollFd {
-                addr: 0,
-                fd: w.fd,
-                events: (w.events & 0xffff) as u16,
-                handle: Some(Arc::clone(&file.handle)),
-                writable: file.writable,
-            };
-            let got = poll_revents(&p) as u32;
-            if got != 0 {
-                out.push((got, w.data));
-            }
-        }
-        out
-    }
-
-    fn write_epoll_events(
-        &self,
-        m: &mut GuestMem<'_>,
-        out: u64,
-        max: u32,
-        ready: &[(u32, u64)],
-    ) -> SysResult {
-        let n = ready.len().min(max as usize);
-        for (i, (events, data)) in ready.iter().take(n).enumerate() {
-            if gex_abi::X86 || self.compat {
-                // Packed: 12 bytes, the token at offset four.
-                let at = out + i as u64 * 12;
-                m.write_u32(at, *events)?;
-                m.write_u64(at + 4, *data)?;
-            } else {
-                let at = out + i as u64 * 16;
-                m.write_u32(at, *events)?;
-                m.write_u32(at + 4, 0)?;
-                m.write_u64(at + 8, *data)?;
-            }
-        }
-        Ok(n as u64)
     }
 
     /// The anonymous shared file behind a descriptor, if it is one.
@@ -9004,7 +8956,7 @@ mod tests {
 
         // An empty pipe parks both ways, on the same stream.
         set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
-        assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::ReadStream { len: 16, .. }))));
+        assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::ReadStream { len: 16, .. }, _))));
         set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
         assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::ReadStream { len: 16, .. })));
 
@@ -9042,6 +8994,70 @@ mod tests {
         assert_eq!(ret(&m, at), 6);
         assert_eq!(m.read(0x26000, 2).unwrap(), b"ga");
         assert_eq!(m.read(0x26100, 4).unwrap(), b"ther");
+
+        // The poll family. An empty pipe parks, the call's mask in force
+        // and the caller's to put back; a zero timeout answers at once, and
+        // so does a ready pipe, with its events; either leaves the caller's
+        // mask in force.
+        let pollfd = 0x29000u64;
+        m.write_u32(pollfd, rfd as u32).unwrap();
+        m.write_u32(pollfd + 4, 1).unwrap(); // POLLIN
+        m.write_bits64(0x29200, 0).unwrap(); // a mask that blocks nothing
+        let ppoll = |m: &mut GuestMem<'_>, secs: u64| {
+            m.write_u64(0x29100, secs).unwrap();
+            m.write_u64(0x29108, 0).unwrap();
+            set_args(m, at, nr::PPOLL, &[pollfd, 1, 0x29100, 0x29200, 8]);
+        };
+        let caller = 1u64 << 14;
+        k.signals.set_blocked(caller);
+        ppoll(&mut m, 5);
+        match free(&k, &mut m, at) {
+            Some(FreeOutcome::Blocking(BlockOp::Poll { deadline, .. }, restore)) => {
+                assert_eq!(deadline, Some(std::time::Duration::from_secs(5)));
+                assert_eq!(restore, Some(caller));
+                assert_eq!(k.signals.blocked(), 0);
+            }
+            _ => panic!("an empty pipe's ppoll did not park"),
+        }
+        k.signals.set_blocked(caller);
+        ppoll(&mut m, 0);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 0);
+        assert_eq!(k.signals.blocked(), caller);
+        set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 1]);
+        assert!(done(free(&k, &mut m, at)));
+        ppoll(&mut m, 5);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 1);
+        assert_eq!(m.read_u32(pollfd + 4).unwrap() >> 16, 1);
+        assert_eq!(k.signals.blocked(), caller);
+        k.signals.set_blocked(0);
+
+        // epoll_pwait on a set holding the pipe: the caller's token back
+        // when it is ready, a park when it is not.
+        set_args(&mut m, at, nr::EPOLL_CREATE1, &[0]);
+        k.syscall(&mut m, 0);
+        let ep = ret(&m, at) as u64;
+        let packed = gex_abi::X86;
+        m.write_u32(0x29300, 1).unwrap();
+        m.write_u64(if packed { 0x29304 } else { 0x29308 }, 0x77).unwrap();
+        set_args(&mut m, at, nr::EPOLL_CTL, &[ep, 1, rfd, 0x29300]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 0);
+        set_args(&mut m, at, nr::EPOLL_PWAIT, &[ep, 0x29400, 4, (-1i64) as u64, 0, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 1);
+        assert_eq!(m.read_u64(if packed { 0x29404 } else { 0x29408 }).unwrap(), 0x77);
+        set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
+        assert!(done(free(&k, &mut m, at)));
+        set_args(&mut m, at, nr::EPOLL_PWAIT, &[ep, 0x29400, 4, 0, 0, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 0);
+        set_args(&mut m, at, nr::EPOLL_PWAIT, &[ep, 0x29400, 4, 1000, 0, 8]);
+        assert!(matches!(
+            free(&k, &mut m, at),
+            Some(FreeOutcome::Blocking(BlockOp::Poll { deadline: Some(_), .. }, None))
+        ));
 
         // A file: positioned and seeking calls agree with the kernel's.
         let tmp = TmpFs::new();

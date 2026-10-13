@@ -10884,8 +10884,8 @@ fn finish_mine(signalled: bool) -> i32 {
 }
 
 /// A call of the lock-free class (`gex_kernel::syscalls::free_class`:
-/// `read`, `write`, their vectored and positioned forms, `lseek` and
-/// `rt_sigprocmask`), made with no kernel lock, blocking included
+/// `read`, `write`, their vectored and positioned forms, `lseek`,
+/// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included
 /// (docs/kernel-locking.md step 9); `None` for any other call, decided by
 /// its number before anything is done. `gex_syscall`'s stop value.
 fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
@@ -10928,7 +10928,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
             exit_here(-(signal as i32), Some(at))
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
-        FreeOutcome::Blocking(op) => park_free(op, pc as u64),
+        FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
     })
 }
 
@@ -10936,7 +10936,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
 /// the wait goes into the thread's own run state, and the scheduler's first
 /// turn is made here (`FIRST_PICK`), as the locked `Blocking` arm makes it
 /// under its take. `gex_syscall`'s stop value.
-fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
+fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> i32 {
     let waiting = match &op {
         gex_kernel::BlockOp::ReadStream { handle, .. } => {
             if tracing() {
@@ -10945,7 +10945,10 @@ fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
             Waiting::Read(Arc::clone(handle))
         }
         gex_kernel::BlockOp::WriteStream { handle, .. } => Waiting::Write(Arc::clone(handle)),
-        _ => unreachable!("a class call parks only on a stream"),
+        // As the kernel's park: re-checked on the scheduler's way round,
+        // woken by the descriptors' queues (`waitq::queues_of`).
+        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64)),
+        _ => unreachable!("a class call parks only on a stream or a poll"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     // A new wait: whatever this Worker's thread was registered for is over.
@@ -10958,7 +10961,7 @@ fn park_free(op: gex_kernel::BlockOp, pc: u64) -> i32 {
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = waiting;
         r.blocked_on = Some(op);
-        r.owed = Owed { write_blocked, ..Owed::default() };
+        r.owed = Owed { restore_sigmask, write_blocked, ..Owed::default() };
     }
     waitq::begin_turn();
     let pick = pick_mine(&run);

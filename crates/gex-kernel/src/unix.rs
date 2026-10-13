@@ -1214,6 +1214,10 @@ impl Drop for EpollSet {
 }
 
 impl FileHandle for EpollSet {
+    fn as_epoll(self: Arc<Self>) -> Option<Arc<EpollSet>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
         Err(Errno::EINVAL)
     }
