@@ -426,6 +426,7 @@ impl Wayland {
             }
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
                 match *ev {
+                    Routed::Origin(surface, x, y) => s.client.placement_origin(surface, x, y),
                     Routed::PointerTo(surface, x, y, ms) => s.client.pointer_to(surface, x, y, ms),
                     Routed::PointerClear => s.client.pointer_clear(),
                     Routed::Button(b, down, ms) => s.client.pointer_button(b, down, ms),
@@ -521,6 +522,9 @@ struct Screen {
 
 /// Scripted input, routed by the screen to one client.
 enum Routed {
+    /// A placed surface's origin, which the pointer positions after it are
+    /// relative to (`gex_window_placement_v1.origin`).
+    Origin(u32, i32, i32),
     PointerTo(u32, i32, i32, u32),
     PointerClear,
     Button(u32, bool, u32),
@@ -636,6 +640,7 @@ impl Screen {
                     eprintln!("[gex] input: pointer at {x},{y} is over {:?}", hit.map(|h| h.0));
                     self.pointer = hit.map(|h| h.0);
                     if let Some(((sid, surface), lx, ly)) = hit {
+                        out.push((sid, Routed::Origin(surface, x - lx, y - ly)));
                         out.push((sid, Routed::PointerTo(surface, lx, ly, ms)));
                     }
                 }

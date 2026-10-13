@@ -20,7 +20,11 @@
 //      gex's test page (nt.html) neither shipped, named nor loaded;
 //   5. with --placed (Paint, "compositor" off): the bare desktop leaves a
 //      window its client places (gex_window_placement_v1) to Wine. A caption
-//      drag moves it by the drag, a border drag past its edge grows it and
+//      drag moves it by the drag; a smooth one (a move a frame, out and back)
+//      has it follow the pointer every frame without moving against the drag
+//      or getting ahead of the pointer (gex_window_placement_v1.origin: the
+//      window shook when Wine read the pointer against where it had already
+//      moved the window); a border drag past its edge grows it and
 //      one inside shrinks it (Win32's own SC_MOVE/SC_SIZE loops, the pointer
 //      held by the canvas), and a click on Paint leaves its owned dialog
 //      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
@@ -207,6 +211,52 @@ if (placedChecks) {
     for (let k = 1; k <= 10; k++) { await mouse('mouseMoved', Math.round(x + (x2 - x) * k / 10), Math.round(y + (y2 - y) * k / 10), true); await sleep(60); }
     await mouse('mouseReleased', x2, y2, false);
   };
+  // A caption drag of `steps` moves `ms` apart, recording every animation
+  // frame the biggest placed window's place and the pointer's; then a second
+  // held still and the release. Per frame, the error is the window's travel
+  // less the pointer's: behind (Wine and the page are a frame or two late)
+  // is expected, against the drag or ahead of the pointer is the shake.
+  const smoothDrag = async (x, y, dx, dy, steps = 80, ms = 4) => {
+    await ev(`(() => {
+      const D = globalThis.__dragProbe = { frames: [], ptr: null, on: true };
+      if (!globalThis.__dragProbeListening) {
+        globalThis.__dragProbeListening = true;
+        const note = (e) => { if (globalThis.__dragProbe) globalThis.__dragProbe.ptr = [e.clientX, e.clientY]; };
+        addEventListener('pointermove', note, { capture: true });
+        addEventListener('pointerdown', note, { capture: true });
+      }
+      const f = (t) => {
+        const cs = [...document.querySelectorAll('canvas')].filter((c) => Number(c.style.zIndex) >= 2000000 && c.isConnected);
+        const c = cs.reduce((a, c) => (!a || c.width * c.height > a.width * a.height ? c : a), null);
+        if (c && D.ptr) { const r = c.getBoundingClientRect(); D.frames.push([r.left, r.top, D.ptr[0], D.ptr[1]]); }
+        if (D.on) requestAnimationFrame(f);
+      };
+      requestAnimationFrame(f);
+      return 1;
+    })()`);
+    await mouse('mouseMoved', x, y, false); await sleep(150);
+    await mouse('mousePressed', x, y, true); await sleep(150);
+    for (let k = 1; k <= steps; k++) {
+      await mouse('mouseMoved', Math.round(x + dx * k / steps), Math.round(y + dy * k / steps), true);
+      await sleep(ms);
+    }
+    await sleep(1000);
+    await mouse('mouseReleased', x + dx, y + dy, false);
+    const fr = (await ev('(() => { const D = globalThis.__dragProbe; D.on = false; return D.frames; })()')) ?? [];
+    // From the press on: the first frame that saw the pointer at (x, y).
+    const i0 = fr.findIndex((f) => f[2] === x && f[3] === y);
+    const rows = i0 < 0 ? [] : fr.slice(i0);
+    const sx = Math.sign(dx), sy = Math.sign(dy);
+    let back = 0, ahead = 0, maxAhead = 0, sumErr = 0, maxErr = 0;
+    rows.forEach((f, i) => {
+      const ex = (f[0] - rows[0][0]) - (f[2] - x), ey = (f[1] - rows[0][1]) - (f[3] - y);
+      const lead = Math.max(ex * sx, ey * sy);
+      if (lead > 1) { ahead++; maxAhead = Math.max(maxAhead, lead); }
+      const e = Math.hypot(ex, ey); sumErr += e; maxErr = Math.max(maxErr, e);
+      if (i && ((f[0] - rows[i - 1][0]) * sx < 0 || (f[1] - rows[i - 1][1]) * sy < 0)) back++;
+    });
+    return { frames: rows.length, back, ahead, maxAhead: Math.round(maxAhead), meanErr: rows.length ? Math.round(sumErr / rows.length) : 0, maxErr: Math.round(maxErr) };
+  };
   const key = async (k, code, vk, modifiers = 0) => {
     if (modifiers & 2) await browser.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, modifiers: 2 }, page);
     await browser.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: k, code, windowsVirtualKeyCode: vk, modifiers }, page);
@@ -236,6 +286,17 @@ if (placedChecks) {
     await drag(before.x + Math.round(before.w / 2), before.y + 10, before.x + Math.round(before.w / 2) + 40, before.y + 40);
     m = await until(main, (w) => w.x === before.x + 40 && w.y === before.y + 30);
     check(m.x === before.x + 40 && m.y === before.y + 30 && m.w === before.w, `a caption drag moves it by the drag (${fmt(before)} -> ${fmt(m)})`);
+    // Smooth caption drags, out and back, a move every 4 ms (a fast hand,
+    // which is when it shook: Wine moved the window between two moves): every
+    // animation frame, where the window is against where the pointer is.
+    for (const [ddx, ddy] of [[160, 60], [-160, -60]]) {
+      const from = m;
+      const r = await smoothDrag(from.x + Math.round(from.w / 2), from.y + 10, ddx, ddy);
+      m = await until(main, (w) => w.x === from.x + ddx && w.y === from.y + ddy);
+      check(r.frames >= 10 && r.back === 0 && r.ahead <= 2 && r.maxErr <= 16,
+        `a smooth caption drag by ${ddx},${ddy}: the window follows the pointer (${r.frames} frames: moved against the drag in ${r.back}, ahead of the pointer in ${r.ahead} by up to ${r.maxAhead} px; behind it by ${r.meanErr} px on average, ${r.maxErr} px at most)`);
+      check(m.x === from.x + ddx && m.y === from.y + ddy, `... and ends where the drag did (${fmt(from)} -> ${fmt(m)})`);
+    }
     // Right border: out by 30 (past the canvas: the pointer stays captured), then in by 60.
     const at = m;
     await drag(at.x + at.w - 3, at.y + Math.round(at.h / 2), at.x + at.w - 3 + 30, at.y + Math.round(at.h / 2));
