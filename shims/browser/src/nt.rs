@@ -697,7 +697,7 @@ mod imp {
             // whether they woke anyone, since the last report.
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
             let m: Vec<String> = crate::MISSES.iter().map(|a| a.swap(0, Ordering::Relaxed).to_string()).collect();
-            warn_line(&format!("gex-nt: misses all/behind/returned/dense/fjit/knows/translate {}; livelocked pcs {}, directory entries healed {}, units published twice refused {}\n", m.join("/"), crate::LIVELOCKS.load(Ordering::Relaxed), crate::DIRS_HEALED.load(Ordering::Relaxed), crate::cgen::TWICE.load(Ordering::Relaxed)));
+            warn_line(&format!("gex-nt: misses all/behind/returned/dense/fjit/knows/translate {}; livelocked pcs {}, directory entries healed {} (and {} in an install window), units published twice refused {}\n", m.join("/"), crate::LIVELOCKS.load(Ordering::Relaxed), crate::DIRS_HEALED.load(Ordering::Relaxed), crate::DIRS_HEALED_EARLY.load(Ordering::Relaxed), crate::cgen::TWICE.load(Ordering::Relaxed)));
             warn_line(&format!(
                 "gex-nt: yield parks woken={} ({} ms) moved={} timed_out={} ({} ms) kicks waking={} idle={}\n",
                 take(&YIELD_PARKS[0]),

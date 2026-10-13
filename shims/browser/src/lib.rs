@@ -12104,13 +12104,17 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Directory entries `heal_dirs` wrote (the NT stats line).
 pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Of those, the ones in a unit's install window (`cgen::in_install_window`),
+/// which are not a bug.
+pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
-/// the page table says. Every heal is said: since units are published once
-/// (`cgen::CLAIMED`) none should happen, so a heal line is a bug report
-/// (something numbered a page and left its entry unwritten), not routine.
+/// the page table says. Every heal outside a unit's install window is said:
+/// since units are published once (`cgen::CLAIMED`) and list every page they
+/// cover (`cgen::bridges`), none should happen, so a heal line is a bug
+/// report (something numbered a page and left its entry unwritten).
 fn heal_dirs(start: u64) {
     let first = gex_abi::dispatch_page(start);
     let healed: Vec<(u64, u32, u32)> = with_jit(|h| {
@@ -12132,6 +12136,13 @@ fn heal_dirs(start: u64) {
         out
     });
     for (page, was, base) in healed {
+        // A unit being published while another thread already runs its code
+        // (two threads loading one DLL): the claimant's install writes this
+        // entry shortly. Counted, not said.
+        if was == 0 && cgen::in_install_window(page) {
+            DIRS_HEALED_EARLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let n = DIRS_HEALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         warn_line(&format!(
             "gex: heal: pid {} pc {start:#x} page {page:#x}: directory entry {was:#x}, the page table numbers it {base:#x}; entry written (heal {n}; a bug: something numbered the page and left its entry unwritten)\n",
