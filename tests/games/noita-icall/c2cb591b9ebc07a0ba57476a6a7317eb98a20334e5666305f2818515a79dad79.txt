@@ -1,0 +1,8 @@
+# /w3/lib/wine/i386-windows/shlwapi.dll at 0x795e0000: (return address, target, calls) at table calls, counted by gex (icallcount units)
+icall 0x795e9a8c 0x7bd916ec 1
+icall 0x795e9aa8 0x7bd9175c 1
+icall 0x795e9ac3 0x7bd9175c 1
+icall 0x795e9ad7 0x7bd912f0 1
+icall 0x795e9bb8 0x795fbab0 1
+icall 0x795fbc23 0x7bd916ec 1
+icall 0x795fbc37 0x7bd9175c 1

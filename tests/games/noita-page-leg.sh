@@ -36,6 +36,15 @@
 # at (NOITA_UNITLESS_OK: a regex of images without code, default tzres and
 # normaliz). (So does the NT shim's trampoline unit, `--nt-trampolines32`,
 # which W3 runs do not place.)
+# The units are built with gex's own indirect-call profile of Noita,
+# tests/games/noita-icall (a counting run's, at the bases it ran at): after
+# a first build, `tests/games/noita-icall/place.py units LIST BUILDLOG`
+# (LIST the images and bases built, BUILDLOG that build's log, which names
+# each one's identity) moves it to these bases as units/icall/, and a second
+# build devirtualises the hot table calls. A new profile: build the units
+# with GEX_CGEN_ICALL_COUNT=1, run with NOITA_Q='&cgen=1&icallcount=1' and
+# NOITA_KEEP=icall, and split the run's dumps (tmp/noita-err.txt on the
+# bench box) with tests/games/noita-icall/split.py.
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
