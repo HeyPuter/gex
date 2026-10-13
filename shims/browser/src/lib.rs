@@ -7806,6 +7806,14 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 }
 
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
+/// The global kernel's id of the pipe end descriptor `fd` is, or -1: the
+/// wineserver's door kick pipe, which a door call in another process
+/// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
+#[no_mangle]
+pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
+    with_host(|h| h.kernel.fds.get(fd).ok().and_then(|f| pipe_id(&f.path)).unwrap_or(-1))
+}
+
 fn pipe_id(path: &str) -> Option<i32> {
     path.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
 }

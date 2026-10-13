@@ -29,6 +29,7 @@ mod ready;
 mod sys_waits;
 mod stall;
 pub(crate) mod ftab;
+pub(crate) mod door;
 pub mod wayland;
 
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};

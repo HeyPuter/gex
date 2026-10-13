@@ -3314,6 +3314,9 @@ export class Gex {
     };
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
+    // What a door instance needs to run this program again on its memory
+    // (a wineserver: `#doorPublish`).
+    if (wasmprog) this.#wasmprogInfo = { module: mod, base, memBase, binds: this.#wasmprogBindText };
     inst = new WebAssembly.Instance(mod, imports);
     if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     if (wasmprog) {
@@ -3812,6 +3815,7 @@ export class Gex {
     const e = this.#shim.exports;
     if (!e.gex_wasmprog_binds) return [];
     const n = e.gex_wasmprog_binds(prov, 0, 0) >>> 0;
+    this.#wasmprogBindText = '';
     if (!n) return [];
     const buf = e.gex_alloc(n) >>> 0;
     let text;
@@ -3821,6 +3825,7 @@ export class Gex {
     } finally {
       e.gex_free?.(buf, n);
     }
+    this.#wasmprogBindText = text;
     const extra = [];
     const set = (m, name, v) => { (imports[m] ??= {})[name] = v; };
     for (const line of text.split('\n')) {
@@ -3912,7 +3917,378 @@ export class Gex {
         return h | 0;
       },
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, name) | 0,
+      // Door calls into the wineserver (docs/wineserver-kernel.md).
+      door_publish: (area) => this.#doorPublish(area >>> 0),
+      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid),
+      // A Worker the door was broadcast to while it ran (it takes no
+      // messages): Wine runs its program again as a child, which starts with
+      // the door (loader.c `wineserver_relaunch`). None in the SP build.
+      door_missing: () => (this.#door || single.on ? 0 : 1),
+      // The session mapping, a block of the server's memory (area +128,
+      // +132), copied from directly by win32u (docs/wineserver-kernel.md
+      // §6.1): the bytes copied, or -1 with no door session; the session's
+      // size for a size of 0.
+      session_copy: (dst, off, size) => this.#sessionCopy(dst >>> 0, off >>> 0, size >>> 0),
+      session_seq: (off) => this.#sessionSeq(off >>> 0),
+      // The server's user shared data page (area +140), copied at a
+      // process's start and written by the first boot's fill (§6.2).
+      usd_copy: (dst, size) => this.#usdMove(dst >>> 0, size >>> 0, false),
+      usd_publish: (src, size) => this.#usdMove(src >>> 0, size >>> 0, true),
+      // The server's own (the pump): a thread's wait pipe, which door calls
+      // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
+      wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
+      wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, buf >>> 0, len >>> 0) ?? -38,
+      wake_close: () => {},
     };
+  }
+
+  // -- door calls (docs/wineserver-kernel.md) ------------------------------
+  //
+  // The wineserver is its own process. When it is up it publishes its door
+  // area; the host hands the server's memory and module to every Worker.
+  // A client thread then makes a Wine request by running it itself, on its
+  // Worker's own instance of the server's module on the server's memory,
+  // under the server's door lock: no pipe, no wake. A system call the server
+  // code makes inside a door is answered here when it needs no process (the
+  // clock, getpid), and otherwise proxied to the server's pump.
+
+  /** This process's wasm32 program as installed (`#cgenInstall`). */
+  #wasmprogInfo = null;
+  /** The binding list `#wasmprogBind` read last (for `#wasmprogInfo`). */
+  #wasmprogBindText = '';
+  /** The session's door server, and this Worker's instance on it. */
+  #door = null;
+  #doorInst = null;
+  #doorViews = null;
+  /** Census: door calls, fallbacks, proxies. */
+  #doorStats = { calls: 0, fallbacks: 0, proxies: 0, t0: 0, nodoor: 0, tPre: 0, tDisp: 0, tPost: 0, T2: 0, tSys: 0, sys: 0, tProxy: 0, byNr: {} };
+
+  /** The server: `area` is its door area, in this process's memory. */
+  #doorPublish(area) {
+    const info = this.#wasmprogInfo;
+    if (!info || single.on) return;
+    const e = this.#shim.exports;
+    const dv = new DataView(this.#memory.buffer);
+    const kickFd = dv.getInt32(area + 68, true);
+    const kickId = e.gex_fd_pipe_id?.(kickFd) ?? -1;
+    if (kickId < 0) {
+      console.error(`[gex-door] the server's kick fd ${kickFd} is not a global pipe: no doors`);
+      return;
+    }
+    // The door context must hold gex's whole register context (gex_abi
+    // ctx::SIZE, 1120 bytes for i386): the kernel writes past the
+    // system-call slots, and a short one corrupted the server's heap.
+    const ctxSize = dv.getUint32(area + 136, true);
+    if (ctxSize < 1120) {
+      console.error(`[gex-door] the server's door context is ${ctxSize} bytes, under gex's 1120: no doors`);
+      return;
+    }
+    const door = {
+      memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? '',
+      area, kickId, pid: dv.getInt32(area + 112, true), id: `${Date.now()}:${area}`,
+    };
+    if (globalThis.GEX_DOOR_TRACE) console.error(`[gex-door] wineserver pid ${door.pid} published its door (area ${area})`);
+    this.#env.publishDoor?.(door);
+  }
+
+  #usdMove(at, size, publish) {
+    const d = this.#door;
+    if (!d || single.on) return -1;
+    const { u8, dv } = this.#doorView();
+    const usd = dv.getUint32(d.area + 140, true);
+    if (!usd) return -1;
+    const n = Math.min(size, 4096);
+    if (publish) u8.set(this.#bytes().subarray(at, at + n), usd);
+    else this.#bytes().set(u8.subarray(usd, usd + n), at);
+    return n;
+  }
+
+  #sessTr = 0;
+  #sessionCopy(dst, off, size) {
+    const d = this.#door;
+    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] copy ${this.#sessTr} off ${off} size ${size}`);
+    if (!d) return -1;
+    const { u8, dv } = this.#doorView();
+    const base = dv.getUint32(d.area + 128, true), len = dv.getUint32(d.area + 132, true);
+    if (!base || !len) return -1;
+    if (!size) return len;
+    if (off >= len) return -1;
+    const n = Math.min(size, len - off);
+    this.#bytes().set(u8.subarray(base + off, base + off + n), dst);
+    return n;
+  }
+
+  #sessionSeq(off) {
+    const d = this.#door;
+    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] seq ${this.#sessTr} off ${off} base ${d && this.#doorView().dv.getUint32(d.area + 128, true)}`);
+    const { dv } = this.#doorView();
+    const base = d ? dv.getUint32(d.area + 128, true) : 0;
+    if (!base) return 0n;
+    const at = base + off;
+    // A seqlock's word: whole, as the server stores it (8-aligned).
+    if (!(at & 7)) return Atomics.load(this.#doorView().i64, at / 8);
+    return dv.getBigInt64(at, true);
+  }
+
+  /** The door server, from the host (all Workers of the session). */
+  setDoor(door) {
+    if (this.#door?.id === door?.id) return;
+    this.#door = door;
+    this.#doorInst = null;
+    this.#doorViews = null;
+  }
+
+  #doorView() {
+    const d = this.#door;
+    const buf = d.memory.buffer;
+    let v = this.#doorViews;
+    if (!v || v.buf !== buf || v.len !== buf.byteLength) {
+      v = this.#doorViews = { buf, len: buf.byteLength, u8: new Uint8Array(buf), i32: new Int32Array(buf), i64: new BigInt64Array(buf, 0, Math.floor(buf.byteLength / 8)), dv: new DataView(buf) };
+    }
+    return v;
+  }
+
+  #doorInstantiate(d) {
+    const v = this.#doorView();
+    const a = d.area;
+    const stackTop = v.dv.getUint32(a + 52, true);
+    const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, stackTop);
+    // `slots` is the program's table reservation (tens of millions, past
+    // an engine's table limit): the door's table needs only the module's
+    // own elements, its dylink table_size.
+    // The binding list (dylink.rs): a static program's are its exports past
+    // the element segment (`X`) and its GOT (`G`); a server with shared
+    // libraries is not a door server.
+    const extra = [];
+    const got = [];
+    let size = d.base + dylinkTableSize(d.module);
+    for (const line of d.binds.split('\n')) {
+      if (!line) continue;
+      const f = line.split('\t');
+      if (f[0] === 'X') { extra.push([Number(f[1]), f[2]]); size = Math.max(size, Number(f[1]) + 1); }
+      else if (f[0] === 'G') got.push(f);
+      else if (f[0] === 'S') { if (f[1] === 'env' && f[2].startsWith('__asyncify_')) got.push(['G', 'env', f[2], '0', '1']); }
+      else throw new Error(`door: the server program's binding ${f[0]} ${f[1]}.${f[2]} is not supported`);
+    }
+    const table = new WebAssembly.Table({ element: 'anyfunc', initial: size });
+    class DoorExit extends Error {}
+    const st = this.#doorStats;
+    const syscall = globalThis.GEX_DOOR_STATS
+      ? (ctx) => { const t = performance.now(); try { this.#doorSyscall(ctx >>> 0, DoorExit); } finally { st.sys++; st.tSys += performance.now() - t; } }
+      : (ctx) => this.#doorSyscall(ctx >>> 0, DoorExit);
+    const imports = {
+      env: {
+        memory: d.memory, __indirect_function_table: table, __stack_pointer: sp,
+        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, d.memBase | 0),
+        __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, d.base | 0),
+      },
+      gex: {
+        syscall,
+        asyncify: (op) => { if (op === 0) return 0; throw new Error('gex.asyncify: no fork inside a door call'); },
+        // a thread's wait pipe is resolved by the pump (init_thread); written in place
+        wake_pipe: () => -1,
+        wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),
+        wake_close: () => {},
+      },
+    };
+    for (const f of got) (imports[f[1]] ??= {})[f[2]] = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
+    for (const imp of WebAssembly.Module.imports(d.module)) {
+      if (imp.kind === 'function' && !imports[imp.module]?.[imp.name]) {
+        (imports[imp.module] ??= {})[imp.name] = () => { throw new Error(`${imp.module}.${imp.name}: not available inside a door call`); };
+      }
+    }
+    const inst = new WebAssembly.Instance(d.module, imports);
+    for (const [slot, name] of extra) table.set(slot, inst.exports[name]);
+    // Its first call sets its context, thread pointer and TLS
+    // (`__gex_thread_start` on the area's frame) and ends at the exit call.
+    const ctx = v.dv.getUint32(a + 72, true);
+    const frame = v.dv.getUint32(a + 76, true);
+    v.dv.setUint32(ctx + 32, frame, true);
+    v.dv.setUint32(ctx + 36, 0, true);
+    try {
+      table.get(v.dv.getUint32(a + 108, true))(ctx, 0, 0, 0n);
+      throw new Error('door: __gex_thread_start returned');
+    } catch (err) {
+      if (!(err instanceof DoorExit)) throw err;
+    }
+    const dispatch = table.get(v.dv.getUint32(a + 60, true));
+    return { door: d, dispatch, sp, stackTop, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
+  }
+
+  /** A system call from server code inside a door (i386 numbers, the
+   *  context in the server memory). */
+  #doorSyscall(ctx, DoorExit) {
+    const d = this.#door;
+    const { dv, i32 } = this.#doorView();
+    const nr = dv.getUint32(ctx, true);
+    const arg = (slot) => dv.getUint32(ctx + slot * 8, true);
+    const ret = (r) => { dv.setUint32(ctx, r >>> 0, true); dv.setUint32(ctx + 4, 0, true); };
+    switch (nr) {
+      case 1: case 252: throw new DoorExit();
+      case 20: case 224: ret(d.pid); return;
+      case 265: case 403: case 78: {
+        // clock_gettime, clock_gettime64, gettimeofday: as the shim's
+        // browser_clock and gex-kernel's monotonic_from (one boot base).
+        const clk = arg(3), buf = nr === 78 ? arg(3) : arg(1);
+        if (nr === 78 || clk === 0 || clk === 5 || clk === 8 || [1, 4, 6, 7, 9].includes(clk)) {
+          if (!buf) { ret(nr === 78 ? 0 : -14); return; }
+          const ns = this.#env.now();
+          let secs = Number(ns / 1000000000n), nanos = Number(ns % 1000000000n);
+          if (nr !== 78 && [1, 4, 6, 7, 9].includes(clk)) secs -= this.#kernel?.k_boot_secs?.(0) ?? 0;
+          if (nr === 403) { dv.setBigUint64(buf, BigInt(secs), true); dv.setBigUint64(buf + 8, BigInt(nanos), true); }
+          else { dv.setUint32(buf, secs >>> 0, true); dv.setUint32(buf + 4, nr === 78 ? Math.floor(nanos / 1000) : nanos, true); }
+          ret(0);
+          return;
+        }
+        break;
+      }
+    }
+    // Proxied: the pump makes it as the server process. ebx, ecx, edx,
+    // esi, edi, ebp.
+    const a = d.area;
+    i32[(a + 8) >> 2] = nr;
+    const regs = [3, 1, 2, 6, 7, 5];
+    for (let k = 0; k < 6; k++) i32[(a + 12 + 4 * k) >> 2] = arg(regs[k]);
+    const stats = dv.getUint32(a + 96, true);
+    if (stats && nr < 512) Atomics.add(i32, (stats >> 2) + nr, 1);
+    Atomics.add(i32, (a + 100) >> 2, 1);
+    const st = this.#doorStats;
+    st.proxies++;
+    const tp = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
+    Atomics.store(i32, (a + 4) >> 2, 1);
+    Atomics.notify(i32, a >> 2);
+    this.#doorKick();
+    while (Atomics.load(i32, (a + 4) >> 2) !== 2) Atomics.wait(i32, (a + 4) >> 2, 1, 5);
+    const r = i32[(a + 36) >> 2];
+    Atomics.store(i32, (a + 4) >> 2, 0);
+    if (tp) { st.tProxy += performance.now() - tp; (st.byNr[nr] = (st.byNr[nr] ?? 0) + 1); }
+    ret(r);
+  }
+
+  #doorScratch = 0;
+
+  /** `gex.wake_write` inside a door: a client's wait pipe written from this
+   *  Worker (the pipes are the global kernel's), not proxied to the pump. */
+  #doorWake(id, buf, len) {
+    if (len > 64 || !this.#doorScratch) return -22;
+    const { u8 } = this.#doorView();
+    this.#bytes().set(u8.subarray(buf, buf + len), this.#doorScratch);
+    return this.#kernel?.k_pipe_write?.(id, this.#doorScratch, len) ?? -38;
+  }
+
+  #doorKick() {
+    // one byte, from anywhere in this process's memory: the pump only drains
+    this.#kernel?.k_pipe_write?.(this.#door.kickId, 0, 1);
+  }
+
+  /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
+   *  1 use the pipes, 2 the thread died in the request. */
+  #doorCall(req, pid, tid) {
+    const d = this.#door;
+    const st = this.#doorStats;
+    if (!d || single.on) {
+      if (globalThis.GEX_DOOR_STATS && !(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
+      return 1;
+    }
+    const T = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
+    // The request's header is in the door buffer once copied in: its 64
+    // bytes are the scratch an in-place wakeup is written from (#doorWake).
+    this.#doorScratch = req;
+    const cm = this.#bytes();
+    const cdv = new DataView(cm.buffer);
+    const reqSize = cdv.getUint32(req + 4, true);
+    const replyMax = cdv.getUint32(req + 8, true);
+    const count = Math.min(cdv.getUint32(req + 64, true), 16);
+    const replyData = cdv.getUint32(req + 68, true);
+    const { u8, i32, dv } = this.#doorView();
+    const a = d.area;
+    const buf = dv.getUint32(a + 44, true), bufSize = dv.getUint32(a + 48, true);
+    const replyOff = (64 + reqSize + 7) & ~7;
+    if (replyOff + 64 + replyMax > bufSize) { st.fallbacks++; return 1; }
+    // the lock: 0 free, 1 held, 2 held with waiters
+    const L = a >> 2;
+    // Poisoned (a door call died midway): no more doors; the pipes say the
+    // rest when the server goes.
+    if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
+    let waitedMs = 0;
+    for (let spins = 0; ; spins++) {
+      const v = Atomics.compareExchange(i32, L, 0, 1);
+      if (v === 0) break;
+      if (spins < 200) continue;
+      if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
+      Atomics.wait(i32, L, 2, 1);
+      // A lock held this long is a stuck door (a Worker ended inside one,
+      // or a deadlock): say who holds it, every 5 s of waiting.
+      if (++waitedMs % 5000 === 0) {
+        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
+      }
+    }
+    i32[(a + 116) >> 2] = tid;
+    i32[(a + 120) >> 2] = pid;
+    let r;
+    try {
+      // This Worker's instance, started under the lock: its start runs on
+      // the one door stack and context.
+      let di = this.#doorInst;
+      if (!di || di.door !== d) di = this.#doorInst = this.#doorInstantiate(d);
+      u8.set(cm.subarray(req, req + 64), buf);
+      let at = buf + 64;
+      for (let k = 0; k < count; k++) {
+        const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
+        u8.set(cm.subarray(ptr, ptr + size), at);
+        at += size;
+      }
+      di.sp.value = di.stackTop;
+      const T1 = T ? performance.now() : 0;
+      // The time, as set_current_time would read it (gettimeofday,
+      // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
+      // of the door saved.
+      const ns = this.#env.now();
+      r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      if (T) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
+      if (r === 0xffffffff) { st.fallbacks++; r = 1; }
+      else if (r === 0xfffffffe) r = 2;
+      else {
+        const ro = buf + r;
+        cm.set(u8.subarray(ro, ro + 64), req);
+        const size = Math.min(dv.getUint32(ro + 4, true), replyMax);
+        if (size && replyData) cm.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
+        st.calls++;
+        r = 0;
+      }
+    } catch (err) {
+      this.#doorInst = null;
+      // A handler cut off midway: the server is poisoned (area +124, the
+      // caller's tid), and its pump ends it at its next turn, as when
+      // wineserver dies. The caller takes the pipes, which then close.
+      Atomics.store(i32, (a + 124) >> 2, tid || -1);
+      console.error(`[gex-door] the wineserver trapped in a door call (pid ${pid} tid ${tid}); the server is poisoned: ${err?.stack ?? err}`);
+      r = 1;
+    }
+    const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;
+    if (Atomics.exchange(i32, L, 0) === 2) Atomics.notify(i32, L);
+    if (kick) this.#doorKick();
+    if (globalThis.GEX_DOOR_STATS) {
+      const now = performance.now();
+      if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
+      if (!st.t0) st.t0 = now;
+      else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
+        const sa = dv.getUint32(a + 96, true) >> 2;
+        const top = [];
+        if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
+        top.sort((x, y) => y[0] - x[0]);
+        console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
+          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
+          + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
+          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
+          + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
+          + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
+        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
+        st.byNr = {};
+        st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
+      }
+    }
+    return r;
   }
 
   /** A native wasm32 program the shim staged (a load, an exec, a fork's
@@ -5221,7 +5597,7 @@ export class Gex {
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
-          if (hit >= 0) return hit === me ? 1 : 0;
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit} (no trap)`); return hit === me ? 1 : 0; }
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {
@@ -5259,12 +5635,12 @@ export class Gex {
             throw err;
           }
           const hit = e.gex_callout_hit();
-          if (hit >= 0) return ended(hit === me ? 1 : 0);
+          if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === me ? 1 : 0); }
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) return 0;
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -5274,7 +5650,7 @@ export class Gex {
           // Control left an exception dispatched nested further out: this
           // call-out's caller leaves, and the dispatch's loop sees the escape
           // at the next check (nt.rs `exc_escape`).
-          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) return 0;
+          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: exception escaped`); return 0; }
           // The NtCallbackReturn of a callback further out (the function
           // this call-out ran was the callback's dispatcher): its loop's, so
           // up through every frame between, as natively.
@@ -5307,12 +5683,14 @@ export class Gex {
           const rc = e.gex_resume_ctx() >>> 0;
           if (rc && rc !== ctx) {
             // A resume on another thread's context is not this call-out's.
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
           const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
           if (sp > c.spWant + c.unwound) {
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
           }
@@ -6432,4 +6810,20 @@ export class Gex {
     return out;
   }
 
+}
+
+/** A PIC module's `dylink.0` table_size (WASM_DYLINK_MEM_INFO: mem_size,
+ *  mem_align, table_size, table_align, LEB128). */
+function dylinkTableSize(mod) {
+  const sec = WebAssembly.Module.customSections(mod, 'dylink.0')[0];
+  if (!sec) throw new Error('door: the server program has no dylink.0 section');
+  const b = new Uint8Array(sec);
+  let i = 0;
+  const leb = () => { let r = 0, sh = 0, c; do { c = b[i++]; r += (c & 0x7f) * 2 ** sh; sh += 7; } while (c & 0x80); return r; };
+  while (i < b.length) {
+    const kind = b[i++], len = leb(), end = i + len;
+    if (kind === 1) { leb(); leb(); return leb(); }
+    i = end;
+  }
+  throw new Error('door: no WASM_DYLINK_MEM_INFO in the server program');
 }
