@@ -649,7 +649,7 @@ build). How it differs from §4:
 - **The page's door instance** gets its own function table, sized from
   the program's `dylink.0` and its binding list (`X` slots, GOT), and it
   starts under the door lock (the start runs on the one door stack).
-- **Not yet done:**
+- **Not yet done** (at the prototype; see §10.2 for what followed):
   - waits still go through the wait pipes;
   - session reads are still `read_session_data` requests, now through
     the door;
@@ -702,6 +702,149 @@ pad. That breakpoint killed the process with status 133. It killed
 winedevice in every page run, pipes too. With doors, services also lost
 a thread that way before setting `__wine_SvcctlStarted`, and wineboot
 hung. The leg for it is `tests/w3/threadexit.sh`.
+
+### 10.2 Full migration status (2026-10-12)
+
+What §10 item 3 has built so far, on `wskern/main` and `wskern/wine`:
+
+- **Session mirror (§6.1): done.** The server publishes its session
+  block in the door area (+128 base, +132 size, `door_set_session` from
+  `set_session_mapping`). win32u copies the live bytes with
+  `gex.session_copy` and checks a seqlock's release against the live
+  sequence with `gex.session_seq` (page: `#sessionCopy`, `#sessionSeq`;
+  native: `door::session_copy`, `session_seq`). There are no TTL and no
+  `read_session_data` requests while a door session exists; without one
+  (pipes, `WINEGEX_DOOR=0`, SP) the request path stays. Leg:
+  `tests/w3/session.sh`. A child sees its parent's window, and sees it
+  gone as soon as the parent destroys it. Natively, 20000 IsWindow calls
+  with a 1 µs TTL made no requests (6637 door calls in the whole run).
+- **Wakeups in place (§4.5, first step): done.** The full wake-ring
+  design is not built. What is built removes the proxy that the census
+  blamed: `send_thread_wakeup`'s `write(2)` to the client's wait pipe.
+  `init_thread`, which the pump serves, names the pipe to the host
+  (`gex.wake_pipe`: the global pipe id in the page, the file natively).
+  A door then writes the wakeup itself (`gex.wake_write`), and EPIPE
+  still ends the thread. The client's wait is unchanged: a blocking read
+  of its wait pipe, which is already a step-2 wait in its own shim.
+  `WINEGEX_DOOR_WAKE=0` restores the proxied `write(2)`. In a native
+  echo, the 45 proxied writes go to 0. In the page echo under Node,
+  101 proxied writes go to fewer than 11 (no longer among the 16 most
+  frequent proxied calls).
+- **Per-process USD (§6.2): done.**
+  - Every process keeps a private page and a 16 ms clock thread
+    (`virtual_map_user_shared_data`), since the server is its own
+    program.
+  - Until now every client's page was zeros, apart from its own clocks:
+    no processor features, version 0, no processor count. Both writers
+    (ntdll's first-boot fill and wineboot) wrote a mapping that gex
+    copies, and the server's own page never reached the file either.
+  - Now the server publishes its page in the door area (+140), and each
+    process copies it at start (`gex.usd_copy`).
+  - ntdll's first-boot fill goes to the server's page
+    (`gex.usd_publish`) and to the filling process's own page. It now
+    includes init_peb's version (10.0.19045), because wineboot's write
+    is still lost.
+  - A probe (`scratch/K/w3t/usd.c`) now reads version 10.0, the
+    processor features and the processor count, natively and in the
+    page.
+  - `wasm32_inproc.h` and the loader's `wineserver_session_data` /
+    `wineserver_user_shared_data` stubs are gone.
+- **In-door word and poisoning (§4.2): done for the page and native.**
+  - The page: host.mjs defers a Worker's termination while it is in a
+    door (`#inDoor`), for up to 10 s.
+  - A door call that throws marks the server poisoned (area +124). So
+    does a lock that stays stuck that long.
+  - Native: a trap in a door now also poisons the server.
+  - A poisoned server refuses doors. Its pump exits at its next lock and
+    first SIGKILLs every client by Unix pid (`door_kill_clients`).
+    Without that, the session hung: a client thread blocked in a wait
+    reads a pipe whose write end it holds itself, so it never sees the
+    server go. Wine behaves that way everywhere; a server that simply
+    dies (`WINEGEX_SERVER_DIE`) still leaves its clients hanging, pipes
+    or doors. With `WINEGEX_DOOR_TRAP` the session now ends in about 20 s
+    in the page under Node, and natively, instead of hanging.
+  - Test hooks: `WINEGEX_DOOR_TRAP=N` (the Nth door call traps) and
+    `WINEGEX_SERVER_DIE=N` (the Nth request exits).
+- **A door bug found on the way: the door's register context was too
+  small.** `door_init` allocated 34 slots (272 bytes), only the
+  system-call registers. gex's kernel writes past them: `clock_call`
+  stores the last call's number at 45 * 8. So an in-door
+  `clock_gettime64` wrote 403 into the next heap block. Natively, with
+  W's page prefix, that block was a new process's handle table, and the
+  next `close_handle` asserted (`obj->handle_count`). The context is now
+  4 KiB (the i386 context is 1120 bytes). The page glue writes only slot
+  0, but the context is the same memory there, so the fix covers both.
+  The area now gives the context's size (+136), and the host opens no
+  doors when it is smaller than gex's register context. The
+  `tests/w3/handles.sh` leg runs many processes making and closing
+  handles and threads at once. Natively it passes. In the page it trips
+  a call-out signature mismatch (`RefCell already borrowed` after a trap
+  at the return pad), which pipes show too; that is W3's, not the
+  door's.
+- **Session keeper:** not started. With the server as its own program,
+  the keeper reduces to running the server persistent (`-p`) and having
+  the page start later programs against the running session.
+- **SP:** see §10.3.
+
+Click-to-present on edger (Chromium, P's latency probe through
+`site/edger-lat.sh`, the median of three clicks per run, one bench call
+per run, alternating builds):
+
+| Click (median of 3, ms) | s4-b: doors, no mirror | s4-s: + session mirror | s5: + wakeups in place, context fix |
+|---|---|---|---|
+| tab-view | 375*, 222 | 223, 227, 233 | 205, 206 |
+| tab-home | 1011*, 533 | 508, 525, 592 | 483, 503 |
+| tool-fill | 90*, 62 | 83, 81, 71 | 57, 70 |
+| tool-pencil | 91*, 59 | 62, 68, 65 | 74, 70 |
+| dropdown-size | 94*, 72 | 64, 68, 56 | 58, 55 |
+| color-red | 77*, 65 | 78, 76, 63 | 57, 73 |
+| window shown (s from start) | 51.2*, 41.2 | 41.1, 39.7, 36.9 | 37.6, 36.6 |
+
+\* s4-b's first run was the box's first after a sync and is slow
+throughout; its second run is the comparable one.
+
+- **The session mirror alone** changes no click beyond run-to-run noise
+  (s4-b against s4-s).
+- **With wakeups in place**, tab-view is about 10% faster than with the
+  mirror alone (205-206 ms against 223-233 ms), and tab-home is 483-503 ms
+  against 508-592 ms.
+- **Tool and colour clicks** stay within noise. By the census, a click
+  spends a few ms in door calls and well under 1 ms in proxies, so what
+  remains of a click is not in the server.
+- **The wake-ring design** (§4.5) would save only the client's read of
+  its wait pipe, which is already a step-2 wait in its own shim. It is
+  not worth building on these numbers.
+
+### 10.3 Doors in the SP build (plan)
+
+W3 Wine does not run in the SP build today, with doors or without. The
+W3 cmd echo under `GEX_SINGLE` fails right after the first
+`rt_sigprocmask` with "trying to suspend JS frames". So SP doors wait for
+W3 in SP. When it runs, two things change for doors:
+
+- **No lock contention.** One thread runs every process. A door call
+  takes the lock with one CAS, and the lock never needs a wait.
+- **Proxies must suspend.** A proxied system call has to wait for the
+  pump's fiber to run it as the server process. JSPI cannot suspend
+  through the JS frames of today's glue (client wasm, then
+  `gex.door_call` in JS, then the server's dispatch, then `gex.syscall`
+  in JS).
+
+The options, in order of preference:
+
+1. **A wasm door glue** (§4.2's original shape): a small multi-memory
+   module that imports the client's memory and SM. It copies the request
+   in, calls the server's dispatch and copies the reply out. Its
+   `syscall` import is a `WebAssembly.Suspending` wrapper that posts the
+   proxy and awaits the pump. Every frame between the client's promising
+   entry and the suspension is then wasm. The MP page gains too: by the
+   census, about 1 µs of a door call's 7 µs is the JS around it.
+2. **A handoff to the pump.** When a door handler needs a proxy in SP,
+   the glue would run the system call on P_s's shim directly, with no
+   suspension. That is safe only when the pump's fiber is parked outside
+   its shim's borrowed state, which the shim does not promise today.
+
+Until then, `door_missing` returns 0 in SP and the pipes serve.
 
 ## 11. Risks
 
