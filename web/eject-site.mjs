@@ -5,19 +5,20 @@
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
-//   index.html     the launcher (web/eject-site/index.html): installs sw.js,
-//                  downloads everything with a progress bar, opens nt.html
-//   sw.js          cross-origin isolation for hosts that can't send the
-//                  headers, and FILE.zst decoded and cached as FILE
-//   nt.html, assets/, gex/   the page (runtime/web/page), runtime and Mesa
+//   index.html     the launcher (web/eject-site/index.html): checks the
+//                  browser, opens nt.html on the build
+//   nt.html, assets/, gex/   the page (runtime/web/page), runtime and Mesa,
+//                  as plain files
 //   project/build/web/nt.json, project/build/web/rootfs.tar.zst, and the
 //                  units the browser loads (project/build/units/...)
 //   pack.json      every packed file: size, compressed size; the build id
 //   _headers       caching and isolation headers (Netlify, Cloudflare Pages)
 //   serve.mjs      a static server with the same headers (node serve.mjs [port])
 //   README.txt     hosting notes
-// Every file over 64 KiB is zstd-compressed (-19 --long=27, cached beside OUT
-// in OUT.zcache by content). --bench keeps the recorded benchmark settings
+// Every file of the bundle and the units over 64 KiB is zstd-compressed (-19
+// --long=27, cached beside OUT in OUT.zcache by content) as FILE.zst, which
+// the page fetches and decodes itself (nt-page.js `pack=`). No service
+// worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
 // (scripted input, the 4x clock); without it they are dropped, so a player
 // gets the real clock and their own input. --drop removes a guest path from
 // the bundle (e.g. a benchmark's seed-pinning mod).
@@ -85,12 +86,20 @@ if (w3) {
   process.exit(0);
 }
 
-// The page and the runtime.
-walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
+/** Put `src` at site path `path` as it is (what the page loads by URL). */
+function plain(src, path) {
+  const dst = join(out, path);
+  mkdirSync(dirname(dst), { recursive: true });
+  copyFileSync(src, dst);
+}
+
+// The page and the runtime, plain: nothing between the page and the server
+// decodes (a host's own compression still applies).
+walk(join(project, 'runtime/web/page'), (p, rel) => plain(p, rel));
 // --wgsl-cache FILE: Mesa's shader translations from a training run
 // (play.mjs's `wgsl` step), beside the Mesa glue, where mesa-gl.js looks.
 // Mesa refuses a blob another build of it made, so it goes stale with Mesa.
-if (opt('--wgsl-cache', null)) place(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
+if (opt('--wgsl-cache', null)) plain(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
 
 // The units the browser loads: each unit's module and entries, region
 // entries, providers, stateful providers, indirect-call profiles (part of a
@@ -169,13 +178,12 @@ const ntOut = { ...nt, settings, args, direct: !!nt.gl && !flag('--no-direct') }
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
-// The launcher, the service worker and its decoder.
+// The launcher and the page's decoder.
 // The build: everything served, packed or not (a page-only change is a new build too).
 const smallHash = createHash('sha256');
 walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
 const build = sha(JSON.stringify(files) + JSON.stringify(ntOut) + smallHash.digest('hex')).slice(0, 12);
 writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
-copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
 cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
 
@@ -199,10 +207,10 @@ Headers (_headers has them for Netlify and Cloudflare Pages):
                Cross-Origin-Embedder-Policy: require-corp
   *.zst and assets/*: Cache-Control: public, max-age=31536000, immutable
   the rest:    Cache-Control: no-cache
-A host that cannot send the isolation headers still works over HTTPS:
-sw.js adds them, and the launcher reloads once.
+The isolation headers are required (threads need them); the launcher says so
+when they are missing.
 
-The .zst files are decoded by sw.js; serve them as plain bytes, with no
+The .zst files are decoded by the page; serve them as plain bytes, with no
 Content-Encoding. nginx:
   location / {
     add_header Cross-Origin-Opener-Policy same-origin always;
