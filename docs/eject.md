@@ -492,7 +492,8 @@ not link to the shim's plain one (checked at build).
 Checked on both guests in Node (`run.mjs`, JIT off): the corpus kernels,
 static gzip and, on x86-64, the host's dynamically linked glibc
 gzip, and a program whose whole library is swapped for wasm. Checked in
-headless Chromium: the `ack` page, with arguments.
+headless Chromium: the `ack` page, with arguments, and
+(`tests/eject/elf-page.mjs`, 2026-10-13) the example page over `app.mjs`.
 
 **Limits of the web build:**
 
