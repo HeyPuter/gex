@@ -54,7 +54,7 @@ const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
-const REC: usize = 28;
+const REC: usize = 37;
 /// Words in one input event record.
 const EV: usize = 8;
 /// The most surfaces published in one pump. A desktop session with a dozen
@@ -760,6 +760,10 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
         word[..chunk.len()].copy_from_slice(chunk);
         r[18 + i] = i32::from_le_bytes(word);
     }
+    // Where its client placed it, if it did (`gex_window_placement_v1`).
+    r[28..33].copy_from_slice(&info.placement.record_words());
+    // Where it takes the pointer, when its client said (`flags` bit 7).
+    r[33..37].copy_from_slice(&info.input_words());
 }
 
 impl HostListener for WaylandDevice {

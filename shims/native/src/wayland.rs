@@ -12,12 +12,22 @@ use gex_kernel::syscalls::Kernel;
 use gex_kernel::unix::{HostListener, MemFd, UnixSocket};
 use gex_kernel::vfs::FileHandle;
 use gex_kernel::GuestMem;
-use gex_wayland::{Buffers, Client, Frame};
+use gex_wayland::{Buffers, Client, Frame, Placement};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// One connected client: its socket, its protocol state, and the descriptors
 /// it has sent.
 struct Session {
+    /// Which connection this is, for the screen's keys: surface ids are only
+    /// unique within one client.
+    id: u64,
+    /// The guest process that connected. Its requests are read only by a
+    /// pump running in that process: a buffer's pixels are found through the
+    /// process's own shared mappings and memory, and a commit read anywhere
+    /// else found neither and was dropped -- most of a Wine session's frames
+    /// never reached the screen.
+    owner: Option<i32>,
     socket: Arc<UnixSocket>,
     client: Client,
     /// Descriptors received over `SCM_RIGHTS`, in arrival order: the protocol
@@ -58,6 +68,9 @@ struct Inner {
     gpu: Mutex<Option<gex_gpu::Compositor>>,
     /// `GEX_WL_INPUT`: scripted input, timed from the first frame.
     input: Mutex<Option<Input>>,
+    /// What is on screen once a client places windows.
+    screen: Mutex<Screen>,
+    next_session: Mutex<u64>,
 }
 
 fn keytrace() -> bool {
@@ -191,6 +204,7 @@ impl Wayland {
     /// A frame was shown (a client's commit, or GL's own present): the
     /// input script's clock starts at its `frames N`th.
     fn note_frame(&self) {
+        crate::stall::frame();
         if let Some(inp) = self.inner.input.lock().unwrap().as_mut() {
             inp.seen += 1;
             if inp.seen >= inp.after && inp.start.is_none() {
@@ -265,8 +279,13 @@ impl Wayland {
         // Before the GPU read-back, so a skipped frame costs nothing.
         let Some(path) = self.frame_path(&prefix) else { return };
         let mut gpu = self.inner.gpu.lock().unwrap();
+        let mut screen = self.inner.screen.lock().unwrap();
+        if screen.active() {
+            screen.list();
+        }
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
-            match c.draw(frames).and_then(|()| c.read_back()) {
+            let drawn = if screen.active() { c.draw_at(&screen.items()) } else { c.draw(frames) };
+            match drawn.and_then(|()| c.read_back()) {
                 Ok(rgba) => {
                     let (w, h) = c.size();
                     (w as i32, h as i32, gex_gpu::rgba_to_rgb(&rgba))
@@ -340,6 +359,7 @@ impl Wayland {
     /// kernel locates a buffer's pixels through its shared mappings; guest
     /// memory is where they are.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
+        PROCESS.with(|p| p.set(Some(kernel.pid)));
         // Scripted input waits for a client that can take it (a seat and a
         // surface); a GL-only window gets the keyboard by default.
         if self.inner.input.lock().unwrap().is_some() {
@@ -347,18 +367,29 @@ impl Wayland {
                 s.client.focus_fallback();
             }
         }
-        let ready = self.inner.sessions.lock().unwrap().iter().any(|s| s.client.input_ready());
+        // Placed windows: the screen knows where each is, so it decides which
+        // client an event is for, as a compositor does.
+        let placing = self.inner.screen.lock().unwrap().active();
+        let ready = self.inner.sessions.lock().unwrap().iter().any(|s| {
+            if placing { s.client.wants_input() } else { s.client.input_ready() }
+        });
         let due = if ready { self.due_input() } else { Vec::new() };
+        let mut routed = if placing && !due.is_empty() {
+            self.inner.screen.lock().unwrap().route(&due)
+        } else {
+            Vec::new()
+        };
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut produced = Vec::new();
         sessions.retain_mut(|s| {
             let mut gone = false;
+            let mine = s.owner.is_none_or(|o| o == kernel.pid);
             // A big read: a toolkit's startup is a few KB of requests at once.
             let mut buf = std::mem::take(&mut s.rbuf);
             if buf.is_empty() {
                 buf = vec![0u8; 64 * 1024];
             }
-            loop {
+            while mine {
                 let n = match s.socket.recv(&mut buf, 32, false) {
                     Ok(0) => {
                         gone = true;
@@ -385,7 +416,7 @@ impl Wayland {
             if !due.is_empty() {
                 eprintln!("[gex] input: {}", s.client.describe_input());
             }
-            let take = s.client.input_ready();
+            let take = s.client.input_ready() && !placing;
             for &(ev, ms) in due.iter().filter(|_| take) {
                 match ev {
                     Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
@@ -393,6 +424,19 @@ impl Wayland {
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
                 }
             }
+            for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
+                match *ev {
+                    Routed::PointerTo(surface, x, y, ms) => s.client.pointer_to(surface, x, y, ms),
+                    Routed::PointerClear => s.client.pointer_clear(),
+                    Routed::Button(b, down, ms) => s.client.pointer_button(b, down, ms),
+                    Routed::Key(k, down, ms) => s.client.keyboard_key(k, down, ms),
+                    Routed::KeyboardLeave => s.client.keyboard_focus(0),
+                }
+            }
+            routed.retain(|r| r.0 != s.id);
+            let frames = s.client.take_frames();
+            self.inner.screen.lock().unwrap().update(s.id, &mut s.client, &frames);
+            produced.extend(frames);
             s.out.extend_from_slice(&s.client.take_outgoing());
             // A `wl_keyboard.keymap` event owes a descriptor for its `h`
             // argument: an in-memory file holding the keymap, staged on the
@@ -423,8 +467,11 @@ impl Wayland {
                 s.out.clear();
                 s.sent = 0;
             }
-            produced.extend(s.client.take_frames());
-            !gone && s.client.failed.is_none()
+            let keep = !gone && s.client.failed.is_none();
+            if !keep {
+                self.inner.screen.lock().unwrap().forget(s.id);
+            }
+            keep
         });
         drop(sessions);
         if !produced.is_empty() {
@@ -436,12 +483,226 @@ impl Wayland {
     }
 }
 
+thread_local! {
+    /// The guest process this host thread runs, as its last pump said: a
+    /// connection is accepted inside the connecting process's own `connect`.
+    static PROCESS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// A surface on the screen: its client's connection and its id there.
+type Key = (u64, u32);
+
+/// The screen, natively, once a client places windows
+/// (`gex_window_placement_v1`): each surface's last frame, and the placed
+/// ones where their clients put them, in the order they stacked them. Enough
+/// of a window manager to check placement, stacking and click-through on a
+/// host with no browser: the browser's compositor (`compositor-worker.js`)
+/// is the one that matters, and does the same with the same records.
+///
+/// Until anything is placed it is not used, and frames are drawn as they
+/// always were: each batch of commits, centred.
+#[derive(Default)]
+struct Screen {
+    frames: HashMap<Key, Frame>,
+    /// Placed surfaces: position and placement.
+    placed: HashMap<Key, (i32, i32, Placement)>,
+    /// Placed surfaces bottom to top, before layers are applied.
+    order: Vec<Key>,
+    /// The restack and activate serials already acted on.
+    acted: HashMap<Key, (u32, u32)>,
+    /// Who has the keyboard (by `activate`) and the pointer (by hit test).
+    focus: Option<Key>,
+    pointer: Option<Key>,
+    /// Sessions owed a keyboard leave: the keyboard went to another client.
+    leaves: Vec<u64>,
+    /// The window list last printed.
+    listed: String,
+}
+
+/// Scripted input, routed by the screen to one client.
+enum Routed {
+    PointerTo(u32, i32, i32, u32),
+    PointerClear,
+    Button(u32, bool, u32),
+    Key(u32, bool, u32),
+    KeyboardLeave,
+}
+
+impl Screen {
+    fn active(&self) -> bool {
+        !self.placed.is_empty()
+    }
+
+    /// A client hung up: its windows are gone.
+    fn forget(&mut self, sid: u64) {
+        self.frames.retain(|k, _| k.0 != sid);
+        self.placed.retain(|k, _| k.0 != sid);
+        self.order.retain(|k| k.0 != sid);
+        self.acted.retain(|k, _| k.0 != sid);
+        if self.focus.is_some_and(|k| k.0 == sid) {
+            self.focus = None;
+        }
+        if self.pointer.is_some_and(|k| k.0 == sid) {
+            self.pointer = None;
+        }
+    }
+
+    /// The placed surfaces bottom to top, layers kept apart.
+    fn stack(&self) -> Vec<Key> {
+        let mut v = self.order.clone();
+        v.sort_by_key(|k| self.placed.get(k).map(|p| p.2.layer).unwrap_or(0));
+        v
+    }
+
+    /// Take in one client's state after its requests were read.
+    fn update(&mut self, sid: u64, client: &mut Client, produced: &[Frame]) {
+        for f in produced {
+            self.frames.insert((sid, f.surface), f.clone());
+        }
+        self.frames.retain(|k, _| k.0 != sid || client.is_mapped(k.1));
+        let now = client.placed();
+        self.placed.retain(|k, _| k.0 != sid || now.iter().any(|p| p.0 == k.1));
+        self.order.retain(|k| self.placed.contains_key(k));
+        self.acted.retain(|k, _| k.0 != sid || self.placed.contains_key(k));
+        let mut restacks = Vec::new();
+        for (surface, x, y, p) in now {
+            let k = (sid, surface);
+            self.placed.insert(k, (x, y, p));
+            if !self.order.contains(&k) {
+                self.order.push(k);
+            }
+            let (restack, activate) = self.acted.get(&k).copied().unwrap_or((0, 0));
+            if p.restack != restack && p.restack != 0 {
+                restacks.push((k, p.below));
+            }
+            if p.activate != activate && p.activate != 0 {
+                if let Some(old) = self.focus.filter(|o| o.0 != sid) {
+                    self.leaves.push(old.0);
+                }
+                self.focus = Some(k);
+                client.keyboard_focus(surface);
+            }
+            self.acted.insert(k, (p.restack, p.activate));
+        }
+        for (k, below) in restacks {
+            self.restack(k, below);
+        }
+        if self.focus.is_some_and(|f| f.0 == sid && !self.placed.contains_key(&f)) {
+            self.focus = None;
+        }
+    }
+
+    fn restack(&mut self, k: Key, below: u32) {
+        self.order.retain(|o| *o != k);
+        let at = if below == Placement::BOTTOM {
+            0
+        } else if below == 0 {
+            self.order.len()
+        } else {
+            self.order
+                .iter()
+                .position(|o| self.placed.get(o).is_some_and(|p| p.2.id == below))
+                .unwrap_or(self.order.len())
+        };
+        self.order.insert(at, k);
+    }
+
+    /// The topmost placed surface at a point, and the point in it.
+    fn hit(&self, x: i32, y: i32) -> Option<(Key, i32, i32)> {
+        for k in self.stack().into_iter().rev() {
+            let (Some(&(px, py, _)), Some(f)) = (self.placed.get(&k), self.frames.get(&k)) else {
+                continue;
+            };
+            if x >= px && x < px + f.width && y >= py && y < py + f.height {
+                return Some((k, x - px, y - py));
+            }
+        }
+        None
+    }
+
+    /// Route scripted events: the pointer to whatever placed window is under
+    /// it, buttons with it, keys to the window its client activated.
+    fn route(&mut self, due: &[(Ev, u32)]) -> Vec<(u64, Routed)> {
+        let mut out: Vec<(u64, Routed)> = self.leaves.drain(..).map(|s| (s, Routed::KeyboardLeave)).collect();
+        for &(ev, ms) in due {
+            match ev {
+                Ev::Motion(x, y) => {
+                    let hit = self.hit(x, y);
+                    if let Some(old) = self.pointer {
+                        if hit.map(|h| h.0 .0) != Some(old.0) {
+                            out.push((old.0, Routed::PointerClear));
+                        }
+                    }
+                    eprintln!("[gex] input: pointer at {x},{y} is over {:?}", hit.map(|h| h.0));
+                    self.pointer = hit.map(|h| h.0);
+                    if let Some(((sid, surface), lx, ly)) = hit {
+                        out.push((sid, Routed::PointerTo(surface, lx, ly, ms)));
+                    }
+                }
+                Ev::Button(b, down) => {
+                    if let Some((sid, _)) = self.pointer {
+                        out.push((sid, Routed::Button(b, down, ms)));
+                    }
+                }
+                Ev::Key(k, down) => {
+                    if let Some((sid, _)) = self.focus {
+                        out.push((sid, Routed::Key(k, down, ms)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What to draw, bottom to top: windows nobody placed centred, as
+    /// before, then the placed ones where they are.
+    fn items(&self) -> Vec<(u64, &Frame, Option<(i32, i32)>)> {
+        let key = |k: &Key| (k.0 << 32) | u64::from(k.1);
+        let mut loose: Vec<_> = self.frames.iter().filter(|(k, _)| !self.placed.contains_key(k)).collect();
+        loose.sort_by_key(|(k, _)| **k);
+        let mut out: Vec<_> = loose.into_iter().map(|(k, f)| (key(k), f, None)).collect();
+        for k in self.stack() {
+            if let (Some(f), Some(&(x, y, _))) = (self.frames.get(&k), self.placed.get(&k)) {
+                out.push((key(&k), f, Some((x, y))));
+            }
+        }
+        out
+    }
+
+    /// The window list, bottom to top, printed when it changes: what a test
+    /// reads to check placement and stacking.
+    fn list(&mut self) {
+        let mut s = String::new();
+        for k in self.stack() {
+            let (Some(&(x, y, p)), Some(f)) = (self.placed.get(&k), self.frames.get(&k)) else {
+                continue;
+            };
+            s += &format!(
+                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}",
+                k.0, k.1, p.id, f.width, f.height, x, y, p.layer,
+                if self.focus == Some(k) { " focus" } else { "" }
+            );
+        }
+        if s != self.listed {
+            eprintln!("[wl-place]{s}");
+            self.listed = s;
+        }
+    }
+}
+
 impl HostListener for Wayland {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut client = Client::new();
         let (w, h) = *self.inner.size.lock().unwrap();
         client.set_default_size(w, h);
+        let id = {
+            let mut n = self.inner.next_session.lock().unwrap();
+            *n += 1;
+            *n
+        };
         self.inner.sessions.lock().unwrap().push(Session {
+            id,
+            owner: PROCESS.with(|p| p.get()),
             socket: peer,
             client,
             fds: Vec::new(),

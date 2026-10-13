@@ -23,7 +23,7 @@ const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 28;
+export const REC = 37;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -58,6 +58,26 @@ export const R_TITLE_WORDS = 8;
  * drawn by the program, and the GL picture only in the client area). */
 export const R_GL_ORIGIN = 26;
 export const R_GL_SIZE = 27;
+/** Where the client placed the surface (`gex_window_placement_v1`, and every
+ * X11 override-redirect window): `P_PLACED | P_UNMANAGED | layer << 8`. A
+ * placed surface is at `R_REL_X`/`R_REL_Y` in output pixels. */
+export const R_PLACE = 28;
+/** The client's stacking name for the surface (a Win32 window, an X window). */
+export const R_STACK_ID = 29;
+/** The last restack: directly below the surface with this stacking name, 0
+ * the top of its layer, -1 the bottom. Acted on when `R_RESTACK` changes. */
+export const R_STACK_BELOW = 30;
+export const R_RESTACK = 31;
+/** Bumped when the client asks for this surface to have the keyboard. */
+export const R_ACTIVATE = 32;
+/** With `F_INPUT_REGION`: the bounds of where the surface takes the pointer
+ * (`wl_surface.set_input_region`), in surface units. Zero-sized: nowhere. */
+export const R_INPUT_X = 33;
+export const R_INPUT_Y = 34;
+export const R_INPUT_W = 35;
+export const R_INPUT_H = 36;
+export const P_PLACED = 1;
+export const P_UNMANAGED = 2;
 
 /** Roles, as `gex_wayland::Role::code` writes them. */
 export const ROLE_TOPLEVEL = 1;
@@ -74,6 +94,9 @@ export const F_CONFIGURE_PENDING = 4;
  *  to the guest -- so the record says how big the surface is and the
  *  compositor finds the picture elsewhere. */
 export const F_EXTERNAL = 2;
+/** The client set an input region (`R_INPUT_X`..): without it the whole
+ *  surface takes the pointer. */
+export const F_INPUT_REGION = 128;
 
 /** Event kinds the compositor writes into a process's ring. */
 export const EV_MOTION = 0;
@@ -221,6 +244,16 @@ export function readScene(channel, { onlyChanged = false } = {}) {
           }
           : null,
         title: end ? decoder.decode(bytes.subarray(0, end)) : '',
+        placed: (a[r + R_PLACE] & P_PLACED) !== 0,
+        unmanaged: (a[r + R_PLACE] & P_UNMANAGED) !== 0,
+        layer: (a[r + R_PLACE] >> 8) & 0xff,
+        stackId: a[r + R_STACK_ID] >>> 0,
+        below: a[r + R_STACK_BELOW] >>> 0,
+        restack: a[r + R_RESTACK] >>> 0,
+        activate: a[r + R_ACTIVATE] >>> 0,
+        input: (a[r + R_FLAGS] & F_INPUT_REGION)
+          ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
+          : null,
       });
     }
   }

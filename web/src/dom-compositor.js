@@ -115,7 +115,17 @@ class DomWindow {
      * `zxdg_decoration_manager_v1` that way, so Qt and KDE draw nothing and
      * the page's HTML is the frame. GTK draws its own inside that anyway --
      * there is no signal for it, and no compositor gets one. */
-    this.decorations = s.role === ROLE_TOPLEVEL ? 'server' : 'none';
+    this.decorations = s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none';
+    /** Placed by its client (`gex_window_placement_v1`: a Win32 window, an X
+     * menu): `relX`/`relY` are where it goes in the desktop's pixels, and
+     * `layer` (0 normal, 1 topmost, 2 menus) and `onrestack` how it stacks.
+     * The page does not move it. */
+    this.placed = !!s.placed;
+    this.layer = s.layer || 0;
+    this.stackId = s.stackId || 0;
+    this.restack = 0;
+    this.activate = 0;
+    this.onrestack = null;
     /** True when the pixels are the host's OpenGL rather than this record's
      * memory: `canvas` is then drawn by whoever runs that GL. */
     this.external = !!s.external;
@@ -519,10 +529,24 @@ export class DomDesktop {
     }
     // A popup, a subsurface or an X menu is placed by its client, not by the
     // page: say where it asked to be.
-    if (s.role !== ROLE_TOPLEVEL && (s.relX !== win.relX || s.relY !== win.relY)) {
+    win.placed = !!s.placed;
+    win.layer = s.layer || 0;
+    win.stackId = s.stackId || 0;
+    if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
       win.relX = s.relX;
       win.relY = s.relY;
       win.onplace?.(s.relX, s.relY, win.parent);
+    }
+    // Directly below the placed window with stack id `below`; 0 the top of
+    // its layer, 0xffffffff the bottom. The page keeps the order.
+    if (s.placed && s.restack !== win.restack) {
+      win.restack = s.restack;
+      win.onrestack?.(s.below);
+    }
+    // Its client activated it: it has the keyboard now.
+    if (s.placed && s.activate !== win.activate) {
+      win.activate = s.activate;
+      this.focus(win);
     }
     // Nothing to copy when there is no buffer: a window whose pixels are the
     // host's GL has none, and neither has one the window manager published

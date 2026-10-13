@@ -418,6 +418,8 @@ class Compositor {
   #glSaidAt = 0;
   #glDraws = 0;
   #focus = null;
+  /** The placed window a held button belongs to (see `pointerMove`). */
+  #grab = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
   /** An interactive resize: the window, the edges being dragged
@@ -617,6 +619,8 @@ class Compositor {
     const { surfaces, blocks } = readScene(this.#channel);
     const live = new Set();
     const byKey = new Map();
+    const restacks = [];
+    const activations = [];
     for (const s of surfaces) {
       const k = key(s);
       live.add(k);
@@ -645,7 +649,12 @@ class Compositor {
         // X client meant every key was dropped for want of a focused surface.
         this.#windows.set(k, win);
         const seen = this.#remembered.get(k);
-        if (s.role === ROLE_TOPLEVEL && seen) {
+        if (s.placed) {
+          // Placed by its client (a Win32 window, an X menu): where it says,
+          // stacked where it says, with the keyboard when it says. Nothing
+          // here cascades it, raises it or focuses it.
+          this.#order.push(k);
+        } else if (s.role === ROLE_TOPLEVEL && seen) {
           win.x = seen.x;
           win.y = seen.y;
           this.#order.push(k);
@@ -692,11 +701,36 @@ class Compositor {
       // The first sight of a window only learns the number.
       const seq = (s.flags >> 3) & 0xf;
       if (win.requestSeq === undefined) win.requestSeq = seq;
-      else if (seq !== win.requestSeq && s.role === ROLE_TOPLEVEL) {
+      else if (seq !== win.requestSeq && s.role === ROLE_TOPLEVEL && !s.placed) {
         win.requestSeq = seq;
         this.#clientRequest(k, win, (s.flags >>> 24) & 0x7f);
       }
+      win.placed = s.placed;
+      win.unmanaged = s.unmanaged;
+      win.layer = s.layer;
+      win.stackId = s.stackId;
+      if (s.placed) {
+        // A placed window's position is its client's: it lives where every
+        // toplevel's does (win.x/win.y), so drawing, hit-testing and any
+        // move or resize read one geometry whoever decided it.
+        win.x = win.relX;
+        win.y = win.relY;
+        // Placed after it appeared: it joins the stack where it is told to.
+        if (!this.#order.includes(k)) this.#order.push(k);
+        // Restacks are applied once every window of this frame is known, or
+        // one naming a sibling that appeared in the same frame would miss it.
+        if (win.restack !== s.restack) {
+          win.restack = s.restack;
+          if (s.restack) restacks.push([k, s.below]);
+        }
+        if (win.activate !== s.activate) {
+          win.activate = s.activate;
+          if (s.activate) activations.push(k);
+        }
+      }
     }
+    for (const [k, below] of restacks) this.#restack(k, below);
+    for (const k of activations) this.#focusWindow(k);
     // Gone: drop the window, its texture, and its place in the stack.
     for (const k of [...this.#windows.keys()]) {
       if (live.has(k)) continue;
@@ -707,7 +741,7 @@ class Compositor {
       }
       this.#note(`- ${k}`);
       const gone = this.#windows.get(k);
-      if (gone?.role === ROLE_TOPLEVEL) {
+      if (gone?.role === ROLE_TOPLEVEL && !gone.placed) {
         this.#remembered.set(k, { x: gone.x, y: gone.y });
         // A session that opens and closes a hundred windows should not
         // remember all of them.
@@ -725,10 +759,13 @@ class Compositor {
       // believing it is inactive.
       if (this.#focus === k) {
         this.#focus = null;
-        const next = this.#order[this.#order.length - 1] ?? null;
+        // Not to a placed window: its client decides which of its windows is
+        // active, and says so.
+        const next = [...this.#order].reverse().find((o) => !this.#windows.get(o)?.placed) ?? null;
         if (next) this.#focusWindow(next);
       }
       if (this.#pointer.over === k) this.#pointer.over = null;
+      if (this.#grab === k) this.#grab = null;
     }
     return { byKey, blocks };
   }
@@ -752,27 +789,51 @@ class Compositor {
     if (this.#log.length > 64) this.#log.splice(0, 32);
   }
 
+  /**
+   * Restack a placed window: directly below the placed window its client
+   * named, at the top (0) or at the bottom (-1). Layers are kept apart when
+   * drawing (`#stack`), so the top and bottom here are its layer's.
+   */
+  #restack(k, below) {
+    const order = this.#order.filter((o) => o !== k);
+    let at = order.length;
+    if (below === 0xffffffff) {
+      at = 0;
+    } else if (below) {
+      const i = order.findIndex((o) => {
+        const w = this.#windows.get(o);
+        return w?.placed && w.stackId === below;
+      });
+      if (i >= 0) at = i;
+    }
+    order.splice(at, 0, k);
+    this.#order = order;
+  }
+
+  /** The windows bottom to top: the stacking order, a layer at a time. */
+  #stack() {
+    const layer = (k) => {
+      const w = this.#windows.get(k);
+      return w?.placed ? w.layer : 0;
+    };
+    // `sort` is stable: within a layer, the stacking order stands.
+    return [...this.#order].sort((a, b) => layer(a) - layer(b));
+  }
+
+  /** Whether the compositor draws a window's frame: a toplevel's, unless its
+   *  client places it and draws the whole window itself. */
+  #decorated(win) {
+    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged);
+  }
+
   /** Absolute position of a surface: popups and subsurfaces follow a parent. */
   #placeOf(win) {
-    if (win.role === ROLE_TOPLEVEL) return { x: win.x, y: win.y };
+    if (win.placed || win.role === ROLE_TOPLEVEL) return { x: win.x, y: win.y };
     const parentKey = `${win.token}:${win.client}:${win.parent}`;
     const parent = win.parent ? this.#windows.get(parentKey) : null;
-    // A popup with no parent is an X11 override-redirect window -- a menu the
-    // client placed itself, in coordinates that are the output's because the
-    // window manager keeps the X geometry and the layout in step.
     if (!parent) return { x: win.relX, y: win.relY };
     const at = this.#placeOf(parent);
     return { x: at.x + win.relX, y: at.y + win.relY };
-  }
-
-  /** Popups with no parent: X11 menus, drawn and hit-tested above everything. */
-  #floating() {
-    const out = [];
-    for (const [k, win] of this.#windows) {
-      if (win.role !== ROLE_POPUP || win.parent) continue;
-      out.push(k);
-    }
-    return out;
   }
 
   // -- uploads ------------------------------------------------------------
@@ -995,6 +1056,7 @@ class Compositor {
     for (const [k, win] of this.#windows) {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
+        win.placed ? `p${win.layer}${win.unmanaged ? 'u' : ''}` : '',
         f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null),
         glFrameFor(win)?.serial ?? '');
     }
@@ -1201,20 +1263,17 @@ class Compositor {
       return;
     }
     // Windows bottom to top, each with its popups and subsurfaces above it.
-    for (const k of this.#order) {
+    // Placed windows -- a Win32 desktop, an X menu -- are in the same stack,
+    // where their clients put them.
+    for (const k of this.#stack()) {
       const win = this.#windows.get(k);
-      if (!win || win.role !== ROLE_TOPLEVEL) continue;
-      this.#drawDecoration(win, this.#focus === k);
+      if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
+      if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
       this.#drawSurface(k, win);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);
       }
-    }
-    // X11 menus and tooltips: no parent to follow, no frame, above everything.
-    for (const k of this.#floating()) {
-      const win = this.#windows.get(k);
-      if (win) this.#drawSurface(k, win);
     }
     // No cursor: the client's is the page's own CSS cursor (`#updateCursor`),
     // so there is one pointer on the screen and it moves at the browser's rate.
@@ -1229,18 +1288,27 @@ class Compositor {
 
   // -- input --------------------------------------------------------------
 
+  /**
+   * Whether a surface takes the pointer at a point (device pixels from its
+   * corner): inside the input region its client set, if it set one. A
+   * surface with an empty region -- Wine's subsurface for a window's GL
+   * picture -- takes none, and the pointer goes to what is under it, in that
+   * surface's coordinates.
+   */
+  #takesInput(win, lx, ly) {
+    const r = win.info?.input;
+    if (!r) return true;
+    const k = win.cs || 1;
+    const ux = Math.floor(lx / k);
+    const uy = Math.floor(ly / k);
+    return ux >= r.x && ux < r.x + r.w && uy >= r.y && uy < r.y + r.h;
+  }
+
   /** The topmost surface at a point, and where in it. */
   #hit(x, y) {
-    for (const k of this.#floating()) {
-      const win = this.#windows.get(k);
-      if (!win) continue;
-      const at = this.#placeOf(win);
-      if (x >= at.x && x < at.x + win.width && y >= at.y && y < at.y + win.height) {
-        return { key: k, win, local: { x: x - at.x, y: y - at.y }, part: 'content' };
-      }
-    }
-    for (let i = this.#order.length - 1; i >= 0; i--) {
-      const k = this.#order[i];
+    const stack = this.#stack();
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const k = stack[i];
       const win = this.#windows.get(k);
       if (!win) continue;
       // Popups first: a menu is above its window and takes the click.
@@ -1250,19 +1318,24 @@ class Compositor {
         const at = this.#placeOf(child);
         if (
           x >= at.x && x < at.x + child.width &&
-          y >= at.y && y < at.y + child.height
+          y >= at.y && y < at.y + child.height &&
+          this.#takesInput(child, x - at.x, y - at.y)
         ) {
           return { key: ck, win: child, local: { x: x - at.x, y: y - at.y }, part: 'content' };
         }
       }
       const f = this.#frameOf(win);
-      if (x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height) {
+      if (
+        x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height &&
+        this.#takesInput(win, x - f.x, y - f.y)
+      ) {
         return { key: k, win, local: { x: x - f.x, y: y - f.y }, part: 'content' };
       }
       // The resize band: GRIP pixels either side of the frame's edge, but not
-      // over the content (taken above) and not on a maximized window.
+      // over the content (taken above) and not on a maximized window or one
+      // its client draws whole (a placed Win32 window sizes itself).
       if (
-        !win.maximized &&
+        this.#decorated(win) && !win.maximized &&
         x >= f.frameX - GRIP && x < f.frameX + f.frameW + GRIP &&
         y >= f.frameY - GRIP && y < f.frameY + f.frameH + GRIP
       ) {
@@ -1273,6 +1346,7 @@ class Compositor {
         if (edges) return { key: k, win, local: { x: 0, y: 0 }, part: 'resize', edges };
       }
       if (
+        this.#decorated(win) &&
         x >= f.frameX && x < f.frameX + f.frameW &&
         y >= f.frameY && y < f.frameY + f.frameH
       ) {
@@ -1293,6 +1367,9 @@ class Compositor {
    * stacked empty frames, one per redundant configure.
    */
   #configure(win, activated, extra = 0) {
+    // A placed window's size is its client's, and so is its activation: the
+    // client said which window is active, and a configure would only echo it.
+    if (win.placed) return;
     const fit = this.#fit(win);
     const states = (activated ? STATE_ACTIVATED : 0) | (win.maximized ? STATE_MAXIMIZED : 0) | extra;
     const want = `${fit.w}x${fit.h}:${states}`;
@@ -1343,6 +1420,17 @@ class Compositor {
       this.#resizeTo(x, y, false);
       return;
     }
+    // A button held on a placed window: the motion is that window's, inside
+    // it or not -- Wayland's implicit grab, which a Win32 window's own move
+    // and size loops and a drag out of a list all depend on.
+    const grabbed = this.#grab ? this.#windows.get(this.#grab) : null;
+    if (grabbed) {
+      const at = this.#placeOf(grabbed);
+      const k = grabbed.cs || 1;
+      sendEvent(this.#channel, grabbed.block, EV_MOTION, Math.floor((x - at.x) / k), Math.floor((y - at.y) / k),
+        time, 0, grabbed.client, grabbed.surface);
+      return;
+    }
     if (this.#drag) {
       const win = this.#windows.get(this.#drag.key);
       if (win) {
@@ -1386,6 +1474,14 @@ class Compositor {
       this.#drag = null;
       return;
     }
+    const grabbed = this.#grab ? this.#windows.get(this.#grab) : null;
+    if (grabbed) {
+      // The grab's window gets every button until the last one is up.
+      sendEvent(this.#channel, grabbed.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0,
+        grabbed.client, grabbed.surface);
+      if (!this.#pointer.buttons) this.#grab = null;
+      return;
+    }
     const hit = this.#hit(this.#pointer.x, this.#pointer.y);
     if (pressed) {
       // A click outside an open menu dismisses it, which is what the client's
@@ -1413,7 +1509,8 @@ class Compositor {
       return;
     }
     if (hit.part === 'title') {
-      if (pressed) {
+      // A placed window stays where its client put it.
+      if (pressed && !hit.win.placed) {
         this.#raise(hit.key);
         this.#focusWindow(hit.key);
         // A second press on the same title bar within 400 ms: maximize, or
@@ -1435,13 +1532,17 @@ class Compositor {
       return;
     }
     if (pressed) {
-      const top = hit.win.role === ROLE_TOPLEVEL
+      const top = hit.win.role === ROLE_TOPLEVEL || hit.win.placed
         ? hit.key
         : `${hit.win.token}:${hit.win.client}:${hit.win.parent}`;
-      if (this.#windows.has(top)) {
+      // A placed window is raised and activated by its own client, which
+      // knows what a click on it means (a click on a taskbar does not
+      // activate the taskbar), and then says so.
+      if (this.#windows.has(top) && !this.#windows.get(top).placed) {
         this.#raise(top);
         this.#focusWindow(top);
       }
+      if (this.#windows.get(top)?.placed) this.#grab = hit.key;
       // The press lands where the pointer is, so the client's last motion has
       // to be this position -- a click without a motion in front of it would
       // otherwise arrive wherever the pointer was last seen by that client.

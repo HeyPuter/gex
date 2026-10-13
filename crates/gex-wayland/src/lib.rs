@@ -105,6 +105,94 @@ impl Role {
     }
 }
 
+/// A `wl_region`: the rectangles a client added, less the ones it
+/// subtracted, kept as disjoint rectangles in surface coordinates.
+///
+/// An input region is where a surface takes the pointer. Wine gives the
+/// subsurface that shows a window's GL picture an empty one, so the pointer
+/// goes to the window under it, in that window's coordinates; a compositor
+/// that ignored it handed clicks to the subsurface, offset by the frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Region {
+    rects: Vec<(i32, i32, i32, i32)>,
+}
+
+impl Region {
+    /// More rectangles than any real client's region, and a bound on what a
+    /// client can make the compositor keep: past it, the region is its bounds.
+    const MAX_RECTS: usize = 256;
+
+    fn add(&mut self, r: (i32, i32, i32, i32)) {
+        if r.2 <= 0 || r.3 <= 0 {
+            return;
+        }
+        self.subtract(r);
+        self.rects.push(r);
+        if self.rects.len() > Self::MAX_RECTS {
+            let b = self.bounds();
+            self.rects = vec![b];
+        }
+    }
+
+    fn subtract(&mut self, (x, y, w, h): (i32, i32, i32, i32)) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (x2, y2) = (x.saturating_add(w), y.saturating_add(h));
+        let mut out = Vec::with_capacity(self.rects.len());
+        for &(rx, ry, rw, rh) in &self.rects {
+            let (rx2, ry2) = (rx + rw, ry + rh);
+            if x >= rx2 || x2 <= rx || y >= ry2 || y2 <= ry {
+                out.push((rx, ry, rw, rh));
+                continue;
+            }
+            // What is left of the rectangle: the bands above and below the
+            // cut, then the parts beside it.
+            let (cy, cy2) = (y.max(ry), y2.min(ry2));
+            if ry < cy {
+                out.push((rx, ry, rw, cy - ry));
+            }
+            if cy2 < ry2 {
+                out.push((rx, cy2, rw, ry2 - cy2));
+            }
+            if rx < x {
+                out.push((rx, cy, x - rx, cy2 - cy));
+            }
+            if x2 < rx2 {
+                out.push((x2, cy, rx2 - x2, cy2 - cy));
+            }
+        }
+        self.rects = out;
+    }
+
+    /// Whether a point in surface coordinates is in the region.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        self.rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+    }
+
+    /// The smallest rectangle holding the region; zero-sized when it is empty.
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        let mut it = self.rects.iter();
+        let Some(&(x, y, w, h)) = it.next() else { return (0, 0, 0, 0) };
+        let (mut x1, mut y1, mut x2, mut y2) = (x, y, x + w, y + h);
+        for &(rx, ry, rw, rh) in it {
+            x1 = x1.min(rx);
+            y1 = y1.min(ry);
+            x2 = x2.max(rx + rw);
+            y2 = y2.max(ry + rh);
+        }
+        (x1, y1, x2 - x1, y2 - y1)
+    }
+
+    /// Whether the region is exactly its bounds, so a host testing the
+    /// bounds tests the region.
+    pub fn is_rect(&self) -> bool {
+        let (_, _, w, h) = self.bounds();
+        let area: i64 = self.rects.iter().map(|r| i64::from(r.2) * i64::from(r.3)).sum();
+        area == i64::from(w) * i64::from(h)
+    }
+}
+
 /// A rectangle of a surface that changed since the host last looked, in surface
 /// pixels. `w == 0` means "all of it" -- what a client that never sent a damage
 /// rectangle is asking for, and what a newly attached buffer of a new size is.
@@ -198,6 +286,58 @@ pub struct SurfaceInfo {
     /// pixels per surface unit. The host draws a surface at
     /// `width * client_scale / buffer_scale` device pixels.
     pub client_scale: i32,
+    /// Where the client says the surface is and what it is stacked under
+    /// (`gex_window_placement_v1`), when it says so.
+    pub placement: Placement,
+    /// The input region (`wl_surface.set_input_region`): `None` is the
+    /// whole surface, as it is until a client sets one, and an empty region
+    /// takes no pointer input at all.
+    pub input: Option<Region>,
+}
+
+/// A placed surface's position and stacking, as its client asked for them
+/// (`protocols/gex-window-placement-v1.xml`). Its position is `rel_x`/`rel_y`
+/// in output pixels.
+///
+/// The one way a client places a window: a Wine window says it through the
+/// protocol, and an X11 override-redirect window (a menu) is given the same
+/// state by the X window manager (`adopt_x11`), so a compositor draws,
+/// stacks and hit-tests both by the same code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// The surface is placed. Everything below means nothing otherwise.
+    pub placed: bool,
+    /// The client draws the whole window: no decoration.
+    pub unmanaged: bool,
+    /// 0 normal, 1 topmost, 2 overlay (menus).
+    pub layer: u32,
+    /// The client's name for the surface, which other placed surfaces --
+    /// of any client in the session -- use to say what they go below.
+    pub id: u32,
+    /// The last restack asked for: directly below the surface with this
+    /// id, 0 the top of the layer, `u32::MAX` its bottom.
+    pub below: u32,
+    /// Bumped by every restack request, so a host acts on each once.
+    pub restack: u32,
+    /// Bumped by every activate request: give this surface the keyboard.
+    pub activate: u32,
+}
+
+impl Placement {
+    /// The bottom of a layer, for `below`.
+    pub const BOTTOM: u32 = u32::MAX;
+
+    /// The placement words of a surface record (`R_PLACE`.. in
+    /// `wl-bridge.mjs`): flags and layer, id, below, restack, activate.
+    pub fn record_words(&self) -> [i32; 5] {
+        [
+            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | ((self.layer as i32 & 0xff) << 8),
+            self.id as i32,
+            self.below as i32,
+            self.restack as i32,
+            self.activate as i32,
+        ]
+    }
 }
 
 impl SurfaceInfo {
@@ -212,6 +352,18 @@ impl SurfaceInfo {
             | ((self.buffer_scale & 0xff) << 8)
             | ((self.client_scale & 0xff) << 16)
             | (((self.request.code() & 0x7f) as i32) << 24)
+            | (i32::from(self.input.is_some()) << 7)
+    }
+
+    /// The input region as a host's record carries it, with `flags` bit 7
+    /// saying there is one: its bounds in surface units, x, y, width, height.
+    /// Zero-sized is a surface that takes no pointer input. A region with
+    /// holes is published as its bounds (a client's input region is in
+    /// practice a rectangle: empty, the whole surface, or the window inside
+    /// its shadow).
+    pub fn input_words(&self) -> [i32; 4] {
+        let (x, y, w, h) = self.input.as_ref().map(Region::bounds).unwrap_or_default();
+        [x, y, w, h]
     }
 }
 
@@ -317,6 +469,10 @@ const GLOBALS: &[(&str, u32)] = &[
     // Recorded (`SurfaceState::viewport`), not yet scaled by: at scale 1 a
     // destination is the buffer's own size.
     ("wp_viewporter", 1),
+    // Windows with real coordinates: a Win32 window (Wine) says where it is
+    // and what it is under, and the compositor shows it there rather than
+    // cascading it. See `protocols/gex-window-placement-v1.xml`.
+    ("gex_window_placement_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -347,6 +503,8 @@ enum Object {
     Viewport { surface: u32 },
     DecorationManager,
     Decoration { surface: u32 },
+    PlacementManager,
+    Placement { surface: u32 },
     /// An object whose requests we accept and ignore (data devices/sources,
     /// subsurfaces) -- present so GTK's init completes, does nothing observable.
     Stub,
@@ -507,6 +665,17 @@ struct SurfaceState {
     /// (0 is 1).
     pending_scale: Option<i32>,
     buffer_scale: i32,
+    /// `wp_viewport.set_source`: the part of the buffer that is the surface,
+    /// as x, y, width, height in buffer pixels. Wine keeps a window's buffer
+    /// when the window shrinks and crops it this way, so without it a 40-pixel
+    /// taskbar showed as its old 125-pixel buffer.
+    crop: Option<(i32, i32, i32, i32)>,
+    /// `gex_window_placement_v1`: where the client put the surface.
+    placement: Placement,
+    /// `set_input_region`, pending until commit (`Some(None)`: back to the
+    /// whole surface), and the committed region (`None`: the whole surface).
+    pending_input: Option<Option<Region>>,
+    input: Option<Region>,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -543,6 +712,8 @@ pub struct Client {
     wm_base_version: u32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
+    /// What each `wl_region` holds.
+    regions: HashMap<u32, Region>,
     /// Surfaces whose scene state changed since the host last published it, so
     /// a pump that changed nothing costs nothing.
     dirty: bool,
@@ -609,6 +780,7 @@ impl Client {
             scale: 1,
             wm_base_version: 0,
             positioners: HashMap::new(),
+            regions: HashMap::new(),
             dirty: false,
             failed: None,
             pointer: None,
@@ -768,6 +940,8 @@ impl Client {
                 Object::Subsurface { surface } => self.subsurface(object, surface, opcode, &mut r),
                 Object::DecorationManager => self.decoration_manager(opcode, &mut r),
                 Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
+                Object::PlacementManager => self.placement_manager(opcode, &mut r),
+                Object::Placement { surface } => self.placement(object, surface, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager => {
                     // create_data_source(id) = 0, get_data_device(id, seat) = 1;
@@ -789,7 +963,8 @@ impl Client {
                 // creates a child object, so just accept and ignore everything.
                 Object::Stub => true,
                 Object::Positioner => self.positioner(object, opcode, &mut r),
-                Object::Buffer(_) | Object::Region => {
+                Object::Region => self.region(object, opcode, &mut r),
+                Object::Buffer(_) => {
                     // Every one of these has `destroy` at opcode 0 and
                     // requests that change nothing observable here.
                     if opcode == 0 {
@@ -1010,6 +1185,9 @@ impl Client {
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
             }
+            "gex_window_placement_manager_v1" => {
+                self.objects.insert(id, Object::PlacementManager);
+            }
             _ => return false,
         }
         true
@@ -1046,6 +1224,7 @@ impl Client {
             1 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Region);
+                self.regions.insert(id, Region::default());
                 true
             }
             _ => false,
@@ -1226,8 +1405,20 @@ impl Client {
                 }
                 true
             }
-            // set_opaque_region, set_input_region
-            4 | 5 => true,
+            // set_opaque_region: only an optimisation for a compositor that
+            // skips drawing what is under an opaque surface.
+            4 => true,
+            // set_input_region(region): a copy of the region as it is now (the
+            // client may destroy it at once), taking effect at commit. Null
+            // is the whole surface again.
+            5 => {
+                let Some(region) = r.object() else { return false };
+                let input = if region == 0 { None } else { Some(self.regions.get(&region).cloned().unwrap_or_default()) };
+                if let Some(s) = self.surfaces.get_mut(&object) {
+                    s.pending_input = Some(input);
+                }
+                true
+            }
             // commit
             6 => {
                 self.commit(object, buffers);
@@ -1277,6 +1468,12 @@ impl Client {
                     self.dirty = true;
                 }
                 s.buffer_scale = k;
+            }
+            if let Some(input) = s.pending_input.take() {
+                if input != s.input {
+                    self.dirty = true;
+                }
+                s.input = input;
             }
         }
         let Some(state) = self.surfaces.get(&surface).cloned() else {
@@ -1330,6 +1527,10 @@ impl Client {
         let showable = state.role != Role::None;
         if let Some(buffer_id) = buffer_id {
             if let Some(Object::Buffer(spec)) = self.objects.get(&buffer_id).cloned() {
+                // The surface is the viewport's source rectangle of the buffer,
+                // when the client gave one: the same rows at the same stride,
+                // starting further in and fewer of them.
+                let spec = Self::crop(spec, state.crop);
                 // Where the pixels are, not what they are. `locate` hands back
                 // the address of the client's pool in an address space the host
                 // can read, so the frame is never copied: the host uploads the
@@ -1428,7 +1629,10 @@ impl Client {
             // whichever last drew -- of the windows: a cursor or a subsurface
             // drawing must not take the keyboard (Xwayland's cursor surface
             // did, and every scripted key went to it).
-            if matches!(state.role, Role::Toplevel | Role::Popup) {
+            // Not a placed one: its client says when it has the keyboard
+            // (`activate`), and Wine takes a keyboard enter as "make this the
+            // foreground window" -- every repaint of a taskbar would.
+            if matches!(state.role, Role::Toplevel | Role::Popup) && !state.placement.placed {
                 self.focus_surface = Some(surface);
                 self.ensure_keyboard_enter();
             }
@@ -1450,6 +1654,19 @@ impl Client {
             s.pending_buffer = None;
             s.pending_callbacks.clear();
         }
+    }
+
+    /// A buffer cut down to a `wp_viewport` source rectangle, clipped to the
+    /// buffer. A rectangle that leaves nothing is ignored, as the protocol
+    /// says a client may not send one.
+    fn crop(spec: BufferSpec, crop: Option<(i32, i32, i32, i32)>) -> BufferSpec {
+        let Some((x, y, w, h)) = crop else { return spec };
+        let (x, y) = (x.clamp(0, spec.width), y.clamp(0, spec.height));
+        let (w, h) = (w.min(spec.width - x), h.min(spec.height - y));
+        if w <= 0 || h <= 0 || (x, y, w, h) == (0, 0, spec.width, spec.height) {
+            return spec;
+        }
+        BufferSpec { offset: spec.offset + y * spec.stride + x * 4, width: w, height: h, ..spec }
     }
 
     /// Copy a buffer's rectangle out of its pool. `None` when the pool does not
@@ -1914,6 +2131,34 @@ impl Client {
     // -- wl_subcompositor / wl_subsurface -----------------------------------
 
     /// `wp_viewporter`: destroy(0), get_viewport(1).
+    // -- wl_region ----------------------------------------------------------
+
+    fn region(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => {
+                self.objects.remove(&object);
+                self.regions.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // add(x, y, width, height), subtract(x, y, width, height)
+            1 | 2 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int()) else {
+                    return false;
+                };
+                let region = self.regions.entry(object).or_default();
+                if opcode == 1 {
+                    region.add((x, y, w, h));
+                } else {
+                    region.subtract((x, y, w, h));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn viewporter(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
             0 => {
@@ -1944,7 +2189,21 @@ impl Client {
                 self.delete_id(object);
                 true
             }
-            1 => true,
+            // set_source(x, y, width, height), wl_fixed: -1 everywhere unsets.
+            1 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int())
+                else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.crop = if w < 0 || h < 0 {
+                        None
+                    } else {
+                        Some((x >> 8, y >> 8, w >> 8, h >> 8))
+                    };
+                }
+                true
+            }
             2 => {
                 let (Some(w), Some(h)) = (r.int(), r.int()) else {
                     return false;
@@ -2102,6 +2361,81 @@ impl Client {
         }
     }
 
+    // -- gex_window_placement_v1 --------------------------------------------
+
+    fn placement_manager(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => true,
+            // get_placement(id, surface)
+            1 => {
+                let (Some(id), Some(surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                let Some(s) = self.surfaces.get_mut(&surface) else {
+                    return false;
+                };
+                s.placement.placed = true;
+                self.objects.insert(id, Object::Placement { surface });
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn placement(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        // The surface may be gone before its placement object: the requests
+        // are then accepted and change nothing.
+        let mut ok = true;
+        let apply = |c: &mut Self, f: &mut dyn FnMut(&mut SurfaceState)| {
+            if let Some(s) = c.surfaces.get_mut(&surface) {
+                f(s);
+                c.dirty = true;
+            }
+        };
+        match opcode {
+            // destroy: back to the compositor's own layout.
+            0 => {
+                apply(self, &mut |s| s.placement = Placement::default());
+                self.objects.remove(&object);
+                self.delete_id(object);
+            }
+            // set_position(x, y)
+            1 => match (r.int(), r.int()) {
+                (Some(x), Some(y)) => apply(self, &mut |s| {
+                    s.rel_x = x;
+                    s.rel_y = y;
+                }),
+                _ => ok = false,
+            },
+            // set_layer(layer)
+            2 => match r.uint() {
+                Some(layer) => apply(self, &mut |s| s.placement.layer = layer.min(2)),
+                None => ok = false,
+            },
+            // set_stack_id(id)
+            3 => match r.uint() {
+                Some(id) => apply(self, &mut |s| s.placement.id = id),
+                None => ok = false,
+            },
+            // place_below(sibling)
+            4 => match r.uint() {
+                Some(sibling) => apply(self, &mut |s| {
+                    s.placement.below = sibling;
+                    s.placement.restack = s.placement.restack.wrapping_add(1);
+                }),
+                None => ok = false,
+            },
+            // set_unmanaged
+            5 => apply(self, &mut |s| s.placement.unmanaged = true),
+            // activate
+            6 => apply(self, &mut |s| s.placement.activate = s.placement.activate.wrapping_add(1)),
+            _ => ok = false,
+        }
+        ok
+    }
+
     // -- wl_seat ------------------------------------------------------------
 
     fn seat(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
@@ -2198,6 +2532,8 @@ impl Client {
                 external: external.is_some(),
                 buffer_scale: s.buffer_scale.max(1),
                 client_scale: self.scale,
+                placement: s.placement,
+                input: s.input.clone(),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -2311,6 +2647,9 @@ impl Client {
         match self.surfaces.get_mut(&surface) {
             Some(s) => {
                 s.xid = xid;
+                if s.x11 && s.placement.placed {
+                    s.placement.id = xid;
+                }
                 self.dirty = true;
             }
             None => trace_out(&format!("[wl] xid {xid:#x}: no surface {surface}")),
@@ -2326,6 +2665,15 @@ impl Client {
         s.parent = 0;
         s.rel_x = x;
         s.rel_y = y;
+        // An override-redirect window is placed by its client: where it is,
+        // undecorated, above everything -- the same state a client asks for
+        // with `gex_window_placement_v1`, so it is drawn and hit-tested by the
+        // same code. Named by its X window id, as other X windows would name it.
+        s.placement = if override_redirect {
+            Placement { placed: true, unmanaged: true, layer: 2, id: s.xid, ..s.placement }
+        } else {
+            Placement::default()
+        };
         if !title.is_empty() {
             s.title = title.to_string();
         } else if s.title.is_empty() {
@@ -2351,6 +2699,29 @@ impl Client {
         self.surfaces.get(&surface).map(|s| s.x11).unwrap_or(false)
     }
 
+    /// Whether a surface is on screen: it has a role and a buffer. For a host
+    /// that composites from copied frames (`take_frames`), which `scene` does
+    /// not describe.
+    pub fn is_mapped(&self, surface: u32) -> bool {
+        self.surfaces
+            .get(&surface)
+            .is_some_and(|s| s.role != Role::None && s.committed_buffer.is_some())
+    }
+
+    /// Every placed surface that is on screen: its id, position and placement.
+    /// The same state `scene` publishes, for a host without a view into guest
+    /// memory.
+    pub fn placed(&self) -> Vec<(u32, i32, i32, Placement)> {
+        let mut out: Vec<_> = self
+            .surfaces
+            .iter()
+            .filter(|(id, s)| s.placement.placed && self.is_mapped(**id))
+            .map(|(id, s)| (*id, s.rel_x, s.rel_y, s.placement))
+            .collect();
+        out.sort_by_key(|p| p.0);
+        out
+    }
+
     /// Whether input can be delivered: the client has a pointer and a
     /// keyboard, and a surface to give them to.
     /// Give the keyboard to a window when none has it.
@@ -2367,7 +2738,7 @@ impl Client {
         let pick = self
             .surfaces
             .iter()
-            .filter(|(_, s)| s.x11 || matches!(s.role, Role::Toplevel))
+            .filter(|(_, s)| !s.placement.placed && (s.x11 || matches!(s.role, Role::Toplevel)))
             .map(|(id, _)| *id)
             .max();
         if let Some(id) = pick {
@@ -3254,6 +3625,40 @@ mod tests {
     }
 
     #[test]
+    fn an_input_region_takes_effect_at_commit() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // Wine's GL subsurface: an empty region (create_region, no adds),
+        // set as the input region, destroyed at once, then committed.
+        c.receive(&Writer::new(3, 1).new_id(40).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 5).object(40).finish(), &[], &pool);
+        c.receive(&Writer::new(40, 0).finish(), &[], &pool);
+        let input = |c: &Client| c.scene().into_iter().find(|s| s.surface == 6).expect("no window").input;
+        assert_eq!(input(&c), None, "the region applied before the commit");
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let got = input(&c).expect("no input region after the commit");
+        assert!(!got.contains(0, 0));
+        let info = c.scene().into_iter().find(|s| s.surface == 6).unwrap();
+        assert_eq!(info.flags() & 0x80, 0x80);
+        assert_eq!(info.input_words(), [0, 0, 0, 0]);
+        // A region with a hole: 0..100 square less a 20x20 in the middle.
+        c.receive(&Writer::new(3, 1).new_id(41).finish(), &[], &pool);
+        c.receive(&Writer::new(41, 1).int(0).int(0).int(100).int(100).finish(), &[], &pool);
+        c.receive(&Writer::new(41, 2).int(40).int(40).int(20).int(20).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 5).object(41).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let got = input(&c).unwrap();
+        assert!(got.contains(10, 10) && got.contains(99, 50) && !got.contains(50, 50) && !got.contains(100, 0));
+        assert_eq!(got.bounds(), (0, 0, 100, 100));
+        assert!(!got.is_rect());
+        // Null: the whole surface again.
+        c.receive(&Writer::new(6, 5).object(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        assert_eq!(input(&c), None);
+        assert_eq!(c.scene().into_iter().find(|s| s.surface == 6).unwrap().flags() & 0x80, 0);
+    }
+
+    #[test]
     fn a_viewport_records_its_destination() {
         let pool = Placed(0x6000, 8192);
         let (mut c, _) = placed_window(200, 100, 800);
@@ -3269,6 +3674,74 @@ mod tests {
         c.receive(&Writer::new(51, 0).finish(), &[], &pool);
         assert!(!c.objects.contains_key(&51), "the viewport outlived its destroy");
         assert!(c.scene().iter().any(|s| s.surface == 6), "the window went away");
+    }
+
+    #[test]
+    fn a_viewport_source_crops_the_buffer() {
+        let pool = Placed(0x10_0000, 800 * 125 + 64);
+        // A 200x125 buffer of which Wine shows the top 40 rows: the surface
+        // the host draws is 200x40, at the same address and stride.
+        let (mut c, _) = placed_window(200, 125, 800);
+        c.receive(&Writer::new(2, 0).uint(9).string("wp_viewporter").uint(1).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 1).new_id(51).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 1).int(0).int(0).int(200 << 8).int(40 << 8).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
+        assert_eq!((s.width, s.height, s.stride), (200, 40, 800));
+        assert_eq!(s.addr, 0x10_0000);
+        // Off the origin: the address moves in by rows and columns.
+        c.receive(&Writer::new(51, 1).int(4 << 8).int(2 << 8).int(100 << 8).int(10 << 8).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
+        assert_eq!((s.width, s.height), (100, 10));
+        assert_eq!(s.addr, 0x10_0000 + 2 * 800 + 4 * 4);
+    }
+
+    #[test]
+    fn a_placed_window_carries_its_position_and_stacking() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(64, 32, 256);
+        assert!(!c.scene()[0].placement.placed, "placed before it asked");
+        // bind gex_window_placement_manager_v1 (name 10), get_placement(60, 6).
+        c.receive(
+            &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(1).new_id(59).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 1).int(300).int(-20).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 2).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 3).uint(0x1004a).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 4).uint(0x20010).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 5).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 6).finish(), &[], &pool);
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+        let s = &c.scene()[0];
+        assert_eq!((s.rel_x, s.rel_y), (300, -20));
+        let p = s.placement;
+        assert!(p.placed && p.unmanaged);
+        assert_eq!((p.layer, p.id, p.below, p.restack, p.activate), (1, 0x1004a, 0x20010, 1, 1));
+        assert_eq!(p.record_words(), [0x103, 0x1004a, 0x20010, 1, 1]);
+        // Destroyed: back to the compositor's layout.
+        c.receive(&Writer::new(60, 0).finish(), &[], &pool);
+        assert_eq!(c.scene()[0].placement, Placement::default());
+    }
+
+    #[test]
+    fn an_override_redirect_window_is_placed_like_any_other() {
+        let (mut c, _) = placed_window(64, 32, 256);
+        c.adopt_x11(6, "menu", true, 30, 40);
+        c.set_xid(6, 0x400007);
+        let s = &c.scene()[0];
+        assert_eq!((s.rel_x, s.rel_y), (30, 40));
+        assert_eq!(
+            s.placement,
+            Placement { placed: true, unmanaged: true, layer: 2, id: 0x400007, ..Placement::default() }
+        );
+        c.adopt_x11(6, "xterm", false, 0, 0);
+        assert!(!c.scene()[0].placement.placed);
     }
 
     #[test]
