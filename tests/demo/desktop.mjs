@@ -35,6 +35,8 @@
 //   {"truth": true, "rounds": N}         type into the xterm, then compare the X server's
 //                                        copy of it (xwd) with the compositor's output
 //                                        (needs the python and xeyes overlays)
+//   {"inputregion": true}                a click over a subsurface with an empty input region
+//                                        reaches its window at window coordinates (python overlay)
 //   {"pools": true, "seconds": N}        the xterm prints a line a second for N s; the
 //                                        X server's live pools must not grow
 // A run step with "show": true prints the command's output tail even on success.
@@ -642,6 +644,51 @@ async function closeProgram(name, title = name) {
   log(`FAIL ${name} exits: its window ${JSON.stringify(title)} is still there after SIGKILL; processes ${JSON.stringify(ps.lines?.map((l) => l.trim()).filter(Boolean))}`);
   return false;
 }
+/**
+ * Input regions: guest/inputregion.py's window holds a subsurface with an
+ * empty input region (as Wine shows a window's GL picture), and a click over
+ * the subsurface must reach the window under it at the window's own
+ * coordinates -- the subsurface's offset included, not left out. Needs the
+ * python overlay.
+ */
+async function inputRegionLeg(step) {
+  const label = step.label ?? 'input region';
+  const script = (await import('node:fs')).readFileSync(new URL('./guest/inputregion.py', import.meta.url)).toString('base64');
+  const py = step.python ?? 'python3.13';
+  const put = await guestRun(`echo ${script} | base64 -d > /tmp/inputregion.py; rm -f /tmp/inputregion.log; `
+    + `(${py} /tmp/inputregion.py 120 >/tmp/inputregion.log 2>&1 &); sleep 1`);
+  if (put.rc) throw new Error('could not start /tmp/inputregion.py');
+  let a = null;
+  for (let i = 0; i < 60 && !a; i++) {
+    a = await windowAt('inputregion');
+    if (!a) await new Promise((r) => setTimeout(r, 1000));
+  }
+  const fail = (why) => {
+    failed = true;
+    log(`FAIL ${label}: ${why}`);
+  };
+  if (!a) {
+    const out = await guestRun('cat /tmp/inputregion.log');
+    const d = await ev('globalThis.__gexCompositor.describe()');
+    return fail(`no window titled "inputregion"; its log: ${out.lines.join(' | ').slice(0, 300)}; the compositor's: ${JSON.stringify(d?.list)}`);
+  }
+  // The script's window is 240x160 surface units: device pixels per unit.
+  const u = a.w / 240;
+  // Into the subsurface (40,30 120x80): 60,40 inside it, 100,70 in the window.
+  const at = [a.left + (a.x + 100 * u) * a.k, a.top + (a.y + 70 * u) * a.k];
+  await click(...at);
+  let lines = [];
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    lines = (await guestRun('cat /tmp/inputregion.log')).lines;
+    if (lines.some((l) => l.startsWith('button') && l.endsWith(' up'))) break;
+  }
+  const press = lines.find((l) => l.startsWith('button') && l.endsWith(' down'));
+  const m = press && /^button (\S+) (-?\d+) (-?\d+)/.exec(press);
+  const ok = m && m[1] === 'parent' && Math.abs(Number(m[2]) - 100) <= 1 && Math.abs(Number(m[3]) - 70) <= 1;
+  if (!ok) return fail(`a click over the input-less subsurface ${press ? `went to: ${press}` : 'reached nobody'} (want "button parent 100 70"); log: ${lines.join(' | ').slice(0, 300)}`);
+  log(`ok ${label}: a click over the input-less subsurface reached the window at its own coordinates (${press})`);
+}
 /** A window's line in describe(), as numbers, with the page's scale. */
 async function windowAt(title) {
   return ev(`(() => {
@@ -963,6 +1010,8 @@ try {
       await fitsLeg(step);
     } else if (step.resize) {
       await resizeLeg(step);
+    } else if (step.inputregion) {
+      await inputRegionLeg(step);
     } else if (step.glcycles) {
       await glCycles(step);
     } else if (step.animates) {

@@ -1286,6 +1286,22 @@ class Compositor {
 
   // -- input --------------------------------------------------------------
 
+  /**
+   * Whether a surface takes the pointer at a point (device pixels from its
+   * corner): inside the input region its client set, if it set one. A
+   * surface with an empty region -- Wine's subsurface for a window's GL
+   * picture -- takes none, and the pointer goes to what is under it, in that
+   * surface's coordinates.
+   */
+  #takesInput(win, lx, ly) {
+    const r = win.info?.input;
+    if (!r) return true;
+    const k = win.cs || 1;
+    const ux = Math.floor(lx / k);
+    const uy = Math.floor(ly / k);
+    return ux >= r.x && ux < r.x + r.w && uy >= r.y && uy < r.y + r.h;
+  }
+
   /** The topmost surface at a point, and where in it. */
   #hit(x, y) {
     const stack = this.#stack();
@@ -1300,13 +1316,17 @@ class Compositor {
         const at = this.#placeOf(child);
         if (
           x >= at.x && x < at.x + child.width &&
-          y >= at.y && y < at.y + child.height
+          y >= at.y && y < at.y + child.height &&
+          this.#takesInput(child, x - at.x, y - at.y)
         ) {
           return { key: ck, win: child, local: { x: x - at.x, y: y - at.y }, part: 'content' };
         }
       }
       const f = this.#frameOf(win);
-      if (x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height) {
+      if (
+        x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height &&
+        this.#takesInput(win, x - f.x, y - f.y)
+      ) {
         return { key: k, win, local: { x: x - f.x, y: y - f.y }, part: 'content' };
       }
       // The resize band: GRIP pixels either side of the frame's edge, but not

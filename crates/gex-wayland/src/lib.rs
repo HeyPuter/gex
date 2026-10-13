@@ -105,6 +105,94 @@ impl Role {
     }
 }
 
+/// A `wl_region`: the rectangles a client added, less the ones it
+/// subtracted, kept as disjoint rectangles in surface coordinates.
+///
+/// An input region is where a surface takes the pointer. Wine gives the
+/// subsurface that shows a window's GL picture an empty one, so the pointer
+/// goes to the window under it, in that window's coordinates; a compositor
+/// that ignored it handed clicks to the subsurface, offset by the frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Region {
+    rects: Vec<(i32, i32, i32, i32)>,
+}
+
+impl Region {
+    /// More rectangles than any real client's region, and a bound on what a
+    /// client can make the compositor keep: past it, the region is its bounds.
+    const MAX_RECTS: usize = 256;
+
+    fn add(&mut self, r: (i32, i32, i32, i32)) {
+        if r.2 <= 0 || r.3 <= 0 {
+            return;
+        }
+        self.subtract(r);
+        self.rects.push(r);
+        if self.rects.len() > Self::MAX_RECTS {
+            let b = self.bounds();
+            self.rects = vec![b];
+        }
+    }
+
+    fn subtract(&mut self, (x, y, w, h): (i32, i32, i32, i32)) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (x2, y2) = (x.saturating_add(w), y.saturating_add(h));
+        let mut out = Vec::with_capacity(self.rects.len());
+        for &(rx, ry, rw, rh) in &self.rects {
+            let (rx2, ry2) = (rx + rw, ry + rh);
+            if x >= rx2 || x2 <= rx || y >= ry2 || y2 <= ry {
+                out.push((rx, ry, rw, rh));
+                continue;
+            }
+            // What is left of the rectangle: the bands above and below the
+            // cut, then the parts beside it.
+            let (cy, cy2) = (y.max(ry), y2.min(ry2));
+            if ry < cy {
+                out.push((rx, ry, rw, cy - ry));
+            }
+            if cy2 < ry2 {
+                out.push((rx, cy2, rw, ry2 - cy2));
+            }
+            if rx < x {
+                out.push((rx, cy, x - rx, cy2 - cy));
+            }
+            if x2 < rx2 {
+                out.push((x2, cy, rx2 - x2, cy2 - cy));
+            }
+        }
+        self.rects = out;
+    }
+
+    /// Whether a point in surface coordinates is in the region.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        self.rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+    }
+
+    /// The smallest rectangle holding the region; zero-sized when it is empty.
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        let mut it = self.rects.iter();
+        let Some(&(x, y, w, h)) = it.next() else { return (0, 0, 0, 0) };
+        let (mut x1, mut y1, mut x2, mut y2) = (x, y, x + w, y + h);
+        for &(rx, ry, rw, rh) in it {
+            x1 = x1.min(rx);
+            y1 = y1.min(ry);
+            x2 = x2.max(rx + rw);
+            y2 = y2.max(ry + rh);
+        }
+        (x1, y1, x2 - x1, y2 - y1)
+    }
+
+    /// Whether the region is exactly its bounds, so a host testing the
+    /// bounds tests the region.
+    pub fn is_rect(&self) -> bool {
+        let (_, _, w, h) = self.bounds();
+        let area: i64 = self.rects.iter().map(|r| i64::from(r.2) * i64::from(r.3)).sum();
+        area == i64::from(w) * i64::from(h)
+    }
+}
+
 /// A rectangle of a surface that changed since the host last looked, in surface
 /// pixels. `w == 0` means "all of it" -- what a client that never sent a damage
 /// rectangle is asking for, and what a newly attached buffer of a new size is.
@@ -201,6 +289,10 @@ pub struct SurfaceInfo {
     /// Where the client says the surface is and what it is stacked under
     /// (`gex_window_placement_v1`), when it says so.
     pub placement: Placement,
+    /// The input region (`wl_surface.set_input_region`): `None` is the
+    /// whole surface, as it is until a client sets one, and an empty region
+    /// takes no pointer input at all.
+    pub input: Option<Region>,
 }
 
 /// A placed surface's position and stacking, as its client asked for them
@@ -260,6 +352,18 @@ impl SurfaceInfo {
             | ((self.buffer_scale & 0xff) << 8)
             | ((self.client_scale & 0xff) << 16)
             | (((self.request.code() & 0x7f) as i32) << 24)
+            | (i32::from(self.input.is_some()) << 7)
+    }
+
+    /// The input region as a host's record carries it, with `flags` bit 7
+    /// saying there is one: its bounds in surface units, x, y, width, height.
+    /// Zero-sized is a surface that takes no pointer input. A region with
+    /// holes is published as its bounds (a client's input region is in
+    /// practice a rectangle: empty, the whole surface, or the window inside
+    /// its shadow).
+    pub fn input_words(&self) -> [i32; 4] {
+        let (x, y, w, h) = self.input.as_ref().map(Region::bounds).unwrap_or_default();
+        [x, y, w, h]
     }
 }
 
@@ -568,6 +672,10 @@ struct SurfaceState {
     crop: Option<(i32, i32, i32, i32)>,
     /// `gex_window_placement_v1`: where the client put the surface.
     placement: Placement,
+    /// `set_input_region`, pending until commit (`Some(None)`: back to the
+    /// whole surface), and the committed region (`None`: the whole surface).
+    pending_input: Option<Option<Region>>,
+    input: Option<Region>,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -604,6 +712,8 @@ pub struct Client {
     wm_base_version: u32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
+    /// What each `wl_region` holds.
+    regions: HashMap<u32, Region>,
     /// Surfaces whose scene state changed since the host last published it, so
     /// a pump that changed nothing costs nothing.
     dirty: bool,
@@ -670,6 +780,7 @@ impl Client {
             scale: 1,
             wm_base_version: 0,
             positioners: HashMap::new(),
+            regions: HashMap::new(),
             dirty: false,
             failed: None,
             pointer: None,
@@ -852,7 +963,8 @@ impl Client {
                 // creates a child object, so just accept and ignore everything.
                 Object::Stub => true,
                 Object::Positioner => self.positioner(object, opcode, &mut r),
-                Object::Buffer(_) | Object::Region => {
+                Object::Region => self.region(object, opcode, &mut r),
+                Object::Buffer(_) => {
                     // Every one of these has `destroy` at opcode 0 and
                     // requests that change nothing observable here.
                     if opcode == 0 {
@@ -1112,6 +1224,7 @@ impl Client {
             1 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Region);
+                self.regions.insert(id, Region::default());
                 true
             }
             _ => false,
@@ -1292,8 +1405,20 @@ impl Client {
                 }
                 true
             }
-            // set_opaque_region, set_input_region
-            4 | 5 => true,
+            // set_opaque_region: only an optimisation for a compositor that
+            // skips drawing what is under an opaque surface.
+            4 => true,
+            // set_input_region(region): a copy of the region as it is now (the
+            // client may destroy it at once), taking effect at commit. Null
+            // is the whole surface again.
+            5 => {
+                let Some(region) = r.object() else { return false };
+                let input = if region == 0 { None } else { Some(self.regions.get(&region).cloned().unwrap_or_default()) };
+                if let Some(s) = self.surfaces.get_mut(&object) {
+                    s.pending_input = Some(input);
+                }
+                true
+            }
             // commit
             6 => {
                 self.commit(object, buffers);
@@ -1343,6 +1468,12 @@ impl Client {
                     self.dirty = true;
                 }
                 s.buffer_scale = k;
+            }
+            if let Some(input) = s.pending_input.take() {
+                if input != s.input {
+                    self.dirty = true;
+                }
+                s.input = input;
             }
         }
         let Some(state) = self.surfaces.get(&surface).cloned() else {
@@ -2000,6 +2131,34 @@ impl Client {
     // -- wl_subcompositor / wl_subsurface -----------------------------------
 
     /// `wp_viewporter`: destroy(0), get_viewport(1).
+    // -- wl_region ----------------------------------------------------------
+
+    fn region(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => {
+                self.objects.remove(&object);
+                self.regions.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // add(x, y, width, height), subtract(x, y, width, height)
+            1 | 2 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int()) else {
+                    return false;
+                };
+                let region = self.regions.entry(object).or_default();
+                if opcode == 1 {
+                    region.add((x, y, w, h));
+                } else {
+                    region.subtract((x, y, w, h));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn viewporter(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
             0 => {
@@ -2374,6 +2533,7 @@ impl Client {
                 buffer_scale: s.buffer_scale.max(1),
                 client_scale: self.scale,
                 placement: s.placement,
+                input: s.input.clone(),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -3462,6 +3622,40 @@ mod tests {
         assert_eq!(sub.role, Role::Subsurface);
         assert_eq!(sub.parent, 6);
         assert_eq!((sub.rel_x, sub.rel_y), (12, 7));
+    }
+
+    #[test]
+    fn an_input_region_takes_effect_at_commit() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // Wine's GL subsurface: an empty region (create_region, no adds),
+        // set as the input region, destroyed at once, then committed.
+        c.receive(&Writer::new(3, 1).new_id(40).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 5).object(40).finish(), &[], &pool);
+        c.receive(&Writer::new(40, 0).finish(), &[], &pool);
+        let input = |c: &Client| c.scene().into_iter().find(|s| s.surface == 6).expect("no window").input;
+        assert_eq!(input(&c), None, "the region applied before the commit");
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let got = input(&c).expect("no input region after the commit");
+        assert!(!got.contains(0, 0));
+        let info = c.scene().into_iter().find(|s| s.surface == 6).unwrap();
+        assert_eq!(info.flags() & 0x80, 0x80);
+        assert_eq!(info.input_words(), [0, 0, 0, 0]);
+        // A region with a hole: 0..100 square less a 20x20 in the middle.
+        c.receive(&Writer::new(3, 1).new_id(41).finish(), &[], &pool);
+        c.receive(&Writer::new(41, 1).int(0).int(0).int(100).int(100).finish(), &[], &pool);
+        c.receive(&Writer::new(41, 2).int(40).int(40).int(20).int(20).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 5).object(41).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let got = input(&c).unwrap();
+        assert!(got.contains(10, 10) && got.contains(99, 50) && !got.contains(50, 50) && !got.contains(100, 0));
+        assert_eq!(got.bounds(), (0, 0, 100, 100));
+        assert!(!got.is_rect());
+        // Null: the whole surface again.
+        c.receive(&Writer::new(6, 5).object(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        assert_eq!(input(&c), None);
+        assert_eq!(c.scene().into_iter().find(|s| s.surface == 6).unwrap().flags() & 0x80, 0);
     }
 
     #[test]

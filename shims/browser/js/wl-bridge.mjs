@@ -21,7 +21,7 @@ const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 33;
+export const REC = 37;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -68,6 +68,12 @@ export const R_STACK_BELOW = 30;
 export const R_RESTACK = 31;
 /** Bumped when the client asks for this surface to have the keyboard. */
 export const R_ACTIVATE = 32;
+/** With `F_INPUT_REGION`: the bounds of where the surface takes the pointer
+ * (`wl_surface.set_input_region`), in surface units. Zero-sized: nowhere. */
+export const R_INPUT_X = 33;
+export const R_INPUT_Y = 34;
+export const R_INPUT_W = 35;
+export const R_INPUT_H = 36;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
 
@@ -86,6 +92,9 @@ export const F_CONFIGURE_PENDING = 4;
  *  to the guest -- so the record says how big the surface is and the
  *  compositor finds the picture elsewhere. */
 export const F_EXTERNAL = 2;
+/** The client set an input region (`R_INPUT_X`..): without it the whole
+ *  surface takes the pointer. */
+export const F_INPUT_REGION = 128;
 
 /** Event kinds the compositor writes into a process's ring. */
 export const EV_MOTION = 0;
@@ -234,6 +243,9 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         below: a[r + R_STACK_BELOW] >>> 0,
         restack: a[r + R_RESTACK] >>> 0,
         activate: a[r + R_ACTIVATE] >>> 0,
+        input: (a[r + R_FLAGS] & F_INPUT_REGION)
+          ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
+          : null,
       });
     }
   }
