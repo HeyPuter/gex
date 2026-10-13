@@ -4258,21 +4258,45 @@ export class Gex {
     return v;
   }
 
+  /** Views of the guest's memory for door calls: { u8, i32, dv } (word
+   *  indices with `>>> 2`: the memory passes 2 GiB). A shared
+   *  memory never detaches (an old SharedArrayBuffer stays valid at its old
+   *  length), so a view is good for any range inside it and is rebuilt only
+   *  when a range reaches past it. Reading `memory.buffer` for every call,
+   *  as `#bytes` does, was about 15% of a door call in Chrome. */
+  #doorGv = null;
+  #doorGuest(end) {
+    let g = this.#doorGv;
+    if (!g || end > g.u8.length) {
+      const buf = this.#memory.buffer;
+      g = this.#doorGv = { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, buf.byteLength >>> 2), dv: new DataView(buf) };
+    }
+    return g;
+  }
+
+  /** The door memory's views (`#doorView`), checked the same way. */
+  #doorMem(end) {
+    const v = this.#doorViews;
+    return v && end <= v.len ? v : this.#doorView();
+  }
+
   /** One door call under the door lock (`st`: the statistics, or null). */
   #doorRun(d, req, pid, tid, st) {
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
-    const cm = this.#bytes();
-    const cdv = this.#guestView();
+    let g = this.#doorGuest(req + 136);
+    const cdv = g.dv;
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
     const replyData = cdv.getUint32(req + 68, true);
-    const { u8, i32, dv } = this.#doorView();
     const a = d.area;
-    const buf = dv.getUint32(a + 44, true), bufSize = dv.getUint32(a + 48, true);
+    let w = this.#doorMem(a + 144);
+    const buf = w.dv.getUint32(a + 44, true), bufSize = w.dv.getUint32(a + 48, true);
+    w = this.#doorMem(buf + bufSize);
+    const { u8, i32, dv } = w;
     const replyOff = (64 + reqSize + 7) & ~7;
     if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
@@ -4289,20 +4313,25 @@ export class Gex {
       // the one door stack and context.
       let di = this.#doorInst;
       if (!di || di.door !== d) di = this.#doorInst = this.#doorInstantiate(d);
-      u8.set(cm.subarray(req, req + 64), buf);
+      // The 64-byte header as 16 words (no subarray views), then the data.
+      if (((req | buf) & 3) === 0) {
+        const gi = g.i32, s0 = req >>> 2, d0 = buf >>> 2;
+        for (let k = 0; k < 16; k++) i32[d0 + k] = gi[s0 + k];
+      } else u8.set(g.u8.subarray(req, req + 64), buf);
       let at = buf + 64;
       for (let k = 0; k < count; k++) {
         const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
-        u8.set(cm.subarray(ptr, ptr + size), at);
+        if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
+        u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
       }
       di.sp.value = di.stackTop;
       const T1 = st ? performance.now() : 0;
-      // The time, as set_current_time would read it (gettimeofday,
-      // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
-      // of the door saved.
       if (di.lazyTime) r = di.dispatch(pid, tid, 0n, 1n) >>> 0;
       else {
+        // The time, as set_current_time would read it (gettimeofday,
+        // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
+        // of the door saved.
         const ns = this.#env.now();
         r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
       }
@@ -4311,9 +4340,14 @@ export class Gex {
       else if (r === 0xfffffffe) r = 2;
       else {
         const ro = buf + r;
-        cm.set(u8.subarray(ro, ro + 64), req);
+        // the dispatch may have grown the guest's memory (a request that maps)
+        g = this.#doorGuest(Math.max(req + 64, replyData + replyMax));
+        if (((req | ro) & 3) === 0) {
+          const gi = g.i32, s0 = ro >>> 2, d0 = req >>> 2;
+          for (let k = 0; k < 16; k++) gi[d0 + k] = i32[s0 + k];
+        } else g.u8.set(u8.subarray(ro, ro + 64), req);
         const size = Math.min(dv.getUint32(ro + 4, true), replyMax);
-        if (size && replyData) cm.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
+        if (size && replyData) g.u8.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
         if (st) st.calls++;
         r = 0;
       }
