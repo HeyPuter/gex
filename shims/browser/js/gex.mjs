@@ -3898,6 +3898,10 @@ export class Gex {
       // size for a size of 0.
       session_copy: (dst, off, size) => this.#sessionCopy(dst >>> 0, off >>> 0, size >>> 0),
       session_seq: (off) => this.#sessionSeq(off >>> 0),
+      // The server's user shared data page (area +140), copied at a
+      // process's start and written by the first boot's fill (§6.2).
+      usd_copy: (dst, size) => this.#usdMove(dst >>> 0, size >>> 0, false),
+      usd_publish: (src, size) => this.#usdMove(src >>> 0, size >>> 0, true),
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
@@ -3939,12 +3943,32 @@ export class Gex {
       console.error(`[gex-door] the server's kick fd ${kickFd} is not a global pipe: no doors`);
       return;
     }
+    // The door context must hold gex's whole register context (gex_abi
+    // ctx::SIZE, 1120 bytes for i386): the kernel writes past the
+    // system-call slots, and a short one corrupted the server's heap.
+    const ctxSize = dv.getUint32(area + 136, true);
+    if (ctxSize < 1120) {
+      console.error(`[gex-door] the server's door context is ${ctxSize} bytes, under gex's 1120: no doors`);
+      return;
+    }
     const door = {
       memory: this.#memory, module: info.module, base: info.base, memBase: info.memBase, binds: info.binds ?? '',
       area, kickId, pid: dv.getInt32(area + 112, true), id: `${Date.now()}:${area}`,
     };
     if (globalThis.GEX_DOOR_TRACE) console.error(`[gex-door] wineserver pid ${door.pid} published its door (area ${area})`);
     this.#env.publishDoor?.(door);
+  }
+
+  #usdMove(at, size, publish) {
+    const d = this.#door;
+    if (!d || single.on) return -1;
+    const { u8, dv } = this.#doorView();
+    const usd = dv.getUint32(d.area + 140, true);
+    if (!usd) return -1;
+    const n = Math.min(size, 4096);
+    if (publish) u8.set(this.#bytes().subarray(at, at + n), usd);
+    else this.#bytes().set(u8.subarray(usd, usd + n), at);
+    return n;
   }
 
   #sessTr = 0;

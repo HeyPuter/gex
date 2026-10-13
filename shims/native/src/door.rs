@@ -41,6 +41,8 @@ mod area {
     pub const POISONED: u32 = 124;
     pub const SESSION: u32 = 128;
     pub const SESSION_SIZE: u32 = 132;
+    pub const CTX_SIZE: u32 = 136;
+    pub const USD: u32 = 140;
 }
 
 /// A native wasm32 program as installed, by pid (`wasmprog::install`): what
@@ -143,6 +145,14 @@ pub(crate) fn publish(caller: &mut Caller<'_, HostState>, area_at: u32) -> Resul
     let version = u32::from_le_bytes(memory.bytes()[(area_at + area::VERSION) as usize..][..4].try_into().unwrap());
     if version != 1 {
         bail!("door area version {version} (want 1)");
+    }
+    // The door context must hold gex's whole register context: the kernel
+    // writes past the system-call slots (LAST_SYSCALL), and a short one
+    // corrupted the server's heap.
+    let ctx_size = u32::from_le_bytes(memory.bytes()[(area_at + area::CTX_SIZE) as usize..][..4].try_into().unwrap());
+    if (ctx_size as usize) < gex_abi::ctx::SIZE {
+        eprintln!("gex-door: the server's door context is {ctx_size} bytes, under gex's {}: no doors", gex_abi::ctx::SIZE);
+        return Ok(());
     }
     let server = Server {
         sm: memory.shared().clone(),
@@ -406,6 +416,28 @@ pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u3
     let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let from = (base + off) as usize;
     cm.bytes()[dst as usize..dst as usize + n].copy_from_slice(&s.mem.bytes()[from..from + n]);
+    Ok(n as i32)
+}
+
+/// `gex.usd_copy(dst, size)` / `gex.usd_publish(src, size)`: the server's
+/// user shared data page to or from the caller (docs/wineserver-kernel.md
+/// §6.2); the bytes copied, -1 with no door.
+pub(crate) fn usd_move(caller: &mut Caller<'_, HostState>, at: u32, size: u32, publish: bool) -> Result<i32> {
+    let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(-1) };
+    let usd = s.get(area::USD);
+    if usd == 0 {
+        return Ok(-1);
+    }
+    let n = size.min(4096) as usize;
+    let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let (c, u) = (at as usize, usd as usize);
+    if publish {
+        let v = cm.bytes()[c..c + n].to_vec();
+        s.mem.bytes()[u..u + n].copy_from_slice(&v);
+    } else {
+        let v = s.mem.bytes()[u..u + n].to_vec();
+        cm.bytes()[c..c + n].copy_from_slice(&v);
+    }
     Ok(n as i32)
 }
 

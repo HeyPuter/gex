@@ -464,6 +464,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::door::wake_write(id, &v)
     })?;
     linker.func_wrap(IMPORT_MODULE, "wake_close", |id: i32| crate::door::wake_close(id))?;
+    linker.func_wrap(IMPORT_MODULE, "usd_copy", |mut caller: Caller<'_, HostState>, dst: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::usd_move(&mut caller, dst as u32, size as u32, false))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
+    })?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
