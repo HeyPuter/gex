@@ -16,7 +16,8 @@
  *  7. the parent is sent a signal while its child runs, and takes it;
  *  8. a parent with a second thread forks;
  *  9. the child crashes (a store far outside its memory): the parent goes on;
- * 10. posix_spawn with file actions and attributes;
+ * 10. posix_spawn with file actions and attributes (gex runs the child in
+ *     the parent's Worker until its exec: shims/browser/src/vfork.rs);
  * 11. posix_spawn of a program that is not there: ENOENT, through the
  *     child's error pipe;
  * 12. posix_spawn of a program that exits at once, many times. */

@@ -869,6 +869,9 @@ async function runProgramHere(
       // of the 32-slot span around the miss. An experiment for #136: it says
       // whether the closure has the blocks an exec'd process lifts anyway.
       wholePage: flag('wholepage') ? 1 : undefined,
+      // `?vforktrace=1`: each posix_spawn child run in its parent's Worker
+      // (shims/browser/src/vfork.rs), on the console.
+      vforkTrace: flag('vforktrace') ? 1 : undefined,
       trapPc: flag('trappc') ? Number.parseInt(flag('trappc'), 16) : undefined,
       // Every process gets a memory two Workers can hold, so a `clone` asking
       // for a thread can be given one. `worker.mjs` passes this to the `Gex`

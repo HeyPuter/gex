@@ -746,6 +746,7 @@ async function handle(msg) {
     if (msg.intrinsicMask !== undefined) ex.gex_set_intrinsic_mask?.(msg.intrinsicMask);
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
+    if (msg.vforkTrace ?? msg.opts?.vforkTrace) globalThis.GEX_VFORK_TRACE = 1;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));
