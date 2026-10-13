@@ -1741,6 +1741,9 @@ export class Gex {
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
+    // left numbered with no directory entry.
+    if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
     if (opts.fjit && e.gex_set_fjit) {

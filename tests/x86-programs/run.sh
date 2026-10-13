@@ -43,7 +43,11 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # for all of them); i386 also checks setitimer's microseconds.
 # thread-churn: more threads over a process's life than the page has Worker
 # slots, and a fork child starting threads while its parent holds 40.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn"}
+# page-cross-entry: a function entered at a page's last byte, its next page
+# retired; in the page with GEX_TEST_UNPUBLISHED_RETIRE, which leaves a
+# retired page numbered with no directory entry (a publisher that never
+# installed), the block's page check must converge (Paint's startup stall).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -71,6 +75,7 @@ for src in "$HERE"/*.c; do
         # and fixing its guard, so the writer's stores land in between.
         envs=""
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
+        [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals execs itself: in the page, from the guest's filesystem.
         pageopts=""
         [ $name = exec-signals ] && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
