@@ -1,6 +1,6 @@
 // Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
 import './zfetch.js';
-import { requestGexDevice, textureCanvas } from './gpu-device.js';
+import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -26,7 +26,7 @@ import {
   ROLE_POPUP,
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
-  F_MOVE_REQUESTED,
+  F_CONFIGURE_PENDING,
   EV_MOTION,
   EV_BUTTON,
   EV_AXIS,
@@ -38,6 +38,7 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  releaseToken,
 } from '@gex/wl-bridge.mjs';
 
 // -- decoration metrics -----------------------------------------------------
@@ -52,12 +53,24 @@ import {
 let UI = 1;
 let TITLE_H = 26;
 let BORDER = 1;
+/** How far either side of a frame's edge a press starts a resize. */
+let GRIP = 6;
+/** `xdg_toplevel.resize_edge` bits, which the frame's band uses too. */
+const EDGE_TOP = 1, EDGE_BOTTOM = 2, EDGE_LEFT = 4, EDGE_RIGHT = 8;
+const RESIZE_CURSORS = {
+  [EDGE_TOP]: 'ns-resize', [EDGE_BOTTOM]: 'ns-resize', [EDGE_LEFT]: 'ew-resize', [EDGE_RIGHT]: 'ew-resize',
+  [EDGE_TOP | EDGE_LEFT]: 'nwse-resize', [EDGE_BOTTOM | EDGE_RIGHT]: 'nwse-resize',
+  [EDGE_TOP | EDGE_RIGHT]: 'nesw-resize', [EDGE_BOTTOM | EDGE_LEFT]: 'nesw-resize',
+};
+/** A configure's states (`gex_wayland::STATE_*`). */
+const STATE_ACTIVATED = 1, STATE_MAXIMIZED = 2, STATE_RESIZING = 4;
 let BUTTON = 18;
 let BUTTON_GAP = 6;
 function setUiScale(u) {
   UI = u > 0 && Number.isFinite(u) ? u : 1;
   TITLE_H = Math.round(26 * UI);
   BORDER = Math.max(1, Math.round(UI));
+  GRIP = Math.round(6 * UI);
   BUTTON = Math.round(18 * UI);
   BUTTON_GAP = Math.round(6 * UI);
 }
@@ -405,8 +418,15 @@ class Compositor {
   #glSaidAt = 0;
   #glDraws = 0;
   #focus = null;
+  /** The placed window a held button belongs to (see `pointerMove`). */
+  #grab = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
+  /** An interactive resize: the window, the edges being dragged
+   *  (`EDGE_*`), and where the pointer and the window started. */
+  #resize = null;
+  /** The last press on a title bar, for a double-click to maximize. */
+  #titlePress = null;
   #outW = 0;
   #outH = 0;
   #frames = 0;
@@ -491,13 +511,106 @@ class Compositor {
 
   dropMemory(token) {
     this.#memories.delete(token);
+    // Its windows too: a process that was killed never released its block.
+    const n = releaseToken(this.#channel, token);
+    if (n) this.#note(`released ${n} block(s) of exited process ${token}`);
   }
 
   /** The content size a window should have to fit the output with its frame. */
   #fit(win) {
     const maxW = Math.max(160, this.#outW - 2 * BORDER);
     const maxH = Math.max(120, this.#outH - TITLE_H - 2 * BORDER);
-    return { w: Math.min(win.width || maxW, maxW), h: Math.min(win.height || maxH, maxH) };
+    // The size the compositor chose (a resize, a maximize) if it chose one,
+    // or 0x0: the client's own choice (xdg_toplevel.configure), within the
+    // bounds it was told. Never the size it last drew. That was racy: a
+    // commit seen before its buffer scale (foot's first frame at dpr 2) was
+    // read at twice its size, and sending that size back made the client
+    // adopt it. foot then opened at 1391x988 surface units, twice the size of
+    // the output.
+    if (!win.want) return { w: 0, h: 0 };
+    return { w: Math.min(win.want.w, maxW), h: Math.min(win.want.h, maxH) };
+  }
+
+  /** A client asked for a move, a resize or a maximize: `Request::code`. */
+  #clientRequest(k, win, code) {
+    const kind = code & 7;
+    const held = (this.#pointer.buttons & 1) !== 0;
+    this.#note(`request ${k} ${['none', 'move', 'resize', 'maximize', 'unmaximize'][kind] ?? kind}`);
+    if (kind === 1 && held && !win.maximized) {
+      this.#drag = { key: k, dx: this.#pointer.x - win.x, dy: this.#pointer.y - win.y };
+    } else if (kind === 2 && held && !win.maximized) {
+      this.#startResize(k, win, code >> 3);
+    } else if (kind === 3) {
+      this.#maximize(k, true);
+    } else if (kind === 4) {
+      this.#maximize(k, false);
+    }
+  }
+
+  #startResize(k, win, edges) {
+    if (!edges) return;
+    this.#resize = {
+      key: k, edges,
+      px: this.#pointer.x, py: this.#pointer.y,
+      x0: win.x, y0: win.y,
+      w0: win.want?.w ?? win.width, h0: win.want?.h ?? win.height,
+      sentAt: 0,
+    };
+    this.#note(`resize ${k} edges ${edges}`);
+  }
+
+  /** The pointer moved during a resize: the size it now asks for, sent once
+   *  the client has acked the last one (or after 250 ms, for one that never
+   *  acks). The opposite edge stays where it was. */
+  #resizeTo(x, y, final) {
+    const r = this.#resize;
+    const win = this.#windows.get(r.key);
+    if (!win) return;
+    const dx = Math.round(x - r.px), dy = Math.round(y - r.py);
+    const maxW = Math.max(160, this.#outW - 2 * BORDER);
+    const maxH = Math.max(120, this.#outH - TITLE_H - 2 * BORDER);
+    const minW = Math.round(96 * UI), minH = Math.round(48 * UI);
+    let w = r.w0, h = r.h0;
+    if (r.edges & EDGE_RIGHT) w = r.w0 + dx;
+    if (r.edges & EDGE_LEFT) w = r.w0 - dx;
+    if (r.edges & EDGE_BOTTOM) h = r.h0 + dy;
+    if (r.edges & EDGE_TOP) h = r.h0 - dy;
+    w = Math.max(minW, Math.min(maxW, w));
+    h = Math.max(minH, Math.min(maxH, h));
+    if (r.edges & EDGE_LEFT) win.x = r.x0 + (r.w0 - w);
+    if (r.edges & EDGE_TOP) win.y = r.y0 + (r.h0 - h);
+    if (r.edges & (EDGE_LEFT | EDGE_TOP)) this.#reportPosition(win);
+    win.want = { w, h };
+    const now = performance.now();
+    if (!final && win.configurePending && now - r.sentAt < 250) return;
+    r.sentAt = now;
+    this.#configure(win, this.#focus === r.key, final ? 0 : STATE_RESIZING);
+  }
+
+  /** Maximize a window into the work area (the output less its frame), or
+   *  put it back where and as big as it was. */
+  #maximize(k, on) {
+    const win = this.#windows.get(k);
+    if (!win || win.role !== ROLE_TOPLEVEL || !!win.maximized === on) return;
+    if (on) {
+      win.restore = { x: win.x, y: win.y, want: win.want, w: win.width, h: win.height };
+      const maxW = Math.max(160, this.#outW - 2 * BORDER);
+      const maxH = Math.max(120, this.#outH - TITLE_H - 2 * BORDER);
+      win.x = BORDER;
+      win.y = TITLE_H;
+      win.want = { w: maxW, h: maxH };
+      win.maximized = true;
+    } else {
+      const r = win.restore ?? { x: win.x, y: win.y, want: undefined, w: win.width, h: win.height };
+      win.x = r.x;
+      win.y = r.y;
+      win.want = r.want ?? { w: r.w, h: r.h };
+      win.maximized = false;
+    }
+    this.#note(`${on ? 'maximize' : 'unmaximize'} ${k}`);
+    this.#reportPosition(win);
+    this.#raise(k);
+    this.#configure(win, this.#focus === k);
   }
 
   // -- the scene ----------------------------------------------------------
@@ -506,6 +619,8 @@ class Compositor {
     const { surfaces, blocks } = readScene(this.#channel);
     const live = new Set();
     const byKey = new Map();
+    const restacks = [];
+    const activations = [];
     for (const s of surfaces) {
       const k = key(s);
       live.add(k);
@@ -534,7 +649,12 @@ class Compositor {
         // X client meant every key was dropped for want of a focused surface.
         this.#windows.set(k, win);
         const seen = this.#remembered.get(k);
-        if (s.role === ROLE_TOPLEVEL && seen) {
+        if (s.placed) {
+          // Placed by its client (a Win32 window, an X menu): where it says,
+          // stacked where it says, with the keyboard when it says. Nothing
+          // here cascades it, raises it or focuses it.
+          this.#order.push(k);
+        } else if (s.role === ROLE_TOPLEVEL && seen) {
           win.x = seen.x;
           win.y = seen.y;
           this.#order.push(k);
@@ -573,12 +693,44 @@ class Compositor {
       win.hotX = s.relX;
       win.hotY = s.relY;
       win.info = s;
-      // A client that asked to be dragged (a GTK titlebar) starts a drag as if
-      // the pointer had grabbed our own frame.
-      if (s.flags & F_MOVE_REQUESTED && s.role === ROLE_TOPLEVEL) {
-        this.#drag = { key: k, dx: this.#pointer.x - win.x, dy: this.#pointer.y - win.y };
+      // A configure the client has not acked yet: an interactive resize
+      // sends its next size once this clears.
+      win.configurePending = (s.flags & F_CONFIGURE_PENDING) !== 0;
+      // A client's request -- move, resize, maximize -- from its own frame
+      // (a GTK title bar, a client-side border), acted on once per number.
+      // The first sight of a window only learns the number.
+      const seq = (s.flags >> 3) & 0xf;
+      if (win.requestSeq === undefined) win.requestSeq = seq;
+      else if (seq !== win.requestSeq && s.role === ROLE_TOPLEVEL && !s.placed) {
+        win.requestSeq = seq;
+        this.#clientRequest(k, win, (s.flags >>> 24) & 0x7f);
+      }
+      win.placed = s.placed;
+      win.unmanaged = s.unmanaged;
+      win.layer = s.layer;
+      win.stackId = s.stackId;
+      if (s.placed) {
+        // A placed window's position is its client's: it lives where every
+        // toplevel's does (win.x/win.y), so drawing, hit-testing and any
+        // move or resize read one geometry whoever decided it.
+        win.x = win.relX;
+        win.y = win.relY;
+        // Placed after it appeared: it joins the stack where it is told to.
+        if (!this.#order.includes(k)) this.#order.push(k);
+        // Restacks are applied once every window of this frame is known, or
+        // one naming a sibling that appeared in the same frame would miss it.
+        if (win.restack !== s.restack) {
+          win.restack = s.restack;
+          if (s.restack) restacks.push([k, s.below]);
+        }
+        if (win.activate !== s.activate) {
+          win.activate = s.activate;
+          if (s.activate) activations.push(k);
+        }
       }
     }
+    for (const [k, below] of restacks) this.#restack(k, below);
+    for (const k of activations) this.#focusWindow(k);
     // Gone: drop the window, its texture, and its place in the stack.
     for (const k of [...this.#windows.keys()]) {
       if (live.has(k)) continue;
@@ -589,7 +741,7 @@ class Compositor {
       }
       this.#note(`- ${k}`);
       const gone = this.#windows.get(k);
-      if (gone?.role === ROLE_TOPLEVEL) {
+      if (gone?.role === ROLE_TOPLEVEL && !gone.placed) {
         this.#remembered.set(k, { x: gone.x, y: gone.y });
         // A session that opens and closes a hundred windows should not
         // remember all of them.
@@ -607,10 +759,13 @@ class Compositor {
       // believing it is inactive.
       if (this.#focus === k) {
         this.#focus = null;
-        const next = this.#order[this.#order.length - 1] ?? null;
+        // Not to a placed window: its client decides which of its windows is
+        // active, and says so.
+        const next = [...this.#order].reverse().find((o) => !this.#windows.get(o)?.placed) ?? null;
         if (next) this.#focusWindow(next);
       }
       if (this.#pointer.over === k) this.#pointer.over = null;
+      if (this.#grab === k) this.#grab = null;
     }
     return { byKey, blocks };
   }
@@ -624,32 +779,61 @@ class Compositor {
     sendEvent(this.#channel, win.block, EV_MOVED, win.x, win.y, 0, 0, win.client, win.surface);
   }
 
+  /** A line in the log `describe` returns. */
+  note(line) {
+    this.#note(line);
+  }
+
   #note(line) {
     this.#log.push(`${this.#frames} ${line}`);
     if (this.#log.length > 64) this.#log.splice(0, 32);
   }
 
+  /**
+   * Restack a placed window: directly below the placed window its client
+   * named, at the top (0) or at the bottom (-1). Layers are kept apart when
+   * drawing (`#stack`), so the top and bottom here are its layer's.
+   */
+  #restack(k, below) {
+    const order = this.#order.filter((o) => o !== k);
+    let at = order.length;
+    if (below === 0xffffffff) {
+      at = 0;
+    } else if (below) {
+      const i = order.findIndex((o) => {
+        const w = this.#windows.get(o);
+        return w?.placed && w.stackId === below;
+      });
+      if (i >= 0) at = i;
+    }
+    order.splice(at, 0, k);
+    this.#order = order;
+  }
+
+  /** The windows bottom to top: the stacking order, a layer at a time. */
+  #stack() {
+    const layer = (k) => {
+      const w = this.#windows.get(k);
+      return w?.placed ? w.layer : 0;
+    };
+    // `sort` is stable: within a layer, the stacking order stands.
+    return [...this.#order].sort((a, b) => layer(a) - layer(b));
+  }
+
+  /** Whether the compositor draws a window's frame: a toplevel's, unless its
+   *  client places it and draws the whole window itself. */
+  #decorated(win) {
+    return win.role === ROLE_TOPLEVEL && !(win.placed && win.unmanaged);
+  }
+
   /** Absolute position of a surface: popups and subsurfaces follow a parent. */
   #placeOf(win) {
-    if (win.role === ROLE_TOPLEVEL) return { x: win.x, y: win.y };
+    if (win.placed || win.role === ROLE_TOPLEVEL) return { x: win.x, y: win.y };
     const parentKey = `${win.token}:${win.client}:${win.parent}`;
     const parent = win.parent ? this.#windows.get(parentKey) : null;
-    // A popup with no parent is an X11 override-redirect window -- a menu the
-    // client placed itself, in coordinates that are the output's because the
-    // window manager keeps the X geometry and the layout in step.
     if (!parent) return { x: win.relX, y: win.relY };
     const at = this.#placeOf(parent);
     return { x: at.x + win.relX, y: at.y + win.relY };
-  }
-
-  /** Popups with no parent: X11 menus, drawn and hit-tested above everything. */
-  #floating() {
-    const out = [];
-    for (const [k, win] of this.#windows) {
-      if (win.role !== ROLE_POPUP || win.parent) continue;
-      out.push(k);
-    }
-    return out;
   }
 
   // -- uploads ------------------------------------------------------------
@@ -872,6 +1056,7 @@ class Compositor {
     for (const [k, win] of this.#windows) {
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
+        win.placed ? `p${win.layer}${win.unmanaged ? 'u' : ''}` : '',
         f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null),
         glFrameFor(win)?.serial ?? '');
     }
@@ -956,8 +1141,23 @@ class Compositor {
   #cursorCss = '';
   #cursorImages = new Map(); // content hash -> css, or a promise of it
 
+  /** The CSS cursor the frame asks for under the pointer (a resize edge), or
+   *  null over anything else. */
+  #frameCursor = null;
+  /** What the pointer was last over, for a harness: `describe().pointer`. */
+  #lastHit = null;
+
   #updateCursor(byKey) {
     let css = 'default';
+    const resizing = this.#resize ? RESIZE_CURSORS[this.#resize.edges] : null;
+    if (resizing || this.#frameCursor) {
+      css = resizing ?? this.#frameCursor;
+      if (css !== this.#cursorCss) {
+        this.#cursorCss = css;
+        post({ kind: 'cursor', css });
+      }
+      return;
+    }
     const overKey = this.#direct ? this.#direct.k : this.#drag ? null : this.#pointer.over;
     const over = overKey ? this.#windows.get(overKey) : null;
     if (over) {
@@ -1063,20 +1263,17 @@ class Compositor {
       return;
     }
     // Windows bottom to top, each with its popups and subsurfaces above it.
-    for (const k of this.#order) {
+    // Placed windows -- a Win32 desktop, an X menu -- are in the same stack,
+    // where their clients put them.
+    for (const k of this.#stack()) {
       const win = this.#windows.get(k);
-      if (!win || win.role !== ROLE_TOPLEVEL) continue;
-      this.#drawDecoration(win, this.#focus === k);
+      if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
+      if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
       this.#drawSurface(k, win);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);
       }
-    }
-    // X11 menus and tooltips: no parent to follow, no frame, above everything.
-    for (const k of this.#floating()) {
-      const win = this.#windows.get(k);
-      if (win) this.#drawSurface(k, win);
     }
     // No cursor: the client's is the page's own CSS cursor (`#updateCursor`),
     // so there is one pointer on the screen and it moves at the browser's rate.
@@ -1091,18 +1288,27 @@ class Compositor {
 
   // -- input --------------------------------------------------------------
 
+  /**
+   * Whether a surface takes the pointer at a point (device pixels from its
+   * corner): inside the input region its client set, if it set one. A
+   * surface with an empty region -- Wine's subsurface for a window's GL
+   * picture -- takes none, and the pointer goes to what is under it, in that
+   * surface's coordinates.
+   */
+  #takesInput(win, lx, ly) {
+    const r = win.info?.input;
+    if (!r) return true;
+    const k = win.cs || 1;
+    const ux = Math.floor(lx / k);
+    const uy = Math.floor(ly / k);
+    return ux >= r.x && ux < r.x + r.w && uy >= r.y && uy < r.y + r.h;
+  }
+
   /** The topmost surface at a point, and where in it. */
   #hit(x, y) {
-    for (const k of this.#floating()) {
-      const win = this.#windows.get(k);
-      if (!win) continue;
-      const at = this.#placeOf(win);
-      if (x >= at.x && x < at.x + win.width && y >= at.y && y < at.y + win.height) {
-        return { key: k, win, local: { x: x - at.x, y: y - at.y }, part: 'content' };
-      }
-    }
-    for (let i = this.#order.length - 1; i >= 0; i--) {
-      const k = this.#order[i];
+    const stack = this.#stack();
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const k = stack[i];
       const win = this.#windows.get(k);
       if (!win) continue;
       // Popups first: a menu is above its window and takes the click.
@@ -1112,16 +1318,35 @@ class Compositor {
         const at = this.#placeOf(child);
         if (
           x >= at.x && x < at.x + child.width &&
-          y >= at.y && y < at.y + child.height
+          y >= at.y && y < at.y + child.height &&
+          this.#takesInput(child, x - at.x, y - at.y)
         ) {
           return { key: ck, win: child, local: { x: x - at.x, y: y - at.y }, part: 'content' };
         }
       }
       const f = this.#frameOf(win);
-      if (x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height) {
+      if (
+        x >= f.x && x < f.x + win.width && y >= f.y && y < f.y + win.height &&
+        this.#takesInput(win, x - f.x, y - f.y)
+      ) {
         return { key: k, win, local: { x: x - f.x, y: y - f.y }, part: 'content' };
       }
+      // The resize band: GRIP pixels either side of the frame's edge, but not
+      // over the content (taken above) and not on a maximized window or one
+      // its client draws whole (a placed Win32 window sizes itself).
       if (
+        this.#decorated(win) && !win.maximized &&
+        x >= f.frameX - GRIP && x < f.frameX + f.frameW + GRIP &&
+        y >= f.frameY - GRIP && y < f.frameY + f.frameH + GRIP
+      ) {
+        const edges = (y < f.frameY + GRIP / 2 ? EDGE_TOP : 0)
+          | (y >= f.frameY + f.frameH - GRIP ? EDGE_BOTTOM : 0)
+          | (x < f.frameX + GRIP ? EDGE_LEFT : 0)
+          | (x >= f.frameX + f.frameW - GRIP ? EDGE_RIGHT : 0);
+        if (edges) return { key: k, win, local: { x: 0, y: 0 }, part: 'resize', edges };
+      }
+      if (
+        this.#decorated(win) &&
         x >= f.frameX && x < f.frameX + f.frameW &&
         y >= f.frameY && y < f.frameY + f.frameH
       ) {
@@ -1141,14 +1366,18 @@ class Compositor {
    * recreating its surface. Sending one per click left a session accumulating
    * stacked empty frames, one per redundant configure.
    */
-  #configure(win, activated) {
+  #configure(win, activated, extra = 0) {
+    // A placed window's size is its client's, and so is its activation: the
+    // client said which window is active, and a configure would only echo it.
+    if (win.placed) return;
     const fit = this.#fit(win);
-    const want = `${fit.w}x${fit.h}:${activated ? 1 : 0}`;
+    const states = (activated ? STATE_ACTIVATED : 0) | (win.maximized ? STATE_MAXIMIZED : 0) | extra;
+    const want = `${fit.w}x${fit.h}:${states}`;
     if (win.configuredAs === want) return;
     win.configuredAs = want;
     this.#note(`configure ${win.key} ${want}`);
     const k = win.cs || 1;
-    sendEvent(this.#channel, win.block, EV_CONFIGURE, Math.floor(fit.w / k), Math.floor(fit.h / k), 0,
+    sendEvent(this.#channel, win.block, EV_CONFIGURE, Math.floor(fit.w / k), Math.floor(fit.h / k), states,
       activated ? 1 : 0, win.client, win.surface);
   }
 
@@ -1187,6 +1416,21 @@ class Compositor {
     }
     this.#pointer.x = x;
     this.#pointer.y = y;
+    if (this.#resize) {
+      this.#resizeTo(x, y, false);
+      return;
+    }
+    // A button held on a placed window: the motion is that window's, inside
+    // it or not -- Wayland's implicit grab, which a Win32 window's own move
+    // and size loops and a drag out of a list all depend on.
+    const grabbed = this.#grab ? this.#windows.get(this.#grab) : null;
+    if (grabbed) {
+      const at = this.#placeOf(grabbed);
+      const k = grabbed.cs || 1;
+      sendEvent(this.#channel, grabbed.block, EV_MOTION, Math.floor((x - at.x) / k), Math.floor((y - at.y) / k),
+        time, 0, grabbed.client, grabbed.surface);
+      return;
+    }
     if (this.#drag) {
       const win = this.#windows.get(this.#drag.key);
       if (win) {
@@ -1197,6 +1441,8 @@ class Compositor {
       return;
     }
     const hit = this.#hit(x, y);
+    this.#lastHit = { x, y, key: hit?.key ?? null, part: hit?.part ?? null, edges: hit?.edges ?? 0 };
+    this.#frameCursor = hit?.part === 'resize' ? RESIZE_CURSORS[hit.edges] ?? 'default' : null;
     const over = hit && hit.part === 'content' ? hit.key : null;
     if (this.#pointer.over && this.#pointer.over !== over) {
       const prev = this.#windows.get(this.#pointer.over);
@@ -1219,8 +1465,21 @@ class Compositor {
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
+    if (!pressed && this.#resize) {
+      this.#resizeTo(this.#pointer.x, this.#pointer.y, true);
+      this.#resize = null;
+      return;
+    }
     if (!pressed && this.#drag) {
       this.#drag = null;
+      return;
+    }
+    const grabbed = this.#grab ? this.#windows.get(this.#grab) : null;
+    if (grabbed) {
+      // The grab's window gets every button until the last one is up.
+      sendEvent(this.#channel, grabbed.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0,
+        grabbed.client, grabbed.surface);
+      if (!this.#pointer.buttons) this.#grab = null;
       return;
     }
     const hit = this.#hit(this.#pointer.x, this.#pointer.y);
@@ -1241,10 +1500,29 @@ class Compositor {
       }
       return;
     }
-    if (hit.part === 'title') {
+    if (hit.part === 'resize') {
       if (pressed) {
         this.#raise(hit.key);
         this.#focusWindow(hit.key);
+        this.#startResize(hit.key, hit.win, hit.edges);
+      }
+      return;
+    }
+    if (hit.part === 'title') {
+      // A placed window stays where its client put it.
+      if (pressed && !hit.win.placed) {
+        this.#raise(hit.key);
+        this.#focusWindow(hit.key);
+        // A second press on the same title bar within 400 ms: maximize, or
+        // put back.
+        const now = performance.now();
+        const again = this.#titlePress && this.#titlePress.key === hit.key && now - this.#titlePress.at < 400;
+        this.#titlePress = again ? null : { key: hit.key, at: now };
+        if (again) {
+          this.#maximize(hit.key, !hit.win.maximized);
+          return;
+        }
+        if (hit.win.maximized) return;
         this.#drag = {
           key: hit.key,
           dx: this.#pointer.x - hit.win.x,
@@ -1254,13 +1532,17 @@ class Compositor {
       return;
     }
     if (pressed) {
-      const top = hit.win.role === ROLE_TOPLEVEL
+      const top = hit.win.role === ROLE_TOPLEVEL || hit.win.placed
         ? hit.key
         : `${hit.win.token}:${hit.win.client}:${hit.win.parent}`;
-      if (this.#windows.has(top)) {
+      // A placed window is raised and activated by its own client, which
+      // knows what a click on it means (a click on a taskbar does not
+      // activate the taskbar), and then says so.
+      if (this.#windows.has(top) && !this.#windows.get(top).placed) {
         this.#raise(top);
         this.#focusWindow(top);
       }
+      if (this.#windows.get(top)?.placed) this.#grab = hit.key;
       // The press lands where the pointer is, so the client's last motion has
       // to be this position -- a click without a motion in front of it would
       // otherwise arrive wherever the pointer was last seen by that client.
@@ -1291,7 +1573,10 @@ class Compositor {
   async readout() {
     try {
       return await this.#painter.read();
-    } catch {
+    } catch (e) {
+      // Said, so a harness that gets null can tell why (`describe().log`).
+      this.#note(`readout failed: ${e?.message ?? e}`);
+      console.error('[compositor] readout failed:', e);
       return null;
     }
   }
@@ -1336,7 +1621,7 @@ class Compositor {
       // appear twice rather than infer it from a screenshot.
       list: [...this.#windows.values()].map((w) =>
         `${w.key} role=${w.role} ${w.width}x${w.height}@${w.x},${w.y}`
-        + ` serial=${w.info?.serial ?? 0} "${w.title}"`),
+        + ` serial=${w.info?.serial ?? 0} scale=${w.bs ?? 1}/${w.cs ?? 1} "${w.title}"`),
       log: this.#log.slice(-24),
       staging: this.#stagingOk === false,
       titles: wins.map((w) => w.title || '(untitled)'),
@@ -1351,6 +1636,12 @@ class Compositor {
       // The GL device's counters (submits, their time, readbacks): the
       // compositor side of a frame's cost.
       gl: glDevice?.glState?.() ?? null,
+      // The GL windows the host's Mesa holds, as `kind:id@token`: a process
+      // that has exited must have none (its 'drop-memory').
+      glWindows: glDevice ? glDevice.surfaces().map((s) => `${s.kind}:${s.id}@${s.token}`) : [],
+      // The GPU objects this Worker made and has not destroyed (gpu-device.js).
+      gpu: gpuLive(),
+      pointer: this.#lastHit,
       turns,
     };
   }
@@ -1559,7 +1850,12 @@ const onMessage = ({ data: m }) => {
       // That process is gone: its GL context, its windows and their frames go
       // with it. Nothing else will ever say so -- a client that exits is not
       // there to send a detach.
-      glDevice?.forgetClient?.(m.token);
+      if (glDevice) {
+        const t0 = performance.now();
+        comp?.note?.(`forget client ${m.token}`);
+        glDevice.forgetClient(m.token);
+        comp?.note?.(`forgot client ${m.token} in ${(performance.now() - t0).toFixed(1)} ms`);
+      }
       glSurfaceFrame = -1;
     } else if (m.kind === 'resize') {
       comp?.resize(m.width, m.height);

@@ -439,6 +439,38 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
         crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
     })?;
+    // Door calls into the wineserver (docs/wineserver-kernel.md, `door`).
+    linker.func_wrap(IMPORT_MODULE, "door_publish", |mut caller: Caller<'_, HostState>, area: i32| -> wasmtime::Result<()> {
+        crate::host(crate::door::publish(&mut caller, area as u32))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "door_call", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::call(&mut caller, req as u32, pid, tid))
+    })?;
+    // Natively every process sees the door once published (one host
+    // process): never missing.
+    linker.func_wrap(IMPORT_MODULE, "door_missing", || -> i32 { 0 })?;
+    linker.func_wrap(IMPORT_MODULE, "session_copy", |mut caller: Caller<'_, HostState>, dst: i32, off: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::session_copy(&mut caller, dst as u32, off as u32, size as u32))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_pipe", |mut caller: Caller<'_, HostState>, fd: i32| -> i32 { crate::door::wake_pipe(&mut caller, fd) })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_write", |caller: Caller<'_, HostState>, id: i32, ptr: i32, len: i32| -> i32 {
+        let Some(m) = caller.data().memory.clone() else { return -14 };
+        let (at, n) = (ptr as u32 as usize, len as u32 as usize);
+        let b = m.bytes();
+        if at.checked_add(n).is_none_or(|e| e > b.len()) {
+            return -14;
+        }
+        let v = b[at..at + n].to_vec();
+        crate::door::wake_write(id, &v)
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "wake_close", |id: i32| crate::door::wake_close(id))?;
+    linker.func_wrap(IMPORT_MODULE, "usd_copy", |mut caller: Caller<'_, HostState>, dst: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::usd_move(&mut caller, dst as u32, size as u32, false))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
     // does (`wasmdll`). The image is named by the descriptor it was mapped

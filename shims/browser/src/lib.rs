@@ -3313,7 +3313,7 @@ static mut STDERR_LEN: usize = 0;
 
 /// A write to standard output or error (`a1`, `a2` as `write` or `writev`
 /// has them), kept for a later abort's report, and said when it fell short.
-fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64) {
+fn stderr_capture(gm: &GuestMem<'_>, fd: u64, vectored: bool, a1: u64, a2: u64, ret: u64) {
     // (base, length) pairs: one for `write`, `a2` of them for
     // `writev`, so the two cases differ only in where the list is.
     let parts: Vec<(u64, u64)> = if !vectored {
@@ -3341,13 +3341,25 @@ fn stderr_capture(gm: &GuestMem<'_>, vectored: bool, a1: u64, a2: u64, ret: u64)
     if !said.is_empty() {
         stderr_note(&said);
     }
-    if ret != want {
+    let lost = (ret as i64) < 0 && ret as i64 != -(Errno::EAGAIN.0 as i64);
+    if want > 0 && (lost || ret == 0) {
+        // Printable text as is, anything else escaped, so a binary
+        // write cannot fill the console with replacement characters.
+        let text: String = said
+            .iter()
+            .flat_map(|&c| match c {
+                b' '..=b'~' => vec![c as char],
+                b'\n' => vec!['\\', 'n'],
+                _ => format!("\\x{c:02x}").chars().collect(),
+            })
+            .collect();
         warn_line(&format!(
-            "[gex] pid {} could not reach stderr ({} of {want} bytes in {} parts): {}",
+            "[gex] pid {} could not write to {} ({} for {want} bytes in {} part{}): {text}",
             my_pid(),
+            if fd == 1 { "stdout" } else { "stderr" },
             ret as i64,
-            a2,
-            String::from_utf8_lossy(&said).trim_end(),
+            parts.len(),
+            if parts.len() == 1 { "" } else { "s" },
         ));
     }
 }
@@ -3597,36 +3609,57 @@ extern "C" {
     fn __wasm_init_tls(ptr: *mut u8);
 }
 
-/// Claim a slot for this Worker and return the top of its stack.
+/// Which slots a live instance holds (bit `i`), and where each slot's span
+/// of arena is once one was taken for it (0: never).
+#[cfg(feature = "shared-memory")]
+static SLOT_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "shared-memory")]
+static SLOT_BASE: [std::sync::atomic::AtomicU64; slots::COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; slots::COUNT];
+
+/// Claim a slot for this Worker and return the top of its stack, or 0 when
+/// all `COUNT` are held.
 ///
-/// Called once per Worker before anything else. The caller writes the answer
-/// into `__stack_pointer` (a wasm global cannot be assigned from inside its own
-/// module). Slots are never given back: a process may not run more than
-/// `COUNT` threads at once, and the host recycles Workers.
+/// Called once per Worker instance before anything else. The caller writes
+/// the answer into `__stack_pointer` (a wasm global cannot be assigned from
+/// inside its own module). A slot is given back by `gex_worker_release` when
+/// the instance is done: a process that starts threads one after another
+/// (handles.exe's children make 150) gets a new instance per thread, and
+/// with slots never returned the 65th ran with no thread-local block --
+/// `__tls_base` zero, its thread-locals over the guest's low memory.
 #[cfg(feature = "shared-memory")]
 #[no_mangle]
 pub extern "C" fn gex_worker_init() -> u32 {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel) as usize;
-    if i >= slots::COUNT {
-        return 0;
-    }
-    // This Worker's own span of arena. The cursor is atomic and the bytes
-    // above it belong to nobody, so two Workers arriving together get two
-    // spans without a lock between them.
-    arena_note(2, (slots::STACK + slots::TLS) as u64);
-    let Some(base) = arena_take((slots::STACK + slots::TLS) as u64) else {
-        return 0;
-    };
-    // SAFETY: `base` is this Worker's alone -- the arena cursor handed it out
-    // and will not hand it out again -- and the memory behind it has been
-    // grown to cover it.
-    unsafe {
-        let at = base as u32 as *mut u8;
-        extern "C" {
-            static __heap_base: u8;
+    use std::sync::atomic::Ordering;
+    let i = loop {
+        let used = SLOT_USED.load(Ordering::Acquire);
+        let i = (!used).trailing_zeros() as usize;
+        if i >= slots::COUNT {
+            return 0;
         }
-        memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        if SLOT_USED.compare_exchange(used, used | 1 << i, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            break i;
+        }
+    };
+    let mut base = SLOT_BASE[i].load(Ordering::Acquire);
+    if base == 0 {
+        // This slot's own span of arena. The cursor is atomic and the bytes
+        // above it belong to nobody, so two Workers arriving together get two
+        // spans without a lock between them.
+        arena_note(2, (slots::STACK + slots::TLS) as u64);
+        let Some(b) = arena_take((slots::STACK + slots::TLS) as u64) else {
+            SLOT_USED.fetch_and(!(1 << i), Ordering::AcqRel);
+            return 0;
+        };
+        base = b;
+        SLOT_BASE[i].store(base, Ordering::Release);
+        // SAFETY: as below; the claims name the span once, when it is taken.
+        unsafe {
+            extern "C" {
+                static __heap_base: u8;
+            }
+            memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        }
         memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
         memmap::claim(
             memmap::Kind::Tls,
@@ -3635,7 +3668,14 @@ pub extern "C" fn gex_worker_init() -> u32 {
             base + (slots::STACK + slots::TLS) as u64,
             "thread-locals",
         );
+    }
+    // SAFETY: `base` is this Worker's alone -- its bit in `SLOT_USED` says so
+    // until `gex_worker_release` -- and the memory behind it has been grown to
+    // cover it.
+    unsafe {
+        let at = base as u32 as *mut u8;
         __wasm_init_tls(at.add(slots::STACK));
+        CLAIMED.with(|c| c.set(true));
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
         WORKER.with(|w| w.set(i as u32));
@@ -3652,6 +3692,46 @@ pub extern "C" fn gex_worker_init() -> u32 {
 
 #[cfg(feature = "shared-memory")]
 const STACK_GUARD: u32 = 0x5747_5d0d;
+/// A forked child's first instance, before it claims: the memory it was
+/// given is its parent's, and so are the slot bits -- held by the parent's
+/// Workers, none of which run here. The child starts with every slot free
+/// (their arena spans stay, for reuse); a parent with many live threads
+/// otherwise left its child too few to start its own.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_slots_reset() {
+    SLOT_USED.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// A forked child's inherited region ending at `end`, told before its first
+/// arena claim (`gex_worker_init` takes a stack there, before
+/// `gex_adopt_vma_blob` has run). Only regions under the arena's ceiling
+/// matter: the arena never hands out above it. Without this the first claim
+/// floored at the child's memory size -- its parent's, grown over every
+/// inherited mapping -- and a mem64 parent's threads' stacks above 4 GiB put
+/// that over the ceiling: the child got no slot and ran with no
+/// thread-locals.
+#[no_mangle]
+pub extern "C" fn gex_note_inherited(end: u64) {
+    if end <= nt::arena_ceiling() {
+        ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Give this instance's slot back (`gex_worker_init`): the last call the
+/// Worker makes into this instance, once its run is over or it trapped. The
+/// next instance to claim the slot runs on the same stack, so nothing of
+/// this one may run after: this function keeps nothing on the shim stack.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_worker_release() {
+    if !CLAIMED.with(|c| c.replace(false)) {
+        return;
+    }
+    let i = worker_id() as usize;
+    SLOT_USED.fetch_and(!(1u64 << i), std::sync::atomic::Ordering::AcqRel);
+}
+
 
 /// This Worker's id, as the lock knows it.
 #[cfg(feature = "shared-memory")]
@@ -3703,6 +3783,8 @@ pub(crate) fn stack_least() -> u32 {
 #[cfg(feature = "shared-memory")]
 thread_local! {
     static WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// This instance holds a `gex_worker_init` slot.
+    static CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// This Worker's kernel-lock recursion depth: a re-entrant `with_host`
     /// (the panic handler writing to fd 2) would otherwise self-deadlock.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -6911,10 +6993,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
-        // go through whole turns a named failure into "killed by signal 6".
-        // Only on a short write, so a working program is silent.
+        // go through turns a named failure into "killed by signal 6".
+        // Only when nothing went through (an error, or 0 of a non-empty
+        // write). A short positive count is not a loss: a full pipe on a
+        // blocking descriptor takes what fits and the caller writes the rest
+        // (`Pipe::write`, `BlockOp::WriteStream`). Warning on that once sent
+        // 4.5 MB of xwd's image, written to stdout through a pipe, to the
+        // console as "could not reach stderr".
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
-            stderr_capture(&gm, nr == 66, a1, a2, ret);
+            stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
         h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {
@@ -7785,6 +7872,14 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 }
 
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
+/// The global kernel's id of the pipe end descriptor `fd` is, or -1: the
+/// wineserver's door kick pipe, which a door call in another process
+/// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
+#[no_mangle]
+pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
+    with_host(|h| h.kernel.fds.get(fd).ok().and_then(|f| pipe_id(&f.path)).unwrap_or(-1))
+}
+
 fn pipe_id(path: &str) -> Option<i32> {
     path.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
 }
@@ -10925,7 +11020,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
         if !gex_abi::X86 && !compat && (a0 == 1 || a0 == 2) && (n == nr::WRITE || n == nr::WRITEV) {
-            stderr_capture(&gm, n == nr::WRITEV, a1, a2, ret);
+            stderr_capture(&gm, a0, n == nr::WRITEV, a1, a2, ret);
         }
     }
     Some(match outcome {

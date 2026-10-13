@@ -905,6 +905,10 @@ async function runProgramHere(
       // because a trap that matters happens in a Worker, and a global set in
       // the page is not visible there.
       trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
+      // `?doorstats=1`: wineserver door call counts every 10 s (docs/wineserver-kernel.md).
+      // (a number past 1: the line's period in ms)
+      doorStats: globalThis.GEX_DOOR_STATS || undefined,
+      calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
@@ -1025,6 +1029,15 @@ async function runProgramHere(
     onOutput: (fd, text, pid, m) => {
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
       term.write(text);
+    },
+    // A process has exited (a thread's end is keyed "pid:tid" and is not
+    // one): the compositor lets go of its memory, and the host's Mesa of its
+    // GL context and windows. Nothing said so before, so every Wayland or GL
+    // client's whole memory stayed held by the compositor for the life of
+    // the page, and a GL program's windows stayed in Mesa's list: a second
+    // glxgears, given the first one's X window id, matched both.
+    onExit: (m, pid) => {
+      if (typeof pid === 'number') compositor?.dropMemory?.(pid);
     },
     readStdin: (lflag) => {
       if (lflag !== undefined) tenv.lflag = lflag;

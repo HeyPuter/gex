@@ -237,11 +237,11 @@ async function launch(item, li, cat) {
     }
     state.textContent = 'starting';
     await sysUp;
-    // A GL program: the host's Mesa first (fetched on first use).
-    if (item.gl) {
-      state.textContent = 'starting GL';
-      await system.startGl?.();
-    }
+    // The program, run as a shell would run it: the session's environment and
+    // nothing for this item alone. A GL program starts the host's Mesa with
+    // its first request, the same way from here as from the xterm (runtime.js
+    // `glLazy`), so there is one path to the screen, not two.
+    //
     // In a session of its own, off pid 1's terminal: a program that takes
     // the terminal (gtk3-demo does) would otherwise leave pid 1 unable to
     // read the next command line. Its output goes to /tmp/launch-ID.log.
@@ -441,8 +441,8 @@ async function boot() {
     wlInput: canvas,
     wlScale: DPR,
     hostX: true,
-    // GL programs marshal to Mesa in the compositor's Worker, started on the
-    // first GL item (`startGl`), so the first load does not carry it.
+    // GL programs marshal to Mesa in the compositor's Worker, started by the
+    // first GL request from any program, so the first load does not carry it.
     gl: 'compositor',
     glLazy: true,
     cwd: '/root',
