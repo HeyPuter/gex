@@ -489,9 +489,16 @@ impl WaylandDevice {
                         InputEvent::DismissPopup { surface, .. } => {
                             s.client.dismiss_popup(surface)
                         }
+                        // Where the page put a window: an X window's
+                        // position, through the manager; a placed
+                        // window's origin, which its client adds to the
+                        // pointer positions that follow.
                         InputEvent::Moved { surface, x, y, .. } => {
                             if let Some(xwm) = s.xwm.as_mut() {
                                 xwm.moved(surface, x, y);
+                            }
+                            if !s.client.is_x11(surface) {
+                                s.client.placement_origin(surface, x, y);
                             }
                         }
                     }

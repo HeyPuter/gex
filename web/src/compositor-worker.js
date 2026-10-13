@@ -716,6 +716,16 @@ class Compositor {
         // move or resize read one geometry whoever decided it.
         win.x = win.relX;
         win.y = win.relY;
+        // Its client is told where it now is, in order with the pointer
+        // events after this, which are relative to it
+        // (`gex_window_placement_v1.origin`, in the client's units): Wine
+        // adds it to them rather than where it last asked the window to be,
+        // which during a caption drag is a step ahead of here.
+        if (win.originX !== s.relX || win.originY !== s.relY) {
+          win.originX = s.relX;
+          win.originY = s.relY;
+          sendEvent(this.#channel, win.block, EV_MOVED, s.relX, s.relY, 0, 0, win.client, win.surface);
+        }
         // Placed after it appeared: it joins the stack where it is told to.
         if (!this.#order.includes(k)) this.#order.push(k);
         // Restacks are applied once every window of this frame is known, or
@@ -774,7 +784,8 @@ class Compositor {
   /**
    * Say where a window now is. Only an X11 window cares -- its client places
    * menus in X coordinates, so the X geometry has to follow the layout -- and
-   * the shim ignores it for everything else.
+   * the shim ignores it for everything else but a placed window, whose
+   * origin it is (said where a placed window's position is read).
    */
   #reportPosition(win) {
     sendEvent(this.#channel, win.block, EV_MOVED, win.x, win.y, 0, 0, win.client, win.surface);

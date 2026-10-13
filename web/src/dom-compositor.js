@@ -162,7 +162,10 @@ class DomWindow {
   /** Where the page has put this window, in output coordinates.
    *
    * A no-op for a Wayland toplevel and required for an X one: see the note at
-   * the top. Call it after moving the element, including while dragging. */
+   * the top. Call it after moving the element, including while dragging. For
+   * a placed window (`gex_window_placement_v1`) it is the origin its client
+   * adds to the surface-local pointer positions sent after it; call it when
+   * the element moves to where the client asked (`onplace`). */
   place(x, y) {
     this.x = Math.round(x);
     this.y = Math.round(y);
