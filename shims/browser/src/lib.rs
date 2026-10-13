@@ -12108,8 +12108,9 @@ pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
-/// the page table says. Said the first few times: something numbered a page
-/// and left its entry unwritten.
+/// the page table says. Every heal is said: since units are published once
+/// (`cgen::CLAIMED`) none should happen, so a heal line is a bug report
+/// (something numbered a page and left its entry unwritten), not routine.
 fn heal_dirs(start: u64) {
     let first = gex_abi::dispatch_page(start);
     let healed: Vec<(u64, u32, u32)> = with_jit(|h| {
@@ -12132,12 +12133,10 @@ fn heal_dirs(start: u64) {
     });
     for (page, was, base) in healed {
         let n = DIRS_HEALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n <= 8 {
-            warn_line(&format!(
-                "gex: pid {} block {start:#x} failed its page check: page {page:#x}'s directory entry was {was:#x}, the page table numbers it {base:#x}; entry written ({n} so far)\n",
-                my_pid()
-            ));
-        }
+        warn_line(&format!(
+            "gex: heal: pid {} pc {start:#x} page {page:#x}: directory entry {was:#x}, the page table numbers it {base:#x}; entry written (heal {n}; a bug: something numbered the page and left its entry unwritten)\n",
+            my_pid()
+        ));
     }
 }
 
