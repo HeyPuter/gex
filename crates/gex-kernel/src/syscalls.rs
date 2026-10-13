@@ -2523,6 +2523,14 @@ impl Kernel {
         Some(done)
     }
 
+    /// The first `n` bytes of `path` (fewer for a shorter file).
+    pub fn read_head(&self, path: &str, n: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; n];
+        let got = self.read_file_at(path, 0, &mut out)?;
+        out.truncate(got);
+        Some(out)
+    }
+
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let h = self.vfs.open(path, 0, 0).ok()?;
         let mut out = Vec::new();
@@ -2558,7 +2566,10 @@ impl Kernel {
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let (path, argv, envp) = self.read_exec_args(m, a)?;
         let (path, argv) = self.resolve_interpreter(path, argv)?;
-        let image = self.read_file(&path).ok_or(Errno::ENOENT)?;
+        // Its head only: the loader reads the whole file once it is past the
+        // point of no return (apt's methods are one 14 MB program, read
+        // three times over per exec while every check read all of it).
+        let image = self.read_head(&path, 64).ok_or(Errno::ENOENT)?;
         if image.len() < 64 || &image[..4] != b"\x7fELF" {
             return Err(Errno::ENOEXEC);
         }
@@ -2590,7 +2601,7 @@ impl Kernel {
         mut argv: Vec<String>,
     ) -> Result<(String, Vec<String>), Errno> {
         for _ in 0..4 {
-            let head = self.read_file(&path).ok_or(Errno::ENOENT)?;
+            let head = self.read_head(&path, 256).ok_or(Errno::ENOENT)?;
             if head.len() >= 4 && &head[..4] == b"\x7fELF" {
                 return Ok((path, argv));
             }

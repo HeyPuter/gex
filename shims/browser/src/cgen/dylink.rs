@@ -155,7 +155,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
         };
         p.module_of[i] = number;
         lock(&BINDS).get_or_insert_with(HashMap::new).insert(number, text);
-        lock(&PROGS).push(Prog { number, wasm: bytes[i - from].take().unwrap_or_default(), relocate });
+        lock(&PROGS).push(Prog { number, wasm: bytes[i - from].take().unwrap_or_default(), relocate, key: None });
         let (_, ok) = ftab(|f| f.publish_at(m.table_base, len.max(1), PROVIDER | number, Tier::Unit, &pairs));
         if !ok {
             return Err(format!("{}: table range {}+{} is taken", m.path, m.table_base, len));

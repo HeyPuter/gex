@@ -26,6 +26,8 @@ pub(super) struct Prog {
     pub number: u32,
     pub wasm: Vec<u8>,
     pub relocate: bool,
+    /// The bytes' content key, made on first asking (`gex_cgen_pmod_wasm_key`).
+    pub key: Option<(u64, u64)>,
 }
 
 pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
@@ -176,7 +178,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let path = exe_path();
     super::dylink::static_published(number, &wasm, &path, base, mem_base as u32);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
-    lock(&PROGS).push(Prog { number, wasm, relocate });
+    lock(&PROGS).push(Prog { number, wasm, relocate, key: None });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
 }
@@ -216,6 +218,39 @@ pub(super) fn entry_bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
 /// Provider module `number`'s bytes when it is a wasm32 program.
 pub(super) fn wasm(number: u32) -> Option<(u32, u32)> {
     lock(&PROGS).iter().find(|p| p.number == number).map(|p| (p.wasm.as_ptr() as u32, p.wasm.len() as u32))
+}
+
+/// A content key for `b`: two 64-bit lanes over its little-endian words, then
+/// the tail. Made here, once per module and process, rather than in JS, which
+/// cost about 35 ms of every apt process start (apt-multi is 14 MB) in a
+/// trace of `apt-get update`, and copied the bytes out first even when the
+/// page already had the module.
+pub(super) fn content_key(b: &[u8]) -> (u64, u64) {
+    let (mut a, mut c) = (0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64);
+    let words = b.chunks_exact(8);
+    let tail = words.remainder();
+    for (i, w) in words.enumerate() {
+        let x = u64::from_le_bytes(w.try_into().unwrap());
+        a = (a ^ x).wrapping_mul(0x0000_0100_0000_01b3);
+        c = (c ^ x.rotate_left(29) ^ i as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        c ^= c >> 32;
+    }
+    for (i, &x) in tail.iter().enumerate() {
+        a = (a ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        c = (c ^ ((x as u64) << (i * 8)) ^ 0xa5).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        c ^= c >> 32;
+    }
+    (a, c)
+}
+
+/// Lane `lane` (0 or 1) of wasm32 program `number`'s content key, or 0 when
+/// it is not one.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_wasm_key(number: u32, lane: u32) -> u64 {
+    let mut g = lock(&PROGS);
+    let Some(p) = g.iter_mut().find(|p| p.number == number) else { return 0 };
+    let k = *p.key.get_or_insert_with(|| content_key(&p.wasm));
+    if lane == 0 { k.0 } else { k.1 }
 }
 
 /// Whether provider module `number` is a wasm32 program.
