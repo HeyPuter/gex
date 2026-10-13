@@ -128,6 +128,11 @@ pub fn set_lazy_fetch(f: LazyFetch) {
 
 /// Lazy files are fetched and kept in pieces this big.
 const LAZY_CHUNK: u64 = 1 << 20;
+/// How many chunks past the one read a sequential read fetches with it: a
+/// read at the start of a file, or right after a chunk already held. One
+/// synchronous request per MiB was 0.8 s of apt installing a 9 MB .deb of
+/// ours from the page; a random read still fetches only what it reads.
+const LAZY_READAHEAD: u64 = 15;
 
 /// A file whose bytes live elsewhere (a URL) and arrive a chunk at a time,
 /// as they are read: a game's gigabytes of data served to a page.
@@ -153,8 +158,11 @@ impl Lazy {
                 c += 1;
                 continue;
             }
+            let sequential = c == 0 || self.chunks.contains_key(&(c - 1));
+            let limit = if sequential { last + LAZY_READAHEAD } else { last };
+            let limit = limit.min((self.size - 1) / LAZY_CHUNK);
             let mut stop = c;
-            while stop < last && !self.chunks.contains_key(&(stop + 1)) {
+            while stop < limit && !self.chunks.contains_key(&(stop + 1)) {
                 stop += 1;
             }
             let lo = c * LAZY_CHUNK;

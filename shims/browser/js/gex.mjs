@@ -2602,7 +2602,9 @@ export class Gex {
           + ` modules=${(child.modules ?? []).length}`,
       );
     }
-    if (performance.measureUserAgentSpecificMemory) {
+    // Only then: the measurement forces a GC in every child, which an
+    // ordinary run (apt's hundred forks) pays for and never reads.
+    if (globalThis.GEX_DEBUG_EXIT && performance.measureUserAgentSpecificMemory) {
       const imageBytes = (child.image ?? []).reduce(
         (n, r) => n + (r.bytes?.byteLength ?? 0), 0);
       performance
@@ -3254,10 +3256,21 @@ export class Gex {
     // path: the page keeps those for every process (host.mjs), so a program
     // run again, by any process, is not compiled again, and a file apt
     // replaced is not mistaken for the old one.
-    const pbytes = wasmdll ? new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice() : null;
+    // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
+    // and the bytes copied out only when the page has no module for it.
+    const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
+    const pcopy = () => new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, plen).slice();
+    let pbytes = null, pkey = null;
+    if (wasmprog && e.gex_cgen_pmod_wasm_key) {
+      const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
+      pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
+      if (!this.#sharedModules.has(pkey)) pbytes = pcopy();
+    } else if (wasmdll) {
+      pbytes = pcopy();
+      if (wasmprog) pkey = `wasm:${moduleContentKey(pbytes)}`;
+    }
     const mod = wasmdll
-      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes,
-        wasmprog ? `wasm:${moduleContentKey(pbytes)}` : null)
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes, pkey)
       : prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)

@@ -29,6 +29,7 @@
 //                                        then a title double-click maximizes and restores
 //   {"fits": "ID"}                       the launcher's item ID opens inside the output, at a
 //                                        terminal's size in CSS pixels at any dpr
+//   {"trace": "start"} ... {"trace": "stop", "file": F}  a browser-wide trace (V8 sampling) to F
 //   {"close": "NAME"}                   end program NAME; its window must go ("title")
 //   {"animates": "TITLE"}                a window titled TITLE appears and its own pixels
 //                                        change ("samples", "every" ms, "min" changes)
@@ -145,6 +146,9 @@ for (let i = 0; i < 50 && !page; i++) {
 if (!page) page = { targetId: (await b.send('Target.createTarget', { url: 'about:blank' })).targetId };
 const { sessionId: s } = await b.send('Target.attachToTarget', { targetId: page.targetId, flatten: true });
 const consoleLines = [];
+let traceEvents = null, traceDone = null, traceFinished = null;
+b.on('Tracing.dataCollected', (p) => { if (traceEvents) for (const e of p.value) traceEvents.push(e); });
+b.on('Tracing.tracingComplete', () => traceFinished?.());
 /** The X server's pools made and not freed, from its last `?hostxcount` line. */
 let xPools = null;
 b.on('Runtime.consoleAPICalled', (p) => {
@@ -1050,6 +1054,35 @@ try {
         }
       }
       log(`typed ${JSON.stringify(step.type)}`);
+    } else if (step.trace === 'start') {
+      // A browser-wide trace (every Worker, so every guest process): V8's
+      // sampling profiler by default, for where the time goes.
+      traceEvents = [];
+      traceDone = new Promise((r) => { traceFinished = r; });
+      await b.send('Tracing.start', {
+        transferMode: 'ReportEvents',
+        traceConfig: {
+          recordMode: 'recordContinuously',
+          includedCategories: step.categories ?? ['v8', 'v8.wasm', 'blink.worker', 'disabled-by-default-v8.cpu_profiler',
+            'disabled-by-default-devtools.timeline', 'devtools.timeline'],
+        },
+      });
+      log('ok trace started');
+    } else if (step.trace === 'stop') {
+      await b.send('Tracing.end');
+      await traceDone;
+      const { createWriteStream } = await import('node:fs');
+      const out = createWriteStream(step.file);
+      out.write('[\n');
+      for (let i = 0; i < traceEvents.length; i++) {
+        if (!out.write(`${JSON.stringify(traceEvents[i])}${i + 1 < traceEvents.length ? ',' : ''}\n`)) {
+          await new Promise((r) => out.once('drain', r));
+        }
+      }
+      out.write(']\n');
+      await new Promise((r) => out.end(r));
+      log(`ok trace stopped: ${traceEvents.length} events in ${step.file}`);
+      traceEvents = null;
     } else if (step.close) {
       if (await closeProgram(step.close, step.title ?? step.close)) log(`ok ${step.close} exits`);
     } else if (step.install || step.launch) {
