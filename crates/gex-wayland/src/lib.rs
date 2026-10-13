@@ -2182,8 +2182,11 @@ impl Client {
     fn viewport(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
             0 => {
+                // Destroying the viewport removes its source and destination
+                // both (applied at the next commit, as they were set).
                 if let Some(s) = self.surfaces.get_mut(&surface) {
                     s.viewport = None;
+                    s.crop = None;
                 }
                 self.objects.remove(&object);
                 self.delete_id(object);
@@ -3697,6 +3700,12 @@ mod tests {
         let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
         assert_eq!((s.width, s.height), (100, 10));
         assert_eq!(s.addr, 0x10_0000 + 2 * 800 + 4 * 4);
+        // Destroying the viewport drops the crop: the whole buffer again.
+        c.receive(&Writer::new(51, 0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
+        assert_eq!((s.width, s.height, s.addr), (200, 125, 0x10_0000));
     }
 
     #[test]
