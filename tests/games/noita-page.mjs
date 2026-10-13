@@ -39,6 +39,9 @@ const WORLD = 0x122374c;
 const IMAGE = 0x400000;
 // Minutes from the page's start to the world, at most (tier-1 or a hang).
 const worldBy = Number(process.env.NOITA_WORLD_BY_MIN || 12) * 60000;
+// Whether TREE's compositor hit-tests by input region (545564cb): the
+// click offset above depends on it.
+const inputRegions = readFileSync(`${tree}/web/src/compositor-worker.js`, 'utf8').includes('#takesInput');
 
 // noita.exe's PE signature and file header (24 bytes at e_lfanew: machine,
 // sections, link time stamp...), as mapped at its base.
@@ -141,10 +144,12 @@ for (;;) {
       // area is a GL subsurface there, which the page compositor hands the
       // pointer to with subsurface-local coordinates (it ignores the empty
       // input region Wine gives it), and Wine reads those as relative to the
-      // whole window: so the point is offset by the frame once more. When
-      // the compositor honours input regions, drop the second (3,29).
+      // whole window: so the point is offset by the frame once more. A
+      // compositor that honours input regions (545564cb, `#takesInput`)
+      // gives the window the pointer in its own coordinates: one (3,29).
       const st = steps.shift();
-      const x = w.x + 3 + 3 + st.x, y = w.y + 29 + 29 + st.y;
+      const [fx, fy] = inputRegions ? [3, 29] : [6, 58];
+      const x = w.x + fx + st.x, y = w.y + fy + st.y;
       console.log(`${secs()} s, frame ${n}: ${st.what} at ${x},${y} (window ${w.w}x${w.h}@${w.x},${w.y})`);
       await click(x, y);
       await grab(`step-${3 - steps.length}`);

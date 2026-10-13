@@ -14,8 +14,12 @@
 # run on tier-1, and the number would mean nothing.
 #
 # The frozen inputs, in NOITA_LEG_DIR (default ~/gex-sandbox/scratch/W/gate-noitapage):
-#   base/   a W3 page tree (W's tree C, 2026-10-10: web/public/gex/nt/w3d.tar,
-#           Mesa, node_modules), never written in place, plus
+#   base/   a W3 page tree (W's tree C, 2026-10-10: Mesa, node_modules), never
+#           written in place, with web/public/gex/nt/w3d.tar, the W3 dist: tree
+#           C's, with the PE skeletons, winepe.wasm and wine{,.wasm} rebuilt from
+#           a wine-w3 commit and wine linked against a gex tree's gexgl.c
+#           (base/README.base gives the commits and the recipe; for gexgl alone,
+#           scratch/W/gate-noitapage/w3d-gexgl.sh), plus
 #           web/public/gex/nt/noita.tar: the W3 prefix at /pfx with
 #           port/seedpin's mod_config.xml in its save, xkb data, and the game at
 #           /g with mods/seedpin (NOITA_WORLD_SEED 1767225600), made by
