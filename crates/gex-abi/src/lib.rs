@@ -897,6 +897,12 @@ pub mod imports {
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.
     pub const SAFEPOINT: &str = "safepoint";
+
+    /// An indirect call about to be made, in a unit of the counting flavor
+    /// (`gex_cgen::image::icall_count`): its return address and target,
+    /// which the host tallies into an indirect-call profile. Signature
+    /// `(ctx: i32, ret: i64, target: i64) -> ()`.
+    pub const ICALL_NOTE: &str = "icall_note";
 }
 
 /// Names translated modules export back to the host.

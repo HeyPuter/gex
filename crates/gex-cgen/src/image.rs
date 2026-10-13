@@ -72,6 +72,7 @@ fn unit_inputs() -> String {
     // The flavor is part of the key: native and browser units never mix.
     let base = if unguarded() { format!("{base}:unguarded") } else { base };
     let base = if narrow_stores() { base } else { format!("{base}:widest") };
+    let base = if icall_count() { format!("{base}:icallcount") } else { base };
     // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {
@@ -94,6 +95,22 @@ pub fn narrow_stores() -> bool {
 }
 
 static UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ICALL_COUNT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build and look up the counting flavor of units: every call through the
+/// function table first tells the host its return address and target
+/// (`gex_abi::imports::ICALL_NOTE`), and no call is devirtualised. A run on
+/// these units makes the indirect-call profile (`icall/<identity>.txt`)
+/// that the ordinary units are then built with. `GEX_CGEN_ICALL_COUNT=1`
+/// for `gexc cgen-image`, mode bit 16 in the page (`?icallcount=1`). In the
+/// unit key. Set before the first key is computed.
+pub fn set_icall_count(on: bool) {
+    ICALL_COUNT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn icall_count() -> bool {
+    ICALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Build and look up the unguarded flavor of i386 units (no bounds guard on
 /// guest accesses: `Emitter::unguarded`), for a host whose guest memory is

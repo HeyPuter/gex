@@ -223,6 +223,11 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if mode & 8 != 0 {
         PROVIDERS_ONLY.store(true, Ordering::Relaxed);
     }
+    // Bit 4 (16): the counting flavor of units (`image::icall_count`), whose
+    // table calls the shim tallies (`gex_icall_note`).
+    if mode & 16 != 0 {
+        gex_cgen::image::set_icall_count(true);
+    }
     let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
     if mode == 0 {
@@ -548,7 +553,8 @@ pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
     let text = if len == 0 { String::new() } else { String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned() };
     let mut units = lock(&UNITS);
     let Some(x) = units.get_mut(u as usize) else { return };
-    let hints = icall_hints(&text);
+    // The counting flavor devirtualises nothing: its key has no profile.
+    let hints = if gex_cgen::image::icall_count() { Default::default() } else { icall_hints(&text) };
     x.key = x.key_base.clone();
     if !hints.is_empty() {
         let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
@@ -1998,4 +2004,94 @@ static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 #[no_mangle]
 pub extern "C" fn gex_signal_hook_set(idx: u32) {
     SIGNAL_HOOK.store(idx, Ordering::Relaxed);
+}
+
+/// The counting flavor's tally (`gex_cgen::image::icall_count`): every
+/// call through the function table, by (return address, target). An
+/// open-addressed table of `ICALL_SLOTS`, claimed by CAS on a tag mixed from
+/// both, so a note takes no lock; a full table drops new pairs (counted).
+const ICALL_SLOTS: usize = 1 << 16;
+#[allow(clippy::declare_interior_mutable_const)]
+const ICALL_ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ICALL_TAG: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_RET: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_TARGET: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_N: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ICALL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the tally is next printed (ns of `now_ns`; 0 before the first note).
+static ICALL_NEXT_DUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Every this many seconds of a counting run, the whole tally so far.
+const ICALL_DUMP_SECS: u64 = 150;
+
+/// A table call of a counting unit (`gex_abi::imports::ICALL_NOTE`).
+#[no_mangle]
+pub extern "C" fn gex_icall_note(_ctx: i32, ret: i64, target: i64) {
+    let (ret, target) = (ret as u64, target as u64);
+    let tag = (ret.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ target.rotate_left(29).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)) | 1;
+    let mut i = (tag >> 20) as usize & (ICALL_SLOTS - 1);
+    let mut noted = false;
+    for _ in 0..64 {
+        let mut t = ICALL_TAG[i].load(Ordering::Relaxed);
+        if t == 0 {
+            match ICALL_TAG[i].compare_exchange(0, tag, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    ICALL_RET[i].store(ret, Ordering::Relaxed);
+                    ICALL_TARGET[i].store(target, Ordering::Release);
+                    t = tag;
+                }
+                Err(now) => t = now,
+            }
+        }
+        if t == tag {
+            ICALL_N[i].fetch_add(1, Ordering::Relaxed);
+            noted = true;
+            break;
+        }
+        i = (i + 1) & (ICALL_SLOTS - 1);
+    }
+    if !noted {
+        ICALL_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let calls = ICALL_CALLS.fetch_add(1, Ordering::Relaxed);
+    if calls & 0xfffff == 0 {
+        let now = crate::now_ns();
+        let next = ICALL_NEXT_DUMP.load(Ordering::Relaxed);
+        if next == 0 {
+            let _ = ICALL_NEXT_DUMP.compare_exchange(0, now + ICALL_DUMP_SECS * 1_000_000_000, Ordering::Relaxed, Ordering::Relaxed);
+        } else if now >= next
+            && ICALL_NEXT_DUMP.compare_exchange(next, now + ICALL_DUMP_SECS * 1_000_000_000, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            gex_icall_dump();
+        }
+    }
+}
+
+/// Print the tally as an indirect-call profile (`icall RET TARGET N`, the
+/// lines `nt_cgen::icall_hints` reads), between `icall-dump` markers: the
+/// last complete dump of a run is its profile.
+#[no_mangle]
+pub extern "C" fn gex_icall_dump() {
+    let pid = crate::my_pid();
+    let mut lines = Vec::new();
+    for i in 0..ICALL_SLOTS {
+        if ICALL_TAG[i].load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let t = ICALL_TARGET[i].load(Ordering::Acquire);
+        let c = ICALL_N[i].load(Ordering::Relaxed);
+        if c != 0 {
+            lines.push(format!("icall {:#x} {t:#x} {c}\n", ICALL_RET[i].load(Ordering::Relaxed)));
+        }
+    }
+    crate::warn_line(&format!(
+        "icall-dump begin pid {pid}: {} pairs, {} calls, {} dropped\n",
+        lines.len(),
+        ICALL_CALLS.load(Ordering::Relaxed),
+        ICALL_DROPPED.load(Ordering::Relaxed)
+    ));
+    for l in &lines {
+        crate::warn_line(l);
+    }
+    crate::warn_line(&format!("icall-dump end pid {pid}\n"));
 }

@@ -115,7 +115,7 @@ const click = async (x, y) => {
 };
 
 const prof = process.env.NOITA_PROF
-  ? (([at = '60', ms = '20000']) => ({ at: +at, ms: +ms, done: false }))(process.env.NOITA_PROF.split(','))
+  ? (([at = '60', ms = '20000']) => ({ at: +at.replace(/^e/, ''), early: at.startsWith('e'), ms: +ms, done: false }))(process.env.NOITA_PROF.split(','))
   : null;
 const steps = [
   { at: 12, x: 85, y: 661, what: 'dismissing the release notes' },
@@ -172,7 +172,7 @@ for (;;) {
       // into the world for MS ms, summarised (and saved beside NOITA_SHOT's
       // pictures). The measurement goes on through it: a profiling run's
       // world rate is not a baseline.
-      if (prof && !prof.done && now - world.t >= prof.at * 1000) {
+      if (prof && !prof.early && !prof.done && now - world.t >= prof.at * 1000) {
         prof.done = true;
         const v0 = p.v, tp = Date.now();
         const profs = await profile('', prof.ms, true);
@@ -191,6 +191,19 @@ for (;;) {
         break;
       }
     }
+  }
+  // NOITA_PROF=eAT,MS: the same AT s after the start, world or not (a
+  // run that never gets there).
+  if (prof && prof.early && !prof.done && now - t0 >= prof.at * 1000) {
+    prof.done = true;
+    const profs = await profile('', prof.ms, true);
+    console.log(`== profile ${prof.at} s after the start for ${prof.ms / 1000} s`);
+    profs.forEach(({ url, profile: pr }, k) => {
+      if (process.env.NOITA_SHOT) writeFileSync(join(process.env.NOITA_SHOT, `prof.${k}.cpuprofile`), JSON.stringify(pr));
+      const sum = summariseProfile(pr, 25);
+      console.log(`-- profile ${k} ${url}`);
+      console.log(typeof sum === 'string' ? sum : JSON.stringify(sum, null, 1).slice(0, 5000));
+    });
   }
   if (!world && now - t0 > worldBy) {
     const p = steps.length ? null : await peek();

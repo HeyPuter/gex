@@ -221,6 +221,10 @@ fn report_hints(image: &gex_ld::Image) {
 /// whose dominant target takes at least 90% of at least 64 calls gets a
 /// guarded direct call to it. By return address.
 pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
+    // The counting flavor devirtualises nothing (`image::icall_count`).
+    if gex_cgen::image::icall_count() {
+        return HashMap::new();
+    }
     let Ok(path) = icall_path(image) else { return HashMap::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
     let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();

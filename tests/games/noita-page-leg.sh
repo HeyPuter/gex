@@ -40,7 +40,7 @@ if [ "${1:-}" = --remote ]; then
   CP=$(free_port); VP=$(free_port)
   mkdir -p $T/../tmp
   export TMPDIR=$(cd $T/.. && pwd)/tmp GEX_NT_CHROME_PORT=$CP GEX_NT_VITE_PORT=$VP GEX_WEBGPU_SOFTWARE=0
-  export GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
+  export GEX_NT_BROWSER_MAX_LINES=200000 GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
   kill_ours() { for p in $(pgrep -f -- "--remote-debugging-port=$CP\b"); do kill $p 2>/dev/null; done; }
   trap 'kill_ours; [ -n "${np:-}" ] && kill $np 2>/dev/null; exit 143' TERM INT
   node $T/tests/games/noita-page.mjs $T $X $secs 2> $TMPDIR/noita-err.txt & np=$!

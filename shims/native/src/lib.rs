@@ -4497,6 +4497,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         })()) },
     )?;
 
+    // The counting flavor's table-call note (`gex_cgen::image::icall_count`):
+    // natively a debugging run only, so nothing is tallied.
+    linker.func_wrap(m, imports::ICALL_NOTE, |_ctx: i32, _ret: i64, _target: i64| {})?;
+
     linker.func_wrap(
         m,
         imports::SAFEPOINT,

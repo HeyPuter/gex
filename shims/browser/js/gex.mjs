@@ -1728,6 +1728,8 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      // A counting unit's table calls (cgen.rs `gex_icall_note`).
+      icall_note: e.gex_icall_note,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
@@ -1956,6 +1958,8 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      // A counting unit's table calls (cgen.rs `gex_icall_note`).
+      icall_note: e.gex_icall_note,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
