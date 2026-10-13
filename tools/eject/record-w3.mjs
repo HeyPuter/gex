@@ -54,6 +54,14 @@ if (opt('--serve', null)) {
     try { st = statSync(p); if (st.isDirectory()) { p = join(p, 'index.html'); st = statSync(p); } } catch { st = null; }
     const h = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin' };
     if (!st?.isFile()) { res.writeHead(404, h).end(); return; }
+    // Ranges: a bundle split's lazy files are read 1 MiB at a time.
+    const r = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+    if (r) {
+      const a = Number(r[1]), b = Math.min(r[2] ? Number(r[2]) : st.size - 1, st.size - 1);
+      res.writeHead(206, { ...h, 'Content-Type': 'application/octet-stream', 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Cache-Control': 'no-cache' });
+      createReadStream(p, { start: a, end: b }).pipe(res);
+      return;
+    }
     res.writeHead(200, { ...h, 'Content-Type': types[extname(p)] || 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
     createReadStream(p).pipe(res);
   });

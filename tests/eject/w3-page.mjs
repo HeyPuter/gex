@@ -56,6 +56,15 @@ if (off.includes('compositor')) {
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
+// "bundle": "split": the files the recorded run never opened are lazy files,
+// each in the store under its hash.
+if (nt.bundle?.split) {
+  const lj = join(site, 'project/build/web/lazy.json');
+  const m = existsSync(lj) ? JSON.parse(readFileSync(lj, 'utf8')) : null;
+  const missing = m ? m.files.filter((f) => !existsSync(join(site, m.base, f[2]))).length : -1;
+  check(!!m && missing === 0 && nt.params?.lazy === '/project/build/web/lazy.json',
+    `bundle split: ${nt.bundle.read} read files in the bundle, ${m?.files.length ?? 'no'} lazy ones (${missing} missing from the store)`);
+}
 if (off.includes('gl')) {
   const left = gexDir.filter((n) => n.startsWith('gex-wgpu-replay'));
   check(left.length === 0, `"gl" off: no Mesa in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
@@ -63,13 +72,23 @@ if (off.includes('gl')) {
 
 // 2. Served and run to the title.
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
+let lazyReads = 0;
 const server = http.createServer((req, res) => {
+  if (req.url.includes('/build/web/lazy/')) lazyReads++;
   let p = join(site, decodeURIComponent(new URL(req.url, 'http://x').pathname));
   if (!p.startsWith(site)) { res.writeHead(403).end(); return; }
   let st = null;
   try { st = statSync(p); if (st.isDirectory()) { p = join(p, 'index.html'); st = statSync(p); } } catch { st = null; }
   const h = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin' };
   if (!st?.isFile()) { res.writeHead(404, h).end(); return; }
+  // Ranges: a bundle split's lazy files are read 1 MiB at a time.
+  const r = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+  if (r) {
+    const a = Number(r[1]), b = Math.min(r[2] ? Number(r[2]) : st.size - 1, st.size - 1);
+    res.writeHead(206, { ...h, 'Content-Type': 'application/octet-stream', 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Cache-Control': 'no-cache' });
+    createReadStream(p, { start: a, end: b }).pipe(res);
+    return;
+  }
   res.writeHead(200, { ...h, 'Content-Type': types[extname(p)] || 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
   createReadStream(p).pipe(res);
 });
@@ -133,6 +152,7 @@ check(launcher === 1 && ntLoads === 1, `one load, no reload (top-frame loads: ${
 await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
+if (nt.bundle?.split) console.log(`info: ${lazyReads} lazy read(s) to the window`);
 
 // 5. Placed windows: Wine moves, sizes and stacks them; the page follows.
 if (placedChecks) {
@@ -208,6 +228,17 @@ if (placedChecks) {
       await key('Escape', 'Escape', 27);
       ws = await until(wins, (l) => l.length === 1);
       check(ws.length === 1, `Escape closes the dialog (${ws.length} placed window(s))`);
+    }
+    // A split bundle's lazy files work: printing's DLLs (winspool.drv,
+    // compstui.dll) are not what a run to the window opens, so Ctrl+P reads
+    // them from the store before Paint says there is no printer.
+    if (nt.bundle?.split) {
+      const before = lazyReads;
+      await key('p', 'KeyP', 80, 2);
+      ws = await until(wins, (l) => l.length >= 2);
+      check(ws.length >= 2 && lazyReads > before, `Ctrl+P reads lazy files and answers (${lazyReads - before} lazy read(s), ${ws.length} placed window(s))`);
+      await key('Enter', 'Enter', 13);
+      await until(wins, (l) => l.length === 1);
     }
   }
 }

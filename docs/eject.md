@@ -515,6 +515,38 @@ node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks 
 Everything else is the page as gex runs it: several processes, the
 kernel, run-time translation behind the units.
 
+### The bundle split
+
+A W3 bundle is a whole Wine prefix plus Wine itself: for Paint 2509 files
+(447 MiB), of which a run to the window opens 221. `user/eject.json`
+`"bundle": "split"` (the W3 template's setting; a config without it means
+`"whole"`) ships only those in the site's bundle:
+
+- **Recording:** the kernel marks every file something opens
+  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the page reads the set
+  from a side Worker (`__ntOpened()`, web/src/fs-opened.js) and
+  record-w3.mjs keeps it as the session's `files_read`.
+- **Build:** `gexc eject build` puts that list in build/web/w3.json
+  (`"bundle": {"split": true, "read": [...]}`); a split without a read set
+  (an older recording) fails the build and says so.
+- **Site:** web/eject-site.mjs keeps the read files (and the loader) in
+  rootfs.tar and makes every other file a lazy file (nt-page.js `lazy=`):
+  stored once by content as `project/build/web/lazy/SHA`, listed with its
+  size and time in `lazy.json`. A guest that reads one gets it from the host
+  in 1 MiB ranges, synchronously, the first time; the site's serve.mjs
+  answers ranges (a host without them still works, sending the whole file
+  per read). A lazy file's time is the bundle's (`mtimes=1`: Wine's wineboot
+  rebuilds a prefix whose wine.inf looks newer than its install).
+
+Nothing the program needs is lost: what the recording did not open is a
+fetch away. What it costs is a wait the first time an unrecorded path reads
+a file (Paint's Ctrl+P reads winspool.drv and compstui.dll that way). Record
+the paths users take (for now: run them before the recorder's settle ends)
+to bring them into the bundle.
+
+Paint on worldmachine (bench, headless Chromium, the same recording ejected
+twice; 3 alternated runs each): see the status line below for the numbers.
+
 ## Limits
 
 - **Dynamic linking for the recorded program only.** An `execve` of a
@@ -547,3 +579,6 @@ kernel, run-time translation behind the units.
   override (the `"entry"` ABI).
 - Features (`user/eject.json` `"features"`) and W3 pages: `compositor` and
   `gl` switch; the rest wait for gex-kernel and shim feature gating.
+- The W3 bundle split (`"bundle": "split"`): the files the recorded run
+  opened in the bundle, the rest lazy. Paint: download 76.5 MB whole, 54.2 MB
+  split.
