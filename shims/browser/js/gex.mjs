@@ -4293,17 +4293,22 @@ export class Gex {
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
     const replyData = cdv.getUint32(req + 68, true);
     const a = d.area;
-    let w = this.#doorMem(a + 144);
-    const buf = w.dv.getUint32(a + 44, true), bufSize = w.dv.getUint32(a + 48, true);
-    w = this.#doorMem(buf + bufSize);
-    const { u8, i32, dv } = w;
+    // The door buffer's place and size never change: read once per door.
+    let buf = d.kBuf, bufSize = d.kBufSize;
+    if (buf === undefined) {
+      const v0 = this.#doorMem(a + 144);
+      buf = d.kBuf = v0.dv.getUint32(a + 44, true);
+      bufSize = d.kBufSize = v0.dv.getUint32(a + 48, true);
+    }
+    const { u8, i32, dv } = this.#doorMem(buf + bufSize);
     const replyOff = (64 + reqSize + 7) & ~7;
     if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
     // Poisoned (a door call died midway): no more doors; the pipes say the
-    // rest when the server goes.
-    if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
+    // rest when the server goes. A plain read, before the lock as the
+    // atomic load was: the flag only ever goes from 0 to set.
+    if (i32[(a + 124) >> 2] !== 0) return 1;
     if (Atomics.compareExchange(i32, L, 0, 1) !== 0) this.#doorLockSlow(i32, a, L, pid, tid);
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
@@ -4360,7 +4365,10 @@ export class Gex {
       console.error(`[gex-door] the wineserver trapped in a door call (pid ${pid} tid ${tid}); the server is poisoned: ${err?.stack ?? err}`);
       r = 1;
     }
-    const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;
+    // kick_needed is written only under the lock (by this call's dispatch,
+    // or the pump): plain accesses, ordered by the lock's own atomics.
+    const K = (a + 80) >> 2, kick = i32[K] !== 0;
+    if (kick) i32[K] = 0;
     if (Atomics.exchange(i32, L, 0) === 2) Atomics.notify(i32, L);
     if (kick) this.#doorKick();
     return r;
