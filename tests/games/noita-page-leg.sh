@@ -29,6 +29,11 @@
 # its sources): `GEX_CGEN_CACHE=units gexc cgen-image IMAGE --pe-base BASE`
 # with TREE's x86 gexc for each "unitless:" line of a run (page paths: /w3 is
 # the W3 dist, /g the game). A stale cache shows up as "unitless" lines.
+# Two more go in with the same gexc and GEX_CGEN_CACHE, and no line says
+# they are missing: `gexc cgen-image --providers` (units/providers) and
+# `gexc cgen-image --nt-trampolines32` (without it every NT system call
+# misses into tier-1: the world never comes up). A flavour in the key
+# (GEX_CGEN_ICALL_COUNT=1, say) needs its own copy of both.
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
