@@ -1288,6 +1288,10 @@ export class Gex {
           }
         },
         now: () => this.#env.now(),
+        // The clock's hot path (lib.rs `host_now_ns`): an f64 per call, the
+        // BigInt origin once per thread. `hostNowNs` is the same sum.
+        perf_now: () => performance.now(),
+        clock_origin: () => ORIGIN_NS,
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
         // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
