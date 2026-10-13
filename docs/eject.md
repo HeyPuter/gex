@@ -544,8 +544,15 @@ a file (Paint's Ctrl+P reads winspool.drv and compstui.dll that way). Record
 the paths users take (for now: run them before the recorder's settle ends)
 to bring them into the bundle.
 
-Paint on worldmachine (bench, headless Chromium, the same recording ejected
-twice; 3 alternated runs each): see the status line below for the numbers.
+Paint (the same recording ejected twice, `--strip --prune --dedupe`;
+worldmachine, bench, headless Chromium, 3 alternated runs each):
+
+| | whole | split |
+| --- | --- | --- |
+| download | 76.5 MB | 54.2 MB (29% less) |
+| to the window | 22.0, 22.0, 22.0 s | 21.0, 20.9, 21.1 s (1.0 s sooner) |
+| browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
+| lazy reads to the window | | 0 |
 
 ## Limits
 
@@ -580,5 +587,6 @@ twice; 3 alternated runs each): see the status line below for the numbers.
 - Features (`user/eject.json` `"features"`) and W3 pages: `compositor` and
   `gl` switch; the rest wait for gex-kernel and shim feature gating.
 - The W3 bundle split (`"bundle": "split"`): the files the recorded run
-  opened in the bundle, the rest lazy. Paint: download 76.5 MB whole, 54.2 MB
-  split.
+  opened in the bundle, the rest lazy (Paint: 29% less download, 0.37 GiB
+  less memory, 1.0 s sooner to the window). Not yet: units of only the
+  functions a recording ran (the units are most of what is left).
