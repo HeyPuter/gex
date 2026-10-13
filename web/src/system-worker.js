@@ -62,7 +62,10 @@ let comp = null;
 async function openCompositor(width, height) {
   globalThis.GEX_COMPOSITOR_IN_REALM = true;
   const [{ inRealm }, { makeWlChannel, setOutputSize }] = await Promise.all([
-    import('./compositor-worker.js'),
+    // gex-eject's `"compositor": false` builds drop it (runtime.js, GEX_COMPOSITOR).
+    (typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__)
+      ? import('./compositor-worker.js')
+      : Promise.reject(new Error('this build has no compositor')),
     import('../../shims/browser/js/wl-bridge.mjs'),
   ]);
   const channel = makeWlChannel();

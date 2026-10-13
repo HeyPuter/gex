@@ -194,13 +194,14 @@ export class ProcessHost {
    * Run `elf` as pid 1 and resolve with its exit status. Children are stopped
    * when it exits -- a page done with a program is done with its daemons.
    */
-  async start({ elf, files = {}, args = [], opts = {} }) {
+  async start({ elf, files = {}, args = [], opts = {}, transfer = [] }) {
     const status = await this.#spawn(1, {
       kind: 'run',
       elf,
       files,
       args,
       opts,
+      transfer,
     });
     this.stop();
     return status;
@@ -456,7 +457,9 @@ export class ProcessHost {
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
             sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
-          }, forkTransfer(msg.child));
+          // `transfer`: buffers the caller gives up (the page's bundle), moved
+          // rather than copied, and freed by the Worker once loaded.
+          }, [...forkTransfer(msg.child), ...(msg.transfer ?? [])]);
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
           const tSent = performance.now();

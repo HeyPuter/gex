@@ -34,6 +34,12 @@ function archInfix() {
 export function archAsset(path) {
   return guestArch() === 'x86' ? path.replace(/^\/(rootfs|closure|fs)\//, '/$1/x86/') : path;
 }
+/** Whether this build has the scene compositor (compositor.js and its
+ *  worker). gex-eject's feature selection (docs/eject.md, "Features") builds
+ *  the page with `__GEX_COMPOSITOR__` defined false, and everything behind
+ *  this constant drops out of the bundle; anything else has it. */
+const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
+
 /** Debian's multiarch directory name for the guest. */
 export function multiarch() {
   return guestArch() === 'x86' ? 'x86_64-linux-gnu' : 'aarch64-linux-gnu';
@@ -429,7 +435,8 @@ function pageGlobals() {
  * and forwards keys, sizes and output.
  */
 async function runInSystemWorker(term, opts) {
-  const { network, onNetEvent, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // `onFilesLoaded` is a function, which cannot cross to the Worker.
+  const { network, onNetEvent, onFilesLoaded, onDesktop, transfer, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
   // Said once, so a person (and tests/single/run.sh) can tell which build ran.
   term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system
@@ -470,7 +477,7 @@ async function runInSystemWorker(term, opts) {
     else if (m?.kind === 'comp-stats' && compStats) compStats.set(m.stats.subarray(0, compStats.length));
   });
   let compositor = null;
-  if (canvas) {
+  if (canvas && GEX_COMPOSITOR) {
     const { Compositor } = await import('./compositor.js');
     // Before `run`: the Worker takes the canvas first, then starts the guest.
     w.postMessage({ kind: 'comp-open', width: canvas.width, height: canvas.height });
@@ -546,6 +553,14 @@ async function runProgramHere(
     tty = true,
     network = null,
     onNetEvent = null,
+    // Called once pid 1 has copied `files` into the kernel's filesystem: the
+    // caller can drop its own references to the bytes (a bundle's buffer).
+    onFilesLoaded = null,
+    // Buffers `files` views that the caller gives up to pid 1's Worker
+    // (moved, not copied; freed there once the kernel has the files).
+    transfer = [],
+    // Called with the DOM desktop when `wl` is an element, before any window.
+    onDesktop = null,
     gl = null,
     // Which Gallium driver the host's Mesa runs when `gl` is 'compositor':
     // gex_wgpu, straight onto WebGPU.
@@ -716,8 +731,10 @@ async function runProgramHere(
     const element = wl && typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
     if (element) {
       const { DomDesktop } = await import('./dom-compositor.js');
-      compositor = DomDesktop.create(element, wlChannel);
+      compositor = DomDesktop.create(element, wlChannel, { width: element.clientWidth, height: element.clientHeight });
       globalThis.__gexDesktop = compositor;
+      // The page lays the windows out (bare-desktop.js, say) before any appears.
+      onDesktop?.(compositor);
       // A GL device that dies mid-session leaves black windows and no other
       // sign; say it where the session's other trouble is reported.
       compositor.onglfailed = (why) => {
@@ -731,7 +748,10 @@ async function runProgramHere(
       }
     }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
-    if (canvas) {
+    // A build without the scene compositor (gex-eject's `"compositor": false`)
+    // has no compositor.js: the page passes an element instead (above).
+    if (canvas && !GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
+    if (canvas && GEX_COMPOSITOR) {
       setOutputSize(wlChannel, canvas.width, canvas.height, Math.max(1, Math.round(wlScale)));
       const { Compositor } = await import('./compositor.js');
       compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas, { scale: wlScale });
@@ -1039,6 +1059,8 @@ async function runProgramHere(
         /* a publish happened; the compositor draws on its own clock */
       }
       else if (m.kind === 'net') onNetEvent?.(m.event);
+      // Pid 1 has copied `files` into the kernel's filesystem.
+      else if (m.kind === 'files-loaded') onFilesLoaded?.();
     },
   });
 
@@ -1061,6 +1083,7 @@ async function runProgramHere(
     const status = await host.start({
       elf,
       files,
+      transfer,
       dirs,
       modes,
       env,

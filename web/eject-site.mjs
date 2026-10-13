@@ -5,19 +5,20 @@
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
-//   index.html     the launcher (web/eject-site/index.html): installs sw.js,
-//                  downloads everything with a progress bar, opens nt.html
-//   sw.js          cross-origin isolation for hosts that can't send the
-//                  headers, and FILE.zst decoded and cached as FILE
-//   nt.html, assets/, gex/   the page (runtime/web/page), runtime and Mesa
+//   index.html     the launcher (web/eject-site/index.html): checks the
+//                  browser, opens nt.html on the build
+//   nt.html, assets/, gex/   the page (runtime/web/page), runtime and Mesa,
+//                  as plain files
 //   project/build/web/nt.json, project/build/web/rootfs.tar.zst, and the
 //                  units the browser loads (project/build/units/...)
 //   pack.json      every packed file: size, compressed size; the build id
 //   _headers       caching and isolation headers (Netlify, Cloudflare Pages)
 //   serve.mjs      a static server with the same headers (node serve.mjs [port])
 //   README.txt     hosting notes
-// Every file over 64 KiB is zstd-compressed (-19 --long=27, cached beside OUT
-// in OUT.zcache by content). --bench keeps the recorded benchmark settings
+// Every file of the bundle and the units over 64 KiB is zstd-compressed (-19
+// --long=27, cached beside OUT in OUT.zcache by content) as FILE.zst, which
+// the page fetches and decodes itself (nt-page.js `pack=`). No service
+// worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
 // (scripted input, the 4x clock); without it they are dropped, so a player
 // gets the real clock and their own input. --drop removes a guest path from
 // the bundle (e.g. a benchmark's seed-pinning mod).
@@ -34,13 +35,20 @@ const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
 const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache'].includes(av[i - 1]));
+// A W3 page's site (below): --strip takes the debug sections out of every
+// .wasm (the bundle's included), --prune leaves out files the browser never
+// reads (precompiled .cwasm, static archives), --dedupe puts identical files
+// next to each other in the tar so zstd's window stores the second as a match.
 if (!project || !out) {
   console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--wgsl-cache FILE] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
-const nt = JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
-const title = opt('--title', nt.exe.split('/').pop().replace(/\.exe$/i, ''));
+// A W3 page's project (gexc eject of a tools/eject/record-w3.mjs recording):
+// build/web/w3.json instead of nt.json. See `w3Site` below.
+const w3 = existsSync(join(project, 'build/web/w3.json')) ? JSON.parse(readFileSync(join(project, 'build/web/w3.json'), 'utf8')) : null;
+const nt = w3 ? null : JSON.parse(readFileSync(join(project, 'build/web/nt.json'), 'utf8'));
+const title = opt('--title', w3 ? (w3.title ?? 'gex').replace(/^Untitled - /, '') : nt.exe.split('/').pop().replace(/\.exe$/i, ''));
 const zcache = `${out.replace(/\/+$/, '')}.zcache`;
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -73,12 +81,25 @@ function walk(dir, fn, base = dir) {
   }
 }
 
-// The page and the runtime.
-walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
+if (w3) {
+  w3Site();
+  process.exit(0);
+}
+
+/** Put `src` at site path `path` as it is (what the page loads by URL). */
+function plain(src, path) {
+  const dst = join(out, path);
+  mkdirSync(dirname(dst), { recursive: true });
+  copyFileSync(src, dst);
+}
+
+// The page and the runtime, plain: nothing between the page and the server
+// decodes (a host's own compression still applies).
+walk(join(project, 'runtime/web/page'), (p, rel) => plain(p, rel));
 // --wgsl-cache FILE: Mesa's shader translations from a training run
 // (play.mjs's `wgsl` step), beside the Mesa glue, where mesa-gl.js looks.
 // Mesa refuses a blob another build of it made, so it goes stale with Mesa.
-if (opt('--wgsl-cache', null)) place(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
+if (opt('--wgsl-cache', null)) plain(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
 
 // The units the browser loads: each unit's module and entries, region
 // entries, providers, stateful providers, indirect-call profiles (part of a
@@ -157,19 +178,51 @@ const ntOut = { ...nt, settings, args, direct: !!nt.gl && !flag('--no-direct') }
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
-// The launcher, the service worker and its decoder.
+// The launcher and the page's decoder.
 // The build: everything served, packed or not (a page-only change is a new build too).
 const smallHash = createHash('sha256');
 walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
 const build = sha(JSON.stringify(files) + JSON.stringify(ntOut) + smallHash.digest('hex')).slice(0, 12);
 writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
-copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
 cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
 writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
 
-// Headers: isolation everywhere; packed files and hashed assets cached for
-// good (their URLs carry the build); the rest revalidated.
-writeFileSync(join(out, '_headers'), `/*
+writeHosting();
+
+const total = Object.values(files).reduce((a, f) => a + f.size, 0);
+const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
+let small = 0;
+walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
+writeFileSync(join(out, 'README.txt'), `${title} in the browser (an ejected Windows program on gex), build ${build}
+
+Serve this directory as static files at the root of an HTTPS origin (or
+http://localhost): node serve.mjs [port] does, with the headers below.
+
+Browser: a desktop Chrome or Edge with WebGPU and hardware acceleration.
+Download: ${mb(ztotal + small)} MB (${mb(total)} MB unpacked), cached by the browser after
+the first load; saves stay in this browser's IndexedDB.
+
+Headers (_headers has them for Netlify and Cloudflare Pages):
+  every file:  Cross-Origin-Opener-Policy: same-origin
+               Cross-Origin-Embedder-Policy: require-corp
+  *.zst and assets/*: Cache-Control: public, max-age=31536000, immutable
+  the rest:    Cache-Control: no-cache
+The isolation headers are required (threads need them); the launcher says so
+when they are missing.
+
+The .zst files are decoded by the page; serve them as plain bytes, with no
+Content-Encoding. nginx:
+  location / {
+    add_header Cross-Origin-Opener-Policy same-origin always;
+    add_header Cross-Origin-Embedder-Policy require-corp always;
+    types { application/javascript mjs js; application/wasm wasm; application/json json; text/html html; }
+  }
+`);
+/** _headers and serve.mjs: the headers the site wants from its host. */
+function writeHosting() {
+  // Headers: isolation everywhere; packed files and hashed assets cached for
+  // good (their URLs carry the build); the rest revalidated.
+  writeFileSync(join(out, '_headers'), `/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Resource-Policy: same-origin
@@ -179,7 +232,7 @@ writeFileSync(join(out, '_headers'), `/*
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
 `);
-writeFileSync(join(out, 'serve.mjs'), `#!/usr/bin/env node
+  writeFileSync(join(out, 'serve.mjs'), `#!/usr/bin/env node
 // A static server for this site with the headers it wants (_headers). node serve.mjs [port]
 import { createServer } from 'node:http';
 import { createReadStream, statSync } from 'node:fs';
@@ -204,35 +257,87 @@ createServer((req, res) => {
   createReadStream(file).pipe(res);
 }).listen(port, () => console.log(\`http://localhost:\${port}/\`));
 `);
-
-const total = Object.values(files).reduce((a, f) => a + f.size, 0);
-const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
-let small = 0;
-walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
-writeFileSync(join(out, 'README.txt'), `${title} in the browser (an ejected Windows program on gex), build ${build}
-
-Serve this directory as static files at the root of an HTTPS origin (or
-http://localhost): node serve.mjs [port] does, with the headers below.
-
-Browser: a desktop Chrome or Edge with WebGPU and hardware acceleration.
-Download: ${mb(ztotal + small)} MB (${mb(total)} MB unpacked), cached by the browser after
-the first load; saves stay in this browser's IndexedDB.
-
-Headers (_headers has them for Netlify and Cloudflare Pages):
-  every file:  Cross-Origin-Opener-Policy: same-origin
-               Cross-Origin-Embedder-Policy: require-corp
-  *.zst and assets/*: Cache-Control: public, max-age=31536000, immutable
-  the rest:    Cache-Control: no-cache
-A host that cannot send the isolation headers still works over HTTPS:
-sw.js adds them, and the launcher reloads once.
-
-The .zst files are decoded by sw.js; serve them as plain bytes, with no
-Content-Encoding. nginx:
-  location / {
-    add_header Cross-Origin-Opener-Policy same-origin always;
-    add_header Cross-Origin-Embedder-Policy require-corp always;
-    types { application/javascript mjs js; application/wasm wasm; application/json json; text/html html; }
-  }
-`);
+}
 function mb(n) { return (n / 1048576).toFixed(1); }
+
+/** The site of a W3 page's project: its page (built with the project's
+ *  features, as plain files), its bundle and units (packed, decoded by the
+ *  page), the launcher and the hosting files. No service worker. */
+function w3Site() {
+  const web = join(project, 'build/web');
+  const work = `${out.replace(/\/+$/, '')}.work`;
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+  const strip = flag('--strip');
+  const stripped = (src) => {
+    if (!strip || !src.endsWith('.wasm')) return src;
+    const dst = join(work, 'strip', sha(readFileSync(src)));
+    mkdirSync(dirname(dst), { recursive: true });
+    if (!existsSync(dst)) execFileSync('wasm-tools', ['strip', '-d', '^(\\.debug_.*|producers|target_features|external_debug_info|sourceMappingURL)$', src, '-o', dst]);
+    return dst;
+  };
+  // The page as plain files: nothing between it and the server decodes, so
+  // only what the page itself fetches and decodes (the bundle, the units:
+  // nt-page.js `pack=`) is packed. A host's own compression still applies.
+  walk(join(web, 'page'), (p, rel) => {
+    const dst = join(out, rel);
+    mkdirSync(dirname(dst), { recursive: true });
+    copyFileSync(stripped(p), dst);
+  });
+  // The bundle.
+  let tar = join(web, 'rootfs.tar');
+  if (strip || flag('--prune') || flag('--dedupe')) {
+    const x = join(work, 'tarx');
+    mkdirSync(x, { recursive: true });
+    execFileSync('tar', ['-xf', tar, '-C', x]);
+    if (strip) walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
+    if (flag('--prune')) walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
+    tar = join(work, 'rootfs.tar');
+    const dirs = [];
+    const byHash = new Map();
+    const all = (d, rel) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        const p = join(d, e.name);
+        if (e.isDirectory()) { dirs.push(r); all(p, r); continue; }
+        const k = flag('--dedupe') && e.isFile() ? sha(readFileSync(p)) : `path:${r}`;
+        if (!byHash.has(k)) byHash.set(k, []);
+        byHash.get(k).push(r);
+      }
+    };
+    all(x, '');
+    const list = join(work, 'tar-list');
+    writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
+    execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
+  }
+  place(tar, 'project/build/web/rootfs.tar');
+  // The units, largest first in the preload list.
+  const preload = [];
+  for (const u of w3.units) {
+    const d = join(web, 'units', u.key);
+    place(join(d, 'c.wasm'), `project/build/web/units/${u.key}/c.wasm`);
+    place(join(d, 'c.entries'), `project/build/web/units/${u.key}/c.entries`);
+    preload.push([`cgen:${u.key}`, `/project/build/web/units/${u.key}/c.wasm`, statSync(join(d, 'c.wasm')).size]);
+    preload.push([`file:${u.key}/c.entries`, `/project/build/web/units/${u.key}/c.entries`, 0]);
+  }
+  preload.sort((a, b) => b[2] - a[2]);
+  writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
+  writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
+  // The launcher and the page's decoder. No service worker: the host sends
+  // the isolation headers (COOP/COEP), and the page decodes what is packed.
+  const smallHash = createHash('sha256');
+  walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
+  const build = sha(JSON.stringify(files) + JSON.stringify(w3) + smallHash.digest('hex')).slice(0, 12);
+  writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
+  cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
+  writeFileSync(join(out, 'pack.json'), JSON.stringify({ build, files }, null, 1));
+  writeHosting();
+  rmSync(work, { recursive: true, force: true });
+  const total = Object.values(files).reduce((a, f) => a + f.size, 0);
+  const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
+  let small = 0;
+  walk(out, (p) => { if (!p.endsWith('.zst')) small += statSync(p).size; });
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small }, null, 1));
+  console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`);
+}
 console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);

@@ -18,7 +18,8 @@ log as they were written (`$S` = `~/gex-sandbox/scratch/eject9`).
 it into a standalone project: AOT units for every image, providers (PUC
 Lua for lua51, CRT and ConcRT ones), region entries for interior resumes,
 and a web build. `web/eject-site.mjs PROJECT OUT` makes the static site
-(zstd-packed, `sw.js` for isolation and decoding, `_headers`, `serve.mjs`):
+(the bundle and units zstd-packed and decoded by the page, `_headers` and
+`serve.mjs` for the isolation headers; no service worker):
 about 75 MB to download, 450 MB unpacked. The page runs AOT-only (no JIT, no
 interpreter), presents GL frames directly (`?direct=1`, eject-site's
 default with GL; `--no-direct` for the composited path), and keeps saves in
@@ -803,9 +804,11 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   JS 1 MB), against pewasm's 190 MB (which ships all of data/fonts, 165 MB;
   the eject ships the files the session read).
 - **Packaging:** `node web/eject-site.mjs PROJECT OUT [--bench] [--overlay
-  DIR] [--drop PATH]`: zstd-19 files decoded and cached by sw.js (which also
-  isolates; sync XHR from Workers goes through it), a launcher with a
-  progress bar, `_headers`, `serve.mjs`, README. Without --bench the
+  DIR] [--drop PATH]`: the bundle and units as zstd-19 files that nt.html
+  fetches and decodes itself (`pack=`; the HTTP cache keeps them), the page
+  as plain files, a launcher, `_headers`, `serve.mjs`, README. (Until
+  2026-10-12 a service worker decoded and isolated; it is gone: the host
+  sends the isolation headers.) Without --bench the
   scripted input and the 4x clock are dropped.
 - **Play-through (edger, site17p = --overlay overlay-play: a `killme` mod
   that kills the player 900 frames after each spawn):** release notes, main

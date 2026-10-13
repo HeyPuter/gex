@@ -38,6 +38,7 @@ import {
   EV_CLOSE,
   EV_DISMISS_POPUP,
   EV_MOVED,
+  waitPublish,
 } from '@gex/wl-bridge.mjs';
 
 // -- decoration metrics -----------------------------------------------------
@@ -1056,6 +1057,8 @@ class Compositor {
       return;
     }
     this.#lastSig = sig;
+    // Marks for traces (`console.timeStamp` costs nothing unless tracing).
+    console.timeStamp('gex:draw');
     // Nothing to draw into: see `Painter.begin`. The arena is still acked
     // below on the next frame that works, so a restored context catches up.
     if (this.#painter.begin(this.#outW, this.#outH) === false) {
@@ -1081,6 +1084,7 @@ class Compositor {
     // No cursor: the client's is the page's own CSS cursor (`#updateCursor`),
     // so there is one pointer on the screen and it moves at the browser's rate.
     this.#painter.end();
+    console.timeStamp('gex:drawn');
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     this.#frames++;
     if (this.#stats) {
@@ -1368,8 +1372,12 @@ let running = false;
 /** Turns of the frame loop, for a test: a loop that stops reads as a still screen. */
 let turns = 0;
 
+// Whether a publish was drawn since the last animation frame (`onPublishes`).
+let drawnSincePaint = false;
+
 function loop() {
   if (!comp || !running) return;
+  drawnSincePaint = false;
   turns++;
   try {
     // A guest paces itself against frames *displayed*, not produced: its
@@ -1385,6 +1393,31 @@ function loop() {
     return;
   }
   requestAnimationFrame(loop);
+}
+
+/**
+ * Draw when a guest publishes, not at the next animation frame: a frame drawn
+ * now reaches the screen a frame tick sooner than one drawn at the next tick
+ * (publish to draw was 3-15 ms of a click's 55-70 ms on mspaint, worldmachine).
+ * At most once between animation frames, so a guest publishing on every
+ * scheduler turn still costs one extra draw a frame at most; the rest waits
+ * for `loop`, which draws whatever is newest.
+ */
+async function onPublishes(channel) {
+  let seen;
+  for (;;) {
+    seen = await waitPublish(channel, seen);
+    if (seen === null || !running) return;
+    if (!comp || drawnSincePaint) continue;
+    drawnSincePaint = true;
+    try {
+      comp.frame();
+    } catch (e) {
+      post({ kind: 'error', error: e?.stack || String(e) });
+      running = false;
+      return;
+    }
+  }
 }
 
 // -- the guest's OpenGL, in this worker -------------------------------------
@@ -1544,6 +1577,7 @@ const onMessage = ({ data: m }) => {
         comp.setDirect(m.direct);
         running = true;
         requestAnimationFrame(loop);
+        if (m.drawOnPublish !== false && !globalThis.GEX_NO_PUBDRAW) onPublishes(m.channel);
         post({ kind: 'ready' });
       }).catch((e) => post({ kind: 'error', error: e?.stack || String(e) }));
     } else if (m.kind === 'gl') {

@@ -443,6 +443,77 @@ guest had since overwritten.
 - Not yet: gex-kernel subsystems behind cargo features (waits for S12's N4,
   as gex-kernel is being edited heavily).
 
+## Features
+
+An ejected build starts as the whole runtime a gex page runs, and
+`user/eject.json` `"features"` takes parts out of it: each is `true` (kept,
+the default) or `false` (left out). The list is `crates/gex-eject/src/
+features.rs`; a feature switched off that no build can remove yet fails the
+build and says why, rather than doing nothing.
+
+| Feature | What it is | Off |
+| --- | --- | --- |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing (`compositor.js`, `compositor-worker.js`, `gpu-device.js`) | each window is its own canvas in the page, laid out by `web/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The page is built with `__GEX_COMPOSITOR__` false (vite `define`, from `GEX_FEATURES_OFF=compositor`), so the code is not in the bundle |
+| `gl` | the guest's OpenGL: Mesa on WebGPU (`gex/gex-wgpu-replay.*`) | the page ships no Mesa |
+| `multiprocess` | more than one guest process | not yet: a W3 program is several processes |
+| `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the shim's translator is not a separate build (kernel and shim feature gating) |
+
+Only a W3 page's build applies them so far; a Linux or NT-layer project
+with a feature off fails its build.
+
+## W3 pages
+
+A W3 program (Wine as native wasm32: every Wine process a guest process
+running `wine`, its PE side in `winepe.wasm`, the Windows images'
+code in function-tier units) runs in the same page (`nt.html`) as any
+demo. Ejecting one makes that page a standalone site, with the features
+the user keeps:
+
+```sh
+# 1. record: run the page to its window (headless Chromium)
+node tools/eject/record-w3.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle mspaint.tar
+# 2. eject: the bundle, the units it used, the runtime, a build step
+gexc eject rec --out mspaint-project --web-src web --unit-cache UNITS --features -compositor
+# 3. build: the page with those features, the site's inputs in build/web
+mspaint-project/build.sh
+# 4. the static site
+node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
+node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
+```
+
+- **The recording** (`w3-session.json`) is how the page was started (its
+  `__nt.session`: exe, arguments, environment, working directory, size,
+  page parameters) and what every Worker said in `[gex-record]` lines
+  (gex.mjs): the processes (each one's main image and command line), the
+  units each image used and the images that had none, and the native wasm32
+  modules (`wine`, `winepe.wasm`, wasm DLLs) by content key.
+- **The project** holds the recording (`session/`), the bundle
+  (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
+  browser shim, kernel and seed (`runtime/web/gex/`) and `gex-project.json`
+  (`"kind": "w3"`). `page_source` names the gex checkout's `web/`: the page
+  is built at build time, because the features decide what goes into it.
+- **The build** (`gexc eject build`) runs `web/build-eject-page.sh` with
+  `GEX_FEATURES_OFF`, puts the project's runtime wasm in it, drops what a
+  feature off ships (Mesa for `gl`), checks the bundler really left out
+  what `compositor` off names, and writes `build/web/` (`page/`,
+  `rootfs.tar`, `units/`, `w3.json`: the launch).
+- **The site** (`web/eject-site.mjs`) is the page as plain files, the
+  bundle and the units as `FILE.zst` with a preload list, `pack.json` (their
+  sizes and the build id), the launcher (which starts nt.html as recorded)
+  and the hosting files (`serve.mjs`, `_headers`). There is **no service
+  worker**: the host sends the isolation headers (COOP `same-origin`, COEP
+  `require-corp`), and nt.html (`pack=`) fetches each packed file and
+  decodes it itself, straight into the one buffer that is then moved to
+  pid 1's Worker, which lets go of it once the kernel has the files (moved
+  on to a closed `MessagePort`: `ArrayBuffer.prototype.transfer(0)` alone
+  leaves a buffer that arrived by `postMessage` resident until the Worker
+  collects). The first load is the only one, and one copy of the bundle is
+  resident: the kernel's. The browser's HTTP cache does the caching
+  (`FILE.zst?v=BUILD`).
+
+Everything else is the page as gex runs it: several processes, the
+kernel, run-time translation behind the units.
+
 ## Limits
 
 - **Dynamic linking for the recorded program only.** An `execve` of a
@@ -473,4 +544,5 @@ guest had since overwritten.
   runtime-level slim runtime; `--jit-fallback` (off by default).
 - `gexc eject decompile` (M5 item 5): the function tier's C as an editable
   override (the `"entry"` ABI).
-- Waiting: gex-kernel feature gating.
+- Features (`user/eject.json` `"features"`) and W3 pages: `compositor` and
+  `gl` switch; the rest wait for gex-kernel and shim feature gating.

@@ -32,6 +32,8 @@ pub struct BuildReport {
     pub rootfs_files: usize,
     /// A Windows program's build (`pe`).
     pub pe: Option<crate::pe::PeReport>,
+    /// A W3 page's build.
+    pub w3: Option<crate::w3::W3Report>,
 }
 
 /// Check the project's `rootfs/` is what the eject wrote.
@@ -534,11 +536,22 @@ impl Translation<'_> {
 }
 
 pub fn build(dir: &Path) -> Result<BuildReport> {
+    if crate::w3::is_project(dir) {
+        return Ok(BuildReport { w3: Some(crate::w3::build(dir)?), ..BuildReport::default() });
+    }
     let project = Project::load(dir)?;
     if project.isa != gex_abi::ARCH_NAME {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);
     }
     let (config, _) = Config::load(dir)?;
+    if !config.features_off.is_empty() {
+        crate::features::check(&config.features_off)?;
+        bail!(
+            "user/eject.json: features are switched off ({}), and only a W3 page's build \
+             (docs/eject.md, \"W3 pages\") can leave them out so far",
+            config.features_off.join(", ")
+        );
+    }
     if crate::pe::nt_session(dir)?.is_some() {
         let pe = crate::pe::build(dir, &project, &config)?;
         let rootfs_files = pe.rootfs_files;
