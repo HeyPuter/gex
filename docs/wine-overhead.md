@@ -193,10 +193,13 @@ callers as well.
 
 - **Saves:** 795 W3 system calls per frame on the main thread (about 2 ms
   inclusive), plus the workers' 8k/s.
-- **Slow path:** `WINEGEX_FASTQPC=0`, read once at PE ntdll init. It is
-  also passed by the page's WDBG injection.
-- **Correctness leg:** a tests/w3 program that calls QPC and NtQPC
-  alternately and checks they are monotonic and agree with each other.
+- **Slow path:** none any more. `WINEGEX_FASTQPC=0` served the timed
+  pair and was then removed (wineperf/wine 81f620b5962). One call in
+  `QPC_SAFEPOINT` still makes the system call, so a thread spinning on QPC
+  still reaches a signal safepoint (f23cb427f50).
+- **Correctness leg:** tests/w3/qpc.sh, native and page: QPC and NtQPC
+  called alternately, monotonic, agreeing with each other and, across
+  threads, with `clock_gettime`.
 
 ### F3. GL calls (opengl32, native wasm32): measure before cutting
 
@@ -221,6 +224,10 @@ are:
 
 Batching (W's gl ring) is W's.
 
+**Not taken this round.** Nothing was profiled, so neither (a) nor (b)
+went in. The swap's 9.1 ms per frame is W's async present (327c4f66), not
+the Wine boundary.
+
 ### F4. Not taken (owner noted)
 
 - Worker sleeps and semaphores: they are off the main thread, and the pool
@@ -240,3 +247,90 @@ Batching (W's gl ring) is W's.
    least 1 ms/frame.
 
 Each round ends with the timed Noita world fps against pewasm's 48.1.
+
+## 7. Results
+
+### 7.1 Per call (wbench, tests/w3/thrd.c)
+
+Microbenchmarks, the same tree with the fast and the slow path:
+
+| Path | node (fast vs slow) | Chrome (fast vs slow) |
+|---|---|---|
+| F1 `_Thrd_current`, provider vs `provskip` | 66 vs 6029 ns: 91× faster | 72 vs 13211 ns: 183× faster |
+| F2 QPC, fast vs `WINEGEX_FASTQPC=0` | 305 vs 726 ns: 2.4× faster | 757 vs 1274 ns: 1.7× faster |
+
+The floor (`GetCurrentThreadId`, no call) is about 100 ns in Chrome. Of
+the 757 ns of a fast QPC, about 650 ns was `gex.clock_ns` reading the host
+clock as a BigInt (the `now` import). The shim's clock now reads
+`performance.now()` as an f64 plus a per-Worker origin
+(`host_now_ns`). The values are the same as before (`hostNowNs`).
+
+### 7.2 In game (census, Noita on the page, per world frame)
+
+| | before | after |
+|---|---|---|
+| QPC system calls | 794.7 | 44.8 |
+| NtDuplicateObject | 63.9 | 0 |
+| NtClose | 64.0 | 0.2 |
+
+### 7.3 Timed pairs (edger, pinned)
+
+Noita on the page, edger, pinned (bench.sh's central pinning since 12:47),
+300 s of world frames per run:
+
+| Leg | Tree, Wine | World fps per run | Mean |
+|---|---|---|---|
+| master | master b26b02f0, land/wskern's Wine | 20.7, 22.4 | 21.55 |
+| on | wineperf/m, dist-f (F1, F2, nosig, fixed bases) | 20.0, 22.8 | 21.4 |
+| off | wineperf/m, dist-kb, `provskip=_Thrd_current` | 20.6, 19.2 | 19.9 |
+
+- **On against master:** 0.7% slower (21.4 vs 21.55 world fps). That is
+  inside the in-run spread (8%, 21.5 vs 23.2 for one config), so there is
+  no regression and no measurable gain.
+- **On against off:** 7.5% faster (21.4 vs 19.9 world fps), also inside
+  the spread.
+- **Against pewasm:** 2.25× slower (21.4 vs 48.1 world fps).
+
+The fast paths remove about 4 ms of Wine-boundary work per world frame on
+the main thread (§5), but world fps does not move. The frame is bound
+elsewhere: the main-thread scheduling and the swap are W's.
+
+Two provskip runs (nr-off-1 and nr-off-2) never reached the world: the
+skip changes msvcp120's unit key, and that unit had not been built. Their
+msvcp120 ran tier-1. Those runs are left out.
+
+## 8. DLL placement: fixed bases for Wine's builtins
+
+The server's `assign_map_address` (server/mapping.c) placed DYNAMIC_BASE
+images at system-wide addresses: top-down in [0x60000000, 0x7c000000), in
+the order the processes first mapped them. Every Wine builtin is
+DYNAMIC_BASE (ImageBase 0x10000000, characteristics 0x140), so its base
+changed from run to run. Function-tier units are keyed by image and base,
+so a builtin that moved ran tier-1. When that builtin was msvcp120, Noita
+never reached the world.
+
+Wine's builtins now get fixed bases when they are staged:
+
+- **Table.** `tools/wine-wasm/w3-bases.txt` maps each DLL to a 64 KiB
+  aligned slot. Slots are packed down from 0x7b000000, and the band
+  0x60000000-0x70000000 is skipped: GNU ld's auto-image-base puts MinGW game
+  DLLs there (SDL2 at 0x6c740000). The table is append-only. A new DLL takes
+  the highest free gap, and an existing DLL keeps its slot unless it outgrows
+  it.
+- **Rebase.** `rebase.py apply` (called at the end of `stage-native.sh`)
+  rewrites ImageBase, applies the HIGHLOW relocations, and clears
+  DYNAMIC_BASE, so the loader maps the image at its slot. The native wasm32
+  skeletons (`.wasmref`) are rebased too.
+- **Checks.** `rebase.py check` fails on an overlap, a DLL missing from the
+  table, a slot the DLL outgrew, or a DLL without relocations. After `apply`
+  it also checks that each DLL is at its base with DYNAMIC_BASE cleared.
+  `check --fixed IMAGE...` reports a program's fixed-base images that
+  overlap a slot; the games corpus has none. `tests/w3/bases.sh` runs the
+  check, then bases.exe (native and page), which loads nine builtins and
+  compares their bases with the table.
+- **Server pool.** Under `__wasm32__` the pool is 0x60000000-0x70000000 plus
+  0x7b000000-0x7c000000, clear of the slots. A game's own DYNAMIC_BASE DLLs
+  land there (Noita: fmod 0x7bdc0000, lua51 0x7bf90000) and keep the
+  server's first-mapped order. Base-independent units for those are W's
+  (design A), not this table's.
+
