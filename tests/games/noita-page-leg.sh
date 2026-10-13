@@ -64,11 +64,12 @@ fi
 W=$(cd "${1:?usage: noita-page-leg.sh TREE [--no-build]}" && pwd)
 . ~/gex-sandbox/scratch/env.sh 2>/dev/null
 B=~/gex-sandbox/scratch/bench/bench.sh
-# Baselines (edger, 2026-10-12, master 3a61c3d8 + this leg, three timed
-# runs): 3.6, 3.6 and 3.7 world frames/s over 300 s, the world up at 83-87 s;
-# after the first 30 s slice (about 4.8) every slice is 3.3-3.6. The floor
-# is about 17% below them.
-MIN=${LEG_MIN_WFPS:-3.0}
+# Baselines (edger, 300 s windows, run alternately against master):
+# step/klock-9 7ee38ef2 (the poll family lock-free) 13.1, 16.3 and 16.2
+# world frames/s, the world up at 74-78 s; master 3.2 and 3.4 (2026-10-12,
+# master 3a61c3d8: 3.6, 3.6, 3.7). The floor is about 23% under klock-9's
+# 16.2 median, leaving room for a cold first run like the 13.1.
+MIN=${LEG_MIN_WFPS:-12.5}
 if [ "${2:-}" != "--no-build" ]; then
   mkdir -p $W/web/public/gex
   for s in kernel browser; do
