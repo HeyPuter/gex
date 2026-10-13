@@ -40,6 +40,12 @@ export function bareDesktop(desktop, mount) {
     placed.set(win.key, p);
     win.canvas.style.left = `${p.x}px`;
     win.canvas.style.top = `${p.y}px`;
+    // A placed window's client is told where it now is, in order with the
+    // pointer events after this, which are relative to it: Wine adds it to
+    // them (`gex_window_placement_v1.origin`). Without it Wine adds where it
+    // last asked the window to be, which is a step ahead of here during a
+    // caption drag, and the window shook.
+    if (win.placed) win.place(p.x, p.y);
     // Children follow: a popup's place is its parent's plus its offset.
     for (const w of desktop.windows()) if (w.role !== ROLE_TOPLEVEL && w.parent && !w.placed && keyOfParent(w) === win.key) move(w);
   };

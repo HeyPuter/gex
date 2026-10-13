@@ -474,8 +474,13 @@ pub extern "C" fn hw_input(ptr: u32, count: u32) {
                 }
                 9 => st.client.dismiss_popup(surface),
                 10 => {
+                    // An X window's position, or a placed window's origin
+                    // (see the browser shim's `InputEvent::Moved`).
                     if let Some(xwm) = st.xwm.as_mut() {
                         xwm.moved(surface, q[1], q[2]);
+                    }
+                    if !st.client.is_x11(surface) {
+                        st.client.placement_origin(surface, q[1], q[2]);
                     }
                 }
                 _ => {}

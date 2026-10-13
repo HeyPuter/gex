@@ -471,8 +471,10 @@ const GLOBALS: &[(&str, u32)] = &[
     ("wp_viewporter", 1),
     // Windows with real coordinates: a Win32 window (Wine) says where it is
     // and what it is under, and the compositor shows it there rather than
-    // cascading it. See `protocols/gex-window-placement-v1.xml`.
-    ("gex_window_placement_manager_v1", 1),
+    // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
+    // adds the `origin` event: where the compositor has the surface, for
+    // turning its surface-local pointer positions into Win32's.
+    ("gex_window_placement_manager_v1", 2),
 ];
 
 /// What an object id currently is.
@@ -672,6 +674,9 @@ struct SurfaceState {
     crop: Option<(i32, i32, i32, i32)>,
     /// `gex_window_placement_v1`: where the client put the surface.
     placement: Placement,
+    /// The last `gex_window_placement_v1.origin` sent: where the host has the
+    /// surface, which the pointer positions after it are relative to.
+    origin: Option<(i32, i32)>,
     /// `set_input_region`, pending until commit (`Some(None)`: back to the
     /// whole surface), and the committed region (`None`: the whole surface).
     pending_input: Option<Option<Region>>,
@@ -710,6 +715,9 @@ pub struct Client {
     /// The version this client bound `xdg_wm_base` at, which its toplevels
     /// share: `configure_bounds` is only for 4 and up.
     wm_base_version: u32,
+    /// The version this client bound `gex_window_placement_manager_v1` at,
+    /// which its placement objects share: `origin` is for 2 and up.
+    placement_version: u32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
     /// What each `wl_region` holds.
@@ -779,6 +787,7 @@ impl Client {
             default_size: (640, 480),
             scale: 1,
             wm_base_version: 0,
+            placement_version: 0,
             positioners: HashMap::new(),
             regions: HashMap::new(),
             dirty: false,
@@ -1187,6 +1196,7 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
+                self.placement_version = version.min(2);
             }
             _ => return false,
         }
@@ -2379,6 +2389,8 @@ impl Client {
                     return false;
                 };
                 s.placement.placed = true;
+                // A new placement object has been told no origin yet.
+                s.origin = None;
                 self.objects.insert(id, Object::Placement { surface });
                 self.dirty = true;
                 true
@@ -2400,7 +2412,10 @@ impl Client {
         match opcode {
             // destroy: back to the compositor's own layout.
             0 => {
-                apply(self, &mut |s| s.placement = Placement::default());
+                apply(self, &mut |s| {
+                    s.placement = Placement::default();
+                    s.origin = None;
+                });
                 self.objects.remove(&object);
                 self.delete_id(object);
             }
@@ -2723,6 +2738,37 @@ impl Client {
             .collect();
         out.sort_by_key(|p| p.0);
         out
+    }
+
+    /// Where the host has put a placed surface, in output pixels: the point
+    /// its surface-local pointer positions are relative to from now on.
+    ///
+    /// The client places the window, but the host shows it -- a frame or more
+    /// after the client asked, and pointer events go on arriving meanwhile,
+    /// relative to where the window was *shown*. A client that turns them into
+    /// screen positions with the place it last asked for (Wine does: its
+    /// window rectangle) gets them wrong by however far the window moved in
+    /// between, and a window that follows the pointer (Win32's own caption
+    /// drag) overshoots by its last step, then back: it shakes. Told the
+    /// origin in order with the pointer events, the client adds the right
+    /// one. Only sent when it changes, and only to a client that bound
+    /// version 2 (`gex_window_placement_v1.origin`).
+    pub fn placement_origin(&mut self, surface: u32, x: i32, y: i32) {
+        if self.placement_version < 2 {
+            return;
+        }
+        let Some(obj) = self.objects.iter().find_map(|(id, o)| match o {
+            Object::Placement { surface: s } if *s == surface => Some(*id),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(s) = self.surfaces.get_mut(&surface) else { return };
+        if s.origin == Some((x, y)) {
+            return;
+        }
+        s.origin = Some((x, y));
+        self.send(Writer::new(obj, 0).int(x).int(y));
     }
 
     /// Whether input can be delivered: the client has a pointer and a
@@ -3736,6 +3782,38 @@ mod tests {
         // Destroyed: back to the compositor's layout.
         c.receive(&Writer::new(60, 0).finish(), &[], &pool);
         assert_eq!(c.scene()[0].placement, Placement::default());
+    }
+
+    #[test]
+    fn a_placed_window_is_told_its_origin_once_per_change_at_version_2() {
+        let pool = Placed(0x6000, 8192);
+        for version in [1u32, 2] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            let _ = c.take_outgoing();
+            c.placement_origin(6, 120, 40);
+            c.placement_origin(6, 120, 40);
+            c.placement_origin(6, 160, 70);
+            let origins: Vec<(i32, i32)> = messages(&c.take_outgoing())
+                .iter()
+                .filter(|(o, op, _)| *o == 60 && *op == 0)
+                .map(|m| {
+                    let mut fds = Vec::new();
+                    let mut r = Reader::new(&m.2, &mut fds);
+                    (r.int().unwrap(), r.int().unwrap())
+                })
+                .collect();
+            let want: Vec<(i32, i32)> = if version >= 2 { vec![(120, 40), (160, 70)] } else { vec![] };
+            assert_eq!(origins, want, "bound at version {version}");
+            // A surface without a placement object is told nothing.
+            c.placement_origin(7, 1, 1);
+            assert!(messages(&c.take_outgoing()).is_empty());
+        }
     }
 
     #[test]

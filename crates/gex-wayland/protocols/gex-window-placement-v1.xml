@@ -22,7 +22,7 @@
     same space the client's own window system uses for a single screen.
   </description>
 
-  <interface name="gex_window_placement_manager_v1" version="1">
+  <interface name="gex_window_placement_manager_v1" version="2">
     <request name="destroy" type="destructor">
       <description summary="destroy the manager">
         Placement objects already made are unaffected.
@@ -40,7 +40,7 @@
     </request>
   </interface>
 
-  <interface name="gex_window_placement_v1" version="1">
+  <interface name="gex_window_placement_v1" version="2">
     <enum name="layer">
       <entry name="normal" value="0"/>
       <entry name="topmost" value="1" summary="above every normal window"/>
@@ -100,5 +100,27 @@
         moves the keyboard focus to it (and from whatever had it).
       </description>
     </request>
+
+    <event name="origin" since="2">
+      <description summary="where the compositor shows the surface">
+        The position, in output pixels, of the surface's top-left corner as
+        the compositor currently shows it and hit-tests it. Surface-local
+        pointer positions sent after this event (wl_pointer.enter, motion)
+        are relative to this point, until the next origin event.
+
+        It is not always the position last set: a compositor shows a move
+        some time after the request, and pointer events go on meanwhile,
+        relative to where the surface was. A client turning surface-local
+        positions into its own window system's coordinates adds this
+        origin, not the position it last asked for; one that has not been
+        sent an origin yet adds the position it asked for.
+
+        Sent when the shown position changes, before the pointer events
+        that depend on it. A compositor may never send it, and a client
+        then goes on adding the position it asked for.
+      </description>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </event>
   </interface>
 </protocol>
