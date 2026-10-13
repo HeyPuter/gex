@@ -3892,6 +3892,12 @@ export class Gex {
       // messages): Wine runs its program again as a child, which starts with
       // the door (loader.c `wineserver_relaunch`). None in the SP build.
       door_missing: () => (this.#door || single.on ? 0 : 1),
+      // The session mapping, a block of the server's memory (area +128,
+      // +132), copied from directly by win32u (docs/wineserver-kernel.md
+      // §6.1): the bytes copied, or -1 with no door session; the session's
+      // size for a size of 0.
+      session_copy: (dst, off, size) => this.#sessionCopy(dst >>> 0, off >>> 0, size >>> 0),
+      session_seq: (off) => this.#sessionSeq(off >>> 0),
     };
   }
 
@@ -3936,6 +3942,33 @@ export class Gex {
     this.#env.publishDoor?.(door);
   }
 
+  #sessTr = 0;
+  #sessionCopy(dst, off, size) {
+    const d = this.#door;
+    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] copy ${this.#sessTr} off ${off} size ${size}`);
+    if (!d) return -1;
+    const { u8, dv } = this.#doorView();
+    const base = dv.getUint32(d.area + 128, true), len = dv.getUint32(d.area + 132, true);
+    if (!base || !len) return -1;
+    if (!size) return len;
+    if (off >= len) return -1;
+    const n = Math.min(size, len - off);
+    this.#bytes().set(u8.subarray(base + off, base + off + n), dst);
+    return n;
+  }
+
+  #sessionSeq(off) {
+    const d = this.#door;
+    if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] seq ${this.#sessTr} off ${off} base ${d && this.#doorView().dv.getUint32(d.area + 128, true)}`);
+    const { dv } = this.#doorView();
+    const base = d ? dv.getUint32(d.area + 128, true) : 0;
+    if (!base) return 0n;
+    const at = base + off;
+    // A seqlock's word: whole, as the server stores it (8-aligned).
+    if (!(at & 7)) return Atomics.load(this.#doorView().i64, at / 8);
+    return dv.getBigInt64(at, true);
+  }
+
   /** The door server, from the host (all Workers of the session). */
   setDoor(door) {
     if (this.#door?.id === door?.id) return;
@@ -3949,7 +3982,7 @@ export class Gex {
     const buf = d.memory.buffer;
     let v = this.#doorViews;
     if (!v || v.buf !== buf || v.len !== buf.byteLength) {
-      v = this.#doorViews = { buf, len: buf.byteLength, u8: new Uint8Array(buf), i32: new Int32Array(buf), dv: new DataView(buf) };
+      v = this.#doorViews = { buf, len: buf.byteLength, u8: new Uint8Array(buf), i32: new Int32Array(buf), i64: new BigInt64Array(buf, 0, Math.floor(buf.byteLength / 8)), dv: new DataView(buf) };
     }
     return v;
   }

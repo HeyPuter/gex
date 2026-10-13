@@ -38,6 +38,8 @@ mod area {
     pub const KICK_NEEDED: u32 = 80;
     pub const STATS: u32 = 96;
     pub const PROXIES: u32 = 100;
+    pub const SESSION: u32 = 128;
+    pub const SESSION_SIZE: u32 = 132;
 }
 
 /// A native wasm32 program as installed, by pid (`wasmprog::install`): what
@@ -331,6 +333,38 @@ fn instantiate(engine: &Engine, s: &Arc<Server>) -> Result<Inst> {
         _ => bail!("door: no dispatch function"),
     };
     Ok(Inst { id: s.id, store, dispatch, sp })
+}
+
+/// `gex.session_copy(dst, off, size)`: copies the server's session block
+/// (docs/wineserver-kernel.md §6.1) into the caller; the bytes copied, -1
+/// with no door session, the session's size for a size of 0.
+pub(crate) fn session_copy(caller: &mut Caller<'_, HostState>, dst: u32, off: u32, size: u32) -> Result<i32> {
+    let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(-1) };
+    let (base, len) = (s.get(area::SESSION), s.get(area::SESSION_SIZE));
+    if base == 0 || len == 0 {
+        return Ok(-1);
+    }
+    if size == 0 {
+        return Ok(len as i32);
+    }
+    if off >= len {
+        return Ok(-1);
+    }
+    let n = size.min(len - off) as usize;
+    let cm = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let from = (base + off) as usize;
+    cm.bytes()[dst as usize..dst as usize + n].copy_from_slice(&s.mem.bytes()[from..from + n]);
+    Ok(n as i32)
+}
+
+/// `gex.session_seq(off)`: a seqlock word of the session block, whole.
+pub(crate) fn session_seq(off: u32) -> i64 {
+    let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return 0 };
+    let base = s.get(area::SESSION);
+    if base == 0 {
+        return 0;
+    }
+    gex_atomic::load_u64(s.mem.bytes(), (base + off) as u64).unwrap_or(0) as i64
 }
 
 /// `gex.door_call(req, unix_pid, unix_tid)`: 0 done (reply in `req`), 1 use

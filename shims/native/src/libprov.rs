@@ -449,6 +449,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // Natively every process sees the door once published (one host
     // process): never missing.
     linker.func_wrap(IMPORT_MODULE, "door_missing", || -> i32 { 0 })?;
+    linker.func_wrap(IMPORT_MODULE, "session_copy", |mut caller: Caller<'_, HostState>, dst: i32, off: i32, size: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::session_copy(&mut caller, dst as u32, off as u32, size as u32))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
     // does (`wasmdll`). The image is named by the descriptor it was mapped
