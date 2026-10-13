@@ -942,6 +942,17 @@ pub(crate) fn forget_gone(gone: &[(u64, u64)]) {
     lock(&ELF_PLACED).retain(|(_, _, (lo, hi))| !gone.iter().any(|&(s, e)| s < *hi && *lo < e));
 }
 
+/// `export,export,...` (the page's `?provskip=`): exports every provider
+/// leaves to the guest's own code, as `GEX_PROVIDER_SKIP` natively (A/B and
+/// debugging runs; the units must be built with the same skip). Before the
+/// program starts.
+#[no_mangle]
+pub extern "C" fn gex_provider_skip(ptr: u32, len: u32) {
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
+    gex_cgen::provider::set_skip(spec.trim());
+}
+
 /// `name,name,...` (the page's `?elfunits=`), before the program starts.
 #[no_mangle]
 pub extern "C" fn gex_cgen_elf_units(ptr: u32, len: u32) {

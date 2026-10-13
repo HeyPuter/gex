@@ -1974,6 +1974,10 @@ fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Res
         let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
         install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;
     }
+    // Its export providers, bound after its unit as an NT image's are (and
+    // as the page binds a W3 image's, cgen.rs `place`): Wine's msvcp120
+    // `_Thrd_current`, docs/wine-overhead.md F1.
+    install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
     crate::ftab::catch_up(&mut *caller)?;
     replay_registry(caller)?;
     Ok(())

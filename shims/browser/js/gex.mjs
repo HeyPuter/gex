@@ -1048,6 +1048,8 @@ export class Gex {
   static wasmDlls = '';
   /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
   static elfUnits = '';
+  /** `export,...` (the page's `?provskip=`): exports no provider binds (`GEX_PROVIDER_SKIP`). */
+  static providerSkip = '';
   /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
   static fjitLibs = '';
   static #whySlot = 0;
@@ -3113,6 +3115,13 @@ export class Gex {
       e.gex_fjit_libs(p, b.length);
       e.gex_free?.(p, Math.max(8, b.length));
     }
+    if (Gex.providerSkip && e.gex_provider_skip) {
+      const b = new TextEncoder().encode(Gex.providerSkip);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_provider_skip(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (Gex.elfUnits && e.gex_cgen_elf_units) {
       const b = new TextEncoder().encode(Gex.elfUnits);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
@@ -3301,6 +3310,7 @@ export class Gex {
         ...(prov >= 0 ? {
           // The shim's exports themselves: a wasm-to-wasm call, no JS.
           nt_qpc: e.gex_nt_qpc,
+          clock_ns: e.gex_clock_ns,
           provider_alloc_top: e.gex_provider_alloc_top,
           // Wine's Unix side (W3.1): its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults

@@ -392,6 +392,9 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         caller.data().nt.as_ref().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
+    // `clock_gettime(clk)` in nanoseconds, no kernel lock (W3's PE ntdll's
+    // performance counter, docs/wine-overhead.md F2).
+    linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_time", |_caller: Caller<'_, HostState>, which: i32| -> f64 {
         match which {
             0 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0),
@@ -607,6 +610,9 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         cx.throw(exn)
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
+    // `clock_gettime(clk)` in nanoseconds, no kernel lock (W3's PE ntdll's
+    // performance counter, docs/wine-overhead.md F2).
+    linker.func_wrap(IMPORT_MODULE, "clock_ns", |_caller: Caller<'_, HostState>, clk: i32| -> i64 { gex_kernel::clock_ns(gex_kernel::system_clock, clk as u32 as u64) as i64 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());

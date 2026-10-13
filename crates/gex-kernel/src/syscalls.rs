@@ -859,6 +859,21 @@ pub fn share_monotonic_base(f: fn(u64) -> u64) {
 /// compares them with its own clock -- which only works while the uptime
 /// is under 49.7 days, as it is on real machines; an epoch-based value
 /// (1.8e12 ms) never agrees with its own truncation.
+/// `clock_gettime(clk)` in nanoseconds from `clock`, as [`Kernel`]'s
+/// `sys_clock_gettime` answers it for every clock but the two CPU-time ones
+/// (0 for those): no kernel, no lock. For a host import that reads the
+/// guest's clock directly (`gex.clock_ns`, W3's PE ntdll
+/// NtQueryPerformanceCounter, docs/wine-overhead.md F2), so the value is the
+/// one a system call would give.
+pub fn clock_ns(clock: ClockFn, clk: u64) -> u64 {
+    let (secs, nanos) = match clk {
+        2 | 3 => return 0,
+        c if is_monotonic_clock(c) => monotonic_from(clock()),
+        _ => clock(),
+    };
+    secs * 1_000_000_000 + nanos as u64
+}
+
 fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     use std::sync::atomic::Ordering;
     let mut base = MONOTONIC_BASE.load(Ordering::Relaxed);

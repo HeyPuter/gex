@@ -1317,7 +1317,7 @@ fn install_bundle_remote() {
 const SAFEPOINT_INTERVAL: u32 = 1024;
 
 /// The host's clock, in the shape `gex-kernel` wants.
-fn browser_clock() -> (u64, u32) {
+pub(crate) fn browser_clock() -> (u64, u32) {
     let ns = unsafe { now() } as u64;
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }

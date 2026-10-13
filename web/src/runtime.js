@@ -108,7 +108,7 @@ let kernelBytes = null;
  */
 function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
-  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
+  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
@@ -946,6 +946,8 @@ async function runProgramHere(
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+      // `?provskip=export,...`: exports no provider binds (gex-cgen `set_skip`).
+      providerSkip: globalThis.GEX_PROVIDER_SKIP || undefined,
       // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
       fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,

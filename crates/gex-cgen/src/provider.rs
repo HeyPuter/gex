@@ -31,13 +31,32 @@
 //!
 //! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep);
 //! `GEX_PROVIDER_SKIP=<export>[,<export>...]` leaves those exports to the
-//! guest's own code.
+//! guest's own code (in the browser, which has no environment, the page's
+//! `?provskip=` through [`set_skip`]).
 
 use crate::{header, toolchain};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+/// The exports [`set_skip`] named, in place of `GEX_PROVIDER_SKIP`.
+static SKIP: RwLock<Option<String>> = RwLock::new(None);
+
+/// Leave `list` (`export,export,...`) to the guest's own code, as
+/// `GEX_PROVIDER_SKIP` does: for a host with no environment (the browser's
+/// `?provskip=`). Before any unit key is made, or keys disagree.
+pub fn set_skip(list: &str) {
+    *SKIP.write().unwrap_or_else(|e| e.into_inner()) = Some(list.to_string());
+}
+
+fn skip_list() -> String {
+    match &*SKIP.read().unwrap_or_else(|e| e.into_inner()) {
+        Some(s) => s.clone(),
+        None => std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default(),
+    }
+}
 
 const PRELUDE: &str = include_str!("../providers/provider.h");
 
@@ -178,7 +197,7 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     if binds.is_empty() {
         bail!("provider {name} provides nothing");
     }
-    let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
+    let skip = skip_list();
     // A versioned export is skipped by its bare name too (`memcpy` skips
     // `memcpy@@GLIBC_2.14`).
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e || e.split('@').next() == Some(s)));

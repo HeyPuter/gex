@@ -375,6 +375,8 @@ const host = new ProcessHost({
     // GEX_ELF_UNITS=name,...: shared objects that get their function-tier
     // unit from the cache at the bias they map at (the page's `?elfunits=`).
     elfUnits: process.env.GEX_ELF_UNITS || undefined,
+    // GEX_PROVIDER_SKIP=export,...: as natively (gex-cgen `set_skip`).
+    providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
     // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,
