@@ -132,6 +132,11 @@ for (;;) {
   if (s?.phase === 'done' || s?.phase === 'failed') { why = `the program ended: phase ${s.phase}, status ${s.status} ${s.error ?? ''}`; break; }
   const threw = consoleLines.find((l) => /\[gex\] pid \d+(:\d+)? threw:|execute fault|\[harness\] the page crashed/.test(l));
   if (threw) { why = `a thread died: ${threw.slice(0, 400)}`; break; }
+  // A unit cache without the provider modules (gex.mjs `#cgenProviders`
+  // names them, as cgen.rs `gex_cgen_missing` does the NT shim's trampoline
+  // unit) runs, but slower, or at a crawl that looks like a hang.
+  const lacking = consoleLines.find((l) => /missing unit: /.test(l));
+  if (lacking) { why = `the unit cache is incomplete: ${lacking.replace(/^.*missing unit: /, '').slice(0, 400)}`; break; }
   if (tRun === null && s && s.phase !== 'loading' && s.phase !== 'fetching') tRun = now;
   const n = tRun === null ? 0 : await produced();
   if (steps.length && n >= steps[0].at) {
