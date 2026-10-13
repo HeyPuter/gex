@@ -100,6 +100,7 @@ fn real_main() -> Result<ExitCode> {
         "funcs" => cmd_funcs(&argv[2..]),
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-split" => cmd_cgen_split(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-c" => cmd_cgen_c(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-prefix" => cmd_cgen_prefix(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -2415,6 +2416,72 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
     // The image's indirect-call profile, as its unit build uses it.
     let hints = gex_native::nt_cgen::icall_hints(&image);
     print!("{}", gex_cgen::image::function_c(&dir, at, &read, &hints)?);
+    Ok(())
+}
+
+/// `gexc cgen-split instrument IN OUT`: a unit whose guest functions call
+/// `gexcov.hit(slot)` on entry (recording which ones a run called).
+/// `gexc cgen-split split IN OUTDIR --hot FILE [--cluster function|unit|graph[:KiB]]`:
+/// the unit split by function (gex_cgen::split): OUTDIR/c.wasm (the slots in
+/// FILE, one slot or `a-b` range per line, and a stub for every other) and
+/// OUTDIR/cold/N.wasm per cluster.
+fn cmd_cgen_split(args: &[String]) -> Result<()> {
+    use std::collections::HashSet;
+    let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
+    let pos: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && !(*i > 0 && args[i - 1].starts_with("--")))
+        .map(|(_, a)| a)
+        .collect();
+    let (Some(what), Some(input), Some(out)) = (pos.first(), pos.get(1), pos.get(2)) else {
+        anyhow::bail!("usage: gexc cgen-split instrument IN OUT | split IN OUTDIR --hot FILE [--cluster MODE]");
+    };
+    let wasm = std::fs::read(input).with_context(|| format!("reading {input}"))?;
+    match what.as_str() {
+        "instrument" => {
+            let w = gex_cgen::split::instrument(&wasm)?;
+            std::fs::write(out, &w)?;
+            eprintln!("{input}: instrumented, {} -> {} bytes", wasm.len(), w.len());
+        }
+        "split" => {
+            let hot_file = opt("--hot").context("--hot FILE")?;
+            let how: gex_cgen::split::Clustering = opt("--cluster").as_deref().unwrap_or("graph").parse()?;
+            let mut hot = HashSet::new();
+            for line in std::fs::read_to_string(&hot_file)?.lines() {
+                let l = line.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                match l.split_once('-') {
+                    Some((a, b)) => hot.extend(a.parse::<u32>()?..=b.parse::<u32>()?),
+                    None => {
+                        hot.insert(l.parse::<u32>()?);
+                    }
+                }
+            }
+            let (primary, clusters, of) = gex_cgen::split::split(&wasm, &hot, how)?;
+            let dir = std::path::Path::new(out.as_str());
+            std::fs::create_dir_all(dir.join("cold"))?;
+            // Each slot's cluster, a line each (`-`: the primary's).
+            let text: String = of.iter().map(|c| c.map_or("-\n".to_string(), |c| format!("{c}\n"))).collect();
+            std::fs::write(dir.join("slots.txt"), text)?;
+            std::fs::write(dir.join("c.wasm"), &primary)?;
+            let mut cold = 0usize;
+            for (i, c) in clusters.iter().enumerate() {
+                std::fs::write(dir.join("cold").join(format!("{i}.wasm")), c)?;
+                cold += c.len();
+            }
+            eprintln!(
+                "{input}: {} bytes -> primary {} bytes ({} hot slots), {} clusters, {cold} bytes",
+                wasm.len(),
+                primary.len(),
+                hot.len(),
+                clusters.len()
+            );
+        }
+        other => anyhow::bail!("cgen-split {other}: instrument or split"),
+    }
     Ok(())
 }
 

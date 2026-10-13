@@ -19,7 +19,7 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
-import { runProgram, globalKernel, singleMode } from './runtime.js';
+import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 
@@ -124,6 +124,9 @@ async function begin(opts, base, at, state) {
   globalThis.GEX_PAGE_SEARCH = `?${sq}`;
   globalThis.GEX_ASSET_BASE = base.href;
   setGlobals((k) => sq.get(k), b);
+  // A unit split by function (gex_cgen::split): its Workers decode the cold
+  // clusters they fetch with the same zstd decoder.
+  if (sq.get('cold')) globalThis.GEX_CGEN_ZSTD = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
 
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
@@ -171,6 +174,11 @@ async function begin(opts, base, at, state) {
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
   const fetcher = { pack, zstd, base, state };
   const preloading = b.preload ? preloadUnits(at(b.preload), fetcher, at) : Promise.resolve(null);
+  // The runtime's wasm, compressed in the pack when the site packed it
+  // (plain, the shim alone was 6.6 MB of Paint's download).
+  const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
+    [k, (await packedEntry(url, fetcher)) ? await fetchShared(url, fetcher) : null]))
+    .then((kv) => primeRuntime(Object.fromEntries(kv.filter(([, v]) => v))));
   const trees = [];
   const buffers = [];
   for (const url of b.tar) {
@@ -230,6 +238,7 @@ async function begin(opts, base, at, state) {
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   const preModules = await preloading;
+  await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
   mark('running');

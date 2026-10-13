@@ -106,6 +106,15 @@ pub struct Config {
     /// from the host when a guest first reads them; `"whole"` (the default
     /// for a config without the setting) ships everything.
     pub bundle_split: bool,
+    /// W3 pages: `"cold"`, how the units' code the recording never ran is
+    /// split off (gex_cgen::split): a clustering (`"chunk:256"`, `"graph:64"`,
+    /// `"unit"`, `"function"`; [`gex_cgen::split::Clustering`]) or `"none"`, the
+    /// default for a config without the setting. `"instrument"` builds
+    /// units that report the functions a run calls, for a recording of the
+    /// site to take its coverage from (tools/eject/record-w3.mjs). Each unit keeps the
+    /// functions the recorded run called; the rest are fetched in clusters
+    /// on first call (docs/eject.md, "Cold code").
+    pub cold: Option<String>,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (docs/eject.md,
@@ -131,6 +140,7 @@ impl Default for Config {
             link_groups: Vec::new(),
             features_off: Vec::new(),
             bundle_split: false,
+            cold: None,
             start: "{}".to_string(),
         }
     }
@@ -189,7 +199,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -346,6 +356,16 @@ impl Config {
             Some(Json::Str(x)) if x == "whole" => false,
             Some(Json::Str(x)) if x == "split" => true,
             Some(_) => bail!("{what}: \"bundle\" is \"whole\" or \"split\""),
+        };
+        c.cold = match v.get("cold") {
+            None | Some(Json::Null) => None,
+            Some(Json::Str(x)) if x == "none" => None,
+            Some(Json::Str(x)) if x == "instrument" => Some(x.clone()),
+            Some(Json::Str(x)) => {
+                x.parse::<gex_cgen::split::Clustering>().map_err(|e| anyhow::anyhow!("{what}: \"cold\": {e}"))?;
+                Some(x.clone())
+            }
+            Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"instrument\" or \"none\""),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

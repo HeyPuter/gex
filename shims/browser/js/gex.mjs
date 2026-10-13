@@ -3352,6 +3352,9 @@ export class Gex {
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     };
+    // A unit split by function (gex_cgen::split): its cold clusters' loader,
+    // or the recorder's hit map of an instrumented unit.
+    if (prov < 0 && jit < 0) this.#splitImports(mod, this.#cgenStr(e.gex_cgen_key, u), imports);
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
     // What a door instance needs to run this program again on its memory
@@ -3396,6 +3399,136 @@ export class Gex {
     const ms = performance.now() - tInst;
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
+  }
+
+  /** Each module's imports, as `module.name`. */
+  #modImports = new WeakMap();
+
+  /** The imports a split unit's primary takes beyond a unit's: `gex.cold(c)`,
+   *  which instantiates cold cluster `c` here (its start function fills its
+   *  slots in this Worker's table, and the stub that called goes on to the
+   *  real body); and an instrumented unit's `gexcov.hit(slot)`. */
+  #splitImports(mod, key, imports) {
+    let names = this.#modImports.get(mod);
+    if (!names) {
+      names = new Set(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`));
+      this.#modImports.set(mod, names);
+    }
+    if (names.has('gex.cold')) {
+      const loaded = new Set();
+      imports.gex = { ...imports.gex, cold: (c) => {
+        c >>>= 0;
+        if (loaded.has(c)) throw new Error(`gex-cgen: ${key}: cold cluster ${c} is in, yet its stub ran`);
+        loaded.add(c);
+        const t0 = performance.now();
+        const m = this.#coldModule(key, c);
+        new WebAssembly.Instance(m, { env: imports.env, gex: imports.gex });
+        this.#coldMs += performance.now() - t0;
+      } };
+    }
+    if (names.has('gexcov.hit')) {
+      // A byte per slot: the slot count is the first word of `gex.funcs`.
+      const sec = WebAssembly.Module.customSections(mod, 'gex.funcs')[0];
+      const n = sec ? new DataView(sec).getUint32(0, true) : 65536;
+      imports.gexcov = { hit: this.#covHit(key, n) };
+    }
+  }
+
+  /** Time this Worker spent bringing in cold clusters, and how many. */
+  #coldMs = 0;
+  #coldIndex = new Map();
+
+  /** Cold cluster `c` of the unit `key`, compiled: a sibling's, or fetched
+   *  (a range of `<key>/cold.bin`, by `<key>/cold.json`) and compiled here. */
+  #coldModule(key, c) {
+    const name = `cold:${key}:${c}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    let ix = this.#coldIndex.get(key);
+    if (!ix) {
+      // `cold.idx`: u32 unpacked length, then a zstd frame of u32 n, the n
+      // clusters' compressed lengths, then their unpacked lengths.
+      const b = this.#env.loadFile?.(`${key}/cold.idx`) ?? null;
+      const z = this.#env.zstd;
+      if (!b) throw new Error(`gex-cgen: ${key}: a split unit with no cold.idx`);
+      if (!z) throw new Error(`gex-cgen: ${key}: a split unit, and this Worker has no zstd decoder`);
+      const raw = z.decode(b.subarray(4), new DataView(b.buffer, b.byteOffset, 4).getUint32(0, true));
+      const r = raw.slice();
+      const w = new Uint32Array(r.buffer, 0, r.byteLength >> 2);
+      const n = w[0];
+      const offs = new Float64Array(n + 1);
+      for (let i = 0; i < n; i++) offs[i + 1] = offs[i] + w[1 + i];
+      ix = { n, w, offs };
+      this.#coldIndex.set(key, ix);
+    }
+    if (!(c >= 0 && c < ix.n)) throw new Error(`gex-cgen: ${key}: no cold cluster ${c}`);
+    const off = ix.offs[c], zlen = ix.w[1 + c], len = ix.w[1 + ix.n + c];
+    const t0 = performance.now();
+    let bytes = this.#env.loadRange?.(`${key}/cold.bin`, off, zlen) ?? null;
+    if (!bytes) throw new Error(`gex-cgen: ${key}: cold cluster ${c} (${zlen} bytes at ${off}) could not be read`);
+    const t1 = performance.now();
+    bytes = this.#env.zstd.decode(bytes, len);
+    const t2 = performance.now();
+    mod = new WebAssembly.Module(bytes);
+    const t3 = performance.now();
+    console.warn(`[cold] ${key.slice(0, 16)} ${c}: ${zlen} bytes (${len} unpacked), fetch ${(t1 - t0).toFixed(1)} ms, `
+      + `decode ${(t2 - t1).toFixed(1)} ms, compile ${(t3 - t2).toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
+  /** An instrumented unit's hit map in this Worker (a byte per slot), and the
+   *  slots already said. */
+  #cov = new Map();
+  #covTimer = null;
+  #covHit(key, slots) {
+    let h = this.#cov.get(key);
+    if (!h) {
+      // One memory per Worker for every unit's map (each Memory reserves
+      // address space: one per unit ran a page out of it), at an offset per
+      // unit. (module (import "m" "m" (memory 1)) (import "m" "o" (global i32))
+      //   (func (export "hit") (param i32) local.get 0 global.get 0 i32.add
+      //   i32.const 1 i32.store8))
+      const wasm = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 1, 127, 0,
+        2, 15, 2, 1, 109, 1, 109, 2, 0, 1, 1, 109, 1, 111, 3, 127, 0, 3, 2, 1, 0, 7, 7, 1, 3, 104, 105, 116, 0, 0,
+        10, 14, 1, 12, 0, 32, 0, 35, 0, 106, 65, 1, 58, 0, 0, 11]);
+      this.#covMod ??= new WebAssembly.Module(wasm);
+      this.#covMem ??= new WebAssembly.Memory({ initial: 1 });
+      const off = this.#covUsed;
+      this.#covUsed += slots;
+      const need = Math.ceil(this.#covUsed / 65536) - this.#covMem.buffer.byteLength / 65536;
+      if (need > 0) this.#covMem.grow(need);
+      const inst = new WebAssembly.Instance(this.#covMod, { m: { m: this.#covMem, o: new WebAssembly.Global({ value: 'i32' }, off) } });
+      h = { off, n: slots, hit: inst.exports.hit, said: new Uint8Array(slots) };
+      this.#cov.set(key, h);
+      this.#covTimer ??= setInterval(() => this.covFlush(), 2000);
+    }
+    return h.hit;
+  }
+  #covMod = null;
+  #covAt = 0;
+  #covMem = null;
+  #covUsed = 0;
+
+  /** Say the slots instrumented units were entered at since the last time:
+   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-w3.mjs). */
+  covFlush() {
+    for (const [key, h] of this.#cov) {
+      const m = new Uint8Array(this.#covMem.buffer, h.off, h.n);
+      const runs = [];
+      let a = -1;
+      for (let k = 0; k <= h.n; k++) {
+        const fresh = k < h.n && m[k] && !h.said[k];
+        if (fresh && a < 0) a = k;
+        if (!fresh && a >= 0) {
+          runs.push(a === k - 1 ? `${a}` : `${a}-${k - 1}`);
+          h.said.fill(1, a, k);
+          a = -1;
+        }
+      }
+      if (runs.length) console.warn(`[gex-cov] ${key} ${runs.join(',')}`);
+    }
   }
 
   /** This Worker's stack for stateful providers (one per guest thread, as
@@ -4631,6 +4764,8 @@ export class Gex {
     try {
       return await this.#runLoop(entry, startCtx);
     } finally {
+      // An instrumented unit's hits, before a short-lived process is gone.
+      if (this.#cov.size) this.covFlush();
       Error.stackTraceLimit = limit;
     }
   }
@@ -4646,6 +4781,10 @@ export class Gex {
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
     for (;;) {
+      if (this.#cov.size && performance.now() - this.#covAt > 250) {
+        this.#covAt = performance.now();
+        this.covFlush();
+      }
       if (trappedAt) {
         this.#shim.exports.gex_nt_note_js_ns?.(ctx, (performance.now() - trappedAt) * 1e6);
         trappedAt = 0;
@@ -5574,6 +5713,13 @@ export class Gex {
         const [op, a, b, c, d, x] = r.value;
         v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
       } catch (err) {
+        // A nested loop never yields to the event loop (a Wine thread's
+        // whole life can be one call-out): an instrumented unit's hits go
+        // from here too.
+        if (this.#cov.size && performance.now() - this.#covAt > 250) {
+          this.#covAt = performance.now();
+          this.covFlush();
+        }
         r = g.throw(err);
         continue;
       }

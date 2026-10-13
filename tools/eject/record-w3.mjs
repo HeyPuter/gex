@@ -22,7 +22,7 @@
 // "Untitled - Paint"); --settle: seconds to keep recording after it (5).
 
 import { spawn } from 'node:child_process';
-import { createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
@@ -30,10 +30,10 @@ import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
-const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome'];
+const named = ['--serve', '--port', '--title', '--timeout', '--bundle', '--settle', '--chrome', '--coverage-into'];
 const [url, out] = av.filter((a, i) => !a.startsWith('--') && !named.includes(av[i - 1]));
 if (!url || !out) {
-  console.error('usage: node tools/eject/record-w3.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH]');
+  console.error('usage: node tools/eject/record-w3.mjs URL OUT [--serve DIR] [--port N] [--title RE] [--timeout S] [--bundle PATH] [--settle S] [--chrome PATH] [--coverage-into SESSION]');
   process.exit(2);
 }
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
@@ -97,6 +97,9 @@ const units = new Map();     // key -> { path, hit }
 const processes = new Map(); // main image -> cmdline
 const modules = new Map();   // path -> content key
 const bases = new Map();     // unit key -> load base, for the images without one
+// An instrumented run's function coverage (gex.mjs `covFlush`, units from
+// `gexc cgen-split instrument`): unit key -> the slots entered.
+const coverage = new Map();
 const errors = [];
 browser.on('Runtime.consoleAPICalled', (p) => {
   const t = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
@@ -106,6 +109,13 @@ browser.on('Runtime.consoleAPICalled', (p) => {
     units.set(m[1], { path: m[3], hit: m[2] === 'hit' || !!was?.hit });
   } else if ((m = /^\[gex-record\] process (.*?) :: (.*)$/.exec(t))) {
     processes.set(m[1], m[2]);
+  } else if ((m = /^\[gex-cov\] ([0-9a-f]{64}) (\S+)$/.exec(t))) {
+    let set = coverage.get(m[1]);
+    if (!set) coverage.set(m[1], (set = new Set()));
+    for (const r of m[2].split(',')) {
+      const [a, b] = r.split('-').map(Number);
+      for (let k = a; k <= (b ?? a); k++) set.add(k);
+    }
   } else if ((m = /^\[gex-record\] module (.*) (\S+)$/.exec(t))) {
     modules.set(m[1], m[2]);
   } else {
@@ -159,6 +169,18 @@ const pageUrl = await ev('location.href');
 const opened = JSON.parse((await ev('globalThis.__ntOpened ? __ntOpened().then((p) => JSON.stringify(p), (e) => JSON.stringify({ error: String(e) })) : "null"')) ?? 'null');
 if (opened?.error) console.error(`record-w3: no read set: ${opened.error}`);
 
+/** Sorted slots as `a-b` runs. */
+function runs(v) {
+  const out = [];
+  for (let i = 0; i < v.length;) {
+    let j = i;
+    while (j + 1 < v.length && v[j + 1] === v[j] + 1) j++;
+    out.push(i === j ? `${v[i]}` : `${v[i]}-${v[j]}`);
+    i = j + 1;
+  }
+  return out.join(',');
+}
+
 const session = {
   format: 'gex-w3-session',
   version: 1,
@@ -178,10 +200,32 @@ const session = {
   unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path, ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,
+  // Which functions (slots of each unit's element segment) the run entered,
+  // when its units were instrumented: `a-b` runs.
+  ...(coverage.size ? { coverage: Object.fromEntries([...coverage].map(([k, set]) => [k, runs([...set].sort((x, y) => x - y))])) } : {}),
 };
 writeFileSync(join(out, 'w3-session.json'), `${JSON.stringify(session, null, 2)}\n`);
 console.log(`${out}/w3-session.json: "${title}" at ${atTitle.toFixed(1)} s; ${session.processes.length} processes, `
   + `${session.units.length} units (${session.unit_misses.length} images without one), ${session.modules.length} wasm modules`
   + `${session.files_read ? `, ${session.files_read.length} files read` : ''}`);
+// --coverage-into SESSION: a run of a site built with "cold": "instrument"
+// (docs/eject.md, "Cold code") adds the functions it called to another
+// recording's coverage, the one the project is ejected from.
+if (opt('--coverage-into', null)) {
+  const into = opt('--coverage-into', null);
+  if (!coverage.size) { console.error(`record-w3: no coverage (were the site's units instrumented?); ${into} left as it was`); done(1); }
+  const s = JSON.parse(readFileSync(into, 'utf8'));
+  for (const [k, r] of Object.entries(s.coverage ?? {})) {
+    let set = coverage.get(k);
+    if (!set) coverage.set(k, (set = new Set()));
+    for (const x of r.split(',').filter(Boolean)) {
+      const [a, b] = x.split('-').map(Number);
+      for (let i = a; i <= (b ?? a); i++) set.add(i);
+    }
+  }
+  s.coverage = Object.fromEntries([...coverage].map(([k, set]) => [k, runs([...set].sort((x, y) => x - y))]));
+  writeFileSync(into, `${JSON.stringify(s, null, 2)}\n`);
+  console.log(`${into}: coverage of ${coverage.size} units, ${[...coverage.values()].reduce((a, v) => a + v.size, 0)} functions`);
+}
 if (errors.length) console.log(`record-w3: ${errors.length} console errors, first: ${errors[0]}`);
 done(0);
