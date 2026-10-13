@@ -3428,10 +3428,12 @@ export class Gex {
     // stay i64, with an i32 copy of the table base for its element segment.
     const lowered = libprov && !m64();
     const w64 = m64() || lowered;
-    // A wasm32 program's module is keyed by its bytes (`wasm:`), not its
-    // path: the page keeps those for every process (host.mjs), so a program
-    // run again, by any process, is not compiled again, and a file apt
-    // replaced is not mistaken for the old one.
+    // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
+    // (`wasm:`), not its path: the page keeps those for every process
+    // (host.mjs), so a program run again, by any process, is not compiled
+    // again, and a file apt replaced is not mistaken for the old one. Keyed
+    // by path, winepe.wasm (8.9 MB) was compiled once per Wine process, ten
+    // times for the mspaint demo, each copy of its code resident.
     // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
     // and the bytes copied out only when the page has no module for it.
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
@@ -3443,8 +3445,11 @@ export class Gex {
       if (!this.#sharedModules.has(pkey)) pbytes = pcopy();
     } else if (wasmdll) {
       pbytes = pcopy();
-      if (wasmprog) pkey = `wasm:${moduleContentKey(pbytes)}`;
+      pkey = `wasm:${moduleContentKey(pbytes)}`;
     }
+    // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) collects: the
+    // native wasm32 modules a session ran.
+    if (wasmdll) console.warn(`[gex-record] module ${this.#cgenStr(e.gex_cgen_pmod_file, prov)} ${pkey.slice(5)}`);
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes, pkey)
       : prov >= 0
@@ -4691,6 +4696,10 @@ export class Gex {
   #cgenUnit(u, key, path, t0) {
     const e = this.#shim.exports;
     const got = this.#env.loadUnit?.(key) ?? null;
+    // For gex-eject's W3 recorder: which image each unit is, and which images
+    // had none; and which program this process is, at its main image.
+    console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
+    if (/\.exe$/i.test(path)) console.warn(`[gex-record] process ${path} :: ${this.cmdline}`);
     if (!got) {
       if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
       this.#cgenProviders(u);

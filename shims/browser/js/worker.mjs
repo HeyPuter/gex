@@ -712,6 +712,32 @@ async function handle(msg) {
         },
       );
       if (!entry) throw new Error('the program could not be loaded');
+      // The files are in the kernel's filesystem now, copied. The views here
+      // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for the
+      // mspaint demo), which stays resident while anything views it: let go,
+      // and tell the page so it can let go of its own.
+      if (msg.files) {
+        msg.files = null;
+        msg.elf = null;
+        // A bundle the page moved here rather than shared: freed now, not
+        // whenever this Worker's isolate next collects (one that runs a guest
+        // in wasm may not for the whole session). Not with
+        // `ArrayBuffer.prototype.transfer(0)`: that detaches V8's view, but
+        // the browser's own handle on a buffer that arrived by postMessage
+        // keeps the bytes until that collection (Chromium: 400 MiB stayed
+        // resident either way). Moved again, into a port already closed, the
+        // message is dropped and the bytes with it.
+        const gone = (msg.transfer ?? []).filter((b) => b instanceof ArrayBuffer && !b.detached);
+        if (gone.length && typeof MessageChannel === 'function') {
+          const ch = new MessageChannel();
+          ch.port2.close();
+          ch.port1.postMessage(null, gone);
+          ch.port1.close();
+        }
+        for (const b of gone) if (!b.detached) b.transfer?.(0);
+        msg.transfer = null;
+        port.post({ kind: 'files-loaded' });
+      }
     }
 
     // Statically recompile each object once it proves hot, rather than meeting

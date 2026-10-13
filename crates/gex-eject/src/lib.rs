@@ -30,6 +30,7 @@
 pub mod build;
 pub mod manifest;
 pub mod config;
+pub mod features;
 #[cfg(feature = "build")]
 pub mod decompile;
 #[cfg(feature = "build")]
@@ -45,5 +46,7 @@ pub mod plt;
 pub mod project;
 pub mod run;
 pub mod templates;
+#[cfg(feature = "build")]
+pub mod w3;
 #[cfg(feature = "build")]
 pub mod web;

@@ -3798,7 +3798,7 @@ impl Kernel {
                 // Zeroed, because Linux zeroes it and libc counts on that.
                 let (result, grew) = self.mem.brk_grow(a[0]);
                 if let Some((from, to)) = grew {
-                    let _ = m.zero(from, (to - from) as usize);
+                    let _ = m.zero_dirty(from, (to - from) as usize);
                 }
                 Ok(result)
             }
@@ -6316,12 +6316,12 @@ impl Kernel {
             // which Linux exposes as zero -- but `dst` may be a reused hole
             // holding stale bytes, and only `keep` of them were overwritten.
             if new_len > old_len {
-                m.zero(dst + keep as u64, (new_len - keep as u64) as usize)?;
+                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
             }
         } else if new_len > old_len {
             // Growing in place must expose zeroes, not whatever the guest
             // left behind the last time this range was mapped.
-            m.zero(addr + old_len, (new_len - old_len) as usize)?;
+            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
         }
         Ok(dst)
     }
@@ -6366,7 +6366,7 @@ impl Kernel {
                 .collect();
             for (lo, hi) in anon {
                 if hi > lo {
-                    m.zero(lo, (hi - lo) as usize)?;
+                    m.zero_dirty(lo, (hi - lo) as usize)?;
                 }
             }
         }
@@ -6446,8 +6446,8 @@ impl Kernel {
             }
             let mut tmp = vec![0u8; len as usize];
             let n = file.pread(offset, &mut tmp)? as usize;
-            m.zero(start, len_aligned as usize)?;
             m.write(start, &tmp[..n])?;
+            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
             // An executable file mapping is a shared library arriving: tell the

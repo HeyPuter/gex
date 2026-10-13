@@ -2615,6 +2615,25 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
     }
 }
 
+/// The files something has opened (`TmpFs::opened`), one path a line, at
+/// `at`; their length, or `-ERANGE` with nothing written when `cap` will not
+/// hold them (ask again with more). A recorded run's read set: gex-eject's
+/// bundle split (web/src/fs-opened.js asks).
+#[no_mangle]
+pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let mut b = rootfs().opened().join("\n");
+    if !b.is_empty() {
+        b.push('\n');
+    }
+    if b.len() as u32 > cap {
+        return -34; // ERANGE
+    }
+    if !b.is_empty() {
+        unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+    }
+    b.len() as i32
+}
+
 /// A path's metadata, without opening it -- which matters for a symlink and
 /// for anything an open would refuse.
 #[no_mangle]

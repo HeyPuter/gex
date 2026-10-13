@@ -1,0 +1,42 @@
+// fs-opened.js's Worker: one `k_fs_opened` call against the global kernel.
+// Message in: { module, memory }; out: { paths } or { error }.
+//
+// It runs on the stack slot persist-worker.js uses (above every Worker's), so
+// it is not for a page that persists while it asks: a recording run.
+
+import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
+
+const SCRATCH = 0x1000;
+
+self.onmessage = async (e) => {
+  try {
+    let inst, mem;
+    // The process memory as the kernel build declares it (shared or not).
+    for (const shared of [true, false]) {
+      mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
+      try {
+        inst = await WebAssembly.instantiate(e.data.module, { env: { memory: e.data.memory, process: mem, lazy_fetch: lazyFetch(e.data.memory) } });
+        break;
+      } catch (err) {
+        if (!shared) throw err;
+      }
+    }
+    const k = inst.exports;
+    if (!k.k_fs_opened) throw new Error('this kernel has no k_fs_opened');
+    if (k.k_stack_area && k.__stack_pointer) {
+      k.__stack_pointer.value = (k.k_stack_area() + k.k_stack_count() * k.k_stack_size()) | 0;
+    }
+    for (let cap = 1 << 20; ; cap *= 4) {
+      const need = Math.ceil((SCRATCH + cap) / 65536) - mem.buffer.byteLength / 65536;
+      if (need > 0) mem.grow(need);
+      const n = k.k_fs_opened(SCRATCH, cap);
+      if (n === -34) continue;
+      if (n < 0) throw new Error(`k_fs_opened: ${n}`);
+      const text = new TextDecoder().decode(new Uint8Array(mem.buffer).slice(SCRATCH, SCRATCH + n));
+      self.postMessage({ paths: text.split('\n').filter(Boolean) });
+      return;
+    }
+  } catch (err) {
+    self.postMessage({ error: String(err?.stack ?? err) });
+  }
+};

@@ -443,6 +443,117 @@ guest had since overwritten.
 - Not yet: gex-kernel subsystems behind cargo features (waits for S12's N4,
   as gex-kernel is being edited heavily).
 
+## Features
+
+An ejected build starts as the whole runtime a gex page runs, and
+`user/eject.json` `"features"` takes parts out of it: each is `true` (kept,
+the default) or `false` (left out). The list is `crates/gex-eject/src/
+features.rs`; a feature switched off that no build can remove yet fails the
+build and says why, rather than doing nothing.
+
+| Feature | What it is | Off |
+| --- | --- | --- |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing (`compositor.js`, `compositor-worker.js`, `gpu-device.js`) | each window is its own canvas in the page, laid out by `web/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The page is built with `__GEX_COMPOSITOR__` false (vite `define`, from `GEX_FEATURES_OFF=compositor`), so the code is not in the bundle |
+| `gl` | the guest's OpenGL: Mesa on WebGPU (`gex/gex-wgpu-replay.*`) | the page ships no Mesa |
+| `multiprocess` | more than one guest process | not yet: a W3 program is several processes |
+| `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the shim's translator is not a separate build (kernel and shim feature gating) |
+
+Only a W3 page's build applies them so far; a Linux or NT-layer project
+with a feature off fails its build.
+
+## W3 pages
+
+A W3 program (Wine as native wasm32: every Wine process a guest process
+running `wine`, its PE side in `winepe.wasm`, the Windows images'
+code in function-tier units) runs in the same page (`nt.html`) as any
+demo. Ejecting one makes that page a standalone site, with the features
+the user keeps:
+
+```sh
+# 1. record: run the page to its window (headless Chromium)
+node tools/eject/record-w3.mjs http://127.0.0.1:8000/ rec --serve SITE --bundle mspaint.tar
+# 2. eject: the bundle, the units it used, the runtime, a build step
+gexc eject rec --out mspaint-project --web-src web --unit-cache UNITS --features -compositor
+# 3. build: the page with those features, the site's inputs in build/web
+mspaint-project/build.sh
+# 4. the static site
+node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
+node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
+node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks its windows
+```
+
+- **The recording** (`w3-session.json`) is how the page was started (its
+  `__nt.session`: exe, arguments, environment, working directory, size,
+  page parameters) and what every Worker said in `[gex-record]` lines
+  (gex.mjs): the processes (each one's main image and command line), the
+  units each image used and the images that had none, and the native wasm32
+  modules (`wine`, `winepe.wasm`, wasm DLLs) by content key.
+- **The project** holds the recording (`session/`), the bundle
+  (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
+  browser shim, kernel and seed (`runtime/web/gex/`) and `gex-project.json`
+  (`"kind": "w3"`). `page_source` names the gex checkout's `web/`: the page
+  is built at build time, because the features decide what goes into it.
+- **The build** (`gexc eject build`) runs `web/build-eject-page.sh` with
+  `GEX_FEATURES_OFF`, puts the project's runtime wasm in it, drops what a
+  feature off ships (Mesa for `gl`), checks the bundler really left out
+  what `compositor` off names, and writes `build/web/` (`page/`,
+  `rootfs.tar`, `units/`, `w3.json`: the launch).
+- **The site** (`web/eject-site.mjs`) is the page as plain files, the
+  bundle and the units as `FILE.zst` with a preload list, `pack.json` (their
+  sizes and the build id), the launcher (which starts nt.html as recorded)
+  and the hosting files (`serve.mjs`, `_headers`). There is **no service
+  worker**: the host sends the isolation headers (COOP `same-origin`, COEP
+  `require-corp`), and nt.html (`pack=`) fetches each packed file and
+  decodes it itself, straight into the one buffer that is then moved to
+  pid 1's Worker, which lets go of it once the kernel has the files (moved
+  on to a closed `MessagePort`: `ArrayBuffer.prototype.transfer(0)` alone
+  leaves a buffer that arrived by `postMessage` resident until the Worker
+  collects). The first load is the only one, and one copy of the bundle is
+  resident: the kernel's. The browser's HTTP cache does the caching
+  (`FILE.zst?v=BUILD`).
+
+Everything else is the page as gex runs it: several processes, the
+kernel, run-time translation behind the units.
+
+### The bundle split
+
+A W3 bundle is a whole Wine prefix plus Wine itself: for Paint 2509 files
+(447 MiB), of which a run to the window opens 221. `user/eject.json`
+`"bundle": "split"` (the W3 template's setting; a config without it means
+`"whole"`) ships only those in the site's bundle:
+
+- **Recording:** the kernel marks every file something opens
+  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the page reads the set
+  from a side Worker (`__ntOpened()`, web/src/fs-opened.js) and
+  record-w3.mjs keeps it as the session's `files_read`.
+- **Build:** `gexc eject build` puts that list in build/web/w3.json
+  (`"bundle": {"split": true, "read": [...]}`); a split without a read set
+  (an older recording) fails the build and says so.
+- **Site:** web/eject-site.mjs keeps the read files (and the loader) in
+  rootfs.tar and makes every other file a lazy file (nt-page.js `lazy=`):
+  stored once by content as `project/build/web/lazy/SHA`, listed with its
+  size and time in `lazy.json`. A guest that reads one gets it from the host
+  in 1 MiB ranges, synchronously, the first time; the site's serve.mjs
+  answers ranges (a host without them still works, sending the whole file
+  per read). A lazy file's time is the bundle's (`mtimes=1`: Wine's wineboot
+  rebuilds a prefix whose wine.inf looks newer than its install).
+
+Nothing the program needs is lost: what the recording did not open is a
+fetch away. What it costs is a wait the first time an unrecorded path reads
+a file (Paint's Ctrl+P reads winspool.drv and compstui.dll that way). Record
+the paths users take (for now: run them before the recorder's settle ends)
+to bring them into the bundle.
+
+Paint (the same recording ejected twice, `--strip --prune --dedupe`;
+worldmachine, bench, headless Chromium, 3 alternated runs each):
+
+| | whole | split |
+| --- | --- | --- |
+| download | 76.5 MB | 54.2 MB (29% less) |
+| to the window | 22.0, 22.0, 22.0 s | 21.0, 20.9, 21.1 s (1.0 s sooner) |
+| browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
+| lazy reads to the window | | 0 |
+
 ## Limits
 
 - **Dynamic linking for the recorded program only.** An `execve` of a
@@ -473,4 +584,9 @@ guest had since overwritten.
   runtime-level slim runtime; `--jit-fallback` (off by default).
 - `gexc eject decompile` (M5 item 5): the function tier's C as an editable
   override (the `"entry"` ABI).
-- Waiting: gex-kernel feature gating.
+- Features (`user/eject.json` `"features"`) and W3 pages: `compositor` and
+  `gl` switch; the rest wait for gex-kernel and shim feature gating.
+- The W3 bundle split (`"bundle": "split"`): the files the recorded run
+  opened in the bundle, the rest lazy (Paint: 29% less download, 0.37 GiB
+  less memory, 1.0 s sooner to the window). Not yet: units of only the
+  functions a recording ran (the units are most of what is left).

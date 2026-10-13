@@ -202,11 +202,7 @@ impl<'a> GuestMem<'a> {
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero_dirty", len);
         let r = self.range(addr, len)?;
-        for page in self.view_mut()[r].chunks_mut(4096) {
-            if !page_is_zero(page) {
-                page.fill(0);
-            }
-        }
+        zero_dirty_bytes(&mut self.view_mut()[r]);
         Ok(())
     }
 
@@ -355,6 +351,19 @@ mod tests {
         let b = m.read(0, 0x3000).unwrap();
         assert!(b[0x800..0x1800].iter().all(|&x| x == 0));
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
+    }
+}
+
+/// Zero `b`, writing only the 4 KiB stretches that are not zero already
+/// (counted from the start of `b`). Reading a page the host never touched
+/// costs nothing; writing one, even a zero, commits it -- in the browser a
+/// page of the tab's resident memory that holds nothing. See
+/// [`GuestMem::zero_dirty`].
+pub fn zero_dirty_bytes(b: &mut [u8]) {
+    for page in b.chunks_mut(4096) {
+        if !page_is_zero(page) {
+            page.fill(0);
+        }
     }
 }
 

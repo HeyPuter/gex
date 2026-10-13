@@ -707,11 +707,18 @@ export class DomDesktop {
 
   #attach(win) {
     const c = win.canvas;
-    const at = (e) => ({
-      x: Math.max(0, Math.min(win.width - 1, Math.round(e.offsetX))),
-      y: Math.max(0, Math.min(win.height - 1, Math.round(e.offsetY))),
-      t: Math.round(e.timeStamp),
-    });
+    // Inside the window, except for a placed window while a button holds the
+    // pointer (Wayland's implicit grab): Wine's own move and size loops
+    // (SC_MOVE, SC_SIZE) follow the pointer past the window's edge.
+    const at = (e) => {
+      const x = Math.round(e.offsetX), y = Math.round(e.offsetY);
+      if (win.placed && c.hasPointerCapture?.(e.pointerId)) return { x, y, t: Math.round(e.timeStamp) };
+      return {
+        x: Math.max(0, Math.min(win.width - 1, x)),
+        y: Math.max(0, Math.min(win.height - 1, y)),
+        t: Math.round(e.timeStamp),
+      };
+    };
     c.addEventListener('pointerenter', (e) => {
       this.#pointerOver = win;
       const p = at(e);

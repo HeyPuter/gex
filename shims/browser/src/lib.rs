@@ -4528,7 +4528,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let data = guest_bytes();
     for (seg, from) in program.placements() {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
-        data[a..b].fill(0);
+        // Only what is not zero already: a segment's bss over memory nothing
+        // touched would otherwise be committed, zeroes and all.
+        gex_kernel::zero_dirty_bytes(&mut data[a..b]);
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
         let mut p = 0;
         if seg.readable {
@@ -5839,7 +5841,7 @@ pub extern "C" fn gex_reset_directory() -> u32 {
     let data = guest_bytes();
     let from = gex_abi::DISPATCH_DIR as usize;
     let to = LOW_END as usize;
-    data[from..to].fill(0);
+    gex_kernel::zero_dirty_bytes(&mut data[from..to]);
     let mut gm = GuestMem::new(guest_bytes());
     let mut n = 0u32;
     for (page, base) in &meta.dir_entries {
@@ -8992,7 +8994,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
             let (a, b) = (start as usize, (end as usize).min(live).min(data.len()));
             if a < b {
-                data[a..b].fill(0);
+                // Only the pages the old program wrote: a mapping it reserved
+                // and never touched reads as zero already, and filling it
+                // would commit all of it (the mspaint demo's Wine processes
+                // carried ~80 MiB each of exactly that).
+                gex_kernel::zero_dirty_bytes(&mut data[a..b]);
             }
         }
     }
@@ -9025,7 +9031,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if b > data.len() {
             return 0;
         }
-        data[a..b].fill(0);
+        gex_kernel::zero_dirty_bytes(&mut data[a..b]);
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
         let mut prot = 0;
         if seg.readable {
@@ -9113,7 +9119,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // below it as the previous image had, so a program reading an uninitialised
     // local read the last program's data instead of zero.
     let stack_lo = (gex_abi::STACK_TOP - gex_abi::STACK_SIZE) as usize;
-    data[stack_lo..gex_abi::STACK_TOP as usize].fill(0);
+    gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     h.kernel.mem.insert(
@@ -9129,7 +9135,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed) >= 0 {
         warn_line(&format!("[gex] pid {} dir cleared by exec\n", my_pid()));
     }
-    data[gex_abi::DISPATCH_DIR as usize..LOW_END as usize].fill(0);
+    gex_kernel::zero_dirty_bytes(&mut data[gex_abi::DISPATCH_DIR as usize..LOW_END as usize]);
     // And forget which spans were asked for: `FILL_ASKED` avoids re-asking a
     // span, which is only safe while the fill's answer is reachable -- and
     // clearing the directory above made it unreachable, so a stale mark would
@@ -9714,7 +9720,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             if a >= b {
                 return None;
             }
-            data[a..b].fill(0);
+            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
             let take = (b - a).min(bytes.len().saturating_sub(off as usize));
             data[a..a + take].copy_from_slice(&bytes[off as usize..off as usize + take]);
             h.kernel.mem.insert_from(start, end, prot, &name, Some((path, off)));
@@ -9731,8 +9737,10 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             }
             // Zero first: a page absent from the bitmap was zero in the
             // recording, and this memory is not necessarily untouched -- an
-            // `execve` runs in the Worker that had the previous program.
-            data[a..b].fill(0);
+            // `execve` runs in the Worker that had the previous program. Only
+            // the pages that hold anything, though: a large reservation
+            // restored with a fill came back fully resident.
+            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
             for q in 0..pages {
                 if bitmap[q / 8] & (1 << (q % 8)) == 0 {
                     continue;
