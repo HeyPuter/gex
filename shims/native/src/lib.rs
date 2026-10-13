@@ -3639,6 +3639,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A blocking syscall is run here, with the kernel unlocked, and
             // then finished under the lock again.
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
+                // `GEX_STALL_BT=1`: where in the guest each blocking call was
+                // made, for a stall dump to say what a stuck thread waits in.
+                if stall_on && stall::want_bt() {
+                    let bt = wasmtime::WasmBacktrace::force_capture(&caller);
+                    let names: Vec<&str> = bt.frames().iter().take(20).map(|f| f.func_name().unwrap_or("?")).collect();
+                    stall::blocked(names.join(" < "));
+                }
                 let compositor = caller.data().wayland.clone();
                 let kernel_for_service = Arc::clone(&caller.data().kernel);
                 let service = move |bytes: &mut [u8]| {

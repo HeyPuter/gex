@@ -53,6 +53,8 @@ struct Entry {
     inside: Option<u64>,
     /// That call's canonical number, once the kernel has decoded it.
     call: Option<u64>,
+    /// Where it blocked, when asked for (`want_bt`).
+    bt: Option<String>,
     since: Instant,
     last: u64,
     /// The latest call-out from a unit: target, return address; how many
@@ -87,12 +89,29 @@ pub fn enter(pid: i32, tid: i32, nr: u64) {
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
     e.tid = tid;
     e.pid = pid;
     e.inside = Some(nr);
     e.call = None;
+    e.bt = None;
     e.since = now;
+}
+
+/// `GEX_STALL_BT=1` (with `GEX_WASM_BACKTRACE=1`): keep where each blocking
+/// call was made.
+pub fn want_bt() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_STALL_BT").as_deref() == Ok("1"))
+}
+
+/// The guest frames a thread blocked from (`want_bt`).
+pub fn blocked(frames: String) {
+    let host = HOST_TID.with(|t| *t);
+    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
+        e.bt = Some(frames);
+    }
 }
 
 /// The kernel has decoded the call this thread is in: its canonical number,
@@ -126,6 +145,7 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
         pid: 0,
         inside: None,
         call: None,
+        bt: None,
         since: Instant::now(),
         last: !0,
         co: (0, 0),
@@ -202,8 +222,12 @@ fn dump(why: &str) {
         } else {
             String::new()
         };
+        let bt = match (&e.inside, &e.bt) {
+            (Some(_), Some(bt)) => format!("\n      at {bt}"),
+            _ => String::new(),
+        };
         lines.push((e.pid, e.tid, format!(
-            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}",
+            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}",
             e.pid, e.tid, h, comm(*h), state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
         )));
     }
