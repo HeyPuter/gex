@@ -350,16 +350,15 @@ static int fbq_invalidates(uint32_t opcode) {
    paced on its reply. In the page a synchronous submit is a round trip to
    the compositor's Worker, which is most of what Unity's render thread spent
    its time on. A host without it refuses once, and every batch then goes
-   the waiting way. GEXGL_SYNC_PRESENT=1 never tries. */
+   the waiting way. */
 #define GEXGL_SUBMIT_ASYNC 0xc0086704u
-static int async_refused = -1;
+static int async_refused;
 
 static void flush_async(void) {
     if (!ring || ring->tail == 0) {
         reply_at = 0;
         return;
     }
-    if (async_refused < 0) async_refused = getenv("GEXGL_SYNC_PRESENT") ? 1 : 0;
     if (async_refused) {
         flush();
         return;
@@ -384,6 +383,39 @@ static void flush_async(void) {
     ring->tail = 0;
     ring->reply_len = 0;
     reply_at = 0;
+}
+
+/* A frame's last batch, ending in PRESENT, handed over unwaited
+   (GEX_GL_PRESENT_ASYNC): the result is the frames the surface had shown as
+   of the previous one. 0 when the host has no such call (ENOTTY, once: every
+   later swap then waits -- the native host's way); the batch is then still
+   in the ring for the caller to flush. */
+#define GEXGL_PRESENT_ASYNC 0xc0086705u
+static int present_async_refused;
+
+static int present_async(uint32_t *shown) {
+    if (present_async_refused || !ring) return 0;
+    gexgl_note_submit();
+    const int r = ioctl(gl_fd, GEXGL_PRESENT_ASYNC, ring);
+    if (r < 0) {
+        if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS) {
+            present_async_refused = 1;
+            return 0;
+        }
+        /* EIO: the batch before failed, and this one was not taken. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gexgl: an asynchronous batch failed on the host\n");
+        }
+        *shown = 0;
+    } else {
+        *shown = (uint32_t)r;
+    }
+    ring->tail = 0;
+    ring->reply_len = 0;
+    reply_at = 0;
+    return 1;
 }
 
 /* Start a command. Returns where to write its arguments, having reserved
@@ -3471,10 +3503,23 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
         ++egl_swaps_issued;
         return EGL_TRUE;
     }
-    flush();
-    /* How many frames the page has actually shown. Zero from a decoder that
-       predates this reply, which is why nothing below acts on zero. */
-    const uint32_t shown = reply_u32();
+    /* Paced, the frame still goes without waiting: the pacing is against the
+       frames shown as of the swap before, which the host has finished by
+       now, so one frame more is in flight than with a waited swap. Waiting
+       here made the host's whole frame a stall in the guest's: Noita's main
+       thread spent 13% of its time in this round trip (edger, 2026-10-13). */
+    uint32_t shown;
+    uint32_t in_flight;
+    if (present_async(&shown)) {
+        in_flight = 2;
+    } else {
+        flush();
+        /* How many frames the page has actually shown. Zero from a decoder
+           that predates this reply, which is why nothing below acts on
+           zero. */
+        shown = reply_u32();
+        in_flight = 1;
+    }
     ++egl_swaps_issued;
 
     /* Pacing, which is what swap interval means here.
@@ -3502,7 +3547,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
            sits at 1 for a well-behaved application and briefly at 2 whenever
            the display loop misses a beat. Pacing at 1 cost SuperTuxKart a
            fifth of its frame rate -- 60 down to 48.8 -- for nothing. */
-        const uint32_t slack = (uint32_t)egl_swap_interval + 1u;
+        const uint32_t slack = (uint32_t)egl_swap_interval + in_flight;
         if (ahead > slack) {
             unsigned long micros = (unsigned long)(ahead - slack) * 16667UL;
             /* Capped so a page that stops displaying entirely -- a hidden

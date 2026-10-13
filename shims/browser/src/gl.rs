@@ -17,7 +17,9 @@ extern "C" {
     /// is written back into the buffer, not through the return value.
     fn gl_submit(ring: u32) -> i32;
     /// `gl_submit` without waiting for the batch to run: the page copies the
-    /// ring and returns; the next submit waits for this one first.
+    /// ring and returns; the next submit waits for this one first. Returns
+    /// the frames shown as of this process's previous unwaited batch's
+    /// PRESENT (0 when not known), or negative when that batch failed.
     fn gl_submit_async(ring: u32) -> i32;
 }
 
@@ -45,6 +47,12 @@ pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 /// `GEX_GL_SUBMIT`, not waited for (gex-kernel's NT OpenGL, for a frame's
 /// last batch): one batch in flight at most.
 pub const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
+/// A frame's last batch, ending in PRESENT, not waited for (gexgl's
+/// eglSwapBuffers at a swap interval above 0): `GEX_GL_SUBMIT_ASYNC` whose
+/// result is the frames the surface had shown as of the previous one -- what
+/// the guest paces itself against, a frame later than a waited PRESENT's
+/// reply. A host without it says ENOTTY and the guest waits as before.
+pub const GEX_GL_PRESENT_ASYNC: u64 = 0xc008_6705;
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
 /// `{ kind, id, width, height }` -- this process's window whose pixels the
 /// host draws.
@@ -68,8 +76,9 @@ thread_local! {
     /// (`GEX_GL_SUBMIT_ASYNC`) to finish: the page says, `gex_gl_note_wait_ns`.
     pub(crate) static GL_WAIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// A submit the ioctl took but left for after the kernel's lock
-    /// (`submit_pending`): (ring address, unwaited).
-    static PENDING: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+    /// (`submit_pending`): (ring address, unwaited, a present whose frames
+    /// shown are the call's result).
+    static PENDING: std::cell::Cell<Option<(u32, bool, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -90,13 +99,19 @@ fn submit_now(ring: u32, unwaited: bool) -> i32 {
 /// run the batch, and under the lock every other thread's syscall waited
 /// with it (Muck's main thread spent 39% of its time on KLOCK while the
 /// render thread submitted, mp16). On failure the call's result becomes
-/// -EIO in `ctx`'s rax.
+/// -EIO in `ctx`'s rax; a present's is its frames shown.
 pub(crate) fn submit_pending(ctx_addr: u64) {
-    let Some((ring, unwaited)) = PENDING.with(|p| p.take()) else { return };
-    if submit_now(ring, unwaited) < 0 {
-        let mut m = GuestMem::new(crate::guest_bytes());
-        let _ = m.write_u64(ctx_addr + gex_abi::ctx::x(0) as u64, (-(Errno::EIO.0 as i64)) as u64);
-    }
+    let Some((ring, unwaited, present)) = PENDING.with(|p| p.take()) else { return };
+    let r = submit_now(ring, unwaited);
+    let rax = if r < 0 {
+        -(Errno::EIO.0 as i64)
+    } else if present {
+        r as i64
+    } else {
+        return;
+    };
+    let mut m = GuestMem::new(crate::guest_bytes());
+    let _ = m.write_u64(ctx_addr + gex_abi::ctx::x(0) as u64, rax as u64);
 }
 
 /// From the page's GL bridge: how long a submit waited for the batch before
@@ -143,7 +158,7 @@ impl FileHandle for GlDevice {
         // The request is an `int` in the C library, so every `_IOWR` number
         // arrives sign-extended.
         match request & 0xffff_ffff {
-            GEX_GL_SUBMIT | GEX_GL_SUBMIT_ASYNC => {
+            GEX_GL_SUBMIT | GEX_GL_SUBMIT_ASYNC | GEX_GL_PRESENT_ASYNC => {
                 if !have_gl() {
                     return Some(Err(Errno::ENODEV));
                 }
@@ -152,17 +167,24 @@ impl FileHandle for GlDevice {
                 if m.read(arg, 32).is_err() {
                     return Some(Err(Errno::EFAULT));
                 }
-                let unwaited = request & 0xffff_ffff == GEX_GL_SUBMIT_ASYNC;
+                let present = request & 0xffff_ffff == GEX_GL_PRESENT_ASYNC;
+                let unwaited = present || request & 0xffff_ffff == GEX_GL_SUBMIT_ASYNC;
                 // One left over (a path that did not finish it): now, in order.
-                if let Some((ring, u)) = PENDING.with(|p| p.take()) {
+                if let Some((ring, u, _)) = PENDING.with(|p| p.take()) {
                     submit_now(ring, u);
                 }
                 if DEFER.with(|d| d.get()) {
-                    PENDING.with(|p| p.set(Some((arg as u32, unwaited))));
+                    PENDING.with(|p| p.set(Some((arg as u32, unwaited, present))));
                     return Some(Ok(0));
                 }
                 let r = submit_now(arg as u32, unwaited);
-                Some(if r < 0 { Err(Errno::EIO) } else { Ok(0) })
+                Some(if r < 0 {
+                    Err(Errno::EIO)
+                } else if present {
+                    Ok(r as u64)
+                } else {
+                    Ok(0)
+                })
             }
             GEX_GL_LIMITS => Some(m.write_u32(arg, MAX_BATCH).map(|()| 0)),
             GEX_GL_SURFACE => {
