@@ -1015,6 +1015,20 @@ impl Xwm {
         true
     }
 
+    /// The compositor resized the window (its frame dragged, or maximized):
+    /// the X window is configured to that size, the client gets its
+    /// ConfigureNotify and redraws, and Xwayland's surface follows.
+    pub fn resized(&mut self, surface: u32, w: i32, h: i32) -> bool {
+        let Some(window) = self.window_of(surface) else {
+            return false;
+        };
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        self.configure_window(window, CW_WIDTH | CW_HEIGHT, &[w as u32, h as u32]);
+        true
+    }
+
 }
 
 #[cfg(test)]

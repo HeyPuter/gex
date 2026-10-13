@@ -63,8 +63,10 @@ export const ROLE_POPUP = 2;
 export const ROLE_SUBSURFACE = 3;
 export const ROLE_CURSOR = 4;
 
-/** `R_FLAGS` bits. */
-export const F_MOVE_REQUESTED = 1;
+/** `R_FLAGS` bits (`gex_wayland::SurfaceInfo::flags`). Bit 0 was a move
+ *  request, a flag nobody cleared; a request is now its kind, edges and
+ *  number (bits 3..6 the number, 24..30 the request). */
+export const F_CONFIGURE_PENDING = 4;
 /** The pixels are not at `addr`: the host has them. A client that renders
  *  through the host's OpenGL attaches no buffer -- its frames never come back
  *  to the guest -- so the record says how big the surface is and the

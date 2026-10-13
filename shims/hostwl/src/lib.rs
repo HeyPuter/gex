@@ -450,7 +450,17 @@ pub extern "C" fn hw_input(ptr: u32, count: u32) {
                         }
                     }
                 }
-                7 => st.client.configure(surface, q[1], q[2], q[4] != 0),
+                7 => {
+                    // An X window is sized by the X server, through the
+                    // manager; the activated state is its focus, said above.
+                    let x11 = surface != 0 && st.client.is_x11(surface);
+                    match (x11, st.xwm.as_mut()) {
+                        (true, Some(xwm)) => {
+                            xwm.resized(surface, q[1], q[2]);
+                        }
+                        _ => st.client.configure(surface, q[1], q[2], gex_wayland::configure_states(q[3], q[4])),
+                    }
+                }
                 8 => {
                     // An X window has no xdg_toplevel to close: the manager
                     // asks the client with WM_DELETE_WINDOW.
@@ -520,9 +530,7 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1)
-        | ((info.buffer_scale & 0xff) << 8)
-        | ((info.client_scale & 0xff) << 16);
+    r[16] = info.flags();
     // The X window this surface is, for a GL client that names a drawable.
     r[17] = info.xid as i32;
     let mut n = info.title.len().min(TITLE_BYTES);

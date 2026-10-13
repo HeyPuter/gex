@@ -173,9 +173,17 @@ pub struct SurfaceInfo {
     pub damage: Damage,
     /// The `xdg_toplevel` title, for the decoration the host draws.
     pub title: String,
-    /// The client asked to be moved by the pointer (`xdg_toplevel.move`), which
-    /// is how a client-decorated window is dragged by its own titlebar.
-    pub move_requested: bool,
+    /// The client's last window-management request (`xdg_toplevel.move`,
+    /// `resize`, `set_maximized`, `unset_maximized`), numbered so the host
+    /// acts on each once: a client-decorated window is dragged, resized and
+    /// maximized by its own frame this way.
+    pub request: Request,
+    /// Bumped with every request; the host remembers the last it acted on.
+    pub request_seq: u8,
+    /// A configure has gone out that the client has not acked yet: a host
+    /// resizing interactively sends the next size once this clears, so a
+    /// client that redraws slowly is not buried in configures.
+    pub configure_pending: bool,
     /// An X window, paired to this surface by the compositor's own X window
     /// manager rather than given a role by its client.
     pub x11: bool,
@@ -190,6 +198,53 @@ pub struct SurfaceInfo {
     /// pixels per surface unit. The host draws a surface at
     /// `width * client_scale / buffer_scale` device pixels.
     pub client_scale: i32,
+}
+
+impl SurfaceInfo {
+    /// `R_FLAGS`, as `wl-bridge.mjs` reads it: external (bit 1), a configure
+    /// not yet acked (bit 2), the request's number (bits 3..6), the buffer
+    /// and client scales (bits 8 and 16), and the request itself
+    /// ([`Request::code`], bits 24..30).
+    pub fn flags(&self) -> i32 {
+        (i32::from(self.external) << 1)
+            | (i32::from(self.configure_pending) << 2)
+            | ((i32::from(self.request_seq) & 0xf) << 3)
+            | ((self.buffer_scale & 0xff) << 8)
+            | ((self.client_scale & 0xff) << 16)
+            | (((self.request.code() & 0x7f) as i32) << 24)
+    }
+}
+
+/// An `EV_CONFIGURE`'s states word, with the older activated word folded in.
+pub fn configure_states(states: i32, activated: i32) -> u32 {
+    (states as u32 & !STATE_ACTIVATED) | if activated != 0 { STATE_ACTIVATED } else { 0 }
+}
+
+/// A window-management request a client made of the compositor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Request {
+    #[default]
+    None,
+    /// `xdg_toplevel.move`: drag me by the pointer.
+    Move,
+    /// `xdg_toplevel.resize`: resize me by the pointer, from these edges
+    /// (`xdg_toplevel.resize_edge` bits: 1 top, 2 bottom, 4 left, 8 right).
+    Resize(u8),
+    Maximize,
+    Unmaximize,
+}
+
+impl Request {
+    /// As the host reads it: the kind in bits 0..2, the edges in 3..6.
+    pub fn code(self) -> u32 {
+        match self {
+            Request::None => 0,
+            Request::Move => 1,
+            Request::Resize(edges) => 2 | (u32::from(edges & 0xf) << 3),
+            Request::Maximize => 3,
+            Request::Unmaximize => 4,
+        }
+    }
 }
 
 /// Interfaces the registry advertises, with the version offered. A toolkit
@@ -227,12 +282,25 @@ fn trace_out(s: &str) {
     }
 }
 
+/// A configure's states, as the host passes them (`EV_CONFIGURE`).
+pub const STATE_ACTIVATED: u32 = 1;
+pub const STATE_MAXIMIZED: u32 = 2;
+pub const STATE_RESIZING: u32 = 4;
+
+/// What the host's frame takes from the output, in surface units: a border
+/// on each side, and the title bar over a border at the bottom
+/// (compositor-worker.js `BORDER` 1 and `TITLE_H` 26, in CSS pixels).
+const FRAME_W: i32 = 2;
+const FRAME_H: i32 = 27;
+
 const GLOBALS: &[(&str, u32)] = &[
     ("wl_compositor", 4),
     ("wl_shm", 1),
     ("wl_seat", 5),
     ("wl_output", 3),
-    ("xdg_wm_base", 3),
+    // 4 for `xdg_toplevel.configure_bounds`: the room a window has, so a
+    // client that chooses its own size chooses one that fits.
+    ("xdg_wm_base", 4),
     // GTK expects these during display init; without them it defers/abandons
     // seat setup (never binds wl_seat) and loops on GDK_IS_SEAT. Minimal: their
     // requests are accepted and ignored (no real clipboard/DnD or subsurfaces).
@@ -399,8 +467,14 @@ struct SurfaceState {
     /// margins GTK leaves for its shadows. What the compositor decorates and
     /// hit-tests, when it is set.
     geom: Option<(i32, i32, i32, i32)>,
-    /// `xdg_toplevel.move`: the client wants the pointer to drag its window.
-    move_requested: bool,
+    /// The last window-management request, and its number (see
+    /// [`SurfaceInfo::request`]).
+    request: Request,
+    request_seq: u8,
+    /// The serial of the last configure sent for this surface's role, and of
+    /// the last one the client acked.
+    configure_sent: u32,
+    configure_acked: u32,
     /// This surface is an X11 window, paired with it by the X window manager.
     /// It has no xdg role and never will: rootless Xwayland hands the
     /// compositor bare surfaces and names them over the X connection.
@@ -464,6 +538,9 @@ pub struct Client {
     /// Device pixels per surface unit: what `wl_output.scale` says. A
     /// toplevel's configure is in surface units, so `default_size / scale`.
     scale: i32,
+    /// The version this client bound `xdg_wm_base` at, which its toplevels
+    /// share: `configure_bounds` is only for 4 and up.
+    wm_base_version: u32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
     /// Surfaces whose scene state changed since the host last published it, so
@@ -530,6 +607,7 @@ impl Client {
             next_serial: 1,
             default_size: (640, 480),
             scale: 1,
+            wm_base_version: 0,
             positioners: HashMap::new(),
             dirty: false,
             failed: None,
@@ -546,10 +624,18 @@ impl Client {
         }
     }
 
-    /// The size a toplevel is told to be, fixed and configurable so a test can
-    /// ask for a particular window.
+    /// The output's size in device pixels: what `wl_output` advertises, and
+    /// (less the frame) the room a toplevel is given.
     pub fn set_default_size(&mut self, w: i32, h: i32) {
         self.default_size = (w, h);
+    }
+
+    /// `configure_bounds`: the output in surface units, less the frame the
+    /// host draws around a window (a title bar and a border, `FRAME_*`).
+    fn bounds(&self) -> (i32, i32) {
+        let (w, h) = self.default_size;
+        let k = self.scale.max(1);
+        ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
     }
 
     /// The output scale this client is told (`wl_output.scale`), for a host
@@ -837,13 +923,13 @@ impl Client {
         if opcode != 0 {
             return false;
         }
-        let (Some(name), Some(interface), Some(_version), Some(id)) =
+        let (Some(name), Some(interface), Some(version), Some(id)) =
             (r.uint(), r.string(), r.uint(), r.new_id())
         else {
             return false;
         };
         if Self::tracing() {
-            trace_out(&format!("[wl] bind {interface} v{_version} as {id}"));
+            trace_out(&format!("[wl] bind {interface} v{version} as {id}"));
         }
         let Some((expected, _)) = GLOBALS.get(name as usize - 1) else {
             return false;
@@ -899,9 +985,18 @@ impl Client {
                 self.send(ev);
                 let ev = Writer::new(id, 2);
                 self.send(ev);
+                // Every surface is on this output, the only one: said with
+                // `wl_surface.enter`, which is how a client learns which
+                // output's scale to draw at. Without it foot at scale 2 drew
+                // at 1 and was shown at twice the size it meant.
+                let surfaces: Vec<u32> = self.surfaces.keys().copied().collect();
+                for surface in surfaces {
+                    self.send(Writer::new(surface, 0).object(id));
+                }
             }
             "xdg_wm_base" => {
                 self.objects.insert(id, Object::WmBase);
+                self.wm_base_version = version.min(4);
             }
             "wl_data_device_manager" => {
                 self.objects.insert(id, Object::DataDeviceManager);
@@ -935,6 +1030,15 @@ impl Client {
                 self.surfaces.insert(id, state);
                 if state_is_external(&self.surfaces, id) {
                     self.dirty = true;
+                }
+                // On the output from the start (see the `wl_output` bind).
+                let outputs: Vec<u32> = self
+                    .objects
+                    .iter()
+                    .filter_map(|(o, k)| matches!(k, Object::Output).then_some(*o))
+                    .collect();
+                for output in outputs {
+                    self.send(Writer::new(id, 0).object(output));
                 }
                 true
             }
@@ -1429,13 +1533,12 @@ impl Client {
                     s.role = Role::Toplevel;
                 }
                 self.dirty = true;
-                // A toplevel may not draw until configured, so a size goes out
-                // at once. A real size (not 0x0, "you choose") is what a tiling
-                // compositor sends, and a window that has just appeared is the
-                // active one.
-                let (w, h) = self.default_size;
-                let k = self.scale.max(1);
-                self.send_toplevel_configure(id, object, w / k, h / k, true);
+                // A toplevel may not draw until configured, so a configure goes
+                // out at once: 0x0, "you choose", within the bounds it carries
+                // -- a window opens at the size its program wants, as on any
+                // floating desktop. It used to be told the whole output, so
+                // every window opened screen-sized.
+                self.send_toplevel_configure(id, object, 0, 0, STATE_ACTIVATED);
                 true
             }
             // get_popup(id, parent, positioner)
@@ -1490,8 +1593,13 @@ impl Client {
             }
             // ack_configure(serial)
             4 => {
+                let serial = r.uint().unwrap_or(0);
                 if let Some(s) = self.surfaces.get_mut(&surface) {
                     s.configured = true;
+                    if serial != 0 && serial != s.configure_acked {
+                        s.configure_acked = serial;
+                        self.dirty = true;
+                    }
                 }
                 true
             }
@@ -1544,21 +1652,30 @@ impl Client {
             // (every GTK app) reports a titlebar drag this way, and it is the
             // only way the compositor can know a CSD window is being moved.
             5 => {
-                let surface = self.surface_of_xdg(xdg_surface);
-                if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
-                    s.move_requested = true;
-                }
-                self.dirty = true;
+                self.request(xdg_surface, Request::Move);
                 true
             }
-            // resize(seat, serial, edges): the same for an interactive resize.
-            // The compositor drives resizes from its own frame, so this is
-            // accepted and the drag is not started.
-            6 => true,
-            // set_max_size, set_min_size, set_maximized, unset_maximized,
-            // set_fullscreen, unset_fullscreen, set_minimized -- layout the
-            // compositor decides, so acknowledged and not acted on.
-            7..=13 => true,
+            // resize(seat, serial, edges): the same for an interactive resize,
+            // from the edge or corner of its own frame the client says.
+            6 => {
+                let (Some(_seat), Some(_serial), Some(edges)) = (r.object(), r.uint(), r.uint()) else {
+                    return false;
+                };
+                self.request(xdg_surface, Request::Resize(edges as u8));
+                true
+            }
+            // set_maximized, unset_maximized: a client's own maximize button.
+            9 => {
+                self.request(xdg_surface, Request::Maximize);
+                true
+            }
+            10 => {
+                self.request(xdg_surface, Request::Unmaximize);
+                true
+            }
+            // set_max_size, set_min_size, set_fullscreen, unset_fullscreen,
+            // set_minimized -- acknowledged and not acted on.
+            7 | 8 | 11..=13 => true,
             _ => false,
         }
     }
@@ -1633,21 +1750,33 @@ impl Client {
         xdg_surface: u32,
         w: i32,
         h: i32,
-        activated: bool,
+        states_in: u32,
     ) {
         // The states array is a list of little-endian u32s: 1 maximized,
         // 2 fullscreen, 3 resizing, 4 activated. A window with none of them
         // draws itself as inactive, which is why an app that never gets
         // `activated` looks greyed out and takes no keyboard focus of its own.
         let mut states = Vec::new();
-        if activated {
-            states.extend_from_slice(&4u32.to_le_bytes());
+        for (bit, state) in [(STATE_MAXIMIZED, 1u32), (STATE_RESIZING, 3), (STATE_ACTIVATED, 4)] {
+            if states_in & bit != 0 {
+                states.extend_from_slice(&state.to_le_bytes());
+            }
+        }
+        // The room there is, in surface units, before the configure it goes
+        // with: a client choosing its own size keeps within it.
+        if self.wm_base_version >= 4 {
+            let (bw, bh) = self.bounds();
+            self.send(Writer::new(toplevel, 2).int(bw).int(bh));
         }
         let ev = Writer::new(toplevel, 0).int(w).int(h).array(&states);
         self.send(ev);
         let serial = self.serial();
         let ev = Writer::new(xdg_surface, 0).uint(serial);
         self.send(ev);
+        if let Some(s) = self.surface_of_xdg(xdg_surface).and_then(|k| self.surfaces.get_mut(&k)) {
+            s.configure_sent = serial;
+        }
+        self.dirty = true;
     }
 
     // -- xdg_positioner -----------------------------------------------------
@@ -2061,7 +2190,9 @@ impl Client {
                 // host only reads damage when the serial has moved on.
                 damage: s.damage.unwrap_or_else(Damage::all),
                 title: s.title.clone(),
-                move_requested: s.move_requested,
+                request: s.request,
+                request_seq: s.request_seq,
+                configure_pending: s.configure_sent != 0 && s.configure_sent != s.configure_acked,
                 x11: s.x11,
                 xid: s.xid,
                 external: external.is_some(),
@@ -2089,27 +2220,27 @@ impl Client {
         }
     }
 
-    /// The windows whose clients asked to be dragged (`xdg_toplevel.move`),
-    /// taken once. A client-decorated window reports a titlebar drag this way.
-    pub fn take_move_requests(&mut self) -> Vec<u32> {
-        let mut out = Vec::new();
-        for (id, s) in self.surfaces.iter_mut() {
-            if s.move_requested {
-                s.move_requested = false;
-                out.push(*id);
-            }
+    /// A client asked something of the compositor for this window: recorded
+    /// and numbered for the host, which acts on each number once. (It was a
+    /// flag nobody cleared, so the host started a drag on every scene read
+    /// after a client-decorated window's first move.)
+    fn request(&mut self, xdg_surface: u32, request: Request) {
+        let surface = self.surface_of_xdg(xdg_surface);
+        if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
+            s.request = request;
+            s.request_seq = s.request_seq.wrapping_add(1);
         }
-        out.sort_unstable();
-        out
+        self.dirty = true;
     }
 
-    /// Tell a window what size to be, and whether it has the keyboard. This is
-    /// how a compositor resizes: it configures, and the client redraws to fit.
-    pub fn configure(&mut self, surface: u32, w: i32, h: i32, activated: bool) {
+    /// Tell a window what size to be, and its states (`STATE_*`: active,
+    /// maximized, being resized). This is how a compositor resizes: it
+    /// configures, and the client redraws to fit.
+    pub fn configure(&mut self, surface: u32, w: i32, h: i32, states: u32) {
         let Some((toplevel, xdg)) = self.toplevel_of_surface(surface) else {
             return;
         };
-        self.send_toplevel_configure(toplevel, xdg, w, h, activated);
+        self.send_toplevel_configure(toplevel, xdg, w, h, states);
     }
 
     /// Ask a window to close, the way a titlebar's close button does. The
@@ -3374,6 +3505,72 @@ mod tests {
         // of it lands where the pointer is.
         let x = i32::from_le_bytes([enter[8], enter[9], enter[10], enter[11]]);
         assert_eq!(x, 3 * 256, "the enter's x, in 24.8 fixed point");
+    }
+
+    #[test]
+    fn a_new_window_chooses_its_size_within_the_room_there_is() {
+        // foot opened four screens wide at scale 2: every toplevel was told
+        // the whole output, and no surface was ever said to be on the output,
+        // so foot never learned its scale. Now: wl_surface.enter, then a
+        // first configure of 0x0 ("you choose") with the room as its bounds.
+        let pool = Placed(0x5000, 4096);
+        let mut c = Client::new();
+        c.set_default_size(2560, 1254);
+        c.set_scale(2);
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &pool);
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        for (name, iface, ver, id) in [
+            (1u32, "wl_compositor", 4u32, 3u32),
+            (4, "wl_output", 3, 4),
+            (5, "xdg_wm_base", 4, 5),
+        ] {
+            go(&mut c, Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish());
+        }
+        c.take_outgoing();
+        go(&mut c, Writer::new(3, 0).new_id(6).finish());
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish());
+        go(&mut c, Writer::new(7, 1).new_id(8).finish());
+        let out = messages(&c.take_outgoing());
+        let enter = out.iter().find(|(id, op, _)| *id == 6 && *op == 0).expect("no wl_surface.enter");
+        assert_eq!(u32::from_le_bytes(enter.2[..4].try_into().unwrap()), 4, "entered the wrong output");
+        let at = |op| out.iter().position(|(id, o, _)| *id == 8 && *o == op);
+        let (bounds, configure) = (at(2).expect("no configure_bounds"), at(0).expect("no configure"));
+        assert!(bounds < configure, "the bounds come before the configure they go with");
+        let word = |m: &[u8], i: usize| i32::from_le_bytes(m[i * 4..i * 4 + 4].try_into().unwrap());
+        let b = &out[bounds].2;
+        assert_eq!((word(b, 0), word(b, 1)), (1280 - 2, 627 - 27), "the output less the frame, in surface units");
+        let cfg = &out[configure].2;
+        assert_eq!((word(cfg, 0), word(cfg, 1)), (0, 0), "a new window was given a size instead of choosing one");
+    }
+
+    #[test]
+    fn a_window_asks_to_be_resized_and_the_resize_is_acked() {
+        // placed_window: toplevel 8 on xdg_surface 7, surface 6.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, surface) = placed_window(64, 64, 256);
+        let info = |c: &Client| c.scene().into_iter().find(|s| s.surface == surface).unwrap();
+        let before = info(&c).request_seq;
+        // resize(seat, serial, edges = bottom | right)
+        c.receive(&Writer::new(8, 6).object(1).uint(1).uint(2 | 8).finish(), &[], &pool);
+        let i = info(&c);
+        assert_eq!(i.request, Request::Resize(10));
+        assert_eq!(i.request_seq, before.wrapping_add(1), "each request is numbered");
+        // set_maximized
+        c.receive(&Writer::new(8, 9).finish(), &[], &pool);
+        assert_eq!(info(&c).request, Request::Maximize);
+        // The host answers with a size, being resized: pending until acked.
+        c.take_outgoing();
+        c.configure(surface, 300, 200, STATE_ACTIVATED | STATE_RESIZING);
+        let out = messages(&c.take_outgoing());
+        let (_, _, cfg) = out.iter().find(|(id, op, _)| *id == 8 && *op == 0).expect("no configure");
+        let word = |i: usize| u32::from_le_bytes(cfg[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!((word(0), word(1)), (300, 200));
+        assert_eq!(word(2), 8, "two states");
+        assert_eq!((word(3), word(4)), (3, 4), "resizing, then activated");
+        let (_, _, serial) = out.iter().find(|(id, op, _)| *id == 7 && *op == 0).expect("no xdg_surface.configure");
+        assert!(info(&c).configure_pending, "sent and not acked");
+        c.receive(&Writer::new(7, 4).uint(u32::from_le_bytes(serial[..4].try_into().unwrap())).finish(), &[], &pool);
+        assert!(!info(&c).configure_pending, "acked");
     }
 
     #[test]
