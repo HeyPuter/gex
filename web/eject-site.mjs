@@ -25,7 +25,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -338,6 +338,20 @@ function w3Site() {
     const x = join(work, 'tarx');
     mkdirSync(x, { recursive: true });
     execFileSync('tar', ['-xf', tar, '-C', x]);
+    // A read-only directory (a prefix's Start menu folders, which the shell
+    // reads desktop.ini names from only when read only) is made writable
+    // while files leave it, and packed with its own mode again.
+    const readOnly = [];
+    const unlock = (d) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        const p = join(d, e.name);
+        const mode = statSync(p).mode & 0o7777;
+        if (!(mode & 0o200)) { readOnly.push([p, mode]); chmodSync(p, mode | 0o700); }
+        unlock(p);
+      }
+    };
+    unlock(x);
     if (strip) walk(x, (p) => { if (p.endsWith('.wasm')) copyFileSync(stripped(p), p); });
     if (flag('--prune')) walk(x, (p) => { if (/\.(cwasm|a)$/.test(p)) rmSync(p); });
     if (split) {
@@ -376,7 +390,9 @@ function w3Site() {
     all(x, '');
     const list = join(work, 'tar-list');
     writeFileSync(list, [...dirs, ...[...byHash.values()].flat()].join('\n') + '\n');
+    for (const [p, mode] of readOnly) chmodSync(p, mode);
     execFileSync('tar', ['-C', x, '--no-recursion', '-cf', tar, '-T', list]);
+    for (const [p, mode] of readOnly) chmodSync(p, mode | 0o700);
   }
   // What the split leaves in the bundle (the run's read set) is all the
   // download has of it; nt.json carries the rest's manifest by URL.
