@@ -11,6 +11,8 @@
 // the bytes are copied before the batch runs, so a batch that kills the
 // device is still in the file.
 
+import { pageSearch } from './page-env.js';
+
 const MAGIC = "GEXGLTR\0";
 const FORMAT_VERSION = 1;
 const HEADER_BYTES = 24;
@@ -91,7 +93,7 @@ export class GlCapture {
  * having to offer a download.
  */
 export function captureIfRequested(protocolVersion, width, height, given = null) {
-  const search = globalThis.location?.search;
+  const search = pageSearch();
   const value = given ?? (search
     ? new URLSearchParams(search).get("glcapture")
     : (globalThis.process?.env?.GEX_GLCAPTURE ?? null));

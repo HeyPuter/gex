@@ -13,6 +13,7 @@ pub mod recover;
 pub mod runtime;
 pub mod header;
 pub mod splice;
+pub mod split;
 pub mod standalone;
 pub mod toolchain;
 

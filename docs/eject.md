@@ -33,7 +33,8 @@ prog-project/
   run.sh              the native launcher                           generated
   .gitignore          ignores build/                                generated
   user/               yours                                         created once
-    eject.json          settings: replacements, coverage, arguments
+    eject.json          settings: replacements, coverage, arguments, start() defaults
+    index.html          the web build's page: an example that calls app.mjs's start()
     src/*.c             replacement functions
     files/              extra files for the guest's filesystem
   build/              build output (build.sh)
@@ -368,6 +369,119 @@ user/src/decompiled_ack.c: 1 function of C; bind it in user/eject.json with:
 
 ## The web build (Node and the browser)
 
+The web build is a **library**, not a page. Whatever the project (a Linux
+program, an NT-layer Windows program, a W3 page), the browser half is
+`app.mjs` exporting `start()`, and the page that calls it is the user's.
+`gexc eject` writes an example, `user/index.html`, once and never again:
+
+```html
+<script type="module">
+  import { start } from './app.mjs';
+  const app = await start({ container: document.body });
+  // app.exited (a promise of the exit status), app.kill(), app.resize('fit' | {w, h})
+</script>
+```
+
+plus a line that shows an error. Nothing about the page is special: any
+page that imports `app.mjs` and gives `start()` an element runs the program
+(tests/eject/w3-shell-min.html is a hand-written one, with its own box,
+arguments and onExit). gex's own test page, `web/nt.html`, is a test page
+only: an ejected build never ships or names it. `web/build-eject-page.sh`,
+`gexc eject build` (W3), `gexc eject` (`--web-page`) and
+`web/eject-site.mjs` each fail if their output has or names it.
+
+**`start(options)`** (web/src/app.js) resolves once the program runs, with
+`{ exited, kill(), resize(size), state, describe() }`. It rejects with a
+message when the run cannot start: no cross-origin isolation, no WebGPU for
+a build that draws with it, a download that failed, or an option for a piece
+the build left out (`start({ compositor: true })` on a `"compositor": false`
+build names `"features": {"compositor": true}` in user/eject.json). Options:
+
+| Option | What |
+| --- | --- |
+| `container` / `canvas` | the element the desktop fills (a canvas or a box is made in it), or the canvas to draw into |
+| `size` | `'fit'` (the container's size), `{w, h}` or `'WxH'` |
+| `args` | the program's arguments, an array, instead of the recorded ones |
+| `env` | more environment, `['K=V']` or `{K: V}`; a name given replaces the build's |
+| `cwd`, `exe` | the working directory, the program (a path in the bundle) |
+| `mtimes` | the bundle's file times for the guest |
+| `persist` | `false`, or `{dir, db}`: a guest directory kept in IndexedDB |
+| `strace` | `true` (every process) or a pid |
+| `trapstack` | a trap's wasm frames |
+| `debug` | any other runtime switch, `{name: value}` (the table below) |
+| `compositor`, `gl`, `translation`, `hostx`, `mem64` | `true` asks for a runtime piece (an error if the build left it out); `compositor: false` draws the windows straight into the page in a build that has both |
+| `onLog(text)`, `onExit(status)` | the program's terminal output; its exit |
+| `onProgress(p)` | the start-up's progress, for the page's loading screen (below); none by default |
+| `ready` | `'frame'` (the default): the start-up is over at the first frame shown; `'manual'`: when the page calls the handle's `ready()` |
+| `baseUrl` | where app.mjs's files are (default: beside app.mjs) |
+
+**The loading screen.** The library draws nothing over the desktop while it
+starts; it says how far along it is, and the page draws that.
+`onProgress(p)` is called whenever the start-up moves (a few times a second
+at most while bytes arrive, at once on a phase change), and the handle's
+`state.progress` holds the same, for a page that polls:
+
+| `p.` | What |
+| --- | --- |
+| `phase` | `'download'`, `'compile'`, `'boot'`, `'first-frame'`, `'ready'`, in that order and never back; then `'exited'` or `'failed'` |
+| `download` | `{done, total}` bytes as sent (compressed), `{filesDone, files}` |
+| `compile` | `{done, total}` units compiled ahead (they compile as they arrive) |
+| `at` | each phase's start, ms since `start()` |
+| `elapsed` | ms since `start()`, at this call |
+| `error` | with `'failed'`: why |
+| `fetch` | after the start, what the program is fetching, or `null` when nothing is in flight (the phase stays `'ready'`): `{kind, name, done, total, inflight}`. `kind` `'file'`: a lazy file (`"bundle": "split"`), `name` its file name, `done` its bytes read so far, `total` its size. `kind` `'code'`: a unit of translated code, `name` the module it is for (`''` if not known), `done` its bytes once in, `total` 0. `inflight`: how many fetches are under way. The page decides what to show; the example page shows one line in a corner |
+
+`'boot'` is the program's first process started, `'first-frame'` a
+window's first pixels in the page. `'ready'` is the first frame unless the
+build's `"start": {"ready": "manual"}` or the page's `ready: 'manual'` says
+the page decides: a program whose first window is a splash, or Windows'
+desktop, which paints its wallpaper long before its taskbar, calls
+`handle.ready()` when what it waits for is there (`describe()` says what
+the windows are). The example page's loading screen (user/index.html) is
+one way to draw it.
+
+The library never reads the page's URL: the runtime's switches come from
+these options (`GEX_PAGE_SEARCH`, web/src/page-env.js), and its files from
+`baseUrl` (`GEX_ASSET_BASE`), so a site can live under any path.
+
+**Build or start.** What changes the build's output (its wasm, its bundle,
+what ships) is `user/eject.json`, at build time. Everything else is a
+`start()` option, whose default the build records: user/eject.json
+`"start"` (`args`, `env`, `cwd`, `size`, `mtimes`, `strace`, `trapstack`,
+`persist`, `ready`) over the recording's, and the page's options over both. A
+`"start"` key for a build setting (`"compositor"`, say) fails the build and
+says where it goes. Each of gex's test page's parameters, and where it went:
+
+| nt.html parameter | Side | Why |
+| --- | --- | --- |
+| `tar`, `lazy`, `pack`, `preload`, `zstd` | build | the bundle, its split, its packing and the preload list are what the site ships (`"bundle"`) |
+| `cgen`, `cgenurl`, `unguarded`, `elfunits`, `wasmdlls`, `pins`, `dense`, `unitcache` | build | the units and providers: which wasm runs |
+| `aot`, `fjit`, `fjitlibs` | build | run-time translation or not (`"translation"`); `start({ translation: true })` only where the build has it |
+| `compositor` | build | `"features"`: the scene compositor in or out; `start({ compositor: false })` may still choose the bare desktop |
+| `gl`, `glbackend` | build | `"features": {"gl"}`: Mesa shipped or not (wgpu is the only backend) |
+| `hostx` | build | ships Xwayland |
+| `mem64` | build | a different shim, seed and kernel |
+| `exe`, `args`, `argv`, `env`, `cwd` | start | how the program starts; nothing in the build changes (`exe`, `args`, `env`, `cwd`) |
+| `size` | start | the desktop's size (`size`; `resize()` later) |
+| `mtimes` | start | file times for the guest (`mtimes`) |
+| `persist`, `persistdb` | start | saves in IndexedDB (`persist`) |
+| `persistms` | start | `debug.persistms` |
+| `strace`, `stracepid`, `trapstack` | start | traces (`strace`, `trapstack`) |
+| `direct`, `present`, `pointerlock`, `gllimits`, `mesaenv`, `wgslcache`, `glcapture`, `wgpustats`, `gltrace`, `glcanvas`, `sharetrace`, `xverbose`, `libs`, `single` | start | presentation and diagnostics: `debug.NAME` |
+| `exittrace`, `callouttrace`, `heartbeat`, `doorstats`, `densedebug`, `tracemisses`, `attachtrace`, `liftmax`, `t1fold`, `xlatereport`, `inlinedispatch` | start | runtime diagnostics: `debug.NAME` |
+
+**Where it lives.** A W3 or NT-layer project's library is
+`web/build-eject-page.sh`'s output (app.mjs, its chunks under assets/, the
+runtime's wasm under gex/, the zstd decoder under vendor/): `build/web/page`
+(W3) or `runtime/web/page` (NT layer, `--web-page`). It reads the build's
+launch file, `project/build/web/nt.json` beside it. `web/eject-site.mjs` lays
+a site out that way (the page at `/`, the library beside it, the project's
+files under `project/`), and so does the project's own `serve.mjs`. A Linux
+program's `app.mjs` (generated, the single-Worker runtime below) has the same
+`start()`, and its `serve.mjs` serves user/index.html at `/`.
+
+### A Linux program's web build
+
 `gexc eject ... --web-shim gex_browser.wasm` vendors gex's browser runtime
 into `runtime/web/`: the shim you give it (built from the same source, for
 the same guest: `shims/browser`, `wasm32-unknown-unknown`, with
@@ -387,8 +501,13 @@ Launchers, sharing `runtime/web/eject.mjs`:
 
 ```sh
 node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]   # Node
-node serve.mjs 8000        # then open http://localhost:8000/?args=5
+node serve.mjs 8000        # then open http://localhost:8000/ (user/index.html)
 ```
+
+`app.mjs`'s `start()` takes `container` (its output goes to a `<pre>` there
+unless `onLog`), `args`, `env`, `cwd`, `strace`, `translation` (the JIT
+fallback), `onExit`; `kill()` stops waiting for and hearing the run (it is
+on the page's thread), `resize()` does nothing (a terminal program).
 
 The page needs cross-origin isolation (gex's runtime uses
 `SharedArrayBuffer`); `serve.mjs` sends the two headers. Replacements run
@@ -400,7 +519,8 @@ not link to the shim's plain one (checked at build).
 Checked on both guests in Node (`run.mjs`, JIT off): the corpus kernels,
 static gzip and, on x86-64, the host's dynamically linked glibc
 gzip, and a program whose whole library is swapped for wasm. Checked in
-headless Chromium: the `ack` page, with arguments.
+headless Chromium: the `ack` page, with arguments, and
+(`tests/eject/elf-page.mjs`, 2026-10-13) the example page over `app.mjs`.
 
 **Limits of the web build:**
 
@@ -465,9 +585,9 @@ with a feature off fails its build.
 
 A W3 program (Wine as native wasm32: every Wine process a guest process
 running `wine`, its PE side in `winepe.wasm`, the Windows images'
-code in function-tier units) runs in the same page (`nt.html`) as any
-demo. Ejecting one makes that page a standalone site, with the features
-the user keeps:
+code in function-tier units) runs on the same runtime as any demo.
+Ejecting one makes it the app library (above), built with the features the
+user keeps, and a standalone site around the project's page:
 
 ```sh
 # 1. record: run the page to its window (headless Chromium)
@@ -480,6 +600,7 @@ mspaint-project/build.sh
 node web/eject-site.mjs mspaint-project site --strip --prune --dedupe
 node tests/eject/w3-page.mjs site      # the leg: it reaches "Untitled - Paint"
 node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks its windows
+node tests/eject/w3-page.mjs site --shell tests/eject/w3-shell-min.html   # a hand-written page
 ```
 
 - **The recording** (`w3-session.json`) is how the page was started (its
@@ -491,19 +612,21 @@ node tests/eject/w3-page.mjs site --placed   # and Wine moves, sizes and stacks 
 - **The project** holds the recording (`session/`), the bundle
   (`bundle/rootfs.tar`, hash checked), the units (`units/KEY/`), the
   browser shim, kernel and seed (`runtime/web/gex/`) and `gex-project.json`
-  (`"kind": "w3"`). `page_source` names the gex checkout's `web/`: the page
-  is built at build time, because the features decide what goes into it.
+  (`"kind": "w3"`), and the page, `user/index.html` (written once, the
+  user's). `page_source` names the gex checkout's `web/`: the library is
+  built at build time, because the features decide what goes into it.
 - **The build** (`gexc eject build`) runs `web/build-eject-page.sh` with
   `GEX_FEATURES_OFF`, puts the project's runtime wasm in it, drops what a
   feature off ships (Mesa for `gl`), checks the bundler really left out
-  what `compositor` off names, and writes `build/web/` (`page/`,
-  `rootfs.tar`, `units/`, `w3.json`: the launch).
-- **The site** (`web/eject-site.mjs`) is the page as plain files, the
-  bundle and the units as `FILE.zst` with a preload list, `pack.json` (their
-  sizes and the build id), the launcher (which starts nt.html as recorded)
-  and the hosting files (`serve.mjs`, `_headers`). There is **no service
-  worker**: the host sends the isolation headers (COOP `same-origin`, COEP
-  `require-corp`), and nt.html (`pack=`) fetches each packed file and
+  what `compositor` off names, checks the library has no test page in it,
+  and writes `build/web/` (`page/`: the app library, `rootfs.tar`, `units/`,
+  `w3.json`: the launch, with user/eject.json `"start"`).
+- **The site** (`web/eject-site.mjs`) is the project's page at `/`
+  (user/index.html), the app library as plain files, the bundle and the
+  units as `FILE.zst` with a preload list, `pack.json` (their sizes and the
+  build id) and the hosting files (`serve.mjs`, `_headers`). There is **no
+  service worker**: the host sends the isolation headers (COOP
+  `same-origin`, COEP `require-corp`), and the library fetches each packed file and
   decodes it itself, straight into the one buffer that is then moved to
   pid 1's Worker, which lets go of it once the kernel has the files (moved
   on to a closed `MessagePort`: `ArrayBuffer.prototype.transfer(0)` alone
@@ -523,14 +646,14 @@ A W3 bundle is a whole Wine prefix plus Wine itself: for Paint 2509 files
 `"whole"`) ships only those in the site's bundle:
 
 - **Recording:** the kernel marks every file something opens
-  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the page reads the set
+  (`TmpFs::opened`, `k_fs_opened` in shims/kernel), the test page reads the set
   from a side Worker (`__ntOpened()`, web/src/fs-opened.js) and
   record-w3.mjs keeps it as the session's `files_read`.
 - **Build:** `gexc eject build` puts that list in build/web/w3.json
   (`"bundle": {"split": true, "read": [...]}`); a split without a read set
   (an older recording) fails the build and says so.
 - **Site:** web/eject-site.mjs keeps the read files (and the loader) in
-  rootfs.tar and makes every other file a lazy file (nt-page.js `lazy=`):
+  rootfs.tar and makes every other file a lazy file (app.js `lazy`):
   stored once by content as `project/build/web/lazy/SHA`, listed with its
   size and time in `lazy.json`. A guest that reads one gets it from the host
   in 1 MiB ranges, synchronously, the first time; the site's serve.mjs
@@ -553,6 +676,85 @@ worldmachine, bench, headless Chromium, 3 alternated runs each):
 | to the window | 22.0, 22.0, 22.0 s | 21.0, 20.9, 21.1 s (1.0 s sooner) |
 | browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
 | lazy reads to the window | | 0 |
+
+### Cold code
+
+A unit holds every function of its image, and a run to the window calls
+about one in twelve of them (Paint: 10,040 of 116,343 across 59 units).
+`user/eject.json` `"cold"` (the W3 template's is `"chunk:256"`; a config
+without it means `"none"`) ships only those functions up front. The rest
+are fetched the first time something calls one. Everything is still
+compiled ahead of time at build time, and nothing is lifted in the page.
+
+- **Coverage.** Build with `"cold": "instrument"`. Every guest function of
+  every unit then calls `gexcov.hit(slot)` on entry (`gexc cgen-split
+  instrument`), and gex.mjs flushes the slots hit as `[gex-cov]` lines.
+  Record that site with `record-w3.mjs URL OUT --serve SITE --coverage-into
+  REC/w3-session.json`, which adds the run's functions to the recording the
+  project is ejected from. Runs add up: record the paths users take. Then
+  eject again (`gexc eject REC ...`; user/ is kept) and set the clustering.
+- **Build.** For each unit, `gexc eject build` keeps the functions in the
+  recording's `coverage` in its primary module. Every other slot gets a
+  stub that calls `gex.cold(cluster)` and then tail-calls its own table
+  slot. The other functions go into cluster modules `cold/N.wasm`
+  (gex_cgen::split). Each cluster module is a PIC module with the
+  primary's imports. It fills its slots with `table.init` from a passive
+  segment. A direct call from one module to a function in another becomes
+  a `call_indirect` through the slot. The entry list does not change, so
+  the shim sees the same unit.
+- **Site.** web/eject-site.mjs packs each unit's clusters into `cold.bin`,
+  one zstd frame per cluster, plus `cold.idx`, a zstd-packed list of frame
+  and unpacked lengths. On a cluster's first call the Worker reads the
+  index once per unit, fetches the frame with a synchronous Range request,
+  decodes it with zstddec, compiles it, shares the Module with its
+  siblings and instantiates it into the table. The Worker that runs the
+  call blocks for that time, as for a lazy file.
+
+Clustering (`gex_cgen::split::Clustering`) sets how much one fetch brings:
+
+- `function`: each cold function is its own module.
+- `graph[:KiB]`: the cold functions a root reaches by direct calls.
+- `chunk[:KiB]`: consecutive cold functions by address, up to that much
+  code. An image's code from one source file sits together, so a dialog's
+  functions mostly come as a few chunks.
+- `graphchunk[:KiB]`: the graph's clusters, then packed by address.
+- `unit`: all of a unit's cold code in one module.
+
+Paint's first use of three cold features, from the action to the dialog's
+window, with the same recording and hot set in every split site
+(worldmachine, bench, headless Chromium, localhost, 3 alternated runs each):
+
+| | whole | chunk:256 | chunk:64 | graph:64 |
+| --- | --- | --- | --- | --- |
+| download (units) | 30.0 MB | 4.37 MB | 4.38 MB | 4.52 MB |
+| cold, fetched on use | | 31.2 MB, 619 clusters | 35.2 MB, 2406 | 79.7 MB, 77,874 |
+| to the window | 16.4, 16.4, 16.1 s | 16.5, 16.5, 16.4 s | 16.5, 16.2, 16.5 s | 16.8, 16.7, 16.7 s |
+| Resize/Skew (Ctrl+W) | 594, 508, 516 ms | 799, 686, 698 ms (34 fetches, 1.9 MB) | 767, 764, 764 ms (46, 0.7 MB) | 944, 955, 1042 ms (105, 0.2 MB) |
+| Open (Ctrl+O) | 1865, 1506, 1976 ms | 2269, 2147, 2253 ms (34, 1.6 MB) | 2542, 2478, 2582 ms (95, 1.4 MB) | 3833, 3818, 3855 ms (340, 1.0 MB) |
+| Print (Ctrl+P) | 994, 1020, 995 ms | 1010, 1009, 1062 ms (6, 0.4 MB) | 995, 1059, 1066 ms (10, 0.2 MB) | 1094, 1004, 988 ms (22, 0.07 MB) |
+
+On localhost a fetch costs 4-6 ms: Range, decode, compile. On a real
+network it costs a round trip, so the number of fetches decides the wait.
+Computed from an instrumented run's per-action coverage, modelled as
+(round trip + 1 ms) per fetch plus bytes at 50 Mbit/s:
+
+| clustering | clusters | cold MB | Open: fetches, MB | Open at 3 ms / 50 ms round trip |
+| --- | --- | --- | --- | --- |
+| function | 106,303 | 94.1 | 788, 0.98 | 3.3 s / 40.3 s |
+| graph:64 | 77,874 | 79.7 | 424, 1.36 | 1.9 s / 21.8 s |
+| chunk:64 | 2406 | 35.2 | 149, 2.35 | 1.0 s / 8.0 s |
+| chunk:256 | 619 | 31.2 | 71, 3.97 | 0.9 s / 4.3 s |
+| chunk:1024 | 181 | 28.7 | 31, 5.98 | 1.1 s / 2.5 s |
+| unit | 59 | 26.1 | 11, 13.4 | 2.2 s / 2.7 s |
+
+Fetching per function is too chatty: the Open dialog alone calls 788 cold
+functions. The call graph alone hardly helps either, because most calls
+between them go through tables (vtables, callbacks) that the direct-call
+graph cannot see. Grouping by address keeps the fetch count low and still
+compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
+`chunk:256` is the default. Behind a slow link, `chunk:1024` makes fewer
+round trips. A function the recording missed at startup is a fetch, too:
+add runs to the coverage.
 
 ## Limits
 

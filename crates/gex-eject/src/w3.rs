@@ -168,6 +168,10 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         // The files the run opened (the recorder's `files_read`; null from an
         // older recorder): what `"bundle": "split"` keeps in the bundle.
         ("files_read", v.get("files_read").cloned().unwrap_or(Json::Null)),
+        // The functions the run called, per unit (the recorder's `coverage`,
+        // from instrumented units: key -> slot ranges; null without): what
+        // `"cold"` keeps in each unit's primary module.
+        ("coverage", v.get("coverage").cloned().unwrap_or(Json::Null)),
         ("page_source", s(web_src.display().to_string())),
         ("session", s(sha256(text.as_bytes()))),
     ]);
@@ -177,6 +181,8 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
     if !out.join(crate::config::CONFIG_FILE).exists() {
         write_file(&out.join(crate::config::CONFIG_FILE), template(&o.features_off).as_bytes(), false)?;
     }
+    // The page: the user's, an example to start from (app.mjs's start()).
+    crate::web::write_shell(out)?;
     Ok(sum)
 }
 
@@ -199,13 +205,20 @@ fn template(off: &[String]) -> String {
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
                first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
-               \"The bundle split\"."),
+               \"The bundle split\". \"cold\": how each unit's code the recording never ran is \
+               split off and fetched on first call (a clustering, \"instrument\" to build units \
+               that record the functions a run calls, or \"none\"); see docs/eject.md, \"Cold code\". \
+               \"start\": defaults for the app library's start() \
+               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
+               recording's; the page's own options win (docs/eject.md, \"The web build\")."),
         ),
         (
             "features",
             obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(!off.iter().any(|x| x == f.name)))).collect()),
         ),
         ("bundle", s("split")),
+        ("cold", s(COLD_DEFAULT)),
+        ("start", obj(vec![])),
     ]))
 }
 
@@ -215,6 +228,25 @@ pub struct W3Report {
     pub page_files: usize,
     pub units: usize,
 }
+
+/// Slot ranges, `a-b,c,...` (the recorder's coverage of one unit).
+fn slot_ranges(r: &str) -> Result<std::collections::HashSet<u32>> {
+    let mut hot = std::collections::HashSet::new();
+    for x in r.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        match x.split_once('-') {
+            Some((a, b)) => hot.extend(a.parse::<u32>()?..=b.parse::<u32>()?),
+            None => {
+                hot.insert(x.parse::<u32>()?);
+            }
+        }
+    }
+    Ok(hot)
+}
+
+/// A new W3 project's `"cold"`: clusters of consecutive cold functions, up to
+/// 256 KiB of code each (docs/eject.md, "Cold code", has the trade-off). A
+/// recording without coverage builds whole units under it (said, not refused).
+const COLD_DEFAULT: &str = "chunk:256";
 
 /// `gexc eject build PROJECT` for a W3 project.
 pub fn build(dir: &Path) -> Result<W3Report> {
@@ -270,6 +302,10 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             }
         }
     }
+    if !page.join("app.mjs").is_file() {
+        bail!("{}/build-eject-page.sh made no app.mjs (an older gex checkout? the page is the app library now)", src.display());
+    }
+    crate::web::check_no_test_page(&page)?;
     let mut page_files = 0;
     let mut stack = vec![page.clone()];
     while let Some(d) = stack.pop() {
@@ -283,14 +319,52 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         }
     }
 
-    // The bundle and the units, as they are.
+    // The bundle and the units: as they are, or with `"cold"` each unit's
+    // primary (the functions the run called, a stub for every other) and
+    // its cold clusters, `cold/N.wasm` (web/eject-site.mjs packs them).
     link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
     let units = list(&v, "units");
+    let instrument = config.cold.as_deref() == Some("instrument");
+    let coverage = match (&config.cold, v.get("coverage")) {
+        (None, _) => None,
+        _ if instrument => None,
+        (Some(_), Some(Json::Obj(kv))) => Some(kv),
+        (Some(_), _) => {
+            eprintln!(
+                "gexc eject build: user/eject.json says \"cold\", but the recording has no coverage: \
+                 the units stay whole (docs/eject.md, \"Cold code\": record a site built with \
+                 \"cold\": \"instrument\" with record-w3.mjs --coverage-into)"
+            );
+            None
+        }
+    };
+    let mut cold_units = 0;
     for u in units {
         let key = json::str_field(u, "key", what)?;
-        for f in ["c.wasm", "c.entries"] {
-            link_or_copy(&dir.join("units").join(&key).join(f), &web.join("units").join(&key).join(f))?;
+        let to = web.join("units").join(&key);
+        link_or_copy(&dir.join("units").join(&key).join("c.entries"), &to.join("c.entries"))?;
+        if instrument {
+            let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
+            write_file(&to.join("c.wasm"), &gex_cgen::split::instrument(&wasm)?, false)?;
+            continue;
         }
+        let (Some(cov), Some(how)) = (coverage, config.cold.as_deref()) else {
+            link_or_copy(&dir.join("units").join(&key).join("c.wasm"), &to.join("c.wasm"))?;
+            continue;
+        };
+        let hot = match cov.iter().find(|(k, _)| *k == key).map(|(_, r)| r) {
+            Some(Json::Str(r)) => slot_ranges(r).with_context(|| format!("the recording's coverage of {key}"))?,
+            _ => std::collections::HashSet::new(),
+        };
+        let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
+        let (primary, clusters, _) = gex_cgen::split::split(&wasm, &hot, how.parse()?)
+            .with_context(|| format!("splitting unit {key}"))?;
+        write_file(&to.join("c.wasm"), &primary, false)?;
+        std::fs::create_dir_all(to.join("cold"))?;
+        for (i, c) in clusters.iter().enumerate() {
+            write_file(&to.join("cold").join(format!("{i}.wasm")), c, false)?;
+        }
+        cold_units += 1;
     }
 
     // How the page starts the program: the recording's, less what the site
@@ -299,11 +373,16 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     let params: Vec<(String, Json)> = match rec.get("params") {
         Some(Json::Obj(kv)) => kv
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "tar" | "cgenurl" | "preload" | "exe" | "argv" | "args" | "env" | "cwd" | "mtimes" | "size" | "compositor"))
+            .filter(|(k, _)| !matches!(k.as_str(), "tar" | "cgenurl" | "preload" | "exe" | "argv" | "args" | "env" | "cwd" | "mtimes" | "size" | "compositor" | "cold"))
             .cloned()
             .collect(),
         _ => Vec::new(),
     };
+    // Split units: the page fetches their cold clusters (gex.mjs `gex.cold`).
+    let mut params = params;
+    if cold_units > 0 {
+        params.push(("cold".to_string(), s("1")));
+    }
     // `"bundle": "split"`: the files the recorded run opened, which the site
     // keeps in its bundle (web/eject-site.mjs).
     let bundle = if config.bundle_split {
@@ -324,12 +403,21 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         ("env", rec.get("env").cloned().unwrap_or(Json::Arr(Vec::new()))),
         ("cwd", rec.get("cwd").cloned().unwrap_or(s("/"))),
         ("mtimes", rec.get("mtimes").cloned().unwrap_or(json::b(false))),
-        ("size", rec.get("size").cloned().unwrap_or(s("1280x800"))),
+        // The size the recording asked for ("fit": the page's), not the one
+        // it resolved to (the recorder's window): a fixed size is the
+        // recorder's viewport on every screen.
+        ("size", match rec.get("params").and_then(|p| p.get("size")) {
+            Some(Json::Str(z)) if !z.is_empty() => s(z),
+            _ => rec.get("size").cloned().unwrap_or(s("fit")),
+        }),
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("params", Json::Obj(params)),
         ("features_off", strs(&off)),
         ("units", Json::Arr(units.to_vec())),
         ("bundle", bundle),
+        // user/eject.json "start": the app library's start() defaults, over
+        // the recording's (docs/eject.md, "The web build").
+        ("start", Json::parse(&config.start).map_err(|e| anyhow!("user/eject.json \"start\": {e}"))?),
     ]);
     write_file(&web.join("w3.json"), json::write(&launch).as_bytes(), false)?;
     write_file(
@@ -342,6 +430,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             ("page_files", json::n(page_files as u64)),
             ("units", json::n(units.len() as u64)),
             ("bundle_split", json::b(config.bundle_split)),
+            ("cold", config.cold.as_deref().map(s).unwrap_or(Json::Null)),
         ]))
         .as_bytes(),
         false,

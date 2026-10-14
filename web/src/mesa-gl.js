@@ -13,6 +13,7 @@ import { requestGexDevice } from './gpu-device.js';
 
 import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';
+import { assetUrl, pageParams } from './page-env.js';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -129,7 +130,7 @@ function countWebGpu() {
  *  the compositor passes its page's switches in as options instead. */
 function pageFlag(name) {
   try {
-    return globalThis.document !== undefined && new URLSearchParams(location.search).get(name) === '1';
+    return globalThis.document !== undefined && pageParams().get(name) === '1';
   } catch {
     return false;
   }
@@ -138,7 +139,7 @@ function pageFlag(name) {
 function quietReports(out) {
   let all = false;
   try {
-    all = new URLSearchParams(location.search).get('gltrace') === '1';
+    all = pageParams().get('gltrace') === '1';
   } catch {}
   if (all) return out;
   const last = new Map();
@@ -227,7 +228,7 @@ export class MesaGlDevice {
       api = 'es',
       major = 0,
       minor = 0,
-      url = '/gex/gex-wgpu-replay.js',
+      url = assetUrl('/gex/gex-wgpu-replay.js'),
     } = options;
     const out = new MesaGlDevice();
     canvas.id = 'gex-gl';

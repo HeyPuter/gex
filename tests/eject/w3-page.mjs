@@ -3,7 +3,7 @@
 // (docs/eject.md, "W3 pages") reaches its window in headless Chromium, built
 // with the features its project left out really gone.
 //
-//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N] [--chrome PATH] [--placed]
+//   node tests/eject/w3-page.mjs SITE [--title RE] [--timeout S] [--port N (default: any free one)] [--chrome PATH] [--placed] [--shell PAGE]
 //
 // Checks, in order:
 //   1. the site's nt.json says kind w3, and for each feature it says is off,
@@ -15,7 +15,9 @@
 //   3. with "compositor" off, what draws it is the page's bare desktop
 //      (`describe().compositor === 'none'`), and the window has pixels;
 //   4. no service worker: the site ships no sw.js, none is registered, and
-//      the first load is the only one (the launcher once, nt.html once);
+//      the first load is the only one: the site's page (the project's
+//      user/index.html, which imports app.mjs and calls start()) once, and
+//      gex's test page (nt.html) neither shipped, named nor loaded;
 //   5. with --placed (Paint, "compositor" off): the bare desktop leaves a
 //      window its client places (gex_window_placement_v1) to Wine. A caption
 //      drag moves it by the drag; a smooth one (a move a frame, out and back)
@@ -27,6 +29,10 @@
 //      held by the canvas), and a click on Paint leaves its owned dialog
 //      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
 //      raises a placed window.
+//   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
+//      the site's page instead, a hand-written one with its own container,
+//      size, arguments and onExit. The desktop is its box's size, inside the
+//      box; then kill() ends the run, `exited` and onExit say 137.
 // Prints PASS or FAIL lines; exits 0 only when all pass.
 
 import { spawn } from 'node:child_process';
@@ -34,15 +40,19 @@ import { createReadStream, existsSync, mkdtempSync, readdirSync, readFileSync, r
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
-import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
+import { Cdp } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
-const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome'].includes(av[i - 1])) ?? '');
+const site = resolve(av.find((a, i) => !a.startsWith('--') && !['--title', '--timeout', '--port', '--chrome', '--shell'].includes(av[i - 1])) ?? '');
+const shell = opt('--shell', null) ? resolve(opt('--shell', null)) : null;
 const placedChecks = av.includes('--placed');
 const titleRe = new RegExp(opt('--title', 'Untitled - Paint'));
 const timeout = Number(opt('--timeout', '400')) * 1000;
-const port = Number(opt('--port', '8731'));
+// Port 0 by default: the system's choice, so two runs on one box (check
+// class allows that) never collide. Chromium's debugging port likewise (see
+// DevToolsActivePort below).
+const askPort = Number(opt('--port', '0'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
 const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if (!ok) failed++; return ok; };
@@ -60,6 +70,21 @@ if (off.includes('compositor')) {
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
+// The app library, and no test page: nt.html is gex's, never an ejected build's.
+check(existsSync(join(site, 'app.mjs')), 'the site has the app library (app.mjs)');
+{
+  const named = [];
+  const scan = (d, rel = '') => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (r.startsWith('project/build/web/lazy')) continue;
+      if (e.isDirectory()) scan(join(d, e.name), r);
+      else if (e.name === 'nt.html' || (/\.(m?js|html|json)$/.test(e.name) && readFileSync(join(d, e.name)).includes('nt.html'))) named.push(r);
+    }
+  };
+  scan(site);
+  check(named.length === 0, `no nt.html in the site, and nothing names it${named.length ? ` (${named.slice(0, 4).join(', ')})` : ''}`);
+}
 // "bundle": "split": the files the recorded run never opened are lazy files,
 // each in the store under its hash.
 if (nt.bundle?.split) {
@@ -79,8 +104,9 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/ja
 let lazyReads = 0;
 const server = http.createServer((req, res) => {
   if (req.url.includes('/build/web/lazy/')) lazyReads++;
-  let p = join(site, decodeURIComponent(new URL(req.url, 'http://x').pathname));
-  if (!p.startsWith(site)) { res.writeHead(403).end(); return; }
+  const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  let p = shell && (path === '/' || path === '/index.html') ? shell : join(site, path);
+  if (!p.startsWith(site) && p !== shell) { res.writeHead(403).end(); return; }
   let st = null;
   try { st = statSync(p); if (st.isDirectory()) { p = join(p, 'index.html'); st = statSync(p); } } catch { st = null; }
   const h = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Resource-Policy': 'same-origin' };
@@ -96,15 +122,15 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { ...h, 'Content-Type': types[extname(p)] || 'application/octet-stream', 'Content-Length': st.size, 'Cache-Control': 'no-cache' });
   createReadStream(p).pipe(res);
 });
-await new Promise((r) => server.listen(port, '127.0.0.1', r));
+await new Promise((r) => server.listen(askPort, '127.0.0.1', r));
+const port = server.address().port;
 const profile = mkdtempSync(join(tmpdir(), 'gex-w3-leg-'));
-const cport = port + 1;
 const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
   '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-webgpu',
   '--use-angle=vulkan', '--enable-features=Vulkan', '--ozone-platform=headless',
   '--ozone-override-screen-size=1280,900', '--window-size=1280,900', '--disable-hang-monitor',
   '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
-  `--remote-debugging-port=${cport}`, `--user-data-dir=${profile}`, 'about:blank',
+  '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });
 const done = () => {
   try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
@@ -114,14 +140,37 @@ const done = () => {
   process.exit(failed ? 1 : 0);
 };
 let ws = null;
-for (let i = 0; i < 80 && !ws; i++) { ws = await browserWsUrl(cport); if (!ws) await sleep(250); }
+// Chromium writes the port it got, and the browser target's path, here.
+const activePort = () => {
+  try {
+    const [p, path] = readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n');
+    return Number(p) > 0 && path ? `ws://127.0.0.1:${Number(p)}${path}` : null;
+  } catch { return null; }
+};
+for (let i = 0; i < 80 && !ws; i++) { ws = activePort(); if (!ws) await sleep(250); }
 if (!check(!!ws, 'Chromium started')) done();
 const browser = await Cdp.connect(ws);
 const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
 const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
 await browser.send('Runtime.enable', {}, page);
+// W3PAGE_CONSOLE=FILE: every target's console lines (the page's and its
+// Workers', with the guests' stderr), timestamped, for a diagnosis.
+if (process.env.W3PAGE_CONSOLE) {
+  const { appendFileSync } = await import('node:fs');
+  const t0 = Date.now();
+  browser.on('Runtime.consoleAPICalled', (p) => {
+    appendFileSync(process.env.W3PAGE_CONSOLE, `${Date.now() - t0} ${p.args.map((a) => a.value ?? a.description ?? '').join(' ')}\n`);
+  });
+  browser.on('Target.attachedToTarget', async (p) => {
+    const s = p.sessionId;
+    await browser.send('Runtime.enable', {}, s).catch(() => {});
+    await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s).catch(() => {});
+    await browser.send('Runtime.runIfWaitingForDebugger', {}, s).catch(() => {});
+  });
+  await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, page);
+}
 const ev = async (e) => (await browser.send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }, page).catch(() => ({})))?.result?.value;
-// Every load of the top frame: the launcher, then nt.html, and nothing again.
+// Every load of the top frame: the site's page, and nothing again.
 const loads = [];
 await browser.send('Page.enable', {}, page);
 browser.on('Page.frameNavigated', (p) => { if (!p.frame.parentId) loads.push(new URL(p.frame.url).pathname); });
@@ -132,8 +181,9 @@ while (Date.now() - t0 < timeout) {
   const s = await ev('(async () => { const c = globalThis.__gexCompositor; return c ? JSON.stringify(await c.describe()) : null; })()');
   d = s ? JSON.parse(s) : null;
   if (d?.titles?.some((t) => titleRe.test(t))) break;
-  const st = await ev('JSON.stringify({ phase: globalThis.__nt?.phase, error: globalThis.__nt?.error })');
-  if (st && JSON.parse(st).phase === 'failed') { check(false, `the page failed: ${JSON.parse(st).error}`); done(); }
+  const st = await ev('JSON.stringify({ phase: globalThis.__nt?.phase, error: globalThis.__nt?.error, start: globalThis.startError, shown: document.getElementById("error")?.textContent })');
+  const sv = st ? JSON.parse(st) : {};
+  if (sv.phase === 'failed' || sv.start || sv.shown) { check(false, `the page failed: ${sv.error ?? sv.start ?? sv.shown}`); done(); }
   await sleep(500);
 }
 const secs = ((Date.now() - t0) / 1000).toFixed(1);
@@ -150,13 +200,23 @@ if (off.includes('compositor')) {
 // 4. No service worker, and no second load.
 const regs = await ev('navigator.serviceWorker.getRegistrations().then((r) => r.length)');
 check(regs === 0, `no service worker registered (${regs})`);
-const launcher = loads.filter((u) => u === '/' || u.endsWith('/index.html')).length;
-const ntLoads = loads.filter((u) => u.endsWith('/nt.html')).length;
-check(launcher === 1 && ntLoads === 1, `one load, no reload (top-frame loads: ${loads.join(' ')})`);
+check(loads.length === 1 && (loads[0] === '/' || loads[0].endsWith('/index.html')), `one load of the site's page, no reload (top-frame loads: ${loads.join(' ')})`);
 await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
 if (nt.bundle?.split) console.log(`info: ${lazyReads} lazy read(s) to the window`);
+
+// 6. A page of its own: the desktop in its box, at the box's size; kill().
+if (shell) {
+  const box = JSON.parse(await ev(`(() => { const s = document.getElementById('stage'); const r = s.getBoundingClientRect();
+    const d = s.querySelector('.gex-desktop'); const dr = d?.getBoundingClientRect();
+    return JSON.stringify({ box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)], desk: dr ? [Math.round(dr.left), Math.round(dr.top), Math.round(dr.width), Math.round(dr.height)] : null }); })()`) ?? '{}');
+  check(box.desk && box.desk.join() === box.box.join(), `the desktop fills the page's own box (box ${box.box}, desktop ${box.desk})`);
+  check(d.output === `${box.box[2]}x${box.box[3]}`, `the guest's output is the box's size (${d.output})`);
+  const st = await ev('(async () => { globalThis.app.kill(); return JSON.stringify({ status: await globalThis.app.exited, onExit: globalThis.exitedWith, title: document.title }); })()');
+  const k = st ? JSON.parse(st) : {};
+  check(k.status === 137 && k.onExit === 137, `kill() ends the run: exited ${k.status}, onExit ${k.onExit} (title "${k.title}")`);
+}
 
 // 5. Placed windows: Wine moves, sizes and stacks them; the page follows.
 if (placedChecks) {
@@ -185,8 +245,12 @@ if (placedChecks) {
   const smoothDrag = async (x, y, dx, dy, steps = 80, ms = 4) => {
     await ev(`(() => {
       const D = globalThis.__dragProbe = { frames: [], ptr: null, on: true };
+      globalThis.__gexEvLog = [];
       if (!globalThis.__dragProbeListening) {
         globalThis.__dragProbeListening = true;
+        // Only the pointer: reading layout here (getBoundingClientRect) would
+        // flush it before the page's own listener reads offsetX, and hide a
+        // page that reads a stale one (the shake this drag looks for).
         const note = (e) => { if (globalThis.__dragProbe) globalThis.__dragProbe.ptr = [e.clientX, e.clientY]; };
         addEventListener('pointermove', note, { capture: true });
         addEventListener('pointerdown', note, { capture: true });
@@ -194,7 +258,7 @@ if (placedChecks) {
       const f = (t) => {
         const cs = [...document.querySelectorAll('canvas')].filter((c) => Number(c.style.zIndex) >= 2000000 && c.isConnected);
         const c = cs.reduce((a, c) => (!a || c.width * c.height > a.width * a.height ? c : a), null);
-        if (c && D.ptr) { const r = c.getBoundingClientRect(); D.frames.push([r.left, r.top, D.ptr[0], D.ptr[1]]); }
+        if (c && D.ptr) { const r = c.getBoundingClientRect(); D.frames.push([r.left, r.top, D.ptr[0], D.ptr[1], t, c.style.zIndex, c.width, c.height, cs.indexOf(c)]); }
         if (D.on) requestAnimationFrame(f);
       };
       requestAnimationFrame(f);
@@ -209,6 +273,7 @@ if (placedChecks) {
     await sleep(1000);
     await mouse('mouseReleased', x + dx, y + dy, false);
     const fr = (await ev('(() => { const D = globalThis.__dragProbe; D.on = false; return D.frames; })()')) ?? [];
+    const evlog = (await ev('(() => { const l = globalThis.__gexEvLog; globalThis.__gexEvLog = null; return l; })()')) ?? [];
     // From the press on: the first frame that saw the pointer at (x, y).
     const i0 = fr.findIndex((f) => f[2] === x && f[3] === y);
     const rows = i0 < 0 ? [] : fr.slice(i0);
@@ -219,7 +284,13 @@ if (placedChecks) {
       const lead = Math.max(ex * sx, ey * sy);
       if (lead > 1) { ahead++; maxAhead = Math.max(maxAhead, lead); }
       const e = Math.hypot(ex, ey); sumErr += e; maxErr = Math.max(maxErr, e);
-      if (i && ((f[0] - rows[i - 1][0]) * sx < 0 || (f[1] - rows[i - 1][1]) * sy < 0)) back++;
+      if (i && ((f[0] - rows[i - 1][0]) * sx < 0 || (f[1] - rows[i - 1][1]) * sy < 0)) {
+        back++;
+        // Which frames, to tell a window that went back from a probe that
+        // looked at something else: frame time, canvas (z, size), place, pointer.
+        for (const g of evlog.filter((g) => g[3] > rows[Math.max(0, i - 3)][4] && g[3] < f[4] + 20)) console.log(`info: drag event: ${g[0]} ${g[1]},${g[2]} t ${g[3].toFixed(1)}`);
+        for (const g of rows.slice(Math.max(0, i - 3), i + 3)) console.log(`info: drag back at frame ${i}: t ${g[4].toFixed(1)} z ${g[5]} ${g[6]}x${g[7]} #${g[8]} at ${g[0]},${g[1]} pointer ${g[2]},${g[3]}`);
+      }
     });
     return { frames: rows.length, back, ahead, maxAhead: Math.round(maxAhead), meanErr: rows.length ? Math.round(sumErr / rows.length) : 0, maxErr: Math.round(maxErr) };
   };

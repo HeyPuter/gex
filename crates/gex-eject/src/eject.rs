@@ -30,6 +30,9 @@ pub const GENERATED: &[&str] = &[
     "run.sh",
     "run.mjs",
     "serve.mjs",
+    // The app library's entry (a Linux program's `start()`); index.html is
+    // the user's now (user/index.html), removed here from older projects.
+    "app.mjs",
     "index.html",
     ".gitignore",
     // A W3 page's (w3.rs).
@@ -45,8 +48,9 @@ pub struct EjectOptions {
     /// gex's browser shim (`gex_browser.wasm`, built from the same source for
     /// the same guest), for a project with a web build.
     pub web_shim: Option<PathBuf>,
-    /// A Windows program's page (web/build-eject-page.sh's output), for the
-    /// web build in a browser: vendored as runtime/web/page.
+    /// The app library (web/build-eject-page.sh's output: app.mjs, its
+    /// chunks and the runtime's wasm), for a Windows program's web build in a
+    /// browser: vendored as runtime/web/page.
     pub web_page: Option<PathBuf>,
 }
 
@@ -382,12 +386,17 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("run.sh"), templates::run_sh().as_bytes(), true)?;
     write_file(&out.join(".gitignore"), templates::GITIGNORE.as_bytes(), false)?;
     // The web launchers, and the browser runtime when there is one: without
-    // it they say so.
+    // it they say so. The page is the user's (user/index.html, written once),
+    // and calls the app library (app.mjs's `start()`).
     write_file(&out.join("run.mjs"), crate::web::RUN_MJS.as_bytes(), true)?;
-    write_file(&out.join("index.html"), crate::web::INDEX_HTML.as_bytes(), false)?;
+    write_file(&out.join("app.mjs"), crate::web::APP_MJS.as_bytes(), false)?;
+    crate::web::write_shell(out)?;
     write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
     write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
     write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
+    for (f, text) in crate::web::GEX_MJS_DEPS {
+        write_file(&out.join("runtime/web").join(f), text.as_bytes(), false)?;
+    }
     if let (Some(shim), true) = (&o.web_shim, nt.is_some()) {
         // A Windows program runs on the shared-memory x86 shim with its
         // kernel and seed (the browser's NT layer), named by their directory
@@ -405,19 +414,23 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             write_file(&to.join("js").join(f), text.as_bytes(), false)?;
         }
         write_file(&out.join("run.mjs"), crate::pe::WEB_NT_RUN_MJS.as_bytes(), true)?;
-        // The page, when given: index.html and serve.mjs run the web build
-        // in a browser (with OpenGL, on Mesa over WebGPU).
+        // The app library, when given (web/build-eject-page.sh's output):
+        // serve.mjs runs the web build in a browser, user/index.html at `/`
+        // calling app.mjs's `start()` (with OpenGL, on Mesa over WebGPU).
         if let Some(page) = &o.web_page {
-            if !page.join("nt.html").is_file() {
-                bail!("{} has no nt.html (make it with web/build-eject-page.sh)", page.display());
+            if !page.join("app.mjs").is_file() {
+                bail!("{} has no app.mjs (make it with web/build-eject-page.sh)", page.display());
             }
+            crate::web::check_no_test_page(page)?;
             let to = out.join(crate::pe::WEB_NT_PAGE);
             if to.exists() {
                 std::fs::remove_dir_all(&to)?;
             }
             let mut n = 0;
             crate::build::copy_tree(page, &to, &mut n)?;
-            write_file(&out.join("index.html"), crate::pe::WEB_NT_INDEX_HTML.as_bytes(), false)?;
+            // The Linux launcher's app.mjs is not this project's: the
+            // library is the vendored one, served at `/`.
+            let _ = std::fs::remove_file(out.join("app.mjs"));
             write_file(&out.join("serve.mjs"), crate::pe::WEB_NT_SERVE_MJS.as_bytes(), true)?;
         }
         summary.web = true;

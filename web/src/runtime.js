@@ -12,6 +12,7 @@ import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
+import { assetUrl, pageParams, pageSearch } from './page-env.js';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -51,9 +52,9 @@ export function elfMachine() {
 // `?mem64=1` (globalThis.GEX_MEM64): a 64-bit guest memory (docs/mem64.md step 6) -- the wasm64
 // shim and seed and the kernel that reaches a process's memory with i64 (`.m64`, x86 only).
 const m64Infix = () => (globalThis.GEX_MEM64 && guestArch() === 'x86' ? '.m64' : '');
-const SHIM_URL = () => `/gex/gex_browser${archInfix()}${m64Infix()}.shared.wasm`;
-const SEED_URL = () => `/gex/seed${archInfix()}${m64Infix()}.shared.wasm`;
-const KERNEL_URL = () => `/gex/gex_kernel${archInfix()}${m64Infix()}.wasm`;
+const SHIM_URL = () => assetUrl(`/gex/gex_browser${archInfix()}${m64Infix()}.shared.wasm`);
+const SEED_URL = () => assetUrl(`/gex/seed${archInfix()}${m64Infix()}.shared.wasm`);
+const KERNEL_URL = () => assetUrl(`/gex/gex_kernel${archInfix()}${m64Infix()}.wasm`);
 
 let shimBytes = null;
 let seedBytes = null;
@@ -126,6 +127,8 @@ function xcacheName() {
 export function primeRuntime(r) {
   if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
   if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
+  // An ejected site's page fetches the kernel through its pack too (app.js).
+  if (r?.kernelBytes && !kernelBytes) kernelBytes = r.kernelBytes;
 }
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */
@@ -137,6 +140,11 @@ export async function loadRuntime(onProgress) {
 
 export { fetchBytes };
 
+/** Where the runtime's three modules are (an ejected site packs them). */
+export function runtimeUrls() {
+  return { shimBytes: SHIM_URL(), seedBytes: SEED_URL(), kernelBytes: KERNEL_URL() };
+}
+
 /**
  * A `?name=` switch, from wherever this is running. `location` does not exist
  * under Node (where the terminal test drives this file), so the same switches
@@ -145,7 +153,7 @@ export { fetchBytes };
 function flag(name) {
   // The single-thread build's system Worker is handed the page's query: its
   // own `location` is the script's.
-  const search = globalThis.GEX_PAGE_SEARCH ?? globalThis.location?.search;
+  const search = pageSearch();
   if (search) return new URLSearchParams(search).get(name);
   return globalThis.process?.env?.[`GEX_${name.toUpperCase()}`] ?? null;
 }
@@ -356,7 +364,7 @@ async function loadKernel() {
     return null;
   }
   try {
-    const bytes = await fetchBytes(KERNEL_URL());
+    const bytes = kernelBytes ?? await fetchBytes(KERNEL_URL());
     kernelBytes = bytes;
     kernelSpec = {
       // The maximum must match `--max-memory` in `shims/kernel/build.sh`
@@ -420,7 +428,7 @@ export function singleMode() {
 /** What of the page's state the system Worker needs: its query and every
  *  `GEX_*` switch a demo or `main.js` set. */
 function pageGlobals() {
-  const out = { GEX_PAGE_SEARCH: globalThis.location?.search ?? '' };
+  const out = { GEX_PAGE_SEARCH: pageSearch() };
   for (const k of Object.keys(globalThis)) {
     if (!k.startsWith('GEX_')) continue;
     const v = globalThis[k];
@@ -760,7 +768,7 @@ async function runProgramHere(
         const opts = {
           api: 'core',
           backend: glBackend,
-          canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',
+          canvasBlit: pageParams().get('glcanvas') === '1',
         };
         // `glLazy`: Mesa (about 20 MB before compression) is fetched when
         // the embedder first asks (`onSystem`'s `startGl`), not at boot.
@@ -797,7 +805,7 @@ async function runProgramHere(
     // The single-thread build (docs/single-thread.md): the server is a fiber of
     // this realm, the non-pthread Xwayland (web/public/gex/xwayland-st/) whose
     // waits suspend. The same messages, without a Worker between.
-    const xDir = single.on ? '/gex/xwayland-st/' : '/gex/xwayland/';
+    const xDir = assetUrl(single.on ? '/gex/xwayland-st/' : '/gex/xwayland/');
     if (single.on) {
       const { HostX } = await import('./hostx.js');
       let deliver = null;
@@ -837,7 +845,7 @@ async function runProgramHere(
       keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
       // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
       // wasm32 build of the kernel (same kernel memory, other process-memory type).
-      kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(`/gex/gex_kernel${archInfix()}.wasm`)) : kernel.module, memory: kernel.memory },
+      kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(assetUrl(`/gex/gex_kernel${archInfix()}.wasm`))) : kernel.module, memory: kernel.memory },
       wlChannel,
       // A name in the scene arena that no guest pid can collide with: pids
       // count up from 1, and this is 'xwl1' as ASCII.
@@ -845,7 +853,7 @@ async function runProgramHere(
       display: ':0',
       // `?xverbose=N`: the X server's own log, which is the only thing that
       // says what it told a client.
-      verbose: globalThis.GEX_HOSTX_VERBOSE || Number(new URLSearchParams(location.search).get('xverbose')) || undefined,
+      verbose: globalThis.GEX_HOSTX_VERBOSE || Number(pageParams().get('xverbose')) || undefined,
       trace: globalThis.GEX_HOSTX_TRACE || undefined,
       wlTrace: flag('wltrace') ? 1 : undefined,
       count: flag('hostxcount') ? 1 : undefined,
@@ -942,9 +950,9 @@ async function runProgramHere(
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
       // `?provskip=a,b`: those exports left to the guest's own code (an A/B).
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', skip: globalThis.GEX_PROVIDER_SKIP }
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', skip: globalThis.GEX_PROVIDER_SKIP, zstd: globalThis.GEX_CGEN_ZSTD }
         : flag('providers') === '0' ? undefined
-        : { mode: 8, url: '/gex/cgen' },
+        : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a
       // miss stops the run, saying where).
       jit: globalThis.GEX_NO_JIT ? false : undefined,

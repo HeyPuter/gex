@@ -314,6 +314,12 @@ export class DomDesktop {
     return d;
   }
 
+  /** The output's size from now on (app.js `resize()`): what a client asks
+   *  for the screen's size sees this. Windows already up keep their places. */
+  resizeOutput(w, h) {
+    setOutputSize(this.#channel, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
+  }
+
   /** Run the guest's OpenGL for this desktop.
    *
    * The device is built here and now, before any client has drawn: the guest's
@@ -538,6 +544,8 @@ export class DomDesktop {
     if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
       win.relX = s.relX;
       win.relY = s.relY;
+      // A test's record (tests/eject/w3-page.mjs's drag), beside wl-bridge's.
+      globalThis.__gexEvLog?.push(['place', s.relX, s.relY, performance.now()]);
       win.onplace?.(s.relX, s.relY, win.parent);
     }
     // Directly below the placed window with stack id `below`; 0 the top of

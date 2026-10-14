@@ -66,6 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
+import { noteFetch } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
@@ -294,6 +295,19 @@ async function handle(msg) {
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
   // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
   const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
+  // A zstd decoder for a split unit's cold clusters (gex_cgen::split), made
+  // before the guest runs: its loads are synchronous.
+  let zstd = null;
+  if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
+    try {
+      const { ZSTDDecoder } = await import(msg.cgen.zstd);
+      zstd = new ZSTDDecoder();
+      await zstd.init();
+    } catch (err) {
+      console.error(`[gex] no zstd decoder for cold clusters (${msg.cgen.zstd}): ${err?.message ?? err}`);
+      zstd = null;
+    }
+  }
   class WorkerEnv extends Env {
     /**
      * Wait until the host has delivered everything this Worker wrote: called
@@ -394,6 +408,47 @@ async function handle(msg) {
         },
       };
     }
+    // `len` bytes at `off` of a unit-cache file (a split unit's
+    // `cold.bin`), synchronously; null when they cannot be read.
+    loadRange(rel, off, len) {
+      const c = msg.cgen;
+      if (!c) return null;
+      try {
+        if (c.root) {
+          const fs = globalThis.process?.getBuiltinModule?.('node:fs');
+          if (!fs) return null;
+          const fd = fs.openSync(`${c.root}/${rel}`, 'r');
+          try {
+            const b = new Uint8Array(len);
+            return fs.readSync(fd, b, 0, len, off) === len ? b : null;
+          } finally {
+            fs.closeSync(fd);
+          }
+        }
+        const x = new XMLHttpRequest();
+        x.open('GET', `${c.url}/${rel}`, false);
+        x.responseType = 'arraybuffer';
+        x.setRequestHeader('Range', `bytes=${off}-${off + len - 1}`);
+        // Said to the page, as a unit's own files are: a cold cluster is
+        // code the program is waiting for.
+        const done = noteFetch(`unit:${rel}`, len);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
+        const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
+        // 206 is the range; a server without ranges sends the whole file.
+        const at = x.status === 206 ? 0 : x.status === 200 ? off : -1;
+        return at >= 0 && got.length >= at + len ? got.slice(at, at + len) : null;
+      } catch {
+        return null;
+      }
+    }
+    // The zstd decoder made above, or null.
+    get zstd() {
+      return zstd;
+    }
     // Any file of the unit cache by its relative path (an export
     // provider's module: `providers/<name>-<fingerprint>.wasm`), or null.
     loadFile(rel) {
@@ -410,7 +465,12 @@ async function handle(msg) {
         const x = new XMLHttpRequest();
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
-        x.send();
+        const done = noteFetch(`unit:${rel}`);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
         return x.status === 200 ? new Uint8Array(x.response) : null;
       } catch {
         return null;
