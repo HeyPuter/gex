@@ -456,18 +456,26 @@ in the scheduler pick after each wake of the global WAKE word: about
    gex-kernel tests `free_futex_answers_as_the_kernel_does`,
    `futex_calls_from_many_threads_keep_a_mutex` and
    `a_map_view_is_read_while_the_map_changes`.
-5. **Signal masks and per-thread state: lock deleted.** rt_sigprocmask,
+5. **Sleeps: lock deleted, L2.** nanosleep and clock_nanosleep are in the
+   free class: `syscalls::sleep_block` and `nanosleep_answer` are the
+   kernel's own code, with the clocks from process constants
+   (`clock_nanos_at`: the clock, the start time); the page parks the sleep
+   on its thread's own run state (`park_free`, `Waiting::Sleep`). They were
+   the largest taker left in every Noita-page process (about 61 a second
+   each). Legs: `sleep-threads` in the page tier;
+   `free_sleep_answers_as_the_kernel_does`.
+6. **Signal masks and per-thread state: lock deleted.** rt_sigprocmask,
    sigaltstack, set_tid_address, set_robust_list, arch_prctl on a
    per-thread state only its owner writes; pending words atomic (§3.8,
    the per-thread half). Leg: thread-signals in the page tier, which
    fails today (§5.3, thread-signals).
-6. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
+7. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
    published VMA snapshot for readers (dispatch_miss, faults,
    /proc/self/maps).
-7. **Signals and the thread table: lock deleted (§3.7, §3.8).**
-8. **Lifecycle, devices, introspection, NT; then KLock itself deleted
+8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
+9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
-9. **Native: `Mutex<Kernel>` gone (§3.11).**
+10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 
 ### 5.3 Measurements and known failures

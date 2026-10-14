@@ -197,6 +197,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         uid: home.uid,
         wasm32: crate::WASM32.load(Ordering::Acquire),
         futex,
+        started: crate::clock_started(),
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
 }

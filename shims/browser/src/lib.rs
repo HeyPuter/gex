@@ -7687,6 +7687,12 @@ fn compat_abi() -> bool {
     CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1
 }
 
+/// When this process started (`CLOCK_STARTED`), for a sleep until a time on
+/// a processor-time clock without the kernel.
+pub(crate) fn clock_started() -> u128 {
+    CLOCK_STARTED.load(std::sync::atomic::Ordering::Acquire) as u128
+}
+
 fn clock_constants(compat: bool, started: u128) {
     use std::sync::atomic::Ordering::Release;
     CLOCK_STARTED.store(started as u64, Release);
@@ -11417,7 +11423,9 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
             gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
             deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
         },
-        _ => unreachable!("a class call parks only on a stream, a poll or a futex"),
+        // A sleep, until its time (the clock alone ends it).
+        gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(turn_now() + d.as_nanos() as u64),
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex or a sleep"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     // A new wait: whatever this Worker's thread was registered for is over.
@@ -11469,9 +11477,10 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         // the deadlock watch confirms (`all_futex_blocked`). A stream does
         // neither.
         let why = wait_why(&r);
-        let futex = matches!(r.waiting, Waiting::Futex { .. } | Waiting::Pi { .. });
+        // A sleep ends by itself too (the clock), as in `pick_turn`.
+        let ends = matches!(r.waiting, Waiting::Futex { .. } | Waiting::Pi { .. } | Waiting::Sleep(_));
         let untimed = matches!(r.waiting, Waiting::Futex { deadline: None, .. });
-        let fresh = waitq::enter(cur(), &r, why, false, futex);
+        let fresh = waitq::enter(cur(), &r, why, false, ends);
         drop(r);
         let all_blocked = why == 0 && untimed && all_futex_blocked();
         if all_blocked {
@@ -11486,7 +11495,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         } {
             continue;
         }
-        return Pick::Idle(IdleLook { why, all_blocked, ends_by_itself: futex });
+        return Pick::Idle(IdleLook { why, all_blocked, ends_by_itself: ends });
     }
 }
 

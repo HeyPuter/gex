@@ -1464,6 +1464,10 @@ pub struct Free<'a> {
     pub wasm32: bool,
     /// The process's futexes, for `futex`.
     pub futex: FutexCx<'a>,
+    /// When the process started (`Kernel::started`, a constant once its
+    /// first call is made): the processor-time clocks, for a sleep until a
+    /// time on one.
+    pub started: u128,
 }
 
 /// How a call [`free_call`] answers ended.
@@ -1503,6 +1507,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
             x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
             x::FUTEX | x::FUTEX_TIME64 => nr::FUTEX,
+            x::NANOSLEEP => nr::NANOSLEEP,
+            x::CLOCK_NANOSLEEP | x::CLOCK_NANOSLEEP_TIME64 => nr::CLOCK_NANOSLEEP,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1521,12 +1527,15 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_WAIT | x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
             x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
             x::FUTEX => nr::FUTEX,
+            x::NANOSLEEP => nr::NANOSLEEP,
+            x::CLOCK_NANOSLEEP => nr::CLOCK_NANOSLEEP,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
-            | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX => raw,
+            | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
+            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => raw,
             _ => return None,
         }
     };
@@ -1570,7 +1579,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
-    if compat && n != nr::RT_SIGPROCMASK && n != nr::FUTEX && !is_poll(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP) && !is_poll(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1599,7 +1608,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
-    if is_poll(n) || (compat && n == nr::FUTEX) {
+    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP)) {
         let t = if compat {
             crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr).0
         } else if gex_abi::X86 {
@@ -1631,6 +1640,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             }
         }
         r
+    } else if n == nr::NANOSLEEP || n == nr::CLOCK_NANOSLEEP {
+        // As the full call: a sleep parks; a malformed or empty one answers.
+        if let Some(op) = sleep_block(m, n, a, f.futex.clock, f.started) {
+            return FreeOutcome::Blocking(op, None);
+        }
+        nanosleep_answer(m, if n == nr::NANOSLEEP { a[0] } else { a[2] })
     } else if is_poll(n) {
         // The call's mask for its duration (as `Kernel::syscall_inner`):
         // back at once when it answers now, before any signal is looked at;
@@ -1684,6 +1699,69 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         Delivery::Resume(_) if f.wasm32 => Delivery::None,
         d => d,
     })
+}
+
+/// Now on `clk`, in nanoseconds, as `clock_gettime` answers it, for a
+/// process that started at `started` (the processor-time clocks count from
+/// it): process constants, so no kernel lock.
+pub fn clock_nanos_at(clock: ClockFn, started: u128, clk: u64) -> u128 {
+    const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+    const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+    let wall = || {
+        let (secs, nanos) = clock();
+        secs as u128 * 1_000_000_000 + nanos as u128
+    };
+    match clk {
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => wall().saturating_sub(started),
+        c if is_monotonic_clock(c) => {
+            let (secs, nanos) = monotonic_from(clock());
+            secs as u128 * 1_000_000_000 + nanos as u128
+        }
+        _ => wall(),
+    }
+}
+
+/// The park of a `nanosleep` or `clock_nanosleep`; `None` leaves the call to
+/// [`nanosleep_answer`], which answers at once: EINVAL for a malformed
+/// request, 0 for one with nothing left to wait for. The same code in the
+/// kernel and in a host that makes the call without it (§5.2 step 5).
+pub fn sleep_block(m: &GuestMem<'_>, n: u64, a: [u64; 6], clock: ClockFn, started: u128) -> Option<BlockOp> {
+    // `clock_nanosleep` puts the request in a[2]; `nanosleep` in a[0].
+    let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
+    if req == 0 {
+        return None;
+    }
+    let secs = m.read_u64(req).ok()? as i64;
+    let nanos = m.read_u64(req + 8).ok()?;
+    if secs < 0 || nanos >= 1_000_000_000 {
+        return None;
+    }
+    let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
+    // TIMER_ABSTIME: a deadline on the clock, not a duration. It was slept
+    // as a duration, so every absolute sleep lasted the 60 s cap below.
+    const TIMER_ABSTIME: u64 = 1;
+    if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
+        wait = wait.checked_sub(clock_nanos_at(clock, started, a[0])).filter(|&w| w > 0)?;
+    }
+    // Capped, as before: a longer sleep returns early.
+    let wait = wait.min(60_000_000_000) as u64;
+    Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
+}
+
+/// A sleep's answer when [`sleep_block`] did not park it.
+pub fn nanosleep_answer(m: &GuestMem<'_>, req: u64) -> SysResult {
+    if req == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let secs = m.read_u64(req)? as i64;
+    let nanos = m.read_u64(req + 8)?;
+    if secs < 0 || nanos >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    // The sleep itself is `BlockOp::Sleep`, run by the host with the kernel
+    // unlocked; reaching here means nothing to wait for: a zero request, or
+    // a deadline already past.
+    Ok(0)
 }
 
 /// What a process's futex calls need of it (docs/kernel-locking.md §3.2):
@@ -3799,30 +3877,10 @@ impl Kernel {
                 })
             }
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
-                // `clock_nanosleep` puts the request in a[2]; `nanosleep` in
-                // a[0]. `None` leaves the call to `sys_nanosleep`, which
-                // answers at once: EINVAL for a malformed request, 0 for
-                // one with nothing left to wait for.
-                let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
-                if req == 0 {
-                    return None;
-                }
-                let secs = m.read_u64(req).ok()? as i64;
-                let nanos = m.read_u64(req + 8).ok()?;
-                if secs < 0 || nanos >= 1_000_000_000 {
-                    return None;
-                }
-                let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
-                // TIMER_ABSTIME: a deadline on the clock, not a duration. It
-                // was slept as a duration, so every absolute sleep lasted the
-                // 60 s cap below.
-                const TIMER_ABSTIME: u64 = 1;
-                if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
-                    wait = wait.checked_sub(self.clock_nanos(a[0])).filter(|&w| w > 0)?;
-                }
-                // Capped, as before: a longer sleep returns early.
-                let wait = wait.min(60_000_000_000) as u64;
-                Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
+                // The clocks as of now, the processor-time ones counted from
+                // a start this sets if it has none yet.
+                let _ = self.cpu_nanos();
+                sleep_block(m, n, a, self.clock, self.started)
             }
             _ => None,
         }
@@ -8021,32 +8079,13 @@ impl Kernel {
     }
 
     fn sys_nanosleep(&mut self, m: &GuestMem<'_>, req: u64) -> SysResult {
-        if req == 0 {
-            return Err(Errno::EFAULT);
-        }
-        let secs = m.read_u64(req)? as i64;
-        let nanos = m.read_u64(req + 8)?;
-        if secs < 0 || nanos >= 1_000_000_000 {
-            return Err(Errno::EINVAL);
-        }
-        // The sleep itself is `BlockOp::Sleep`, run by the host with the
-        // kernel unlocked; reaching here means nothing to wait for: a zero
-        // request, or a deadline already past.
-        Ok(0)
+        nanosleep_answer(m, req)
     }
 
     /// Now on `clk`, in nanoseconds, as `clock_gettime` would answer it.
     fn clock_nanos(&mut self, clk: u64) -> u128 {
-        const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
-        const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
-        match clk {
-            CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => self.cpu_nanos(),
-            c if is_monotonic_clock(c) => {
-                let (secs, nanos) = monotonic_from((self.clock)());
-                secs as u128 * 1_000_000_000 + nanos as u128
-            }
-            _ => self.now_nanos(),
-        }
+        let _ = self.cpu_nanos();
+        clock_nanos_at(self.clock, self.started, clk)
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since
@@ -9214,7 +9253,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9378,6 +9417,64 @@ mod tests {
     }
 
 
+    /// `nanosleep` and `clock_nanosleep` without the kernel: the same park
+    /// or answer as the full call (docs/kernel-locking.md §5.2 step 5).
+    #[test]
+    fn free_sleep_answers_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let req = 0x3000u64;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("sleeps are in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        let r = |m: &GuestMem<'_>| ret(m, at) as i64;
+        let ts = |m: &mut GuestMem<'_>, secs: u64, nanos: u64| {
+            m.write_u64(req, secs).unwrap();
+            m.write_u64(req + 8, nanos).unwrap();
+        };
+        // A plain sleep parks for its length, both ways.
+        ts(&mut m, 0, 5_000_000);
+        set_args(&mut m, at, nr::NANOSLEEP, &[req, 0]);
+        let FreeOutcome::Blocking(BlockOp::Sleep(d), None) = free(&k, &mut m, at) else { panic!("a sleep parks") };
+        assert_eq!(d, std::time::Duration::from_millis(5));
+        assert!(matches!(k.blocking_op(&m, nr::NANOSLEEP, [req, 0, 0, 0, 0, 0]), Some(BlockOp::Sleep(e)) if e == d));
+        // Zero: a park of nothing, both ways (a turn of the scheduler).
+        ts(&mut m, 0, 0);
+        set_args(&mut m, at, nr::NANOSLEEP, &[req, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::Sleep(d), None) if d.is_zero()));
+        assert!(matches!(k.blocking_op(&m, nr::NANOSLEEP, [req, 0, 0, 0, 0, 0]), Some(BlockOp::Sleep(d)) if d.is_zero()));
+        // Malformed: EINVAL; none: EFAULT.
+        for (secs, nanos, want) in [(0, 1_000_000_000, Errno::EINVAL.as_return() as i64)] {
+            ts(&mut m, secs, nanos);
+            set_args(&mut m, at, nr::NANOSLEEP, &[req, 0]);
+            assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+            assert_eq!(r(&m), want);
+            set_args(&mut m, at, nr::NANOSLEEP, &[req, 0]);
+            k.syscall(&mut m, 0);
+            assert_eq!(r(&m), want);
+        }
+        set_args(&mut m, at, nr::NANOSLEEP, &[0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(r(&m), Errno::EFAULT.as_return() as i64);
+        // An absolute deadline already past on the monotonic clock: 0 at
+        // once; one ahead of it: a park.
+        let now = clock_nanos_at(k.clock, k.started, 1);
+        ts(&mut m, (now / 1_000_000_000) as u64 - 1, 0);
+        set_args(&mut m, at, nr::CLOCK_NANOSLEEP, &[1, 1, req, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(r(&m), 0);
+        ts(&mut m, (now / 1_000_000_000) as u64 + 2, 0);
+        set_args(&mut m, at, nr::CLOCK_NANOSLEEP, &[1, 1, req, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::Sleep(_), None)));
+    }
+
     /// `futex` in the lock-free class (docs/kernel-locking.md §5.2 step 4)
     /// answers as the full call does: a wait on a changed word, on an
     /// unmapped word, a wait that parks, a wake, and a PI lock taken, found
@@ -9395,7 +9492,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
