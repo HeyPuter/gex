@@ -293,6 +293,13 @@ Revisit (a) only if exact Flip3D or animations become the goal.
   window's frame glass when the driver draws glass (the glass surrounds
   the box inside borders and caption; a menu bar stays opaque) and passes
   the buttons where its own hit testing has them, pressed state included.
+- **The page with no compositor** (`bare-desktop.js`, the W3 page:
+  Wine's windows are canvases the browser composites): `web/src/dom-glass.js`
+  puts an element with a `backdrop-filter` (blur, then DWM's tint) under
+  each glass rectangle, stacked directly beneath the window's canvas, so the
+  browser blurs whatever is behind the window, and draws a frame left to
+  DWM from the same atlas on a canvas just above it. `DomWindow.paint`
+  applies the alpha-in-glass rule. `web/test/glass.html?dom=1`.
 - **Not yet**: hover glow on caption buttons (win32u does not track
   hover), the reflection streaks, thumbnails and Flip3D, the Windows 7
   colorization formula beyond colour-over-blur, and an end-to-end run:
