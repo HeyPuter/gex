@@ -21,7 +21,10 @@ while IFS= read -r line; do
   [ -f "$h" ] || { echo "units: $p is not in the tree" >&2; exit 1; }
   # the key: the unit's directory in the cache, as cgen-image reports it
   # (cgen-image ends with "IMAGE at BASE: CACHE/KEY/c.wasm (Ns)")
-  out=$(GEX_CGEN_CACHE=$U nice -n 10 "$G" cgen-image "$h" --pe-base "$base" --jobs "$JOBS" 2>&1 | tee -a "$L/units.log" | grep " at $base: " | tail -1)
+  log=$(GEX_CGEN_CACHE=$U nice -n 10 "$G" cgen-image "$h" --pe-base "$base" --jobs "$JOBS" 2>&1 | tee -a "$L/units.log")
+  # an image with no code (normaliz.dll: forwards only) has no unit
+  if echo "$log" | grep -q '^\[cgen\] recovered 0 functions'; then echo "  [$i/$n] $(basename "$p"): no code, no unit"; continue; fi
+  out=$(echo "$log" | grep " at $base: " | tail -1)
   key=$(echo "$out" | sed -n "s|.* at $base: .*/\([0-9a-f]*\)/c\.wasm ([0-9.]*s)\$|\1|p")
   [ ${#key} = 64 ] && [ -f "$U/$key/c.wasm" ] || { echo "units: no unit for $p at $base (logs/units.log)" >&2; exit 1; }
   echo "$key $p" >> "$W7_OUT/unit-keys.txt"
