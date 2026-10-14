@@ -3294,3 +3294,41 @@ pub extern "C" fn k_stage_drop(id: i32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// wasm32 programs' content keys, by file. Every exec of a wasm32 program
+// hashed its bytes (`gex_cgen_pmod_wasm_key`) to find the compiled module the
+// page keeps, 6-12 ms for `apt-get`, every time; the key is the same while
+// the file is. Kept here, where every process sees it.
+
+/// (path, inode, mtime, file size, module length) -> the key's two lanes.
+type ProgId = (String, u64, i64, u64, u32);
+
+fn progkeys() -> &'static Mutex<BTreeMap<ProgId, (u64, u64)>> {
+    static K: OnceLock<Mutex<BTreeMap<ProgId, (u64, u64)>>> = OnceLock::new();
+    K.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// How many program keys are kept; past it the cache starts again.
+const PROGKEYS_MAX: usize = 4096;
+
+/// The key noted for this file, if any: 1 and its lanes at `out`, or 0.
+#[no_mangle]
+pub extern "C" fn k_progkey_get(path: gex_kmem::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, out: gex_kmem::PAddr) -> i32 {
+    let id = (path_of_raw(path, path_len), ino, mtime, size, len);
+    let Some(&(a, c)) = progkeys().lock().unwrap_or_else(|e| e.into_inner()).get(&id) else { return 0 };
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&a.to_le_bytes());
+    b[8..].copy_from_slice(&c.to_le_bytes());
+    unsafe { gex_kmem::push_checked(out, b.as_ptr(), 16) as i32 }
+}
+
+/// Note the key of this file's program.
+#[no_mangle]
+pub extern "C" fn k_progkey_put(path: gex_kmem::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, a: u64, c: u64) {
+    let id = (path_of_raw(path, path_len), ino, mtime, size, len);
+    let mut k = progkeys().lock().unwrap_or_else(|e| e.into_inner());
+    if k.len() >= PROGKEYS_MAX {
+        k.clear();
+    }
+    k.insert(id, (a, c));
+}

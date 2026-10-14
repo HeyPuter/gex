@@ -347,6 +347,10 @@ extern "C" {
     fn k_obj_translated(obj: u64, produced: u32);
     /// The translation cache across page loads (docs/gexcc.md §8).
     fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64) -> i32;
+    /// A wasm32 program's content key by its file, system-wide
+    /// (`cgen/wasmprog.rs` `known_key`): 1 and the key's two lanes at `out`, or 0.
+    fn k_progkey_get(path: gex_kernel::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, out: gex_kernel::PAddr) -> i32;
+    fn k_progkey_put(path: gex_kernel::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, a: u64, c: u64);
     fn k_xcache_on() -> u32;
     fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
