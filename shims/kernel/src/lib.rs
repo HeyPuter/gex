@@ -3191,3 +3191,106 @@ fn path_of_raw(at: gex_kmem::PAddr, len: u32) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+
+// ---------------------------------------------------------------------------
+// Fork image staging. A fork's image used to leave the parent as fresh
+// ArrayBuffers (`slice`) and enter the child with a typed-array `set`: two
+// copies at about 0.6 GB/s, most of it first-touching new pages (62.6 MiB of
+// apt-get cost ~50 ms in the parent and ~100 ms in the child). Staged here
+// instead, both copies are `memory.copy` between this memory and a process's,
+// into buffers kept from one fork to the next, so their pages are already
+// touched. The buffer is the parent's until the fork record is sent and the
+// child's from then on; nobody else can name it.
+
+/// A staging buffer, in use by one fork or free.
+struct Stage {
+    buf: Vec<u8>,
+    used: bool,
+}
+
+/// Every staging buffer, by id - 1. Free ones are kept, up to
+/// [`STAGE_KEEP_BYTES`], so the next fork's copy lands on touched pages.
+fn stages() -> &'static Mutex<Vec<Option<Stage>>> {
+    static S: OnceLock<Mutex<Vec<Option<Stage>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// How many bytes of free staging buffers are kept for reuse.
+const STAGE_KEEP_BYTES: usize = 192 << 20;
+
+/// A staging buffer of at least `len` bytes, for one fork: its id (> 0), or
+/// -12 when the kernel's memory cannot hold it (the caller sends the image
+/// the old way). Reuses the smallest free buffer that fits.
+#[no_mangle]
+pub extern "C" fn k_stage_take(len: u32) -> i32 {
+    let len = len as usize;
+    let mut s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let best = s
+        .iter()
+        .enumerate()
+        .filter_map(|(i, x)| x.as_ref().filter(|x| !x.used && x.buf.capacity() >= len).map(|x| (i, x.buf.capacity())))
+        .min_by_key(|&(_, c)| c)
+        .map(|(i, _)| i);
+    if let Some(i) = best {
+        s[i].as_mut().unwrap().used = true;
+        return i as i32 + 1;
+    }
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return -12;
+    }
+    let st = Stage { buf, used: true };
+    if let Some(i) = s.iter().position(|x| x.is_none()) {
+        s[i] = Some(st);
+        i as i32 + 1
+    } else {
+        s.push(Some(st));
+        s.len() as i32
+    }
+}
+
+/// Where buffer `id`'s `[off, off + len)` is, if it is in use and that fits.
+/// The address stays good while the buffer is in use: only `k_stage_drop`
+/// can free or reuse it, and only its one user calls that.
+fn stage_at(id: i32, off: u32, len: u32) -> Option<*mut u8> {
+    let s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let st = s.get((id as usize).wrapping_sub(1))?.as_ref().filter(|x| x.used)?;
+    let end = (off as usize).checked_add(len as usize)?;
+    if end > st.buf.capacity() {
+        return None;
+    }
+    // Into the reserved capacity: every byte read back was written first
+    // (the parent fills `[off, off+len)` before the child reads it).
+    Some(unsafe { st.buf.as_ptr().cast_mut().add(off as usize) })
+}
+
+/// Copies `len` bytes of the calling process's memory at `at` into buffer
+/// `id` at `off`. 0, or -14 when either range is bad.
+#[no_mangle]
+pub extern "C" fn k_stage_pull(id: i32, off: u32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(p) = stage_at(id, off, len) else { return -14 };
+    if unsafe { gex_kmem::pull_checked(p, at, len) } { 0 } else { -14 }
+}
+
+/// Copies `len` bytes of buffer `id` at `off` into the calling process's
+/// memory at `at`. 0, or -14 when either range is bad.
+#[no_mangle]
+pub extern "C" fn k_stage_push(id: i32, off: u32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(p) = stage_at(id, off, len) else { return -14 };
+    if unsafe { gex_kmem::push_checked(at, p, len) } { 0 } else { -14 }
+}
+
+/// Buffer `id` is done with: kept for the next fork while the free ones add
+/// up to [`STAGE_KEEP_BYTES`], freed otherwise (largest kept first).
+#[no_mangle]
+pub extern "C" fn k_stage_drop(id: i32) {
+    let mut s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let i = (id as usize).wrapping_sub(1);
+    let Some(Some(st)) = s.get_mut(i) else { return };
+    st.used = false;
+    let free: usize = s.iter().flatten().filter(|x| !x.used).map(|x| x.buf.capacity()).sum();
+    if free > STAGE_KEEP_BYTES {
+        s[i] = None;
+    }
+}
+
