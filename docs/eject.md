@@ -815,6 +815,35 @@ compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
 round trips. A function the recording missed at startup is a fetch, too:
 add runs to the coverage.
 
+### Services
+
+`"services"` sets Windows services' start types in the site's prefix:
+`{"PlugPlay": "demand", "StiSvc": "disabled"}`, each `boot`, `system`,
+`auto`, `demand` or `disabled`. The build writes them into the bundle's
+`system.reg` in place (the key under `CurrentControlSet` and under
+`ControlSet001`), and fails on a service the prefix has no key for.
+
+What it is for: Wine's start-up is serial. `wineboot --init` starts
+`services.exe`, which starts every auto-start service one after another
+and waits for each to say it is running; only then does wineboot finish,
+and only then does the first program go on. A program that calls a
+demand-start service waits for that service's process to start in the
+same way. In gex a process start is a fork, a Worker and the Wine loader,
+and each service process starts threads of its own, so every service on
+that path costs time before the window appears. A service the site never
+uses can come off it.
+
+Paint (854551ad runtime, worldmachine, six timed loads each, the window
+from navigation): `PlugPlay`, `NDIS` and `nsiproxy` on `demand` (none of
+them reached by Paint; `NDIS` and `nsiproxy` are one `winedevice.exe`)
+put the window at 16.2 s against 17.1 s with them auto-started; then
+`StiSvc` (still image: scanners and cameras, which a browser has none of)
+`disabled`, at 12.6 s against 14.2 s, since Paint asks it at start-up
+whether there is a device and waited for `svchost -k imgsvc` to start.
+Paint's "From scanner or camera" is then unavailable. The whole of
+tests/eject/w3-prune.mjs passes with them so, and the theme is intact
+(`Themes`, Win7's theme service, stays `auto`: uxtheme needs it).
+
 ### Cold code on the function JIT
 
 `"cold": "jit"` keeps the recording's coverage as clang's code and ships

@@ -335,6 +335,55 @@ fn trim_resources(dir: &Path, v: &Json, units: &[Json], web: &Path) -> Result<st
     Ok(rekeyed)
 }
 
+/// `"services"`: each named service's `"Start"` in the site's prefix, set in
+/// place in the bundle's `system.reg` (same length: eight hex digits), under
+/// `CurrentControlSet` and `ControlSet001` wherever the key is. A name the
+/// prefix has no key for, or a key with no `"Start"`, fails the build.
+fn set_services(v: &Json, web: &Path, services: &[(String, u32)]) -> Result<()> {
+    let what = crate::project::PROJECT_FILE;
+    let path = web.join("rootfs.tar");
+    let mut bytes = std::fs::read(&path)?;
+    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
+    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").trim_matches('/').to_string();
+    let want = format!("{prefix}/system.reg");
+    let (o, n) = {
+        let tar = crate::reach::Tar::parse(&bytes)?;
+        let found = tar.files().into_iter().find(|(p, _, _)| *p == want).map(|(_, o, n)| (o, n));
+        found.ok_or_else(|| anyhow!("\"services\": the bundle has no {want}"))?
+    };
+    let reg = &mut bytes[o..o + n];
+    let lower: Vec<u8> = reg.to_ascii_lowercase();
+    let mut said = Vec::new();
+    for (name, start) in services {
+        let mut keys = 0;
+        for set in ["currentcontrolset", "controlset001"] {
+            let head = format!("[system\\\\{set}\\\\services\\\\{}]", name.to_ascii_lowercase());
+            let Some(at) = find(&lower, head.as_bytes(), 0) else { continue };
+            let end = find(&lower, b"\n[", at + head.len()).unwrap_or(lower.len());
+            let tag = b"\"start\"=dword:";
+            let Some(v) = find(&lower[..end], tag, at) else {
+                bail!("\"services\": \"{name}\": its key in {want} has no \"Start\"");
+            };
+            let d = v + tag.len();
+            reg[d..d + 8].copy_from_slice(format!("{start:08x}").as_bytes());
+            keys += 1;
+        }
+        if keys == 0 {
+            bail!("\"services\": the prefix has no service \"{name}\" ({want})");
+        }
+        said.push(format!("{name} {}", ["boot", "system", "auto", "demand", "disabled"][*start as usize]));
+    }
+    // A new file: the one there may be a hard link to the project's bundle.
+    std::fs::remove_file(&path)?;
+    write_file(&path, &bytes, false)?;
+    eprintln!("gexc eject build: \"services\": {}", said.join(", "));
+    Ok(())
+}
+
+fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
+}
+
 #[derive(Debug, Default)]
 pub struct W3Report {
     pub features_off: Vec<String>,
@@ -447,6 +496,9 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
         std::collections::HashMap::new()
     };
+    if !config.services.is_empty() {
+        set_services(&v, &web, &config.services)?;
+    }
     let site_key = |k: &str| rekeyed.get(k).cloned().unwrap_or_else(|| k.to_string());
     let instrument = config.cold.as_deref() == Some("instrument");
     let coverage = match (&config.cold, v.get("coverage")) {
