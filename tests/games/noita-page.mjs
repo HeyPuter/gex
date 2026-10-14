@@ -145,7 +145,10 @@ for (;;) {
   const n = tRun === null ? 0 : await produced();
   if (steps.length && n >= steps[0].at) {
     const w = await noitaWindow();
-    if (w) {
+    // Only once the window has its 1280x720 client area: Wine maps it small
+    // first (10x10), and a click then lands outside the game (K: a New Game
+    // lost that way cost a 12-minute run). The step waits for the next poll.
+    if (w && w.w >= 1280 && w.h >= 720) {
       // The surface holds Wine's own window frame around the 1280x720
       // client area the recipe's points are in: a 3-pixel border and a
       // caption, the client at (3,29) in the surface (read off the
