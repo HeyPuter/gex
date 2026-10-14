@@ -314,6 +314,10 @@ pub struct Glass {
     /// 0..=100 each: colour over the backdrop, and how much backdrop shows.
     pub balance: u32,
     pub blur_balance: u32,
+    /// The frame the host draws (`set_frame`): flags, and the close,
+    /// maximize and minimize buttons as (x, y, width, height, state).
+    pub frame: u32,
+    pub buttons: [(i32, i32, i32, i32, u32); 3],
 }
 
 impl Glass {
@@ -321,14 +325,21 @@ impl Glass {
     /// `RECTS - 1` and the bounds of the rest.
     pub const RECTS: usize = 4;
     /// Words a record spends on glass (`R_GLASS`.. in `wl-bridge.mjs`).
-    pub const WORDS: usize = 3 + 4 * Self::RECTS;
+    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3;
 
     /// Null (`None`) is the whole surface: one rectangle the host clips to
     /// the surface's size.
     fn set_region(&mut self, region: Option<&Region>) {
         let whole = [(0, 0, i32::MAX / 2, i32::MAX / 2)];
         let rects = region.map_or(&whole[..], Region::rects);
-        *self = Glass { argb: self.argb, balance: self.balance, blur_balance: self.blur_balance, ..Glass::default() };
+        *self = Glass {
+            argb: self.argb,
+            balance: self.balance,
+            blur_balance: self.blur_balance,
+            frame: self.frame,
+            buttons: self.buttons,
+            ..Glass::default()
+        };
         for (i, r) in rects.iter().enumerate() {
             if i == Self::RECTS - 1 && rects.len() > Self::RECTS {
                 let mut rest = Region::default();
@@ -359,6 +370,15 @@ impl Glass {
             w[4 + 4 * i] = r.1;
             w[5 + 4 * i] = r.2;
             w[6 + 4 * i] = r.3;
+        }
+        let f = 3 + 4 * Self::RECTS;
+        w[f] = self.frame as i32;
+        for (i, b) in self.buttons.iter().enumerate() {
+            w[f + 1 + 5 * i] = b.0;
+            w[f + 2 + 5 * i] = b.1;
+            w[f + 3 + 5 * i] = b.2;
+            w[f + 4 + 5 * i] = b.3;
+            w[f + 5 + 5 * i] = b.4 as i32;
         }
         w
     }
@@ -2585,6 +2605,22 @@ impl Client {
                 }
                 None => ok = false,
             },
+            // set_frame(flags, then x, y, width, height, state for close, max, min)
+            3 => {
+                let Some(flags) = r.uint() else { return false };
+                let mut buttons = [(0, 0, 0, 0, 0); 3];
+                for b in &mut buttons {
+                    match (r.int(), r.int(), r.int(), r.int(), r.uint()) {
+                        (Some(x), Some(y), Some(w), Some(h), Some(state)) => *b = (x, y, w, h, state.min(4)),
+                        _ => return false,
+                    }
+                }
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.glass.frame = flags;
+                    s.glass.buttons = buttons;
+                    self.dirty = true;
+                }
+            }
             // set_colorization(argb, balance, blur_balance)
             2 => match (r.uint(), r.uint(), r.uint()) {
                 (Some(argb), Some(balance), Some(blur_balance)) => {

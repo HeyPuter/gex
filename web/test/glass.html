@@ -12,7 +12,7 @@ import { Compositor } from '../src/compositor.js';
 import {
   makeWlChannel, WlProxy, REC, R_CLIENT, R_SURFACE, R_ROLE, R_REL_X, R_REL_Y, R_WIDTH, R_HEIGHT, R_ADDR,
   R_STRIDE, R_FORMAT, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H, R_PLACE, R_STACK_ID, R_GLASS, R_GLASS_ARGB,
-  R_GLASS_BALANCE, R_GLASS_RECTS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
+  R_GLASS_BALANCE, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
 } from '@gex/wl-bridge.mjs';
 
 const params = new URLSearchParams(location.search);
@@ -54,7 +54,7 @@ const win = pixels(W, H, (x, y) => {
 });
 
 const recs = new Int32Array(memory.buffer, 1024, 2 * REC);
-function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0 }) {
+function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0, title = '', frame = null }) {
   const r = i * REC;
   recs[r + R_CLIENT] = 1; recs[r + R_SURFACE] = surface; recs[r + R_ROLE] = ROLE_TOPLEVEL;
   recs[r + R_REL_X] = x; recs[r + R_REL_Y] = y; recs[r + R_WIDTH] = w; recs[r + R_HEIGHT] = h;
@@ -67,9 +67,21 @@ function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0 }) {
     recs[r + R_GLASS_BALANCE] = 45 | (60 << 8);
     glass.forEach((q, j) => recs.set(q, r + R_GLASS_RECTS + 4 * j));
   }
+  // The frame DWM would draw: flags, then close, max and min as x, y, w, h, state.
+  if (frame) recs.set(frame, r + R_GLASS_FRAME);
+  const t = new TextEncoder().encode(title).slice(0, R_TITLE_WORDS * 4 - 1);
+  const tb = new Uint8Array(R_TITLE_WORDS * 4);
+  tb.set(t);
+  recs.set(new Int32Array(tb.buffer), r + R_TITLE);
 }
 rec(0, { surface: 1, x: 0, y: 0, w: 800, h: 600, addr: bg, id: 1 });
-rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1,
+// Windows 7's caption buttons: close 43 wide, maximize and minimize 26, all
+// 20 high at the top edge, 6 px in from the right.
+const frame = params.get('frame') === '0' ? null : [1 | 2,
+  W - 6 - 43, 0, 43, 20, 1,
+  W - 6 - 43 - 26, 0, 26, 20, 1,
+  W - 6 - 43 - 52, 0, 26, 20, 1];
+rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1, title: 'Computer', frame,
   glass: glassOn ? [[0, 0, W, 30], [0, 30, 8, H - 38], [W - 8, 30, 8, H - 38], [0, H - 8, W, 8]] : null });
 const proxy = new WlProxy(channel, null, () => TOKEN);
 proxy.publish(memory, 1024, 2);
