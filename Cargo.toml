@@ -28,6 +28,7 @@ members = [
     "crates/gex-xwm",
     "crates/gex-gpu",
     "crates/gex-gl",
+    "crates/gex-webgpu",
     "crates/gex-eject",
     "crates/gex-rt",
     "crates/gexc",
@@ -56,6 +57,7 @@ gex-wayland = { path = "crates/gex-wayland" }
 gex-xwm = { path = "crates/gex-xwm" }
 gex-gpu = { path = "crates/gex-gpu" }
 gex-gl = { path = "crates/gex-gl", default-features = false }
+gex-webgpu = { path = "crates/gex-webgpu" }
 gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-isa-ppc = { path = "crates/gex-isa-ppc" }

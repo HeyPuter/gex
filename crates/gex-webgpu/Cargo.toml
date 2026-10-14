@@ -1,0 +1,16 @@
+[package]
+name = "gex-webgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The gex WebGPU wire's server on the host's Dawn: what /dev/gex-gpu runs"
+
+[features]
+# Build the server and link Dawn (GEX_DAWN_PREFIX). Off, the crate is the
+# empty shell a host without Dawn compiles.
+dawn = []
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.4"

@@ -28,4 +28,6 @@ anyhow = "1"
 # Build a gexc for x86-64 guests. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-eject/x86"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).
+# /dev/gex-gpu on the host's Dawn (GEX_DAWN_PREFIX).
+webgpu = ["gex-native/webgpu"]
 ppc = ["gex-abi/ppc", "gex-xlate/ppc", "gex-native/ppc", "gex-kernel/ppc"]

@@ -18,6 +18,7 @@ wasmparser = "0.219"
 gex-wayland.workspace = true
 gex-gpu.workspace = true
 gex-gl = { workspace = true, features = ["host"] }
+gex-webgpu.workspace = true
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-cgen.workspace = true
@@ -40,6 +41,8 @@ compile = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "gex-cache/com
 # the runtime runs only code compiled ahead of time (`aot_only`): an
 # ejected project's runtime (docs/eject-pe.md §7, E7).
 translate = ["compile"]
+# /dev/gex-gpu on the host's Dawn (GEX_DAWN_PREFIX; docs/d3d-webgpu.md).
+webgpu = ["gex-webgpu/dawn"]
 # Host an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).

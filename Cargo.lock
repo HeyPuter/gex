@@ -817,6 +817,7 @@ dependencies = [
  "gex-ld",
  "gex-mem",
  "gex-wayland",
+ "gex-webgpu",
  "gex-xlate",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
@@ -846,6 +847,13 @@ dependencies = [
 [[package]]
 name = "gex-wayland"
 version = "0.0.1"
+
+[[package]]
+name = "gex-webgpu"
+version = "0.0.1"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "gex-xlate"
