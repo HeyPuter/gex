@@ -73,7 +73,6 @@ Three further costs come from the server living in one process's memory:
   stays single-threaded in its logic: one request runs at a time.
 - **The user rejected a same-process direct-call shortcut.** The design
   must treat every process equally, the first one included.
-- **Eject ships no cross-process shared memory** (§9).
 - **SP build (no SAB):** every process shares one thread through the JSPI
   scheduler. The design must work there with no locks.
 
@@ -555,16 +554,11 @@ census in step 2 of §10 checks that before the numbers are trusted.
 
 ## 9. Eject
 
-**gex-eject ships no cross-process shared memory** (user, 2026-10-07).
 SM is runtime-owned memory with the kernel module's lifecycle, never a
-guest-visible `MAP_SHARED` region (§3.1). So whether it is shared is a
-build option, not a design fork (coordinator, 2026-10-12).
-
-**Decided (user, 2026-10-12): allowed.** In eject, SM may be shared
-across a program's Windows processes as a runtime-owned memory, like the
-kernel module's memory. It is not guest-visible shared memory, so the
-"no cross-process shm" rule does not apply to it. The two build options
-stay:
+guest-visible `MAP_SHARED` region (§3.1). So whether eject shares it across
+a program's Windows processes is a plain design and build-option question,
+not a design fork (coordinator, 2026-10-12). Eject may share it, as it
+shares the kernel module's memory. The two build options:
 
 - **Private SM (the build option eject can always take).**
   - The process's Workers alone import SM.
@@ -578,8 +572,7 @@ stay:
   Windows processes).**
   - SM is imported by the Workers of every process in the session, as
     the kernel module's memory is.
-  - An eject build of several Windows processes uses this (allowed
-    above).
+  - An eject build of several Windows processes can use this.
 
 The code is the same in both; the option chooses which Workers receive
 SM and whether a pump Worker exists.
