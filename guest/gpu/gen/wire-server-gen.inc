@@ -1173,6 +1173,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             if (limits) deser_out_chain_WGPULimits(r, limits);
             if (r->error)
                 return false;
+            if (!self)
+                return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.adapterGetLimits(self, limits));
             ser_out_WGPULimits(&server->reply, limits);
             gexgpu_server_reply_done(server);
@@ -1184,6 +1186,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUAdapterInfo *info = gexgpu_r_alloc(r, sizeof(*info));
             if (info) deser_out_chain_WGPUAdapterInfo(r, info);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.adapterGetInfo(self, info));
             ser_out_WGPUAdapterInfo(&server->reply, info);
@@ -1197,6 +1201,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             feature = (WGPUFeatureName)gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.adapterHasFeature(self, feature));
             gexgpu_server_reply_done(server);
             break;
@@ -1207,6 +1213,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUSupportedFeatures *features = gexgpu_r_alloc(r, sizeof(*features));
             if (features) deser_out_chain_WGPUSupportedFeatures(r, features);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             server->procs.adapterGetFeatures(self, features);
             ser_out_WGPUSupportedFeatures(&server->reply, features);
@@ -1220,6 +1228,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.bindGroupSetLabel(self, label);
             break;
         }
@@ -1230,6 +1240,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.bindGroupLayoutSetLabel(self, label);
             break;
         }
@@ -1240,6 +1252,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.bufferSetLabel(self, label);
             break;
         }
@@ -1248,6 +1262,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUBuffer self = (WGPUBuffer)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.bufferUnmap(self);
             break;
         }
@@ -1256,6 +1272,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUBuffer self = (WGPUBuffer)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.bufferDestroy(self);
             break;
         }
@@ -1266,6 +1284,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandBufferSetLabel(self, label);
             break;
         }
@@ -1290,6 +1310,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_CommandBuffer, server->procs.commandEncoderFinish(self, descriptor));
             break;
         }
@@ -1314,6 +1336,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_ComputePassEncoder, server->procs.commandEncoderBeginComputePass(self, descriptor));
             break;
         }
@@ -1338,6 +1362,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_RenderPassEncoder, server->procs.commandEncoderBeginRenderPass(self, descriptor));
             break;
         }
@@ -1356,6 +1382,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderCopyBufferToBuffer(self, source, sourceOffset, destination, destinationOffset, size);
             break;
         }
@@ -1406,6 +1434,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderCopyBufferToTexture(self, source, destination, copySize);
             break;
         }
@@ -1456,6 +1486,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderCopyTextureToBuffer(self, source, destination, copySize);
             break;
         }
@@ -1506,6 +1538,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderCopyTextureToTexture(self, source, destination, copySize);
             break;
         }
@@ -1520,6 +1554,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderClearBuffer(self, buffer, offset, size);
             break;
         }
@@ -1530,6 +1566,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             markerLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderInsertDebugMarker(self, markerLabel);
             break;
         }
@@ -1538,6 +1576,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUCommandEncoder self = (WGPUCommandEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderPopDebugGroup(self);
             break;
         }
@@ -1548,6 +1588,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             groupLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderPushDebugGroup(self, groupLabel);
             break;
         }
@@ -1566,6 +1608,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             destinationOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderResolveQuerySet(self, querySet, firstQuery, queryCount, destination, destinationOffset);
             break;
         }
@@ -1578,6 +1622,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             queryIndex = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderWriteTimestamp(self, querySet, queryIndex);
             break;
         }
@@ -1588,6 +1634,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.commandEncoderSetLabel(self, label);
             break;
         }
@@ -1598,6 +1646,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             markerLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderInsertDebugMarker(self, markerLabel);
             break;
         }
@@ -1606,6 +1656,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUComputePassEncoder self = (WGPUComputePassEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderPopDebugGroup(self);
             break;
         }
@@ -1616,6 +1668,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             groupLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderPushDebugGroup(self, groupLabel);
             break;
         }
@@ -1626,6 +1680,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             pipeline = (WGPUComputePipeline)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderSetPipeline(self, pipeline);
             break;
         }
@@ -1650,6 +1706,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderSetBindGroup(self, groupIndex, group, dynamicOffsetCount, dynamicOffsets);
             break;
         }
@@ -1664,6 +1722,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             workgroupCountZ = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderDispatchWorkgroups(self, workgroupCountX, workgroupCountY, workgroupCountZ);
             break;
         }
@@ -1676,6 +1736,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             indirectOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderDispatchWorkgroupsIndirect(self, indirectBuffer, indirectOffset);
             break;
         }
@@ -1684,6 +1746,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUComputePassEncoder self = (WGPUComputePassEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderEnd(self);
             break;
         }
@@ -1694,6 +1758,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderSetLabel(self, label);
             break;
         }
@@ -1711,6 +1777,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePassEncoderSetImmediates(self, offset, data, size);
             break;
         }
@@ -1723,6 +1791,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_BindGroupLayout, server->procs.computePipelineGetBindGroupLayout(self, groupIndex));
             break;
         }
@@ -1733,6 +1803,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.computePipelineSetLabel(self, label);
             break;
         }
@@ -1757,6 +1829,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_BindGroup, server->procs.deviceCreateBindGroup(self, descriptor));
             break;
         }
@@ -1781,6 +1855,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_BindGroupLayout, server->procs.deviceCreateBindGroupLayout(self, descriptor));
             break;
         }
@@ -1805,6 +1881,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_Buffer, server->procs.deviceCreateBuffer(self, descriptor));
             break;
         }
@@ -1829,6 +1907,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_CommandEncoder, server->procs.deviceCreateCommandEncoder(self, descriptor));
             break;
         }
@@ -1853,6 +1933,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_ComputePipeline, server->procs.deviceCreateComputePipeline(self, descriptor));
             break;
         }
@@ -1877,6 +1959,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_PipelineLayout, server->procs.deviceCreatePipelineLayout(self, descriptor));
             break;
         }
@@ -1901,6 +1985,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_QuerySet, server->procs.deviceCreateQuerySet(self, descriptor));
             break;
         }
@@ -1925,6 +2011,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_RenderBundleEncoder, server->procs.deviceCreateRenderBundleEncoder(self, descriptor));
             break;
         }
@@ -1949,6 +2037,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_RenderPipeline, server->procs.deviceCreateRenderPipeline(self, descriptor));
             break;
         }
@@ -1973,6 +2063,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_Sampler, server->procs.deviceCreateSampler(self, descriptor));
             break;
         }
@@ -1997,6 +2089,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_ShaderModule, server->procs.deviceCreateShaderModule(self, descriptor));
             break;
         }
@@ -2021,6 +2115,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_Texture, server->procs.deviceCreateTexture(self, descriptor));
             break;
         }
@@ -2029,6 +2125,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUDevice self = (WGPUDevice)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.deviceDestroy(self);
             break;
         }
@@ -2038,6 +2136,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPULimits *limits = gexgpu_r_alloc(r, sizeof(*limits));
             if (limits) deser_out_chain_WGPULimits(r, limits);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.deviceGetLimits(self, limits));
             ser_out_WGPULimits(&server->reply, limits);
@@ -2051,6 +2151,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             feature = (WGPUFeatureName)gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.deviceHasFeature(self, feature));
             gexgpu_server_reply_done(server);
             break;
@@ -2061,6 +2163,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUSupportedFeatures *features = gexgpu_r_alloc(r, sizeof(*features));
             if (features) deser_out_chain_WGPUSupportedFeatures(r, features);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             server->procs.deviceGetFeatures(self, features);
             ser_out_WGPUSupportedFeatures(&server->reply, features);
@@ -2074,6 +2178,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             if (adapterInfo) deser_out_chain_WGPUAdapterInfo(r, adapterInfo);
             if (r->error)
                 return false;
+            if (!self)
+                return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.deviceGetAdapterInfo(self, adapterInfo));
             ser_out_WGPUAdapterInfo(&server->reply, adapterInfo);
             gexgpu_server_reply_done(server);
@@ -2086,6 +2192,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             filter = (WGPUErrorFilter)gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.devicePushErrorScope(self, filter);
             break;
         }
@@ -2096,6 +2204,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.deviceSetLabel(self, label);
             break;
         }
@@ -2106,6 +2216,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.externalTextureSetLabel(self, label);
             break;
         }
@@ -2115,6 +2227,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUWGSLLanguageFeatureName feature;
             feature = (WGPUWGSLLanguageFeatureName)gexgpu_r_u32(r);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             gexgpu_w_u32(&server->reply, (uint32_t)server->procs.instanceHasWGSLLanguageFeature(self, feature));
             gexgpu_server_reply_done(server);
@@ -2126,6 +2240,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUSupportedWGSLLanguageFeatures *features = gexgpu_r_alloc(r, sizeof(*features));
             if (features) deser_out_chain_WGPUSupportedWGSLLanguageFeatures(r, features);
             if (r->error)
+                return false;
+            if (!self)
                 return false;
             server->procs.instanceGetWGSLLanguageFeatures(self, features);
             ser_out_WGPUSupportedWGSLLanguageFeatures(&server->reply, features);
@@ -2139,6 +2255,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.pipelineLayoutSetLabel(self, label);
             break;
         }
@@ -2149,6 +2267,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.querySetSetLabel(self, label);
             break;
         }
@@ -2157,6 +2277,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUQuerySet self = (WGPUQuerySet)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.querySetDestroy(self);
             break;
         }
@@ -2177,6 +2299,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.queueSubmit(self, commandCount, commands);
             break;
         }
@@ -2196,6 +2320,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.queueWriteBuffer(self, buffer, bufferOffset, data, size);
             break;
         }
@@ -2253,6 +2379,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.queueWriteTexture(self, destination, data, dataSize, dataLayout, writeSize);
             break;
         }
@@ -2263,6 +2391,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.queueSetLabel(self, label);
             break;
         }
@@ -2273,6 +2403,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleSetLabel(self, label);
             break;
         }
@@ -2283,6 +2415,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             pipeline = (WGPURenderPipeline)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetPipeline(self, pipeline);
             break;
         }
@@ -2307,6 +2441,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetBindGroup(self, groupIndex, group, dynamicOffsetCount, dynamicOffsets);
             break;
         }
@@ -2323,6 +2459,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             firstInstance = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderDraw(self, vertexCount, instanceCount, firstVertex, firstInstance);
             break;
         }
@@ -2341,6 +2479,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             firstInstance = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderDrawIndexed(self, indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
             break;
         }
@@ -2353,6 +2493,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             indirectOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderDrawIndirect(self, indirectBuffer, indirectOffset);
             break;
         }
@@ -2365,6 +2507,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             indirectOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderDrawIndexedIndirect(self, indirectBuffer, indirectOffset);
             break;
         }
@@ -2375,6 +2519,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             markerLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderInsertDebugMarker(self, markerLabel);
             break;
         }
@@ -2383,6 +2529,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPURenderBundleEncoder self = (WGPURenderBundleEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderPopDebugGroup(self);
             break;
         }
@@ -2393,6 +2541,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             groupLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderPushDebugGroup(self, groupLabel);
             break;
         }
@@ -2409,6 +2559,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetVertexBuffer(self, slot, buffer, offset, size);
             break;
         }
@@ -2425,6 +2577,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetIndexBuffer(self, buffer, format, offset, size);
             break;
         }
@@ -2449,6 +2603,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_RenderBundle, server->procs.renderBundleEncoderFinish(self, descriptor));
             break;
         }
@@ -2459,6 +2615,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetLabel(self, label);
             break;
         }
@@ -2476,6 +2634,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderBundleEncoderSetImmediates(self, offset, data, size);
             break;
         }
@@ -2486,6 +2646,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             pipeline = (WGPURenderPipeline)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetPipeline(self, pipeline);
             break;
         }
@@ -2510,6 +2672,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetBindGroup(self, groupIndex, group, dynamicOffsetCount, dynamicOffsets);
             break;
         }
@@ -2526,6 +2690,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             firstInstance = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderDraw(self, vertexCount, instanceCount, firstVertex, firstInstance);
             break;
         }
@@ -2544,6 +2710,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             firstInstance = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderDrawIndexed(self, indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
             break;
         }
@@ -2556,6 +2724,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             indirectOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderDrawIndirect(self, indirectBuffer, indirectOffset);
             break;
         }
@@ -2568,6 +2738,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             indirectOffset = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderDrawIndexedIndirect(self, indirectBuffer, indirectOffset);
             break;
         }
@@ -2588,6 +2760,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderExecuteBundles(self, bundleCount, bundles);
             break;
         }
@@ -2598,6 +2772,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             markerLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderInsertDebugMarker(self, markerLabel);
             break;
         }
@@ -2606,6 +2782,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPURenderPassEncoder self = (WGPURenderPassEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderPopDebugGroup(self);
             break;
         }
@@ -2616,6 +2794,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             groupLabel = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderPushDebugGroup(self, groupLabel);
             break;
         }
@@ -2626,6 +2806,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             reference = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetStencilReference(self, reference);
             break;
         }
@@ -2648,6 +2830,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             }
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetBlendConstant(self, color);
             break;
         }
@@ -2668,6 +2852,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             maxDepth = gexgpu_r_f32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetViewport(self, x, y, width, height, minDepth, maxDepth);
             break;
         }
@@ -2684,6 +2870,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             height = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetScissorRect(self, x, y, width, height);
             break;
         }
@@ -2700,6 +2888,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetVertexBuffer(self, slot, buffer, offset, size);
             break;
         }
@@ -2716,6 +2906,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetIndexBuffer(self, buffer, format, offset, size);
             break;
         }
@@ -2726,6 +2918,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             queryIndex = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderBeginOcclusionQuery(self, queryIndex);
             break;
         }
@@ -2734,6 +2928,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPURenderPassEncoder self = (WGPURenderPassEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderEndOcclusionQuery(self);
             break;
         }
@@ -2742,6 +2938,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPURenderPassEncoder self = (WGPURenderPassEncoder)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderEnd(self);
             break;
         }
@@ -2752,6 +2950,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetLabel(self, label);
             break;
         }
@@ -2769,6 +2969,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             size = gexgpu_r_u64(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPassEncoderSetImmediates(self, offset, data, size);
             break;
         }
@@ -2781,6 +2983,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_BindGroupLayout, server->procs.renderPipelineGetBindGroupLayout(self, groupIndex));
             break;
         }
@@ -2791,6 +2995,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.renderPipelineSetLabel(self, label);
             break;
         }
@@ -2801,6 +3007,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.samplerSetLabel(self, label);
             break;
         }
@@ -2811,6 +3019,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.shaderModuleSetLabel(self, label);
             break;
         }
@@ -2821,6 +3031,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.surfaceSetLabel(self, label);
             break;
         }
@@ -2845,6 +3057,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             result_id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_TextureView, server->procs.textureCreateView(self, descriptor));
             break;
         }
@@ -2855,6 +3069,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.textureSetLabel(self, label);
             break;
         }
@@ -2863,6 +3079,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             WGPUTexture self = (WGPUTexture)gexgpu_r_object(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.textureDestroy(self);
             break;
         }
@@ -2873,6 +3091,8 @@ static bool gexgpu_server_dispatch_gen(struct gexgpu_server *server, uint32_t op
             label = gexgpu_r_string(r);
             if (r->error)
                 return false;
+            if (!self)
+                break;
             server->procs.textureViewSetLabel(self, label);
             break;
         }
