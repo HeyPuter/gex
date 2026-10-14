@@ -5,4 +5,5 @@ edition.workspace = true
 description = "Content keys every host computes alike: SHA-256, an image's identity, a function-tier unit's key"
 
 [dependencies]
+gex-abi.workspace = true
 gex-ld.workspace = true

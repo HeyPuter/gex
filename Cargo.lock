@@ -746,6 +746,7 @@ dependencies = [
 name = "gex-key"
 version = "0.0.1"
 dependencies = [
+ "gex-abi",
  "gex-ld",
 ]
 
