@@ -156,6 +156,31 @@ futex.rs, 4 Mutexes): its waiter lists and PI owners.
 - FUTEX_WAKE and REQUEUE take at most two shards, in address order.
 - PI futexes (LOCK_PI/UNLOCK_PI) keep their owner per shard.
 
+As landed (L1, branch l/klock): `futex` is in the free class
+(`syscalls::free_call`), answered by `syscalls::futex_call`,
+`futex_block` and `futex_pi_park`, the same functions the kernel's own
+`sys_futex` calls, through a `FutexCx` (the process's table, a way to ask
+whether the word is mapped, the caller's tid, the clock).
+
+- `FutexTable`'s queues are 256 shards (`futex::shard`), each its own
+  mutex; a queue's generation has its own. The cross-Worker relay
+  (`woken`) has an `any_woken` flag, so a call with nothing to relay takes
+  no lock.
+- PI: the waiter count and the waiters bit change together under the
+  table's `pi_lock`. `FUTEX_LOCK_PI` that finds the lock held sets the bit
+  (a compare-and-swap even when it is on) and counts itself; `UNLOCK_PI`
+  reads the count and stores the word. Apart, an unlock could read no
+  waiters, a waiter set the bit and count itself, and the unlock then
+  clear the word to a bare 0, which user space takes and releases without
+  a wake: the waiter slept on (pi-mutex hung in 5 of 8 runs).
+- Whether the word is mapped: the page asks the process's `MapView`
+  (`mem::MapView`, the VMA ranges published through `rcu::Published`
+  after every map change, §3.5's reader half); the kernel's own path and
+  the SP build ask the map itself.
+- The park (`park_free`) takes the thread's own `Run` lock only; the
+  deadlock watch reads every thread's published run state
+  (`all_futex_blocked`) without the kernel lock.
+
 ### 3.3 Wakes
 
 TW2 replaced the global `k_wake` after every syscall with targeted wakes:
@@ -423,10 +448,14 @@ in the scheduler pick after each wake of the global WAKE word: about
    select and epoll_pwait then run without KLock; offsets are atomics
    in `OpenFile`. Leg: close-while-reading; pipe and socket stress in
    both hosts.
-4. **Futexes: lock deleted (§3.2).** `FutexTable` sharded by the kernel
-   module's hash, 256 shards with their own locks; WAKE and REQUEUE take
-   at most two shards in address order; PI owners per shard. Leg:
-   `check-futex-wake.mjs` at 8 Workers on 64 futexes with requeue.
+4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
+   shards with their own locks; the PI count and bit under one table
+   lock; `futex` answered in the free class with no fallback. Legs:
+   `check-futex-wake.mjs`; `kernel-contend` (mutex, condvar, PI, map
+   churn, idents from 4 threads) in the page tier; pi-mutex; the
+   gex-kernel tests `free_futex_answers_as_the_kernel_does`,
+   `futex_calls_from_many_threads_keep_a_mutex` and
+   `a_map_view_is_read_while_the_map_changes`.
 5. **Signal masks and per-thread state: lock deleted.** rt_sigprocmask,
    sigaltstack, set_tid_address, set_robust_list, arch_prctl on a
    per-thread state only its owner writes; pending words atomic (§3.8,

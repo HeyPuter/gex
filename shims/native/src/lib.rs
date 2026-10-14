@@ -1024,7 +1024,7 @@ fn run_program_with(
         }) => {
             // The address space is new, so the map of it starts empty. Every
             // other part of the kernel is what exec is defined to keep.
-            k.mem = gex_kernel::mem::MemoryMap::new(image.brk);
+            k.mem.renew(image.brk);
             k.ctx_addr = ctx_addr;
             // `exec_program` already named the file it loaded, as a guest path;
             // argv[0] (all `exe_path` has here) may be a bare `wc`.

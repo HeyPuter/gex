@@ -1261,6 +1261,7 @@ mod imp {
                     // A Worker of its own, as a Linux clone gets: the entry
                     // is this process's, the thread runs elsewhere.
                     h.threads.push(Thread::new(ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 }, start, Waiting::Elsewhere));
+                    crate::publish_runs(h);
                     if !h.jit.ever_threaded {
                         backfill_registry(h);
                         h.jit.ever_threaded = true;

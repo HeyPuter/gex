@@ -3196,7 +3196,57 @@ fn set_host(host: Host) {
 fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
+    publish_runs(h);
     bind_mine(h, 0);
+}
+
+/// Most threads a process's run states are published for ([`publish_runs`]).
+const RUN_SLOTS: usize = 1024;
+
+/// Every thread's run state, published for readers without the kernel lock
+/// (docs/kernel-locking.md §3.7): the futex deadlock watch, which asks
+/// whether every thread is parked on a futex nothing will wake. Each slot is
+/// an `Arc::into_raw` that is never taken back: a run state lives as long as
+/// the memory does (a few words a thread), so a reader never meets a freed
+/// one, whatever replaced it.
+static RUNS: [std::sync::atomic::AtomicUsize; RUN_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RUN_SLOTS];
+/// How many of [`RUNS`] are this process's threads.
+static RUNS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Publish `h`'s threads' run states to [`RUNS`]: after the table changes
+/// (a new process, a new thread, an exec, a vfork's swap).
+pub(crate) fn publish_runs(h: &Host) {
+    use std::sync::atomic::Ordering::Release;
+    let n = h.threads.len().min(RUN_SLOTS);
+    for (i, t) in h.threads.iter().take(n).enumerate() {
+        if RUNS[i].load(std::sync::atomic::Ordering::Relaxed) != Arc::as_ptr(&t.run) as usize {
+            RUNS[i].store(Arc::into_raw(Arc::clone(&t.run)) as usize, Release);
+        }
+    }
+    RUNS_N.store(n, Release);
+}
+
+/// Whether every thread of this process is parked on a futex with no
+/// deadline, and not one of them already woken: a deadlock, if it lasts
+/// (`DEADLOCK_CONFIRM`). No kernel lock: each thread's run state has its own
+/// ([`RUNS`]).
+pub(crate) fn all_futex_blocked() -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    let n = RUNS_N.load(Acquire);
+    if n == 0 {
+        return false;
+    }
+    let now = turn_now();
+    (0..n).all(|i| {
+        let p = RUNS[i].load(Acquire) as *const Mutex<Run>;
+        if p.is_null() {
+            return false;
+        }
+        // SAFETY: an `Arc::into_raw` of a run state, never released (`RUNS`).
+        let r = unsafe { &*p }.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(r.waiting, Waiting::Futex { deadline: None, .. }) && !wait_ready(&r.waiting, &r.blocked_on, now, false)
+    })
 }
 
 /// Whether this Worker has a kernel yet.
@@ -7015,39 +7065,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
-        if nr == gex_kernel::syscalls::nr::FUTEX {
-            let op = (a1 as u32)
-                & !(gex_kernel::futex::op::PRIVATE_FLAG
-                    | gex_kernel::futex::op::CLOCK_REALTIME);
-            if !matches!(op, 0 | 1 | 3 | 4 | 5 | 9 | 10) {
-                let fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
-                let caller = gm.read_u64(fp + 8).unwrap_or(0);
-                let call_insn = gm.read_u32(caller.saturating_sub(4)).unwrap_or(0);
-                let imm26 = ((call_insn & 0x03ff_ffff) as i32) << 6 >> 6;
-                let target = caller
-                    .saturating_sub(4)
-                    .wrapping_add((imm26 as i64 * 4) as u64);
-                let last_target = gm
-                    .read_u64(kstate.ctx_addr + ctx::LAST_TARGET as u64)
-                    .unwrap_or(0);
-                let saved_pc = gm
-                    .read_u64(kstate.ctx_addr + ctx::PC as u64)
-                    .unwrap_or(0);
-                let dir = |addr: u64| {
-                    gm.read_u32(gex_abi::DISPATCH_DIR + gex_abi::dispatch_page(addr) * 4)
-                        .unwrap_or(0)
-                };
-                warn_line(&format!(
-                    "[gex] invalid futex registers at pc={:#x}, translated ctx={:#x}, worker ctx={:#x}: x0={a0:#x} x1={a1:#x} x2={a2:#x}; saved-pc={saved_pc:#x} last-target={last_target:#x}; caller={caller:#x} call={call_insn:#x}->{target:#x}, mem[target]={:#x}, dirs target={:#x} libc={:#x}",
-                    pc as u64,
-                    ctx as u32,
-                    kstate.ctx_addr,
-                    gm.read_u32(target).unwrap_or(0),
-                    dir(target),
-                    dir(pc as u64),
-                ));
-            }
-        }
         let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         // The page finishes its own waits (`finish_wait`, which asks the op
@@ -7133,12 +7150,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         if is_mem_call(nr) {
             mem_note(nr, a0, a1, ret);
         }
-        // Every futex answer that is an error, by name: glibc aborts on an
-        // unexpected futex error code with no clue which call or code, and the
-        // ring cannot say (a blocked call has not written `x0` when recorded).
-        if nr == 98 {
-            ftx_note(a1, a0, ret as i64, pc as u64, kstate.tid);
-        }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
         // go through turns a named failure into "killed by signal 6".
@@ -7218,6 +7229,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     start,
                     Waiting::Elsewhere,
                 ));
+                publish_runs(h);
                 // From here the process has a second Worker, so translated
                 // modules must be kept for it to catch up. Until now they were
                 // not (see `gex_jit_installed`) -- so on this first edge, take
@@ -9087,8 +9099,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
-    h.kernel.mem =
-        gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
+    h.kernel.mem.renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     // Old code the new program may put something else at: what lies in the
@@ -9404,6 +9415,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
     h.threads = vec![Thread::new(ThreadState::new(ctx_addr, h.kernel.pid), entry, Waiting::Runnable)];
+    publish_runs(h);
     set_current(h, 0);
     if let (Some(p), None) = (&program, &restored) {
         if hook != 0 {
@@ -9827,7 +9839,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     let tpidr = snap_read_u64(raw, &mut p)?;
     let n = snap_read_u32(raw, &mut p)?;
 
-    h.kernel.mem = gex_kernel::mem::MemoryMap::new(brk);
+    h.kernel.mem.renew(brk);
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     // One read per file, not per mapping: a library is four mappings (text,
     // rodata, relro, data), and re-reading `libc.so.6` for each is wasteful.
@@ -10554,7 +10566,7 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
             // thread writes `result` then clears its tid, and a joiner resumed by
             // the bare tid re-read saw the tid zero but `result` still zero. With
             // a global kernel every real futex wake goes through `FutexTable::wake`
-            // -> `woken()` (set under `KLock`) and the relayed generation, both
+            // -> `woken()` (set under its queue's own lock) and the relayed generation, both
             // properly ordered, so the re-read adds nothing but the hazard.
             parked.woken()
                 || deadline.is_some_and(|d| now >= d)
@@ -11020,6 +11032,15 @@ fn schedule() -> i32 {
             return 2;
         }
         waitq::Turn::Ready(signalled) => return finish_mine(signalled),
+        // Every thread parked on a futex: a deadlock once it lasts.
+        waitq::Turn::Stuck => {
+            if deadlock_confirmed() {
+                report_deadlock();
+                return 2;
+            }
+            set_paused_to(2);
+            return 2;
+        }
         waitq::Turn::Locked => {}
     }
     loop {
@@ -11061,58 +11082,8 @@ fn schedule() -> i32 {
                 set_paused_to(why);
                 return 2;
             }
-            if all_blocked && {
-                // Confirm it persists before acting. A single all-blocked instant
-                // is not a deadlock -- during startup one is routine -- so require
-                // a run of them at a wake seq that never moves (a real deadlock
-                // runs no more syscalls, so nothing bumps the counter). A moved
-                // seq resets the count: something woke, so progress is possible.
-                // The seq is this Worker's wait slot's, which every wake of
-                // any of the process's threads' waits does not move -- but a
-                // wake of this one's does, and a deadlock moves nothing.
-                let seq = if unsafe { k_present() } != 0 {
-                    unsafe { k_ws_seq(waitq::slot()) }
-                } else {
-                    0
-                };
-                DEADLOCK_WATCH.with(|w| {
-                    let (last, n) = w.get();
-                    let n = if n > 0 && last == seq { n + 1 } else { 1 };
-                    w.set((seq, n));
-                    n >= DEADLOCK_CONFIRM
-                })
-            } {
-                // Every remaining thread parked on a futex nothing will wake.
-                // On Linux this hangs; saying which futex and where the guest
-                // stands turns it from a symptom into something to look up.
-                let who = with_host(|h| {
-                    let mut s = String::new();
-                    let gm = GuestMem::new(guest_bytes());
-                    for (i, t) in h.threads.iter().enumerate() {
-                        let r = t.run();
-                        if let Waiting::Futex { parked, .. } = &r.waiting {
-                            let pc = gm
-                                .read_u64(t.kstate.ctx_addr + ctx::PC as u64)
-                                .unwrap_or(0);
-                            s.push_str(&format!(
-                                "gex:   thread {i} parked on {:#x}, pc {:#x}{}\n",
-                                parked.addr(),
-                                pc,
-                                h.kernel
-                                    .mem
-                                    .vmas()
-                                    .iter()
-                                    .find(|v| pc >= v.start && pc < v.end)
-                                    .map(|v| format!(" in {} +{:#x}", v.name, pc - v.start))
-                                    .unwrap_or_default(),
-                            ));
-                        }
-                    }
-                    s
-                });
-                trace_line("gex: every thread is blocked on a futex\n");
-                trace_line(&who);
-                with_host(|h| set_exit(h, 128 + 31));
+            if all_blocked && deadlock_confirmed() {
+                report_deadlock();
                 return 2;
             }
             // Nothing runnable and nothing above recognised the wait: going
@@ -11141,6 +11112,58 @@ fn schedule() -> i32 {
             None => return 2,
         }
     }
+}
+
+/// Whether the all-blocked state this Worker's turn found has lasted long
+/// enough to be a deadlock. Confirm it persists before acting: a single
+/// all-blocked instant is not a deadlock -- during startup one is routine --
+/// so it takes a run of them at a wake seq that never moves (a real deadlock
+/// runs no more syscalls, so nothing bumps the counter). A moved seq resets
+/// the count: something woke, so progress is possible. The seq is this
+/// Worker's wait slot's, which every wake of any of the process's threads'
+/// waits does not move -- but a wake of this one's does, and a deadlock
+/// moves nothing. No kernel lock.
+fn deadlock_confirmed() -> bool {
+    let seq = if unsafe { k_present() } != 0 { unsafe { k_ws_seq(waitq::slot()) } } else { 0 };
+    DEADLOCK_WATCH.with(|w| {
+        let (last, n) = w.get();
+        let n = if n > 0 && last == seq { n + 1 } else { 1 };
+        w.set((seq, n));
+        n >= DEADLOCK_CONFIRM
+    })
+}
+
+/// Every remaining thread parked on a futex nothing will wake. On Linux this
+/// hangs; saying which futex and where the guest stands turns it from a
+/// symptom into something to look up. The process ends (`set_exit`), which
+/// is the kernel's.
+fn report_deadlock() {
+    let who = with_host(|h| {
+        let mut s = String::new();
+        let gm = GuestMem::new(guest_bytes());
+        for (i, t) in h.threads.iter().enumerate() {
+            let r = t.run();
+            if let Waiting::Futex { parked, .. } = &r.waiting {
+                let pc = gm.read_u64(t.kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                s.push_str(&format!(
+                    "gex:   thread {i} parked on {:#x}, pc {:#x}{}\n",
+                    parked.addr(),
+                    pc,
+                    h.kernel
+                        .mem
+                        .vmas()
+                        .iter()
+                        .find(|v| pc >= v.start && pc < v.end)
+                        .map(|v| format!(" in {} +{:#x}", v.name, pc - v.start))
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        s
+    });
+    trace_line("gex: every thread is blocked on a futex\n");
+    trace_line(&who);
+    with_host(|h| set_exit(h, 128 + 31));
 }
 
 /// One locked turn of `schedule` for this Worker's thread: run it again if
@@ -11320,6 +11343,22 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
     let [a0, a1, a2] = call.args();
     let slot = sys_note(n, a0, a1);
     let outcome = sigs::free_call(&mut gm, ctx_addr, call, compat);
+    if n == nr::FUTEX {
+        // Every futex this call woke, relayed to the shared per-address
+        // counter, so a waiter parked in another Worker sees the wake.
+        if unsafe { k_present() } != 0 {
+            if let Some(home) = sigs::home() {
+                for addr in home.futexes.take_woken() {
+                    unsafe { k_futex_wake(addr) };
+                }
+            }
+        }
+        // Every futex answer that is an error, by name (`ftx_recent`).
+        if let FreeOutcome::Done(_) = &outcome {
+            let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
+            ftx_note(a1, a0, ret as i64, pc as u64, my_tid());
+        }
+    }
     if let FreeOutcome::Done(_) = &outcome {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
@@ -11360,7 +11399,25 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
         gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
-        _ => unreachable!("a class call parks only on a stream or a poll"),
+        // A futex wait, as the kernel's park: the shared generation of the
+        // address sampled now, after the word was checked (a wake since
+        // bumps it, so the first look sees it), and the place the call took
+        // before it checked the word (a wake between the two is seen there).
+        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+            val: *val,
+            wake_gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
+            parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
+            deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
+        },
+        // A priority-inheritance lock found held: tried again when the
+        // thread runs (`finish_parked`), its call made again until it is
+        // taken.
+        gex_kernel::BlockOp::FutexLockPi { uaddr, deadline, .. } => Waiting::Pi {
+            addr: *uaddr,
+            gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
+            deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
+        },
+        _ => unreachable!("a class call parks only on a stream, a poll or a futex"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     // A new wait: whatever this Worker's thread was registered for is over.
@@ -11407,11 +11464,19 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         if matches!(r.waiting, Waiting::Exited) && !leader_waits() {
             return Pick::Over;
         }
-        // A stream: no futex deadlock to confirm, and not a wait that ends
-        // by itself.
+        // A futex ends by itself (another Worker wakes it); one with no
+        // deadline may be the last of the process's threads to park, which
+        // the deadlock watch confirms (`all_futex_blocked`). A stream does
+        // neither.
         let why = wait_why(&r);
-        let fresh = waitq::enter(cur(), &r, why, false, false);
+        let futex = matches!(r.waiting, Waiting::Futex { .. } | Waiting::Pi { .. });
+        let untimed = matches!(r.waiting, Waiting::Futex { deadline: None, .. });
+        let fresh = waitq::enter(cur(), &r, why, false, futex);
         drop(r);
+        let all_blocked = why == 0 && untimed && all_futex_blocked();
+        if all_blocked {
+            waitq::note_all_blocked();
+        }
         // Registered now, so a change from here on notifies: one before
         // that is seen by asking again.
         if fresh && {
@@ -11421,7 +11486,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         } {
             continue;
         }
-        return Pick::Idle(IdleLook { why, all_blocked: false, ends_by_itself: false });
+        return Pick::Idle(IdleLook { why, all_blocked, ends_by_itself: futex });
     }
 }
 

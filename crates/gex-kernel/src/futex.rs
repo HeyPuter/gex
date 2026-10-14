@@ -84,10 +84,24 @@ impl Parked {
     }
 }
 
+/// How many shards a table's queues are split over: a wait and a wake on
+/// different words rarely meet on one lock (docs/kernel-locking.md §3.2).
+const SHARDS: usize = 256;
+
+/// The shard of `addr`'s queue: the word's index, mixed so that neighbouring
+/// words (a lock and its condition variable) go to different shards.
+fn shard(addr: u64) -> usize {
+    ((addr >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % SHARDS
+}
+
 /// The process's futex queues.
-#[derive(Default, Debug)]
+///
+/// No lock shared by every call: the queues are sharded by address, each
+/// shard behind its own mutex, and each queue's generation behind its own.
+/// A wait and a wake on one word meet only on that word's shard and queue.
+#[derive(Debug)]
 pub struct FutexTable {
-    queues: Mutex<HashMap<u64, Arc<Queue>>>,
+    queues: Box<[Mutex<HashMap<u64, Arc<Queue>>>]>,
     /// Addresses woken since the host last drained them, for a host that relays
     /// wakes across threads that do not share this table -- the browser, where
     /// each Worker has its own `FutexTable` and a cross-Worker wake must reach
@@ -96,6 +110,9 @@ pub struct FutexTable {
     /// Bounded: the browser drains it after each syscall; a native run, which
     /// blocks in [`Self::wait`] and never drains, must not grow it without end.
     woken: Mutex<VecDeque<u64>>,
+    /// Whether `woken` may hold anything, so a caller with nothing to relay
+    /// does not take its lock.
+    any_woken: std::sync::atomic::AtomicBool,
     /// How many callers wait for each priority-inheritance lock: a
     /// `FUTEX_LOCK_PI` that found it held counts until its wait ends, so an
     /// unlock with nobody left clears the waiters bit, as Linux does (a
@@ -103,14 +120,45 @@ pub struct FutexTable {
     pi: Mutex<HashMap<u64, u32>>,
 }
 
+/// [`FutexTable::pi_lock`]'s guard.
+pub struct PiCounts<'a>(std::sync::MutexGuard<'a, HashMap<u64, u32>>);
+
+impl PiCounts<'_> {
+    /// A caller starts waiting for the PI lock at `addr`.
+    pub fn wait(&mut self, addr: u64) {
+        *self.0.entry(addr).or_insert(0) += 1;
+    }
+
+    /// Whether anyone waits for the PI lock at `addr`.
+    pub fn waiters(&self, addr: u64) -> bool {
+        self.0.contains_key(&addr)
+    }
+}
+
+impl Default for FutexTable {
+    fn default() -> Self {
+        FutexTable {
+            queues: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            woken: Mutex::new(VecDeque::new()),
+            any_woken: std::sync::atomic::AtomicBool::new(false),
+            pi: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl FutexTable {
     pub fn new() -> FutexTable {
         FutexTable::default()
     }
 
-    /// A caller starts waiting for the PI lock at `addr` ([`Self::pi`]).
-    pub fn pi_wait(&self, addr: u64) {
-        *self.pi.lock().unwrap_or_else(|e| e.into_inner()).entry(addr).or_insert(0) += 1;
+    /// The waiter counts, held while a `FUTEX_LOCK_PI` that finds the lock
+    /// held sets the waiters bit and counts itself, and while a
+    /// `FUTEX_UNLOCK_PI` reads the count and stores the word: the two are
+    /// one step each, so an unlock never clears the bit of a waiter that
+    /// has just set it (a bare 0 is a lock user space takes and releases
+    /// without a wake, and the waiter would sleep on).
+    pub fn pi_lock(&self) -> PiCounts<'_> {
+        PiCounts(self.pi.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Its wait for the PI lock at `addr` is over, however it ended.
@@ -124,13 +172,9 @@ impl FutexTable {
         }
     }
 
-    /// Whether anyone waits for the PI lock at `addr`.
-    pub fn pi_waiters(&self, addr: u64) -> bool {
-        self.pi.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&addr)
-    }
 
     fn queue(&self, addr: u64) -> Arc<Queue> {
-        let mut q = self.queues.lock().unwrap();
+        let mut q = self.queues[shard(addr)].lock().unwrap();
         Arc::clone(q.entry(addr).or_default())
     }
 
@@ -193,8 +237,9 @@ impl FutexTable {
                 w.pop_front();
             }
             w.push_back(addr);
+            self.any_woken.store(true, std::sync::atomic::Ordering::Release);
         }
-        let Some(queue) = self.queues.lock().unwrap().get(&addr).cloned() else {
+        let Some(queue) = self.queues[shard(addr)].lock().unwrap().get(&addr).cloned() else {
             return 0;
         };
         let mut gen = queue.generation.lock().unwrap();
@@ -217,6 +262,9 @@ impl FutexTable {
     /// host blocks in [`Self::wait`] and never calls this; the buffer is bounded
     /// so that is safe.
     pub fn take_woken(&self) -> Vec<u64> {
+        if !self.any_woken.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Vec::new();
+        }
         Vec::from(std::mem::take(&mut *self.woken.lock().unwrap()))
     }
 
@@ -235,7 +283,8 @@ impl FutexTable {
     /// Used when the process is ending: a thread parked on a futex will never
     /// be woken by the guest, because the guest is not going to run again.
     pub fn wake_everything(&self) {
-        let queues: Vec<Arc<Queue>> = self.queues.lock().unwrap().values().cloned().collect();
+        let queues: Vec<Arc<Queue>> =
+            self.queues.iter().flat_map(|q| q.lock().unwrap().values().cloned().collect::<Vec<_>>()).collect();
         for q in queues {
             let mut gen = q.generation.lock().unwrap();
             *gen = gen.wrapping_add(1);
@@ -246,10 +295,9 @@ impl FutexTable {
     /// Drop queues nobody is using, so a long-running process does not keep
     /// an entry for every lock it ever touched.
     pub fn gc(&self) {
-        self.queues
-            .lock()
-            .unwrap()
-            .retain(|_, q| Arc::strong_count(q) > 1);
+        for q in self.queues.iter() {
+            q.lock().unwrap().retain(|_, q| Arc::strong_count(q) > 1);
+        }
     }
 }
 
@@ -353,6 +401,6 @@ mod tests {
         let f = FutexTable::new();
         let _ = f.wait(0x6000, 1, Some(Duration::from_millis(1)), &|| Some(2));
         f.gc();
-        assert!(f.queues.lock().unwrap().is_empty());
+        assert!(f.queues.iter().all(|q| q.lock().unwrap().is_empty()));
     }
 }

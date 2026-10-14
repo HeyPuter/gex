@@ -11,7 +11,9 @@
 use crate::{k_present, k_signal_seq};
 use gex_kernel::proc::ProcTable;
 use gex_kernel::signal::{self, Delivery, ProcSig, Signals, ThreadSig};
-use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome};
+use gex_kernel::futex::FutexTable;
+use gex_kernel::mem::MapView;
+use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -26,6 +28,10 @@ pub(crate) struct Home {
     pub pid: i32,
     uid: u32,
     clock: ClockFn,
+    /// Its futexes and its memory map's published view, for `futex`
+    /// without the kernel (docs/kernel-locking.md §5.2 step 4).
+    pub futexes: Arc<FutexTable>,
+    map: Arc<MapView>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -50,11 +56,13 @@ pub(crate) fn publish(k: &Kernel) {
         pid: k.pid,
         uid: k.uid,
         clock: k.clock,
+        futexes: Arc::clone(&k.futexes),
+        map: Arc::clone(k.mem.view()),
     });
     HOME.store(Box::into_raw(home), Ordering::Release);
 }
 
-fn home() -> Option<&'static Home> {
+pub(crate) fn home() -> Option<&'static Home> {
     // SAFETY: a published `Home` is never freed (see `HOME`).
     unsafe { HOME.load(Ordering::Acquire).as_ref() }
 }
@@ -161,6 +169,26 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     let view = view(home).expect("a syscall from a Worker with no thread bound");
     let fds = crate::fds_free().expect("a syscall before its descriptor table was published");
     gather(home);
+    // Whether a futex word is mapped: the map's published view where other
+    // Workers may be changing the map; the map itself in the single-threaded
+    // build, which keeps no view and has nobody inside the kernel now.
+    #[cfg(not(feature = "shared-memory"))]
+    let by_kernel = |addr: u64, len: u64| {
+        crate::with_host(|h| h.kernel.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end))
+    };
+    let futex = FutexCx {
+        table: &home.futexes,
+        #[cfg(feature = "shared-memory")]
+        map: Some(&*home.map),
+        #[cfg(not(feature = "shared-memory"))]
+        map: None,
+        #[cfg(feature = "shared-memory")]
+        mapped_by: None,
+        #[cfg(not(feature = "shared-memory"))]
+        mapped_by: Some(&by_kernel),
+        tid: crate::my_tid() as u32,
+        clock: home.clock,
+    };
     let f = Free {
         io: FdIo { fds, compat },
         signals: &view,
@@ -168,6 +196,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         pid: home.pid,
         uid: home.uid,
         wasm32: crate::WASM32.load(Ordering::Acquire),
+        futex,
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
 }

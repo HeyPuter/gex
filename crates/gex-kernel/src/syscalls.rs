@@ -1462,6 +1462,8 @@ pub struct Free<'a> {
     pub uid: u32,
     /// A wasm32 program, whose own code runs a handler's frame.
     pub wasm32: bool,
+    /// The process's futexes, for `futex`.
+    pub futex: FutexCx<'a>,
 }
 
 /// How a call [`free_call`] answers ended.
@@ -1500,6 +1502,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::NEWSELECT | x::PSELECT6 | x::PSELECT6_TIME64 => nr::PSELECT6,
             x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
             x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
+            x::FUTEX | x::FUTEX_TIME64 => nr::FUTEX,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1517,12 +1520,13 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SELECT | x::PSELECT6 => nr::PSELECT6,
             x::EPOLL_WAIT | x::EPOLL_PWAIT => nr::EPOLL_PWAIT,
             x::EPOLL_PWAIT2 => nr::EPOLL_PWAIT2,
+            x::FUTEX => nr::FUTEX,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
-            | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => raw,
+            | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX => raw,
             _ => return None,
         }
     };
@@ -1540,9 +1544,10 @@ pub struct FreeCall {
 
 /// Whether the call in the context at `ctx_addr` is one [`free_call`]
 /// answers, decided by its number alone: `read`, `write`, `readv`,
-/// `writev`, `pread64`, `pwrite64`, `lseek`, `rt_sigprocmask`, and the poll
+/// `writev`, `pread64`, `pwrite64`, `lseek`, `rt_sigprocmask`, the poll
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
-/// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms). The 32-bit ABI's
+/// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms) and `futex` (every
+/// operation, and i386's `futex_time64`). The 32-bit ABI's
 /// positioned calls and `_llseek` are not in it.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
@@ -1565,7 +1570,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
-    if compat && n != nr::RT_SIGPROCMASK && !is_poll(n) {
+    if compat && n != nr::RT_SIGPROCMASK && n != nr::FUTEX && !is_poll(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1592,9 +1597,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     let compat = f.io.compat;
     // The poll family in the canonical form: `poll`, `select` and
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
-    // `pselect6` mask argument widened (none of these has anything to do
-    // after the call: `Post::None`).
-    if is_poll(n) {
+    // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
+    // (none of these has anything to do after the call: `Post::None`).
+    if is_poll(n) || (compat && n == nr::FUTEX) {
         let t = if compat {
             crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr).0
         } else if gex_abi::X86 {
@@ -1613,6 +1618,19 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     }
     let r = if n == nr::RT_SIGPROCMASK {
         sigprocmask(f.signals, m, a[0] as u32, a[1], a[2])
+    } else if n == nr::FUTEX {
+        // As the full call: a wait parks, an operation answers, and a PI
+        // lock found held parks once its waiters bit is set.
+        if let Some(op) = futex_block(&f.futex, m, a) {
+            return FreeOutcome::Blocking(op, None);
+        }
+        let r = futex_call(&f.futex, m, a);
+        if r == Err(Errno::EAGAIN) {
+            if let Some(op) = futex_pi_park(&f.futex, m, a) {
+                return FreeOutcome::Blocking(op, None);
+            }
+        }
+        r
     } else if is_poll(n) {
         // The call's mask for its duration (as `Kernel::syscall_inner`):
         // back at once when it answers now, before any signal is looked at;
@@ -1667,6 +1685,307 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         d => d,
     })
 }
+
+/// What a process's futex calls need of it (docs/kernel-locking.md §3.2):
+/// its futex table, its memory map's published view (whether a word is
+/// mapped), the calling thread's id (a PI lock's owner) and the clock. No
+/// kernel lock: the table and the view synchronise themselves.
+pub struct FutexCx<'a> {
+    pub table: &'a Arc<futex::FutexTable>,
+    /// `None` where the host answers "mapped" itself (`mapped_by`).
+    pub map: Option<&'a crate::mem::MapView>,
+    /// The host's own answer, where it keeps no view (the single-threaded
+    /// page, which reads its map directly).
+    pub mapped_by: Option<&'a dyn Fn(u64, u64) -> bool>,
+    pub tid: u32,
+    pub clock: ClockFn,
+}
+
+impl FutexCx<'_> {
+    /// Whether the futex word at `addr` is inside the process's memory map.
+    /// Checked against the map, not by reading: a guest address is a
+    /// linear-memory offset, so reading address zero succeeds and proves
+    /// nothing (#113).
+    fn mapped(&self, addr: u64) -> bool {
+        match (self.map, self.mapped_by) {
+            (Some(v), _) => v.mapped(addr, 4),
+            (None, Some(f)) => f(addr, 4),
+            (None, None) => false,
+        }
+    }
+
+    fn now_nanos(&self) -> u128 {
+        let (secs, nanos) = (self.clock)();
+        secs as u128 * 1_000_000_000 + nanos as u128
+    }
+
+    fn monotonic_nanos(&self) -> u128 {
+        let (secs, nanos) = monotonic_from((self.clock)());
+        secs as u128 * 1_000_000_000 + nanos as u128
+    }
+}
+
+/// The waiting half of `futex` (`FUTEX_WAIT`, `FUTEX_WAIT_BITSET`): the
+/// park, when the word still holds what the caller expects and is mapped;
+/// `None` for every other operation and for a wait that answers at once
+/// ([`futex_call`] then says how).
+pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
+    let operation =
+        (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+    // A priority-inheritance lock is tried first (`sys_futex`),
+    // which parks only a call that found it held (`lock_pi_op`).
+    if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
+        return None;
+    }
+    // A futex word outside the process's memory map is `EFAULT`,
+    // not a wait: the wake would have to come from an address
+    // nothing can write. Checked against the map, not with
+    // `GuestMem::read` -- a guest address is a linear-memory
+    // offset, so reading address zero succeeds and proves nothing
+    // (#113).
+    if !cx.mapped(a[0]) {
+        return None;
+    }
+    // Take the queue place BEFORE reading the word. A cooperative
+    // host (the browser) parks by snapshotting the generation and
+    // polling it; if it snapshotted AFTER the check, a `FUTEX_WAKE`
+    // from another thread's Worker landing between the check and the
+    // snapshot would bump the generation first and the park would
+    // baseline against the already-bumped value -- the wake lost,
+    // the thread asleep forever (Mesa's util_queue deadlocked here).
+    // Snapshotting first means such a wake either changed the word
+    // (caught just below as EAGAIN) or bumped a generation the park
+    // will see. The native host holds the queue lock across its
+    // check-and-sleep instead and ignores this.
+    let parked = cx.table.park(a[0]);
+    // The word must still hold what the caller expects, or the
+    // wake that changed it has already been and gone and the wait
+    // would be permanent. A mismatch declines the wait (EAGAIN via
+    // `sys_futex`).
+    if m.read_u32(a[0]).ok()? != a[2] as u32 {
+        return None;
+    }
+    let deadline = if a[3] == 0 {
+        None
+    } else {
+        let secs = m.read_u64(a[3]).ok()?;
+        let nanos = m.read_u64(a[3] + 8).ok()?;
+        let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+        // `FUTEX_WAIT_BITSET` names an absolute moment: on
+        // CLOCK_REALTIME with `FUTEX_CLOCK_REALTIME`, else on
+        // CLOCK_MONOTONIC (what pthread_cond_clockwait and C++'s
+        // steady-clock waits use). Plain `FUTEX_WAIT` really is
+        // relative.
+        let left = if operation == futex::op::WAIT_BITSET {
+            let now = if (a[1] as u32) & futex::op::CLOCK_REALTIME != 0 {
+                cx.now_nanos()
+            } else {
+                cx.monotonic_nanos()
+            };
+            want.saturating_sub(now)
+        } else {
+            want
+        };
+        let left = left.min(3600 * 1_000_000_000);
+        Some(std::time::Duration::new(
+            (left / 1_000_000_000) as u64,
+            (left % 1_000_000_000) as u32,
+        ))
+    };
+    Some(BlockOp::FutexWait {
+        table: Arc::clone(cx.table),
+        uaddr: a[0],
+        val: a[2] as u32,
+        deadline,
+        parked: Some(parked),
+    })
+}
+
+/// The park for a `FUTEX_LOCK_PI` that found the lock held ([`futex_call`]
+/// set the waiters bit and answered `EAGAIN`).
+pub fn futex_pi_park(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
+    let operation = (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+    if operation != futex::op::LOCK_PI && operation != futex::op::LOCK_PI2 {
+        return None;
+    }
+    // An absolute time: CLOCK_REALTIME for LOCK_PI, the
+    // monotonic clock for LOCK_PI2 (unless FUTEX_CLOCK_REALTIME).
+    let deadline = if a[3] == 0 {
+        None
+    } else {
+        let secs = m.read_u64(a[3]).ok()?;
+        let nanos = m.read_u64(a[3] + 8).ok()?;
+        let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+        let monotonic = operation == futex::op::LOCK_PI2 && (a[1] as u32) & futex::op::CLOCK_REALTIME == 0;
+        let now = if monotonic { cx.monotonic_nanos() } else { cx.now_nanos() };
+        let left = want.saturating_sub(now).min(3600 * 1_000_000_000);
+        Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
+    };
+    Some(BlockOp::FutexLockPi {
+        table: Arc::clone(cx.table),
+        uaddr: a[0],
+        tid: cx.tid,
+        deadline,
+    })
+}
+
+/// `futex`'s answer, every operation but the waiting half of `FUTEX_WAIT`
+/// (which [`futex_block`] parks): the same code in the kernel and in a host
+/// that makes the call without the kernel (docs/kernel-locking.md §3.2).
+pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+    let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
+    // The private and clock bits change nothing here: the timeout is
+    // treated as relative either way.
+    let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+    match operation {
+        // The waiting forms reach here only when `blocking_op` refused
+        // them, which it does for a futex word the process cannot read.
+        futex::op::WAIT | futex::op::WAIT_BITSET => {
+            let mapped = cx.mapped(uaddr);
+            // `EAGAIN`, not `EINVAL`, for a wait on memory the process
+            // has: glibc aborts on a futex error it does not recognise,
+            // and `EAGAIN` (word changed, so re-read and loop) is on its
+            // recognised list while `EINVAL` is not. An address the
+            // process lacks is still `EFAULT` (#113).
+            Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
+        }
+        futex::op::WAKE | futex::op::WAKE_BITSET => Ok(cx.table.wake(uaddr, val)),
+        // Take the lock if it is free. Held, the waiters bit goes on
+        // *before* the caller parks (`EAGAIN`, which `lock_pi_op` turns
+        // into the park), as Linux sets it in the kernel: the owner's
+        // unlock then comes here and wakes, where without the bit it
+        // released the lock in user space and the waiter slept on.
+        futex::op::LOCK_PI | futex::op::LOCK_PI2 => {
+            if uaddr % 4 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if !cx.mapped(uaddr) {
+                return Err(Errno::EFAULT);
+            }
+            let tid = cx.tid;
+            // The bit and the count together, against an unlock's reading
+            // of the count and its store (`FutexTable::pi_lock`).
+            let mut pi = cx.table.pi_lock();
+            loop {
+                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                match v & futex::pi::TID_MASK {
+                    0 => {
+                        if gex_atomic::cas_u32(m.bytes, uaddr, v, tid | (v & futex::pi::WAITERS))
+                            .ok_or(Errno::EFAULT)?
+                            .is_ok()
+                        {
+                            return Ok(0);
+                        }
+                    }
+                    owner if owner == tid => return Err(Errno::EDEADLK),
+                    // A compare-and-swap even when the bit is already on:
+                    // it checks the word is still the one just read.
+                    _ => {
+                        if gex_atomic::cas_u32(m.bytes, uaddr, v, v | futex::pi::WAITERS)
+                            .ok_or(Errno::EFAULT)?
+                            .is_ok()
+                        {
+                            // Counted until its wait ends (the host's
+                            // `pi_done`).
+                            pi.wait(uaddr);
+                            return Err(Errno::EAGAIN);
+                        }
+                    }
+                }
+            }
+        }
+        // Release a PI lock this thread owns, and wake one waiter, which
+        // takes it in its own `FUTEX_LOCK_PI` loop. The waiters bit stays
+        // while anyone waits (the table's count): a waiter that has set it
+        // may not be parked yet, and a thread taking the lock in user space
+        // meanwhile (from a bare 0) would release it there too, waking
+        // nobody. Count and store under the count's lock, which a waiter
+        // takes to set the bit and count itself.
+        futex::op::UNLOCK_PI => {
+            let tid = cx.tid;
+            let pi = cx.table.pi_lock();
+            let rest = if pi.waiters(uaddr) { futex::pi::WAITERS } else { 0 };
+            loop {
+                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                if v & futex::pi::TID_MASK != tid {
+                    return Err(Errno::EPERM);
+                }
+                if gex_atomic::cas_u32(m.bytes, uaddr, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
+                    break;
+                }
+            }
+            drop(pi);
+            cx.table.wake(uaddr, 1);
+            Ok(0)
+        }
+        futex::op::TRYLOCK_PI => {
+            let tid = cx.tid;
+            loop {
+                let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                match v & futex::pi::TID_MASK {
+                    0 => {
+                        let new = tid | (v & futex::pi::WAITERS);
+                        if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
+                            return Ok(0);
+                        }
+                    }
+                    owner if owner == tid => return Err(Errno::EDEADLK),
+                    _ => return Err(Errno::EAGAIN),
+                }
+            }
+        }
+        // Requeue is an optimisation for condition variables; waking
+        // everyone is correct, if less efficient.
+        futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(cx.table.wake(uaddr, u32::MAX)),
+        // `FUTEX_WAKE_OP`: atomically apply an op to a second word, wake
+        // `val` waiters on `uaddr`, then -- if the old second word compares
+        // true -- wake `a[3]` waiters on `uaddr2` (`a[4]`). glibc's condvar
+        // signalling uses it; returning ENOSYS here lost a wake and left
+        // Qt's pthread-cond waiters asleep forever. The operation and
+        // comparison are packed into `a[5]` (see the kernel's `FUTEX_OP`).
+        futex::op::WAKE_OP => {
+            let nr_wake2 = a[3] as u32;
+            let uaddr2 = a[4];
+            let encoded = a[5] as u32;
+            let mut oper = (encoded >> 28) & 0xf;
+            let cmp = (encoded >> 24) & 0xf;
+            // `oparg`/`cmparg` are 12-bit signed fields.
+            let mut oparg = ((((encoded >> 12) & 0xfff) as i32) << 20) >> 20;
+            let cmparg = (((encoded & 0xfff) as i32) << 20) >> 20;
+            // `FUTEX_OP_OPARG_SHIFT`: the arg is a shift count, not a value.
+            if oper & 8 != 0 {
+                oper &= 7;
+                oparg = 1i32.wrapping_shl((oparg & 31) as u32);
+            }
+            let oldval = m.read_u32(uaddr2)? as i32;
+            let newval = match oper {
+                0 => oparg,                        // SET
+                1 => oldval.wrapping_add(oparg),   // ADD
+                2 => oldval | oparg,               // OR
+                3 => oldval & !oparg,              // ANDN
+                4 => oldval ^ oparg,               // XOR
+                _ => return Err(Errno::ENOSYS),
+            };
+            m.write_u32(uaddr2, newval as u32)?;
+            let mut woken = cx.table.wake(uaddr, val);
+            let fire = match cmp {
+                0 => oldval == cmparg, // EQ
+                1 => oldval != cmparg, // NE
+                2 => oldval < cmparg,  // LT
+                3 => oldval <= cmparg, // LE
+                4 => oldval > cmparg,  // GT
+                5 => oldval >= cmparg, // GE
+                _ => return Err(Errno::ENOSYS),
+            };
+            if fire {
+                woken += cx.table.wake(uaddr2, nr_wake2);
+            }
+            Ok(woken)
+        }
+        _ => Err(Errno::ENOSYS),
+    }
+}
+
 
 // -- I/O on a descriptor table ----------------------------------------------
 //
@@ -3345,29 +3664,8 @@ impl Kernel {
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
     /// set the waiters bit and answered `EAGAIN`).
     fn lock_pi_op(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
-        let operation = (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
-        if operation != futex::op::LOCK_PI && operation != futex::op::LOCK_PI2 {
-            return None;
-        }
-        // An absolute time: CLOCK_REALTIME for LOCK_PI, the
-        // monotonic clock for LOCK_PI2 (unless FUTEX_CLOCK_REALTIME).
-        let deadline = if a[3] == 0 {
-            None
-        } else {
-            let secs = m.read_u64(a[3]).ok()?;
-            let nanos = m.read_u64(a[3] + 8).ok()?;
-            let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-            let monotonic = operation == futex::op::LOCK_PI2 && (a[1] as u32) & futex::op::CLOCK_REALTIME == 0;
-            let now = if monotonic { self.clock_nanos(1) } else { self.now_nanos() };
-            let left = want.saturating_sub(now).min(3600 * 1_000_000_000);
-            Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
-        };
-        Some(BlockOp::FutexLockPi {
-            table: Arc::clone(&self.futexes),
-            uaddr: a[0],
-            tid: self.tid as u32,
-            deadline,
-        })
+        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        futex_pi_park(&self.futex_cx(&mapped), m, a)
     }
 
     /// The descriptor half of this kernel ([`FdIo`]).
@@ -3477,75 +3775,8 @@ impl Kernel {
                 })
             }
             nr::FUTEX => {
-                let operation =
-                    (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
-                // A priority-inheritance lock is tried first (`sys_futex`),
-                // which parks only a call that found it held (`lock_pi_op`).
-                if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
-                    return None;
-                }
-                // A futex word outside the process's memory map is `EFAULT`,
-                // not a wait: the wake would have to come from an address
-                // nothing can write. Checked against the map, not with
-                // `GuestMem::read` -- a guest address is a linear-memory
-                // offset, so reading address zero succeeds and proves nothing
-                // (#113).
-                if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
-                    return None;
-                }
-                // Take the queue place BEFORE reading the word. A cooperative
-                // host (the browser) parks by snapshotting the generation and
-                // polling it; if it snapshotted AFTER the check, a `FUTEX_WAKE`
-                // from another thread's Worker landing between the check and the
-                // snapshot would bump the generation first and the park would
-                // baseline against the already-bumped value -- the wake lost,
-                // the thread asleep forever (Mesa's util_queue deadlocked here).
-                // Snapshotting first means such a wake either changed the word
-                // (caught just below as EAGAIN) or bumped a generation the park
-                // will see. The native host holds the queue lock across its
-                // check-and-sleep instead and ignores this.
-                let parked = self.futexes.park(a[0]);
-                // The word must still hold what the caller expects, or the
-                // wake that changed it has already been and gone and the wait
-                // would be permanent. A mismatch declines the wait (EAGAIN via
-                // `sys_futex`).
-                if m.read_u32(a[0]).ok()? != a[2] as u32 {
-                    return None;
-                }
-                let deadline = if a[3] == 0 {
-                    None
-                } else {
-                    let secs = m.read_u64(a[3]).ok()?;
-                    let nanos = m.read_u64(a[3] + 8).ok()?;
-                    let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-                    // `FUTEX_WAIT_BITSET` names an absolute moment: on
-                    // CLOCK_REALTIME with `FUTEX_CLOCK_REALTIME`, else on
-                    // CLOCK_MONOTONIC (what pthread_cond_clockwait and C++'s
-                    // steady-clock waits use). Plain `FUTEX_WAIT` really is
-                    // relative.
-                    let left = if operation == futex::op::WAIT_BITSET {
-                        let now = if (a[1] as u32) & futex::op::CLOCK_REALTIME != 0 {
-                            self.now_nanos()
-                        } else {
-                            self.clock_nanos(1)
-                        };
-                        want.saturating_sub(now)
-                    } else {
-                        want
-                    };
-                    let left = left.min(3600 * 1_000_000_000);
-                    Some(std::time::Duration::new(
-                        (left / 1_000_000_000) as u64,
-                        (left % 1_000_000_000) as u32,
-                    ))
-                };
-                Some(BlockOp::FutexWait {
-                    table: Arc::clone(&self.futexes),
-                    uaddr: a[0],
-                    val: a[2] as u32,
-                    deadline,
-                    parked: Some(parked),
-                })
+                let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+                futex_block(&self.futex_cx(&mapped), m, a)
             }
             nr::WAIT4 => {
                 // Children come from the table, not from a list this process
@@ -4100,154 +4331,14 @@ impl Kernel {
     }
 
     fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
-        // The private and clock bits change nothing here: the timeout is
-        // treated as relative either way.
-        let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
-        match operation {
-            // The waiting forms reach here only when `blocking_op` refused
-            // them, which it does for a futex word the process cannot read.
-            futex::op::WAIT | futex::op::WAIT_BITSET => {
-                let mapped = self
-                    .mem
-                    .vmas()
-                    .iter()
-                    .any(|v| uaddr >= v.start && uaddr + 4 <= v.end);
-                // `EAGAIN`, not `EINVAL`, for a wait on memory the process
-                // has: glibc aborts on a futex error it does not recognise,
-                // and `EAGAIN` (word changed, so re-read and loop) is on its
-                // recognised list while `EINVAL` is not. An address the
-                // process lacks is still `EFAULT` (#113).
-                Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
-            }
-            futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
-            // Take the lock if it is free. Held, the waiters bit goes on
-            // *before* the caller parks (`EAGAIN`, which `lock_pi_op` turns
-            // into the park), as Linux sets it in the kernel: the owner's
-            // unlock then comes here and wakes, where without the bit it
-            // released the lock in user space and the waiter slept on.
-            futex::op::LOCK_PI | futex::op::LOCK_PI2 => {
-                if uaddr % 4 != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                if !self.mem.vmas().iter().any(|v| uaddr >= v.start && uaddr + 4 <= v.end) {
-                    return Err(Errno::EFAULT);
-                }
-                let tid = self.tid as u32;
-                loop {
-                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
-                    match v & futex::pi::TID_MASK {
-                        0 => {
-                            if gex_atomic::cas_u32(m.bytes, uaddr, v, tid | (v & futex::pi::WAITERS))
-                                .ok_or(Errno::EFAULT)?
-                                .is_ok()
-                            {
-                                return Ok(0);
-                            }
-                        }
-                        owner if owner == tid => return Err(Errno::EDEADLK),
-                        _ => {
-                            if v & futex::pi::WAITERS != 0
-                                || gex_atomic::cas_u32(m.bytes, uaddr, v, v | futex::pi::WAITERS)
-                                    .ok_or(Errno::EFAULT)?
-                                    .is_ok()
-                            {
-                                // Counted until its wait ends (the host's
-                                // `pi_done`).
-                                self.futexes.pi_wait(uaddr);
-                                return Err(Errno::EAGAIN);
-                            }
-                        }
-                    }
-                }
-            }
-            // Release a PI lock this thread owns, and wake one waiter, which
-            // takes it in its own `FUTEX_LOCK_PI` loop. The waiters bit stays
-            // while anyone waits (`pi_waiters`): a waiter that has set it may
-            // not be parked yet, and a thread taking the lock in user space
-            // meanwhile (from a bare 0) would release it there too, waking
-            // nobody.
-            futex::op::UNLOCK_PI => {
-                let tid = self.tid as u32;
-                let rest = if self.futexes.pi_waiters(uaddr) { futex::pi::WAITERS } else { 0 };
-                loop {
-                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
-                    if v & futex::pi::TID_MASK != tid {
-                        return Err(Errno::EPERM);
-                    }
-                    if gex_atomic::cas_u32(m.bytes, uaddr, v, rest).ok_or(Errno::EFAULT)?.is_ok() {
-                        break;
-                    }
-                }
-                self.futexes.wake(uaddr, 1);
-                Ok(0)
-            }
-            futex::op::TRYLOCK_PI => {
-                let tid = self.tid as u32;
-                loop {
-                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
-                    match v & futex::pi::TID_MASK {
-                        0 => {
-                            let new = tid | (v & futex::pi::WAITERS);
-                            if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
-                                return Ok(0);
-                            }
-                        }
-                        owner if owner == tid => return Err(Errno::EDEADLK),
-                        _ => return Err(Errno::EAGAIN),
-                    }
-                }
-            }
-            // Requeue is an optimisation for condition variables; waking
-            // everyone is correct, if less efficient.
-            futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(self.futexes.wake(uaddr, u32::MAX)),
-            // `FUTEX_WAKE_OP`: atomically apply an op to a second word, wake
-            // `val` waiters on `uaddr`, then -- if the old second word compares
-            // true -- wake `a[3]` waiters on `uaddr2` (`a[4]`). glibc's condvar
-            // signalling uses it; returning ENOSYS here lost a wake and left
-            // Qt's pthread-cond waiters asleep forever. The operation and
-            // comparison are packed into `a[5]` (see the kernel's `FUTEX_OP`).
-            futex::op::WAKE_OP => {
-                let nr_wake2 = a[3] as u32;
-                let uaddr2 = a[4];
-                let encoded = a[5] as u32;
-                let mut oper = (encoded >> 28) & 0xf;
-                let cmp = (encoded >> 24) & 0xf;
-                // `oparg`/`cmparg` are 12-bit signed fields.
-                let mut oparg = ((((encoded >> 12) & 0xfff) as i32) << 20) >> 20;
-                let cmparg = (((encoded & 0xfff) as i32) << 20) >> 20;
-                // `FUTEX_OP_OPARG_SHIFT`: the arg is a shift count, not a value.
-                if oper & 8 != 0 {
-                    oper &= 7;
-                    oparg = 1i32.wrapping_shl((oparg & 31) as u32);
-                }
-                let oldval = m.read_u32(uaddr2)? as i32;
-                let newval = match oper {
-                    0 => oparg,                        // SET
-                    1 => oldval.wrapping_add(oparg),   // ADD
-                    2 => oldval | oparg,               // OR
-                    3 => oldval & !oparg,              // ANDN
-                    4 => oldval ^ oparg,               // XOR
-                    _ => return Err(Errno::ENOSYS),
-                };
-                m.write_u32(uaddr2, newval as u32)?;
-                let mut woken = self.futexes.wake(uaddr, val);
-                let fire = match cmp {
-                    0 => oldval == cmparg, // EQ
-                    1 => oldval != cmparg, // NE
-                    2 => oldval < cmparg,  // LT
-                    3 => oldval <= cmparg, // LE
-                    4 => oldval > cmparg,  // GT
-                    5 => oldval >= cmparg, // GE
-                    _ => return Err(Errno::ENOSYS),
-                };
-                if fire {
-                    woken += self.futexes.wake(uaddr2, nr_wake2);
-                }
-                Ok(woken)
-            }
-            _ => Err(Errno::ENOSYS),
-        }
+        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        futex_call(&self.futex_cx(&mapped), m, a)
+    }
+
+    /// What this process's futex calls need ([`FutexCx`]), for the calling
+    /// thread, with the map asked directly (`mapped`): this kernel owns it.
+    fn futex_cx<'a>(&'a self, mapped: &'a dyn Fn(u64, u64) -> bool) -> FutexCx<'a> {
+        FutexCx { table: &self.futexes, map: None, mapped_by: Some(mapped), tid: self.tid as u32, clock: self.clock }
     }
 
     // -- signals -------------------------------------------------------------
@@ -9122,7 +9213,8 @@ mod tests {
         let wfd = m.read_u32(0x20004).unwrap() as u64;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9283,6 +9375,187 @@ mod tests {
         ));
         set_args(&mut m, at, nr::WRITE, &[wfd, 0x21000, 7]);
         assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Killed { signal: signal::sig::SIGPIPE, .. }));
+    }
+
+
+    /// `futex` in the lock-free class (docs/kernel-locking.md §5.2 step 4)
+    /// answers as the full call does: a wait on a changed word, on an
+    /// unmapped word, a wait that parks, a wake, and a PI lock taken, found
+    /// held (waiters bit set, then a park) and released. The map is asked
+    /// through its published view, which follows `mmap` and `munmap`.
+    #[test]
+    fn free_futex_answers_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let word = 0x30000u64;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("futex is in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex };
+            free_call(&f, m, at, call)
+        }
+        let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
+        let wait = futex::op::WAIT | futex::op::PRIVATE_FLAG;
+        // Not mapped yet: EFAULT, both ways.
+        set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(errno(&m), Errno::EFAULT.as_return() as i64);
+        set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 0, 0]);
+        k.syscall(&mut m, 0);
+        assert_eq!(errno(&m), Errno::EFAULT.as_return() as i64);
+        // Mapped: the view follows the map.
+        k.mem.insert(word, word + 0x1000, crate::mem::prot::READ | crate::mem::prot::WRITE, "futex");
+        assert!(k.mem.view().mapped(word, 4));
+        assert!(!k.mem.view().mapped(word + 0xffe, 4));
+        m.write_u32(word, 7).unwrap();
+        // A changed word: EAGAIN.
+        set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 6, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(errno(&m), Errno::EAGAIN.as_return() as i64);
+        // The word as expected: a park on it, which a wake ends.
+        set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 7, 0]);
+        let FreeOutcome::Blocking(BlockOp::FutexWait { parked: Some(parked), uaddr, .. }, None) = free(&k, &mut m, at) else {
+            panic!("a wait on the expected word parks");
+        };
+        assert_eq!(uaddr, word);
+        assert!(!parked.woken());
+        set_args(&mut m, at, nr::FUTEX, &[word, futex::op::WAKE as u64, 1]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert!(parked.woken());
+        assert_eq!(k.futexes.take_woken(), vec![word]);
+        // PI: free, so taken; held by another, so the waiters bit and a park.
+        let pi = word + 0x100;
+        set_args(&mut m, at, nr::FUTEX, &[pi, futex::op::LOCK_PI as u64, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(m.read_u32(pi).unwrap(), k.tid as u32);
+        set_args(&mut m, at, nr::FUTEX, &[pi, futex::op::UNLOCK_PI as u64, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(m.read_u32(pi).unwrap(), 0);
+        m.write_u32(pi, 4242).unwrap();
+        set_args(&mut m, at, nr::FUTEX, &[pi, futex::op::LOCK_PI as u64, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::FutexLockPi { .. }, None)));
+        assert_eq!(m.read_u32(pi).unwrap(), 4242 | futex::pi::WAITERS);
+        set_args(&mut m, at, nr::FUTEX, &[pi, futex::op::TRYLOCK_PI as u64, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(errno(&m), Errno::EAGAIN.as_return() as i64);
+        // Unmapped again: EFAULT.
+        k.mem.unmap(word, 0x1000).unwrap();
+        assert!(!k.mem.view().mapped(word, 4));
+        set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 7, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(errno(&m), Errno::EFAULT.as_return() as i64);
+    }
+
+    /// A map's view under writers and readers at once: readers on other
+    /// threads, each in a reader slot of its own, never see a mapping that
+    /// was never made, and always see the one that is never removed, while
+    /// the owner maps and unmaps around it.
+    #[test]
+    fn a_map_view_is_read_while_the_map_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut map = crate::mem::MemoryMap::new(0x40_1000);
+        let rw = crate::mem::prot::READ | crate::mem::prot::WRITE;
+        map.insert(0x1000_0000, 0x1000_1000, rw, "fixed");
+        let view = Arc::clone(map.view());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|i| {
+                let (view, stop) = (Arc::clone(&view), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    crate::sync::set_thread_id(i + 1);
+                    let mut looks = 0u64;
+                    while !stop.load(Ordering::Relaxed) || looks < 1000 {
+                        assert!(view.mapped(0x1000_0000, 4), "the fixed mapping went missing");
+                        assert!(!view.mapped(0x2000_0000, 4), "a mapping never made appeared");
+                        looks += 1;
+                    }
+                })
+            })
+            .collect();
+        for i in 0..2000u64 {
+            let a = map.mmap(0, 0x10000 + (i % 4) * 0x1000, rw, crate::mem::flags::PRIVATE | crate::mem::flags::ANONYMOUS, "churn").unwrap();
+            assert!(view.mapped(a, 4));
+            map.protect(a, 0x1000, crate::mem::prot::READ).unwrap();
+            map.unmap(a, 0x10000 + (i % 4) * 0x1000).unwrap();
+            assert!(!view.mapped(a, 4));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        // A copy (fork) has a view of its own.
+        let mut child = map.clone();
+        child.insert(0x3000_0000, 0x3000_1000, rw, "child");
+        assert!(child.view().mapped(0x3000_0000, 4));
+        assert!(!map.view().mapped(0x3000_0000, 4));
+    }
+
+    /// Futex calls from many threads at once, with no kernel lock between
+    /// them: a mutex built on `FUTEX_WAIT`/`FUTEX_WAKE` over a shared word,
+    /// each thread making the calls through `futex_block`/`futex_call` as
+    /// a lock-free host does, keeps its count exact.
+    #[test]
+    fn futex_calls_from_many_threads_keep_a_mutex() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        let table = Arc::new(FutexTable::new());
+        let word = Arc::new(AtomicU32::new(0));
+        let count = Arc::new(AtomicU64::new(0));
+        const N: u64 = 4;
+        const ITERS: u64 = 3000;
+        let threads: Vec<_> = (0..N)
+            .map(|i| {
+                let (table, word, count) = (Arc::clone(&table), Arc::clone(&word), Arc::clone(&count));
+                std::thread::spawn(move || {
+                    crate::sync::set_thread_id(i as u32 + 1);
+                    let mapped = |_: u64, _: u64| true;
+                    let cx = FutexCx { table: &table, map: None, mapped_by: Some(&mapped), tid: i as u32 + 1, clock: system_clock };
+                    // The word lives in an AtomicU32 every thread shares; each
+                    // call sees it through a copy of its own (the crate has no
+                    // unsafe code to alias it), and a waiter also re-reads it,
+                    // which is what a wake between the copy and the park
+                    // would otherwise cost.
+                    for _ in 0..ITERS {
+                        // Drepper's mutex: 0 free, 1 held, 2 held with waiters.
+                        let mut c = word.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).unwrap_or_else(|v| v);
+                        if c != 0 {
+                            if c != 2 {
+                                c = word.swap(2, Ordering::Acquire);
+                            }
+                            while c != 0 {
+                                let mut copy = word.load(Ordering::Relaxed).to_le_bytes().to_vec();
+                                let mut m = GuestMem::new(&mut copy);
+                                if let Some(BlockOp::FutexWait { parked: Some(p), .. }) =
+                                    futex_block(&cx, &m, [0, futex::op::WAIT as u64, 2, 0, 0, 0])
+                                {
+                                    while !p.woken() && word.load(Ordering::Relaxed) == 2 {
+                                        std::thread::yield_now();
+                                    }
+                                } else {
+                                    let _ = futex_call(&cx, &mut m, [0, futex::op::WAIT as u64, 2, 0, 0, 0]);
+                                }
+                                c = word.swap(2, Ordering::Acquire);
+                            }
+                        }
+                        let v = count.load(Ordering::Relaxed);
+                        count.store(v + 1, Ordering::Relaxed);
+                        if word.fetch_sub(1, Ordering::Release) != 1 {
+                            word.store(0, Ordering::Release);
+                            let mut copy = vec![0u8; 4];
+                            let mut m = GuestMem::new(&mut copy);
+                            futex_call(&cx, &mut m, [0, futex::op::WAKE as u64, 1, 0, 0, 0]).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(count.load(Ordering::Relaxed), N * ITERS);
     }
 
     #[test]

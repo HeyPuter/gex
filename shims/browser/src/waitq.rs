@@ -264,7 +264,7 @@ pub(crate) fn idle_turn() -> Turn {
     WAIT.with(|w| {
         let w = w.borrow();
         let Some(m) = w.as_ref() else { return Turn::Locked };
-        if m.thread != cur() || m.all_blocked {
+        if m.thread != cur() {
             return Turn::Locked;
         }
         if crate::wl::pump_wanted() {
@@ -282,8 +282,25 @@ pub(crate) fn idle_turn() -> Turn {
         if wait_ready(&m.waiting, &m.blocked_on, turn_now(), false) {
             return Turn::Ready(false);
         }
+        // Every thread of the process parked on a futex when this one
+        // parked: still so, asked of each thread's own run state, is a
+        // deadlock to confirm (`schedule`); no longer, an ordinary wait.
+        if m.all_blocked && crate::all_futex_blocked() {
+            return Turn::Stuck;
+        }
         Turn::Idle(m.why, m.ends_by_itself)
     })
+}
+
+/// This Worker's registered wait was the last of its process's threads to
+/// park on a futex (`crate::all_futex_blocked`): its idle turns ask again,
+/// and its parks are bounded so they do (`park_ns`).
+pub(crate) fn note_all_blocked() {
+    WAIT.with(|w| {
+        if let Some(m) = w.borrow_mut().as_mut() {
+            m.all_blocked = true;
+        }
+    });
 }
 
 /// What an idle turn without the kernel lock found ([`idle_turn`]).
@@ -294,9 +311,12 @@ pub(crate) enum Turn {
     /// The wait is over (`true`: a signal that would do something ended
     /// it): the thread's own Worker finishes its call (`finish_mine`).
     Ready(bool),
-    /// The turn is the kernel's: the compositor has work, a deadlock is
-    /// being confirmed, or there is no wait in hand.
+    /// The turn is the kernel's: the compositor has work, or there is no
+    /// wait in hand.
     Locked,
+    /// Every thread of the process is parked on a futex nothing has woken:
+    /// a deadlock, once it has lasted (`schedule`'s `DEADLOCK_WATCH`).
+    Stuck,
 }
 
 /// How long this Worker's thread may sleep: until its own deadline, a

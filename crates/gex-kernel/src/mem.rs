@@ -83,10 +83,77 @@ impl Vma {
     }
 }
 
+/// What a reader that does not own the map sees of it: each mapping's
+/// range and protection, published after every change
+/// (docs/kernel-locking.md §3.5). A futex's "is the word mapped" asks this,
+/// from any thread, with no lock shared with the map's writers.
+///
+/// A reader on a view one change old can see a mapping a concurrent
+/// `munmap` has just removed, or miss one a concurrent `mmap` is adding:
+/// the window Linux also has between a lookup and the access.
+///
+/// Not kept in the single-threaded page build (wasm32 without atomics),
+/// which has no other reader and must not pay for one: there
+/// [`MapView::mapped`] is never asked, and the host reads the map itself.
+pub struct MapView {
+    cur: gex_atomic::rcu::Published<Vec<(u64, u64, u32)>>,
+}
+
+/// Reader slots in a view's epoch array, as the descriptor table's
+/// ([`crate::file::FD_READER_SLOTS`]): one per page Worker.
+const VIEW_READER_SLOTS: usize = crate::file::FD_READER_SLOTS;
+
+/// Whether this build keeps [`MapView`]s: every build but the
+/// single-threaded page's.
+pub const KEEPS_VIEWS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+
+impl MapView {
+    fn new(vmas: &[Vma]) -> MapView {
+        MapView { cur: gex_atomic::rcu::Published::new(Self::ranges(vmas), VIEW_READER_SLOTS) }
+    }
+
+    fn ranges(vmas: &[Vma]) -> Vec<(u64, u64, u32)> {
+        if !KEEPS_VIEWS {
+            return Vec::new();
+        }
+        vmas.iter().map(|v| (v.start, v.end, v.prot)).collect()
+    }
+
+    /// Whether `[addr, addr + len)` lies inside one mapping, of any
+    /// protection, as [`MemoryMap::vmas`] would say.
+    pub fn mapped(&self, addr: u64, len: u64) -> bool {
+        let end = addr.saturating_add(len);
+        self.cur.read(crate::sync::me() as usize, |r| {
+            let i = r.partition_point(|&(s, _, _)| s <= addr);
+            r[..i].last().is_some_and(|&(_, e, _)| end <= e)
+        })
+    }
+}
+
+/// A map's view, which a copy of the map does not share: a forked child's
+/// changes are its own.
+struct ViewCell(std::sync::Arc<MapView>);
+
+impl Clone for ViewCell {
+    fn clone(&self) -> ViewCell {
+        ViewCell(std::sync::Arc::new(MapView {
+            cur: gex_atomic::rcu::Published::new(self.0.cur.read(crate::sync::me() as usize, |r| r.clone()), VIEW_READER_SLOTS),
+        }))
+    }
+}
+
+impl std::fmt::Debug for ViewCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MapView")
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
+    /// What readers that do not own the map see of it ([`MapView`]).
+    view: ViewCell,
     brk_start: u64,
     brk_cur: u64,
     /// Next address the top-down allocator will try.
@@ -202,6 +269,7 @@ impl MemoryMap {
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
+            view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
             brk_start: page_align_up(brk_start),
             brk_cur: page_align_up(brk_start),
@@ -216,6 +284,16 @@ impl MemoryMap {
             clean: Vec::new(),
             fresh: None,
         }
+    }
+
+    /// Start again with an empty map (an exec, a snapshot's restore): the
+    /// same [`MapView`], which readers without the kernel lock already hold
+    /// (a new map would leave them reading the old program's).
+    pub fn renew(&mut self, brk_start: u64) {
+        let mut fresh = MemoryMap::new(brk_start);
+        std::mem::swap(&mut fresh.view, &mut self.view);
+        *self = fresh;
+        self.publish();
     }
 
     /// Record that `[start, end)` holds only zeros (the caller just zeroed it,
@@ -310,6 +388,20 @@ impl MemoryMap {
 
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
+    }
+
+    /// The map as readers that do not own it see it ([`MapView`]): the same
+    /// view for the map's whole life, republished as it changes.
+    pub fn view(&self) -> &std::sync::Arc<MapView> {
+        &self.view.0
+    }
+
+    /// Publish the map as it stands to its [`MapView`].
+    fn publish(&self) {
+        if KEEPS_VIEWS {
+            let ranges = MapView::ranges(&self.vmas);
+            self.view.0.cur.write(|_| (Some(ranges), ()));
+        }
     }
 
     /// Hand out arena addresses bottom-up, for a host whose memory must be
@@ -569,6 +661,13 @@ impl MemoryMap {
     /// the shared store instead of re-translating from cold. No `origin`: that
     /// is a claim about a mapping this process made, not one to inherit.
     pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
+        let r = self.adopt_unpublished(start, end, prot, name, code);
+        self.publish();
+        r
+    }
+
+    /// [`Self::adopt`] before it is published.
+    fn adopt_unpublished(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
         self.generation += 1;
         self.mark_dirty(page_align_down(start), page_align_up(end));
         self.vmas.push(Vma {
@@ -602,7 +701,14 @@ impl MemoryMap {
     }
 
     /// As [`Self::insert`], recording where the bytes came from.
-    pub fn insert_from(
+    pub fn insert_from(&mut self, start: u64, end: u64, prot: u32, name: &str, origin: Option<(String, u64)>) {
+        let r = self.insert_from_unpublished(start, end, prot, name, origin);
+        self.publish();
+        r
+    }
+
+    /// [`Self::insert_from`] before it is published.
+    fn insert_from_unpublished(
         &mut self,
         start: u64,
         end: u64,
@@ -742,7 +848,14 @@ impl MemoryMap {
     }
 
     /// As [`Self::mmap`], recording the file and offset the bytes came from.
-    pub fn mmap_from(
+    pub fn mmap_from(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str, origin: Option<(String, u64)>) -> SysResult {
+        let r = self.mmap_from_unpublished(addr, len, prot, flags, name, origin);
+        self.publish();
+        r
+    }
+
+    /// [`Self::mmap_from`] before it is published.
+    fn mmap_from_unpublished(
         &mut self,
         addr: u64,
         len: u64,
@@ -875,7 +988,14 @@ impl MemoryMap {
     /// when extended in place, a fresh range otherwise; the caller moves the
     /// bytes. musl's `realloc` calls this for mmap-backed buffers, so `ENOSYS`
     /// would make it copy on every growth.
-    pub fn mremap(
+    pub fn mremap(&mut self, addr: u64, old_len: u64, new_len: u64, may_move: bool) -> Result<(u64, bool), Errno> {
+        let r = self.mremap_unpublished(addr, old_len, new_len, may_move);
+        self.publish();
+        r
+    }
+
+    /// [`Self::mremap`] before it is published.
+    fn mremap_unpublished(
         &mut self,
         addr: u64,
         old_len: u64,
@@ -957,6 +1077,13 @@ impl MemoryMap {
 
     /// Remove `[addr, addr+len)` from the map, splitting mappings as needed.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        let r = self.unmap_unpublished(addr, len);
+        self.publish();
+        r
+    }
+
+    /// [`Self::unmap`] before it is published.
+    fn unmap_unpublished(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
         self.generation += 1;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
@@ -983,6 +1110,13 @@ impl MemoryMap {
 
     /// Change protection over a range, splitting mappings as needed.
     pub fn protect(&mut self, addr: u64, len: u64, new_prot: u32) -> Result<(), Errno> {
+        let r = self.protect_unpublished(addr, len, new_prot);
+        self.publish();
+        r
+    }
+
+    /// [`Self::protect`] before it is published.
+    fn protect_unpublished(&mut self, addr: u64, len: u64, new_prot: u32) -> Result<(), Errno> {
         self.generation += 1;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
