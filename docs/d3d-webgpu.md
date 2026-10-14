@@ -187,17 +187,18 @@ Native tests (macOS, Apple M4 Pro, Rosetta x86_64 Wine):
 | d3d11 (FL 9_3) | 3925 checks, 3 failing, 190 skipped |
 | d3d10_1 (FL 9_3 / 10_1) | 97 / 318 checks, none failing |
 | d3d10core (FL 10_1) | runs to the end: 194656 checks, 480 failing (depth bias 205: Metal's depth24plus is float underneath; stream output ~100; layered rendering needs geometry shaders) |
-| d3d9 visual | 332 failing checks to test_depth_stencil (the 20-minute limit), 120 in test_signed_formats; shader fog fixed |
+| d3d9 visual | runs to the end: 202515 checks, 646 failing |
 
 Known gaps: D3D9 sRGB write control, stream output (WebGPU's vertex
 shaders cannot write storage), occlusion and timestamp queries (answered,
-not measured), UAV clears, triangle fans, instance divisors above 1,
+not measured), UAV clears, instance divisors above 1,
 wireframe, depth bias for lines, comparison sampling of non-depth
 textures, geometry and tessellation shaders, and presentation (GDI
 read-back for now). Done by other means than the GL and Vulkan renderers:
 typed buffer views (storage buffers decoded in the shader, the format part
 of the variant), sampler LOD bias (in the shader), depth24plus read-back
-(drawn into r32float), mipmap generation and partial clears (draws).
+(drawn into r32float), mipmap generation and partial clears (draws),
+triangle fans (indexed lists made at draw time).
 
 ### 2.4 Next
 
