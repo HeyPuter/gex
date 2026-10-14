@@ -50,7 +50,7 @@ const sig = [...exe.subarray(lfanew, lfanew + 24)];
 
 const tars = `/gex/nt/w3d.tar,/gex/nt/${process.env.NOITA_TAR || 'noita.tar'}`;
 const argv = encodeURIComponent(JSON.stringify(['noita.exe', '-single_threaded_loading']));
-const env = encodeURIComponent(`WINEPREFIX=/pfx,WINEDEBUG=${process.env.WDBG || 'err+all,fixme-all'},XDG_RUNTIME_DIR=/tmp,WAYLAND_DISPLAY=wayland-0`);
+const env = encodeURIComponent(`WINEPREFIX=/pfx,WINEDEBUG=${process.env.WDBG || 'err+all,fixme-all'},XDG_RUNTIME_DIR=/tmp,WAYLAND_DISPLAY=wayland-0${process.env.NOITA_ENV ? ',' + process.env.NOITA_ENV : ''}`);
 const { browser, page, state, evaluate, consoleLines, profile } = await openPage(
   `tar=${tars}&exe=/w3/lib/wine/i386-unix/wine&mtimes=1&cwd=/g&gl=1&glbackend=wgpu&size=1320x800`
     + `&argv=${argv}&env=${env}${process.env.NOITA_Q ?? '&cgen=1'}`,
