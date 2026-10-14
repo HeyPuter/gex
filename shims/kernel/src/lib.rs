@@ -3294,6 +3294,18 @@ pub extern "C" fn k_stage_drop(id: i32) {
     }
 }
 
+/// Zero `len` bytes of the calling process's memory at `at`, with
+/// `memory.fill` (an exited process's memory, cleared for the next fork child
+/// to adopt into: `recycleMemory` in worker.mjs). 0, or -14 out of range.
+#[no_mangle]
+pub extern "C" fn k_proc_zero(at: gex_kmem::PAddr, len: u32) -> i32 {
+    if !gex_kmem::in_process(at, len) {
+        return -14;
+    }
+    unsafe { gex_kmem::zero(at, len) };
+    0
+}
+
 // ---------------------------------------------------------------------------
 // wasm32 programs' content keys, by file. Every exec of a wasm32 program
 // hashed its bytes (`gex_cgen_pmod_wasm_key`) to find the compiled module the

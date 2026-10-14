@@ -101,6 +101,26 @@ pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
     }
 }
 
+/// Zero `len` bytes of the calling process's memory at `dst`.
+///
+/// # Safety
+/// `dst..dst+len` must be in bounds of the process memory.
+#[inline]
+pub unsafe fn zero(dst: PAddr, len: u32) {
+    // A memory64's `memory.fill` takes its length as an i64, like its address.
+    let len = len as PAddr;
+    unsafe {
+        core::arch::asm!(
+            "local.get {dst}",
+            "i32.const 0",
+            "local.get {len}",
+            "memory.fill 1",
+            dst = in(local) dst,
+            len = in(local) len,
+        );
+    }
+}
+
 /// Read one `u64` out of the guest, via a copy: no load can name a second
 /// memory.
 ///

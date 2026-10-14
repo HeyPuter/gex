@@ -98,6 +98,10 @@ async function workerMain(port) {
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// Whether this process's memory can go to the next fork child when it exits
+/// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
+/// compositor reading its pixels, the session reaching its door.
+let recyclable = true;
 
 // Standard input, as it arrives. A guest read that finds nothing asks the
 // host and waits here; `readStdin` below is what the run loop awaits.
@@ -359,6 +363,7 @@ async function handle(msg) {
     // `WebAssembly.Memory` crosses `postMessage` as itself, so the other Worker
     // is on this process's address space.
     async spawnThread(thread) {
+      recyclable = false;
       port.post({ kind: 'thread', thread });
     }
     // A module this Worker just compiled, up to the host to relay to the sibling
@@ -371,6 +376,7 @@ async function handle(msg) {
     // The wineserver published its door (docs/wineserver-kernel.md): up to
     // the host, which hands it to every Worker of the session.
     publishDoor(door) {
+      recyclable = false;
       port.post({ kind: 'doorPublish', door });
     }
     // A function-tier unit's files by key (`gex.useCgen`): `msg.cgen.root`, a
@@ -455,7 +461,9 @@ async function handle(msg) {
     kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
     // A thread joins its process's memory; a process makes one. `shared` only
     // decides whether the memory a process builds can have threads later.
-    memory: msg.memory ?? null,
+    // A fork child may be given an exited process's memory, zeroed
+    // (`recycledMemory`, host.mjs): the same as a new one, its pages touched.
+    memory: msg.memory ?? msg.recycledMemory ?? null,
     moduleStore: msg.moduleStore ?? null,
     shared: !!msg.shared,
   });
@@ -520,6 +528,7 @@ async function handle(msg) {
     // The memory object, not its buffer: a shared memory that grows gives out a
     // new buffer, and the compositor has to be able to see the new length.
     gex.onWlToken = (token) => {
+      recyclable = false;
       port.post({ kind: 'wl-memory', token, memory: gex.memory, kernel: gex.kernelWake()?.memory });
     };
     proxy.onToken = gex.onWlToken;
@@ -851,7 +860,7 @@ async function handle(msg) {
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
-    port.post({
+    const exitMsg = {
       kind: 'exit',
       status,
       guestMillis,
@@ -937,9 +946,16 @@ async function handle(msg) {
       arena: gex.shim.exports.gex_arena_spent_mib
         ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
-    });
+    };
     // Last: nothing calls into this instance after (`releaseWorker`).
     gex.releaseWorker?.();
+    // This process's memory, zeroed, for the host to give the next fork child
+    // (`Gex#recycleMemory`): its pages are touched, which a fresh memory's are
+    // not. After the kernel has the process gone, so no parent waits on it.
+    if (recyclable && msg.kind !== 'thread' && !msg.child?.exec) {
+      exitMsg.recycle = gex.recycleMemory?.() ?? undefined;
+    }
+    port.post(exitMsg);
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the
     // shim reaches the host as `unreachable`, and the guest pc and object are

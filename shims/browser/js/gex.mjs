@@ -1138,6 +1138,42 @@ export class Gex {
    * (`gex_worker_release`). The last call into this instance: the slot's next
    * holder runs on the same stack.
    */
+  /** This process's memory, every non-zero page zeroed, for another
+   *  process to start in; null where that cannot be done (the memory is not
+   *  shared, mem64, no global kernel). Only after the process is gone and
+   *  nothing will run in this instance again. The non-zero runs are found by
+   *  the shim's scan (`gex_image_runs`) and cleared by the kernel's
+   *  `memory.fill` (`k_proc_zero`), so only pages the process wrote are
+   *  written again. */
+  recycleMemory() {
+    const e = this.#shim?.exports;
+    const k = this.#kernel;
+    if (!e?.gex_image_runs || !k?.k_proc_zero || m64() || single.on) return null;
+    if (!(this.#memory.buffer instanceof SharedArrayBuffer)) return null;
+    const size = this.#memory.buffer.byteLength;
+    let cap = 4096;
+    let at = e.gex_alloc(cap * 8) >>> 0;
+    const runs = [];
+    const CHUNK = 64 << 20;
+    for (let s = 0; s < size; ) {
+      const end = Math.min(size, s + CHUNK);
+      const n = e.gex_image_runs(s, end, at, cap);
+      if (n < 0) {
+        e.gex_free?.(at, cap * 8);
+        cap *= 4;
+        at = e.gex_alloc(cap * 8) >>> 0;
+        continue;
+      }
+      const pairs = new Uint32Array(this.#memory.buffer, at, n * 2);
+      for (let j = 0; j < n; j++) runs.push(pairs[j * 2], pairs[j * 2 + 1]);
+      s = end;
+    }
+    for (let j = 0; j < runs.length; j += 2) {
+      if (k.k_proc_zero(runs[j], runs[j + 1]) !== 0) return null;
+    }
+    return this.#memory;
+  }
+
   releaseWorker() {
     if (this.#stackTop === null) return;
     try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
