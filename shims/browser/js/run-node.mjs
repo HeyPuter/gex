@@ -288,6 +288,23 @@ function readClosure() {
   return names.map((n) => readFileSync(join(dir, n)));
 }
 
+// GEX_GPU=1: /dev/gex-gpu, its wire served on this thread by the page's
+// server module (GEX_GPU_SERVER, default <web dir>/gexgpu-server.mjs) over
+// Dawn's Node bindings (GEX_NODE_WEBGPU: the `webgpu` package's directory).
+// Needs --experimental-wasm-jspi: the server suspends in a WAIT.
+let gpuChannel;
+if (process.env.GEX_GPU) {
+  const { createRequire } = await import('node:module');
+  const req = createRequire(join(process.env.GEX_NODE_WEBGPU ?? '.', 'node_modules') + '/');
+  const { create, globals } = req('webgpu');
+  Object.assign(globalThis, globals);
+  Object.defineProperty(globalThis.navigator, 'gpu', { value: create([]), configurable: true });
+  const { makeGpuChannel, serveGpu, GpuServer } = await import('./gpu-bridge.mjs');
+  gpuChannel = makeGpuChannel();
+  const url = process.env.GEX_GPU_SERVER ? new URL(`file://${process.env.GEX_GPU_SERVER}`) : new URL('gexgpu-server.mjs', PUB);
+  serveGpu(await GpuServer.load(url.href), gpuChannel);
+}
+
 const host = new ProcessHost({
   makeWorker: SINGLE ? () => new FiberWorker() : () => new Worker(new URL('./worker.mjs', import.meta.url),
     // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
@@ -341,6 +358,7 @@ const host = new ProcessHost({
     // parent's modules (0: all of them at the fork). See `adoptAfterTraps`.
     adoptAfter: process.env.GEX_ADOPT_AFTER !== undefined ? Number(process.env.GEX_ADOPT_AFTER) : undefined,
     mem64: MEM64,
+    gpuChannel,
     // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
     wasmDlls: process.env.GEX_WASM_DLLS || undefined,
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,

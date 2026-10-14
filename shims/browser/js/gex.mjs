@@ -735,7 +735,7 @@ function vforkTrace(line) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #gpu = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -1373,6 +1373,16 @@ export class Gex {
             (this.#gl
               ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
               : -1),
+        // WebGPU (/dev/gex-gpu): a connection per open, and the address of
+        // the guest's `struct gex_gpu_submit`, whose message and reply buffer
+        // are read and written in this memory (gpu-bridge.mjs). A promise in
+        // the single build, so the import suspends.
+        gpu_open: () => (this.#gpu ? this.#gpu.open() : -1),
+        gpu_submit: single.on ? new WebAssembly.Suspending((conn, arg, fetch) =>
+          (this.#gpu ? this.#gpu.submit(this.#memory, conn, arg >>> 0, fetch !== 0) : -19))
+          : (conn, arg, fetch) =>
+            (this.#gpu ? this.#gpu.submit(this.#memory, conn, arg >>> 0, fetch !== 0) : -19),
+        gpu_close: (conn) => this.#gpu?.close(conn),
         // The same, not waited for (a frame's last batch): the copy is taken
         // and the guest draws on; the next submit waits for this one, and
         // says how long through `gex_gl_note_wait_ns`.
@@ -1449,6 +1459,7 @@ export class Gex {
     }
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    this.#shim.exports.gex_set_gpu?.(this.#gpu ? 1 : 0);
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
@@ -1944,6 +1955,7 @@ export class Gex {
     // built, which is when the device nodes are made and the vtest socket bound.
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_gpu?.(this.#gpu ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
@@ -4774,6 +4786,13 @@ export class Gex {
       this.#cgenProviders(m.u);
       this.#cgenRegions(m.u, m.path);
     }
+  }
+
+  /** Give the guest /dev/gex-gpu: a `GpuProxy` (gpu-bridge.mjs). Before
+   *  `load`, which mounts the device only when one is set. */
+  useGpu(gpu) {
+    this.#gpu = gpu;
+    this.#shim?.exports?.gex_set_gpu?.(gpu ? 1 : 0);
   }
 
   useGl(gl) {

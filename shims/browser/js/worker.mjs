@@ -497,6 +497,12 @@ async function handle(msg) {
       if (!msg.glChannel.direct) port.post({ kind: 'gl' });
     }));
   }
+  // WebGPU (/dev/gex-gpu): the wire's server, wherever the page runs it,
+  // over its own shared buffers. Before `load`, which mounts the device.
+  if (msg.gpuChannel) {
+    const { GpuProxy } = await import('./gpu-bridge.mjs');
+    gex.useGpu(new GpuProxy(msg.gpuChannel));
+  }
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
   // load, so it must run before `load` -- which binds `wayland-0` only when it

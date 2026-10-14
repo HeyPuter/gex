@@ -40,6 +40,7 @@ use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
+pub mod gpu;
 pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
@@ -1467,6 +1468,10 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     }
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
+    }
+    // WebGPU: every open a wire connection of the page's own.
+    if crate::gpu::have_gpu() {
+        devfs.add_per_open("gex-gpu", Arc::new(crate::gpu::GpuConnection::new));
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
@@ -7317,6 +7322,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     };
     gl::DEFER.with(|d| d.set(false));
     gl::submit_pending(ctx as u32 as u64);
+    gpu::submit_pending(ctx as u32 as u64);
     {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
