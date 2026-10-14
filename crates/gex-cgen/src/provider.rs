@@ -74,6 +74,9 @@ const SOURCES: &[(&str, &str)] = &[
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
     ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
+    // Noita's FMOD, silent until FMOD's own wasm build binds there instead.
+    ("fmodstudio_silent", include_str!("../providers/fmodstudio_silent.c")),
+    ("fmod_silent", include_str!("../providers/fmod_silent.c")),
     ("glibc_mem", include_str!("../providers/glibc_mem.c")),
     ("glibc_printf", include_str!("../providers/glibc_printf.c")),
     ("glibc_math", include_str!("../providers/glibc_math.c")),
