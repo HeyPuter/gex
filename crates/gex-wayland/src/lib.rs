@@ -314,6 +314,10 @@ pub struct Glass {
     /// 0..=100 each: colour over the backdrop, and how much backdrop shows.
     pub balance: u32,
     pub blur_balance: u32,
+    /// The afterglow colour (ARGB), laid over the backdrop by the backdrop's
+    /// own brightness, and how much of it (0..=100).
+    pub afterglow: u32,
+    pub afterglow_balance: u32,
     /// The frame the host draws (`set_frame`): flags, and the close,
     /// maximize and minimize buttons as (x, y, width, height, state).
     pub frame: u32,
@@ -325,7 +329,7 @@ impl Glass {
     /// `RECTS - 1` and the bounds of the rest.
     pub const RECTS: usize = 4;
     /// Words a record spends on glass (`R_GLASS`.. in `wl-bridge.mjs`).
-    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3;
+    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3 + 1;
 
     /// Null (`None`) is the whole surface: one rectangle the host clips to
     /// the surface's size.
@@ -336,6 +340,8 @@ impl Glass {
             argb: self.argb,
             balance: self.balance,
             blur_balance: self.blur_balance,
+            afterglow: self.afterglow,
+            afterglow_balance: self.afterglow_balance,
             frame: self.frame,
             buttons: self.buttons,
             ..Glass::default()
@@ -358,13 +364,14 @@ impl Glass {
         }
     }
 
-    /// The glass words of a surface record: count, colour, balances, then
-    /// the rectangles (x, y, width, height each).
+    /// The glass words of a surface record: count, colour, balances (colour,
+    /// blur and afterglow, a byte each), the rectangles (x, y, width, height
+    /// each), the frame, and the afterglow colour.
     pub fn record_words(&self) -> [i32; Glass::WORDS] {
         let mut w = [0i32; Glass::WORDS];
         w[0] = self.count as i32;
         w[1] = self.argb as i32;
-        w[2] = (self.balance & 0xff | (self.blur_balance & 0xff) << 8) as i32;
+        w[2] = (self.balance & 0xff | (self.blur_balance & 0xff) << 8 | (self.afterglow_balance & 0xff) << 16) as i32;
         for (i, r) in self.rects.iter().enumerate() {
             w[3 + 4 * i] = r.0;
             w[4 + 4 * i] = r.1;
@@ -380,6 +387,7 @@ impl Glass {
             w[f + 4 + 5 * i] = b.3;
             w[f + 5 + 5 * i] = b.4 as i32;
         }
+        w[f + 16] = self.afterglow as i32;
         w
     }
 }
@@ -2621,13 +2629,15 @@ impl Client {
                     self.dirty = true;
                 }
             }
-            // set_colorization(argb, balance, blur_balance)
-            2 => match (r.uint(), r.uint(), r.uint()) {
-                (Some(argb), Some(balance), Some(blur_balance)) => {
+            // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
+            2 => match (r.uint(), r.uint(), r.uint(), r.uint(), r.uint()) {
+                (Some(argb), Some(balance), Some(blur_balance), Some(afterglow), Some(afterglow_balance)) => {
                     if let Some(s) = self.surfaces.get_mut(&surface) {
                         s.glass.argb = argb;
                         s.glass.balance = balance.min(100);
                         s.glass.blur_balance = blur_balance.min(100);
+                        s.glass.afterglow = afterglow;
+                        s.glass.afterglow_balance = afterglow_balance.min(100);
                         self.dirty = true;
                     }
                 }

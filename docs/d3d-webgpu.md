@@ -264,8 +264,8 @@ Revisit (a) only if exact Flip3D or animations become the goal.
 
 - **Protocol**: `crates/gex-wayland/protocols/gex-glass-v1.xml`: a
   surface's glass region and DWM's colorization (colour, balance, blur
-  balance), taking effect at once. gex-wayland keeps it in `SurfaceInfo`
-  (`Glass`), and the surface record (56 words now) carries up to four
+  balance, afterglow colour and balance), taking effect at once. gex-wayland keeps it in `SurfaceInfo`
+  (`Glass`), and the surface record (74 words now) carries up to four
   rectangles.
 - **Compositor** (`web/src/compositor-worker.js`, `Painter.glass`): before
   a window with glass, the scene's pass ends, the box beneath the glass is
@@ -293,6 +293,14 @@ Revisit (a) only if exact Flip3D or animations become the goal.
   window's frame glass when the driver draws glass (the glass surrounds
   the box inside borders and caption; a menu bar stays opaque) and passes
   the buttons where its own hit testing has them, pressed state included.
+- **Colorization** (`web/src/glass-colorization.js`, both compositors):
+  Windows 7's glass is blurred backdrop times the blur balance, plus the
+  colour times its balance, plus the afterglow colour times the backdrop's
+  brightness (luma) times the afterglow balance; linear in the backdrop, so
+  a 3x3 matrix and an offset (a shader mode in the WebGPU compositor, an
+  SVG `feColorMatrix` after a blur in `backdrop-filter: url()` without
+  one). dwmapi reads all five registry values (default "sky": 0x6b74b8fc,
+  8, 49, 0x6b74b8fc, 43) and implements `DwmpGetColorizationParameters`.
 - **The page with no compositor** (`bare-desktop.js`, the W3 page:
   Wine's windows are canvases the browser composites): `web/src/dom-glass.js`
   puts an element with a `backdrop-filter` (blur, then DWM's tint) under
@@ -301,8 +309,7 @@ Revisit (a) only if exact Flip3D or animations become the goal.
   DWM from the same atlas on a canvas just above it. `DomWindow.paint`
   applies the alpha-in-glass rule. `web/test/glass.html?dom=1`.
 - **Not yet**: hover glow on caption buttons (win32u does not track
-  hover), the reflection streaks, thumbnails and Flip3D, the Windows 7
-  colorization formula beyond colour-over-blur, and an end-to-end run:
+  hover), the reflection streaks, thumbnails and Flip3D, and an end-to-end run:
   W3 (winewayland in the page) is not reproducible from the repo yet.
 
 ## 4. Reproducing (macOS, Apple silicon)

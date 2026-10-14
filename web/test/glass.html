@@ -18,7 +18,7 @@ import { bareDesktop } from '../src/bare-desktop.js';
 import {
   makeWlChannel, WlProxy, REC, R_CLIENT, R_SURFACE, R_ROLE, R_REL_X, R_REL_Y, R_WIDTH, R_HEIGHT, R_ADDR,
   R_STRIDE, R_FORMAT, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H, R_PLACE, R_STACK_ID, R_GLASS, R_GLASS_ARGB,
-  R_GLASS_BALANCE, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
+  R_GLASS_BALANCE, R_GLASS_AFTERGLOW, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
 } from '@gex/wl-bridge.mjs';
 
 const params = new URLSearchParams(location.search);
@@ -77,8 +77,11 @@ function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0, title = '', 
   recs[r + R_PLACE] = P_PLACED | P_UNMANAGED; recs[r + R_STACK_ID] = id;
   if (glass) {
     recs[r + R_GLASS] = glass.length;
-    recs[r + R_GLASS_ARGB] = 0x6b74b8fc | 0; // Windows 7's default sky colour, alpha 0x6b
-    recs[r + R_GLASS_BALANCE] = 45 | (60 << 8);
+    // Windows 7's default "sky": colour and afterglow 0x6b74b8fc, balances
+    // 8 (colour), 49 (blur) and 43 (afterglow).
+    recs[r + R_GLASS_ARGB] = 0x6b74b8fc | 0;
+    recs[r + R_GLASS_BALANCE] = 8 | (49 << 8) | (43 << 16);
+    recs[r + R_GLASS_AFTERGLOW] = 0x6b74b8fc | 0;
     glass.forEach((q, j) => recs.set(q, r + R_GLASS_RECTS + 4 * j));
   }
   // The frame DWM would draw: flags, then close, max and min as x, y, w, h, state.

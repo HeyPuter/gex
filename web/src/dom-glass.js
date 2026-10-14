@@ -7,7 +7,9 @@
 // under the window's canvas, and the canvas lets it show through wherever the
 // window's alpha says so inside its glass (`DomWindow.paint`, DWM's rule).
 // What lies behind -- the desktop, the windows beneath -- is blurred and
-// tinted by the browser's own compositor, as it was by DWM.
+// coloured by the browser's own compositor, as it was by DWM: the filter is
+// an SVG one (a Gaussian blur, then Windows 7's colorization as a colour
+// matrix, glass-colorization.js), which `backdrop-filter: url()` applies.
 //
 // A frame the compositor draws (`gex_glass_v1.set_frame`: the client's
 // window system left its frame to DWM) is a second canvas above the window's:
@@ -16,7 +18,44 @@
 // extract-dwm-frame.py, served at /gex/aero/). Without the atlas, the glass
 // has no frame artwork and the caption text is drawn alone.
 
+import { glassFeColorMatrix } from './glass-colorization.js';
+
 const UI = 1;
+/** The blur's standard deviation, in pixels: DWM's look at 96 dpi. */
+const BLUR = 4;
+
+/** The page's glass filters, one per colorization, in one hidden <svg>. */
+const filters = new Map(); // values -> id
+let svg = null;
+
+function glassFilter(glass) {
+  const values = glassFeColorMatrix(glass);
+  let id = filters.get(values);
+  if (id) return id;
+  const ns = 'http://www.w3.org/2000/svg';
+  if (!svg) {
+    svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '0');
+    svg.setAttribute('height', '0');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.style.position = 'absolute';
+    document.body.append(svg);
+  }
+  id = `gex-glass-${filters.size + 1}`;
+  const f = document.createElementNS(ns, 'filter');
+  f.id = id;
+  f.setAttribute('color-interpolation-filters', 'sRGB');
+  const blur = document.createElementNS(ns, 'feGaussianBlur');
+  blur.setAttribute('stdDeviation', String(BLUR));
+  blur.setAttribute('edgeMode', 'duplicate');
+  const matrix = document.createElementNS(ns, 'feColorMatrix');
+  matrix.setAttribute('type', 'matrix');
+  matrix.setAttribute('values', values);
+  f.append(blur, matrix);
+  svg.append(f);
+  filters.set(values, id);
+  return id;
+}
 
 let aero = null; // null: not tried; a promise while loading; false: none; else { img, parts }
 const waiting = new Set();
@@ -187,9 +226,7 @@ export function domGlass(win, mount) {
     // everything stacked lower.
     while (panes.length > rects.length) panes.pop().remove();
     const g = win.glass;
-    const argb = g?.argb ?? 0;
-    const alpha = ((argb >>> 24) / 255) * ((g?.balance ?? 0) / 100);
-    const tint = `rgba(${(argb >> 16) & 0xff}, ${(argb >> 8) & 0xff}, ${argb & 0xff}, ${alpha.toFixed(3)})`;
+    const filter = g ? `url(#${glassFilter(g)})` : 'none';
     rects.forEach((r, i) => {
       let p = panes[i];
       if (!p) {
@@ -197,7 +234,6 @@ export function domGlass(win, mount) {
         p.className = 'gex-glass';
         p.style.position = 'absolute';
         p.style.pointerEvents = 'none';
-        p.style.backdropFilter = p.style.webkitBackdropFilter = 'blur(6px)';
         panes.push(p);
       }
       if (p.nextSibling !== c) c.before(p);
@@ -206,7 +242,7 @@ export function domGlass(win, mount) {
       p.style.width = `${r.w}px`;
       p.style.height = `${r.h}px`;
       p.style.zIndex = z;
-      p.style.background = tint;
+      p.style.backdropFilter = filter;
     });
     const framed = g && (g.frame & 1) !== 0;
     if (!framed) {
