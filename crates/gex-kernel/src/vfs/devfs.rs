@@ -173,7 +173,11 @@ impl Default for DevFs {
 }
 
 impl FileSystem for DevFs {
-    fn open(&self, path: &str, _flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        // A directory opens for reading only.
+        if super::writes(flags) && self.metadata(path).is_ok_and(|md| md.file_type == FileType::Directory) {
+            return Err(Errno::EISDIR);
+        }
         if let Some(device) = Self::device_of(path) {
             return Ok(Arc::new(DevHandle { device }));
         }

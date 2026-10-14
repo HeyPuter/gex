@@ -2507,21 +2507,42 @@ fn as_unit(r: Result<(), gex_kernel::errno::Errno>) -> i32 {
 pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
     let p = path_of(path, path_len);
     match rootfs().open(&p, flags, mode) {
+        Ok(h) => install_handle(h),
+        Err(e) => -e.0,
+    }
+}
+
+/// [`k_fs_open`], and a file it creates or truncates is stamped at `now`,
+/// the caller's clock (this module has none): one call where a process
+/// made two, an open and a touch.
+#[no_mangle]
+pub extern "C" fn k_fs_open_now(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
+    use gex_kernel::fs::oflags::{O_CREAT, O_TRUNC};
+    let p = path_of(path, path_len);
+    match rootfs().open(&p, flags, mode) {
         Ok(h) => {
-            let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
-            // First free slot, so an open/close loop does not grow this unbounded.
-            match t.iter().position(|s| s.is_none()) {
-                Some(i) => {
-                    t[i] = Some(h);
-                    i as i32
-                }
-                None => {
-                    t.push(Some(h));
-                    (t.len() - 1) as i32
-                }
+            if flags & (O_CREAT | O_TRUNC) != 0 {
+                let _ = h.set_mtime(now);
             }
+            install_handle(h)
         }
         Err(e) => -e.0,
+    }
+}
+
+/// A slot for `h` in the handle table: the first free one, so an open/close
+/// loop does not grow it unbounded.
+fn install_handle(h: std::sync::Arc<dyn FileHandle>) -> i32 {
+    let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
+    match t.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            t[i] = Some(h);
+            i as i32
+        }
+        None => {
+            t.push(Some(h));
+            (t.len() - 1) as i32
+        }
     }
 }
 
@@ -2584,6 +2605,22 @@ pub extern "C" fn k_fs_write(handle: i32, offset: u64, at: gex_kmem::PAddr, len:
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     as_ret(h.write_at(offset, &buf))
+}
+
+/// [`k_fs_write`], and the file is stamped at `now` when anything was
+/// written: the writing process's clock, in the same call.
+#[no_mangle]
+pub extern "C" fn k_fs_write_now(handle: i32, offset: u64, at: gex_kmem::PAddr, len: u32, now: i64) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    let r = h.write_at(offset, &buf);
+    if matches!(r, Ok(n) if n > 0) {
+        let _ = h.set_mtime(now);
+    }
+    as_ret(r)
 }
 
 /// This handle's metadata, as `remote::META_BYTES` bytes at `at`.
@@ -2730,6 +2767,13 @@ pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) -> i32 {
     as_unit(rootfs().rename(&path_of(from, from_len), &path_of(to, to_len)))
+}
+
+/// `fchmod` on an open handle, by the name it was opened under: no walk.
+#[no_mangle]
+pub extern "C" fn k_fs_fchmod(handle: i32, mode: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.chmod(mode).unwrap_or(Err(gex_kernel::errno::Errno::EOPNOTSUPP)))
 }
 
 #[no_mangle]

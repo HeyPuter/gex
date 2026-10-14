@@ -287,6 +287,9 @@ extern "C" {
     fn k_fs_dup(handle: i32) -> i32;
     fn k_fs_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_write_now(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32;
+    fn k_fs_open_now(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32;
+    fn k_fs_fchmod(handle: i32, mode: u32) -> i32;
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
     fn k_fs_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
@@ -744,8 +747,8 @@ extern "C" fn rpty_queue(id: i32) -> u32 {
     unsafe { k_pty_queue(id) }
 }
 
-extern "C" fn rf_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
-    unsafe { k_fs_open(path, path_len, flags, mode) }
+extern "C" fn rf_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
+    unsafe { k_fs_open_now(path, path_len, flags, mode, now) }
 }
 extern "C" fn rf_close(handle: i32) {
     unsafe { k_fs_close(handle) }
@@ -756,8 +759,8 @@ extern "C" fn rf_dup(handle: i32) -> i32 {
 extern "C" fn rf_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_fs_read(handle, offset, at, len) }
 }
-extern "C" fn rf_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_fs_write(handle, offset, at, len) }
+extern "C" fn rf_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32 {
+    unsafe { k_fs_write_now(handle, offset, at, len, now) }
 }
 extern "C" fn rf_meta(handle: i32, at: gex_kernel::PAddr) -> i32 {
     unsafe { k_fs_meta(handle, at) }
@@ -791,6 +794,9 @@ extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::
 }
 extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
+}
+extern "C" fn rf_fchmod(handle: i32, mode: u32) -> i32 {
+    unsafe { k_fs_fchmod(handle, mode) }
 }
 extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32 {
     unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) }
@@ -1305,6 +1311,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             rmdir: rf_rmdir,
             rename: rf_rename,
             chmod: rf_chmod,
+            fchmod: rf_fchmod,
             symlink: rf_symlink,
             link: rf_link,
             mksocket: rf_mksocket,
