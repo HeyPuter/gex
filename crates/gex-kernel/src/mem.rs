@@ -139,6 +139,9 @@ pub struct MemoryMap {
     /// anyway -- which faults on Linux -- may see that page zeroed by a
     /// later `mmap` over it, or not copied into a forked child.
     clean: Vec<(u64, u64)>,
+    /// The span the last [`Self::extend_arena`] took, until the caller asks
+    /// ([`Self::take_fresh`]): memory nothing has been in, so zero.
+    fresh: Option<(u64, u64)>,
 }
 
 /// The parts of `[start, end)` outside `clean` (sorted, disjoint), in order:
@@ -211,6 +214,7 @@ impl MemoryMap {
             // high arena (docs/mem64.md §3).
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
             clean: Vec::new(),
+            fresh: None,
         }
     }
 
@@ -520,6 +524,7 @@ impl MemoryMap {
         if let Some(last) = self.arena.last_mut() {
             if last.1 == start {
                 last.1 = start + want;
+                self.fresh = Some((start, start + want));
                 return Ok(start - tail);
             }
         }
@@ -536,7 +541,16 @@ impl MemoryMap {
         // a freed tail, which is rare and predates this code -- fix that in the
         // mmap path if it ever bites, not with a second racing take.
         self.arena.push((start, start + want));
+        self.fresh = Some((start, start + want));
         Ok(start)
+    }
+
+    /// The span of arena the last mapping had to claim, which nothing has
+    /// been in yet (`arena_take` hands out memory past everything the
+    /// process used, and a recycled memory comes zeroed): zero without
+    /// looking. Cleared by asking.
+    pub fn take_fresh(&mut self) -> Option<(u64, u64)> {
+        self.fresh.take()
     }
 
     pub fn brk_current(&self) -> u64 {
