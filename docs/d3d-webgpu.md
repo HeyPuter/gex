@@ -122,6 +122,13 @@ only server.
   (`runProgram`'s `webgpu`); `run-node.mjs` with `GEX_GPU=1` over Dawn's
   Node bindings (the `webgpu` npm package) and `--experimental-wasm-jspi`.
 
+With a compositor, the server runs in its worker on its own device
+(`Compositor.hostGpu`, `gexgpu_server_set_shared`: every client is given
+that adapter and device and cannot destroy it), so a guest's textures are
+on the device that draws the screen; `web/test/gpu-compositor.html` runs
+gpu-smoke so. Presenting a guest's swap chain texture as a window's
+pixels, without the GDI read-back, is the next step on that.
+
 `guest/gpu/test/gpu-smoke.c` (static aarch64, `build-guest.sh`: Alpine in
 Docker) runs a compute shader and checks the result: "gpu-smoke: ok" under
 `gexc run`, under `run-node.mjs`, and in Chrome (a page serving the
