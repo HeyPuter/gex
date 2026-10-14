@@ -642,6 +642,11 @@ async function runProgramHere(
     // (handed to `onSystem`) is called -- a desktop whose first windows
     // draw no GL does not download it.
     glLazy = false,
+    // WebGPU for the guest (/dev/gex-gpu, docs/d3d-webgpu.md): the wire's
+    // server (web/build-gexgpu-server.sh) on this page's WebGPU, a
+    // connection per open. Needs a cross-origin isolated page and JSPI.
+    // `?webgpu=1` turns it on for any page.
+    webgpu = !!flag('webgpu'),
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -697,6 +702,28 @@ async function runProgramHere(
       glServe = gl.attachChannel?.(glChannel) || serveGl(gl, glChannel);
     }
   }
+
+  // WebGPU: the server runs here, on the page's thread, and every Worker
+  // reaches it over its own shared buffers (gpu-bridge.mjs).
+  // With a compositor, the server moves to its worker once it exists (see
+  // `hostGpu` below): the channel is made here either way.
+  let gpuChannel = null;
+  const gpuServerUrl = new URL('/gex/gexgpu-server.mjs', globalThis.location?.href ?? 'http://localhost/').href;
+  if (webgpu && globalThis.crossOriginIsolated && globalThis.navigator?.gpu) {
+    const { makeGpuChannel } = await import('@gex/gpu-bridge.mjs');
+    gpuChannel = makeGpuChannel();
+  }
+  let gpuHosted = false;
+  const hostGpuHere = async () => {
+    if (!gpuChannel || gpuHosted) return;
+    gpuHosted = true;
+    const { serveGpu, GpuServer } = await import('@gex/gpu-bridge.mjs');
+    try {
+      serveGpu(await GpuServer.load(gpuServerUrl), gpuChannel);
+    } catch (e) {
+      console.warn('[gex] no WebGPU server for /dev/gex-gpu', e);
+    }
+  };
 
   // The network: the page's Wisp connection, which every Worker calls across
   // shared memory. A WebSocket in the guest's own Worker delivers on that
@@ -757,6 +784,15 @@ async function runProgramHere(
       const { Compositor } = await import('./compositor.js');
       compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas, { scale: wlScale });
       globalThis.__gexCompositor = compositor;
+      // WebGPU's server on the compositor's device, so a guest's frames can
+      // be its textures; the page's own if the compositor cannot.
+      if (gpuChannel && !gpuHosted) {
+        gpuHosted = true;
+        await compositor.hostGpu(gpuChannel, gpuServerUrl).catch((e) => {
+          console.warn('[gex] the compositor will not serve WebGPU; the page does', e);
+          gpuHosted = false;
+        });
+      }
       if (gl === 'compositor' && glChannel) {
         const opts = {
           api: 'core',
@@ -861,6 +897,9 @@ async function runProgramHere(
     if (ok === 'timeout') term.writeln('gex: the X server did not come up in 60s');
   }
 
+  // No compositor took the WebGPU server: the page serves it.
+  await hostGpuHere();
+
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,
     shim: shimBytes,
@@ -890,6 +929,9 @@ async function runProgramHere(
       // of the 32-slot span around the miss. An experiment for #136: it says
       // whether the closure has the blocks an exec'd process lifts anyway.
       wholePage: flag('wholepage') ? 1 : undefined,
+      // `?vforktrace=1`: each posix_spawn child run in its parent's Worker
+      // (shims/browser/src/vfork.rs), on the console.
+      vforkTrace: flag('vforktrace') ? 1 : undefined,
       trapPc: flag('trappc') ? Number.parseInt(flag('trappc'), 16) : undefined,
       // Every process gets a memory two Workers can hold, so a `clone` asking
       // for a thread can be given one. `worker.mjs` passes this to the `Gex`
@@ -899,6 +941,8 @@ async function runProgramHere(
       // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
       // reach the page's GlDevice.
       glChannel: glChannel ?? undefined,
+      // The WebGPU wire's shared buffers, for /dev/gex-gpu.
+      gpuChannel: gpuChannel ?? undefined,
       // The Wayland ring's shared buffers, so a Worker that binds the
       // compositor can carry its frames to the page's canvas. Like glChannel.
       wlChannel: wlChannel ?? undefined,

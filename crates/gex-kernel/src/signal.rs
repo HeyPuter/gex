@@ -745,6 +745,47 @@ impl Signals {
         }
         Some(ready.trailing_zeros() + 1)
     }
+
+    /// The running thread's signal state as bytes, for another Worker to
+    /// rebuild with [`Signals::from_bytes`]: the dispositions, the mask and
+    /// the alternate stack, which is what a `fork` child inherits
+    /// ([`Signals::fork`]), and with `pending` the pending sets too, which
+    /// an `execve` keeps. Who sent each pending signal is not kept, nor are
+    /// the timers.
+    pub fn to_bytes(&self, pending: bool) -> Vec<u8> {
+        let mut v = Vec::with_capacity(STATE_BYTES);
+        for a in self.proc.actions.read().iter() {
+            for w in [a.handler, a.flags, a.restorer, a.mask] {
+                v.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let alt = self.alt_stack();
+        let (mine, shared) = if pending { (self.cur.pending(), self.proc.shared()) } else { (0, 0) };
+        for w in [self.blocked(), alt.sp, alt.flags as u64, alt.size, mine, shared] {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        v
+    }
+
+    /// A process's signal state from [`Signals::to_bytes`], or `None` for
+    /// bytes that are not one.
+    pub fn from_bytes(b: &[u8]) -> Option<Signals> {
+        if b.len() != STATE_BYTES {
+            return None;
+        }
+        let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        let mut actions = [SigAction::default(); NSIG];
+        for (i, a) in actions.iter_mut().enumerate() {
+            *a = SigAction { handler: w(i * 4), flags: w(i * 4 + 1), restorer: w(i * 4 + 2), mask: w(i * 4 + 3) };
+        }
+        let o = NSIG * 4;
+        let cur = ThreadSig::new_thread(w(o));
+        cur.own.lock().alt_stack = SigAltStack { sp: w(o + 1), flags: w(o + 2) as u32, size: w(o + 3) };
+        cur.pending.store(w(o + 4), Ordering::Release);
+        let proc = ProcSig::with_actions(actions);
+        proc.shared.store(w(o + 5), Ordering::Release);
+        Some(Signals { proc: Arc::new(proc), cur: Arc::new(cur) })
+    }
 }
 
 /// How a blocking call a signal interrupts ends ([`Signals::restarts`]).
@@ -763,6 +804,10 @@ pub enum Restart {
     /// Restarted after a handler too (`-ERESTARTNOINTR`): `FUTEX_LOCK_PI`.
     Always,
 }
+
+/// The length of [`Signals::to_bytes`]: four words a disposition, then the
+/// mask, the alternate stack's three and the two pending sets.
+const STATE_BYTES: usize = (NSIG * 4 + 6) * 8;
 
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1808,6 +1853,30 @@ mod tests {
             }
         }
         (buf, Signals::new())
+    }
+
+    #[test]
+    fn state_bytes_round_trip() {
+        let s = Signals::new();
+        let a = SigAction { handler: 0x1234, flags: 4, restorer: 0x99, mask: 1 << 3 };
+        s.set_action(sig::SIGUSR1, a).unwrap();
+        s.set_action(sig::SIGPIPE, SigAction { handler: SIG_IGN, ..Default::default() }).unwrap();
+        s.set_blocked(bit(sig::SIGTERM));
+        s.set_alt_stack(SigAltStack { sp: 0x7000, flags: 0, size: 0x2000 });
+        s.raise(sig::SIGUSR2);
+        s.raise_shared(sig::SIGHUP, None);
+        // As a fork child: no pending.
+        let f = Signals::from_bytes(&s.to_bytes(false)).unwrap();
+        assert_eq!(f.action(sig::SIGUSR1).handler, 0x1234);
+        assert_eq!(f.action(sig::SIGUSR1).mask, 1 << 3);
+        assert_eq!(f.action(sig::SIGPIPE).handler, SIG_IGN);
+        assert_eq!(f.blocked(), bit(sig::SIGTERM));
+        assert_eq!(f.alt_stack().sp, 0x7000);
+        assert_eq!(f.pending_raw(), 0);
+        // As an execve: pending kept.
+        let e = Signals::from_bytes(&s.to_bytes(true)).unwrap();
+        assert_eq!(e.pending_raw(), bit(sig::SIGUSR2) | bit(sig::SIGHUP));
+        assert!(Signals::from_bytes(&[0u8; 7]).is_none());
     }
 
     #[test]

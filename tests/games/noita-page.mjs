@@ -39,9 +39,6 @@ const WORLD = 0x122374c;
 const IMAGE = 0x400000;
 // Minutes from the page's start to the world, at most (tier-1 or a hang).
 const worldBy = Number(process.env.NOITA_WORLD_BY_MIN || 12) * 60000;
-// Whether TREE's compositor hit-tests by input region (545564cb): the
-// click offset above depends on it.
-const inputRegions = readFileSync(`${tree}/web/src/compositor-worker.js`, 'utf8').includes('#takesInput');
 
 // noita.exe's PE signature and file header (24 bytes at e_lfanew: machine,
 // sections, link time stamp...), as mapped at its base.
@@ -132,6 +129,11 @@ for (;;) {
   if (s?.phase === 'done' || s?.phase === 'failed') { why = `the program ended: phase ${s.phase}, status ${s.status} ${s.error ?? ''}`; break; }
   const threw = consoleLines.find((l) => /\[gex\] pid \d+(:\d+)? threw:|execute fault|\[harness\] the page crashed/.test(l));
   if (threw) { why = `a thread died: ${threw.slice(0, 400)}`; break; }
+  // A unit cache without the provider modules (gex.mjs `#cgenProviders`
+  // names them, as cgen.rs `gex_cgen_missing` does the NT shim's trampoline
+  // unit) runs, but slower, or at a crawl that looks like a hang.
+  const lacking = consoleLines.find((l) => /missing unit: /.test(l));
+  if (lacking) { why = `the unit cache is incomplete: ${lacking.replace(/^.*missing unit: /, '').slice(0, 400)}`; break; }
   if (tRun === null && s && s.phase !== 'loading' && s.phase !== 'fetching') tRun = now;
   const n = tRun === null ? 0 : await produced();
   if (steps.length && n >= steps[0].at) {
@@ -140,16 +142,11 @@ for (;;) {
       // The surface holds Wine's own window frame around the 1280x720
       // client area the recipe's points are in: a 3-pixel border and a
       // caption, the client at (3,29) in the surface (read off the
-      // compositor's output with the frozen prefix's theme). The client
-      // area is a GL subsurface there, which the page compositor hands the
-      // pointer to with subsurface-local coordinates (it ignores the empty
-      // input region Wine gives it), and Wine reads those as relative to the
-      // whole window: so the point is offset by the frame once more. A
-      // compositor that honours input regions (545564cb, `#takesInput`)
-      // gives the window the pointer in its own coordinates: one (3,29).
+      // compositor's output with the frozen prefix's theme). The page
+      // compositor honours the empty input region of Wine's GL subsurface
+      // (545564cb), so the window takes the pointer in its own coordinates.
       const st = steps.shift();
-      const [fx, fy] = inputRegions ? [3, 29] : [6, 58];
-      const x = w.x + fx + st.x, y = w.y + fy + st.y;
+      const x = w.x + 3 + st.x, y = w.y + 29 + st.y;
       console.log(`${secs()} s, frame ${n}: ${st.what} at ${x},${y} (window ${w.w}x${w.h}@${w.x},${w.y})`);
       await click(x, y);
       await grab(`step-${3 - steps.length}`);

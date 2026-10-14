@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 /// Words in one published surface record, and words in one input event. The
 /// same layout the guest shim publishes, because the page reads one arena.
-const REC: usize = 37;
+const REC: usize = 72;
 const EV: usize = 8;
 const TITLE_BYTES: usize = 32;
 
@@ -474,8 +474,13 @@ pub extern "C" fn hw_input(ptr: u32, count: u32) {
                 }
                 9 => st.client.dismiss_popup(surface),
                 10 => {
+                    // An X window's position, or a placed window's origin
+                    // (see the browser shim's `InputEvent::Moved`).
                     if let Some(xwm) = st.xwm.as_mut() {
                         xwm.moved(surface, q[1], q[2]);
+                    }
+                    if !st.client.is_x11(surface) {
+                        st.client.placement_origin(surface, q[1], q[2]);
                     }
                 }
                 _ => {}
@@ -547,4 +552,6 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
     r[33..37].copy_from_slice(&info.input_words());
+    // Its glass, if its client asked for some (`gex_glass_v1`).
+    r[37..72].copy_from_slice(&info.glass.record_words());
 }

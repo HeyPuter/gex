@@ -40,6 +40,7 @@ use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
+pub mod gpu;
 pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
@@ -48,6 +49,7 @@ mod dense;
 mod fjit;
 mod waitq;
 mod sigs;
+mod vfork;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -1466,6 +1468,10 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     }
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
+    }
+    // WebGPU: every open a wire connection of the page's own.
+    if crate::gpu::have_gpu() {
+        devfs.add_per_open("gex-gpu", Arc::new(crate::gpu::GpuConnection::new));
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
@@ -6440,7 +6446,10 @@ pub extern "C" fn gex_sys_calls() -> u64 {
 /// Nanoseconds spent inside each syscall number, filled in by `gex_syscall`.
 static mut SYS_NS: [u64; 512] = [0; 512];
 
-fn count_syscall() {
+/// `nr` is the call's canonical number (`gex_syscall`'s `this_nr`: an
+/// i386-ABI process's own numbers mapped too), `ctx` the calling thread's
+/// context: no kernel lock to find either.
+fn count_syscall(nr: u64, ctx: u64) {
     if unsafe { HEARTBEAT } == 0 {
         return;
     }
@@ -6448,27 +6457,13 @@ fn count_syscall() {
     // past it is a guest asking for something that does not exist.
     static mut COUNTS: [u32; 512] = [0; 512];
     static mut TOTAL: u32 = 0;
-    let nr = with_host(|h| {
+    let (a0, a1) = {
         let gm = GuestMem::new(guest_bytes());
-        let at = h.threads[cur()].kstate.ctx_addr;
-        let n = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0);
-        // Canonical, so the census and the ring name x86-64 calls too.
-        if gex_abi::X86 {
-            gex_kernel::x86::canonical_number(n)
-        } else if gex_abi::PPC {
-            gex_kernel::ppc::canonical_number(n)
-        } else {
-            n
-        }
-    });
-    let (a0, a1) = with_host(|h| {
-        let gm = GuestMem::new(guest_bytes());
-        let at = h.threads[cur()].kstate.ctx_addr;
         (
-            gm.read_u64(at + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
-            gm.read_u64(at + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
+            gm.read_u64(ctx + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
+            gm.read_u64(ctx + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
         )
-    });
+    };
     let total = unsafe {
         if (nr as usize) < COUNTS.len() {
             COUNTS[nr as usize] = COUNTS[nr as usize].saturating_add(1);
@@ -6645,6 +6640,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         n
     };
+    // posix_spawn's child running in its parent's Worker: not the calls
+    // that would change the memory map it shares (vfork.rs).
+    if vfork::active() {
+        vfork::check(this_nr);
+    }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = my_ctx();
@@ -6733,7 +6733,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     }
-    count_syscall();
+    count_syscall(this_nr, ctx as u32 as u64);
     watch_mem("syscall");
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
@@ -7258,6 +7258,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                    // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run
+                    // in this Worker (vfork.rs). The flags are the first
+                    // argument: ebx for a wasm32 program (the i386 ABI).
+                    let flags = if h.kernel.compat {
+                        gm.read_u64(kstate.ctx_addr + ctx::x(3) as u64).unwrap_or(0) & 0xffff_ffff
+                    } else {
+                        gm.read_u64(kstate.ctx_addr + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0)
+                    };
+                    vfork::note_clone(flags);
                     do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
                     WASM32_STAGED.with(|c| c.set(true));
                     return 0;
@@ -7269,6 +7278,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // several syscalls later, with a context already saved over.
                 set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                1
+            }
+            SyscallOutcome::Exec { path, argv, envp } if vfork::active() => {
+                // posix_spawn's child, in its parent's memory: the new
+                // program gets a Worker of its own (vfork.rs).
+                vfork::stage_exec(h, &path, &argv, &envp);
                 1
             }
             SyscallOutcome::Exec { path, argv, envp } => {
@@ -7308,11 +7323,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     };
     gl::DEFER.with(|d| d.set(false));
     gl::submit_pending(ctx as u32 as u64);
+    gpu::submit_pending(ctx as u32 as u64);
     {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         if unsafe { HEARTBEAT } != 0 {
-            let nr = LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            // Canonical, as the census counts it (an i386-ABI process's
+            // own numbers name other calls in the canonical table).
+            let nr = this_nr as usize;
             if nr < 512 {
                 unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(took) };
             }
@@ -7738,6 +7756,9 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
     // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
     // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
+    // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
+    // which a child inherits and keeps across its `execve`.
+    *FORK_STATE.0.borrow_mut() = state_bytes(&h.kernel, false);
     *FORK_EXE.0.borrow_mut() = std::iter::once(h.kernel.exe_path.as_str())
         .chain(h.kernel.argv.iter().map(String::as_str))
         .collect::<Vec<_>>()
@@ -7772,6 +7793,63 @@ static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(St
 static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 /// The parent's exe path then its argv, NUL-separated, staged at `fork`.
 static FORK_EXE: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's signal state, umask and limits at `fork` (`state_bytes`),
+/// staged for the child to inherit.
+static FORK_STATE: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_fork_state_ptr() -> u32 {
+    FORK_STATE.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_state_len() -> u32 {
+    FORK_STATE.0.borrow().len() as u32
+}
+
+/// The child's side of `gex_fork_state_*`, before `gex_adopt_child`.
+static CHILD_STATE: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
+    *CHILD_STATE.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+}
+
+/// The signal state, umask and resource limits a process passes on: to a
+/// fork's child (`pending` false), or with its pending signals across an
+/// exec that starts in another Worker.
+fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
+    let sig = k.signals.to_bytes(pending);
+    let mut v = Vec::with_capacity(8 + sig.len() + k.rlimits.len() * 16);
+    v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+    v.extend_from_slice(&sig);
+    v.extend_from_slice(&k.umask.to_le_bytes());
+    for [soft, hard] in k.rlimits {
+        v.extend_from_slice(&soft.to_le_bytes());
+        v.extend_from_slice(&hard.to_le_bytes());
+    }
+    v
+}
+
+/// [`state_bytes`] into a kernel being built. Bytes that are not one
+/// change nothing.
+fn apply_state(k: &mut Kernel, b: &[u8]) {
+    let Some(n) = b.get(..4).map(|w| u32::from_le_bytes(w.try_into().unwrap()) as usize) else { return };
+    let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
+    let rest = &b[4 + n..];
+    if rest.len() != 4 + k.rlimits.len() * 16 {
+        return;
+    }
+    k.signals = sig;
+    k.thread_signals.clear();
+    k.sig_tid = 0;
+    k.umask = u32::from_le_bytes(rest[..4].try_into().unwrap());
+    for (i, lim) in k.rlimits.iter_mut().enumerate() {
+        let at = 4 + i * 16;
+        lim[0] = u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
+        lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fork_exe_ptr() -> u32 {
@@ -7936,7 +8014,11 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
     let Ok(text) = std::str::from_utf8(shim_slice(ptr, len)) else {
         return -1;
     };
-    let text = text.to_string();
+    adopt_fds_text(&text.to_string())
+}
+
+/// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
+fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
     let n = with_host(|h| {
         let mut n = 0;
@@ -8529,10 +8611,40 @@ pub extern "C" fn gex_adopt_child(
     brk: i64,
 ) -> i64 {
     phase(1);
+    // The state this Worker started from is a *copy* of the parent's, and the
+    // descriptors in it are the parent's: pipe and pty ends it still holds,
+    // sockets it is still using. Every one of those handles closes its end in
+    // the global kernel when it drops (that is how a process leaving by a trap
+    // still releases them), so letting the copy drop here closes descriptors
+    // that belong to another process -- and it is charged to whichever pid this
+    // Worker answers as. That is what killed a terminal's session: the shell's
+    // slave end went with the copy, the master read end of file, and the whole
+    // foreground group took a SIGHUP one command in. The child's own ends are
+    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
+    // dropped -- into memory that is this process's own image anyway.
+    if gex_has_host() != 0 {
+        with_host(|h| {
+            std::mem::forget(std::mem::replace(
+                &mut h.kernel.fds,
+                gex_kernel::file::FdTable::new(),
+            ));
+            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
+        });
+    }
     // The slot maps the copied low region names are the parent's.
     dense::child();
     // So is the probe cache, which names the parent's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
+    set_host(child_host(pid, ctx_addr, pc, sp, tls, brk));
+    pc
+}
+
+/// The process state a forked child starts with: in a Worker of its own
+/// holding a copy of the parent's image (`gex_adopt_child`), or for
+/// posix_spawn's child in its parent's (`vfork`). Its working directory,
+/// program and signal state are what was staged (`gex_set_cwd`,
+/// `gex_set_child_exe`, `gex_set_child_state`).
+fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> Host {
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -8631,27 +8743,15 @@ pub extern "C" fn gex_adopt_child(
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
-    // The state this Worker started from is a *copy* of the parent's, and the
-    // descriptors in it are the parent's: pipe and pty ends it still holds,
-    // sockets it is still using. Every one of those handles closes its end in
-    // the global kernel when it drops (that is how a process leaving by a trap
-    // still releases them), so letting the copy drop here closes descriptors
-    // that belong to another process -- and it is charged to whichever pid this
-    // Worker answers as. That is what killed a terminal's session: the shell's
-    // slave end went with the copy, the master read end of file, and the whole
-    // foreground group took a SIGHUP one command in. The child's own ends are
-    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
-    // dropped -- into memory that is this process's own image anyway.
-    if gex_has_host() != 0 {
-        with_host(|h| {
-            std::mem::forget(std::mem::replace(
-                &mut h.kernel.fds,
-                gex_kernel::file::FdTable::new(),
-            ));
-            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
-        });
+    // The dispositions, mask, umask and limits the parent had (`do_fork`'s
+    // `FORK_STATE`, staged here by the host with `gex_set_child_state`).
+    {
+        let state = std::mem::take(&mut *CHILD_STATE.0.borrow_mut());
+        if !state.is_empty() {
+            apply_state(&mut kernel, &state);
+        }
     }
-    set_host(Host {
+    Host {
         magic_head: HOST_MAGIC,
         kernel,
         wayland,
@@ -8704,8 +8804,7 @@ pub extern "C" fn gex_adopt_child(
             nanos: 0,
         }},
         magic_tail: HOST_MAGIC,
-    });
-    pc
+    }
 }
 
 /// Record one of the parent's mappings in the adopted child's memory map.

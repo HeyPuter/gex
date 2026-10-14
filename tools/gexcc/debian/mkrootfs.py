@@ -176,7 +176,7 @@ def write_repo(root, debs):
     return repo
 
 
-def configure(root, ours, native_pkgs):
+def configure(root, ours, native_pkgs, debian=None):
     """What maintainer scripts and debootstrap would have done."""
     def w(rel, text, mode=0o644):
         p = os.path.join(root, rel)
@@ -277,6 +277,17 @@ def configure(root, ours, native_pkgs):
             for item in c.get('Provides', '').split(','):
                 if item.strip():
                     names.add(item.strip().split(' ')[0])
+    # and Debian's packages that Provide one of our package names (vim-nox,
+    # vim-gtk3 and vim-motif provide vim): Multi-Arch: foreign makes ours a
+    # provider of vim:arm64 too, and with more than one provider holding a
+    # candidate `apt-get install vim` gives up ("no installation candidate")
+    ours_pkgs = {c['Package'] for _, c in ours if c['Architecture'] == OURS_ARCH}
+    for n, p in (debian or {}).items():
+        if n in ours_pkgs:
+            continue
+        for item in p.get('Provides', '').split(','):
+            if item.strip() and item.strip().split(' ')[0] in ours_pkgs:
+                names.add(n)
     names = sorted(names)
     w('etc/apt/preferences.d/gex-native',
       '# Our native tools (musl-linux-wasm32) are never replaced by Debian\'s\n'
@@ -408,7 +419,7 @@ def main():
                     cmd5.append((p, md5(f)))
         status.append(status_stanza(ctl, cmd5))
     open(os.path.join(root, 'var/lib/dpkg/status'), 'w').write('\n'.join(status))
-    configure(root, ours, native)
+    configure(root, ours, native, pkgs)
     write_repo(root, ours)
 
     size = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(root) for f in fs

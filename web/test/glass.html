@@ -1,0 +1,89 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Glass test</title>
+<style>html, body { margin: 0; background: #000; } canvas { display: block; width: 800px; height: 600px; }</style>
+<canvas id="c" width="800" height="600"></canvas>
+<script type="module">
+// The compositor's glass (gex_glass_v1) without a guest: two surface
+// records written straight into the scene arena, as a process's shim would.
+// A colourful backdrop window, and above it a window whose frame band is
+// glass: transparent pixels there, an opaque client area in the middle.
+import { Compositor } from '../src/compositor.js';
+import {
+  makeWlChannel, WlProxy, REC, R_CLIENT, R_SURFACE, R_ROLE, R_REL_X, R_REL_Y, R_WIDTH, R_HEIGHT, R_ADDR,
+  R_STRIDE, R_FORMAT, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H, R_PLACE, R_STACK_ID, R_GLASS, R_GLASS_ARGB,
+  R_GLASS_BALANCE, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
+} from '@gex/wl-bridge.mjs';
+
+const params = new URLSearchParams(location.search);
+const glassOn = params.get('glass') !== '0';
+const channel = makeWlChannel();
+const canvas = document.getElementById('c');
+const comp = await Compositor.create(canvas, channel);
+const memory = new WebAssembly.Memory({ initial: 128, maximum: 128, shared: true });
+const bytes = new Uint8Array(memory.buffer);
+const TOKEN = 7;
+comp.addMemory(TOKEN, memory);
+
+let next = 4096;
+function pixels(w, h, fn) {
+  const at = next;
+  next += w * h * 4;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const [r, g, b, a] = fn(x, y);
+      const o = at + (y * w + x) * 4;
+      bytes[o] = b; bytes[o + 1] = g; bytes[o + 2] = r; bytes[o + 3] = a; // ARGB8888: B, G, R, A
+    }
+  }
+  return at;
+}
+// Backdrop: stripes and circles, so blur is plain to see.
+const bg = pixels(800, 600, (x, y) => {
+  const stripe = ((x >> 4) + (y >> 4)) & 1;
+  const d = Math.hypot(x - 400, y - 300);
+  return [stripe ? 230 : 30, (d % 80) < 40 ? 200 : 40, (x * 255 / 800) | 0, 255];
+});
+// The glass window: 400x300, an 8px frame and 30px caption of glass, the
+// rest an opaque white client area.
+const W = 400, H = 300;
+const win = pixels(W, H, (x, y) => {
+  const glass = x < 8 || x >= W - 8 || y < 30 || y >= H - 8;
+  // As GDI leaves it: alpha 0 everywhere, black where the glass is.
+  return glass ? [0, 0, 0, 0] : [245, 245, 245, 0];
+});
+
+const recs = new Int32Array(memory.buffer, 1024, 2 * REC);
+function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0, title = '', frame = null }) {
+  const r = i * REC;
+  recs[r + R_CLIENT] = 1; recs[r + R_SURFACE] = surface; recs[r + R_ROLE] = ROLE_TOPLEVEL;
+  recs[r + R_REL_X] = x; recs[r + R_REL_Y] = y; recs[r + R_WIDTH] = w; recs[r + R_HEIGHT] = h;
+  recs[r + R_ADDR] = addr; recs[r + R_STRIDE] = w * 4; recs[r + R_FORMAT] = format; recs[r + R_SERIAL] = 1;
+  recs[r + R_DAMAGE_W] = w; recs[r + R_DAMAGE_H] = h;
+  recs[r + R_PLACE] = P_PLACED | P_UNMANAGED; recs[r + R_STACK_ID] = id;
+  if (glass) {
+    recs[r + R_GLASS] = glass.length;
+    recs[r + R_GLASS_ARGB] = 0x6b74b8fc | 0; // Windows 7's default sky colour, alpha 0x6b
+    recs[r + R_GLASS_BALANCE] = 45 | (60 << 8);
+    glass.forEach((q, j) => recs.set(q, r + R_GLASS_RECTS + 4 * j));
+  }
+  // The frame DWM would draw: flags, then close, max and min as x, y, w, h, state.
+  if (frame) recs.set(frame, r + R_GLASS_FRAME);
+  const t = new TextEncoder().encode(title).slice(0, R_TITLE_WORDS * 4 - 1);
+  const tb = new Uint8Array(R_TITLE_WORDS * 4);
+  tb.set(t);
+  recs.set(new Int32Array(tb.buffer), r + R_TITLE);
+}
+rec(0, { surface: 1, x: 0, y: 0, w: 800, h: 600, addr: bg, id: 1 });
+// Windows 7's caption buttons: close 43 wide, maximize and minimize 26, all
+// 20 high at the top edge, 6 px in from the right.
+const frame = params.get('frame') === '0' ? null : [1 | 2,
+  W - 6 - 43, 0, 43, 20, 1,
+  W - 6 - 43 - 26, 0, 26, 20, 1,
+  W - 6 - 43 - 52, 0, 26, 20, 1];
+rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1, title: 'Computer', frame,
+  glass: glassOn ? [[0, 0, W, 30], [0, 30, 8, H - 38], [W - 8, 30, 8, H - 38], [0, H - 8, W, 8]] : null });
+const proxy = new WlProxy(channel, null, () => TOKEN);
+proxy.publish(memory, 1024, 2);
+window.published = true;
+</script>

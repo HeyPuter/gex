@@ -484,9 +484,16 @@ async function handle(msg) {
     // (web/src/compositor-worker.js `glInRealm`), and a submit is a promise
     // the Suspending `gl_submit` waits on. A batch is run straight out of
     // this process's memory: no copy, and no batch in flight unwaited.
+    // An unwaited batch is waited for all the same; its answer is what the
+    // Worker build's would be, the frames shown its PRESENT replied.
+    const { shownInReply } = await import('./gl-bridge.mjs');
     gex.useGl({
-      submit: (memory, ring, client) =>
-        globalThis.__gexGlInRealm ? globalThis.__gexGlInRealm.submit(memory, ring, client) : -1,
+      submit: (memory, ring, client, unwaited) => {
+        if (!globalThis.__gexGlInRealm) return -1;
+        const r = globalThis.__gexGlInRealm.submit(memory, ring, client);
+        if (!unwaited) return r;
+        return Promise.resolve(r).then((rc) => (rc < 0 ? rc : shownInReply(new Uint8Array(memory.buffer), ring)));
+      },
     });
   } else if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
@@ -495,6 +502,12 @@ async function handle(msg) {
       // thousands of synchronous query wake-ups off the page event loop.
       if (!msg.glChannel.direct) port.post({ kind: 'gl' });
     }));
+  }
+  // WebGPU (/dev/gex-gpu): the wire's server, wherever the page runs it,
+  // over its own shared buffers. Before `load`, which mounts the device.
+  if (msg.gpuChannel) {
+    const { GpuProxy } = await import('./gpu-bridge.mjs');
+    gex.useGpu(new GpuProxy(msg.gpuChannel));
   }
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
@@ -778,6 +791,7 @@ async function handle(msg) {
     if (msg.intrinsicMask !== undefined) ex.gex_set_intrinsic_mask?.(msg.intrinsicMask);
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
+    if (msg.vforkTrace ?? msg.opts?.vforkTrace) globalThis.GEX_VFORK_TRACE = 1;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));

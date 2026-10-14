@@ -998,6 +998,16 @@ wasm32 code as a library into a process at run time:
   is instrumented (an onlylist from `forkreach.py`, a whole-program call
   graph). The child re-instantiates the module over the copied memory at
   the parent's table base (bdd34eb3).
+  Tried and not landed (2026-10-13, branch `feat/inplace-fork` 6fe60515):
+  running a single-threaded parent's child in the parent's own Worker first,
+  with the parent's memory snapshotted and put back after the child exits or
+  execs (promoting it to the old path on any call that is not local). It is
+  correct (tests/wasm32/inplace.c on that branch), but it measured no win
+  against pooled Workers. apt-get update ran 11 forks in place, costing
+  snapshots 740 ms plus restores 226 ms, about what the old path's image
+  copy costs. The timed apt pair on edger was inside noise. A child that
+  only execs needs no snapshot under vfork's contract, which is the
+  vfork/posix_spawn path.
 - **Side modules exist already for Wine and for ejected projects**:
   `wasmdll.rs` (Wine's PE side as one wasm module behind PE skeletons),
   `libprov.rs` (stateful providers: `-shared` PIC modules with their own

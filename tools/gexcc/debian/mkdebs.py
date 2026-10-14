@@ -77,6 +77,33 @@ def field(kind, binpkg):
     return ', '.join(out)
 
 
+def alternatives(binpkg):
+    """`alternative BINPKG NAME LINK PATH PRIORITY` lines: what Debian's
+    maintainer scripts register with update-alternatives (vim's /usr/bin/vim
+    is only ever that link to vim.basic)."""
+    out = []
+    for line in open(os.path.join(HERE, 'binpkgs.txt')):
+        f = line.split()
+        if len(f) == 6 and f[0] == 'alternative' and f[1] == binpkg:
+            out.append(f[2:])
+    return out
+
+
+def maintainer_scripts(t, binpkg):
+    """A postinst and prerm for the package's alternatives, as Debian's do
+    it: installed on configure, removed on remove or deconfigure."""
+    alts = alternatives(binpkg)
+    if not alts:
+        return
+    inst = ''.join(f'    update-alternatives --install {link} {name} {path} {prio}\n'
+                   for name, link, path, prio in alts)
+    rm = ''.join(f'    update-alternatives --remove {name} {path}\n' for name, link, path, prio in alts)
+    for script, when, body in (('postinst', 'configure', inst), ('prerm', 'remove|deconfigure', rm)):
+        p = os.path.join(t, 'DEBIAN', script)
+        open(p, 'w').write(f'#!/bin/sh\nset -e\ncase "$1" in\n  {when})\n{body}    ;;\nesac\n')
+        os.chmod(p, 0o755)
+
+
 def depends(binpkg):
     return field('depends', binpkg)
 
@@ -178,6 +205,7 @@ def main():
             desc = st.get('Description', f'{b} (native wasm32 build)')
             ctl.append(f'Description: {desc}')
             open(os.path.join(t, 'DEBIAN', 'control'), 'w').write('\n'.join(ctl) + '\n')
+            maintainer_scripts(t, b)
             deb = os.path.join(a.out, f'{b}_{version.split(":", 1)[-1]}_{arch}.deb')
             subprocess.run(['dpkg-deb', '--root-owner-group', '-Zxz', '--build', t, deb],
                            check=True, stdout=subprocess.DEVNULL)

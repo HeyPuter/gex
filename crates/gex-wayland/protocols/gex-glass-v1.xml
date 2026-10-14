@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="gex_glass_v1">
+  <copyright>
+    Copyright 2026 the gex authors. Same terms as the rest of gex.
+  </copyright>
+
+  <description summary="blur-behind and tint: Windows 7's glass">
+    Windows 7 draws Aero's glass in its compositor (DWM): parts of a window
+    show what is beneath them, blurred and tinted with the colorization
+    colour. A Win32 window asks for it with DwmExtendFrameIntoClientArea and
+    DwmEnableBlurBehindWindow, and its glass frame is glass as well. Here the
+    client names those parts of a surface; the compositor fills them with the
+    blurred backdrop and draws the surface's own pixels over it, alpha
+    blended, as DWM does.
+
+    State takes effect at once, like gex_window_placement_v1's: a window
+    changing its glass does not need new contents.
+  </description>
+
+  <interface name="gex_glass_manager_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Glass objects already made are unaffected.
+      </description>
+    </request>
+
+    <request name="get_glass">
+      <description summary="give a surface glass">
+        The surface has no glass until a region is set.
+      </description>
+      <arg name="id" type="new_id" interface="gex_glass_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="gex_glass_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="no more glass">
+        The surface is drawn as an ordinary one.
+      </description>
+    </request>
+
+    <request name="set_region">
+      <description summary="where the surface is glass">
+        In surface coordinates; null is the whole surface, an empty region no
+        glass. The region is copied as it is now. A compositor may keep only
+        a few rectangles of it, and the bounds of the rest.
+      </description>
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+
+    <request name="set_colorization">
+      <description summary="the tint">
+        DWM's colorization parameters: the colour (ARGB, its alpha the
+        colour's own strength), how much of it is mixed over the blurred
+        backdrop (balance), and how much of the blurred backdrop shows
+        (blur_balance), both 0 to 100.
+      </description>
+      <arg name="argb" type="uint"/>
+      <arg name="balance" type="uint"/>
+      <arg name="blur_balance" type="uint"/>
+    </request>
+
+    <enum name="frame" bitfield="true">
+      <entry name="frame" value="1" summary="draw Windows 7's frame on the glass"/>
+      <entry name="active" value="2"/>
+      <entry name="maximized" value="4"/>
+      <entry name="tool" value="8" summary="a tool window's small frame"/>
+    </enum>
+
+    <enum name="button_state">
+      <entry name="hidden" value="0"/>
+      <entry name="normal" value="1"/>
+      <entry name="hot" value="2"/>
+      <entry name="pushed" value="3"/>
+      <entry name="disabled" value="4"/>
+    </enum>
+
+    <request name="set_frame">
+      <description summary="the frame the compositor draws">
+        What DWM draws on a window's glass frame: the frame itself, and the
+        caption buttons where the client's window system has them (it hit
+        tests them, so they are drawn where it says). Rectangles are in
+        surface coordinates. The caption text is the surface's title.
+      </description>
+      <arg name="flags" type="uint" enum="frame"/>
+      <arg name="close_x" type="int"/>
+      <arg name="close_y" type="int"/>
+      <arg name="close_width" type="int"/>
+      <arg name="close_height" type="int"/>
+      <arg name="close_state" type="uint" enum="button_state"/>
+      <arg name="max_x" type="int"/>
+      <arg name="max_y" type="int"/>
+      <arg name="max_width" type="int"/>
+      <arg name="max_height" type="int"/>
+      <arg name="max_state" type="uint" enum="button_state"/>
+      <arg name="min_x" type="int"/>
+      <arg name="min_y" type="int"/>
+      <arg name="min_width" type="int"/>
+      <arg name="min_height" type="int"/>
+      <arg name="min_state" type="uint" enum="button_state"/>
+    </request>
+  </interface>
+</protocol>

@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU in the compositor</title>
+<canvas id="c" width="320" height="240"></canvas>
+<pre id="out"></pre>
+<script type="module">
+// /dev/gex-gpu served by the compositor's worker on its own device
+// (Compositor.hostGpu), with a guest (guest/gpu/test/gpu-smoke.c, from
+// web/public/gex/test/) running in a Worker of its own.
+import { Compositor } from '../src/compositor.js';
+import { makeWlChannel } from '@gex/wl-bridge.mjs';
+import { makeGpuChannel } from '@gex/gpu-bridge.mjs';
+
+const out = (s) => { document.getElementById('out').textContent += s; };
+const comp = await Compositor.create(document.getElementById('c'), makeWlChannel());
+const channel = makeGpuChannel();
+await comp.hostGpu(channel, new URL('/gex/gexgpu-server.mjs', location.href).href);
+out('served by the compositor\n');
+const w = new Worker(new URL('./gpu-worker.mjs', import.meta.url), { type: 'module' });
+w.onmessage = (e) => { out(e.data); if (e.data.startsWith('exit')) window.done = e.data; };
+w.postMessage(channel);
+</script>

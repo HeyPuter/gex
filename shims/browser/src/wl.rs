@@ -54,7 +54,7 @@ const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
-const REC: usize = 37;
+const REC: usize = 72;
 /// Words in one input event record.
 const EV: usize = 8;
 /// The most surfaces published in one pump. A desktop session with a dozen
@@ -489,9 +489,16 @@ impl WaylandDevice {
                         InputEvent::DismissPopup { surface, .. } => {
                             s.client.dismiss_popup(surface)
                         }
+                        // Where the page put a window: an X window's
+                        // position, through the manager; a placed
+                        // window's origin, which its client adds to the
+                        // pointer positions that follow.
                         InputEvent::Moved { surface, x, y, .. } => {
                             if let Some(xwm) = s.xwm.as_mut() {
                                 xwm.moved(surface, x, y);
+                            }
+                            if !s.client.is_x11(surface) {
+                                s.client.placement_origin(surface, x, y);
                             }
                         }
                     }
@@ -764,6 +771,8 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
     r[33..37].copy_from_slice(&info.input_words());
+    // Its glass, if its client asked for some (`gex_glass_v1`).
+    r[37..72].copy_from_slice(&info.glass.record_words());
 }
 
 impl HostListener for WaylandDevice {

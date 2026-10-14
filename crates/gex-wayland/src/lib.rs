@@ -165,6 +165,11 @@ impl Region {
         self.rects = out;
     }
 
+    /// The rectangles, in surface coordinates.
+    pub fn rects(&self) -> &[(i32, i32, i32, i32)] {
+        &self.rects
+    }
+
     /// Whether a point in surface coordinates is in the region.
     pub fn contains(&self, x: i32, y: i32) -> bool {
         self.rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
@@ -293,6 +298,90 @@ pub struct SurfaceInfo {
     /// whole surface, as it is until a client sets one, and an empty region
     /// takes no pointer input at all.
     pub input: Option<Region>,
+    /// Blur-behind and tint (`gex_glass_v1`).
+    pub glass: Glass,
+}
+
+/// A surface's glass (`protocols/gex-glass-v1.xml`): where the compositor
+/// shows the blurred backdrop beneath it, and the tint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glass {
+    /// Up to `Glass::RECTS` rectangles in surface units; `count` 0 is no glass.
+    pub rects: [(i32, i32, i32, i32); Glass::RECTS],
+    pub count: u32,
+    /// The colorization colour, ARGB.
+    pub argb: u32,
+    /// 0..=100 each: colour over the backdrop, and how much backdrop shows.
+    pub balance: u32,
+    pub blur_balance: u32,
+    /// The frame the host draws (`set_frame`): flags, and the close,
+    /// maximize and minimize buttons as (x, y, width, height, state).
+    pub frame: u32,
+    pub buttons: [(i32, i32, i32, i32, u32); 3],
+}
+
+impl Glass {
+    /// Rectangles a record carries. A region of more is kept as its first
+    /// `RECTS - 1` and the bounds of the rest.
+    pub const RECTS: usize = 4;
+    /// Words a record spends on glass (`R_GLASS`.. in `wl-bridge.mjs`).
+    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3;
+
+    /// Null (`None`) is the whole surface: one rectangle the host clips to
+    /// the surface's size.
+    fn set_region(&mut self, region: Option<&Region>) {
+        let whole = [(0, 0, i32::MAX / 2, i32::MAX / 2)];
+        let rects = region.map_or(&whole[..], Region::rects);
+        *self = Glass {
+            argb: self.argb,
+            balance: self.balance,
+            blur_balance: self.blur_balance,
+            frame: self.frame,
+            buttons: self.buttons,
+            ..Glass::default()
+        };
+        for (i, r) in rects.iter().enumerate() {
+            if i == Self::RECTS - 1 && rects.len() > Self::RECTS {
+                let mut rest = Region::default();
+                for &q in &rects[i..] {
+                    rest.add(q);
+                }
+                self.rects[i] = rest.bounds();
+                self.count = Self::RECTS as u32;
+                return;
+            }
+            if i == Self::RECTS {
+                break;
+            }
+            self.rects[i] = *r;
+            self.count = i as u32 + 1;
+        }
+    }
+
+    /// The glass words of a surface record: count, colour, balances, then
+    /// the rectangles (x, y, width, height each).
+    pub fn record_words(&self) -> [i32; Glass::WORDS] {
+        let mut w = [0i32; Glass::WORDS];
+        w[0] = self.count as i32;
+        w[1] = self.argb as i32;
+        w[2] = (self.balance & 0xff | (self.blur_balance & 0xff) << 8) as i32;
+        for (i, r) in self.rects.iter().enumerate() {
+            w[3 + 4 * i] = r.0;
+            w[4 + 4 * i] = r.1;
+            w[5 + 4 * i] = r.2;
+            w[6 + 4 * i] = r.3;
+        }
+        let f = 3 + 4 * Self::RECTS;
+        w[f] = self.frame as i32;
+        for (i, b) in self.buttons.iter().enumerate() {
+            w[f + 1 + 5 * i] = b.0;
+            w[f + 2 + 5 * i] = b.1;
+            w[f + 3 + 5 * i] = b.2;
+            w[f + 4 + 5 * i] = b.3;
+            w[f + 5 + 5 * i] = b.4 as i32;
+        }
+        w
+    }
 }
 
 /// A placed surface's position and stacking, as its client asked for them
@@ -471,8 +560,13 @@ const GLOBALS: &[(&str, u32)] = &[
     ("wp_viewporter", 1),
     // Windows with real coordinates: a Win32 window (Wine) says where it is
     // and what it is under, and the compositor shows it there rather than
-    // cascading it. See `protocols/gex-window-placement-v1.xml`.
-    ("gex_window_placement_manager_v1", 1),
+    // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
+    // adds the `origin` event: where the compositor has the surface, for
+    // turning its surface-local pointer positions into Win32's.
+    ("gex_window_placement_manager_v1", 2),
+    // Windows 7's glass: blur-behind and tint for parts of a surface. See
+    // `protocols/gex-glass-v1.xml`.
+    ("gex_glass_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -505,6 +599,8 @@ enum Object {
     Decoration { surface: u32 },
     PlacementManager,
     Placement { surface: u32 },
+    GlassManager,
+    Glass { surface: u32 },
     /// An object whose requests we accept and ignore (data devices/sources,
     /// subsurfaces) -- present so GTK's init completes, does nothing observable.
     Stub,
@@ -672,6 +768,11 @@ struct SurfaceState {
     crop: Option<(i32, i32, i32, i32)>,
     /// `gex_window_placement_v1`: where the client put the surface.
     placement: Placement,
+    /// `gex_glass_v1`: blur-behind and tint.
+    glass: Glass,
+    /// The last `gex_window_placement_v1.origin` sent: where the host has the
+    /// surface, which the pointer positions after it are relative to.
+    origin: Option<(i32, i32)>,
     /// `set_input_region`, pending until commit (`Some(None)`: back to the
     /// whole surface), and the committed region (`None`: the whole surface).
     pending_input: Option<Option<Region>>,
@@ -710,6 +811,9 @@ pub struct Client {
     /// The version this client bound `xdg_wm_base` at, which its toplevels
     /// share: `configure_bounds` is only for 4 and up.
     wm_base_version: u32,
+    /// The version this client bound `gex_window_placement_manager_v1` at,
+    /// which its placement objects share: `origin` is for 2 and up.
+    placement_version: u32,
     /// Positioner state, by object id: what a popup asked to be placed against.
     positioners: HashMap<u32, Positioner>,
     /// What each `wl_region` holds.
@@ -779,6 +883,7 @@ impl Client {
             default_size: (640, 480),
             scale: 1,
             wm_base_version: 0,
+            placement_version: 0,
             positioners: HashMap::new(),
             regions: HashMap::new(),
             dirty: false,
@@ -942,6 +1047,8 @@ impl Client {
                 Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
                 Object::PlacementManager => self.placement_manager(opcode, &mut r),
                 Object::Placement { surface } => self.placement(object, surface, opcode, &mut r),
+                Object::GlassManager => self.glass_manager(opcode, &mut r),
+                Object::Glass { surface } => self.glass(object, surface, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager => {
                     // create_data_source(id) = 0, get_data_device(id, seat) = 1;
@@ -1187,6 +1294,10 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
+                self.placement_version = version.min(2);
+            }
+            "gex_glass_manager_v1" => {
+                self.objects.insert(id, Object::GlassManager);
             }
             _ => return false,
         }
@@ -2379,6 +2490,8 @@ impl Client {
                     return false;
                 };
                 s.placement.placed = true;
+                // A new placement object has been told no origin yet.
+                s.origin = None;
                 self.objects.insert(id, Object::Placement { surface });
                 self.dirty = true;
                 true
@@ -2400,7 +2513,10 @@ impl Client {
         match opcode {
             // destroy: back to the compositor's own layout.
             0 => {
-                apply(self, &mut |s| s.placement = Placement::default());
+                apply(self, &mut |s| {
+                    s.placement = Placement::default();
+                    s.origin = None;
+                });
                 self.objects.remove(&object);
                 self.delete_id(object);
             }
@@ -2434,6 +2550,89 @@ impl Client {
             5 => apply(self, &mut |s| s.placement.unmanaged = true),
             // activate
             6 => apply(self, &mut |s| s.placement.activate = s.placement.activate.wrapping_add(1)),
+            _ => ok = false,
+        }
+        ok
+    }
+
+    // -- gex_glass_v1 -------------------------------------------------------
+
+    fn glass_manager(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => true,
+            // get_glass(id, surface)
+            1 => {
+                let (Some(id), Some(surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                if !self.surfaces.contains_key(&surface) {
+                    return false;
+                }
+                self.objects.insert(id, Object::Glass { surface });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn glass(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        // As with placement: a request for a surface already gone is
+        // accepted and changes nothing.
+        let mut ok = true;
+        match opcode {
+            // destroy
+            0 => {
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.glass = Glass::default();
+                    self.dirty = true;
+                }
+                self.objects.remove(&object);
+                self.delete_id(object);
+            }
+            // set_region(region)
+            1 => match r.object() {
+                Some(region) => {
+                    let region = if region == 0 {
+                        None
+                    } else {
+                        Some(self.regions.get(&region).cloned().unwrap_or_default())
+                    };
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass.set_region(region.as_ref());
+                        self.dirty = true;
+                    }
+                }
+                None => ok = false,
+            },
+            // set_frame(flags, then x, y, width, height, state for close, max, min)
+            3 => {
+                let Some(flags) = r.uint() else { return false };
+                let mut buttons = [(0, 0, 0, 0, 0); 3];
+                for b in &mut buttons {
+                    match (r.int(), r.int(), r.int(), r.int(), r.uint()) {
+                        (Some(x), Some(y), Some(w), Some(h), Some(state)) => *b = (x, y, w, h, state.min(4)),
+                        _ => return false,
+                    }
+                }
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.glass.frame = flags;
+                    s.glass.buttons = buttons;
+                    self.dirty = true;
+                }
+            }
+            // set_colorization(argb, balance, blur_balance)
+            2 => match (r.uint(), r.uint(), r.uint()) {
+                (Some(argb), Some(balance), Some(blur_balance)) => {
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass.argb = argb;
+                        s.glass.balance = balance.min(100);
+                        s.glass.blur_balance = blur_balance.min(100);
+                        self.dirty = true;
+                    }
+                }
+                _ => ok = false,
+            },
             _ => ok = false,
         }
         ok
@@ -2537,6 +2736,7 @@ impl Client {
                 client_scale: self.scale,
                 placement: s.placement,
                 input: s.input.clone(),
+                glass: s.glass,
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -2723,6 +2923,37 @@ impl Client {
             .collect();
         out.sort_by_key(|p| p.0);
         out
+    }
+
+    /// Where the host has put a placed surface, in output pixels: the point
+    /// its surface-local pointer positions are relative to from now on.
+    ///
+    /// The client places the window, but the host shows it -- a frame or more
+    /// after the client asked, and pointer events go on arriving meanwhile,
+    /// relative to where the window was *shown*. A client that turns them into
+    /// screen positions with the place it last asked for (Wine does: its
+    /// window rectangle) gets them wrong by however far the window moved in
+    /// between, and a window that follows the pointer (Win32's own caption
+    /// drag) overshoots by its last step, then back: it shakes. Told the
+    /// origin in order with the pointer events, the client adds the right
+    /// one. Only sent when it changes, and only to a client that bound
+    /// version 2 (`gex_window_placement_v1.origin`).
+    pub fn placement_origin(&mut self, surface: u32, x: i32, y: i32) {
+        if self.placement_version < 2 {
+            return;
+        }
+        let Some(obj) = self.objects.iter().find_map(|(id, o)| match o {
+            Object::Placement { surface: s } if *s == surface => Some(*id),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(s) = self.surfaces.get_mut(&surface) else { return };
+        if s.origin == Some((x, y)) {
+            return;
+        }
+        s.origin = Some((x, y));
+        self.send(Writer::new(obj, 0).int(x).int(y));
     }
 
     /// Whether input can be delivered: the client has a pointer and a
@@ -3736,6 +3967,38 @@ mod tests {
         // Destroyed: back to the compositor's layout.
         c.receive(&Writer::new(60, 0).finish(), &[], &pool);
         assert_eq!(c.scene()[0].placement, Placement::default());
+    }
+
+    #[test]
+    fn a_placed_window_is_told_its_origin_once_per_change_at_version_2() {
+        let pool = Placed(0x6000, 8192);
+        for version in [1u32, 2] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            let _ = c.take_outgoing();
+            c.placement_origin(6, 120, 40);
+            c.placement_origin(6, 120, 40);
+            c.placement_origin(6, 160, 70);
+            let origins: Vec<(i32, i32)> = messages(&c.take_outgoing())
+                .iter()
+                .filter(|(o, op, _)| *o == 60 && *op == 0)
+                .map(|m| {
+                    let mut fds = Vec::new();
+                    let mut r = Reader::new(&m.2, &mut fds);
+                    (r.int().unwrap(), r.int().unwrap())
+                })
+                .collect();
+            let want: Vec<(i32, i32)> = if version >= 2 { vec![(120, 40), (160, 70)] } else { vec![] };
+            assert_eq!(origins, want, "bound at version {version}");
+            // A surface without a placement object is told nothing.
+            c.placement_origin(7, 1, 1);
+            assert!(messages(&c.take_outgoing()).is_empty());
+        }
     }
 
     #[test]

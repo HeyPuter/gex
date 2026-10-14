@@ -23,7 +23,7 @@ const BLOCKS = 8;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 37;
+export const REC = 72;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -76,6 +76,20 @@ export const R_INPUT_X = 33;
 export const R_INPUT_Y = 34;
 export const R_INPUT_W = 35;
 export const R_INPUT_H = 36;
+/** Glass (`gex_glass_v1`): rectangle count, colorization ARGB, balance
+ *  (bits 0..7) and blur balance (8..15), then x, y, w, h per rectangle. */
+export const R_GLASS = 37;
+export const R_GLASS_ARGB = 38;
+export const R_GLASS_BALANCE = 39;
+export const R_GLASS_RECTS = 40;
+export const GLASS_RECTS = 4;
+/** The frame the compositor draws (`set_frame`): flags, then close, max and
+ *  min buttons as x, y, w, h, state. */
+export const R_GLASS_FRAME = 56;
+export const GLASS_FRAME_ON = 1;
+export const GLASS_FRAME_ACTIVE = 2;
+export const GLASS_FRAME_MAXIMIZED = 4;
+export const GLASS_FRAME_TOOL = 8;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
 
@@ -271,10 +285,38 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         input: (a[r + R_FLAGS] & F_INPUT_REGION)
           ? { x: a[r + R_INPUT_X], y: a[r + R_INPUT_Y], w: a[r + R_INPUT_W], h: a[r + R_INPUT_H] }
           : null,
+        glass: glassOf(a, r),
       });
     }
   }
   return { surfaces: out, blocks };
+}
+
+/** A record's glass: null without any, else its rectangles (surface
+ *  units) and DWM's colorization parameters. */
+function glassOf(a, r) {
+  const count = Math.min(a[r + R_GLASS], GLASS_RECTS);
+  if (count <= 0) return null;
+  const rects = [];
+  for (let i = 0; i < count; i++) {
+    const q = r + R_GLASS_RECTS + 4 * i;
+    rects.push({ x: a[q], y: a[q + 1], w: a[q + 2], h: a[q + 3] });
+  }
+  const buttons = [];
+  for (let i = 0; i < 3; i++) {
+    const q = r + R_GLASS_FRAME + 1 + 5 * i;
+    buttons.push({ x: a[q], y: a[q + 1], w: a[q + 2], h: a[q + 3], state: a[q + 4] });
+  }
+  return {
+    rects,
+    frame: a[r + R_GLASS_FRAME] >>> 0,
+    close: buttons[0],
+    max: buttons[1],
+    min: buttons[2],
+    argb: a[r + R_GLASS_ARGB] >>> 0,
+    balance: a[r + R_GLASS_BALANCE] & 0xff,
+    blurBalance: (a[r + R_GLASS_BALANCE] >> 8) & 0xff,
+  };
 }
 
 /**

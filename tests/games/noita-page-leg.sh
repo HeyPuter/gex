@@ -29,6 +29,11 @@
 # its sources): `GEX_CGEN_CACHE=units gexc cgen-image IMAGE --pe-base BASE`
 # with TREE's x86 gexc for each "unitless:" line of a run (page paths: /w3 is
 # the W3 dist, /g the game). A stale cache shows up as "unitless" lines.
+# The provider modules go in too, with the same gexc and GEX_CGEN_CACHE:
+# `gexc cgen-image --providers` (units/providers; no image's unit carries
+# them). The page names a missing one as "missing unit:", and the leg fails on
+# it at once. (So does the NT shim's trampoline unit, `--nt-trampolines32`,
+# which W3 runs do not place.)
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
