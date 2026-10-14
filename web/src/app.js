@@ -166,7 +166,7 @@ function progressMeter(state, onProgress) {
         let kind = 'file';
         let total = 0;
         if (m.what.startsWith('unit:')) {
-          const unit = m.what.split('/')[1] ?? '';
+          const unit = m.what.slice('unit:'.length).split('/')[0];
           kind = 'code';
           name = unitNames[unit] || '';
         } else {
