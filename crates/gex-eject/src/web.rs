@@ -433,24 +433,122 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gex-eject</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
-  #error { position: fixed; left: 1em; right: 1em; bottom: 1em; margin: 0; color: #f88; white-space: pre-wrap; }
+  :root { --bg: #111; --fg: #ddd; --dim: #8a8f98; --track: #2a2d33; --bar: #4a90e2; --err: #f88; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; }
+  #error { position: fixed; left: 1em; right: 1em; bottom: 1em; margin: 0; color: var(--err); white-space: pre-wrap; z-index: 2147483647; }
+  /* The loading screen: over the whole page (above the windows' own z-index)
+     until the program's first frame. */
+  #loading { position: fixed; inset: 0; z-index: 2147483646; display: flex; align-items: center; justify-content: center;
+             background: var(--bg); transition: opacity 0.6s ease; }
+  #loading.done { opacity: 0; pointer-events: none; }
+  #loading .box { width: min(360px, calc(100vw - 32px)); }
+  #loading .row { display: flex; justify-content: space-between; gap: 1em; margin-bottom: 8px; }
+  #loading .phase { font-weight: 600; }
+  #loading .time, #loading .detail { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #loading .track { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+  #loading .fill { height: 100%; width: 0; background: var(--bar); transition: width 0.2s linear; }
+  /* No count to show (the program is starting): a bar that moves. */
+  #loading .track.busy .fill { width: 30%; animation: busy 1.2s ease-in-out infinite; }
+  @keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  #loading .detail { margin-top: 8px; min-height: 1.2em; }
+  /* What the running program is fetching (a lazy file, translated code). */
+  #fetching { position: fixed; right: 8px; bottom: 48px; z-index: 2147483645; max-width: calc(100vw - 32px);
+              padding: 3px 10px; border-radius: 4px; background: rgba(0, 0, 0, 0.72); color: #eee;
+              font: 12px system-ui, sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; pointer-events: none; opacity: 0; transition: opacity 0.2s; }
+  #fetching.on { opacity: 1; }
 </style>
 </head>
 <body>
 <pre id="error"></pre>
+<div id="fetching" aria-live="polite"></div>
+<div id="loading" role="progressbar" aria-live="polite">
+  <div class="box">
+    <div class="row"><span class="phase">Loading</span><span class="time">0 s</span></div>
+    <div class="track"><div class="fill"></div></div>
+    <div class="detail"></div>
+  </div>
+</div>
 <script type="module">
   // Your page: gexc eject wrote it once (user/index.html) and never rewrites
   // it. The program is app.mjs's: start() takes an element to fill and,
-  // optionally, args, env, size ('fit' or {w, h}), onLog, onExit and more
-  // (docs/eject.md, "The web build"); it gives back { exited, kill(), resize() }.
+  // optionally, args, env, size ('fit' or {w, h}), onLog, onExit, onProgress
+  // and more (docs/eject.md, "The web build"); it gives back { exited, kill(),
+  // resize(), state }. The loading screen below is this page's: start()
+  // only says how far along it is (onProgress).
   import { start } from './app.mjs';
   const error = document.getElementById('error');
   const show = (e) => { error.textContent = String(e?.message ?? e); };
+
+  const loading = document.getElementById('loading');
+  const $ = (c) => loading.querySelector(c);
+  const t0 = performance.now();
+  const clock = setInterval(() => { $('.time').textContent = `${Math.floor((performance.now() - t0) / 1000)} s`; }, 250);
+  const mb = (n) => (n / 1e6).toFixed(n < 1e7 ? 1 : 0);
+  const bar = (frac) => {
+    $('.track').classList.toggle('busy', frac === null);
+    $('.fill').style.width = frac === null ? '' : `${Math.min(100, frac * 100).toFixed(1)}%`;
+  };
+  const hide = () => {
+    clearInterval(clock);
+    loading.classList.add('done');
+    setTimeout(() => loading.remove(), 700);
+  };
+  // After the start: what the program is fetching, in a corner, while it is.
+  const line = document.getElementById('fetching');
+  let off = 0;
+  const fetching = (f) => {
+    clearTimeout(off);
+    if (!f) {
+      off = setTimeout(() => line.classList.remove('on'), 400);
+      return;
+    }
+    const more = f.inflight > 1 ? ` (+${f.inflight - 1})` : '';
+    const of = f.total >= 1e6 ? `${mb(f.done)} of ${mb(f.total)} MB`
+      : `${Math.round(f.done / 1e3)} of ${Math.max(1, Math.round(f.total / 1e3))} KB`;
+    const what = f.kind === 'code' ? `code for ${f.name || 'the program'}` : f.name;
+    line.textContent = `Loading ${what}${f.total ? ` \u2014 ${of}` : ''}${more}`;
+    line.classList.add('on');
+  };
+  const progress = (p) => {
+    const d = p.download;
+    const c = p.compile;
+    if (p.phase === 'download') {
+      $('.phase').textContent = 'Downloading';
+      $('.detail').textContent = d.total ? `${mb(d.done)} of ${mb(d.total)} MB` : `${d.filesDone} of ${d.files} files`;
+      bar(d.total ? d.done / d.total : d.files ? d.filesDone / d.files : null);
+    } else if (p.phase === 'compile') {
+      $('.phase').textContent = 'Compiling';
+      $('.detail').textContent = `${c.done} of ${c.total}`;
+      bar(c.total ? c.done / c.total : null);
+    } else if (p.phase === 'boot' || p.phase === 'first-frame') {
+      $('.phase').textContent = 'Starting';
+      $('.detail').textContent = '';
+      bar(null);
+    } else if (p.phase === 'ready') {
+      hide();
+      fetching(p.fetch);
+    } else if (p.phase === 'failed' || p.phase === 'exited') {
+      clearInterval(clock);
+      $('.phase').textContent = p.phase === 'failed' ? 'Failed' : 'The program exited';
+      bar(0);
+    }
+  };
+
   try {
-    const app = await start({ container: document.body });
+    const app = await start({ container: document.body, onProgress: progress });
+    // A library that says nothing of its progress: no loading screen to keep.
+    if (!app.state?.progress) hide();
+    // The desktop follows the window (a resize, a zoom): 'fit' again,
+    // once the window has settled.
+    let resizing = 0;
+    addEventListener('resize', () => {
+      clearTimeout(resizing);
+      resizing = setTimeout(() => app.resize?.('fit'), 250);
+    });
     app.exited.then((status) => { if (status) show(`The program exited (${status}).`); }, show);
   } catch (e) {
+    progress({ phase: 'failed' });
     show(e);
   }
 </script>
@@ -503,7 +601,10 @@ pub const APP_MJS: &str = r#"// Generated by `gexc eject`: this project's app li
 //   const status = await app.exited;
 // Options: container, args, env (['K=V'] or {K: V}), cwd, onLog(text, stream)
 // (default: a <pre> in the container), onExit(status), strace, translation
-// (the JIT fallback: what the build never saw is translated), baseUrl.
+// (the JIT fallback: what the build never saw is translated), baseUrl,
+// onProgress(p) (the same progress as a W3 page's start(): download, boot,
+// ready -- a program without windows is ready once it runs -- then exited
+// or failed; docs/eject.md, "The loading screen").
 import { launch } from './runtime/web/eject.mjs';
 
 const ABSENT = { compositor: 'a desktop', gl: 'OpenGL', hostx: 'an X server', mem64: 'a 64-bit guest memory' };
@@ -514,10 +615,32 @@ export async function start(opts = {}) {
   }
   const base = new URL(opts.baseUrl ?? new URL('.', import.meta.url), globalThis.location?.href);
   const at = (p) => new URL(p, base).href;
+  const t0 = performance.now();
+  const progress = {
+    phase: 'download', download: { done: 0, total: 0, filesDone: 0, files: 0 }, compile: { done: 0, total: 0 },
+    at: { download: 0 }, elapsed: 0, error: null, fetch: null,
+  };
+  const tell = (phase, error = null) => {
+    const ms = Math.round(performance.now() - t0);
+    if (phase && progress.phase !== phase) { progress.phase = phase; progress.at[phase] = ms; }
+    if (error) progress.error = error;
+    progress.elapsed = ms;
+    try {
+      opts.onProgress?.({ ...progress, download: { ...progress.download }, compile: { ...progress.compile }, at: { ...progress.at } });
+    } catch (e) {
+      console.warn(`[app] onProgress: ${e?.stack ?? e}`);
+    }
+  };
   const read = async (p) => {
+    progress.download.files++;
     const r = await fetch(at(p));
     if (!r.ok) throw new Error(`fetching ${p}: ${r.status}`);
-    return new Uint8Array(await r.arrayBuffer());
+    const b = new Uint8Array(await r.arrayBuffer());
+    progress.download.total += b.length;
+    progress.download.done += b.length;
+    progress.download.filesDone++;
+    tell();
+    return b;
   };
   const r = await fetch(at('build/web/manifest.json'), { cache: 'no-cache' });
   if (!r.ok) throw new Error('no build/web/manifest.json: run ./build.sh');
@@ -529,7 +652,7 @@ export async function start(opts = {}) {
     m = { ...m, env: [...m.env.filter((e) => !names.has(e.split('=')[0])), ...more] };
   }
   if (opts.cwd) m = { ...m, cwd: opts.cwd };
-  const state = { out: '', status: null, phase: 'running' };
+  const state = { out: '', status: null, phase: 'running', progress };
   let pre = null;
   if (!opts.onLog) {
     pre = document.createElement('pre');
@@ -545,12 +668,19 @@ export async function start(opts = {}) {
   };
   let settle;
   const killed = new Promise((res) => { settle = res; });
+  tell('boot');
   const run = launch(m, read, { args: opts.args ?? null, write, jitFallback: opts.translation === true, strace: !!opts.strace });
+  tell('ready');
   const exited = Promise.race([run, killed]).then((status) => {
     state.status = status;
     state.phase = 'done';
+    tell('exited');
     opts.onExit?.(status);
     return status;
+  }, (e) => {
+    state.phase = 'failed';
+    tell('failed', String(e?.stack ?? e));
+    throw e;
   });
   return {
     exited,
@@ -559,6 +689,7 @@ export async function start(opts = {}) {
     kill() { opts = { ...opts, onLog: () => {}, onExit: null }; settle(137); },
     resize() { return null; },
     describe: () => null,
+    ready() {},
   };
 }
 "#;

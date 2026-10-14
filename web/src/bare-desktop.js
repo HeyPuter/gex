@@ -140,5 +140,8 @@ export function bareDesktop(desktop, mount) {
       compositor: 'none',
     };
   };
+  /** Whether a window's first pixels are in the page (app.js's progress). */
+  desktop.presented = () => desktop.windows().some((w) => w.role !== ROLE_CURSOR && w.paints > 0
+    && w.canvas.isConnected && w.canvas.width > 1 && w.canvas.height > 1);
   return desktop;
 }

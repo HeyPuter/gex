@@ -3,6 +3,7 @@
 // request, made from the Worker whose guest is reading (the read blocks
 // there anyway); it fills `len` bytes at `dst` in the kernel's memory.
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
+import { noteFetch } from './fetch-note.mjs';
 
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
@@ -12,6 +13,8 @@ export function lazyFetch(memory) {
     const from = Number(offset);
     const href = new TextDecoder().decode(new Uint8Array(memory.buffer, url, urlLen).slice());
     let last = 'no response';
+    const done = noteFetch(href, len);
+    try {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const x = new XMLHttpRequest();
@@ -29,10 +32,14 @@ export function lazyFetch(memory) {
         const at = x.status === 206 ? 0 : x.status === 200 ? from : -1;
         if (at < 0 || got.length < at + len) continue;
         new Uint8Array(memory.buffer, dst, len).set(got.subarray(at, at + len));
+        done(len);
         return len;
       } catch (e) {
         last = String(e);
       }
+    }
+    } finally {
+      done(0);
     }
     console.error(`[lazy] ${href} @${from}+${len}: failed (${last})`);
     return -1;

@@ -66,6 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
+import { noteFetch } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
@@ -457,7 +458,12 @@ async function handle(msg) {
         const x = new XMLHttpRequest();
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
-        x.send();
+        const done = noteFetch(`unit:${rel}`);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
         return x.status === 200 ? new Uint8Array(x.response) : null;
       } catch {
         return null;

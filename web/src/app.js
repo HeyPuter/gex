@@ -40,8 +40,9 @@ const PIECES = {
  *   exited    a promise of the exit status (rejects if the run fails)
  *   kill()    stop it now (`exited` resolves 137)
  *   resize(size)  the desktop's new size: 'fit' (the container's) or {w, h}
- *   state     what a driver reads (phase, out, error, session, ...)
+ *   state     what a driver reads (phase, out, error, session, progress, ...)
  *   describe()    the desktop's windows, titles and pixels
+ *   ready()   the start-up is over (with `ready: 'manual'`): progress 'ready'
  * Rejects when the run cannot start (no cross-origin isolation, no WebGPU
  * for a build that needs it, a download that failed, an option for a piece
  * the build left out).
@@ -67,22 +68,150 @@ const PIECES = {
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
  *   onLog(text)     the program's terminal output
  *   onExit(status)  called when it exits
+ *   onProgress(p)   the start-up's progress, for a loading screen: called
+ *              when it moves (a few times a second at most while bytes
+ *              arrive, at once on a phase change) with `state.progress`'s
+ *              copy (`progressMeter` says what is in it)
+ *   ready      'frame' (the default): progress is 'ready' at the first frame
+ *              shown; 'manual': the page says when, with the handle's ready()
+ *              (a program whose first frame is not yet what the page waits for)
  */
 export async function start(opts = {}) {
   const base = new URL(opts.baseUrl ?? new URL('.', import.meta.url), globalThis.location?.href);
   const at = (p) => (p ? new URL(String(p).replace(/^\//, ''), base).href : p);
   const state = { out: '', status: null, error: null, phase: 'loading' };
   globalThis.__nt = state;
+  const meter = progressMeter(state, opts.onProgress);
   try {
-    return await begin(opts, base, at, state);
+    return await begin(opts, base, at, state, meter);
   } catch (e) {
     state.error = String(e?.stack ?? e);
     state.phase = 'failed';
+    meter.end('failed', state.error);
     throw e;
   }
 }
 
-async function begin(opts, base, at, state) {
+/**
+ * The start-up's progress: `state.progress`, and `onProgress(copy)` when it
+ * moves. Its phases, in order (a phase never goes back):
+ *   download     the bundle and the units' files arrive: `download` is
+ *                {done, total} bytes (as sent, compressed) and {filesDone,
+ *                files}; a file the site did not pack adds its size when
+ *                its response says it
+ *   compile      the downloads are in, the units still compiling: `compile`
+ *                is {done, total} units (they compile as they arrive, so
+ *                `compile` moves during 'download' too)
+ *   boot         the program's process has started; nothing is shown yet
+ *   first-frame  a window's first pixels are in the page
+ *   ready        the start-up is over: the first frame, or the page's
+ *                handle.ready() with `ready: 'manual'`
+ * and then 'exited' or 'failed' (with `error`). `at` holds each phase's
+ * start, and `elapsed` the time at the call, in ms since start().
+ */
+function progressMeter(state, onProgress) {
+  const t0 = performance.now();
+  const order = ['download', 'compile', 'boot', 'first-frame', 'ready'];
+  const p = {
+    phase: 'download',
+    download: { done: 0, total: 0, filesDone: 0, files: 0 },
+    compile: { done: 0, total: 0 },
+    at: { download: 0 },
+    elapsed: 0,
+    error: null,
+    fetch: null,
+  };
+  state.progress = p;
+  let timer = null;
+  let last = -1e9;
+  const emit = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    last = performance.now();
+    p.elapsed = Math.round(last - t0);
+    if (!onProgress) return;
+    try {
+      onProgress({ ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch } });
+    } catch (e) {
+      console.warn(`[app] onProgress: ${e?.stack ?? e}`);
+    }
+  };
+  return {
+    p,
+    /** A count moved: tell the page soon (every 100 ms at most). */
+    tick() {
+      if (!timer) timer = setTimeout(emit, Math.max(0, 100 - (performance.now() - last)));
+    },
+    /** The program's own fetches while it runs (shims/browser/js/fetch-note.mjs):
+     *  `p.fetch` is the latest in flight, {kind, name, done, total,
+     *  inflight}, or null when none is: kind 'file' (a lazy file: name its
+     *  file name, done/total its bytes read so far and its size) or 'code'
+     *  (a unit of translated code: name the module it is for, '' if not
+     *  known; done the bytes in, total 0). */
+    watchFetches(lazyNames, unitNames) {
+      if (typeof BroadcastChannel !== 'function') return;
+      const ch = new BroadcastChannel('gex-fetch');
+      const live = new Map(); // id -> { name, key }
+      const files = new Map(); // key -> { name, done, total }
+      const show = () => {
+        let last = null;
+        for (const f of live.values()) last = f;
+        p.fetch = last ? { ...files.get(last.key), inflight: live.size } : null;
+        this.tick();
+      };
+      ch.onmessage = ({ data: m }) => {
+        if (!m || typeof m.what !== 'string') return;
+        let key = m.what;
+        let name;
+        let kind = 'file';
+        let total = 0;
+        if (m.what.startsWith('unit:')) {
+          const unit = m.what.slice('unit:'.length).split('/')[0];
+          kind = 'code';
+          name = unitNames[unit] || '';
+        } else {
+          try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
+          const l = lazyNames.get(key);
+          name = l?.name ?? key.split('/').pop();
+          total = l?.size ?? 0;
+        }
+        const f = files.get(key) ?? { kind, name, done: 0, total };
+        files.set(key, f);
+        if (m.phase === 'start') {
+          live.set(m.id, { key });
+        } else {
+          live.delete(m.id);
+          f.done += m.bytes || 0;
+          if (!f.total || f.done > f.total) f.total = Math.max(f.total, f.done);
+        }
+        show();
+      };
+      state.stopFetches = () => ch.close();
+    },
+    /** Bytes in, a file whole, a size learned late, a unit compiled. */
+    bytes(n) { p.download.done += n; this.tick(); },
+    fileDone() { p.download.filesDone++; this.tick(); },
+    more(n) { p.download.total += n; },
+    compiled() { p.compile.done++; this.tick(); },
+    /** On to `name`, if it is further along than where it is. */
+    phase(name) {
+      if (!order.includes(name) || order.indexOf(name) <= order.indexOf(p.phase)) return;
+      p.phase = name;
+      p.at[name] = Math.round(performance.now() - t0);
+      emit();
+    },
+    /** The run is over: 'exited' or 'failed'. */
+    end(name, error = null) {
+      if (p.phase === 'failed' || p.phase === 'exited') return;
+      p.phase = name;
+      p.at[name] = Math.round(performance.now() - t0);
+      if (error) p.error = error;
+      emit();
+    },
+  };
+}
+
+async function begin(opts, base, at, state, meter) {
   const mark = (what) => console.warn(`[app] ${what} at ${Math.round(performance.timeOrigin + performance.now()) % 1e7} (+${Math.round(performance.now())} ms)`);
   const say = (s) => {
     state.out += s;
@@ -102,6 +231,9 @@ async function begin(opts, base, at, state) {
     if (opts[k] === true && !has[k]) {
       throw new Error(`start({ ${k}: true }): this build has no ${k === 'gl' ? 'OpenGL' : k}; it needs ${PIECES[k]} in user/eject.json, and a rebuild`);
     }
+  }
+  for (const r of [opts.ready, b.ready]) {
+    if (r !== undefined && r !== null && r !== 'frame' && r !== 'manual') throw new Error(`start({ ready: ${JSON.stringify(r)} }): 'frame' or 'manual'`);
   }
   const compositor = has.compositor && opts.compositor !== false && b.compositor !== false;
   const gl = b.gl && opts.gl !== false;
@@ -172,8 +304,27 @@ async function begin(opts, base, at, state) {
   mark('fetching');
   const zstd = zstdLoader(at(b.zstd ?? 'vendor/zstddec-stream.mjs'));
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
-  const fetcher = { pack, zstd, base, state };
-  const preloading = b.preload ? preloadUnits(at(b.preload), fetcher, at) : Promise.resolve(null);
+  const fetcher = { pack, zstd, base, state, meter };
+  // What is to come, for the progress: the bundle's files and the units'.
+  // The two small lists are read before the bundle starts, so the totals
+  // are whole from the first count.
+  const preList = b.preload ? await fetch(at(b.preload)).then((r) => (r.ok ? r.json() : null)).catch(() => null) : null;
+  {
+    const d = meter.p.download;
+    for (const href of [...b.tar.map(at), ...(preList ?? []).map(([, path]) => at(path))]) {
+      d.files++;
+      d.total += (await packedEntry(href, fetcher))?.zsize ?? 0;
+    }
+    // The runtime's modules, the ones the site packed (the rest load as
+    // they always did, outside these counts).
+    for (const href of Object.values(runtimeUrls())) {
+      const e = await packedEntry(href, fetcher);
+      if (e) { d.files++; d.total += e.zsize ?? 0; }
+    }
+    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:')).length;
+    meter.tick();
+  }
+  const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
   // The runtime's wasm, compressed in the pack when the site packed it
   // (plain, the shim alone was 6.6 MB of Paint's download).
   const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
@@ -213,6 +364,7 @@ async function begin(opts, base, at, state) {
   // Lazy files: read from the host when the guest first reads them (a bundle
   // split's, docs/eject.md "The bundle split").
   let lazy = [];
+  const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
   if (b.lazy) {
     const m = await fetchJson(at(b.lazy), 'the lazy files\' list');
@@ -221,6 +373,7 @@ async function begin(opts, base, at, state) {
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
     lazy = m.files.map(([path, size, rel]) => [path, size, lazyBase + rel.split('/').map(encodeURIComponent).join('/')]);
+    for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
   const exe = opts.exe ?? b.exe;
@@ -237,6 +390,7 @@ async function begin(opts, base, at, state) {
   state.session = { exe, argv: args.slice(1), env, cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
+  if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
   const preModules = await preloading;
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
@@ -262,6 +416,8 @@ async function begin(opts, base, at, state) {
   let sys = null;
   let desktop = null;
   let settle;
+  meter.phase('boot');
+  meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
   const run = runProgram(term, {
     elf: exeBytes,
@@ -298,13 +454,36 @@ async function begin(opts, base, at, state) {
   const exited = Promise.race([run.then(({ status }) => status), killed]).then((status) => {
     state.status = status;
     state.phase = 'done';
+    meter.end('exited');
     opts.onExit?.(status);
     return status;
   }, (e) => {
     state.error = String(e?.stack ?? e);
     state.phase = 'failed';
+    meter.end('failed', state.error);
     throw e;
   });
+  // The first frame: a window's first pixels in the page. The bare desktop
+  // counts a window's paints; the scene compositor its frames drawn since
+  // the first window was mapped.
+  const manual = (opts.ready ?? b.ready ?? 'frame') === 'manual';
+  let framesAtMap = null;
+  const shown = () => {
+    if (desktop) return desktop.presented?.() ?? false;
+    const c = sys?.compositor?.counters?.();
+    if (!c || !c.windows) return false;
+    framesAtMap ??= c.frames;
+    return c.frames > framesAtMap;
+  };
+  const watch = setInterval(() => {
+    if (state.phase === 'done' || state.phase === 'failed') {
+      clearInterval(watch);
+    } else if (shown()) {
+      clearInterval(watch);
+      meter.phase('first-frame');
+      if (!manual) meter.phase('ready');
+    }
+  }, 50);
   return {
     exited,
     state,
@@ -327,6 +506,10 @@ async function begin(opts, base, at, state) {
       return { w, h };
     },
     describe: () => globalThis.__gexCompositor?.describe?.() ?? null,
+    ready() {
+      meter.phase('first-frame');
+      meter.phase('ready');
+    },
   };
 }
 
@@ -361,6 +544,7 @@ function withStart(b, st) {
   }
   if (st.trapstack) out.switches.trapstack = '1';
   if (st.persist !== undefined) out.persist = st.persist || null;
+  if (st.ready) out.ready = st.ready;
   return out;
 }
 
@@ -384,6 +568,8 @@ function launchBuild(m, at) {
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
+      // A unit's module, by key: what the page names while one is fetched.
+      unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
     };
   }
@@ -496,6 +682,8 @@ async function fetchShared(url, f, { shared = false } = {}) {
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length'));
   if (!total) throw new Error(`${url}: no content-length`);
+  // Not packed: its size was not in the totals.
+  f.meter?.more(total);
   const out = new Uint8Array(shared ? new SharedArrayBuffer(total) : new ArrayBuffer(total));
   const reader = res.body.getReader();
   let at = 0;
@@ -504,7 +692,9 @@ async function fetchShared(url, f, { shared = false } = {}) {
     if (done) break;
     out.set(value, at);
     at += value.length;
+    f.meter?.bytes(value.length);
   }
+  f.meter?.fileDone();
   if (at !== total) throw new Error(`${url}: ${at} of ${total} bytes`);
   return out;
 }
@@ -524,7 +714,9 @@ async function fetchPacked(url, { size, zsize, build }, shared, f) {
     parts.push(value);
     at += value.length;
     f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
+    f.meter?.bytes(value.length);
   }
+  f.meter?.fileDone();
   if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
   const d = await f.zstd();
   const out = new Uint8Array(shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size));
@@ -539,15 +731,9 @@ async function fetchPacked(url, { size, zsize, build }, shared, f) {
   return out;
 }
 
-/** Compile the units a preload list names while the bundle downloads, a few
- *  at a time; null if there is no list. */
-async function preloadUnits(url, f, at) {
-  let list;
-  try {
-    list = await (await fetch(url)).json();
-  } catch {
-    return null;
-  }
+/** Compile the units a preload list (`[[name, path], ...]`) names while the
+ *  bundle downloads, a few at a time. */
+async function preloadUnits(list, f, at) {
   const out = [];
   let i = 0;
   const one = async () => {
@@ -563,14 +749,20 @@ async function preloadUnits(url, f, at) {
             continue;
           }
           const b = new Uint8Array(await (await fetch(href)).arrayBuffer());
+          f.meter?.fileDone();
           const s = new Uint8Array(new SharedArrayBuffer(b.byteLength));
           s.set(b);
           out.push([name, s]);
           continue;
         }
-        out.push([name, await packedEntry(href, f)
-          ? await WebAssembly.compile(await fetchShared(href, f))
-          : await WebAssembly.compileStreaming(fetch(href))]);
+        if (await packedEntry(href, f)) {
+          out.push([name, await WebAssembly.compile(await fetchShared(href, f))]);
+        } else {
+          const res = fetch(href);
+          res.then(() => f.meter?.fileDone(), () => {});
+          out.push([name, await WebAssembly.compileStreaming(res)]);
+        }
+        f.meter?.compiled();
       } catch (e) {
         console.warn(`[app] preload ${href}: ${e?.message ?? e}`);
       }

@@ -209,7 +209,7 @@ fn template(off: &[String]) -> String {
                split off and fetched on first call (a clustering, \"instrument\" to build units \
                that record the functions a run calls, or \"none\"); see docs/eject.md, \"Cold code\". \
                \"start\": defaults for the app library's start() \
-               (args, env, cwd, size, mtimes, strace, trapstack, persist), over the \
+               (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (docs/eject.md, \"The web build\")."),
         ),
         (
@@ -403,7 +403,13 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         ("env", rec.get("env").cloned().unwrap_or(Json::Arr(Vec::new()))),
         ("cwd", rec.get("cwd").cloned().unwrap_or(s("/"))),
         ("mtimes", rec.get("mtimes").cloned().unwrap_or(json::b(false))),
-        ("size", rec.get("size").cloned().unwrap_or(s("1280x800"))),
+        // The size the recording asked for ("fit": the page's), not the one
+        // it resolved to (the recorder's window): a fixed size is the
+        // recorder's viewport on every screen.
+        ("size", match rec.get("params").and_then(|p| p.get("size")) {
+            Some(Json::Str(z)) if !z.is_empty() => s(z),
+            _ => rec.get("size").cloned().unwrap_or(s("fit")),
+        }),
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("params", Json::Obj(params)),
         ("features_off", strs(&off)),
