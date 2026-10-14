@@ -544,6 +544,8 @@ export class DomDesktop {
     if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
       win.relX = s.relX;
       win.relY = s.relY;
+      // A test's record (tests/eject/w3-page.mjs's drag), beside wl-bridge's.
+      globalThis.__gexEvLog?.push(['place', s.relX, s.relY, performance.now()]);
       win.onplace?.(s.relX, s.relY, win.parent);
     }
     // Directly below the placed window with stack id `below`; 0 the top of

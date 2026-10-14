@@ -7698,14 +7698,30 @@ impl Kernel {
                 return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
             }
         }
-        let mut total = 0u64;
+        // One read for the whole vector, then scattered over it, as the
+        // remote path does. Reading each iovec in turn lost data: a first
+        // iovec filled exactly, with nothing left behind it, made the second
+        // read fail EAGAIN and the call return that error -- the bytes of the
+        // first were taken from the socket and never reported. libwayland
+        // reads its ring buffer as two iovecs whenever it wraps, so a Wayland
+        // client lost whole events now and then (a placement origin, and
+        // Paint's window stepped back a pixel during a caption drag). A peek
+        // per iovec also peeked the same bytes into each.
+        let mut parts = Vec::new();
+        let mut want = 0usize;
         for i in 0..iovlen.min(1024) {
             let base = self.msg_rd(m, iov, 2 * i)?;
             let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
-            if len == 0 {
-                continue;
+            let len = len.min((1 << 22) - want);
+            if len > 0 {
+                parts.push((base, len));
+                want += len;
             }
-            let mut tmp = vec![0u8; len.min(1 << 22)];
+        }
+        let total = if want == 0 {
+            0
+        } else {
+            let mut tmp = vec![0u8; want];
             let n = match &unix_sock {
                 Some(sock) => sock.recv(&mut tmp, room, peek)?,
                 None if peek => match self.socket_of(fd) {
@@ -7714,14 +7730,17 @@ impl Kernel {
                 },
                 None => self.fds.get(fd)?.read(&mut tmp)?,
             };
-            m.write(base, &tmp[..n as usize])?;
-            total += n;
-            // A short read means there is no more waiting; asking again would
-            // block, and `recvmsg` returns what it has.
-            if (n as usize) < tmp.len() {
-                break;
+            let mut at = 0usize;
+            for (base, len) in parts {
+                if at >= n as usize {
+                    break;
+                }
+                let take = len.min(n as usize - at);
+                m.write(base, &tmp[at..at + take])?;
+                at += take;
             }
-        }
+            n
+        };
         // Who sent it, as recvfrom says: musl's resolver drops a reply whose
         // msg_name is not one of its nameservers. A unix peer has no name.
         let name = self.msg_rd(m, msg, 0)?;
@@ -9405,6 +9424,51 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
+    }
+
+    /// A vector whose first iovec the waiting bytes fill exactly: the call
+    /// returns them, not EAGAIN from the empty second iovec (libwayland's
+    /// wrapped ring buffer, which lost Wayland events); and a peek over two
+    /// iovecs fills them in order rather than peeking the same bytes twice.
+    #[test]
+    fn recvmsg_iovecs() {
+        if gex_abi::PPC {
+            return;
+        }
+        const MSG_PEEK: u64 = 0x2;
+        const MSG_DONTWAIT: u64 = 0x40;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        set_args(&mut m, k.ctx_addr, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
+        k.syscall(&mut m, 0);
+        let a = m.read_u32(0x20000).unwrap() as u64;
+        let b = m.read_u32(0x20004).unwrap() as u64;
+        // Two iovecs: 4 bytes at 0x22000, 64 at 0x22100.
+        m.write_u64(0x21000 + 16, 0x21100).unwrap();
+        m.write_u64(0x21000 + 24, 2).unwrap();
+        m.write_u64(0x21100, 0x22000).unwrap();
+        m.write_u64(0x21108, 4).unwrap();
+        m.write_u64(0x21110, 0x22100).unwrap();
+        m.write_u64(0x21118, 64).unwrap();
+        m.write(0x23000, b"abcdefgh").unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[b, 0x23000, 4]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 4, "the bytes that filled the first iovec");
+        assert_eq!(m.read(0x22000, 4).unwrap(), b"abcd");
+
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[b, 0x23000, 8]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_PEEK]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 8);
+        assert_eq!(m.read(0x22000, 4).unwrap(), b"abcd");
+        assert_eq!(m.read(0x22100, 4).unwrap(), b"efgh");
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 8, "peek must leave the bytes queued");
+        assert_eq!(m.read(0x22100, 4).unwrap(), b"efgh");
     }
 
     #[test]
