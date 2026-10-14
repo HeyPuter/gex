@@ -28,6 +28,8 @@ pub(super) struct Prog {
     pub relocate: bool,
     /// The bytes' content key, made on first asking (`gex_cgen_pmod_wasm_key`).
     pub key: Option<(u64, u64)>,
+    /// The file the bytes are from, for the system-wide key cache.
+    pub path: String,
 }
 
 pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
@@ -178,7 +180,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let path = exe_path();
     super::dylink::static_published(number, &wasm, &path, base, mem_base as u32);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
-    lock(&PROGS).push(Prog { number, wasm, relocate, key: None });
+    let path = path.clone();
+    lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
 }
@@ -249,8 +252,52 @@ pub(super) fn content_key(b: &[u8]) -> (u64, u64) {
 pub extern "C" fn gex_cgen_pmod_wasm_key(number: u32, lane: u32) -> u64 {
     let mut g = lock(&PROGS);
     let Some(p) = g.iter_mut().find(|p| p.number == number) else { return 0 };
-    let k = *p.key.get_or_insert_with(|| content_key(&p.wasm));
+    let k = match p.key {
+        Some(k) => k,
+        None => {
+            let id = file_id(&p.path);
+            let len = p.wasm.len() as u32;
+            let k = id.as_ref().and_then(|id| known_key(id, len)).unwrap_or_else(|| {
+                let k = content_key(&p.wasm);
+                if let Some(id) = &id {
+                    note_key(id, len, k);
+                }
+                k
+            });
+            p.key = Some(k);
+            k
+        }
+    };
     if lane == 0 { k.0 } else { k.1 }
+}
+
+/// Which file a program's bytes are from, as the system-wide key cache names
+/// it: (path, inode, mtime, size). `None` without a global kernel or a file.
+fn file_id(path: &str) -> Option<(&str, u64, i64, u64)> {
+    if path.is_empty() || unsafe { crate::k_present() } == 0 {
+        return None;
+    }
+    let m = crate::with_host(|h| h.kernel.vfs.metadata(path)).ok()?;
+    Some((path, m.ino, m.mtime, m.size))
+}
+
+/// A program's content key as some process already made it, by its file:
+/// hashing the bytes again was 6-12 ms of every `apt-get` exec. A file whose
+/// identity has changed (dpkg's rename gives a new inode) is a miss, hashed
+/// and noted again.
+fn known_key(id: &(&str, u64, i64, u64), len: u32) -> Option<(u64, u64)> {
+    let (path, ino, mtime, size) = *id;
+    let mut out = [0u64; 2];
+    let found = unsafe {
+        crate::k_progkey_get(path.as_ptr() as gex_kernel::PAddr, path.len() as u32, ino, mtime, size, len, out.as_mut_ptr() as gex_kernel::PAddr)
+    };
+    (found == 1).then_some((out[0], out[1]))
+}
+
+/// Note `key` as the content key of the program `id` names.
+fn note_key(id: &(&str, u64, i64, u64), len: u32, key: (u64, u64)) {
+    let (path, ino, mtime, size) = *id;
+    unsafe { crate::k_progkey_put(path.as_ptr() as gex_kernel::PAddr, path.len() as u32, ino, mtime, size, len, key.0, key.1) };
 }
 
 /// Whether provider module `number` is a wasm32 program.

@@ -419,6 +419,12 @@ const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
  * A cheap content hash for whether two copies of a region agree. FNV-1a over
  * words, not bytes: only ever answers same-or-different.
  */
+/// How many bytes a fork image entry carries: its `bytes`, or, staged in the
+/// global kernel's memory (`#processImage`), its `len`.
+function imageLen(r) {
+  return r.len ?? r.bytes?.byteLength ?? 0;
+}
+
 function sum32(buf) {
   const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, Math.floor(buf.byteLength / 4));
   let h = 0x811c9dc5;
@@ -1134,6 +1140,42 @@ export class Gex {
    * (`gex_worker_release`). The last call into this instance: the slot's next
    * holder runs on the same stack.
    */
+  /** This process's memory, every non-zero page zeroed, for another
+   *  process to start in; null where that cannot be done (the memory is not
+   *  shared, mem64, no global kernel). Only after the process is gone and
+   *  nothing will run in this instance again. The non-zero runs are found by
+   *  the shim's scan (`gex_image_runs`) and cleared by the kernel's
+   *  `memory.fill` (`k_proc_zero`), so only pages the process wrote are
+   *  written again. */
+  recycleMemory() {
+    const e = this.#shim?.exports;
+    const k = this.#kernel;
+    if (!e?.gex_image_runs || !k?.k_proc_zero || m64() || single.on) return null;
+    if (!(this.#memory.buffer instanceof SharedArrayBuffer)) return null;
+    const size = this.#memory.buffer.byteLength;
+    let cap = 4096;
+    let at = e.gex_alloc(cap * 8) >>> 0;
+    const runs = [];
+    const CHUNK = 64 << 20;
+    for (let s = 0; s < size; ) {
+      const end = Math.min(size, s + CHUNK);
+      const n = e.gex_image_runs(s, end, at, cap);
+      if (n < 0) {
+        e.gex_free?.(at, cap * 8);
+        cap *= 4;
+        at = e.gex_alloc(cap * 8) >>> 0;
+        continue;
+      }
+      const pairs = new Uint32Array(this.#memory.buffer, at, n * 2);
+      for (let j = 0; j < n; j++) runs.push(pairs[j * 2], pairs[j * 2 + 1]);
+      s = end;
+    }
+    for (let j = 0; j < runs.length; j += 2) {
+      if (k.k_proc_zero(runs[j], runs[j + 1]) !== 0) return null;
+    }
+    return this.#memory;
+  }
+
   releaseWorker() {
     if (this.#stackTop === null) return;
     try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
@@ -2016,6 +2058,40 @@ export class Gex {
    * switch for the life of both, which is what the switcher was built to cope
    * with.
    */
+  /** Copy the runs `#processImage` left as `len` into one staging buffer,
+   *  noting each one's offset (`stage`) and the buffer (`#imageStage`, sent
+   *  as the record's `imageStage`); the child copies them out and frees it.
+   *  Sliced as before when the kernel cannot hold them. */
+  #stageImage(out) {
+    const k = this.#kernel;
+    const staged = out.filter((r) => r.len !== undefined);
+    const total = staged.reduce((n, r) => n + r.len, 0);
+    let id = total ? k.k_stage_take(total) : 0;
+    let off = 0;
+    for (const r of id > 0 ? staged : []) {
+      if (k.k_stage_pull(id, off, r.at, r.len) !== 0) {
+        k.k_stage_drop(id);
+        id = 0;
+        break;
+      }
+      r.stage = off;
+      off += r.len;
+    }
+    if (id > 0) {
+      this.#imageStage = id;
+      return;
+    }
+    const mem = this.#bytes();
+    for (const r of staged) {
+      r.bytes = mem.slice(r.at, r.at + r.len);
+      delete r.len;
+      delete r.stage;
+    }
+  }
+
+  /// The staging buffer of the image `#processImage` built last (0: none).
+  #imageStage = 0;
+
   #processImage() {
     const t0 = performance.now();
     const e = this.#shim.exports;
@@ -2039,7 +2115,49 @@ export class Gex {
       return true;
     };
     const out = [];
-    const runs = (start, end) => {
+    // The runs go through a staging buffer in the global kernel's memory where
+    // there is one to share (`k_stage_*`): `memory.copy` both ways, into pages
+    // a previous fork already touched, where a fresh ArrayBuffer per run cost
+    // ~50 ms here and ~100 ms in the child for apt-get's 62.6 MiB. Not with
+    // `GEX_DEBUG_EXIT`, whose checksums read the bytes; not in a build whose
+    // memories are not shared (the single-thread page), which transfers them.
+    const k = this.#kernel;
+    const staging = !globalThis.GEX_DEBUG_EXIT && !m64() && !!k?.k_stage_take
+      && this.#memory.buffer instanceof SharedArrayBuffer
+      && this.#kernelSpec?.memory?.buffer instanceof SharedArrayBuffer;
+    this.#imageStage = 0;
+    // The scan in the shim (`gex_image_runs`, 16 bytes a load) when it has
+    // one; the pairs it writes are the runs of pages that are not all zero.
+    let runsCap = 0;
+    let runsAt = 0;
+    const runsWasm = e.gex_image_runs
+      ? (start, end) => {
+        for (;;) {
+          if (!runsCap) {
+            runsCap = 1024;
+            runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+          }
+          const n = e.gex_image_runs(start, end, runsAt, runsCap);
+          if (n >= 0) {
+            // Views made now: the allocation above may have grown memory.
+            const pairs = new Uint32Array(this.#memory.buffer, runsAt, n * 2);
+            const mem = this.#bytes();
+            let dense = 0;
+            for (let j = 0; j < n; j++) {
+              const at = pairs[j * 2];
+              const len = pairs[j * 2 + 1];
+              out.push(staging ? { at, len, dense: true } : { at, bytes: mem.slice(at, at + len), dense: true });
+              dense += len;
+            }
+            return end - start - dense;
+          }
+          e.gex_free?.(runsAt, runsCap * 8);
+          runsCap *= 4;
+          runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+        }
+      }
+      : null;
+    const runs = runsWasm ?? ((start, end) => {
       const PAGE = 4096;
       let zeros = 0;
       let i = start;
@@ -2060,7 +2178,7 @@ export class Gex {
         i = run;
       }
       return zeros;
-    };
+    });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
@@ -2079,6 +2197,8 @@ export class Gex {
       }
     }
     e.gex_free?.(scratch, 24);
+    if (runsCap) e.gex_free?.(runsAt, runsCap * 8);
+    if (staging) this.#stageImage(out);
     // A checksum per region, so the child can say whether what it runs on is
     // what was sent: a corrupt copy and a good copy under a disagreeing kernel
     // look identical otherwise (#96).
@@ -2489,7 +2609,12 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + r.bytes.byteLength), 0));
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + imageLen(r)), 0));
+    // A staged image (`#stageImage`) is copied out by the global kernel, here
+    // before `attach` as the transferred one is: its instance only needs this
+    // memory, and starting it again there is a no-op.
+    const stage = child.imageStage > 0 ? child.imageStage : 0;
+    if (stage) await this.#startKernel();
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -2509,12 +2634,19 @@ export class Gex {
     let skipped = 0;
     let zeros = 0;
     for (const r of child.image) {
-      const n = r.bytes.byteLength;
+      const n = imageLen(r);
       if (n > skipOver) {
         skipped += n;
         continue;
       }
       zeros += r.zeros ?? 0;
+      if (r.stage !== undefined) {
+        if (this.#kernel.k_stage_push(stage, r.stage, r.at, n) !== 0) {
+          throw new Error(`fork image: staged run at 0x${r.at.toString(16)} (${n} bytes) did not copy`);
+        }
+        copied += n;
+        continue;
+      }
       if (r.dense) {
         u8.set(new Uint8Array(r.bytes), r.at);
         copied += n;
@@ -2524,6 +2656,7 @@ export class Gex {
       copied += wrote;
       zeros += blank;
     }
+    if (stage) this.#kernel.k_stage_drop(stage);
     this.#forkCopied = copied;
     this.#forkSkipped = skipped;
     this.#forkZeros = zeros;
@@ -2554,7 +2687,7 @@ export class Gex {
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
     this.#forkChild = true;
-    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + r.bytes.byteLength));
+    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + imageLen(r)));
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -2683,7 +2816,7 @@ export class Gex {
           // to Chrome's own coarse counter.
           + ` used=${performance.memory?.usedJSHeapSize ?? 'n/a'}`
           + ` limit=${performance.memory?.jsHeapSizeLimit ?? 'n/a'}`
-          + ` image=${(child.image ?? []).reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0)}`
+          + ` image=${(child.image ?? []).reduce((n, r) => n + imageLen(r), 0)}`
           + ` modules=${(child.modules ?? []).length}`,
       );
     }
@@ -3006,10 +3139,13 @@ export class Gex {
         const t0 = performance.now();
         const img = this.#processImage();
         this.#imageMs = performance.now() - t0;
-        this.#imageBytes = img.reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0);
+        this.#imageBytes = img.reduce((n, r) => n + imageLen(r), 0);
         this.#imageRegions = img.length;
         return img;
       })(),
+      // Where the image's runs are staged, in the global kernel's memory (0:
+      // they travel as `bytes`). The child copies them out and frees it.
+      imageStage: this.#imageStage,
       // The map, separately from the bytes: names and code identities the child
       // needs to recognise a page as belonging to an already-translated library.
       vmaBlob: this.#vmaBlob(),

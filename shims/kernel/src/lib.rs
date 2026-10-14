@@ -3201,3 +3201,156 @@ fn path_of_raw(at: gex_kmem::PAddr, len: u32) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+
+// ---------------------------------------------------------------------------
+// Fork image staging. A fork's image used to leave the parent as fresh
+// ArrayBuffers (`slice`) and enter the child with a typed-array `set`: two
+// copies at about 0.6 GB/s, most of it first-touching new pages (62.6 MiB of
+// apt-get cost ~50 ms in the parent and ~100 ms in the child). Staged here
+// instead, both copies are `memory.copy` between this memory and a process's,
+// into buffers kept from one fork to the next, so their pages are already
+// touched. The buffer is the parent's until the fork record is sent and the
+// child's from then on; nobody else can name it.
+
+/// A staging buffer, in use by one fork or free.
+struct Stage {
+    buf: Vec<u8>,
+    used: bool,
+}
+
+/// Every staging buffer, by id - 1. Free ones are kept, up to
+/// [`STAGE_KEEP_BYTES`], so the next fork's copy lands on touched pages.
+fn stages() -> &'static Mutex<Vec<Option<Stage>>> {
+    static S: OnceLock<Mutex<Vec<Option<Stage>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// How many bytes of free staging buffers are kept for reuse.
+const STAGE_KEEP_BYTES: usize = 192 << 20;
+
+/// A staging buffer of at least `len` bytes, for one fork: its id (> 0), or
+/// -12 when the kernel's memory cannot hold it (the caller sends the image
+/// the old way). Reuses the smallest free buffer that fits.
+#[no_mangle]
+pub extern "C" fn k_stage_take(len: u32) -> i32 {
+    let len = len as usize;
+    let mut s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let best = s
+        .iter()
+        .enumerate()
+        .filter_map(|(i, x)| x.as_ref().filter(|x| !x.used && x.buf.capacity() >= len).map(|x| (i, x.buf.capacity())))
+        .min_by_key(|&(_, c)| c)
+        .map(|(i, _)| i);
+    if let Some(i) = best {
+        s[i].as_mut().unwrap().used = true;
+        return i as i32 + 1;
+    }
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return -12;
+    }
+    let st = Stage { buf, used: true };
+    if let Some(i) = s.iter().position(|x| x.is_none()) {
+        s[i] = Some(st);
+        i as i32 + 1
+    } else {
+        s.push(Some(st));
+        s.len() as i32
+    }
+}
+
+/// Where buffer `id`'s `[off, off + len)` is, if it is in use and that fits.
+/// The address stays good while the buffer is in use: only `k_stage_drop`
+/// can free or reuse it, and only its one user calls that.
+fn stage_at(id: i32, off: u32, len: u32) -> Option<*mut u8> {
+    let s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let st = s.get((id as usize).wrapping_sub(1))?.as_ref().filter(|x| x.used)?;
+    let end = (off as usize).checked_add(len as usize)?;
+    if end > st.buf.capacity() {
+        return None;
+    }
+    // Into the reserved capacity: every byte read back was written first
+    // (the parent fills `[off, off+len)` before the child reads it).
+    Some(unsafe { st.buf.as_ptr().cast_mut().add(off as usize) })
+}
+
+/// Copies `len` bytes of the calling process's memory at `at` into buffer
+/// `id` at `off`. 0, or -14 when either range is bad.
+#[no_mangle]
+pub extern "C" fn k_stage_pull(id: i32, off: u32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(p) = stage_at(id, off, len) else { return -14 };
+    if unsafe { gex_kmem::pull_checked(p, at, len) } { 0 } else { -14 }
+}
+
+/// Copies `len` bytes of buffer `id` at `off` into the calling process's
+/// memory at `at`. 0, or -14 when either range is bad.
+#[no_mangle]
+pub extern "C" fn k_stage_push(id: i32, off: u32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(p) = stage_at(id, off, len) else { return -14 };
+    if unsafe { gex_kmem::push_checked(at, p, len) } { 0 } else { -14 }
+}
+
+/// Buffer `id` is done with: kept for the next fork while the free ones add
+/// up to [`STAGE_KEEP_BYTES`], freed otherwise (largest kept first).
+#[no_mangle]
+pub extern "C" fn k_stage_drop(id: i32) {
+    let mut s = stages().lock().unwrap_or_else(|e| e.into_inner());
+    let i = (id as usize).wrapping_sub(1);
+    let Some(Some(st)) = s.get_mut(i) else { return };
+    st.used = false;
+    let free: usize = s.iter().flatten().filter(|x| !x.used).map(|x| x.buf.capacity()).sum();
+    if free > STAGE_KEEP_BYTES {
+        s[i] = None;
+    }
+}
+
+/// Zero `len` bytes of the calling process's memory at `at`, with
+/// `memory.fill` (an exited process's memory, cleared for the next fork child
+/// to adopt into: `recycleMemory` in worker.mjs). 0, or -14 out of range.
+#[no_mangle]
+pub extern "C" fn k_proc_zero(at: gex_kmem::PAddr, len: u32) -> i32 {
+    if !gex_kmem::in_process(at, len) {
+        return -14;
+    }
+    unsafe { gex_kmem::zero(at, len) };
+    0
+}
+
+// ---------------------------------------------------------------------------
+// wasm32 programs' content keys, by file. Every exec of a wasm32 program
+// hashed its bytes (`gex_cgen_pmod_wasm_key`) to find the compiled module the
+// page keeps, 6-12 ms for `apt-get`, every time; the key is the same while
+// the file is. Kept here, where every process sees it.
+
+/// (path, inode, mtime, file size, module length) -> the key's two lanes.
+type ProgId = (String, u64, i64, u64, u32);
+
+fn progkeys() -> &'static Mutex<BTreeMap<ProgId, (u64, u64)>> {
+    static K: OnceLock<Mutex<BTreeMap<ProgId, (u64, u64)>>> = OnceLock::new();
+    K.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// How many program keys are kept; past it the cache starts again.
+const PROGKEYS_MAX: usize = 4096;
+
+/// The key noted for this file, if any: 1 and its lanes at `out`, or 0.
+#[no_mangle]
+pub extern "C" fn k_progkey_get(path: gex_kmem::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, out: gex_kmem::PAddr) -> i32 {
+    let id = (path_of_raw(path, path_len), ino, mtime, size, len);
+    let Some(&(a, c)) = progkeys().lock().unwrap_or_else(|e| e.into_inner()).get(&id) else { return 0 };
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&a.to_le_bytes());
+    b[8..].copy_from_slice(&c.to_le_bytes());
+    unsafe { gex_kmem::push_checked(out, b.as_ptr(), 16) as i32 }
+}
+
+/// Note the key of this file's program.
+#[no_mangle]
+pub extern "C" fn k_progkey_put(path: gex_kmem::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, a: u64, c: u64) {
+    let id = (path_of_raw(path, path_len), ino, mtime, size, len);
+    let mut k = progkeys().lock().unwrap_or_else(|e| e.into_inner());
+    if k.len() >= PROGKEYS_MAX {
+        k.clear();
+    }
+    k.insert(id, (a, c));
+}

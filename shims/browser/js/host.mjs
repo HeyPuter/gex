@@ -56,6 +56,20 @@ function forkTransfer(child) {
 
 /// Where a pooled Worker's early messages are kept until somebody owns it.
 const EARLY = Symbol('gex.early');
+/** How many exited processes' memories are kept for fork children, and how
+ *  many bytes they may hold together: memory the page held anyway while
+ *  those processes ran, not more. */
+const RECYCLE_COUNT = 4;
+const RECYCLE_BYTES = 768 << 20;
+
+/** How far a fork record's image reaches: what its child's memory grows to. */
+function imageExtent(child) {
+  let n = 0;
+  for (const r of child?.image ?? []) {
+    n = Math.max(n, r.end ?? 0, r.at + (r.len ?? r.bytes?.byteLength ?? 0));
+  }
+  return n;
+}
 /** How many content-keyed modules (`wasm:`) the page keeps for every
  *  process, and how many bytes of wasm they may add up to (their compiled
  *  code is larger still; python3.13 alone is 24 MiB of wasm). */
@@ -145,7 +159,12 @@ export class ProcessHost {
   /// off the path. One spare suits a shell; a pipeline wants more, and an empty
   /// pool falls back to making a Worker inline.
   #warm = [];
-  #warmWanted = 2;
+  #warmWanted = 3;
+  /// Exited processes' memories, zeroed (`Gex#recycleMemory`), for fork
+  /// children to adopt into: their pages are touched, where a new memory's
+  /// first touch was most of the cost of copying a fork's image in. Kept
+  /// newest last, up to RECYCLE_COUNT and RECYCLE_BYTES.
+  #recycled = [];
   #warmMade = 0;
   #warmUsed = 0;
   #stackOf = new Map();
@@ -472,6 +491,40 @@ export class ProcessHost {
     w.terminate();
   }
 
+  /** Keep an exited process's zeroed memory for a fork child, dropping the
+   *  oldest past RECYCLE_COUNT or RECYCLE_BYTES. */
+  #keepMemory(mem) {
+    this.#recycled.push(mem);
+    let bytes = this.#recycled.reduce((n, x) => n + x.buffer.byteLength, 0);
+    while (this.#recycled.length > RECYCLE_COUNT || (this.#recycled.length > 1 && bytes > RECYCLE_BYTES)) {
+      bytes -= this.#recycled.shift().buffer.byteLength;
+    }
+    if (bytes > RECYCLE_BYTES) this.#recycled.length = 0;
+  }
+
+  /** A kept memory for a child whose image ends at `need` bytes, taken: the
+   *  smallest that already covers it, up to twice its size (the slack is
+   *  zeroed, already-touched pages the shim's arena grows into without a
+   *  `memory.grow`); otherwise the largest smaller one, which `growTo`
+   *  extends. A memory never shrinks, so one more than twice the child's is
+   *  left for a bigger child. */
+  #takeMemory(need) {
+    let best = -1;
+    let bestN = 0;
+    for (let i = 0; i < this.#recycled.length; i++) {
+      const n = this.#recycled[i].buffer.byteLength;
+      const fits = n >= need && n <= 2 * need;
+      const better = best < 0
+        || (fits && (bestN < need || n < bestN))
+        || (!fits && n < need && bestN < need && n > bestN);
+      if ((fits || n < need) && better) {
+        best = i;
+        bestN = n;
+      }
+    }
+    return best < 0 ? undefined : this.#recycled.splice(best, 1)[0];
+  }
+
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
@@ -512,6 +565,10 @@ export class ProcessHost {
             sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
             // the wineserver's door, if one is up (`doorPublish`)
             door: this.#door ?? undefined,
+            // A fork child's memory: an exited process's, zeroed, if one fits.
+            recycledMemory: msg.kind === 'adopt' && msg.child && !msg.child.exec
+              ? this.#takeMemory(imageExtent(msg.child))
+              : undefined,
           // `transfer`: buffers the caller gives up (the page's bundle), moved
           // rather than copied, and freed by the Worker once loaded.
           }, [...forkTransfer(msg.child), ...(msg.transfer ?? [])]);
@@ -724,6 +781,7 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        if (m.recycle instanceof WebAssembly.Memory) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
           this.#onOutput(
             2,
