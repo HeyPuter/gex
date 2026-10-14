@@ -4643,6 +4643,9 @@ export class Gex {
         wake_pipe: () => -1,
         wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),
         wake_close: () => {},
+        // The lazy clock of a DOOR_VERSION 2 server (door_time_refresh): the
+        // shim's export, a wasm-to-wasm call.
+        clock_ns: this.#shim.exports.gex_clock_ns,
       },
     };
     for (const f of got) (imports[f[1]] ??= {})[f[2]] = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
@@ -4666,7 +4669,11 @@ export class Gex {
       if (!(err instanceof DoorExit)) throw err;
     }
     const dispatch = table.get(v.dv.getUint32(a + 60, true));
-    return { door: d, dispatch, sp, stackTop, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
+    // DOOR_VERSION 2 (area +40): the server reads the clock itself, lazily
+    // (`dispatch(pid, tid, 0, 1)`), so a request that never looks at the
+    // time costs no clock read (Chrome: performance.now() alone is ~0.5 us).
+    const lazyTime = v.dv.getInt32(a + 40, true) >= 2;
+    return { door: d, dispatch, sp, stackTop, lazyTime, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
   }
 
   /** A system call from server code inside a door (i386 numbers, the
@@ -4759,28 +4766,57 @@ export class Gex {
     return v;
   }
 
+  /** Views of the guest's memory for door calls: { u8, i32, dv } (word
+   *  indices with `>>> 2`: the memory passes 2 GiB). A shared
+   *  memory never detaches (an old SharedArrayBuffer stays valid at its old
+   *  length), so a view is good for any range inside it and is rebuilt only
+   *  when a range reaches past it. Reading `memory.buffer` for every call,
+   *  as `#bytes` does, was about 15% of a door call in Chrome. */
+  #doorGv = null;
+  #doorGuest(end) {
+    let g = this.#doorGv;
+    if (!g || end > g.u8.length) {
+      const buf = this.#memory.buffer;
+      g = this.#doorGv = { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, buf.byteLength >>> 2), dv: new DataView(buf) };
+    }
+    return g;
+  }
+
+  /** The door memory's views (`#doorView`), checked the same way. */
+  #doorMem(end) {
+    const v = this.#doorViews;
+    return v && end <= v.len ? v : this.#doorView();
+  }
+
   /** One door call under the door lock (`st`: the statistics, or null). */
   #doorRun(d, req, pid, tid, st) {
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
-    const cm = this.#bytes();
-    const cdv = this.#guestView();
+    let g = this.#doorGuest(req + 136);
+    const cdv = g.dv;
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
     const replyData = cdv.getUint32(req + 68, true);
-    const { u8, i32, dv } = this.#doorView();
     const a = d.area;
-    const buf = dv.getUint32(a + 44, true), bufSize = dv.getUint32(a + 48, true);
+    // The door buffer's place and size never change: read once per door.
+    let buf = d.kBuf, bufSize = d.kBufSize;
+    if (buf === undefined) {
+      const v0 = this.#doorMem(a + 144);
+      buf = d.kBuf = v0.dv.getUint32(a + 44, true);
+      bufSize = d.kBufSize = v0.dv.getUint32(a + 48, true);
+    }
+    const { u8, i32, dv } = this.#doorMem(buf + bufSize);
     const replyOff = (64 + reqSize + 7) & ~7;
     if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
     // Poisoned (a door call died midway): no more doors; the pipes say the
-    // rest when the server goes.
-    if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
+    // rest when the server goes. A plain read, before the lock as the
+    // atomic load was: the flag only ever goes from 0 to set.
+    if (i32[(a + 124) >> 2] !== 0) return 1;
     if (Atomics.compareExchange(i32, L, 0, 1) !== 0) this.#doorLockSlow(i32, a, L, pid, tid);
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
@@ -4790,28 +4826,41 @@ export class Gex {
       // the one door stack and context.
       let di = this.#doorInst;
       if (!di || di.door !== d) di = this.#doorInst = this.#doorInstantiate(d);
-      u8.set(cm.subarray(req, req + 64), buf);
+      // The 64-byte header as 16 words (no subarray views), then the data.
+      if (((req | buf) & 3) === 0) {
+        const gi = g.i32, s0 = req >>> 2, d0 = buf >>> 2;
+        for (let k = 0; k < 16; k++) i32[d0 + k] = gi[s0 + k];
+      } else u8.set(g.u8.subarray(req, req + 64), buf);
       let at = buf + 64;
       for (let k = 0; k < count; k++) {
         const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
-        u8.set(cm.subarray(ptr, ptr + size), at);
+        if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
+        u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
       }
       di.sp.value = di.stackTop;
       const T1 = st ? performance.now() : 0;
-      // The time, as set_current_time would read it (gettimeofday,
-      // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
-      // of the door saved.
-      const ns = this.#env.now();
-      r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      if (di.lazyTime) r = di.dispatch(pid, tid, 0n, 1n) >>> 0;
+      else {
+        // The time, as set_current_time would read it (gettimeofday,
+        // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
+        // of the door saved.
+        const ns = this.#env.now();
+        r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      }
       if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
       else if (r === 0xfffffffe) r = 2;
       else {
         const ro = buf + r;
-        cm.set(u8.subarray(ro, ro + 64), req);
+        // the dispatch may have grown the guest's memory (a request that maps)
+        g = this.#doorGuest(Math.max(req + 64, replyData + replyMax));
+        if (((req | ro) & 3) === 0) {
+          const gi = g.i32, s0 = ro >>> 2, d0 = req >>> 2;
+          for (let k = 0; k < 16; k++) gi[d0 + k] = i32[s0 + k];
+        } else g.u8.set(u8.subarray(ro, ro + 64), req);
         const size = Math.min(dv.getUint32(ro + 4, true), replyMax);
-        if (size && replyData) cm.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
+        if (size && replyData) g.u8.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
         if (st) st.calls++;
         r = 0;
       }
@@ -4824,7 +4873,10 @@ export class Gex {
       console.error(`[gex-door] the wineserver trapped in a door call (pid ${pid} tid ${tid}); the server is poisoned: ${err?.stack ?? err}`);
       r = 1;
     }
-    const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;
+    // kick_needed is written only under the lock (by this call's dispatch,
+    // or the pump): plain accesses, ordered by the lock's own atomics.
+    const K = (a + 80) >> 2, kick = i32[K] !== 0;
+    if (kick) i32[K] = 0;
     if (Atomics.exchange(i32, L, 0) === 2) Atomics.notify(i32, L);
     if (kick) this.#doorKick();
     return r;
