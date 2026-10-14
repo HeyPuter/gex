@@ -528,7 +528,12 @@ export class DomDesktop {
         this.#attach(win);
         if (s.role === ROLE_CURSOR) this.#cursor = win;
         else this.onwindow?.(win);
-        if (s.role === ROLE_TOPLEVEL) this.focus(win);
+        // A new toplevel takes the keyboard -- unless its client places it
+        // (a Win32 window), whose client says which window is active
+        // (`activate`, below): Wine's popups (an edit box's autocomplete
+        // list, a menu) are toplevels too, and must not take the keys from
+        // the window being typed in.
+        if (s.role === ROLE_TOPLEVEL && !s.placed) this.focus(win);
       }
       this.#update(win, s);
     }
