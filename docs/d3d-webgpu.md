@@ -198,7 +198,9 @@ read-back for now). Done by other means than the GL and Vulkan renderers:
 typed buffer views (storage buffers decoded in the shader, the format part
 of the variant), sampler LOD bias (in the shader), depth24plus read-back
 (drawn into r32float), mipmap generation and partial clears (draws),
-triangle fans (indexed lists made at draw time).
+triangle fans (indexed lists made at draw time), big points and point
+sprites (quads, an instance per point), D3D9's channel defaults for
+two-channel formats (legacy fixups).
 
 ### 2.4 Next
 
