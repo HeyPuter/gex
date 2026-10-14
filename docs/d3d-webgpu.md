@@ -157,8 +157,8 @@ Native tests (macOS, Apple M4 Pro, Rosetta x86_64 Wine):
 | webgpu.dll | 40 of 40 |
 | d3d11 (FL 9_3) | 3919 checks, 9 failing (16-bit packed formats), 190 skipped |
 | d3d10_1 (FL 9_3 / 10_1) | 97 / 318 checks, none failing |
-| d3d10core (FL 10_1) | 76 failing checks (layered rendering, clears, queries); stops at the R11G11B10 input layout |
-| d3d9 visual | 735 failing checks (378 in shader fog; the run stops in test_updatetexture) |
+| d3d10core (FL 10_1) | the whole suite runs now: 830 failing checks, most in tests the old stop at the R11G11B10 input layout hid (lines 16198, 15106: formats and resource views), LOD bias, layered rendering |
+| d3d9 visual | 332 failing checks to test_depth_stencil (the 20-minute limit), 120 in test_signed_formats; shader fog fixed |
 
 Known gaps: 16-bit packed formats (B5G6R5 and the like: no WebGPU
 format, conversion not written), D3D9 sRGB write control, partial colour
