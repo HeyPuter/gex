@@ -99,7 +99,7 @@ client, the Unix side the server on Dawn, every call made from one thread
 (Dawn keeps error scopes per thread). Its tests pass natively (x86_64,
 Metal).
 
-### 2.2a /dev/gex-gpu (working: gexc, browser runtime under Node)
+### 2.2a /dev/gex-gpu (working: gexc, browser runtime in Chrome and Node)
 
 A guest reaches a host WebGPU through `/dev/gex-gpu`
 (`guest/gpu/transport-dev.h`): one ioctl per wire message, carrying the
@@ -124,7 +124,8 @@ only server.
 
 `guest/gpu/test/gpu-smoke.c` (static aarch64, `build-guest.sh`: Alpine in
 Docker) runs a compute shader and checks the result: "gpu-smoke: ok" under
-`gexc run` and under `run-node.mjs`. The emdawnwebgpu package must match
+`gexc run`, under `run-node.mjs`, and in Chrome (a page serving the
+server, a Worker running the single-Worker `Gex` with a `GpuProxy`). The emdawnwebgpu package must match
 `third_party/dawn-api` (the Dawn release `v20261009.190412` for both).
 
 ### 2.3 wined3d's WebGPU renderer (working natively)
