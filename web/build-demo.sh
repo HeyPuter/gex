@@ -32,6 +32,20 @@ ROOT="$(cd "$HERE/.." && pwd)"
 CACHE="${GEX_WEB_BUILD:-$ROOT/target/web-build}"
 export GEXCC_DEB=${GEXCC_DEB:-$HOME/gex-sandbox/scratch/CC/debian}
 WORK=${GEX_DEMO_WORK:-$GEXCC_DEB/demo}
+# Our .debs are zstd (mkdebs.py): with xz, dpkg-deb's decoder was what
+# dpkg waited on through every install (python3.13: about 470 ms of a 2.6 s
+# reinstall). A pool packed before that still holds xz ones and would ship
+# them without a word, so a stale one stops the build here.
+stale=$(for f in "$GEXCC_DEB"/pool/*.deb; do
+    [ -e "$f" ] || continue
+    ar t "$f" | grep -qx 'data\.tar\.zst' || echo "  $(basename "$f")"
+done)
+if [ -n "$stale" ]; then
+    echo "$GEXCC_DEB/pool has .debs that are not zstd; repack it with" >&2
+    echo "  GEXCC_DEB=$GEXCC_DEB web/build-native-debian.sh --repack" >&2
+    echo "$stale" | head -5 >&2
+    exit 1
+fi
 OUT=$HERE/dist-demo
 PUB=$HERE/public
 RUNTIME=1 X=1 ROOTFS=1 PKGS=1
