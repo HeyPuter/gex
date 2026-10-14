@@ -1151,7 +1151,7 @@ export class Gex {
     const e = this.#shim?.exports;
     const k = this.#kernel;
     if (!e?.gex_image_runs || !k?.k_proc_zero || m64() || single.on) return null;
-    if (!(this.#memory.buffer instanceof SharedArrayBuffer)) return null;
+    if (!isShared(this.#memory.buffer)) return null;
     const size = this.#memory.buffer.byteLength;
     let cap = 4096;
     let at = e.gex_alloc(cap * 8) >>> 0;
@@ -2133,8 +2133,8 @@ export class Gex {
     // memories are not shared (the single-thread page), which transfers them.
     const k = this.#kernel;
     const staging = !globalThis.GEX_DEBUG_EXIT && !m64() && !!k?.k_stage_take
-      && this.#memory.buffer instanceof SharedArrayBuffer
-      && this.#kernelSpec?.memory?.buffer instanceof SharedArrayBuffer;
+      && isShared(this.#memory.buffer)
+      && isShared(this.#kernelSpec?.memory?.buffer);
     this.#imageStage = 0;
     // The scan in the shim (`gex_image_runs`, 16 bytes a load) when it has
     // one; the pairs it writes are the runs of pages that are not all zero.
