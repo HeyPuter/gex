@@ -135,6 +135,28 @@ Docker) runs a compute shader and checks the result: "gpu-smoke: ok" under
 server, a Worker running the single-Worker `Gex` with a `GpuProxy`). The emdawnwebgpu package must match
 `third_party/dawn-api` (the Dawn release `v20261009.190412` for both).
 
+### 2.2b Presentation: plan
+
+Today wined3d presents by reading the back buffer back and drawing it with
+GDI (`swapchain_blit_gdi`). The plan is webgpu.h's own surface API, end to
+end, so any webgpu.h program presents the same way:
+
+1. wined3d makes a `WGPUSurface` from the swap chain's window
+   (`WGPUSurfaceSourceWindowsHWND`), configures it, renders into
+   `wgpuSurfaceGetCurrentTexture`'s texture and calls `wgpuSurfacePresent`.
+2. webgpu.dll turns the HWND into the display driver's client surface, as
+   winevulkan does for `vkCreateWin32SurfaceKHR` (win32u's client surfaces;
+   winewayland's is a `wl_surface`), and the wire carries that surface's
+   Wayland object id (the GL path's `GEX_GL_SURFACE` equivalent).
+3. The server, in the compositor's worker (2.2a), hands out a small ring of
+   textures per surface for `GetCurrentTexture`, and on `Present` makes the
+   presented one that surface's pixels: drawn like a GL frame
+   (`glFrameFor` in compositor-worker.js), the surface marked external
+   (`attach_external`). No copy anywhere.
+
+Natively (macOS), the same Win32 surface source maps to winemac's client
+surface and Dawn's Metal layer.
+
 ### 2.3 wined3d's WebGPU renderer (working natively)
 
 `WINE_D3D_CONFIG=renderer=webgpu`. Modelled on the Vulkan renderer, but
