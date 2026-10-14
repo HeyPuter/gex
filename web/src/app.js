@@ -378,6 +378,15 @@ async function begin(opts, base, at, state, meter) {
   const env = mergeEnv(b.env, opts.env);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
+  // The browser's time zone, unless the caller names one: without TZ the
+  // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
+  // A zoneinfo name (':' = a file under /usr/share/zoneinfo, which Wine also
+  // maps to its Windows zone).
+  if (!env.some((e) => e.startsWith('TZ='))) {
+    let zone = null;
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* none */ }
+    if (zone) env.push(`TZ=:${zone}`);
+  }
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
   // How it was started (gex-eject's W3 recorder keeps this).
