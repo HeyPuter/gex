@@ -41,13 +41,20 @@ static const char *base(const char *p)
  * 7.6). Handles from it are GEX_DL_HANDLE and above; 0 with a message in
  * err when it cannot. A static program's loader has no link map and says
  * so. */
+/* a pointer as the address gex's imports take: 32-bit on wasm32 and on
+ * wasm64 lowered to wasm32 (every address below 4 GiB); 64-bit in a
+ * memory64 flavour (GEX_MEMORY64, docs/wine-native-x64.md §0.1) */
+#ifdef GEX_MEMORY64
+typedef unsigned long long gex_addr_t;
+#define GEX_ADDR(p) ((gex_addr_t)(unsigned long)(p))
+#else
+typedef unsigned gex_addr_t;
+#define GEX_ADDR(p) ((gex_addr_t)(unsigned long)(p))
+#endif
 __attribute__((__import_module__("gex"), __import_name__("dlopen")))
-unsigned __gex_dlopen(unsigned path, unsigned err, unsigned errlen);
+unsigned __gex_dlopen(gex_addr_t path, gex_addr_t err, unsigned errlen);
 __attribute__((__import_module__("gex"), __import_name__("dlsym")))
-unsigned __gex_dlsym(unsigned handle, unsigned name);
-/* a pointer as the 32-bit address gex's imports take (wasm64: LP64 lowered
- * to wasm32, every address below 4 GiB) */
-#define GEX_ADDR(p) ((unsigned)(unsigned long)(p))
+unsigned __gex_dlsym(unsigned handle, gex_addr_t name);
 #define GEX_DL_HANDLE 0xfff00000u
 #define IS_GEX(p) ((unsigned long)(p) >= GEX_DL_HANDLE)
 

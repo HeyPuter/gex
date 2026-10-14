@@ -1234,7 +1234,7 @@ both compiled for wasm64 and lowered to the process's wasm32 memory.
 | W4 games | Noita and Peggle on native Wine; AOT share of app code, fps against today's path and pewasm (fixed seed, paired) | ≥ today's fps; Peggle's wined3d native | 3–5 days |
 | W5 browser | modules in Workers, wineserver Worker | browser tests/nt; Noita, Peggle and Half-Life in the page | 3–5 days |
 | W6 retire | remove superseded NT-layer subsystems and Wine prefix units; eject on native Wine | gate green with the NT layer gone for i386 | 2–4 days |
-| W7 x64 | see docs/wine-native-x64.md (LLP64/LP64 lowered to wasm32, no memory64) | x64 tests/nt, then programs, then games | docs/wine-native-x64.md §5 |
+| W7 x64 | see docs/wine-native-x64.md (LLP64/LP64 lowered to wasm32 by default; a memory64 flavour per game) | x64 tests/nt, then programs, then games | docs/wine-native-x64.md §5 |
 
 Today's path keeps working throughout. Programs switch per process
 (`--wine native`) until W6.

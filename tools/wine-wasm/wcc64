@@ -10,7 +10,11 @@ container gexc runs (wasm-elf.py --elf64). The module stays beside it as
 OUT.wasm (OUT.64.wasm is the module before lowering).
 
 -Wl,--gex-guest-x86-64 marks a program that runs x86-64 Windows code (the
-W64 loader). No fork (programs spawn by clone/vfork), no -shared yet."""
+W64 loader). No fork (programs spawn by clone/vfork), no -shared yet.
+
+-mgex-memory64 builds the memory64 flavour (docs/wine-native-x64.md §0.1):
+GEX_MEMORY64 defined, the module left unlowered (no runtime runs it yet;
+the sysroot's libgex would need the same define)."""
 import os, subprocess, sys, tempfile, atexit, shutil
 
 here = os.path.dirname(os.path.realpath(__file__))
@@ -27,6 +31,10 @@ CC = ['clang'] + flags['WASM64_CFLAGS'].split() + ['--sysroot=' + sysroot, '-isy
 if os.path.basename(sys.argv[0]).endswith('++'):
     CC[0] = 'clang++'
 args = sys.argv[1:]
+mem64 = '-mgex-memory64' in args
+if mem64:
+    args = [a for a in args if a != '-mgex-memory64']
+    CC += ['-DGEX_MEMORY64=1']
 if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
        for a in args) or not args:
     os.execvp(CC[0], CC + args)
@@ -77,7 +85,7 @@ w64 = out + '.64.wasm'
 wasm = out + '.wasm'
 # libgex before libc: its setjmp runtime, dlopen registry and signal frames.
 cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
-       '--max-memory=4294967296', '-L' + lib, '-pie', '--no-entry', '-o', w64, lib + '/crt1.o'] + \
+       '--max-memory=' + ('17179869184' if mem64 else '4294967296'), '-L' + lib, '-pie', '--no-entry', '-o', w64, lib + '/crt1.o'] + \
     objs + ld_in + ld_flags + [lib + '/libgex.a', '-lc', lib + '/libclang_rt.builtins-wasm64.a']
 r = subprocess.call(cmd)
 if r:
@@ -87,7 +95,7 @@ feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals',
          '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types',
          '--enable-memory64']
 # Names kept (-g): gex binds the entries by name.
-r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ['--memory64-lowering', '-O2', '-o', wasm])
+r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + ['-O2', '-o', wasm])
 if r:
     sys.exit('wcc64: wasm-opt failed on ' + w64)
 sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out, '--elf64'] +

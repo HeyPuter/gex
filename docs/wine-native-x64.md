@@ -6,17 +6,25 @@ docs/wine-native.md §3.10-3.17 first.
 
 ## 0. Decisions this plan rests on
 
-- **No memory64.** The user decided this on 2026-10-08, and it overrides
-  §3.9's "wasm64, memory64". Both halves of Wine are compiled for clang's
-  wasm64 target, which gives the 64-bit *data layout*. binaryen's
-  `--memory64-lowering` then lowers them to wasm32 before they ship. They
-  run in the process's own 4 GiB wasm32 memory, beside the translated
-  x86-64 program.
+- **Lowered wasm32 first, then memory64 per game.** Both halves of Wine
+  are compiled for clang's wasm64 target, which gives the 64-bit *data
+  layout*. The order (the user, 2026-10-08 and 2026-10-14):
+  1. **Lowered wasm32, the default.** binaryen's `--memory64-lowering`
+     lowers the modules to wasm32 before they ship. They run in the
+     process's own 4 GiB wasm32 memory, beside the translated x86-64
+     program.
+  2. **A memory64 flavour, chosen per game at run time,** for what needs
+     more than 4 GiB. Unity goes here (§0.1, phase W64.7).
+  3. **The dual heap is undecided.** Its measurements are not in. It is
+     only a possible later alternative, not part of this plan.
+
+  No memory64 work comes before W64.1 and the browser runtime path. The
+  default path must not close the flavour off.
 - **One address step.** The lowering pass wraps each i64 address to i32 at
-  the access. That pass is the only place an address becomes a memory
-  index. If 4 GiB ever runs out, the dual heap replaces that one pass: a
-  guard on high pointers routes them to a second 4 GiB heap. This is the
-  same rule as gexcc's item 3 (docs/gexcc.md §7.8).
+  the access. In C, `GEX_ADDR` and `gex_addr_t` (include/wine/gex/addr.h,
+  and libgex's dl.c) are the only place a pointer becomes the address a gex
+  import takes. Wine's address-space limit (virtual.c) is a setting, not a
+  constant. Nothing else may assume that addresses are below 4 GiB.
 - **Cost of the lowering.** C measured LP64 lowered to wasm32 at 7-13%
   slower than plain wasm32 on pointer-heavy code (docs/gexcc.md §7.3: zlib
   321.4 vs 283.5 ms). The user measured memory64 at 11.3% slower than
@@ -25,6 +33,31 @@ docs/wine-native.md §3.10-3.17 first.
   units.
 - **No new NT-layer work.** W64 replaces the NT layer for x64 programs, as
   W3 did for i386.
+
+### 0.1 The memory64 flavour (phase W64.7)
+
+None of this is built yet. It is recorded so the default path keeps it
+possible.
+
+- **Build.** `wcc64 -mgex-memory64` links the same objects and skips
+  `--memory64-lowering`. It ships the wasm64 module unlowered and defines
+  `GEX_MEMORY64` while compiling. That makes `gex_addr_t` 64-bit, so the
+  gex imports take i64 addresses (their 64-bit variants, as `door_call64`
+  will be). Every object except the import declarations is the same as
+  the lowered flavour's.
+- **Runtime.** The process runs with a 64-bit guest memory, using the
+  per-process choice in docs/mem64.md §5 (at exec, from a flag or a
+  per-binary record). The native and browser hosts already instantiate an unlowered
+  wasm64 provider in such a process (the `m64()` paths in `ftab.rs` and
+  `gex.mjs`). The translator's x86-64 code uses the mem64 flavour
+  (docs/mem64.md §3, §7).
+- **Address limit.** Wine's user-space limit (virtual.c) is a value the
+  process gets at start. It is 4 GiB in a lowered process and the full
+  x86-64 limit in a memory64 one.
+- **Fixed-base images.** x64 images at 0x1_4000_0000 with no relocations
+  map at their base, which the lowered flavour cannot do (§2, "Pointers").
+- **What stays the same.** The LLP64 and LP64 layouts, the kernel
+  wineserver, signal frames (already 64-bit) and the layout gate.
 
 ## 1. Toolchain
 
@@ -153,13 +186,16 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
   `__gexw_syscall` directly, as on wasm32. The Unix dispatcher takes the
   number from RAX and the arguments as `ULONG_PTR` words. W3's
   typed-wrapper rule applies: wasm traps on a mistyped indirect call.
-- **Pointers.** These are 64-bit values in both halves and in the guest,
-  all below 4 GiB. Wine's 64-bit `virtual.c` gets an address-space limit
-  under 4 GiB (Windows' own `/LARGEADDRESSAWARE:NO` x64 layout is
+- **Pointers.** These are 64-bit values in both halves and in the guest.
+  In the lowered flavour they are all below 4 GiB. Wine's 64-bit
+  `virtual.c` gets an address-space limit, a value the process receives at
+  start: under 4 GiB when lowered, and x86-64's own limit in the memory64
+  flavour (Windows' own `/LARGEADDRESSAWARE:NO` x64 layout is
   similar). Images are placed low, as the NT layer packs them: code below
   `MMAP_TOP`, so the dispatch directory can name it. An x64 image that
   cannot move (a fixed base at 0x1_4000_0000 with no relocations) fails to
-  map, as it does under the NT layer (`pe-x64/highbase-fixed`). The
+  map when lowered, as it does under the NT layer
+  (`pe-x64/highbase-fixed`). Such a program runs in the memory64 flavour. The
   server's 64-bit DLL pool (0x6000_0000_0000) moves below 2 GiB.
 - **Exceptions: the one new mechanism compared with i386.** x64 SEH unwinds
   by table (`.pdata`, `RtlVirtualUnwind`), not by a chain on the stack.
@@ -183,7 +219,7 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
 - **Same as W3.** An i386 program keeps W3, the wasm32 loader. An x64
   program runs on the W64 loader. Neither loads wow64.dll or a BTCpu DLL.
   ntdll calls gex's hooks directly, as on W3.
-- **Mixed sessions come later (W64.7).** These are an x64 launcher with an
+- **Mixed sessions come later (W64.8).** These are an x64 launcher with an
   i386 child, or an i386 installer with an x64 child. Wine 11 still has
   "old wow64": a 32-bit ntdll.so in a 64-bit prefix, `is_old_wow64()`. So
   the W3 loader could be the 32-bit client of an AMD64 session. Until that
@@ -246,14 +282,15 @@ layer are untouched.
 | W64.4 GUI and GL | win32u.so; winewayland with libwayland, xkbcommon and FreeType built LP64; opengl32 and gex-gl's guest library LP64; the opengl32 id fast path | x64 window, user_win, gdi, input, display, glcompat and glfast on gex's compositor | 3-5 d |
 | W64.5 page | the ELF64 wasm program in the browser runtime, the door's LP64 parsing in `gex.mjs`, the page prefix template for win64 | browser tests/nt x64 (both builds, SP leg) | 2-4 d |
 | W64.6 games | G's x64 games that fit 4 GiB, through bench.sh on worldmachine | a game to gameplay; fps against the NT layer's x64 path | open |
-| W64.7 mixed sessions | the W3 loader as an old-wow64 client of an AMD64 session | an x64 launcher starting an i386 child | 2-3 d |
+| W64.7 memory64 flavour | per game, for what needs more than 4 GiB (Unity, fixed-base x64 images): the unlowered wasm64 modules (`wcc64 -mgex-memory64`, `GEX_MEMORY64`, the gex imports' i64 variants); the translator's mem64 flavour for the x86-64 code (docs/mem64.md §3, §7); the runtime choice at exec (docs/mem64.md §5); the address limit as x86-64's; fixed-base images above 4 GiB at their base | the W64.1 tests/nt set and `pe-x64/highbase-fixed` in the memory64 flavour, natively and in the browser; a Unity game past its menus | open |
+| W64.8 mixed sessions | the W3 loader as an old-wow64 client of an AMD64 session | an x64 launcher starting an i386 child | 2-3 d |
 
 **Risks.**
 
 - **Unity needs more than 4 GiB of address space.** docs/mem64.md
   measured 16-19 slots of 256 MiB at the menus, about 4-4.75 GiB of
-  reservations. So Unity on W64 needs the dual heap, which is a separate
-  decision for the user. Programs and smaller x64 games come first.
+  reservations. So Unity on W64 runs in the memory64 flavour (W64.7).
+  Programs and smaller x64 games, lowered, come first.
 - **The plugin uses clang internals.** TargetInfo fields can move between
   LLVM releases. The layout gate catches that at once. The fallback is a
   roughly 30-line wasm64-windows TargetInfo in a clang we build ourselves.
