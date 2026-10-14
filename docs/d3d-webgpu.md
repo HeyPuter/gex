@@ -156,6 +156,8 @@ Native tests (macOS, Apple M4 Pro, Rosetta x86_64 Wine):
 |---|---|
 | webgpu.dll | 40 of 40 |
 | d3d11 (FL 9_3) | 3919 checks, 9 failing (16-bit packed formats), 190 skipped |
+| d3d10_1 (FL 9_3 / 10_1) | 97 / 318 checks, none failing |
+| d3d10core (FL 10_1) | 76 failing checks (layered rendering, clears, queries); stops at the R11G11B10 input layout |
 | d3d9 visual | 735 failing checks (378 in shader fog; the run stops in test_updatetexture) |
 
 Known gaps: 16-bit packed formats (B5G6R5 and the like: no WebGPU
@@ -173,26 +175,54 @@ non-depth textures, and presentation (GDI read-back for now).
 2. Presentation: a swap chain's texture is a compositor surface on the same
    device (the compositor today assumes one GL frame:
    web/src/compositor-worker.js, "one canvas and one frame").
-3. Section 3.
+3. Section 3's compositor.
 
-## 3. Aero: open decision
+## 3. Aero: route (b), a glass compositor of our own
 
-D3D alone does not give glass. Windows 7 draws it in DWM: `dwm.exe`, whose
-`dwmcore.dll` renders with `D3D10CreateDevice1` and `CreateDXGIFactory`, and
-which takes each window's pixels from win32k's redirection surfaces
-(`dwmcore`: `D3DKMTGetPresentHistory`, `D3DKMTOpenAdapterFromHdc`;
-`dwmredir`: `GetWindowCompositionInfo`/`Attribute`). Wine has none of that,
-and its dwmapi reports composition off below Windows 8. Two routes:
+D3D alone does not give glass: Windows 7 draws it in DWM. An analysis of the
+SP1 binaries (dwm.exe, dwmcore, uDWM, dwmredir, uxsms, with Microsoft's
+public symbols, against the Wine fork's spec files, 2026-10-14) settled the
+choice.
 
-- **(a) Win7's own dwm.exe**, on 2.x's D3D10.1, with the redirection
-  plumbing faked in win32u and gex-kernel's D3DKMT.
-- **(b) a glass compositor of our own** in the page (or a guest process)
-  on the same WebGPU device: blur-behind for the regions dwmapi is asked
-  for (`DwmExtendFrameIntoClientArea`, `DwmEnableBlurBehindWindow`), frames
-  from aero.msstyles, thumbnails.
+**What real DWM needs.** dwmcore's device is `D3D10CreateDevice1(HARDWARE,
+flags 0x99)` trying 10_1, 10_0, 9_3, 9_2, 9_1 (no WARP, no D3D9 path), so
+the WebGPU wined3d at 9_3 is enough for the device. Everything else is
+win32k's: uxsms starts dwm.exe and hands it `\UxSmsApiPort`; dwm.exe makes a
+waitable LPC port and `RegisterSessionPort`s it, then
+`DwmStartRedirection(1)`; win32k then tells it about windows over kernel-only
+LPC messages (sprites, child notifications, logical surfaces: about 25
+undocumented layouts, dispatched by dwmredir's
+`DwmRedirectionManagerDispatchMessage`). Pixels come from win32k logical
+surfaces (gdi32 ordinals 1000-1011: `DwmGetSurfaceData`,
+`DwmHLSurfGetDirtyRgn`, ...) as DX shared allocations or sections, and
+recomposition is driven by `D3DKMTGetPresentQueueEvent` /
+`D3DKMTGetPresentHistory` tokens. Wine has no LPC (all `NtCreatePort`-family
+calls are stubs), none of the HLSURF or Sfm calls, and a stub present
+history. The glass frame itself is uDWM building dwmcore (MIL) drawing
+instructions from aero.msstyles' `DWMWindow` atlas: not reusable without
+dwmcore. Estimate for (a): 10k+ lines, mostly reverse-engineering
+undocumented kernel behaviour.
 
-To decide once D3D10.1 renders: (a) is exact if it can be made to run, (b)
-is in our hands.
+**Chosen: (b).** gex already has DWM's redirection in effect: each top-level
+window is a surface with damage in the gex compositor (docs/nt-layer.md
+§6a). What is needed:
+
+1. dwmapi: composition on for Windows 7 versions; keep each window's
+   frame extension, blur-behind region, attributes, colorization and
+   thumbnail registrations and send them to the compositor; the ordinals
+   explorer and shell32 import (#113 live preview, #114/#124 thumbnails,
+   #127/#131 colorization, #106/#107).
+2. win32u/user32: no frame drawn for composited top-level windows (the
+   frame is client area, as on Windows 7), caption buttons hit-tested
+   through `DwmDefWindowProc`, the client's alpha kept in extended glass.
+3. The compositor, on WebGPU: backdrop blur under frames and blur-behind
+   regions, the colorization tint (ColorizationColor, Balance, Afterglow,
+   BlurBalance), the `DWMWindow` atlas parts as nine-grids (uxtheme's
+   `GetThemeStream` for TMT 213 in msstyles.c, or the atlas extracted
+   offline), reflection and caption glow, live thumbnails for the taskbar
+   and Alt-Tab.
+
+Revisit (a) only if exact Flip3D or animations become the goal.
 
 ## 4. Reproducing (macOS, Apple silicon)
 
