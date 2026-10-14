@@ -18,7 +18,7 @@ import { bareDesktop } from '../src/bare-desktop.js';
 import {
   makeWlChannel, WlProxy, REC, R_CLIENT, R_SURFACE, R_ROLE, R_REL_X, R_REL_Y, R_WIDTH, R_HEIGHT, R_ADDR,
   R_STRIDE, R_FORMAT, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H, R_PLACE, R_STACK_ID, R_GLASS, R_GLASS_ARGB,
-  R_GLASS_BALANCE, R_GLASS_AFTERGLOW, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
+  R_GLASS_BALANCE, R_GLASS_AFTERGLOW, R_GLASS_CLIENT, R_GLASS_RECTS, R_GLASS_FRAME, R_TITLE, R_TITLE_WORDS, ROLE_TOPLEVEL, P_PLACED, P_UNMANAGED,
 } from '@gex/wl-bridge.mjs';
 
 const params = new URLSearchParams(location.search);
@@ -63,8 +63,11 @@ const bg = pixels(800, 600, (x, y) => {
 const W = 400, H = 300;
 const win = pixels(W, H, (x, y) => {
   const glass = x < 8 || x >= W - 8 || y < 30 || y >= H - 8;
-  // As GDI leaves it: alpha 0 everywhere, black where the glass is.
-  return glass ? [0, 0, 0, 0] : [245, 245, 245, 0];
+  // As GDI leaves it: alpha 0 everywhere, black where the glass is; with
+  // `?nc=white`, the frame opaque white, as a theme might paint it, which a
+  // frame DWM draws hides (set_frame's client area).
+  if (glass) return params.get('nc') === 'white' ? [255, 255, 255, 255] : [0, 0, 0, 0];
+  return [245, 245, 245, 0];
 });
 
 const recs = new Int32Array(memory.buffer, 1024, 2 * REC);
@@ -85,7 +88,10 @@ function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0, title = '', 
     glass.forEach((q, j) => recs.set(q, r + R_GLASS_RECTS + 4 * j));
   }
   // The frame DWM would draw: flags, then close, max and min as x, y, w, h, state.
-  if (frame) recs.set(frame, r + R_GLASS_FRAME);
+  if (frame) {
+    recs.set(frame, r + R_GLASS_FRAME);
+    recs.set([8, 30, w - 16, h - 38], r + R_GLASS_CLIENT);
+  }
   const t = new TextEncoder().encode(title).slice(0, R_TITLE_WORDS * 4 - 1);
   const tb = new Uint8Array(R_TITLE_WORDS * 4);
   tb.set(t);

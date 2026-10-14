@@ -103,6 +103,7 @@ struct U {
   opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha), 2 = but in glass
   glassCount: u32,
   glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels); mode 4: the matrix's rows
+  client: vec4f,    // w > 0: a frame DWM draws goes over the texture outside this (output pixels)
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
@@ -148,6 +149,9 @@ fn blur(uv: vec2f) -> vec4f {
     return vec4f(clamp(c.rgb * m + u.color.rgb, vec3f(0.0), vec3f(1.0)), 1.0);
   }
   if (u.swizzle == 1u) { c = c.bgra; }
+  if (u.client.z > 0.0 && (any(v.pos.xy < u.client.xy) || any(v.pos.xy >= u.client.xy + u.client.zw))) {
+    return vec4f(0.0);
+  }
   if (u.opaque == 1u) { c.a = 1.0; }
   // DWM's rule: a window's alpha counts in its glass and nowhere else (GDI
   // leaves the alpha byte 0, so anything else would be see-through).
@@ -279,7 +283,7 @@ class Painter {
     return true;
   }
 
-  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv, glass = null) {
+  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv, glass = null, client = null) {
     if (this.n >= MAX_DRAWS) return;
     const o = (this.n * SLOT) / 4;
     const f = this.f32;
@@ -293,6 +297,7 @@ class Painter {
       const g = glass[i];
       f[o + 20 + 4 * i] = g.x; f[o + 21 + 4 * i] = g.y; f[o + 22 + 4 * i] = g.w; f[o + 23 + 4 * i] = g.h;
     }
+    f[o + 36] = client?.x ?? 0; f[o + 37] = client?.y ?? 0; f[o + 38] = client?.w ?? 0; f[o + 39] = client?.h ?? 0;
     // 1:1 and on whole pixels: nearest, so a terminal's glyphs are the
     // client's own pixels and not a blend of two neighbours.
     const nearest = mode === 1 || (w === Math.round(w) && h === Math.round(h) && x === Math.round(x)
@@ -397,9 +402,9 @@ class Painter {
     }
   }
 
-  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1], glass = null } = {}) {
+  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1], glass = null, client = null } = {}) {
     if (!tex) return;
-    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, glass ? 2 : opaque, uv, glass);
+    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, glass ? 2 : opaque, uv, glass, client);
   }
 
   end() {
@@ -1287,10 +1292,14 @@ class Compositor {
     // With glass, an opaque window's (XRGB) alpha counts in the glass only,
     // as under DWM; a window with alpha of its own (ARGB) keeps it.
     const opaque = win.info?.format === 1;
+    // A frame DWM draws goes over the window outside its client area.
+    const g = win.info?.glass;
+    const c = g?.frame & 1 && g.client?.w > 0 ? g.client : null;
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
       opaque: opaque ? 1 : 0,
       glass: opaque && glass?.length ? glass : null,
+      client: c && { x: f.x + c.x, y: f.y + c.y, w: c.w, h: c.h },
     });
   }
 
