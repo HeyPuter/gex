@@ -76,6 +76,15 @@ extern "C" {
     fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
+    /// `performance.now()`, in milliseconds: the clock's hot path. An f64,
+    /// not an i64: an i64 import result is a BigInt per call, most of a
+    /// clock read's cost (Chrome: about 650 ns of a 757 ns
+    /// QueryPerformanceCounter, docs/wine-overhead.md F2).
+    fn perf_now() -> f64;
+    /// The epoch `now` counts from in this Worker, in ns (`ORIGIN_NS`):
+    /// `now() == clock_origin() + round(perf_now() * 1e6)`. Read once per
+    /// thread.
+    fn clock_origin() -> i64;
     /// Block until the host has delivered every `write` so far. Called just
     /// before this process's exit is published: output from different
     /// processes reaches the host by different routes, so without it a parent
@@ -1318,9 +1327,36 @@ fn install_bundle_remote() {
 const SAFEPOINT_INTERVAL: u32 = 1024;
 
 /// The host's clock, in the shape `gex-kernel` wants.
-fn browser_clock() -> (u64, u32) {
-    let ns = unsafe { now() } as u64;
+pub(crate) fn browser_clock() -> (u64, u32) {
+    let ns = host_now_ns();
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+}
+
+thread_local! {
+    /// This Worker's `clock_origin()`: each Worker's `performance.now()`
+    /// counts from its own start, so the origin is per thread, not shared.
+    static CLOCK_ORIGIN: Cell<i64> = const { Cell::new(i64::MIN) };
+}
+
+/// The host clock in ns, as the `now` import reads it (the same value:
+/// `hostNowNs` in gex.mjs is `ORIGIN_NS + round(performance.now() * 1e6)`),
+/// without a BigInt per call.
+pub(crate) fn host_now_ns() -> u64 {
+    let ms = unsafe { perf_now() };
+    // try_with: a clock read during thread teardown (after the TLS is
+    // destroyed) asks the host again rather than panicking.
+    let origin = CLOCK_ORIGIN
+        .try_with(|c| {
+            let o = c.get();
+            if o != i64::MIN {
+                return o;
+            }
+            let o = unsafe { clock_origin() };
+            c.set(o);
+            o
+        })
+        .unwrap_or_else(|_| unsafe { clock_origin() });
+    (origin + (ms * 1e6).round() as i64) as u64
 }
 
 /// The guest's standard input, as a queue the page appends to.
@@ -10263,7 +10299,7 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
 
 /// Nanoseconds on the host clock.
 fn now_ns() -> u64 {
-    unsafe { now() as u64 }
+    host_now_ns()
 }
 
 /// What a scheduler turn that found nothing to run saw, under the one lock
@@ -12111,7 +12147,7 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact.
-        -3 => unsafe { now() },
+        -3 => host_now_ns() as i64,
         // MIDR_EL1: a plausible Cortex-A72, the same one the native host
         // claims to be.
         -7 => 0x410f_d083,

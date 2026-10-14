@@ -208,6 +208,8 @@ async function main() {
   if (q.get('wasmdlls')) globalThis.GEX_WASM_DLLS = q.get('wasmdlls');
   // `?elfunits=name,...`: shared objects that get function-tier units (with `?cgen=1`).
   if (q.get('elfunits')) globalThis.GEX_ELF_UNITS = q.get('elfunits');
+  // `?provskip=export,...`: exports no provider binds, as GEX_PROVIDER_SKIP natively (units built with the same skip).
+  if (q.get('provskip')) globalThis.GEX_PROVIDER_SKIP = q.get('provskip');
   // `?fjitlibs=+name,-name`: the function JIT only for (+) or not for (-) those objects (a bisection aid).
   if (q.get('fjitlibs')) globalThis.GEX_FJIT_LIBS = q.get('fjitlibs');
   // `?pins=path@base+span,...` (hex): place those shared objects at fixed bases, as a

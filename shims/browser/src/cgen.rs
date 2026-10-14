@@ -1045,6 +1045,14 @@ pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
     }
 }
 
+/// `gex.clock_ns(clk)`: `clock_gettime(clk)` in nanoseconds, the value the
+/// system call gives, with no kernel and no lock (W3's PE ntdll reads its
+/// performance counter with it, docs/wine-overhead.md F2).
+#[no_mangle]
+pub extern "C" fn gex_clock_ns(clk: u32) -> i64 {
+    gex_kernel::clock_ns(crate::browser_clock, clk as u64) as i64
+}
+
 /// `gex.nt_qpc()`: the process clock as NtQueryPerformanceCounter reads it
 /// (100 ns units), for the nt_qpc provider.
 #[no_mangle]
