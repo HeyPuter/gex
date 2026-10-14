@@ -1225,9 +1225,9 @@ static LOCAL_FDS: std::sync::Mutex<(u32, Vec<(u32, Arc<gex_kernel::file::OpenFil
 
 /// A descriptor as a line another process can rebuild it from. See
 /// [`carry_name`]; what has no name to travel by is parked in [`LOCAL_FDS`].
-fn scm_describe(k: &gex_kernel::syscalls::Kernel, file: &Arc<gex_kernel::file::OpenFile>) -> Option<String> {
+fn scm_describe(file: &Arc<gex_kernel::file::OpenFile>) -> Option<String> {
     const IN_FLIGHT: i32 = -1;
-    let name = carry_name(k, file, IN_FLIGHT).unwrap_or_else(|| {
+    let name = carry_name(file, IN_FLIGHT).unwrap_or_else(|| {
         let mut t = LOCAL_FDS.lock().unwrap_or_else(|e| e.into_inner());
         t.0 += 1;
         let n = t.0;
@@ -1237,12 +1237,12 @@ fn scm_describe(k: &gex_kernel::syscalls::Kernel, file: &Arc<gex_kernel::file::O
     Some(format!("{} {} {}", file.flags(), file.offset(), name))
 }
 
-fn scm_rebuild(k: &mut gex_kernel::syscalls::Kernel, desc: &str) -> Option<Arc<gex_kernel::file::OpenFile>> {
+fn scm_rebuild(ns: &gex_kernel::vfs::Namespace, desc: &str) -> Option<Arc<gex_kernel::file::OpenFile>> {
     let mut p = desc.splitn(3, ' ');
     let flags = p.next()?.parse::<u64>().ok()?;
     let offset = p.next()?.parse::<u64>().ok()?;
     let name = p.next()?;
-    match rebuild_carried(k, name, flags, offset) {
+    match rebuild_carried(ns, name, flags, offset) {
         Ok(f) => Some(f),
         Err(e) => {
             warn_line(&format!("gex: SCM_RIGHTS lost '{name}': {e}\n"));
@@ -8032,7 +8032,7 @@ pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
 fn stage_fork_fds(h: &Host, child: i32) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
-        let Some(name) = carry_name(&h.kernel, &file, child) else {
+        let Some(name) = carry_name(&file, child) else {
             continue;
         };
         out.push_str(&format!(
@@ -8060,7 +8060,7 @@ fn stage_fork_fds(h: &Host, child: i32) {
 /// same descriptor numbers name the same files in a fork's child): a copy, so
 /// an `epoll_ctl` on one side after the fork is not seen by the other, where
 /// Linux shares the one set. `None`: nothing with a name -- a local socket.
-fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
+fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> {
     if let Some(id) = pipe_id(&file.path) {
         unsafe { k_pipe_open_end(id, file.writable as i32, holder) };
         return Some(file.path.clone());
@@ -8080,12 +8080,12 @@ fn carry_name(k: &gex_kernel::syscalls::Kernel, file: &gex_kernel::file::OpenFil
         // W3's image hook finding the module beside a DLL).
         return Some(format!("#{dup}:{}", file.path));
     }
-    if let Some(sock) = k.remote_unix_of_file(file) {
+    if let Some(sock) = gex_kernel::syscalls::Kernel::remote_unix_of_file(file) {
         // A socket in the global kernel: another id on the same end.
         let dup = sock.dup_id()?;
         return Some(format!("sock:{dup}:{}", sock.listening as i32));
     }
-    if let Some(set) = k.epoll_of_file(file) {
+    if let Some(set) = Arc::clone(&file.handle).as_epoll() {
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
         return Some(format!("epoll:{key}:{}", set.describe()));
     }
@@ -8191,7 +8191,7 @@ fn adopt_fds_text(text: &str) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = match rebuild_carried(&mut h.kernel, path, flags, offset) {
+            let file = match rebuild_carried(&h.kernel.vfs, path, flags, offset) {
                 Ok(f) => f,
                 Err(e) => {
                     // Never quietly: a missing descriptor is an `EBADF` at
@@ -8214,7 +8214,7 @@ fn adopt_fds_text(text: &str) -> i32 {
 /// this process. The reference the sender took is this one now; nothing more
 /// is opened for a pipe, pty, file id or socket id.
 fn rebuild_carried(
-    k: &mut gex_kernel::syscalls::Kernel,
+    ns: &gex_kernel::vfs::Namespace,
     path: &str,
     flags: u64,
     offset: u64,
@@ -8261,7 +8261,7 @@ fn rebuild_carried(
         if let Some(f) = ADOPTED_EPOLLS.with(|m| m.borrow().as_ref().and_then(|m| m.get(key).cloned())) {
             return Ok(f);
         }
-        let f = k.adopt_epoll(watches, flags);
+        let f = gex_kernel::syscalls::Kernel::adopt_epoll(watches, flags);
         ADOPTED_EPOLLS.with(|m| {
             if let Some(m) = m.borrow_mut().as_mut() {
                 m.insert(key.to_string(), Arc::clone(&f));
@@ -8274,9 +8274,7 @@ fn rebuild_carried(
         let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
         let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
         sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
-        let handle: Arc<dyn FileHandle> = sock.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
-        k.note_remote_unix(key, &sock);
+        let handle: Arc<dyn FileHandle> = sock;
         OpenFile::new(handle, "socket".to_string(), flags, true, true)
     } else if let Some(rest) = path.strip_prefix("local:") {
         let (pid, n) = rest.split_once(':').ok_or("bad local name")?;
@@ -8295,8 +8293,7 @@ fn rebuild_carried(
         // `/proc` are per-process, so `/dev/null` is not in the shared
         // filesystem by name.
         use gex_kernel::vfs::FileSystem;
-        let handle = k
-            .vfs
+        let handle = ns
             .open(path, flags, 0)
             .or_else(|e| match global_root() {
                 Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
@@ -8782,7 +8779,6 @@ pub extern "C" fn gex_adopt_child(
                 &mut h.kernel.fds,
                 gex_kernel::file::FdTable::new(),
             ));
-            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
         });
     }
     // The slot maps the copied low region names are the parent's.
@@ -9000,10 +8996,6 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // global kernel and only learns of a close from `Drop` -- otherwise the
     // reader waits forever for an EOF nobody sends.
     h.kernel.fds.close_all();
-    h.kernel.remote_sockets.clear();
-    // Internet sockets too: a listener (in the global kernel) is unbound and
-    // a connection closed when its last holder goes, as on Linux at exit.
-    h.kernel.sockets.clear();
     // And anything the table did not account for: a guest leaving by a trap
     // rather than `exit_group` never reaches the line above (see
     // `k_pipe_forget`).
@@ -11425,9 +11417,13 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         },
         // A sleep, until its time (the clock alone ends it).
         gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(turn_now() + d.as_nanos() as u64),
-        _ => unreachable!("a class call parks only on a stream, a poll, a futex or a sleep"),
+        // A `recvmsg` on a blocking socket: until it is readable, then made
+        // again (`Owed::reissue`).
+        gex_kernel::BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep or a socket"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
+    let reissue = matches!(op, gex_kernel::BlockOp::AcceptWait { .. });
     // A new wait: whatever this Worker's thread was registered for is over.
     waitq::leave();
     let run = MY_RUN
@@ -11438,7 +11434,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         r.pc = pc + gex_abi::SYSCALL_INST_BYTES;
         r.waiting = waiting;
         r.blocked_on = Some(op);
-        r.owed = Owed { restore_sigmask, write_blocked, ..Owed::default() };
+        r.owed = Owed { restore_sigmask, write_blocked, reissue };
     }
     waitq::begin_turn();
     let pick = pick_mine(&run);
@@ -15680,7 +15676,6 @@ pub extern "C" fn gex_abandon(code: i32) {
         // one process further along than the one that died, which is the shape
         // that made a lifter fault in a forked child look like a hang in `apt`.
         h.kernel.fds.close_all();
-        h.kernel.remote_sockets.clear();
         // SAFETY: takes a scalar and borrows nothing here.
         unsafe {
             if k_present() != 0 {

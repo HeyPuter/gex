@@ -937,6 +937,10 @@ impl Socket {
 }
 
 impl FileHandle for Socket {
+    fn as_inet_socket(self: Arc<Self>) -> Option<Arc<Socket>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.kind == Kind::Udp {
             return self.recv_dgram(buf);

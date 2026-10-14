@@ -1393,7 +1393,6 @@ fn run_program_with(
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
             k.fds.close_all();
-            k.sockets.clear();
             return Err(e);
         }
     };
@@ -2334,7 +2333,6 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             {
                 let mut k = cleanup.kernel.lock().unwrap_or_else(|e| e.into_inner());
                 k.fds.close_all();
-                k.sockets.clear();
             }
             procs.exit(pid, wstatus);
             let (st, done) = status;

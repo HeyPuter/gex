@@ -448,6 +448,19 @@ in the scheduler pick after each wake of the global WAKE word: about
    select and epoll_pwait then run without KLock; offsets are atomics
    in `OpenFile`. Leg: close-while-reading; pipe and socket stress in
    both hosts.
+   - sendmsg and recvmsg (L5): in the free class, as `FdIo::sendmsg`,
+     `recvmsg` and `recvmsg_park` (the kernel's `sys_sendmsg`/`sys_recvmsg`
+     call the same). A socket is recovered from its descriptor's handle
+     (`FileHandle::as_remote_unix`, `as_inet_socket`), so the kernel's two
+     tables of sockets by handle address are deleted. A descriptor arriving
+     from another process is rebuilt through the process's published
+     namespace (`Vfs::view`, a `Namespace` republished on every mount,
+     unmount and `chdir`; a thread with its own working directory has it
+     only in its own calls), and the remote socket hooks take no kernel.
+     A blocking `recvmsg` parks until the socket is readable and is made
+     again (`Owed::reissue`). Legs: `sendmsg-rights` and `scm-fork` (a
+     file and a pipe passed to a forked child) in the page tier;
+     `free_socket_messages_answer_as_the_kernel_does`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:

@@ -1328,9 +1328,9 @@ pub struct Remote {
     /// A descriptor as text another process can rebuild it from, taking
     /// whatever reference keeps it alive in flight; `None` when it is
     /// something that cannot leave this process.
-    pub describe: fn(&crate::syscalls::Kernel, &Arc<OpenFile>) -> Option<String>,
+    pub describe: fn(&Arc<OpenFile>) -> Option<String>,
     /// The other half of [`Remote::describe`], in the receiving process.
-    pub rebuild: fn(&mut crate::syscalls::Kernel, &str) -> Option<Arc<OpenFile>>,
+    pub rebuild: fn(&crate::vfs::Namespace, &str) -> Option<Arc<OpenFile>>,
     /// The end's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
 }
@@ -1474,6 +1474,10 @@ impl Drop for RemoteUnix {
 impl crate::vfs::FileHandle for RemoteUnix {
     fn is_global_socket(&self) -> bool {
         true
+    }
+
+    fn as_remote_unix(self: Arc<Self>) -> Option<Arc<RemoteUnix>> {
+        Some(self)
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {

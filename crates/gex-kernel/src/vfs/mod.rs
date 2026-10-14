@@ -262,6 +262,16 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a unix socket in the global kernel, when it is one.
+    fn as_remote_unix(self: Arc<Self>) -> Option<Arc<crate::unix::RemoteUnix>> {
+        None
+    }
+
+    /// This handle as an internet socket, when it is one.
+    fn as_inet_socket(self: Arc<Self>) -> Option<Arc<crate::net::Socket>> {
+        None
+    }
+
     /// This handle as an epoll set, when it is one: `epoll_ctl` and
     /// `epoll_pwait` recover the set from the descriptor's handle, with or
     /// without the kernel.
@@ -309,8 +319,7 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
 
     /// Whether this is a socket in the global kernel (`unix::RemoteUnix`):
-    /// what a host asks of a parked thread's handle without the kernel's
-    /// table of them (`Kernel::remote_sockets`).
+    /// what a host asks of a parked thread's handle without the kernel.
     fn is_global_socket(&self) -> bool {
         false
     }
@@ -483,9 +492,100 @@ fn within(abs: &str, at: &str) -> bool {
     abs.starts_with(at) && matches!(abs.as_bytes().get(at.len()), None | Some(b'/'))
 }
 
-/// The mount table.
-#[derive(Clone)]
+/// A process's mount table and working directory, and its published
+/// [`Namespace`]: what a caller without the kernel lock reads
+/// ([`Vfs::view`], docs/kernel-locking.md §3.4). Every lookup is the
+/// namespace's (`Deref`); the three changes -- a mount, an unmount, a
+/// `chdir` -- are this type's, and publish.
 pub struct Vfs {
+    ns: Namespace,
+    view: NsCell,
+}
+
+/// A [`Vfs`]'s namespace as other threads read it: replaced whole on every
+/// change, so a reader holds one consistent table and directory for as long
+/// as it likes (an `Arc`), and a lookup through it runs outside every lock.
+pub struct VfsView {
+    cur: gex_atomic::rcu::Published<Arc<Namespace>>,
+}
+
+impl VfsView {
+    fn new(ns: &Namespace) -> VfsView {
+        VfsView { cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS) }
+    }
+
+    /// The namespace as it stands.
+    pub fn get(&self) -> Arc<Namespace> {
+        self.cur.read(crate::sync::me() as usize, Arc::clone)
+    }
+}
+
+/// A view a copy of the table does not share: a forked child's mounts and
+/// directory are its own.
+struct NsCell(Arc<VfsView>);
+
+impl Clone for Vfs {
+    fn clone(&self) -> Vfs {
+        Vfs { ns: self.ns.clone(), view: NsCell(Arc::new(VfsView::new(&self.ns))) }
+    }
+}
+
+impl std::ops::Deref for Vfs {
+    type Target = Namespace;
+    fn deref(&self) -> &Namespace {
+        &self.ns
+    }
+}
+
+impl Vfs {
+    pub fn new() -> Vfs {
+        let ns = Namespace::new();
+        let view = NsCell(Arc::new(VfsView::new(&ns)));
+        Vfs { ns, view }
+    }
+
+    /// The published namespace, the same view for this table's whole life.
+    pub fn view(&self) -> &Arc<VfsView> {
+        &self.view.0
+    }
+
+    /// Every build, the single-threaded page's too, which reads its
+    /// namespace the same way: a mount or a `chdir` is rare.
+    fn publish(&self) {
+        let ns = Arc::new(self.ns.clone());
+        self.view.0.cur.write(|_| (Some(ns), ()));
+    }
+
+    pub fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
+        self.ns.mount(at, fs);
+        self.publish();
+    }
+
+    /// Remove the mount at exactly this path ([`Namespace::unmount`]).
+    pub fn unmount(&mut self, path: &str) -> bool {
+        let gone = self.ns.unmount(path);
+        if gone {
+            self.publish();
+        }
+        gone
+    }
+
+    pub fn set_cwd(&mut self, path: &str) -> Result<(), Errno> {
+        self.ns.set_cwd(path)?;
+        self.publish();
+        Ok(())
+    }
+    /// Trade the working directory for `cwd`, unpublished: a thread with
+    /// its own (`unshare(CLONE_FS)`) has it here while its call runs, and
+    /// the view keeps the process's.
+    pub fn swap_cwd(&mut self, cwd: &mut String) {
+        std::mem::swap(&mut self.ns.cwd, cwd);
+    }
+}
+
+/// The mount table and working directory: every path lookup.
+#[derive(Clone)]
+pub struct Namespace {
     /// Mount point (absolute, no trailing slash except for "/") to backend.
     mounts: BTreeMap<String, Arc<dyn FileSystem>>,
     /// The mount points other than `/`, NUL-separated: what a walk of the
@@ -495,16 +595,16 @@ pub struct Vfs {
     pub cwd: String,
 }
 
-impl Vfs {
-    pub fn new() -> Vfs {
-        Vfs {
+impl Namespace {
+    fn new() -> Namespace {
+        Namespace {
             mounts: BTreeMap::new(),
             others: String::new(),
             cwd: "/".to_string(),
         }
     }
 
-    pub fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
+    fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
         let at = normalize(at, "/");
         self.mounts.insert(at, fs);
         self.list_others();
@@ -522,7 +622,7 @@ impl Vfs {
 
     /// Remove the mount at exactly this path. The root mount stays: a guest
     /// that unmounts `/` has nothing left to run from.
-    pub fn unmount(&mut self, path: &str) -> bool {
+    fn unmount(&mut self, path: &str) -> bool {
         let at = normalize(path, &self.cwd);
         let gone = at != "/" && self.mounts.remove(&at).is_some();
         if gone {
@@ -813,7 +913,7 @@ impl Vfs {
         normalize(path, &self.cwd)
     }
 
-    pub fn set_cwd(&mut self, path: &str) -> Result<(), Errno> {
+    fn set_cwd(&mut self, path: &str) -> Result<(), Errno> {
         let abs = normalize(path, &self.cwd);
         let md = self.metadata(&abs)?;
         if md.file_type != FileType::Directory {

@@ -225,8 +225,6 @@ pub(crate) fn stage_exec(h: &mut Host, path: &str, argv: &[String], envp: &[Stri
     let state = state_bytes(&h.kernel, true);
     *EXEC_PARTS.0.borrow_mut() = [cmd, fds, cwd, state];
     h.kernel.fds.close_all();
-    h.kernel.remote_sockets.clear();
-    h.kernel.sockets.clear();
     WHY.store(EXEC, Relaxed);
     set_resume_none();
     set_resume_ctx_none();

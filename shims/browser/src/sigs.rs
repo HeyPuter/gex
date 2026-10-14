@@ -32,6 +32,9 @@ pub(crate) struct Home {
     /// without the kernel (docs/kernel-locking.md §5.2 step 4).
     pub futexes: Arc<FutexTable>,
     map: Arc<MapView>,
+    /// Its namespace's published view, for a descriptor rebuilt from its
+    /// name (`recvmsg`'s `SCM_RIGHTS`).
+    vfs: Arc<gex_kernel::vfs::VfsView>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -58,6 +61,7 @@ pub(crate) fn publish(k: &Kernel) {
         clock: k.clock,
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
+        vfs: Arc::clone(k.vfs.view()),
     });
     HOME.store(Box::into_raw(home), Ordering::Release);
 }
@@ -176,6 +180,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     let by_kernel = |addr: u64, len: u64| {
         crate::with_host(|h| h.kernel.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end))
     };
+    let ns = home.vfs.get();
     let futex = FutexCx {
         table: &home.futexes,
         #[cfg(feature = "shared-memory")]
@@ -190,7 +195,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         clock: home.clock,
     };
     let f = Free {
-        io: FdIo { fds, compat },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid },
         signals: &view,
         procs: &home.procs,
         pid: home.pid,
