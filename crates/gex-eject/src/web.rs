@@ -450,10 +450,17 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
   #loading .track.busy .fill { width: 30%; animation: busy 1.2s ease-in-out infinite; }
   @keyframes busy { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
   #loading .detail { margin-top: 8px; min-height: 1.2em; }
+  /* What the running program is fetching (a lazy file, translated code). */
+  #fetching { position: fixed; right: 8px; bottom: 48px; z-index: 2147483645; max-width: calc(100vw - 32px);
+              padding: 3px 10px; border-radius: 4px; background: rgba(0, 0, 0, 0.72); color: #eee;
+              font: 12px system-ui, sans-serif; font-variant-numeric: tabular-nums; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; pointer-events: none; opacity: 0; transition: opacity 0.2s; }
+  #fetching.on { opacity: 1; }
 </style>
 </head>
 <body>
 <pre id="error"></pre>
+<div id="fetching" aria-live="polite"></div>
 <div id="loading" role="progressbar" aria-live="polite">
   <div class="box">
     <div class="row"><span class="phase">Loading</span><span class="time">0 s</span></div>
@@ -486,6 +493,21 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
     loading.classList.add('done');
     setTimeout(() => loading.remove(), 700);
   };
+  // After the start: what the program is fetching, in a corner, while it is.
+  const line = document.getElementById('fetching');
+  let off = 0;
+  const fetching = (f) => {
+    clearTimeout(off);
+    if (!f) {
+      off = setTimeout(() => line.classList.remove('on'), 400);
+      return;
+    }
+    const more = f.inflight > 1 ? ` (+${f.inflight - 1})` : '';
+    const of = f.total >= 1e6 ? `${mb(f.done)} of ${mb(f.total)} MB`
+      : `${Math.round(f.done / 1e3)} of ${Math.max(1, Math.round(f.total / 1e3))} KB`;
+    line.textContent = `Loading ${f.name}${f.total ? ` \u2014 ${of}` : ''}${more}`;
+    line.classList.add('on');
+  };
   const progress = (p) => {
     const d = p.download;
     const c = p.compile;
@@ -503,6 +525,7 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
       bar(null);
     } else if (p.phase === 'ready') {
       hide();
+      fetching(p.fetch);
     } else if (p.phase === 'failed' || p.phase === 'exited') {
       clearInterval(clock);
       $('.phase').textContent = p.phase === 'failed' ? 'Failed' : 'The program exited';
