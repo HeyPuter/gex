@@ -164,6 +164,9 @@ function progressMeter(state, onProgress) {
       };
       ch.onmessage = ({ data: m }) => {
         if (!m || typeof m.what !== 'string') return;
+        // A unit's indirect-call side file: a probe the runtime makes, not
+        // code the program waits for.
+        if (m.what.startsWith('unit:icall/')) return;
         let key = m.what;
         let name;
         let kind = 'file';
