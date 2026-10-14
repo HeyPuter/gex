@@ -44,6 +44,23 @@ cd "$W7_OUT"
 n=$(grep -c 'Cryptography\\\\Defaults\\\\Provider' "$I/system.reg" 2>/dev/null || true)
 e=$(grep -a '^child exit' "$L/wineboot.log" | tr -d '\r' || true)
 [ "${n:-0}" -gt 0 ] && [ "$e" = "child exit 0" ] || { echo "wineboot failed (rc $rc, ${e:-no exit}, $n crypto provider keys): logs/wineboot.log" >&2; exit 1; }
+# The install replaces modules that are loaded while it runs (kernel32,
+# shell32, ...) as pending renames (PendingFileRenameOperations); a boot
+# carries them out. Run one here: left in the prefix, they would replace
+# the Windows files 31 stages with Wine's at the session's first boot.
+step "wineboot -r: the install's pending renames (logs/wineboot-r.log)"
+cd "$I/drive_c"
+set +e
+timeout 1800 nice -n 10 "$G" run --env WINEPREFIX="$I" --env USER="$W7_USER" \
+  --env WINEDLLOVERRIDES=mscoree,mshtml= \
+  "$DIST/lib/wine/i386-unix/wine" 'C:\launch.exe' 'C:\windows\system32\wineboot.exe -r' > "$L/wineboot-r.log" 2>&1
+rc=$?
+set -e
+cd "$W7_OUT"
+e=$(grep -a '^child exit' "$L/wineboot-r.log" | tr -d '\r' || true)
+if [ "$e" != "child exit 0" ] || grep -q PendingFileRenameOperations "$I/system.reg" || ls "$I"/drive_c/windows/system32/dll*.tmp >/dev/null 2>&1; then
+  echo "wineboot -r left pending renames (rc $rc, ${e:-no exit}): logs/wineboot-r.log" >&2; exit 1
+fi
 rm -f "$I/drive_c/launch.exe"
 step "the page prefix"
 GRAPHICS=wayland "$GEX_SRC/tools/wine-wasm/page-prefix.sh" "$I" "$DIST" "$OUT"
