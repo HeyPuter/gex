@@ -9,6 +9,9 @@ struct gexgpu_server;
  * fills them with the webgpu.h the caller is compiled against). */
 struct gexgpu_server *gexgpu_server_create(const struct gexgpu_procs *procs);
 
+/* Releases everything the client made and frees the server. */
+void gexgpu_server_destroy(struct gexgpu_server *server);
+
 /* Handles a message of commands; the reply (call results, events) is valid
  * until the next call. Returns false for a malformed message. */
 bool gexgpu_server_handle(struct gexgpu_server *server, const void *data, size_t size,

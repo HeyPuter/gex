@@ -19,6 +19,7 @@ pub(crate) mod elfprov;
 pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
+pub mod gpu;
 pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
@@ -2840,6 +2841,11 @@ fn mount_filesystems(
         let dev = crate::gl::GlDevice::new(1024, 1024);
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
+    }
+    // WebGPU (docs/d3d-webgpu.md): every open a wire connection of its own,
+    // on the host's Dawn. Only in a build that has one (`webgpu`).
+    if gex_webgpu::AVAILABLE {
+        devfs.add_per_open("gex-gpu", Arc::new(|| crate::gpu::GpuConnection::new() as Arc<dyn gex_kernel::vfs::FileHandle>));
     }
     // Audio (W3.5): OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).

@@ -669,6 +669,41 @@ struct gexgpu_server *gexgpu_server_create(const struct gexgpu_procs *procs)
     return server;
 }
 
+void gexgpu_server_destroy(struct gexgpu_server *server)
+{
+    uint32_t id, instance_refs = 0;
+
+    current = server;
+    /* Everything but the instance first, so the callbacks the releases end
+     * (device lost, pending maps) still find the server, and run in the
+     * events processed after. */
+    for (id = server->object_capacity; id--;)
+    {
+        struct gexgpu_server_object *o = &server->objects[id];
+
+        if (!o->object)
+            continue;
+        if (o->type == GEXGPU_TYPE_Instance)
+            ++instance_refs;
+        else
+            gexgpu_server_release_object(server, o->type, o->object);
+        o->object = NULL;
+    }
+    if (server->instance)
+    {
+        server->procs.instanceProcessEvents(server->instance);
+        while (instance_refs--)
+            server->procs.instanceRelease(server->instance);
+    }
+    current = NULL;
+    arena_reset(server);
+    free(server->objects);
+    free(server->futures);
+    free(server->reply.data);
+    free(server->events.data);
+    free(server);
+}
+
 bool gexgpu_server_handle(struct gexgpu_server *server, const void *data, size_t size,
         const void **reply, size_t *reply_size)
 {
