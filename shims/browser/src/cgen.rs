@@ -1292,6 +1292,17 @@ pub(crate) fn unit_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).tier == Tier::Unit))
 }
 
+/// Whether a provider's function serves `addr` (a W3 builtin's export, an
+/// export provider): native code in place of the bytes there, which may be
+/// no code at all (a skeleton's `ud2` stub). A retirement of its page
+/// forgets the bridge and keeps the binding, so tier-1 must neither lift it
+/// (its discovery follows `call [iat]`) nor translate it at a miss, but
+/// bridge it again (`elfprov::rebridge`): IE8's Detours hooks beside
+/// user32's RegisterClassW ran its stub (c000001d).
+pub(crate) fn provider_serves(addr: u64) -> bool {
+    ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).module >= PROVIDER))
+}
+
 /// Whether a current JIT function serves `addr` (its pages unchanged since).
 /// After the JIT forgets (`fjit::on_retire`) this is what still knows
 /// which functions it has made.

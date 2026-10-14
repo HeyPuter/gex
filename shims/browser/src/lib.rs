@@ -13857,11 +13857,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let translated = match pre {
         MissPre::Done(t) => t,
         MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
+    // A provider's address counts as known: a miss there is bridged again
+    // (`cgen::provider_serves`), its bytes may be a `ud2` stub.
     let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&a),
+            &|a| known.contains(&a) || crate::cgen::provider_serves(a),
             table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
@@ -14563,7 +14565,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         map.end,
         &seeds,
         &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-        &|a| known.contains(&a),
+        &|a| known.contains(&a) || crate::cgen::provider_serves(a),
         page_table,
         Default::default(),
         MAX_OBJECT_BLOCKS,
