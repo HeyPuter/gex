@@ -514,7 +514,7 @@ mod imp {
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
-    const REC: usize = 37;
+    const REC: usize = 56;
     const EV: usize = 8;
     /// The client number NT windows go by in this process's block. A Windows
     /// process has no Wayland clients of its own, so there is nobody to

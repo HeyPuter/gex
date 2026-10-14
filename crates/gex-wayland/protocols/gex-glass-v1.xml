@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="gex_glass_v1">
+  <copyright>
+    Copyright 2026 the gex authors. Same terms as the rest of gex.
+  </copyright>
+
+  <description summary="blur-behind and tint: Windows 7's glass">
+    Windows 7 draws Aero's glass in its compositor (DWM): parts of a window
+    show what is beneath them, blurred and tinted with the colorization
+    colour. A Win32 window asks for it with DwmExtendFrameIntoClientArea and
+    DwmEnableBlurBehindWindow, and its glass frame is glass as well. Here the
+    client names those parts of a surface; the compositor fills them with the
+    blurred backdrop and draws the surface's own pixels over it, alpha
+    blended, as DWM does.
+
+    State takes effect at once, like gex_window_placement_v1's: a window
+    changing its glass does not need new contents.
+  </description>
+
+  <interface name="gex_glass_manager_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Glass objects already made are unaffected.
+      </description>
+    </request>
+
+    <request name="get_glass">
+      <description summary="give a surface glass">
+        The surface has no glass until a region is set.
+      </description>
+      <arg name="id" type="new_id" interface="gex_glass_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="gex_glass_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="no more glass">
+        The surface is drawn as an ordinary one.
+      </description>
+    </request>
+
+    <request name="set_region">
+      <description summary="where the surface is glass">
+        In surface coordinates; null is the whole surface, an empty region no
+        glass. The region is copied as it is now. A compositor may keep only
+        a few rectangles of it, and the bounds of the rest.
+      </description>
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+
+    <request name="set_colorization">
+      <description summary="the tint">
+        DWM's colorization parameters: the colour (ARGB, its alpha the
+        colour's own strength), how much of it is mixed over the blurred
+        backdrop (balance), and how much of the blurred backdrop shows
+        (blur_balance), both 0 to 100.
+      </description>
+      <arg name="argb" type="uint"/>
+      <arg name="balance" type="uint"/>
+      <arg name="blur_balance" type="uint"/>
+    </request>
+  </interface>
+</protocol>

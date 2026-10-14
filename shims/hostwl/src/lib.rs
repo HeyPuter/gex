@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 /// Words in one published surface record, and words in one input event. The
 /// same layout the guest shim publishes, because the page reads one arena.
-const REC: usize = 37;
+const REC: usize = 56;
 const EV: usize = 8;
 const TITLE_BYTES: usize = 32;
 
@@ -552,4 +552,6 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
     r[33..37].copy_from_slice(&info.input_words());
+    // Its glass, if its client asked for some (`gex_glass_v1`).
+    r[37..56].copy_from_slice(&info.glass.record_words());
 }
