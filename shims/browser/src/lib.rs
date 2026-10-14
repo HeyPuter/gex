@@ -6359,7 +6359,7 @@ pub extern "C" fn gex_park(_max_ms: u32) -> i32 {
 /// the one its wait registered with.
 #[no_mangle]
 pub extern "C" fn gex_wait_bound_ms(max_ms: u32) -> u32 {
-    let ms = waitq::park_ns(now_ns()).map_or(max_ms as u64, |ns| (ns / 1_000_000).min(max_ms as u64));
+    let ms = waitq::park_ns(turn_now()).map_or(max_ms as u64, |ns| (ns / 1_000_000).min(max_ms as u64));
     ms.max(1) as u32
 }
 
@@ -6537,9 +6537,15 @@ pub extern "C" fn gex_cmdline(out: u32, max: u32) -> u32 {
     n as u32
 }
 
-/// Nanoseconds spent inside syscalls, and how many there were. Always kept.
+/// Nanoseconds spent inside syscalls, and how many there were: kept while
+/// [`sys_timed`] (a heartbeat or a trace), so both read 0 in a plain run.
 static SYS_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether syscalls are timed and counted (`SYS_TOTAL_NS`, `SYS_CALLS`).
+fn sys_timed() -> bool {
+    (unsafe { HEARTBEAT } != 0) || tracing()
+}
 
 /// How long this process has spent in syscalls, in microseconds.
 #[no_mangle]
@@ -6643,6 +6649,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if let Some(p) = nt::process() {
         return nt::syscall(p, ctx, pc);
     }
+    // One clock reading for the whole call (`turn_now`), taken when first
+    // asked: most calls never ask.
+    let _now = NowScope::open();
     // A stateful provider's syscall (`PROVIDER_SYSCALL` set by the page's glue,
     // cgen/libprov.rs): its wasm frames cannot be left, so it is served as a
     // wasm32 program's is -- a blocking call waits here, a thread or a child
@@ -6865,11 +6874,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // done inside the locked section below: each took the host lock on its
     // own, and with a W3 game's ~25 Wine Workers contending for it every take
     // costs (Undertale's game thread spent ~14 ms a frame on this path).
-    // Time every syscall, always: a blocking call parks the Worker here, so
-    // this covers waiting as well as work, and `guest` is the majority of a
-    // warm process. The per-number census above stays behind the heartbeat.
-    let began = now_ns();
-    SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Every syscall timed, with a heartbeat or a trace on (`sys_timed`): a
+    // blocking call parks the Worker here, so this covers waiting as well as
+    // work. Off by default: two clock reads (JS calls) and two read-modify-
+    // writes on counters every Worker shares cost more than a lock-free call.
+    let timed = sys_timed();
+    let began = if timed { now_ns() } else { 0 };
+    if timed {
+        SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
     let mut mapped = Vec::new();
@@ -7258,16 +7271,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         // if the kernel gave none, which it always does for a
                         // real FUTEX_WAIT.
                         parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
-                        deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
+                        deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
                     },
-                    gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
+                    gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(turn_now() + d.as_nanos() as u64),
                     // A priority-inheritance lock: tried when the thread runs
                     // again (`finish_parked`), and the syscall made again until
                     // it is taken (`PI_RETRY`); a short sleep between tries.
                     gex_kernel::BlockOp::FutexLockPi { uaddr, deadline, .. } => Waiting::Pi {
                         addr: *uaddr,
                         gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
-                        deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
+                        deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
@@ -7295,7 +7308,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // scheduler on its way round.
                     gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
                     gex_kernel::BlockOp::Poll { deadline, .. } => {
-                        Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64))
+                        Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64))
                     }
                     // `WNOHANG` answers straight away; anything else waits
                     // for the child, which may not have started yet.
@@ -7432,7 +7445,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     };
     gl::DEFER.with(|d| d.set(false));
     gl::submit_pending(ctx as u32 as u64);
-    {
+    if timed {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         if unsafe { HEARTBEAT } != 0 {
@@ -7797,6 +7810,9 @@ fn wasm32_wait(pc: u64) -> i32 {
     // Worker's wait slot.
     let mut said = PAGE_WAIT_SAID.with(|c| c.get());
     loop {
+        // A pass reads the clock once (`turn_now`); the park below lets
+        // time pass, and the next pass reads it again.
+        let _now = NowScope::open();
         let picked = schedule();
         if picked == 1 {
             let here = my_ctx();
@@ -10381,6 +10397,57 @@ fn now_ns() -> u64 {
     host_now_ns()
 }
 
+thread_local! {
+    /// The clock as this pass first read it ([`turn_now`]); 0 for unread.
+    static TURN_NOW: Cell<u64> = const { Cell::new(0) };
+    /// Whether a [`NowScope`] is open on this Worker.
+    static NOW_SCOPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The clock for one pass through the kernel: inside a [`NowScope`] (a
+/// syscall, a turn of a wasm32 program's wait loop) it is read once, lazily,
+/// and every later question in the pass gets the same answer; outside one,
+/// each call reads it. The host's clock is a JS call (`performance.now`,
+/// about 0.5 us in Chrome), and a syscall that blocked asked it up to five
+/// times (its deadline, the process timer, readiness, how the wait ended,
+/// how long to park): 37% of a pipe ping-pong's busy time.
+pub(crate) fn turn_now() -> u64 {
+    if !NOW_SCOPED.with(|s| s.get()) {
+        return now_ns();
+    }
+    TURN_NOW.with(|c| match c.get() {
+        0 => {
+            let n = now_ns().max(1);
+            c.set(n);
+            n
+        }
+        n => n,
+    })
+}
+
+/// Time has passed (this Worker parked): the next [`turn_now`] reads again.
+pub(crate) fn stale_now() {
+    TURN_NOW.with(|c| c.set(0));
+}
+
+/// A pass whose clock questions share one reading ([`turn_now`]). Nested
+/// scopes start their own reading; the outer one reads again after.
+pub(crate) struct NowScope(bool);
+
+impl NowScope {
+    pub(crate) fn open() -> NowScope {
+        stale_now();
+        NowScope(NOW_SCOPED.with(|s| s.replace(true)))
+    }
+}
+
+impl Drop for NowScope {
+    fn drop(&mut self) {
+        NOW_SCOPED.with(|s| s.set(self.0));
+        stale_now();
+    }
+}
+
 /// What a scheduler turn that found nothing to run saw, under the one lock
 /// it took to decide: everything the idle path then acts on, so that a pass
 /// of a waiting Worker's loop takes the kernel's lock once rather than seven
@@ -10779,7 +10846,7 @@ fn idle_look(h: &mut Host) -> IdleLook {
     // through, let its Worker pick it, and only the genuinely
     // all-blocked case (no thread ready) reaches the report.
     let all_blocked = why == 0 && {
-        let now = now_ns();
+        let now = turn_now();
         let k = &mut h.kernel;
         h.threads
             .iter()
@@ -11087,7 +11154,7 @@ fn pick_turn(h: &mut Host) -> Pick {
         h.exit.get_or_insert(code);
         return Pick::Over;
     }
-    let now = now_ns();
+    let now = turn_now();
     // Nothing to choose: this Worker owns one table entry and the
     // engine schedules the rest, so picking any *other* runnable thread
     // would put two Workers on one set of registers.
@@ -11130,7 +11197,7 @@ fn pick_turn(h: &mut Host) -> Pick {
         if fresh
             && {
                 let sig = any_signal(h);
-                thread_ready(&h.threads[i], now_ns(), sig)
+                thread_ready(&h.threads[i], turn_now(), sig)
             }
         {
             return Pick::Again;
@@ -11191,7 +11258,7 @@ fn finish_mine(signalled: bool) -> i32 {
         SCHED_OVER.with(|c| c.set(true));
         return 2;
     }
-    let now = now_ns();
+    let now = turn_now();
     if !wait_ready(&r.waiting, &r.blocked_on, now, signalled) {
         // What the idle turn asked was the registered copy of this same
         // wait; the next turn asks again.
@@ -11280,7 +11347,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         gex_kernel::BlockOp::WriteStream { handle, .. } => Waiting::Write(Arc::clone(handle)),
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
-        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64)),
+        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
         _ => unreachable!("a class call parks only on a stream or a poll"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
@@ -11310,7 +11377,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
     loop {
         let sig = sigs::ready();
         let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
-        let now = now_ns();
+        let now = turn_now();
         if wait_ready(&r.waiting, &r.blocked_on, now, sig) {
             let (timed_out, by_signal) = how_ended(&r, now, sig);
             waitq::leave();
@@ -11338,7 +11405,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         if fresh && {
             let sig = sigs::ready();
             let r = run.lock().unwrap_or_else(|e| e.into_inner());
-            wait_ready(&r.waiting, &r.blocked_on, now_ns(), sig)
+            wait_ready(&r.waiting, &r.blocked_on, turn_now(), sig)
         } {
             continue;
         }
