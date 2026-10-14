@@ -2424,7 +2424,7 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
 /// `gexc cgen-split instrument IN OUT`: a unit whose guest functions call
 /// `gexcov.hit(slot)` on entry (recording which ones a run called).
 /// `gexc cgen-split split IN OUTDIR --hot FILE [--cluster function|unit|graph[:KiB]]`:
-/// the unit split by function (gex_cgen::split): OUTDIR/c.wasm (the slots in
+/// the unit split by function (gex_split): OUTDIR/c.wasm (the slots in
 /// FILE, one slot or `a-b` range per line, and a stub for every other) and
 /// OUTDIR/cold/N.wasm per cluster.
 fn cmd_cgen_split(args: &[String]) -> Result<()> {
@@ -2442,13 +2442,13 @@ fn cmd_cgen_split(args: &[String]) -> Result<()> {
     let wasm = std::fs::read(input).with_context(|| format!("reading {input}"))?;
     match what.as_str() {
         "instrument" => {
-            let w = gex_cgen::split::instrument(&wasm)?;
+            let w = gex_split::instrument(&wasm)?;
             std::fs::write(out, &w)?;
             eprintln!("{input}: instrumented, {} -> {} bytes", wasm.len(), w.len());
         }
         "split" => {
             let hot_file = opt("--hot").context("--hot FILE")?;
-            let how: gex_cgen::split::Clustering = opt("--cluster").as_deref().unwrap_or("graph").parse()?;
+            let how: gex_split::Clustering = opt("--cluster").as_deref().unwrap_or("graph").parse()?;
             let mut hot = HashSet::new();
             for line in std::fs::read_to_string(&hot_file)?.lines() {
                 let l = line.trim();
@@ -2462,7 +2462,7 @@ fn cmd_cgen_split(args: &[String]) -> Result<()> {
                     }
                 }
             }
-            let (primary, clusters, of) = gex_cgen::split::split(&wasm, &hot, how)?;
+            let (primary, clusters, of) = gex_split::split(&wasm, &hot, how)?;
             let dir = std::path::Path::new(out.as_str());
             std::fs::create_dir_all(dir.join("cold"))?;
             // Each slot's cluster, a line each (`-`: the primary's).

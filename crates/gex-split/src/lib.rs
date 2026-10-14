@@ -5,6 +5,11 @@
 //! of its functions is called. Nothing is compiled again and nothing is
 //! translated at run time: a cold function's code is clang's, moved.
 //!
+//! A crate of its own, not a gex-cgen module: a unit's cache key hashes
+//! gex-cgen's sources (its `build.rs`), and the split, a step after the
+//! link that changes nothing a unit is built from, must not re-key every
+//! unit (it did, and an ejected page missed all 59 of Paint's units).
+//!
 //! A unit's module is position-independent: it imports the memory, the
 //! process's function table, `__table_base` and a few host functions, and its
 //! one element segment fills the table from `__table_base` with every guest
