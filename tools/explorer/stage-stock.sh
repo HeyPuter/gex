@@ -36,9 +36,13 @@ put() {  # put IMAGE_DIR NAME DEST_DIR
 # directories of IMG, over the template's): their shortcuts stay (the prune
 # below keeps a link only when its program is here) and show the programs'
 # own icons and names, whether or not a program starts yet.
-STOCK=${STOCK-"OobeFldr.dll calc.exe mspaint.exe MFC42u.dll StikyNot.exe SNTSearch.dll SnippingTool.exe Magnify.exe Magnification.dll mstsc.exe mstscax.dll iertutil.dll urlmon.dll"}
-STOCK_DIRS=${STOCK_DIRS-"Program Files/Internet Explorer:Program Files/Windows Media Player:Program Files/Microsoft Games:Windows/ehome"}
+STOCK=${STOCK-"OobeFldr.dll calc.exe mspaint.exe MFC42u.dll StikyNot.exe SNTSearch.dll SnippingTool.exe Magnify.exe Magnification.dll mstsc.exe mstscax.dll iertutil.dll urlmon.dll notepad.exe write.exe"}
+STOCK_DIRS=${STOCK_DIRS-"Program Files/Internet Explorer:Program Files/Windows Media Player:Program Files/Microsoft Games:Windows/ehome:Program Files/Windows NT/Accessories"}
 for n in $STOCK; do put "$S" "$n" "$D/system32"; done
+# Notepad is in the Windows directory too (its shortcut and file
+# associations name either copy): Windows 7's over Wine's, like WordPad's
+# (STOCK_DIRS) and write.exe (STOCK), which starts WordPad
+put "$IMG/Windows" notepad.exe "$D"
 # system32 files the image has only in its component store (winsxs), which
 # setup projects when it turns the component on: the card games' common
 # library (Solitaire: "Unable to find the file [CardGames.dll]") and Paint's
