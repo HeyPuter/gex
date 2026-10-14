@@ -65,4 +65,15 @@ if (!text.includes(expect)) console.log(`info: ${await ev('location.href')}: ${J
 check(text.includes(expect), `the program's output has ${JSON.stringify(expect)} (${JSON.stringify(text.slice(0, 200))})`);
 if (status !== null) check(shown.includes(`exited (${status})`), `the page says it exited ${status} (${JSON.stringify(shown)})`);
 check(loads.length === 1 && loads[0] === '/', `one load of the project's page (${loads.join(' ')})`);
+// start()'s progress: whole totals from the manifest, all of them read, and
+// the phases in order.
+{
+  const p = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.progress ?? null)')) ?? 'null');
+  const d = p?.download;
+  check(!!d && d.total > 0 && d.done === d.total && d.files > 0 && d.filesDone === d.files,
+    `start()'s download is whole and all read (${d ? `${d.done} of ${d.total} bytes, ${d.filesDone} of ${d.files} files` : 'no progress'})`);
+  const at = p?.at ?? {};
+  check(at.boot !== undefined && at.ready !== undefined && at.download <= at.boot && at.boot <= at.ready,
+    `its phases in order (${JSON.stringify(at)})`);
+}
 done();
