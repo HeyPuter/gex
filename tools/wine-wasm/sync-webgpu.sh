@@ -11,8 +11,8 @@ python3 "$GEX/tools/gen_webgpu_wire.py" >/dev/null
 mkdir -p "$DLL/gen"
 cp "$GEX/guest/gpu/wire.h" "$GEX/guest/gpu/wire-client.c" "$GEX/guest/gpu/wire-server.c" \
    "$GEX/guest/gpu/wire-server.h" "$DLL/"
-cp "$GEX/guest/gpu/gen/wire-gen.h" "$GEX/guest/gpu/gen/wire-client-gen.c" \
-   "$GEX/guest/gpu/gen/wire-server-gen.c" "$DLL/gen/"
+cp "$GEX/guest/gpu/gen/wire-gen.h" "$GEX/guest/gpu/gen/wire-client-gen.inc" \
+   "$GEX/guest/gpu/gen/wire-server-gen.inc" "$DLL/gen/"
 cp "$GEX/third_party/dawn-api/webgpu.h" "$WINE/include/webgpu.h"
 # Every entry point the client defines, by name; their arguments are C's
 # business (the relay does not see them).

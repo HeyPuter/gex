@@ -13,8 +13,8 @@ the standard API is carried, not Dawn's extensions (items tagged "dawn",
 
 Output (guest/gpu/gen/):
   wire-gen.h          opcodes, object types, the server's proc table
-  wire-client-gen.c   the client's serialisers and generated entry points
-  wire-server-gen.c   the server's deserialisers and dispatch
+  wire-client-gen.inc   the client's serialisers and generated entry points
+  wire-server-gen.inc   the server's deserialisers and dispatch
   wire-rename-gen.h   wgpuX -> gex_wgpuX, for a client linked beside a real
                       webgpu.h in one process (the tests)
 
@@ -794,8 +794,8 @@ class Gen:
         rename += ['', '#endif', '']
 
         os.makedirs(OUT, exist_ok=True)
-        for fname, lines in (('wire-gen.h', header), ('wire-client-gen.c', client),
-                             ('wire-server-gen.c', server), ('wire-rename-gen.h', rename)):
+        for fname, lines in (('wire-gen.h', header), ('wire-client-gen.inc', client),
+                             ('wire-server-gen.inc', server), ('wire-rename-gen.h', rename)):
             with open(os.path.join(OUT, fname), 'w') as f:
                 f.write('\n'.join(lines))
         print(f'{len(self.ops)} ops, {len(done)} structs serialised, {len(self.out_needed)} out structs')

@@ -1,11 +1,16 @@
 /* The server half of the gex WebGPU wire: makes a client's commands on a
  * real webgpu.h, given as a proc table (wire.h).
  *
- * Most commands are generated (gen/wire-server-gen.c). Those here have
+ * Most commands are generated (gen/wire-server-gen.inc). Those here have
  * callbacks: the server makes the call with its own callback, which puts
  * the result in an event record for the client, under the client's cookie.
  * Its callbacks are AllowProcessEvents, so they fire in WaitAny and
  * ProcessEvents, which the client's WAIT and PROCESS_EVENTS commands make. */
+
+/* In a Wine DLL, the server is Unix-side code. */
+#if 0
+#pragma makedep unix
+#endif
 
 #include "wire.h"
 #include "wire-server.h"
@@ -380,7 +385,7 @@ static struct request_context *request_context(struct gexgpu_server *server, uin
 static bool gexgpu_server_dispatch_handwritten(struct gexgpu_server *server, uint32_t op,
         struct gexgpu_reader *r);
 
-#include "gen/wire-server-gen.c"
+#include "gen/wire-server-gen.inc"
 
 static bool gexgpu_server_dispatch_handwritten(struct gexgpu_server *server, uint32_t op,
         struct gexgpu_reader *r)
