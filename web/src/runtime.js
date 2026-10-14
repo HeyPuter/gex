@@ -704,17 +704,25 @@ async function runProgramHere(
 
   // WebGPU: the server runs here, on the page's thread, and every Worker
   // reaches it over its own shared buffers (gpu-bridge.mjs).
+  // With a compositor, the server moves to its worker once it exists (see
+  // `hostGpu` below): the channel is made here either way.
   let gpuChannel = null;
+  const gpuServerUrl = new URL('/gex/gexgpu-server.mjs', globalThis.location?.href ?? 'http://localhost/').href;
   if (webgpu && globalThis.crossOriginIsolated && globalThis.navigator?.gpu) {
-    const { makeGpuChannel, serveGpu, GpuServer } = await import('@gex/gpu-bridge.mjs');
+    const { makeGpuChannel } = await import('@gex/gpu-bridge.mjs');
+    gpuChannel = makeGpuChannel();
+  }
+  let gpuHosted = false;
+  const hostGpuHere = async () => {
+    if (!gpuChannel || gpuHosted) return;
+    gpuHosted = true;
+    const { serveGpu, GpuServer } = await import('@gex/gpu-bridge.mjs');
     try {
-      const server = await GpuServer.load(new URL('/gex/gexgpu-server.mjs', location.href).href);
-      gpuChannel = makeGpuChannel();
-      serveGpu(server, gpuChannel);
+      serveGpu(await GpuServer.load(gpuServerUrl), gpuChannel);
     } catch (e) {
       console.warn('[gex] no WebGPU server for /dev/gex-gpu', e);
     }
-  }
+  };
 
   // The network: the page's Wisp connection, which every Worker calls across
   // shared memory. A WebSocket in the guest's own Worker delivers on that
@@ -775,6 +783,15 @@ async function runProgramHere(
       const { Compositor } = await import('./compositor.js');
       compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas, { scale: wlScale });
       globalThis.__gexCompositor = compositor;
+      // WebGPU's server on the compositor's device, so a guest's frames can
+      // be its textures; the page's own if the compositor cannot.
+      if (gpuChannel && !gpuHosted) {
+        gpuHosted = true;
+        await compositor.hostGpu(gpuChannel, gpuServerUrl).catch((e) => {
+          console.warn('[gex] the compositor will not serve WebGPU; the page does', e);
+          gpuHosted = false;
+        });
+      }
       if (gl === 'compositor' && glChannel) {
         const opts = {
           api: 'core',
@@ -878,6 +895,9 @@ async function runProgramHere(
     ]);
     if (ok === 'timeout') term.writeln('gex: the X server did not come up in 60s');
   }
+
+  // No compositor took the WebGPU server: the page serves it.
+  await hostGpuHere();
 
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,

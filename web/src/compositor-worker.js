@@ -2073,6 +2073,17 @@ function glFrame() {
   return { tex, w: tex.width, h: tex.height, serial: glDevice?.presentedCount?.() ?? 0 };
 }
 
+/** The WebGPU wire's server (gpu-bridge.mjs) for every guest, on this
+ *  worker's device. */
+async function startGpu(m) {
+  const { GpuServer, serveGpu } = await import('@gex/gpu-bridge.mjs');
+  const { adapter, device } = await requestGexDevice();
+  gpuServer = await GpuServer.load(m.url, { adapter, device });
+  serveGpu(gpuServer, m.channel);
+}
+
+let gpuServer = null;
+
 async function startGl(m, canvas) {
   // Mesa presents into a canvas of its own whose 'webgpu' context is a
   // texture on the compositor's device: its frames are drawn into the scene
@@ -2164,6 +2175,11 @@ const onMessage = ({ data: m }) => {
         if (m.drawOnPublish !== false && !globalThis.GEX_NO_PUBDRAW) onPublishes(m.channel);
         post({ kind: 'ready' });
       }).catch((e) => post({ kind: 'error', error: e?.stack || String(e) }));
+    } else if (m.kind === 'gpu') {
+      // The guest's WebGPU (/dev/gex-gpu), served on this worker's device,
+      // so a guest's textures are on the device that draws the screen.
+      startGpu(m).then(() => post({ kind: 'gpu-ready' }),
+        (e) => post({ kind: 'gpu-failed', error: e?.message || String(e) }));
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its

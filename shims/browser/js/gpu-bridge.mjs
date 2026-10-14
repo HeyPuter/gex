@@ -48,9 +48,21 @@ export class GpuServer {
   #servers = new Map();
   #next = 1;
 
-  static async load(url) {
+  #shared = false;
+
+  /** `shared`: `{ adapter, device }` every connection is given (the
+   *  compositor's, so a guest's textures are on the device that draws the
+   *  screen); without it, each connection asks the browser for its own. */
+  static async load(url, shared = null) {
     const { default: create } = await import(/* @vite-ignore */ url);
-    return new GpuServer(await create());
+    const module = await create();
+    const server = new GpuServer(module);
+    if (shared) {
+      module.gexAdapter = shared.adapter;
+      module.gexDevice = shared.device;
+      server.#shared = true;
+    }
+    return server;
   }
 
   constructor(module) {
@@ -58,7 +70,7 @@ export class GpuServer {
   }
 
   open() {
-    const server = this.#m._gexgpu_web_create();
+    const server = this.#shared ? this.#m._gexgpu_web_create_shared() : this.#m._gexgpu_web_create();
     if (!server) return -1;
     const id = this.#next++;
     this.#servers.set(id, server);
