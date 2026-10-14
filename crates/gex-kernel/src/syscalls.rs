@@ -694,7 +694,7 @@ pub struct Kernel {
     /// reported rather than executed.
     pub pin_landed: Vec<(String, u64, u64)>,
     /// File mappings whose writes are meant to reach the file.
-    pub shared_maps: Vec<SharedMap>,
+    pub shared_maps: SharedMaps,
     /// The working directories of threads that left the process's
     /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
     /// the length of each of that thread's system calls.
@@ -2992,12 +2992,94 @@ impl CodeMap {
 /// A file mapping here is an eager copy rather than a page table pointed at
 /// the file, so the two are only the same thing until somebody writes. This
 /// is what makes them the same thing again.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SharedMap {
     pub start: u64,
     pub len: u64,
     pub file: Arc<OpenFile>,
     pub offset: u64,
+}
+
+/// A process's shared file mappings ([`SharedMap`]), and their published
+/// copy ([`SharedMaps::view`]): what a caller without the kernel lock reads
+/// (the page's compositor, finding a client's pool; docs/kernel-locking.md
+/// §3.10). Read as a slice (`Deref`); the two changes, a mapping added and
+/// mappings dropped, are this type's, and publish.
+#[derive(Debug)]
+pub struct SharedMaps {
+    list: Vec<SharedMap>,
+    view: Arc<SharedMapView>,
+}
+
+/// A [`SharedMaps`]'s list as other threads read it: replaced whole on every
+/// change, so a reader holds one consistent list for as long as it likes.
+pub struct SharedMapView {
+    cur: gex_atomic::rcu::Published<Arc<[SharedMap]>>,
+}
+
+impl std::fmt::Debug for SharedMapView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedMapView")
+    }
+}
+
+impl SharedMapView {
+    fn new(list: &[SharedMap]) -> SharedMapView {
+        SharedMapView { cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS) }
+    }
+
+    /// The mappings as they stand.
+    pub fn get(&self) -> Arc<[SharedMap]> {
+        self.cur.read(crate::sync::me() as usize, Arc::clone)
+    }
+
+    /// The mapping of `file`, if it is mapped shared.
+    pub fn of(&self, file: &Arc<OpenFile>) -> Option<SharedMap> {
+        self.cur.read(crate::sync::me() as usize, |l| l.iter().find(|m| Arc::ptr_eq(&m.file, file)).cloned())
+    }
+}
+
+impl SharedMaps {
+    pub fn new() -> SharedMaps {
+        SharedMaps { list: Vec::new(), view: Arc::new(SharedMapView::new(&[])) }
+    }
+
+    /// The published list, the same view for this process's whole life.
+    pub fn view(&self) -> &Arc<SharedMapView> {
+        &self.view
+    }
+
+    fn publish(&self) {
+        let l: Arc<[SharedMap]> = self.list.as_slice().into();
+        self.view.cur.write(|_| (Some(l), ()));
+    }
+
+    pub fn push(&mut self, map: SharedMap) {
+        self.list.push(map);
+        self.publish();
+    }
+
+    /// Keep the mappings `keep` says to; publishes only on a change.
+    pub fn retain(&mut self, keep: impl FnMut(&SharedMap) -> bool) {
+        let n = self.list.len();
+        self.list.retain(keep);
+        if self.list.len() != n {
+            self.publish();
+        }
+    }
+}
+
+impl Default for SharedMaps {
+    fn default() -> SharedMaps {
+        SharedMaps::new()
+    }
+}
+
+impl std::ops::Deref for SharedMaps {
+    type Target = [SharedMap];
+    fn deref(&self) -> &[SharedMap] {
+        &self.list
+    }
 }
 
 /// A child process the kernel is tracking.
@@ -3266,7 +3348,7 @@ impl Kernel {
             wasm32: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
-            shared_maps: Vec::new(),
+            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -3524,7 +3606,7 @@ impl Kernel {
             wasm32: self.wasm32,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
-            shared_maps: Vec::new(),
+            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -6600,7 +6682,7 @@ impl Kernel {
             return Ok(());
         }
         let (lo, hi) = (addr, addr.saturating_add(len));
-        for map in &self.shared_maps {
+        for map in self.shared_maps.iter() {
             let from = map.start.max(lo);
             let to = (map.start + map.len).min(hi);
             if from >= to {
@@ -10048,6 +10130,30 @@ mod tests {
         set_args(&mut m, at, nr::IOCTL, &[pr, FIONBIO, 0x26000]);
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
         assert_ne!(k.fds.get(pr as i32).unwrap().flags() & oflags::O_NONBLOCK, 0);
+    }
+
+    /// The shared mappings' published view (docs/kernel-locking.md §3.10,
+    /// L8) follows the list: what the page's compositor reads without the
+    /// kernel to find a client's pool. A mapping added is seen, one dropped
+    /// is gone, a reader's copy stays whole, and a forked copy's view is
+    /// its own.
+    #[test]
+    fn the_shared_map_view_follows_the_list() {
+        let file = |name: &str| OpenFile::new(Arc::new(crate::unix::MemFd::new(name)), name.into(), 0, true, true);
+        let (a, b) = (file("a"), file("b"));
+        let mut maps = SharedMaps::new();
+        let view = Arc::clone(maps.view());
+        assert!(view.of(&a).is_none());
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0 });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0 });
+        let held = view.get();
+        assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
+        assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
+        maps.retain(|m| m.start != 0x10000);
+        assert!(view.of(&a).is_none(), "gone when dropped");
+        assert!(view.of(&b).is_some());
+        assert_eq!(held.len(), 2, "a reader's copy is whole");
+        assert_eq!(maps.len(), 1);
     }
 
     #[test]

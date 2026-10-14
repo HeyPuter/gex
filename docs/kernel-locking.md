@@ -519,6 +519,17 @@ in the scheduler pick after each wake of the global WAKE word: about
      single-thread builds.
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
+   - The compositor's pump (L8): no lock. What it asked of the kernel is
+     published: the shared file mappings (`SharedMaps`, a list republished
+     on every `mmap(MAP_SHARED)` and every unmap that drops one, read as
+     `SharedMapView`, which is where a client's `wl_shm` pool is), and the
+     process's program and X socket names (`wl::ProcCx`, set at a
+     process's start, a fork, a vfork's return and an exec). Pumps from
+     several Workers are serialised by the device's own sessions lock.
+     After L7 it was the last per-frame taker in the Noita page (60 a
+     second in Noita's process, 16 in each Wine process's). Legs:
+     `the_shared_map_view_follows_the_list`; the Noita page and the core
+     gate's browser and gears legs, which pump.
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

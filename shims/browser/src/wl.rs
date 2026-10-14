@@ -229,13 +229,58 @@ static COMPOSITOR: std::sync::Mutex<Option<WaylandDevice>> = std::sync::Mutex::n
 
 /// Whether this process's compositor has anything to move (`needs_pump`),
 /// for a scheduler turn that takes no lock (`waitq::idle_turn`): if so, the
-/// turn takes the lock and pumps. A compositor busy elsewhere is a yes.
+/// turn pumps (`pump_if_wanted`). A compositor busy elsewhere is a yes.
 pub fn pump_wanted() -> bool {
     let device = match COMPOSITOR.try_lock() {
         Ok(d) => d.clone(),
         Err(_) => return true,
     };
     device.is_some_and(|d| d.needs_pump())
+}
+
+/// What the pump needs of its process, read without the kernel lock
+/// (docs/kernel-locking.md §3.10): the shared mappings' published view (a
+/// client's pool), the program (whether it is the X server whose windows
+/// this compositor manages), and how to reach that server's socket. Set
+/// under the lock where they change: a process's start, a fork's child, a
+/// vfork's return, an exec (`publish_process`).
+pub(crate) struct ProcCx {
+    maps: Arc<gex_kernel::syscalls::SharedMapView>,
+    exe_path: String,
+    x_server: bool,
+    pub(crate) unix_remote: Option<gex_kernel::unix::Remote>,
+    pub(crate) socket_names: Arc<gex_kernel::unix::SocketNames>,
+}
+
+static PROC_CX: Mutex<Option<Arc<ProcCx>>> = Mutex::new(None);
+
+/// Publish `kernel`'s process for the pump ([`ProcCx`]).
+pub fn publish_process(kernel: &Kernel) {
+    let cx = Arc::new(ProcCx {
+        maps: Arc::clone(kernel.shared_maps.view()),
+        exe_path: kernel.exe_path.clone(),
+        x_server: is_x_server(kernel),
+        unix_remote: kernel.unix_remote,
+        socket_names: Arc::clone(&kernel.socket_names),
+    });
+    *PROC_CX.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx);
+}
+
+fn proc_cx() -> Option<Arc<ProcCx>> {
+    PROC_CX.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The compositor's work, when it has any: pumped by the Worker that asks,
+/// without the kernel lock. Pumps are serialised by the device's sessions.
+pub fn pump_if_wanted() {
+    if !pump_wanted() {
+        return;
+    }
+    let device = COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(w) = device.filter(|w| w.needs_pump()) {
+        let gm = GuestMem::new(crate::guest_bytes());
+        w.pump(&gm);
+    }
 }
 
 /// Remember it at mount, so the GL device can find it later.
@@ -368,7 +413,8 @@ impl WaylandDevice {
     /// pool `MAP_SHARED`, which aliases a range of guest memory, so what the
     /// compositor is told is the address of that range -- nothing is copied
     /// here, and nothing is composited here either.
-    pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) -> bool {
+    pub fn pump(&self, mem: &GuestMem<'_>) -> bool {
+        let Some(proc_cx) = proc_cx() else { return false };
         self.inner.last_pump.store(crate::now_ns(), std::sync::atomic::Ordering::Relaxed);
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut sent_any = false;
@@ -408,7 +454,7 @@ impl WaylandDevice {
                 s.fds.extend(s.socket.take_received());
                 let tokens: Vec<u32> = (first..s.fds.len()).map(|i| i as u32).collect();
                 let view = PoolView {
-                    kernel,
+                    maps: &proc_cx.maps,
                     mem,
                     fds: &s.fds,
                 };
@@ -519,13 +565,13 @@ impl WaylandDevice {
                     crate::write_stderr(&format!(
                         "[wl] client {} is {} (x server: {})\n",
                         s.idx,
-                        kernel.exe_path,
-                        is_x_server(kernel)
+                        proc_cx.exe_path,
+                        proc_cx.x_server
                     ));
                 }
             }
-            if s.xwm.is_none() && s.xwm_tries % 64 == 1 && is_x_server(kernel) {
-                s.xwm = crate::xwm::connect(kernel);
+            if s.xwm.is_none() && s.xwm_tries % 64 == 1 && proc_cx.x_server {
+                s.xwm = crate::xwm::connect(&proc_cx);
                 if s.xwm.is_none() {
                     // Once, and only from the process that is the X server: a
                     // manager that cannot reach the server is the difference
@@ -639,7 +685,7 @@ impl WaylandDevice {
     /// hang-up to read, bytes still owed to one, an X window manager to
     /// drive, or input in the ring for a client that takes it -- or the floor
     /// (`PUMP_FLOOR_NS`) has passed. Asked on every scheduler turn of every
-    /// Worker, under the lock as the pump was: Undertale's game process pumped 7,000
+    /// Worker (once under the lock, as the pump was): Undertale's game process pumped 7,000
     /// times a second, nearly all with nothing to move, and the pump was 311
     /// of the 546 ms a 10 s window held the lock for the turn (census,
     /// worldmachine) -- the turn that is 70% of the game's lock wait.
@@ -810,7 +856,7 @@ impl HostListener for WaylandDevice {
 
 /// Resolves a descriptor the client sent to the pixels behind it.
 struct PoolView<'a, 'm> {
-    kernel: &'a Kernel,
+    maps: &'a gex_kernel::syscalls::SharedMapView,
     mem: &'a GuestMem<'m>,
     fds: &'a [Arc<OpenFile>],
 }
@@ -822,11 +868,7 @@ impl Buffers for PoolView<'_, '_> {
         // pool: its address in guest memory is where the pixels are, live,
         // and the compositor reads them from there. This is why a frame is
         // never copied on the way to the screen.
-        let map = self
-            .kernel
-            .shared_maps
-            .iter()
-            .find(|m| Arc::ptr_eq(&m.file, file))?;
+        let map = self.maps.of(file)?;
         Some((u32::try_from(map.start).ok()?, u32::try_from(map.len).ok()?))
     }
 
@@ -834,11 +876,7 @@ impl Buffers for PoolView<'_, '_> {
         let file = self.fds.get(fd as usize)?;
         // Mapped shared, so the live pixels are in the guest's memory; the
         // file's own bytes are what was there before it drew.
-        let map = self
-            .kernel
-            .shared_maps
-            .iter()
-            .find(|m| Arc::ptr_eq(&m.file, file))?;
+        let map = self.maps.of(file)?;
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }
