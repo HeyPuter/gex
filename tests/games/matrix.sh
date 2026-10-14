@@ -4,7 +4,11 @@
 # how far it got.
 #
 #   tests/games/matrix.sh [--time S] [--only SLUG,...] [--out DIR] [--keep]
-#                         [--frames] [-- GEXC-FLAGS]
+#                         [--frames] [--no-listed] [-- GEXC-FLAGS]
+#   tests/games/matrix.sh --table DIR    (DIR/summary.txt as a markdown table)
+#
+# Rows of kind dotnet, blocked or idea are not run; they go into the summary
+# with their reason (--no-listed leaves them out).
 #
 # --frames keeps every written frame (DIR/SLUG/frames/f-N.png), for writing
 # an input script.
@@ -13,14 +17,24 @@
 # (first.png, last.png; frames are counted by --wayland-out, every
 # PPM_EVERY-th one written), and one summary line in DIR/summary.txt:
 #
-#   slug  arch  stage  frames  seconds  end  reason
+#   slug  arch  host  stage  frames  first  menu  seconds  end  reason
+#
+# host is where it ran (MATRIX_HOST, default the short hostname; bench.sh
+# runs on edger/worldmachine). first and menu are the seconds from launch to
+# the first presented frame and to the menu frame (`-` if not reached): they
+# decide where a game's check runs (user 2026-10-14: 8 minutes or more to the
+# title on gooner moves it to a bench box through bench.sh, BENCH_CLASS=check,
+# unless the box is no faster), never a speed result. matrix.txt's `host=H`
+# in the extra field is the host a game's check belongs on; --host H runs only
+# the games that belong on H (rows without host= belong on gooner).
 #
 # stage is the furthest of none (no frame), frame (presented something;
 # `blank` when the last frame is a single colour), menu and gameplay (the
 # frame numbers matrix.txt gives for them, reached with its input script).
 # end is `exit N`, `signal N` or `timeout` (still running at --time). reason
 # is the last line of the log that looks like why it stopped (an unhandled
-# exception, an unimplemented call, a panic, ...), for a first look.
+# exception, an unimplemented call, a panic, ...), for a first look; DIR/SLUG/
+# excerpt holds the last 30 such lines.
 #
 # This is a correctness/debug tool: never read speed from it (no timing on
 # gooner; fps comes from the bench box, scratch/bench/bench.sh).
@@ -39,14 +53,25 @@
 # steam_api.dll replaces the game's, so games run with no Steam client),
 # GAME_ENV (space-separated K=V for the game's environment, e.g.
 # GEX_STEAM_TRACE=1).
+# W3 games (kind w3): W3_DIST (a W3 Wine install, lib/wine/i386-unix/wine;
+# default ~/gex-sandbox/scratch/K/gate-w3legs/dist), W3_PREFIX (a prefix made
+# for it with Graphics=wayland; default the same directory's pfx; copied per
+# run, never written), W3_LAUNCHER (a Windows program run first with the game
+# as its arguments, e.g. 'C:\winlogon.exe' for the Win7 shell's prefix),
+# WINEDEBUG (default err+all,fixme-all).
+# Every game runs in a systemd user scope with TasksMax=TASKS_MAX (default
+# 1024; MATRIX_SCOPE=0 leaves it out), so a runaway can't storm the host.
 set -u
 # MATRIX_HERE: tests/games of the tree to use (for a copy of this script run
 # while the tree is edited: bash reads a running script as it goes).
 here=${MATRIX_HERE:-$(cd "$(dirname "$0")" && pwd)}
 root=$(cd "$here/../.." && pwd)
-limit=300 only= out= keep=0 keepframes=0 flags=(--no-cgen)
+onlyhost= limit=300 only= out= keep=0 keepframes=0 listed=1 table= flags=(--no-cgen)
 while [ $# -gt 0 ]; do
     case $1 in
+        --table) table=$2; shift ;;
+        --no-listed) listed=0 ;;
+        --host) onlyhost=$2; shift ;;
         --time) limit=$2; shift ;;
         --only) only=,$2,; shift ;;
         --out) out=$2; shift ;;
@@ -57,18 +82,35 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# --table: the summary as a markdown table, for docs/games.md.
+if [ -n "$table" ]; then
+    echo '| game | arch | host | stage | frames | first frame s | menu s | secs | end | first failure / reason |'
+    echo '|---|---|---|---|---|---|---|---|---|---|'
+    tail -n +2 "$table/summary.txt" | while read -r slug arch h stage frames tf tm secs end rest; do
+        case $end in exit|signal) end="$end ${rest%% *}"; rest=${rest#* } ;; esac
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' "$slug" "$arch" "$h" "$stage" "$frames" "$tf" "$tm" "$secs" "$end" "$(printf %s "$rest" | sed 's/|/\\|/g')"
+    done
+    exit 0
+fi
 gexc=${GEXC:-$root/target/x86/release/gexc}
 games=${GAMES:-$HOME/gex-sandbox/games}
 games_linux=${GAMES_LINUX:-$HOME/gex-sandbox/games-linux}
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
+w3dist=${W3_DIST:-$HOME/gex-sandbox/scratch/K/gate-w3legs/dist}
+w3prefix=${W3_PREFIX:-$(dirname "$w3dist")/pfx}
+scope=()
+[ "${MATRIX_SCOPE:-1}" = 1 ] && scope=(systemd-run --user --scope -q -p TasksMax=${TASKS_MAX:-1024})
 gl64=${GEX_GL_X64:-}
 every=${PPM_EVERY:-10}
-state=${TMPDIR:-/tmp}/gex-games-$(id -u)/matrix
+host=${MATRIX_HOST:-$(hostname -s)}
+# MATRIX_STATE: the games' and prefixes' run copies; on the games'
+# filesystem (hard links).
+state=${MATRIX_STATE:-${TMPDIR:-/tmp}/gex-games-$(id -u)/matrix}
 out=${out:-$state/out}
 [ -x "$gexc" ] || { echo "no $gexc" >&2; exit 2; }
 mkdir -p "$out" "$state"
 summary=$out/summary.txt
-[ -f "$summary" ] || printf '%-18s %-6s %-9s %7s %6s %-10s %s\n' slug arch stage frames secs end reason > "$summary"
+[ -f "$summary" ] || printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' slug arch host stage frames first menu secs end reason > "$summary"
 
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf %s "$s"; }
 
@@ -99,23 +141,36 @@ reason_of() {
     grep -aE 'unhandled|Unhandled|unimplemented|not implemented|illegal instruction|panicked|fatal|FATAL|abort|segfault|SIGSEGV|page fault|exception|err:|error:|Error' "$1" \
         | grep -avE 'gex-nt: stats|fixme:' | tail -1 | cut -c1-160
 }
+excerpt_of() {
+    grep -aE 'unhandled|Unhandled|unimplemented|not implemented|illegal instruction|panicked|fatal|FATAL|abort|segfault|SIGSEGV|page fault|exception|err:|error:|Error|wasm trap|gexc:' "$1" \
+        | grep -avE 'gex-nt: stats|fixme:' | tail -30 | cut -c1-300
+}
 
 while IFS='|' read -r slug kind dir prog args menu play input extra; do
     slug=$(trim "$slug")
     case $slug in ''|'#'*) continue ;; esac
     [ -n "$only" ] && [[ $only != *",$slug,"* ]] && continue
+    if [ -n "$onlyhost" ]; then
+        want=gooner; [[ $extra =~ (^|[[:space:]])host=([^[:space:]]+) ]] && want=${BASH_REMATCH[2]}
+        [ "$want" = "$onlyhost" ] || continue
+    fi
     kind=$(trim "$kind") dir=$(trim "$dir") prog=$(trim "$prog") args=$(trim "$args")
     menu=$(trim "$menu") play=$(trim "$play") input=$(trim "$input") extra=$(trim "${extra:-}")
     # `@path`: run from the game's directory rather than the program's
     # (Baba Is You's launcher does `cd $GAMEDIR; ./bin64/Chowdren`).
     fromroot=0
     case $prog in @*) prog=${prog#@} fromroot=1 ;; esac
+    case $kind in
+    dotnet|blocked|idea)
+        [ $listed = 1 ] && printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' "$slug" - - "$kind" 0 - - 0 - "$prog" | tee -a "$summary"
+        continue ;;
+    esac
     case $kind in linux*) gdir=$games_linux/$dir ;; *) gdir=$games/$dir ;; esac
     exe=$gdir/$prog
     g=$out/$slug
     rm -rf "$g"; mkdir -p "$g/frames"
     if [ ! -e "$exe" ]; then
-        printf '%-18s %-6s %-9s %7s %6s %-10s %s\n' "$slug" - none 0 0 missing "no $exe" | tee -a "$summary"
+        printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' "$slug" - "$host" none 0 - - 0 missing "no $exe" | tee -a "$summary"
         continue
     fi
     case $(file -bL "$exe") in
@@ -127,13 +182,19 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     # place), so nothing a run writes reaches the original.
     ov=$state/game-$slug
     rm -rf "$ov"
-    cp -al "$gdir" "$ov"
+    if ! cp -al "$gdir" "$ov" 2>"$g/cp.err"; then
+        # Hard links need the state directory (MATRIX_STATE, TMPDIR) on the
+        # games' filesystem; a full copy would be gigabytes per game.
+        rm -rf "$ov"
+        printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' "$slug" - "$host" none 0 - - 0 setup "cannot hard-link $gdir into $state (put MATRIX_STATE on its filesystem)" | tee -a "$summary"
+        continue
+    fi
     find "$ov" -type f -size -256k -print0 | while IFS= read -r -d '' f; do cp -p "$f" "$f.gexcp" && mv "$f.gexcp" "$f"; done
     exe=$ov/$prog
     env=(GEX_PPM_EVERY=$every)
-    if [ "$input" != - ] && [ -n "$input" ] && [[ $kind == linux* ]]; then
-        # Linux games: the compositor's scripted input (GEX_WL_INPUT, timed
-        # in seconds from a frame).
+    if [ "$input" != - ] && [ -n "$input" ] && [[ $input == *.wl ]]; then
+        # Linux and W3 games: the compositor's scripted input (GEX_WL_INPUT,
+        # timed in seconds from a frame).
         env+=("GEX_WL_INPUT=$here/$input")
     elif [ "$input" != - ] && [ -n "$input" ]; then
         env+=("GEX_NT_INPUT=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/$input" | tr -d ' ' | paste -sd';')")
@@ -154,6 +215,7 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             sd=$state/seed-$slug/$nseed; nseed=$((nseed + 1))
             rm -rf "$sd"; mkdir -p "$sd"; cp -r "$here/$src/." "$sd/"
             gflags+=(--bind "$sd=$dst") ;;
+        host=*) ;;
         *) gflags+=("$x") ;;
         esac
     done
@@ -195,6 +257,7 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             fi
         fi
     else
+        # Windows games (w3 and pe).
         # gex-steam's steam_api[64].dll in place of the game's when
         # GEX_STEAM_WIN is set; the original stays beside it as .orig, which
         # gex-steam reads for the interface versions of old SDKs.
@@ -207,6 +270,19 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             done
         fi
         pfx=$state/prefix-$slug
+      if [ "$kind" = w3 ]; then
+        # W3: Wine's own loader, as a program of the guest. The prefix is a
+        # full copy: wineserver and the registry rewrite files in it.
+        [ -x "$w3dist/lib/wine/i386-unix/wine" ] || { echo "$slug: no W3 dist at $w3dist (W3_DIST)" >&2; continue; }
+        if [ $keep = 0 ] || [ ! -d "$pfx/drive_c" ]; then
+            rm -rf "$pfx"; cp -a "$w3prefix" "$pfx"
+        fi
+        mkdir -p "$state/wl-$slug"
+        run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}"
+              --wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}")
+        pre=("$w3dist/lib/wine/i386-unix/wine")
+        [ -n "${W3_LAUNCHER:-}" ] && pre+=("$W3_LAUNCHER")
+      else
         if [ $keep = 0 ] || [ ! -f "$pfx/.wine-version" ]; then
             rm -rf "$pfx"
             cp -al "$prefix" "$pfx" 2>/dev/null || { rm -rf "$pfx"; cp -as "$(cd "$prefix" && pwd)" "$pfx"; }
@@ -216,19 +292,22 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
         fi
         env+=(GEX_NT_STATS=1)
         run+=(--wine-prefix "$pfx")
+      fi
     fi
     # shellcheck disable=SC2206
     argv=($args)
     t0=$(date +%s)
     if [ $fromroot = 1 ]; then cwd=$ov rel=./$prog; else cwd=$(dirname "$exe") rel=./$(basename "$exe"); fi
-    (cd "$cwd" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
+    (cd "$cwd" && exec env "${env[@]}" "${scope[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
         > "$g/log" 2>&1 &
     pid=$!
-    first=
+    first= tfirst= tmenu=
     while kill -0 $pid 2>/dev/null; do
         # Keep the first frame and the newest one (or, with --frames, all
         # of them, as PNGs).
         n=$(newest "$g/frames")
+        [ -n "$n" ] && [ -z "$tfirst" ] && tfirst=$(( $(date +%s) - t0 ))
+        [ -n "$n" ] && [ -z "$tmenu" ] && [ "$menu" != - ] && [ "$n" -ge "$menu" ] && tmenu=$(( $(date +%s) - t0 ))
         if [ -n "$n" ] && [ $keepframes = 1 ]; then
             for f in $(ls "$g/frames" | grep '\.ppm$' | grep -v "^f-0*$n\.ppm$"); do
                 python3 "$here/ppm2png.py" "$g/frames/$f" "$g/frames/${f%.ppm}.png" && rm -f "$g/frames/$f"
@@ -264,5 +343,6 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     [ -n "${xn:-}" ] && rm -f "/tmp/.X$xn-lock" "/tmp/.X11-unix/X$xn"
     xn=
     reason=$(reason_of "$g/log")
-    printf '%-18s %-6s %-9s %7s %6s %-10s %s\n' "$slug" "$arch" "$stage" "$frames" "$secs" "$end" "${reason:--}" | tee -a "$summary"
+    excerpt_of "$g/log" > "$g/excerpt"
+    printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' "$slug" "$arch" "$host" "$stage" "$frames" "${tfirst:--}" "${tmenu:--}" "$secs" "$end" "${reason:--}" | tee -a "$summary"
 done < "$here/matrix.txt"
