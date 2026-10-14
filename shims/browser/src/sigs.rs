@@ -35,6 +35,8 @@ pub(crate) struct Home {
     /// Its namespace's published view, for a descriptor rebuilt from its
     /// name (`recvmsg`'s `SCM_RIGHTS`).
     vfs: Arc<gex_kernel::vfs::VfsView>,
+    /// Its terminal, for `ioctl`.
+    tty: Arc<gex_kernel::tty::TtyRef>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -62,6 +64,7 @@ pub(crate) fn publish(k: &Kernel) {
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
         vfs: Arc::clone(k.vfs.view()),
+        tty: Arc::clone(&k.tty),
     });
     HOME.store(Box::into_raw(home), Ordering::Release);
 }
@@ -198,6 +201,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         io: FdIo { fds, compat, ns: &ns, pid: home.pid },
         signals: &view,
         procs: &home.procs,
+        tty: &home.tty,
         pid: home.pid,
         uid: home.uid,
         wasm32: crate::WASM32.load(Ordering::Acquire),

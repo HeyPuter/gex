@@ -1800,6 +1800,9 @@ pub struct Free<'a> {
     /// The calling thread's signal state.
     pub signals: &'a Signals,
     pub procs: &'a ProcTable,
+    /// The terminal (`Kernel::tty`, the same one for the process's life),
+    /// for `ioctl`.
+    pub tty: &'a crate::tty::TtyRef,
     pub pid: i32,
     pub uid: u32,
     /// A wasm32 program, whose own code runs a handler's frame.
@@ -1853,6 +1856,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::CLOCK_NANOSLEEP | x::CLOCK_NANOSLEEP_TIME64 => nr::CLOCK_NANOSLEEP,
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
+            x::IOCTL => nr::IOCTL,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1875,13 +1879,14 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::CLOCK_NANOSLEEP => nr::CLOCK_NANOSLEEP,
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
+            x::IOCTL => nr::IOCTL,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
             | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
-            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG => raw,
+            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL => raw,
             _ => return None,
         }
     };
@@ -1901,8 +1906,9 @@ pub struct FreeCall {
 /// answers, decided by its number alone: `read`, `write`, `readv`,
 /// `writev`, `pread64`, `pwrite64`, `lseek`, `rt_sigprocmask`, the poll
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
-/// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms) and `futex` (every
-/// operation, and i386's `futex_time64`). The 32-bit ABI's
+/// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
+/// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
+/// `sendmsg`, `recvmsg` and `ioctl`. The 32-bit ABI's
 /// positioned calls and `_llseek` are not in it.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
@@ -1985,6 +1991,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 return FreeOutcome::Blocking(op, None);
             }
         }
+        r
+    } else if n == nr::IOCTL {
+        let r = f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]);
+        // A terminal's request may have signalled this process's own group
+        // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
+        // end as the full call's are.
+        f.signals.process().collect(f.procs, f.pid, f.uid);
         r
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
@@ -5867,7 +5880,21 @@ impl Kernel {
         }
     }
 
-    fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+}
+
+impl FdIo<'_> {
+    /// `ioctl`: the device's own requests, the descriptor's, and the
+    /// terminal's. No kernel lock: the table, the process table, the
+    /// terminal and every device synchronise themselves (§5.2 step 6).
+    pub fn ioctl(
+        &self,
+        m: &mut GuestMem<'_>,
+        procs: &ProcTable,
+        tty: &crate::tty::TtyRef,
+        fd: i32,
+        req: u64,
+        arg: u64,
+    ) -> SysResult {
         use crate::tty::{self, lflag};
         // The kernel takes an `unsigned int` command: a request with the top
         // `_IOC` direction bit set (a read ioctl like TIOCGPTN or TCGETS2)
@@ -5945,7 +5972,7 @@ impl Kernel {
         // is the only thing that can reach the other module. See
         // `FileHandle::claim_session`.
         if req == TIOCSCTTY {
-            let sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+            let sid = procs.sid(self.pid, 0).unwrap_or(self.pid);
             file.handle.claim_session(sid);
         }
         if let Some(r) = file.handle.ioctl(m, req, arg) {
@@ -5993,8 +6020,7 @@ impl Kernel {
                 _ => Err(Errno::ENOTTY),
             };
         }
-        let tty = Arc::clone(&self.tty);
-        match req {
+                match req {
             // Only the kernel's part of the structure: glibc's `tcgetattr`
             // passes a 36-byte `struct __kernel_termios` on the stack, and
             // writing the 60-byte userspace shape overruns it onto the stack
@@ -6105,7 +6131,7 @@ impl Kernel {
                 let ws = m.read(arg, 8)?.to_vec();
                 let g = |n: usize| u16::from_ge_bytes([ws[n], ws[n + 1]]);
                 if tty.set_winsize((g(0), g(2), g(4), g(6))) {
-                    self.signal_foreground(crate::signal::sig::SIGWINCH);
+                    signal_foreground(procs, tty, self.pid, crate::signal::sig::SIGWINCH);
                 }
                 Ok(0)
             }
@@ -6118,7 +6144,7 @@ impl Kernel {
                 let g = if fg > 0 {
                     fg
                 } else {
-                    self.procs.pgid(self.pid, 0).unwrap_or(self.pid)
+                    procs.pgid(self.pid, 0).unwrap_or(self.pid)
                 };
                 m.write_u32(arg, g as u32)?;
                 Ok(0)
@@ -6137,14 +6163,14 @@ impl Kernel {
             }
             TIOCGSID => {
                 let sid = tty.sid();
-                let s = if sid > 0 { sid } else { self.procs.sid(self.pid, 0).unwrap_or(1) };
+                let s = if sid > 0 { sid } else { procs.sid(self.pid, 0).unwrap_or(1) };
                 m.write_u32(arg, s as u32)?;
                 Ok(0)
             }
             // Claiming the terminal. A session leader that has none takes it,
             // and becomes the foreground group by doing so.
             TIOCSCTTY => {
-                let sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+                let sid = procs.sid(self.pid, 0).unwrap_or(self.pid);
                 let held = tty.sid();
                 // `arg` non-zero is the steal-it-anyway form, which only root
                 // may use -- and here everybody is root often enough that
@@ -6156,7 +6182,7 @@ impl Kernel {
                 Ok(0)
             }
             TIOCNOTTY => {
-                if tty.sid() == self.procs.sid(self.pid, 0).unwrap_or(-1) {
+                if tty.sid() == procs.sid(self.pid, 0).unwrap_or(-1) {
                     tty.set_sid(0);
                 }
                 Ok(0)
@@ -6277,7 +6303,7 @@ impl Kernel {
                 if signo == 0 || signo > crate::signal::sig::MAX {
                     return Err(Errno::EINVAL);
                 }
-                self.signal_foreground(signo);
+                signal_foreground(procs, tty, self.pid, signo);
                 Ok(0)
             }
             // Asynchronous I/O by SIGIO. Accepted and not armed: nothing here
@@ -6311,23 +6337,29 @@ impl Kernel {
             }
         }
     }
+}
 
-    /// Raise `signo` on whoever holds the terminal.
-    ///
-    /// The foreground process group if a shell has set one, and otherwise
-    /// this process's own group -- which is right for the case that has no
-    /// shell in it at all, a program started directly on the terminal.
-    fn signal_foreground(&mut self, signo: u32) {
-        let fg = self.tty.fg();
-        let g = if fg > 0 {
-            fg
-        } else {
-            self.procs.pgid(self.pid, 0).unwrap_or(self.pid)
-        };
-        // `kill_group` and not `kill(-g)`: a negative target of -1 is
-        // POSIX's "every process", so group 1 is the one group that cannot
-        // be named negatively -- and a shell running as pid 1 is in it.
-        let _ = self.procs.kill_group(self.pid, g, signo);
+/// Raise `signo` on whoever holds the terminal.
+///
+/// The foreground process group if a shell has set one, and otherwise
+/// this process's own group -- which is right for the case that has no
+/// shell in it at all, a program started directly on the terminal.
+fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, signo: u32) {
+    let fg = tty.fg();
+    let g = if fg > 0 {
+        fg
+    } else {
+        procs.pgid(pid, 0).unwrap_or(pid)
+    };
+    // `kill_group` and not `kill(-g)`: a negative target of -1 is
+    // POSIX's "every process", so group 1 is the one group that cannot
+    // be named negatively -- and a shell running as pid 1 is in it.
+    let _ = procs.kill_group(pid, g, signo);
+}
+
+impl Kernel {
+    fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+        self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }
 
     fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
@@ -7869,18 +7901,6 @@ impl Kernel {
 
 
 
-    fn cmsg_hdr(&self) -> u64 {
-        self.fd_io().cmsg_hdr()
-    }
-
-    fn msg_rd(&self, m: &GuestMem<'_>, at: u64, i: u64) -> Result<u64, Errno> {
-        self.fd_io().msg_rd(m, at, i)
-    }
-
-    fn msg_wr(&self, m: &mut GuestMem<'_>, at: u64, i: u64, v: u64) -> Result<(), Errno> {
-        self.fd_io().msg_wr(m, at, i, v)
-    }
-
     fn sys_write_sockaddr(&self, m: &mut GuestMem<'_>, ip: u32, port: u16, addr: u64, addrlen: u64) -> SysResult {
         self.fd_io().write_sockaddr(m, ip, port, addr, addrlen)
     }
@@ -9250,7 +9270,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9428,7 +9448,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9489,7 +9509,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9901,7 +9921,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -9954,6 +9974,80 @@ mod tests {
         assert_eq!(ret(&m, at) as i64, Errno::EAGAIN.as_return() as i64);
         set_args(&mut m, at, nr::RECVMSG, &[a, rmsg, 0]);
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Blocking(BlockOp::AcceptWait { .. }, None)));
+    }
+
+    /// `ioctl` in the lock-free class (docs/kernel-locking.md §5.2, L6)
+    /// answers as the full call does: a pipe's bytes waiting, close-on-exec
+    /// and non-blocking set from either path, a terminal request on a pipe,
+    /// the terminal's own (whatever stdin is here) and a bad descriptor.
+    #[test]
+    fn free_ioctl_answers_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        const FIONREAD: u64 = 0x541b;
+        const FIONBIO: u64 = 0x5421;
+        const FIOCLEX: u64 = 0x5451;
+        const FIONCLEX: u64 = 0x5450;
+        const TCGETS: u64 = 0x5401;
+        const TIOCGWINSZ: u64 = 0x5413;
+        const TIOCGPGRP: u64 = 0x540f;
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("ioctl is in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
+        k.syscall(&mut m, 0);
+        let pr = m.read_u32(0x20010).unwrap() as u64;
+        let pw = m.read_u32(0x20014).unwrap() as u64;
+        m.write(0x23000, b"abc").unwrap();
+        set_args(&mut m, at, nr::WRITE, &[pw, 0x23000, 3]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 3);
+        // The same request each way: the same result, the same bytes out.
+        let both = |m: &mut GuestMem<'_>, k: &mut Kernel, fd: u64, req: u64, arg: u64| {
+            m.zero(0x26000, 64).unwrap();
+            m.zero(0x27000, 64).unwrap();
+            m.write_u32(0x26000, 1).unwrap();
+            m.write_u32(0x27000, 1).unwrap();
+            set_args(m, at, nr::IOCTL, &[fd, req, if arg == 0 { 0x26000 } else { arg }]);
+            assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+            let a = ret(m, at);
+            set_args(m, at, nr::IOCTL, &[fd, req, if arg == 0 { 0x27000 } else { arg }]);
+            k.syscall(m, 0);
+            let b = ret(m, at);
+            assert_eq!(a, b, "ioctl({fd}, {req:#x})");
+            assert_eq!(m.read(0x26000, 64).unwrap().to_vec(), m.read(0x27000, 64).unwrap().to_vec());
+            a
+        };
+        assert_eq!(both(&mut m, &mut k, pr, FIONREAD, 0), 0);
+        assert_eq!(m.read_u32(0x26000).unwrap(), 3);
+        assert_eq!(both(&mut m, &mut k, pr, TCGETS, 0) as i64, Errno::ENOTTY.as_return() as i64);
+        assert_eq!(both(&mut m, &mut k, 99, FIONREAD, 0) as i64, Errno::EBADF.as_return() as i64);
+        for req in [TCGETS, TIOCGWINSZ, TIOCGPGRP] {
+            both(&mut m, &mut k, 0, req, 0);
+        }
+        // Flags set without the kernel are the descriptor's.
+        set_args(&mut m, at, nr::IOCTL, &[pr, FIOCLEX, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(ret(&m, at), 0);
+        set_args(&mut m, at, nr::FCNTL, &[pr, 1 /* F_GETFD */]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 1);
+        set_args(&mut m, at, nr::IOCTL, &[pr, FIONCLEX, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        set_args(&mut m, at, nr::FCNTL, &[pr, 1]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 0);
+        m.write_u32(0x26000, 1).unwrap();
+        set_args(&mut m, at, nr::IOCTL, &[pr, FIONBIO, 0x26000]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_ne!(k.fds.get(pr as i32).unwrap().flags() & oflags::O_NONBLOCK, 0);
     }
 
     #[test]

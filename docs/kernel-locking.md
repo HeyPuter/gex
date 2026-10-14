@@ -461,6 +461,23 @@ in the scheduler pick after each wake of the global WAKE word: about
      again (`Owed::reissue`). Legs: `sendmsg-rights` and `scm-fork` (a
      file and a pipe passed to a forked child) in the page tier;
      `free_socket_messages_answer_as_the_kernel_does`.
+   - ioctl (L6): in the free class, as `FdIo::ioctl` (the kernel's
+     `sys_ioctl` calls the same), whole: the device's own requests, the
+     descriptor's (FIOCLEX, FIONCLEX, FIONBIO, FIONREAD) and the
+     terminal's. Nothing it touches is the process's alone: the process
+     table, the terminal (`Kernel::tty`, one for the process's life, kept
+     in the page's published process state) and every device handle
+     synchronise themselves already, because other processes reach them
+     through their own kernels. The page's GL device keeps its state per
+     Worker and submits from the calling Worker, so a submit or present no
+     longer waits behind the lock or defers itself (`gl::DEFER` stays for
+     the locked path the PowerPC page still takes). A request that signals
+     the caller's own group (TIOCSIG, TIOCSWINSZ) collects it before the
+     call's end. In the Noita page it was the last per-frame taker (one
+     present a frame). Legs: `ioctl-threads` (FIONREAD on a pipe being
+     filled and drained, close-on-exec flipped and terminal requests from
+     three more threads) in the page tier;
+     `free_ioctl_answers_as_the_kernel_does`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:
