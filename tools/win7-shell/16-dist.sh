@@ -16,7 +16,7 @@ step "the x86 prefix stage-native.sh builds on"
 rm -rf "$X86"; mkdir -p "$X86/drive_c/windows/syswow64" "$X86/drive_c/windows/system32" "$X86/nls" "$X86/drive_c/windows/Fonts"
 cp -p "$I"/lib/wine/i386-windows/* "$X86/drive_c/windows/syswow64/"
 cp -p "$I"/share/wine/nls/*.nls "$X86/nls/"
-cp -p "$I"/share/wine/fonts/* "$X86/drive_c/windows/Fonts/"
+cp -p "$F"/fonts/*.ttf "$X86/drive_c/windows/Fonts/"
 sed -n 's/^Wine version \(.*\)$/\1/p' "$F/VERSION" > "$X86/.wine-version"
 step "the native wasm32 module and its skeletons"
 GEX_WINE_PREFIX=$X86 WINEBUILD=$W7_OUT/wine-tools/tools/winebuild/winebuild \

@@ -21,6 +21,8 @@ if ! nice make -k -j"$JOBS" > "$L/wine-i386-make.log" 2>&1; then
   done
   nice make -j"$JOBS" >> "$L/wine-i386-make.log" 2>&1 || { grep -m20 -B2 -A2 "error" "$L/wine-i386-make.log"; exit 1; }
 fi
-rm -rf "$I"; make install DESTDIR="$I" > "$L/wine-i386-install.log" 2>&1 || { tail -20 "$L/wine-i386-install.log"; exit 1; }
+# installed stripped (winebuild --builtin strips each PE module's debug
+# information, as a distribution's package does)
+rm -rf "$I"; make install DESTDIR="$I" INSTALL_PROGRAM_FLAGS=-s > "$L/wine-i386-install.log" 2>&1 || { tail -20 "$L/wine-i386-install.log"; exit 1; }
 ls "$I/usr/local/lib/wine/i386-windows/kernel32.dll" "$I/usr/local/share/wine/wine.inf" > /dev/null
 step "done: $I ($(ls "$I/usr/local/lib/wine/i386-windows" | wc -l) i386 modules)"

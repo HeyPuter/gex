@@ -15,13 +15,14 @@ G=$GEX_SRC/target/x86/release/gexc; B=$W7_OUT/bundle; U=$W7_OUT/units; L=$W7_OUT
 mkdir -p "$U" "$W7_OUT/rec"; : > "$L/units.log"; : > "$W7_OUT/unit-keys.txt"
 n=$(wc -l < "$W7_OUT/units.txt"); i=0
 step "$n units (logs/units.log)"
-while read -r p _ _ base; do
-  i=$((i + 1))
+while IFS= read -r line; do
+  p=${line% at base *} base=${line##* at base }; i=$((i + 1))
   h=$(realpath -m "$B$p")
   [ -f "$h" ] || { echo "units: $p is not in the tree" >&2; exit 1; }
   # the key: the unit's directory in the cache, as cgen-image reports it
-  line=$(GEX_CGEN_CACHE=$U nice -n 10 "$G" cgen-image "$h" --pe-base "$base" --jobs "$JOBS" 2>&1 | tee -a "$L/units.log" | grep " at $base: " | tail -1)
-  key=$(echo "$line" | sed -n "s|.* at $base: \(.*\) ([0-9.]*s)\$|\1|p" | xargs -r basename)
+  # (cgen-image ends with "IMAGE at BASE: CACHE/KEY/c.wasm (Ns)")
+  out=$(GEX_CGEN_CACHE=$U nice -n 10 "$G" cgen-image "$h" --pe-base "$base" --jobs "$JOBS" 2>&1 | tee -a "$L/units.log" | grep " at $base: " | tail -1)
+  key=$(echo "$out" | sed -n "s|.* at $base: .*/\([0-9a-f]*\)/c\.wasm ([0-9.]*s)\$|\1|p")
   [ ${#key} = 64 ] && [ -f "$U/$key/c.wasm" ] || { echo "units: no unit for $p at $base (logs/units.log)" >&2; exit 1; }
   echo "$key $p" >> "$W7_OUT/unit-keys.txt"
   echo "  [$i/$n] $(basename "$p") at $base: $key"
