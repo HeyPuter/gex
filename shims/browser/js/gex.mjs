@@ -1458,7 +1458,6 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
-    this.#providerSkipApply();
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
@@ -1964,7 +1963,6 @@ export class Gex {
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
-      this.#providerSkipApply();
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
@@ -3293,23 +3291,6 @@ export class Gex {
   }
 
   #cgenMode = 0;
-  /** Exports the built-in providers leave alone (`?provskip=a,b`, as
-   *  GEX_PROVIDER_SKIP natively): every process of the run, before the
-   *  shim keys its units. */
-  providerSkip(list) {
-    this.#providerSkip = String(list ?? '');
-    if (this.#shim) this.#providerSkipApply();
-  }
-  #providerSkip = '';
-  #providerSkipApply() {
-    const e = this.#shim.exports;
-    if (!this.#providerSkip || !e.gex_cgen_set_provider_skip) return;
-    const b = new TextEncoder().encode(this.#providerSkip);
-    const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
-    this.#bytes().set(b, p);
-    e.gex_cgen_set_provider_skip(p, b.length);
-    e.gex_free?.(p, Math.max(8, b.length));
-  }
   /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
    *  the run (a forked child's Worker is told too). Before the shim exists. */
   /** `?wasmdlls=soname=path,...`: libraries this process replaces with wasm64
