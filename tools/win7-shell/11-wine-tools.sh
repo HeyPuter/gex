@@ -5,7 +5,9 @@
 WINE_SRC=$(cd "$WINE_SRC" && pwd); B=$W7_OUT/wine-tools
 step "host tools from $WINE_SRC ($(git -C "$WINE_SRC" rev-parse --short HEAD))"
 mkdir -p "$B"; cd "$B"
-[ -f Makefile ] || "$WINE_SRC/configure" $WINE_OPTS --without-mingw --without-freetype --without-wayland --without-opengl \
+# aarch64 hosts must have a PE arch; the tools never use it
+PE=--without-mingw; [ "$(uname -m)" = aarch64 ] && PE=--enable-archs=aarch64
+[ -f Makefile ] || "$WINE_SRC/configure" $WINE_OPTS $PE --without-freetype --without-wayland --without-opengl \
   > "$W7_OUT/logs/wine-tools-configure.log" 2>&1 || { tail -20 "$W7_OUT/logs/wine-tools-configure.log"; exit 1; }
 nice make -j"$JOBS" __tooldeps__ > "$W7_OUT/logs/wine-tools-make.log" 2>&1 || { grep -m20 -i error "$W7_OUT/logs/wine-tools-make.log"; exit 1; }
 # wrc and wmc read the locale table from the tools tree's nls/ (a build of
