@@ -132,7 +132,7 @@ pub const WEB_NT_DIR: &str = "runtime/web/nt";
 /// The files of [`WEB_NT_DIR`] besides `js/`.
 pub const WEB_NT_WASM: [&str; 3] = ["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
 /// The host JavaScript a Windows program's web run needs (shims/browser/js).
-pub const WEB_NT_JS: [(&str, &str); 11] = [
+pub const WEB_NT_JS: [(&str, &str); 12] = [
     ("run-node.mjs", include_str!("../../../shims/browser/js/run-node.mjs")),
     ("host.mjs", include_str!("../../../shims/browser/js/host.mjs")),
     ("worker.mjs", include_str!("../../../shims/browser/js/worker.mjs")),
@@ -142,6 +142,7 @@ pub const WEB_NT_JS: [(&str, &str); 11] = [
     ("net-node.mjs", include_str!("../../../shims/browser/js/net-node.mjs")),
     ("net-bridge.mjs", include_str!("../../../shims/browser/js/net-bridge.mjs")),
     ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
+    ("fetch-note.mjs", include_str!("../../../shims/browser/js/fetch-note.mjs")),
     ("single.mjs", include_str!("../../../shims/browser/js/single.mjs")),
     ("xcache.mjs", include_str!("../../../shims/browser/js/xcache.mjs")),
 ];

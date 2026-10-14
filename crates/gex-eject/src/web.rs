@@ -27,8 +27,9 @@ pub const MANIFEST: &str = "build/web/manifest.json";
 /// The browser runtime's JavaScript, as built into this gexc.
 pub const GEX_MJS: &str = include_str!("../../../shims/browser/js/gex.mjs");
 /// The modules `gex.mjs` imports, vendored beside it.
-pub const GEX_MJS_DEPS: [(&str, &str); 3] = [
+pub const GEX_MJS_DEPS: [(&str, &str); 4] = [
     ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
+    ("fetch-note.mjs", include_str!("../../../shims/browser/js/fetch-note.mjs")),
     ("xcache.mjs", include_str!("../../../shims/browser/js/xcache.mjs")),
     ("single.mjs", include_str!("../../../shims/browser/js/single.mjs")),
 ];
@@ -692,3 +693,29 @@ export async function start(opts = {}) {
   };
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{EJECT_MJS, GEX_MJS, GEX_MJS_DEPS};
+
+    /// Every module a Linux program's vendored runtime imports (`'./x.mjs'`)
+    /// is vendored too, as pe.rs checks the NT layer's: lazy-fetch.mjs's
+    /// import of fetch-note.mjs, missed, failed every Linux page's load.
+    #[test]
+    fn the_linux_web_runtime_vendors_every_module_it_imports() {
+        let mut have: Vec<&str> = GEX_MJS_DEPS.iter().map(|(f, _)| *f).collect();
+        have.extend(["gex.mjs", "eject.mjs"]);
+        let all = GEX_MJS_DEPS.iter().copied().chain([("gex.mjs", GEX_MJS), ("eject.mjs", EJECT_MJS)]);
+        for (f, text) in all {
+            for q in ['\'', '"'] {
+                for part in text.split(&format!("{q}./")).skip(1) {
+                    let Some(end) = part.find(q) else { continue };
+                    let m = &part[..end];
+                    if m.ends_with(".mjs") {
+                        assert!(have.contains(&m), "{f} imports ./{m}, which GEX_MJS_DEPS leaves out");
+                    }
+                }
+            }
+        }
+    }
+}
