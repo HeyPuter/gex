@@ -224,6 +224,34 @@ window is a surface with damage in the gex compositor (docs/nt-layer.md
 
 Revisit (a) only if exact Flip3D or animations become the goal.
 
+### 3.1 State (2026-10-14)
+
+- **Protocol**: `crates/gex-wayland/protocols/gex-glass-v1.xml`: a
+  surface's glass region and DWM's colorization (colour, balance, blur
+  balance), taking effect at once. gex-wayland keeps it in `SurfaceInfo`
+  (`Glass`), and the surface record (56 words now) carries up to four
+  rectangles.
+- **Compositor** (`web/src/compositor-worker.js`, `Painter.glass`): before
+  a window with glass, the scene's pass ends, the box beneath the glass is
+  copied out and blurred (separable Gaussian, two passes each way, wider
+  the second time), and drawn back, tinted, under the window. The window's
+  alpha counts only inside its glass, as under DWM, so a GDI window (alpha
+  byte 0 throughout) is opaque but where it is glass. `web/test/glass.html`
+  shows it with hand-made records.
+- **Wine** (fork `gex-webgpu`): dwmapi reports composition on when the
+  display driver draws glass, and `DwmExtendFrameIntoClientArea`,
+  `DwmEnableBlurBehindWindow` and `DwmGetColorizationColor` work, through
+  `NtUserSetWindowGlass` (a private `NtUserCallHwndParam`) to win32u, which
+  keeps each window's glass, turns it into rectangles relative to the
+  visible rect (frame bands, extended margins, blur-behind) whenever the
+  window's rects change, and hands them to the new user-driver entry
+  `pSetWindowGlass`. winewayland.drv implements it with `gex_glass_v1`.
+- **Not yet**: the frame. Composited windows' non-client areas should be
+  glass with the caption, buttons and borders drawn from aero.msstyles'
+  `DWMWindow` parts (`WINDOW_GLASS_FRAME` is plumbed but nothing sets
+  it); thumbnails; the Windows 7 colorization formula beyond
+  colour-over-blur.
+
 ## 4. Reproducing (macOS, Apple silicon)
 
 - Wine host tools from the fork (for widl): configure with Homebrew `llvm`
