@@ -50,6 +50,15 @@ else
     echo "no global kernel module -- needs nightly"
 fi
 
+# The WebGPU wire's server, for /dev/gex-gpu (`?webgpu=1`): needs emcc and
+# an emdawnwebgpu package matching third_party/dawn-api (GEX_EMDAWN_PORT).
+if command -v emcc >/dev/null 2>&1 && [ -n "${GEX_EMDAWN_PORT:-}" ]; then
+    echo "building the WebGPU wire's server..."
+    "$ROOT/web/build-gexgpu-server.sh" "$PUB/gex" >/dev/null
+else
+    echo "no WebGPU wire server -- needs emcc and GEX_EMDAWN_PORT"
+fi
+
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory

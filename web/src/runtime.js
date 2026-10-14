@@ -641,6 +641,11 @@ async function runProgramHere(
     // (handed to `onSystem`) is called -- a desktop whose first windows
     // draw no GL does not download it.
     glLazy = false,
+    // WebGPU for the guest (/dev/gex-gpu, docs/d3d-webgpu.md): the wire's
+    // server (web/build-gexgpu-server.sh) on this page's WebGPU, a
+    // connection per open. Needs a cross-origin isolated page and JSPI.
+    // `?webgpu=1` turns it on for any page.
+    webgpu = !!flag('webgpu'),
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -694,6 +699,20 @@ async function runProgramHere(
       // the returned function is then only the cheap wake-up fallback. A
       // main-thread renderer retains the original page-side service path.
       glServe = gl.attachChannel?.(glChannel) || serveGl(gl, glChannel);
+    }
+  }
+
+  // WebGPU: the server runs here, on the page's thread, and every Worker
+  // reaches it over its own shared buffers (gpu-bridge.mjs).
+  let gpuChannel = null;
+  if (webgpu && globalThis.crossOriginIsolated && globalThis.navigator?.gpu) {
+    const { makeGpuChannel, serveGpu, GpuServer } = await import('@gex/gpu-bridge.mjs');
+    try {
+      const server = await GpuServer.load(new URL('/gex/gexgpu-server.mjs', location.href).href);
+      gpuChannel = makeGpuChannel();
+      serveGpu(server, gpuChannel);
+    } catch (e) {
+      console.warn('[gex] no WebGPU server for /dev/gex-gpu', e);
     }
   }
 
@@ -901,6 +920,8 @@ async function runProgramHere(
       // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
       // reach the page's GlDevice.
       glChannel: glChannel ?? undefined,
+      // The WebGPU wire's shared buffers, for /dev/gex-gpu.
+      gpuChannel: gpuChannel ?? undefined,
       // The Wayland ring's shared buffers, so a Worker that binds the
       // compositor can carry its frames to the page's canvas. Like glChannel.
       wlChannel: wlChannel ?? undefined,
