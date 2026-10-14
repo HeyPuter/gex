@@ -99,6 +99,10 @@ async function workerMain(port) {
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// The page's modules, given while this Worker waited in the host's pool
+/// (`pooledModules`): its runtime starts with them, and the start message
+/// carries only those it lacks.
+const pooled = new Map();
 /// Whether this process's memory can go to the next fork child when it exits
 /// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
 /// compositor reading its pixels, the session reaching its door.
@@ -234,6 +238,10 @@ async function handle(msg) {
   // the module is simply recompiled. See `Gex#sharedModules`.
   if (msg?.kind === 'sharedModule') {
     workerGex?.addSharedModule(msg.key, msg.mod);
+    return;
+  }
+  if (msg?.kind === 'pooledModules') {
+    for (const [key, mod] of msg.entries ?? []) pooled.set(key, mod);
     return;
   }
   // The wineserver's door, from the host: this Worker's door calls go to it
@@ -531,6 +539,7 @@ async function handle(msg) {
     memory: msg.memory ?? msg.recycledMemory ?? null,
     moduleStore: msg.moduleStore ?? null,
     shared: !!msg.shared,
+    modules: pooled,
   });
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.

@@ -56,6 +56,9 @@ function forkTransfer(child) {
 
 /// Where a pooled Worker's early messages are kept until somebody owns it.
 const EARLY = Symbol('gex.early');
+/// The keys of the page's modules a pooled Worker was sent while it waited
+/// (`#poolModules`), so its start message carries only the rest.
+const POOLED = Symbol('gex.pooled');
 /** How many exited processes' memories are kept for fork children, and how
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
@@ -135,10 +138,32 @@ export class ProcessHost {
   #unitModules = new Map();
   #unitBytes = 0;
   /** What a starting Worker gets: its process's modules and the page's. */
-  #sharedFor(pid, withProcess) {
+  #sharedFor(pid, withProcess, w = null) {
     const own = withProcess ? [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] : [];
-    // And the page's translation units (empty unless `extra.unitCache`).
-    return [...own, ...this.#pageModules.entries(), ...this.#unitModules.entries()];
+    // And the page's translation units (empty unless `extra.unitCache`),
+    // less those the Worker was given while it waited in the pool.
+    const page = [...this.#pageModules.entries(), ...this.#unitModules.entries()];
+    const had = w?.[POOLED];
+    return [...own, ...(had ? page.filter(([k]) => !had.has(k)) : page)];
+  }
+
+  /** Give a pooled Worker the page's modules now, while it waits: in the
+   *  start message they were most of a fork's hand-off (about 860 on the
+   *  demo after a few commands; 2.5 ms to clone in, 1.1 ms more in transit
+   *  and 0.7 ms to register, of every child's start). */
+  #poolModules(w) {
+    const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries()];
+    w[POOLED] = new Set(entries.map(([k]) => k));
+    if (entries.length) w.postMessage({ kind: 'pooledModules', entries });
+  }
+
+  /** A module the page just kept, to the Workers waiting in the pool. */
+  #poolModule(key, mod) {
+    for (const w of this.#warm) {
+      if (!w[POOLED] || w[POOLED].has(key)) continue;
+      w[POOLED].add(key);
+      w.postMessage({ kind: 'pooledModules', entries: [[key, mod]] });
+    }
   }
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
@@ -330,7 +355,12 @@ export class ProcessHost {
       // pooled Worker announces itself while still sitting in the array, and
       // that message would otherwise be delivered to nobody and dropped.
       const early = [];
-      const buf = (e) => early.push(e && e.data !== undefined ? e.data : e);
+      const buf = (e) => {
+        const m = e && e.data !== undefined ? e.data : e;
+        early.push(m);
+        // Listening now (`ready` is posted once its handler is on).
+        if (m?.kind === 'ready' && !w[POOLED]) this.#poolModules(w);
+      };
       w.addEventListener?.('message', buf);
       w.on?.('message', buf);
       w[EARLY] = { early, buf };
@@ -562,7 +592,7 @@ export class ProcessHost {
             // other, at start-up). The `start` closure above meant to send
             // these, but this is the path that runs. A fork has its own memory
             // and registry, so only threads (pid `proc:tid`).
-            sharedModules: this.#sharedFor(pid, msg.kind === 'thread'),
+            sharedModules: this.#sharedFor(pid, msg.kind === 'thread', w),
             // the wineserver's door, if one is up (`doorPublish`)
             door: this.#door ?? undefined,
             // A fork child's memory: an exited process's, zeroed, if one fits.
@@ -624,6 +654,7 @@ export class ProcessHost {
         if (typeof m.key === 'string' && m.key.startsWith('wasm:')) {
           this.#pageModules.delete(m.key);
           this.#pageModules.set(m.key, m.mod);
+          this.#poolModule(m.key, m.mod);
           let bytes = 0;
           for (const k of this.#pageModules.keys()) bytes += keyBytes(k);
           while (this.#pageModules.size > 1 && (this.#pageModules.size > PAGE_MODULES || bytes > PAGE_MODULE_BYTES)) {
@@ -638,6 +669,7 @@ export class ProcessHost {
         if (typeof m.key === 'string' && m.key.startsWith('u:')) {
           if (this.#extra?.unitCache && !this.#unitModules.has(m.key)) {
             this.#unitModules.set(m.key, m.mod);
+            this.#poolModule(m.key, m.mod);
             this.#unitBytes += Number(m.key.split(':')[1]);
             while (this.#unitBytes > UNIT_MODULE_BYTES && this.#unitModules.size > 1) {
               const oldest = this.#unitModules.keys().next().value;
