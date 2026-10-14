@@ -51,14 +51,18 @@
 
     <request name="set_colorization">
       <description summary="the tint">
-        DWM's colorization parameters: the colour (ARGB, its alpha the
-        colour's own strength), how much of it is mixed over the blurred
-        backdrop (balance), and how much of the blurred backdrop shows
-        (blur_balance), both 0 to 100.
+        DWM's colorization parameters (Windows 7's ColorizationColor,
+        ColorizationColorBalance, ColorizationBlurBalance,
+        ColorizationAfterglow, ColorizationAfterglowBalance): the glass is
+        the blurred backdrop times blur_balance, plus the colour times
+        balance, plus the afterglow colour times the backdrop's brightness
+        times afterglow_balance; balances 0 to 100.
       </description>
       <arg name="argb" type="uint"/>
       <arg name="balance" type="uint"/>
       <arg name="blur_balance" type="uint"/>
+      <arg name="afterglow" type="uint"/>
+      <arg name="afterglow_balance" type="uint"/>
     </request>
 
     <enum name="frame" bitfield="true">

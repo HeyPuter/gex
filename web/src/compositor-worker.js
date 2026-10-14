@@ -1,6 +1,7 @@
 // Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
+import { glassColorMatrix } from './glass-colorization.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -97,11 +98,11 @@ struct U {
   texRect: vec4f,   // sub-rectangle of the texture to sample (0..1)
   color: vec4f,
   output: vec2f,    // output size in pixels
-  mode: u32,        // 0 = texture, 1 = solid colour, 2 = blur (color.xy: step in texels)
+  mode: u32,        // 0 = texture, 1 = solid colour, 2 = blur (color.xy: step in texels), 4 = colorization
   swizzle: u32,     // 1 = the texture holds BGRA bytes (wl_shm)
   opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha), 2 = but in glass
   glassCount: u32,
-  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels)
+  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels); mode 4: the matrix's rows
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
@@ -140,6 +141,12 @@ fn blur(uv: vec2f) -> vec4f {
   if (u.mode == 1u) { return u.color; }
   if (u.mode == 2u) { return vec4f(blur(v.uv).rgb, 1.0); }
   if (u.mode == 3u) { return c * u.color; }
+  // Windows 7's colorization of the blurred backdrop (glass-colorization.js):
+  // a 3x3 matrix (glass[0..2].xyz, rows) and an offset (color.rgb).
+  if (u.mode == 4u) {
+    let m = mat3x3f(u.glass[0].xyz, u.glass[1].xyz, u.glass[2].xyz);
+    return vec4f(clamp(c.rgb * m + u.color.rgb, vec3f(0.0), vec3f(1.0)), 1.0);
+  }
   if (u.swizzle == 1u) { c = c.bgra; }
   if (u.opaque == 1u) { c.a = 1.0; }
   // DWM's rule: a window's alpha counts in its glass and nowhere else (GDI
@@ -330,10 +337,11 @@ class Painter {
   }
 
   /** Windows 7's glass under a window: what is drawn so far, blurred and
-   *  tinted, in `rects` (output pixels). The scene's pass ends, the box
-   *  around the rectangles is copied out and blurred in two passes each way,
-   *  and the pass resumes on the scene to draw the result. */
-  glass(rects, tint, blurAlpha) {
+   *  coloured (`colour`, glassColorMatrix's), in `rects` (output pixels). The
+   *  scene's pass ends, the box around the rectangles is copied out and
+   *  blurred in two passes each way, and the pass resumes on the scene to
+   *  draw the result. */
+  glass(rects, colour) {
     if (!rects.length || this.n + 8 + rects.length * 2 >= MAX_DRAWS) return;
     const pad = 24;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -380,9 +388,12 @@ class Painter {
     this.pass.setPipeline(this.pipeline);
     for (const r of rects) {
       const u = [(r.x - x0) / a.width, (r.y - y0) / a.height, r.w / a.width, r.h / a.height];
-      this.#draw(r.x, r.y, r.w, r.h, a, 0, [0, 0, 0, 0], 0, 1, u);
-      if (tint[3] > 0) this.solid(r.x, r.y, r.w, r.h, tint);
-      if (blurAlpha < 1) this.solid(r.x, r.y, r.w, r.h, [tint[0], tint[1], tint[2], 1 - blurAlpha]);
+      const { m, offset } = colour;
+      // `c.rgb * m` in WGSL dots c with each of m's columns, and
+      // mat3x3f(a, b, c) takes columns: so the columns given are m's rows
+      // (as x, y, w for #draw's x, y, z).
+      const rows = [0, 1, 2].map((i) => ({ x: m[3 * i], y: m[3 * i + 1], w: m[3 * i + 2], h: 0 }));
+      this.#draw(r.x, r.y, r.w, r.h, a, 4, [...offset, 1], 0, 0, u, rows);
     }
   }
 
@@ -1126,12 +1137,7 @@ class Compositor {
       const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
       if (w > 0 && h > 0) rects.push({ x: f.x + x, y: f.y + y, w, h });
     }
-    // The colour's own alpha times the balance is how much of it lies over
-    // the backdrop; the blur balance, how much backdrop shows through.
-    const c = g.argb;
-    const alpha = ((c >>> 24) / 255) * (g.balance / 100);
-    const tint = [((c >> 16) & 0xff) / 255, ((c >> 8) & 0xff) / 255, (c & 0xff) / 255, alpha];
-    this.#painter.glass(rects, tint, g.blurBalance / 100);
+    this.#painter.glass(rects, glassColorMatrix(g));
     return rects;
   }
 
