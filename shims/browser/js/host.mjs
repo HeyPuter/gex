@@ -346,7 +346,13 @@ export class ProcessHost {
   }
 
   /// Start Workers up to the pool size, one per call so a burst of forks does
-  /// not spend its first moments making Workers it will not reach.
+  /// not spend its first moments making Workers it will not reach. Called on
+  /// a take and again when a pooled Worker is ready, so the pool fills one
+  /// Worker after another: called on a take alone, a take removed one and
+  /// added one, and the pool never held more than one Worker. The second
+  /// and third processes of a pipeline (`echo a | cat | cat`) then each
+  /// waited about 20 ms for a Worker made at their fork (worldmachine,
+  /// demo page).
   #topUp() {
     if (this.#warm.length >= this.#warmWanted) return;
     try {
@@ -360,6 +366,8 @@ export class ProcessHost {
         early.push(m);
         // Listening now (`ready` is posted once its handler is on).
         if (m?.kind === 'ready' && !w[POOLED]) this.#poolModules(w);
+        // Still pooled (not taken, the host not stopped): start the next.
+        if (m?.kind === 'ready' && this.#warm.includes(w)) this.#topUp();
       };
       w.addEventListener?.('message', buf);
       w.on?.('message', buf);
