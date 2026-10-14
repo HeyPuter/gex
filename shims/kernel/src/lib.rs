@@ -2659,6 +2659,41 @@ pub extern "C" fn k_fs_path_meta(path: gex_kmem::PAddr, path_len: u32, at: gex_k
     }
 }
 
+/// [`gex_kernel::vfs::walk_links`] through the root: a whole path lookup in
+/// one call, where the process's own walk asked here once per directory.
+/// `mounts` is the caller's other mount points, NUL-separated. Answers the
+/// length of the path reached (written to `at`), with
+/// `remote::WALK_AT_MOUNT` set if the walk stopped at one of those mounts.
+#[no_mangle]
+pub extern "C" fn k_fs_walk(
+    path: gex_kmem::PAddr,
+    path_len: u32,
+    mounts: gex_kmem::PAddr,
+    mounts_len: u32,
+    follow: u32,
+    at: gex_kmem::PAddr,
+    cap: u32,
+) -> i32 {
+    let abs = path_of_raw(path, path_len);
+    let list = path_of_raw(mounts, mounts_len);
+    let mounts: Vec<&str> = list.split('\0').filter(|m| !m.is_empty()).collect();
+    let fs = rootfs();
+    match gex_kernel::vfs::walk_links(abs, follow != 0, &mounts, &|rel| fs.read_link(rel)) {
+        Ok(w) => {
+            let b = w.path.as_bytes();
+            if b.len() as u32 > cap {
+                return -36; // ENAMETOOLONG
+            }
+            if !b.is_empty() {
+                unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+            }
+            let flag = if w.at_mount { gex_kernel::vfs::remote::WALK_AT_MOUNT } else { 0 };
+            b.len() as i32 | flag
+        }
+        Err(e) => -e.0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr, cap: u32) -> i32 {
     let p = path_of(path, path_len);

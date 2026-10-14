@@ -380,6 +380,14 @@ pub trait FileSystem: Send + Sync {
         let _ = path;
         Err(Errno::EINVAL)
     }
+    /// Absolute path `abs` with the symlinks among its directories followed
+    /// (and its last component's, with `follow_final`), as far as this
+    /// filesystem mounted at `/` can say: see [`walk_links`]. A filesystem
+    /// whose `read_link` is a round trip (the browser's [`remote::RemoteFs`])
+    /// does the whole walk in one.
+    fn walk(&self, abs: &str, follow_final: bool, mounts: &[&str]) -> Result<Walked, Errno> {
+        walk_links(abs.to_string(), follow_final, mounts, &|rel| self.read_link(rel))
+    }
     fn unlink(&self, path: &str) -> Result<(), Errno> {
         let _ = path;
         Err(Errno::EROFS)
@@ -479,8 +487,32 @@ impl Vfs {
     /// Longest prefix wins, so a `/proc` mount shadows the root mount for
     /// everything beneath it.
     fn resolve<'a>(&'a self, path: &str) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
-        let abs = self.through_dir_links(normalize(path, &self.cwd))?;
+        let abs = normalize(path, &self.cwd);
+        let abs = match self.walk(&abs, false)? {
+            Some(w) if !w.at_mount => w.path,
+            _ => self.through_dir_links(abs)?,
+        };
         self.mount_of(abs)
+    }
+
+    /// The root filesystem's [`FileSystem::walk`] of absolute `abs`, or
+    /// `None` with nothing mounted at `/`.
+    fn walk(&self, abs: &str, follow_final: bool) -> Result<Option<Walked>, Errno> {
+        let Some(root) = self.mounts.get("/") else {
+            return Ok(None);
+        };
+        let mounts: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
+        root.walk(abs, follow_final, &mounts).map(Some)
+    }
+
+    /// `abs` fully resolved in the root filesystem, final link and all, and
+    /// that filesystem with the path relative to it; `None` when the walk
+    /// reached another mount, which the caller resolves the long way.
+    fn resolve_final(&self, abs: &str) -> Result<Option<(&Arc<dyn FileSystem>, String)>, Errno> {
+        match self.walk(abs, true)? {
+            Some(w) if !w.at_mount => self.mount_of(w.path).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// `abs` with every symlink among its directories followed (not the
@@ -554,6 +586,9 @@ impl Vfs {
     /// Open a path, following symlinks up to a bounded depth.
     pub fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let mut current = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_final(&current)? {
+            return fs.open(&rel, flags, mode);
+        }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
             // O_NOFOLLOW and O_PATH are not modelled; a symlink is always
@@ -575,6 +610,9 @@ impl Vfs {
 
     pub fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let mut current = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_final(&current)? {
+            return fs.metadata(&rel);
+        }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
             match fs.read_link(&rel) {
@@ -594,6 +632,9 @@ impl Vfs {
     /// `access(2)` on `path`, following symlinks as [`Vfs::metadata`] does.
     pub fn access(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let mut current = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_final(&current)? {
+            return fs.access(&rel, mode);
+        }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
             match fs.read_link(&rel) {
@@ -739,6 +780,74 @@ impl Default for Vfs {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where [`walk_links`] got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walked {
+    /// The absolute path reached.
+    pub path: String,
+    /// It stopped at another mount (`mounts`), which resolves its own names:
+    /// the caller carries on from `path` there.
+    pub at_mount: bool,
+}
+
+/// Follow the root filesystem's symlinks through absolute path `abs`: every
+/// directory's, and the last component's too with `follow_final`. Stops,
+/// with `at_mount`, at the first prefix inside one of `mounts` (absolute,
+/// not `/`), whose filesystem names its own links. `read_link` takes a path
+/// relative to the root. At most 40 links, as Linux.
+///
+/// The one walk both the per-process [`Vfs`] and the browser's global kernel
+/// run, so a whole lookup there is one call (it was one round trip per
+/// directory per lookup: an `openat` of a file five directories down made a
+/// dozen).
+pub fn walk_links(
+    mut abs: String,
+    follow_final: bool,
+    mounts: &[&str],
+    read_link: &dyn Fn(&str) -> Result<String, Errno>,
+) -> Result<Walked, Errno> {
+    let under = |p: &str| {
+        mounts.iter().any(|m| p == *m || (p.starts_with(m) && p.as_bytes().get(m.len()) == Some(&b'/')))
+    };
+    'again: for _ in 0..40 {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        let mut prefix = String::with_capacity(abs.len());
+        for (i, c) in comps.iter().enumerate().take(comps.len().saturating_sub(1)) {
+            prefix.push('/');
+            prefix.push_str(c);
+            if under(&prefix) {
+                return Ok(Walked { path: abs, at_mount: true });
+            }
+            if let Ok(target) = read_link(&prefix[1..]) {
+                let base = if target.starts_with('/') {
+                    normalize(&target, "/")
+                } else {
+                    normalize(&target, &parent_of(&prefix))
+                };
+                abs = normalize(&comps[i + 1..].join("/"), &base);
+                continue 'again;
+            }
+        }
+        if !follow_final {
+            return Ok(Walked { path: abs, at_mount: false });
+        }
+        if under(&abs) {
+            return Ok(Walked { path: abs, at_mount: true });
+        }
+        match read_link(abs.trim_start_matches('/')) {
+            Ok(target) => {
+                abs = if target.starts_with('/') {
+                    normalize(&target, "/")
+                } else {
+                    normalize(&target, &parent_of(&abs))
+                };
+            }
+            Err(_) => return Ok(Walked { path: abs, at_mount: false }),
+        }
+    }
+    Err(Errno::ELOOP)
 }
 
 /// Make a path absolute and remove `.`, `..` and redundant separators.
@@ -894,5 +1003,24 @@ mod tests {
         let (buf, n) = encode_dirents(&entries, 0, 8);
         assert!(buf.is_empty());
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn walk_links_follows_dirs_final_and_stops_at_mounts() {
+        let links = |rel: &str| match rel {
+            "bin" => Ok("usr/bin".to_string()),
+            "usr/bin/sh" => Ok("dash".to_string()),
+            "loop" => Ok("/loop".to_string()),
+            "var/run" => Ok("/run".to_string()),
+            _ => Err(Errno::EINVAL),
+        };
+        let w = |p: &str, f: bool| walk_links(p.to_string(), f, &["/proc", "/run"], &links);
+        assert_eq!(w("/bin/sh", false).unwrap(), Walked { path: "/usr/bin/sh".into(), at_mount: false });
+        assert_eq!(w("/bin/sh", true).unwrap(), Walked { path: "/usr/bin/dash".into(), at_mount: false });
+        assert_eq!(w("/proc/self/exe", true).unwrap(), Walked { path: "/proc/self/exe".into(), at_mount: true });
+        assert_eq!(w("/var/run/x/y", false).unwrap(), Walked { path: "/run/x/y".into(), at_mount: true });
+        assert_eq!(w("/run", true).unwrap(), Walked { path: "/run".into(), at_mount: true });
+        assert_eq!(w("/loop", true), Err(Errno::ELOOP));
+        assert_eq!(w("/", true).unwrap(), Walked { path: "/".into(), at_mount: false });
     }
 }
