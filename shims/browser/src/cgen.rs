@@ -110,6 +110,9 @@ struct Provided {
     /// A native wasm32 Wine DLL's skeleton (`wasmdll`): Wine's PE module is
     /// its provider, installed at the first skeleton and bound at each.
     skeleton: Option<Arc<gex_ld::pe::PeImage>>,
+    /// Falls back to lifted twins (`lifted`): bound only where its unit
+    /// installed them.
+    lifted: bool,
 }
 
 /// Stateful providers by library (lower case) and module file under the
@@ -222,6 +225,11 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     }
     if mode & 8 != 0 {
         PROVIDERS_ONLY.store(true, Ordering::Relaxed);
+    }
+    // Bit 4 (16): the counting flavor of units (`image::icall_count`), whose
+    // table calls the shim tallies (`gex_icall_note`).
+    if mode & 16 != 0 {
+        gex_cgen::image::set_icall_count(true);
     }
     let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
@@ -428,7 +436,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 }
             }
             let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
-            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None });
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None, lifted: false });
         }
     }
     // A native wasm32 Wine DLL: its exports are Wine's PE module's, not the
@@ -441,6 +449,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             stateful: None,
             data: false,
             skeleton: Some(Arc::new(pe.clone())),
+            lifted: false,
         }];
     }
     let identity = match known {
@@ -508,6 +517,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, 
             stateful: None,
             data: p.stateful,
             skeleton: None,
+            lifted: p.lifted,
         })
         .filter(|p| !p.binds.is_empty())
         .collect();
@@ -526,6 +536,7 @@ fn trampoline_providers() -> Vec<Provided> {
             stateful: None,
             data: p.stateful,
             skeleton: None,
+            lifted: false,
         })
         .filter(|p| !p.binds.is_empty())
         .collect()
@@ -548,7 +559,8 @@ pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
     let text = if len == 0 { String::new() } else { String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned() };
     let mut units = lock(&UNITS);
     let Some(x) = units.get_mut(u as usize) else { return };
-    let hints = icall_hints(&text);
+    // The counting flavor devirtualises nothing: its key has no profile.
+    let hints = if gex_cgen::image::icall_count() { Default::default() } else { icall_hints(&text) };
     x.key = x.key_base.clone();
     if !hints.is_empty() {
         let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
@@ -675,7 +687,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     let raw = crate::shim_slice(entries, 8 * n);
     let slots: Vec<u64> = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
-    let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
+    // A lifted twin is no entry of its own address: no cache slot, no bridge.
+    let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0 && a & gex_abi::ftab::TWIN == 0).collect();
     let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
     {
@@ -848,11 +861,20 @@ pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> 
 /// provider's module number (an install names `PROVIDER | number`), or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
-    let (file, binds, stateful, data) = {
+    let (file, mut binds, stateful, data) = {
         let units = lock(&UNITS);
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
         (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data)
     };
+    if lock(&UNITS).get(u as usize).and_then(|x| x.providers.get(i as usize)).is_some_and(|p| p.lifted) {
+        // Only where its unit keeps the lifted twin it falls back to, as
+        // natively (`nt_cgen::install_providers`).
+        let had = binds.len();
+        binds.retain(|(_, a)| ftab(|m| m.twin(*a).is_some()));
+        if binds.len() < had {
+            crate::warn_line(&format!("gex-nt: provider {file}: {} of {had} exports left unbound (no lifted twin in its unit)\n", had - binds.len()));
+        }
+    }
     let wasm = crate::shim_slice(ptr, len);
     let names = match gex_cgen::provider::slot_names(wasm) {
         Ok(n) => n,
@@ -1199,6 +1221,37 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
 /// address, slot): its install's number.
 pub(crate) fn publish(len: u32, module: u32, tier: Tier, pairs: &[(u64, u32)]) -> u32 {
     ftab(|m| m.publish(len, module, tier, pairs))
+}
+
+/// `gex.ftab_twin(addr)`: the table index of the lifted twin of the export
+/// at `addr` (`gex_abi::ftab::TWIN`), 0 when its unit has none -- a
+/// provider's fallback (provider.h `gp_lifted`). Each address's first
+/// fallback is reported, every one counted (`TWIN_CALLS`), as natively.
+#[no_mangle]
+pub extern "C" fn gex_ftab_twin(addr: i64) -> i32 {
+    let addr = addr as u64;
+    TWIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    let idx = ftab(|m| m.twin(addr).map_or(0, |f| f.idx));
+    if lock(&TWIN_SEEN).insert(addr) {
+        crate::warn_line(&if idx == 0 {
+            format!("gex: provider at {addr:#x} fell back to its lifted body, but its unit has none\n")
+        } else {
+            format!("gex: provider at {addr:#x} fell back to its lifted body\n")
+        });
+    }
+    idx as i32
+}
+
+/// Fallbacks to lifted twins so far ([`gex_ftab_twin`]).
+pub(crate) static TWIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TWIN_SEEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// The exports no built-in provider binds (`?provskip=`, the native
+/// GEX_PROVIDER_SKIP): `len` bytes of comma-separated names at `ptr`.
+#[no_mangle]
+pub extern "C" fn gex_cgen_set_provider_skip(ptr: u32, len: u32) {
+    let s = String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned();
+    gex_cgen::provider::set_skip(&s);
 }
 
 /// The function table index serving `addr` now, if any.
@@ -2017,4 +2070,94 @@ static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 #[no_mangle]
 pub extern "C" fn gex_signal_hook_set(idx: u32) {
     SIGNAL_HOOK.store(idx, Ordering::Relaxed);
+}
+
+/// The counting flavor's tally (`gex_cgen::image::icall_count`): every
+/// call through the function table, by (return address, target). An
+/// open-addressed table of `ICALL_SLOTS`, claimed by CAS on a tag mixed from
+/// both, so a note takes no lock; a full table drops new pairs (counted).
+const ICALL_SLOTS: usize = 1 << 16;
+#[allow(clippy::declare_interior_mutable_const)]
+const ICALL_ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ICALL_TAG: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_RET: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_TARGET: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_N: [std::sync::atomic::AtomicU64; ICALL_SLOTS] = [ICALL_ZERO; ICALL_SLOTS];
+static ICALL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ICALL_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the tally is next printed (ns of `now_ns`; 0 before the first note).
+static ICALL_NEXT_DUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Every this many seconds of a counting run, the whole tally so far.
+const ICALL_DUMP_SECS: u64 = 150;
+
+/// A table call of a counting unit (`gex_abi::imports::ICALL_NOTE`).
+#[no_mangle]
+pub extern "C" fn gex_icall_note(_ctx: i32, ret: i64, target: i64) {
+    let (ret, target) = (ret as u64, target as u64);
+    let tag = (ret.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ target.rotate_left(29).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)) | 1;
+    let mut i = (tag >> 20) as usize & (ICALL_SLOTS - 1);
+    let mut noted = false;
+    for _ in 0..64 {
+        let mut t = ICALL_TAG[i].load(Ordering::Relaxed);
+        if t == 0 {
+            match ICALL_TAG[i].compare_exchange(0, tag, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    ICALL_RET[i].store(ret, Ordering::Relaxed);
+                    ICALL_TARGET[i].store(target, Ordering::Release);
+                    t = tag;
+                }
+                Err(now) => t = now,
+            }
+        }
+        if t == tag {
+            ICALL_N[i].fetch_add(1, Ordering::Relaxed);
+            noted = true;
+            break;
+        }
+        i = (i + 1) & (ICALL_SLOTS - 1);
+    }
+    if !noted {
+        ICALL_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let calls = ICALL_CALLS.fetch_add(1, Ordering::Relaxed);
+    if calls & 0xfffff == 0 {
+        let now = crate::now_ns();
+        let next = ICALL_NEXT_DUMP.load(Ordering::Relaxed);
+        if next == 0 {
+            let _ = ICALL_NEXT_DUMP.compare_exchange(0, now + ICALL_DUMP_SECS * 1_000_000_000, Ordering::Relaxed, Ordering::Relaxed);
+        } else if now >= next
+            && ICALL_NEXT_DUMP.compare_exchange(next, now + ICALL_DUMP_SECS * 1_000_000_000, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            gex_icall_dump();
+        }
+    }
+}
+
+/// Print the tally as an indirect-call profile (`icall RET TARGET N`, the
+/// lines `nt_cgen::icall_hints` reads), between `icall-dump` markers: the
+/// last complete dump of a run is its profile.
+#[no_mangle]
+pub extern "C" fn gex_icall_dump() {
+    let pid = crate::my_pid();
+    let mut lines = Vec::new();
+    for i in 0..ICALL_SLOTS {
+        if ICALL_TAG[i].load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let t = ICALL_TARGET[i].load(Ordering::Acquire);
+        let c = ICALL_N[i].load(Ordering::Relaxed);
+        if c != 0 {
+            lines.push(format!("icall {:#x} {t:#x} {c}\n", ICALL_RET[i].load(Ordering::Relaxed)));
+        }
+    }
+    crate::warn_line(&format!(
+        "icall-dump begin pid {pid}: {} pairs, {} calls, {} dropped\n",
+        lines.len(),
+        ICALL_CALLS.load(Ordering::Relaxed),
+        ICALL_DROPPED.load(Ordering::Relaxed)
+    ));
+    for l in &lines {
+        crate::warn_line(l);
+    }
+    crate::warn_line(&format!("icall-dump end pid {pid}\n"));
 }

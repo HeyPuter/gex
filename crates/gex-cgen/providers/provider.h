@@ -125,6 +125,27 @@ GEX_INLINE void gp_poll(int ctx, uint64_t pc) { gex_safepoint(ctx, (int64_t)pc);
  * it. Read it on entry, before anything calls out. */
 #define GP_SELF_PC() GEX_C64(GEX_CTX_LAST_TARGET)
 
+/* ---- falling back to the guest's own code (a `lifted` provider) ----
+ * A provider whose first line says `lifted` has the image's own body of
+ * every export it binds kept beside it, as a lifted twin (gex_abi::ftab::TWIN).
+ * GP_LIFTED(self) runs that body instead of the provider, as if the call had
+ * gone there: for the cases a provider cannot match bit for bit (another
+ * x87 control word, an error path that calls back into the library). Use it
+ * in a provider body before it has written anything, `self` being
+ * GP_SELF_PC() read on entry. The lookup is a host call: slow paths only. A
+ * unit without the twin (clang wanted a shadow stack for it) traps. */
+__attribute__((import_module("gex"), import_name("ftab_twin"))) int32_t gex_ftab_twin(int64_t addr);
+#define GP_LIFTED(self)                                                    \
+    do {                                                                   \
+        uint32_t gp_self_ = (self);                                        \
+        int32_t gp_twin_ = gex_ftab_twin((int64_t)gp_self_);               \
+        if (!gp_twin_) {                                                   \
+            __builtin_trap();                                              \
+        }                                                                  \
+        GEX_C64(GEX_CTX_LAST_TARGET) = gp_self_;                           \
+        GEX_MUSTTAIL return GEX_FTAB(gp_twin_)(ctx, depth, need, ret);     \
+    } while (0)
+
 /* ---- the slow path's view of the library a provider serves ----
  * For rare cases (errors) that must do what the library at hand does: the
  * library is found from the provider's own export address, so one provider

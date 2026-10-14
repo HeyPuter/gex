@@ -341,7 +341,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
             regs: Vec::new(),
             dirs: Vec::new(),
             slots: 0,
-            providers: vec![Provided { file: format!("libprov:{index}"), binds: Vec::new(), stateful: None, data: false, skeleton: None }],
+            providers: vec![Provided { file: format!("libprov:{index}"), binds: Vec::new(), stateful: None, data: false, skeleton: None, lifted: false }],
             identity: String::new(),
             key_base: String::new(),
         });

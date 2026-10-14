@@ -133,8 +133,20 @@ impl FuncMap {
     }
 
     /// The function at `addr`, if any is installed.
+    /// A lifted twin's marked address is none (only [`FuncMap::twin`]
+    /// finds it): a guest's jump there must not reach it, nor fill the probe
+    /// cache with it under the export's own low half.
     pub fn get(&self, addr: u64) -> Option<Func> {
+        if addr & gex_abi::ftab::TWIN != 0 {
+            return None;
+        }
         self.by_addr.get(&addr).copied()
+    }
+
+    /// The lifted twin of the export at `addr` (`gex_abi::ftab::TWIN`), if
+    /// a unit installed one.
+    pub fn twin(&self, addr: u64) -> Option<Func> {
+        self.by_addr.get(&(addr | gex_abi::ftab::TWIN)).copied()
     }
 
     pub fn installs(&self) -> &[Install] {
@@ -206,8 +218,15 @@ impl FuncMap {
 
     /// Forget `addr`'s function: its index is pointed back at the resolve
     /// stub in every table (as each catches up) and a lookup translates the
-    /// address again. Returns the retired index.
+    /// address again. Returns the retired index. An entry's lifted twin
+    /// (`gex_abi::ftab::TWIN`) goes with it.
     pub fn retire(&mut self, addr: u64) -> Option<u32> {
+        use gex_abi::ftab::TWIN;
+        if addr & TWIN == 0 {
+            if let Some(t) = self.by_addr.remove(&(addr | TWIN)) {
+                self.unref(t.idx);
+            }
+        }
         let f = self.by_addr.remove(&addr)?;
         self.unref(f.idx);
         Some(f.idx)
@@ -435,6 +454,25 @@ fn leb(b: &[u8]) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit's lifted twin (`gex_abi::ftab::TWIN`) is found only as the
+    /// twin of its export -- never by the address a guest could jump to --
+    /// and goes when the export's own entry is retired.
+    #[test]
+    fn a_lifted_twin_is_reachable_only_as_a_twin() {
+        use gex_abi::ftab::TWIN;
+        let mut m = FuncMap::new();
+        let unit = m.publish(3, 1, Tier::Unit, &[(0x1000, 0), (0x1000 | TWIN, 1), (0x2000, 2)]);
+        let prov = m.publish(1, 2, Tier::Unit, &[(0x1000, 0)]);
+        assert_eq!(m.get(0x1000).map(|f| f.install), Some(prov));
+        assert_eq!(m.twin(0x1000).map(|f| f.install), Some(unit));
+        assert!(m.get(0x1000 | TWIN).is_none());
+        assert!(m.twin(0x2000).is_none());
+        assert_eq!(m.range(0, 0x10000).count(), 2);
+        m.retire(0x1000);
+        assert!(m.twin(0x1000).is_none());
+        assert!(m.get(0x2000).is_some());
+    }
 
     #[test]
     fn the_rebridge_guard_never_gives_up_an_unliftable_address() {

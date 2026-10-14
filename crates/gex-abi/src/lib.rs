@@ -773,6 +773,18 @@ pub mod ftab {
     /// guest address of the function there (0: not reachable by address,
     /// e.g. a helper). `u32` count, then that many little-endian `u64`s.
     pub const FUNCS_SECTION: &str = "gex.funcs";
+
+    /// Marks a slot's address in [`FUNCS_SECTION`] as a lifted twin: the
+    /// image's own body for an export a `lifted` provider serves
+    /// (gex-cgen/providers/provider.h `gp_lifted`), kept beside the
+    /// provider. Hosts map it apart from the address itself -- never in the
+    /// probe cache, never bridged from tier-1 -- and answer
+    /// [`TWIN_IMPORT`] with it.
+    pub const TWIN: u64 = 1 << 63;
+
+    /// `(addr: i64) -> i32`: the function-table index of `addr`'s lifted
+    /// twin, or 0 when there is none. A provider's fallback only.
+    pub const TWIN_IMPORT: &str = "ftab_twin";
 }
 
 /// A counter the browser glue takes bootstrap stacks by: a Worker calls
@@ -897,6 +909,12 @@ pub mod imports {
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.
     pub const SAFEPOINT: &str = "safepoint";
+
+    /// An indirect call about to be made, in a unit of the counting flavor
+    /// (`gex_cgen::image::icall_count`): its return address and target,
+    /// which the host tallies into an indirect-call profile. Signature
+    /// `(ctx: i32, ret: i64, target: i64) -> ()`.
+    pub const ICALL_NOTE: &str = "icall_note";
 }
 
 /// Names translated modules export back to the host.

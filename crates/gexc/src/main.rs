@@ -51,6 +51,8 @@ fn real_main() -> Result<ExitCode> {
         || (argv[1] == "eject" && matches!(argv.get(2).map(String::as_str), Some("build" | "run")));
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
+    // The counting flavor, whose run makes the indirect-call profile.
+    gex_cgen::image::set_icall_count(std::env::var("GEX_CGEN_ICALL_COUNT").as_deref() == Ok("1"));
     // The guest's `select`/`poll` on stdin asks the host's fd 0.
     let _ = gex_kernel::stdio::STDIN_READY.set(stdin_ready);
     match argv[1].as_str() {

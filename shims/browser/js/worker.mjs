@@ -464,6 +464,7 @@ async function handle(msg) {
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
   if (msg.door) gex.setDoor(msg.door);
+  if (msg.cgen?.skip) gex.providerSkip(msg.cgen.skip);
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.

@@ -143,6 +143,9 @@ struct Provided {
     providers: Vec<gex_cgen::provider::Provider>,
     exports: HashMap<String, u32>,
     stubs: Vec<u64>,
+    /// Those of `stubs` whose unit keeps a lifted twin
+    /// (`gex_cgen::provider::twins`, marked `gex_abi::ftab::TWIN`).
+    twins: Vec<u64>,
 }
 
 fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
@@ -156,7 +159,8 @@ fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
         }
     }
     let stubs = gex_cgen::provider::stubs(&providers, &exports, base);
-    Provided { providers, exports, stubs }
+    let twins = gex_cgen::provider::twins(&providers, &exports, base);
+    Provided { providers, exports, stubs, twins }
 }
 
 /// The key of `image`'s unit built around `pv`'s providers and its
@@ -221,6 +225,10 @@ fn report_hints(image: &gex_ld::Image) {
 /// whose dominant target takes at least 90% of at least 64 calls gets a
 /// guarded direct call to it. By return address.
 pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
+    // The counting flavor devirtualises nothing (`image::icall_count`).
+    if gex_cgen::image::icall_count() {
+        return HashMap::new();
+    }
     let Ok(path) = icall_path(image) else { return HashMap::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
     let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();
@@ -626,6 +634,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         member_keys.push(unit_key(&image, &pv));
         recoveries.push(root.join("recovery").join(recovery_key(&image)));
         stubs.extend(pv.stubs.iter().copied());
+        stubs.extend(pv.twins.iter().copied());
         if with_providers {
             // A stateful provider (data, a stack) stays a module of its own.
             for prov in pv.providers.iter().filter(|p| !p.stateful) {
@@ -727,7 +736,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
 
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
-    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
     prepare_with(image, &|| gex_xlate::func::recover_pe(image, seeds, &Default::default()), jobs, verbose, &none)
 }
 
@@ -776,7 +785,7 @@ fn prepare_with(
     let byte = |a: u64| {
         image.segments.iter().find_map(|s| s.byte(a))
     };
-    let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
+    let stubs: std::collections::HashSet<u64> = pv.stubs.iter().chain(&pv.twins).copied().collect();
     let hints = icall_hints(image);
     let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
     // GEX_CGEN_KEEP: keep the generated C (dir/work) to read.
@@ -1625,7 +1634,19 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         // no need for the cache's build lock (which a unit build holds for
         // an hour).
         let (path, slots) = provider_module(prov)?;
-        let pairs = gex_cgen::provider::bindings(prov, &slots, &pv.exports, p.base, trace());
+        let mut pairs = gex_cgen::provider::bindings(prov, &slots, &pv.exports, p.base, trace());
+        if prov.lifted {
+            // Only where its unit keeps the lifted twin it falls back to:
+            // none on tier-1 alone (--no-cgen, no unit for this base).
+            let had = pairs.len();
+            {
+                let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                pairs.retain(|&(a, _)| s.ftab.map.twin(a).is_some());
+            }
+            if pairs.len() < had {
+                eprintln!("gex-nt: provider {} for {}: {} of {had} exports left unbound (no lifted twin in its unit)", prov.name, p.path, had - pairs.len());
+            }
+        }
         if pairs.is_empty() {
             continue;
         }
@@ -1711,7 +1732,7 @@ pub fn elf_image(bytes: &[u8], base: u64) -> Result<gex_ld::Image> {
 /// Build (or find) the unit for the ELF object `bytes` at `base`.
 pub fn prepare_elf(bytes: &[u8], base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let image = elf_image(bytes, base)?;
-    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
     prepare_with(&image, &|| gex_xlate::func::recover(&image, Some(bytes), &Default::default()), jobs, verbose, &none)
 }
 
@@ -1775,7 +1796,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
             (lo.min(s.vaddr), hi.max(s.vaddr + s.bytes.len() as u64))
         });
         ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((m.path.clone(), base, span));
-        let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+        let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new(), twins: Vec::new() };
         let key = unit_key(&image, &none);
         let cwasm_path = cache_root()?.join(&key).join("c.wasm");
         let Ok(cwasm) = std::fs::read(&cwasm_path) else {

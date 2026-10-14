@@ -250,7 +250,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     // GEX_NT_BROWSER_KEEP=REGEX: also any line it matches (Mesa's compile
     // and link notes, say), without the verbose flood.
     keepRe ??= process.env.GEX_NT_BROWSER_KEEP ? new RegExp(process.env.GEX_NT_BROWSER_KEEP) : false;
-    if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE || (keepRe && keepRe.test(text))) && printed++ < 20000) {
+    if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE || (keepRe && keepRe.test(text))) && printed++ < Number(process.env.GEX_NT_BROWSER_MAX_LINES || 20000)) {
       log(`console[${sid?.slice(0, 6)} @${((Date.now() - T0) / 1000).toFixed(1)}s] ${text.slice(0, 4000)}`);
     }
   });

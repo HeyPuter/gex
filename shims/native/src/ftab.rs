@@ -480,7 +480,8 @@ pub(crate) fn publish_stateful(
 /// Bind more addresses to slots of an existing install (`FuncMap::bind`):
 /// one module serving several images.
 pub(crate) fn bind_pairs(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, install: u32, pairs: &[(u64, u32)]) -> Result<()> {
-    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0).collect();
+    // A lifted twin is no entry of its own address: no cache slot, no bridge.
+    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0 && a & gex_abi::ftab::TWIN == 0).collect();
     entries.sort_unstable();
     entries.dedup();
     sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.bind(install, pairs);
@@ -512,7 +513,8 @@ fn publish_pairs_at(
     checks: Vec<(u64, u32)>,
     epoch: Option<u64>,
 ) -> Result<Option<u32>> {
-    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0).collect();
+    // A lifted twin is no entry of its own address: no cache slot, no bridge.
+    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0 && a & gex_abi::ftab::TWIN == 0).collect();
     entries.sort_unstable();
     entries.dedup();
     let n = {

@@ -32,8 +32,19 @@
 # The provider modules go in too, with the same gexc and GEX_CGEN_CACHE:
 # `gexc cgen-image --providers` (units/providers; no image's unit carries
 # them). The page names a missing one as "missing unit:", and the leg fails on
-# it at once. (So does the NT shim's trampoline unit, `--nt-trampolines32`,
+# it at once, as on any image with code that has no unit at the base it landed
+# at (NOITA_UNITLESS_OK: a regex of images without code, default tzres and
+# normaliz). (So does the NT shim's trampoline unit, `--nt-trampolines32`,
 # which W3 runs do not place.)
+# The units are built with gex's own indirect-call profile of Noita,
+# tests/games/noita-icall (a counting run's, at the bases it ran at): after
+# a first build, `tests/games/noita-icall/place.py units LIST BUILDLOG`
+# (LIST the images and bases built, BUILDLOG that build's log, which names
+# each one's identity) moves it to these bases as units/icall/, and a second
+# build devirtualises the hot table calls. A new profile: build the units
+# with GEX_CGEN_ICALL_COUNT=1, run with NOITA_Q='&cgen=1&icallcount=1' and
+# NOITA_KEEP=icall, and split the run's dumps (tmp/noita-err.txt on the
+# bench box) with tests/games/noita-icall/split.py.
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
@@ -45,7 +56,7 @@ if [ "${1:-}" = --remote ]; then
   CP=$(free_port); VP=$(free_port)
   mkdir -p $T/../tmp
   export TMPDIR=$(cd $T/.. && pwd)/tmp GEX_NT_CHROME_PORT=$CP GEX_NT_VITE_PORT=$VP GEX_WEBGPU_SOFTWARE=0
-  export GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
+  export GEX_NT_BROWSER_MAX_LINES=200000 GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
   kill_ours() { for p in $(pgrep -f -- "--remote-debugging-port=$CP\b"); do kill $p 2>/dev/null; done; }
   trap 'kill_ours; [ -n "${np:-}" ] && kill $np 2>/dev/null; exit 143' TERM INT
   node $T/tests/games/noita-page.mjs $T $X $secs 2> $TMPDIR/noita-err.txt & np=$!
@@ -111,6 +122,7 @@ shots="env NOITA_WORLD_BY_MIN=${NOITA_WORLD_BY_MIN:-12}"
 [ -n "${NOITA_PROF:-}" ] && shots="$shots NOITA_PROF=$NOITA_PROF"
 [ -n "${NOITA_Q:-}" ] && shots="$shots NOITA_Q=$NOITA_Q"
 [ -n "${NOITA_KEEP:-}" ] && shots="$shots NOITA_KEEP=$NOITA_KEEP"
+[ -n "${NOITA_UNITLESS_OK:-}" ] && shots="$shots NOITA_UNITLESS_OK=$NOITA_UNITLESS_OK"
 BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} $B -s $T -s $A/units -- $shots bash $R/tree/tests/games/noita-page-leg.sh --remote $R/tree Noita/noita.exe $R/units ${LEG_SECS:-300} > $A/last.txt 2>&1
 [ -n "${NOITA_SHOTS:-}" ] && { rm -rf $A/shots; rsync -a claude@edger:gex-sandbox/$R/shots/ $A/shots/; ssh claude@edger "rm -rf gex-sandbox/$R/shots"; }
 res=$(grep -m1 '^== noita' $A/last.txt)
