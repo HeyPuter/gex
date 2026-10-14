@@ -197,16 +197,20 @@ mod tests {
             .map(|slot| {
                 let (p, stop) = (p.clone(), stop.clone());
                 std::thread::spawn(move || {
+                    // At least one read, even if the writer finishes before this thread
+                    // first runs (a loaded machine: the gate runs every lane at once).
                     let mut n = 0u64;
-                    while !stop.load(SeqCst) {
+                    loop {
                         p.read(slot, |s| {
                             for _ in 0..50 {
                                 assert!(s.0.load(SeqCst), "read a freed value");
                             }
                         });
                         n += 1;
+                        if stop.load(SeqCst) {
+                            break n;
+                        }
                     }
-                    n
                 })
             })
             .collect();
