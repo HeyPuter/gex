@@ -1,0 +1,1220 @@
+{
+ "format": "gex-w3-session",
+ "version": 1,
+ "url": "http://127.0.0.1:8761/nt.html?tar=%2Fmspaint.tar&exe=%2Fw3%2Flib%2Fwine%2Fi386-unix%2Fwine&mtimes=1&cwd=%2Fpfx%2Fdrive_c&argv=%5B%22C%3A%5C%5Cwinlogon.exe%22%2C%22C%3A%5C%5CWindows%5C%5Csystem32%5C%5Cuserinit.exe%22%5D&env=WINEPREFIX%3D%2Fpfx%2CWINEDEBUG%3Dfixme-all%2CXDG_RUNTIME_DIR%3D%2Ftmp%2CWAYLAND_DISPLAY%3Dwayland-0%2CUSER%3Dgex&fjit=0&compositor=0&size=fit&cgen=1&cgenurl=%2Funits&preload=%2Funits%2Fpreload.json&pack=%2Fpack.json%3Fv%3D82d4f4bf7905",
+ "title": "(untitled)",
+ "title_seconds": 147.78,
+ "page": {
+  "exe": "/w3/lib/wine/i386-unix/wine",
+  "argv": [
+   "C:\\winlogon.exe",
+   "C:\\Windows\\system32\\userinit.exe"
+  ],
+  "env": [
+   "WINEPREFIX=/pfx",
+   "WINEDEBUG=fixme-all",
+   "XDG_RUNTIME_DIR=/tmp",
+   "WAYLAND_DISPLAY=wayland-0",
+   "USER=gex",
+   "GEX_WINE_PREFIX=/wine",
+   "GEX_NT_STRICT=1"
+  ],
+  "cwd": "/pfx/drive_c",
+  "mtimes": true,
+  "size": "1280x813",
+  "tar": [
+   "/mspaint.tar"
+  ],
+  "params": {
+   "tar": "/mspaint.tar",
+   "exe": "/w3/lib/wine/i386-unix/wine",
+   "mtimes": "1",
+   "cwd": "/pfx/drive_c",
+   "argv": "[\"C:\\\\winlogon.exe\",\"C:\\\\Windows\\\\system32\\\\userinit.exe\"]",
+   "env": "WINEPREFIX=/pfx,WINEDEBUG=fixme-all,XDG_RUNTIME_DIR=/tmp,WAYLAND_DISPLAY=wayland-0,USER=gex",
+   "fjit": "0",
+   "compositor": "0",
+   "size": "fit",
+   "cgen": "1",
+   "cgenurl": "/units",
+   "preload": "/units/preload.json",
+   "pack": "/pack.json?v=82d4f4bf7905"
+  }
+ },
+ "bundle": "shell.tar",
+ "processes": [
+  {
+   "image": "/w3/lib/wine/i386-windows/ntoskrnl.exe",
+   "cmdline": "/w3/lib/wine/i386-unix/wine C:\\windows\\system32\\winedevice.exe"
+  },
+  {
+   "image": "/pfx/dosdevices/c:/winlogon.exe",
+   "cmdline": "/w3/lib/wine/i386-unix/wine C:\\winlogon.exe C:\\Windows\\system32\\userinit.exe"
+  },
+  {
+   "image": "/pfx/dosdevices/c:/windows/system32/userinit.exe",
+   "cmdline": "/w3/lib/wine/i386-unix/wine C:\\Windows\\system32\\userinit.exe"
+  },
+  {
+   "image": "/pfx/dosdevices/c:/windows/explorer.exe",
+   "cmdline": "/w3/lib/wine/i386-unix/wine C:\\Windows\\explorer.exe"
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/dllhost.exe",
+   "cmdline": "/w3/lib/wine/i386-unix/wine C:\\windows\\system32\\dllhost.exe /PROCESSID:{AB8902B4-09CA-4BB6-B78D-A8F59079A8D5}"
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/wineboot.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/services.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/winedevice.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/plugplay.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/svchost.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/explorer.exe",
+   "cmdline": null
+  },
+  {
+   "image": "/w3/lib/wine/i386-windows/rpcss.exe",
+   "cmdline": null
+  }
+ ],
+ "units": [
+  {
+   "key": "a6cae4eccdd25c7728c2cfb632092b9982ff24538ac8568b2a24d0a597af4dfd",
+   "path": "/w3/lib/wine/i386-windows/rpcrt4.dll"
+  },
+  {
+   "key": "aaaef391c820c0d73b7d5f7426a744ae34619851f01c891f82a7287743dc6580",
+   "path": "/w3/lib/wine/i386-windows/advapi32.dll"
+  },
+  {
+   "key": "2dfd808417b3222d0b3fb9937fc404f2dfd1490bbb93a71aaa26b7343f0a305e",
+   "path": "/w3/lib/wine/i386-windows/sechost.dll"
+  },
+  {
+   "key": "91c0c9aa9496df682234390641a02f21a9b6677ae91efdfed4ca4f42ce4b3157",
+   "path": "/w3/lib/wine/i386-windows/imm32.dll"
+  },
+  {
+   "key": "3b2857d6fce652599616394e19d4caddf84d1e4aace29e8ef90c48894bfd5352",
+   "path": "/w3/lib/wine/i386-windows/combase.dll"
+  },
+  {
+   "key": "6b582a5de7afe27bf454c83c468992c2acf7afbc5677430613cb67cab1ce4d01",
+   "path": "/w3/lib/wine/i386-windows/ole32.dll"
+  },
+  {
+   "key": "ba653c86ec91942495d5ec9ec44bc45fd582d805691804d6ed591ce381e16ac6",
+   "path": "/w3/lib/wine/i386-windows/coml2.dll"
+  },
+  {
+   "key": "1084e2b76379620673af18cf574767289ce0702587c95269c665c0b07fa45f63",
+   "path": "/w3/lib/wine/i386-windows/cryptbase.dll"
+  },
+  {
+   "key": "bbeead68d179b068681b6bb8e10f50fa7b79f25810fc913535df071cccc8b267",
+   "path": "/w3/lib/wine/i386-windows/ws2_32.dll"
+  },
+  {
+   "key": "44de3675f342823e22a99f311a7c48e98d532fae0d9e2ea1af6d7682b83d92e2",
+   "path": "/w3/lib/wine/i386-windows/version.dll"
+  },
+  {
+   "key": "5984f968cb0c717b793b8395f69c26a379024fa9e2ca23603ef3edfad4b4012c",
+   "path": "/w3/lib/wine/i386-windows/setupapi.dll"
+  },
+  {
+   "key": "caaa3d39083f9dd7226c12554fd9554e0a6a13639b8ea065694be6d5fc1f7195",
+   "path": "/w3/lib/wine/i386-windows/cfgmgr32.dll"
+  },
+  {
+   "key": "1b9f7014fd9152a2b13e61255ae90069d100e264a320f12386efe9d7271bad57",
+   "path": "/w3/lib/wine/i386-windows/newdev.dll"
+  },
+  {
+   "key": "b4f7754fdb301ef118951d94d77ea798dc974e65110097781d09e3ff09a3cc56",
+   "path": "/w3/lib/wine/i386-windows/wininet.dll"
+  },
+  {
+   "key": "bf7987b31d26e299e88b853199f42f161de4510d34cf8e528fe6f0c32e3cc43b",
+   "path": "/w3/lib/wine/i386-windows/mpr.dll"
+  },
+  {
+   "key": "d729e95f7c04e6d9c8914b2edd8f06ae2aa78eaaa9065be6918044fa87c04471",
+   "path": "/pfx/dosdevices/c:/windows/system32/shlwapi.dll"
+  },
+  {
+   "key": "27b792ee284b3a91139d9d80468b2cc34a64094457c77902db88ee5ab76aa230",
+   "path": "/pfx/dosdevices/c:/windows/system32/shell32.dll"
+  },
+  {
+   "key": "d114ff27a34aa7da2277717195f497afae3152f5f5acb93c5e98ab498b6ae2ca",
+   "path": "/pfx/dosdevices/c:/windows/system32/profapi.dll"
+  },
+  {
+   "key": "e9aeaad06924d9b3519fe694dd215869a3a8bba296aa2e9270f8fe3478641956",
+   "path": "/w3/lib/wine/i386-windows/userenv.dll"
+  },
+  {
+   "key": "72321c39411bcc1099b968d66b9da2d92eb0be77c9e4d1a875f070e13ccd2787",
+   "path": "/w3/lib/wine/i386-windows/hal.dll"
+  },
+  {
+   "key": "5976536fd3e4eb31343bb914de1fe17a93c51488012f9c41175523ef9e6f41f2",
+   "path": "/w3/lib/wine/i386-windows/srvsvc.dll"
+  },
+  {
+   "key": "6a42a02392ffe3d2cc1ecd8ebf73310fd438af36d12d2e756fdfa6d2b0bc813c",
+   "path": "/w3/lib/wine/i386-windows/qmgr.dll"
+  },
+  {
+   "key": "cb127ccb9218a2ed6f6898b7f3c88c9b9dec238230c39440361cad6c4d070831",
+   "path": "/w3/lib/wine/i386-windows/winhttp.dll"
+  },
+  {
+   "key": "68a93b80a25bea7fccf52218abd70fb725679aae5c5369825a2013ae8f01d981",
+   "path": "/w3/lib/wine/i386-windows/jsproxy.dll"
+  },
+  {
+   "key": "c3efdbc54e67c3e5b3abf700f5647e60606c94c9470f02ed4db6e08c08e8ed02",
+   "path": "/w3/lib/wine/i386-windows/oleaut32.dll"
+  },
+  {
+   "key": "c15d5937d6436d61fdbbabc197129e4966bd8ff314b469247453fee1302bd321",
+   "path": "/w3/lib/wine/i386-windows/schedsvc.dll"
+  },
+  {
+   "key": "c7582815d3776379266bc38e4676610e9075c56f38d9d7782a6d5f82fbcc91ec",
+   "path": "/pfx/dosdevices/c:/windows/system32/xmllite.dll"
+  },
+  {
+   "key": "bab3c3d5b6f386c338791eab8a1d817516108d98509ab284d979a470b0d5e631",
+   "path": "/pfx/dosdevices/c:/windows/system32/themeservice.dll"
+  },
+  {
+   "key": "d33855e6c803e9ede4bf4d11097c385d4b5d36d4982f3cbf0e029393a5f08717",
+   "path": "/w3/lib/wine/i386-windows/difxapi.dll"
+  },
+  {
+   "key": "bb4daf5bceaecd62f790106d0cd5b9e605a2e86b6d2f3d16363a1210713d189c",
+   "path": "/w3/lib/wine/i386-windows/gdiplus.dll"
+  },
+  {
+   "key": "ba1f28e9d206bfad6e17050d6b7b788d7a324d71dbf6682a5d90c12f2dc74917",
+   "path": "/w3/lib/wine/i386-windows/imagehlp.dll"
+  },
+  {
+   "key": "a474026957c435f9a3cbaaf98fa601198a5422f3205a0a55d4c6c120b708f158",
+   "path": "/w3/lib/wine/i386-windows/msctf.dll"
+  },
+  {
+   "key": "d95cdbfc6b1ad8740483a8ee23aa391209fd359db68b3aa5b7b13565f1c42404",
+   "path": "/w3/lib/wine/i386-windows/nsi.dll"
+  },
+  {
+   "key": "22cd6f4b8aa698be249c1c018d6fe788d370ac2c8ed4b3cd981224653e46e93f",
+   "path": "/w3/lib/wine/i386-windows/psapi.dll"
+  },
+  {
+   "key": "8479394db495e268993ddfc2e2f8ba4bf25dc37bfda98588ea585611d9428189",
+   "path": "/w3/lib/wine/i386-windows/shcore.dll"
+  },
+  {
+   "key": "8ee2a66897b344f879463570ae18ecead7b149e3111242253b4bff9bccb0dbff",
+   "path": "/w3/lib/wine/i386-windows/wldap32.dll"
+  },
+  {
+   "key": "f65f233cd6c2ac474f9283869a4c7f7ac23b03f2d32a6965fd6f6aa991b4a5d5",
+   "path": "/w3/lib/wine/i386-windows/comctl32.dll"
+  },
+  {
+   "key": "987031afb2c2c25a3e0c0313f985284c7dd9b461dba773c25668480647641463",
+   "path": "/pfx/dosdevices/c:/winlogon.exe"
+  },
+  {
+   "key": "207fd59f32746397fa445a5606a486ca6a03ad2f67c0de1182345e8025fada31",
+   "path": "/pfx/dosdevices/c:/windows/winsxs/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef/comctl32.dll"
+  },
+  {
+   "key": "61df700b939b5c146c6c553dbea7f35786ca5f4f55f85c8bb8d6344712fc1545",
+   "path": "/pfx/dosdevices/c:/windows/system32/uxtheme.dll"
+  },
+  {
+   "key": "64c97fcc89e59134e11f6f0edef56e521eaa75ba783bb6e31dfb7b8fa4cefaae",
+   "path": "/pfx/dosdevices/c:/windows/system32/WindowsCodecs.dll"
+  },
+  {
+   "key": "c8ed5253e3c7c9e0bb2b3a905216f52ac8252d2afaebf997e7c28283dcb34dd9",
+   "path": "/pfx/dosdevices/c:/windows/system32/UXInit.dll"
+  },
+  {
+   "key": "5560ffb65cdf947bf7b68a27872b0e32ff0a0a8979116d3db07e036132e32efe",
+   "path": "/w3/lib/wine/i386-windows/cryptsp.dll"
+  },
+  {
+   "key": "8bd035ba88e2d955dd896297b8f08e4c79ff855d1b98cf0ffa11dea417c0c0f1",
+   "path": "/w3/lib/wine/i386-windows/rsaenh.dll"
+  },
+  {
+   "key": "0089bf7f245b5001715b60b0588c07dbbc98e2ab3f21cba122c6a612f4349932",
+   "path": "/w3/lib/wine/i386-windows/crypt32.dll"
+  },
+  {
+   "key": "6aee46692a45e79693c9fa9f7c1e114c4b3b6cd92365548718f071095e11f8ac",
+   "path": "/w3/lib/wine/i386-windows/bcrypt.dll"
+  },
+  {
+   "key": "919ebaa4cc42e4aca03134244af22f9e5f10f346f44f5c5c32ea7c4a9aa50ddd",
+   "path": "/w3/lib/wine/i386-windows/ncrypt.dll"
+  },
+  {
+   "key": "66ccd2035843b5b5c9685063e46d2e6ff7170cdaa6af6953459d2f49365d0f8f",
+   "path": "/pfx/dosdevices/c:/windows/system32/userinit.exe"
+  },
+  {
+   "key": "7bfccf362394203810430ed6504cb0f100dc741f837f2938be3807e950d0d6f1",
+   "path": "/w3/lib/wine/i386-windows/dwmapi.dll"
+  },
+  {
+   "key": "4aefc6e2ac94d9587dd1e13b943b8a4045c572f8b6e383f6e51a4e38a4b93a6a",
+   "path": "/w3/lib/wine/i386-windows/powrprof.dll"
+  },
+  {
+   "key": "d9a59ccdf62e2bf02dc68725b42d93d1257a7de3997652acfd233fb272f8c589",
+   "path": "/w3/lib/wine/i386-windows/slc.dll"
+  },
+  {
+   "key": "f9e360282e77df4e0fd9b5e42acd08b4b47027b8053847d638d5de97ea21f74c",
+   "path": "/w3/lib/wine/i386-windows/secur32.dll"
+  },
+  {
+   "key": "a354434a36b7dc236a23b9a024a6ea455a2a830f295bdf3620677f730d51b90c",
+   "path": "/pfx/dosdevices/c:/windows/system32/duser.dll"
+  },
+  {
+   "key": "6107da7108985c0afa849499e3f16b1415da6ed138a7f7c825a81dbe51eeb7a2",
+   "path": "/pfx/dosdevices/c:/windows/system32/dui70.dll"
+  },
+  {
+   "key": "e6c7656222ab27e725fc16cb2e3f1faa2a47453acfc26fe8a5f8c4887b46af21",
+   "path": "/pfx/dosdevices/c:/windows/system32/ExplorerFrame.dll"
+  },
+  {
+   "key": "91d01d61bd2c75563fbd336137c6f82611badb133338819e2d3057918444066e",
+   "path": "/w3/lib/wine/i386-windows/kerberos.dll"
+  },
+  {
+   "key": "f3651643f1cacbbc4ed1e7bcfc9b53d048045918227d2f0dc7860aa37bb9d3cd",
+   "path": "/w3/lib/wine/i386-windows/msv1_0.dll"
+  },
+  {
+   "key": "adfaa5b6eb0f09d7f2058115758a377467a02ce50d7b64274144f12d4c33a765",
+   "path": "/w3/lib/wine/i386-windows/netapi32.dll"
+  },
+  {
+   "key": "83604d08b8f87b6a479890ee8335de357a7d08fa9e75df256529771745452913",
+   "path": "/w3/lib/wine/i386-windows/dnsapi.dll"
+  },
+  {
+   "key": "867f92dee8b3f3bcd0ea035da68bb23447120b3cae54900c100bf41744ab58ab",
+   "path": "/w3/lib/wine/i386-windows/iphlpapi.dll"
+  },
+  {
+   "key": "46cdad0a64fd03cbbdb83efcb38064209e5694131684c11816b43462b70872b6",
+   "path": "/w3/lib/wine/i386-windows/netutils.dll"
+  },
+  {
+   "key": "bfbe3d2ccec7ee22795c0ac28428615239200cd886c884ace786d66d93da3a02",
+   "path": "/pfx/dosdevices/c:/windows/system32/propsys.dll"
+  },
+  {
+   "key": "78b5f77ae9c3a67390241a53018747dc5f7ab20dbe85c20f8e6332247feb7018",
+   "path": "/pfx/dosdevices/c:/windows/explorer.exe"
+  },
+  {
+   "key": "0b60220faa5a8e011ebea0ce54e1561ddc83fdeaa639a9767d9bbc4f1540dff9",
+   "path": "/w3/lib/wine/i386-windows/apphelp.dll"
+  },
+  {
+   "key": "f45feedf28fdd378173c72fd364aad24f4aa83be839c3ac121390545bbe22f94",
+   "path": "/pfx/dosdevices/c:/windows/system32/ntshrui.dll"
+  },
+  {
+   "key": "9feda423ee370f6e17ba47b263d096eeee60d29aca52f70ca8670bc8e927d277",
+   "path": "/w3/lib/wine/i386-windows/srvcli.dll"
+  },
+  {
+   "key": "1f09afc9e2c31abd99781f3ae0918355e7586be5db39c647f3f4503b94f42013",
+   "path": "/w3/lib/wine/i386-windows/gameux.dll"
+  },
+  {
+   "key": "d4438e1204020365f6cb43699b8c07e42937adb46d5f802ff77ddfff35df94af",
+   "path": "/w3/lib/wine/i386-windows/hid.dll"
+  },
+  {
+   "key": "a4094b80d62e99cae06356ecc47f7aa2bb5ea1007c0b5b2edefd549f132f480b",
+   "path": "/pfx/dosdevices/c:/windows/system32/SndVolSSO.dll"
+  },
+  {
+   "key": "f460c64dc95a70544f54f7cc2141de80a12bb0ef3672a71cb585e913a2ada5e4",
+   "path": "/w3/lib/wine/i386-windows/mmdevapi.dll"
+  },
+  {
+   "key": "69245b79788c7b5b47aa9fd5e71349d31cbbe0975fd822599078fda76f543cf8",
+   "path": "/pfx/dosdevices/c:/windows/system32/shacct.dll"
+  },
+  {
+   "key": "2ca6ea51ecea9635042467f91d469cd36ed67e7631d212a1b72f73dbaf3d0d1f",
+   "path": "/w3/lib/wine/i386-windows/samlib.dll"
+  },
+  {
+   "key": "84632fdaee4ea2b3958cf733d60f13fa7a855d1a6c59a411c6598d3912944f08",
+   "path": "/w3/lib/wine/i386-windows/samcli.dll"
+  },
+  {
+   "key": "b94c365291ae59614353dc9320c361dee9eefa252bb348e5d0d473e76e37b177",
+   "path": "/w3/lib/wine/i386-windows/msftedit.dll"
+  },
+  {
+   "key": "c007934ee0ca3da3892cc69b225241bc83159b9c750341c243f3ce0c4f015e04",
+   "path": "/w3/lib/wine/i386-windows/riched20.dll"
+  },
+  {
+   "key": "a4079d6a24f6cf113cb08b58af14c5b0473aea17e28c8c30b9e3e169eb84bc05",
+   "path": "/w3/lib/wine/i386-windows/cryptui.dll"
+  },
+  {
+   "key": "f05c229f6ac8d4aad753fda4f158a9037e1cd2e1691a1a6cbd462babf923456c",
+   "path": "/pfx/dosdevices/c:/windows/system32/comdlg32.dll"
+  },
+  {
+   "key": "a5b873f745909245bab4949504290334e0f4e77946b41773a358e7806c1ee8b0",
+   "path": "/pfx/dosdevices/c:/windows/system32/authui.dll"
+  },
+  {
+   "key": "115fc3ed73f219e9ae60dceeac70f9dae624e47a432f12bc7cdd7b225c9b7741",
+   "path": "/pfx/dosdevices/c:/windows/system32/thumbcache.dll"
+  },
+  {
+   "key": "4b0e349a8f55a09c02237e80b99ffbcf5839e5f50d8be161ba2f839e732f0900",
+   "path": "/pfx/dosdevices/c:/windows/system32/shdocvw.dll"
+  },
+  {
+   "key": "0ed11a2b9dd812994e97a65c977fda0a87fe0beaf173c46b83547ceb2df41bcb",
+   "path": "/w3/lib/wine/i386-windows/winmm.dll"
+  },
+  {
+   "key": "2f572285fe71a629f4e2517e24c24b3c3c7254116c84773f45e1280276b18c7a",
+   "path": "/w3/lib/wine/i386-windows/msacm32.dll"
+  },
+  {
+   "key": "a913c83c7eeae4b1b679c273f9cd53623a40981bb99a514d0e99abc6f084c2b0",
+   "path": "/w3/lib/wine/i386-windows/dllhost.exe"
+  }
+ ],
+ "unit_misses": [
+  {
+   "key": "e0bb3302714bd56dcf9fe7f5259534cecc4e87c6f3829a0932fb0664e984d393",
+   "path": "/w3/lib/wine/i386-windows/tzres.dll",
+   "base": "0x9f0000"
+  },
+  {
+   "key": "fe87bcc253bdf0c334ef3865ec6bd5f8845750a3606b8240d366b08d5ddb28f0",
+   "path": "/w3/lib/wine/i386-windows/tzres.dll",
+   "base": "0x990000"
+  },
+  {
+   "key": "2527ef9a41a44e0a82c1378af04b79b9a46cecad9a8ea651d46ef8ae1c363bdd",
+   "path": "/w3/lib/wine/i386-windows/ntoskrnl.exe",
+   "base": "0x7bab0000"
+  },
+  {
+   "key": "c3e5b85563b684c6b75e1053a95325ebe3b4831702c0cb8af511546c459cac29",
+   "path": "/w3/lib/wine/i386-windows/normaliz.dll",
+   "base": "0xdb0000"
+  },
+  {
+   "key": "5f8d59560dd59d57f6a654bc28c776db0ffd279718ddb8be6b750176f6f59696",
+   "path": "/w3/lib/wine/i386-windows/tzres.dll",
+   "base": "0x10000000"
+  },
+  {
+   "key": "0a5237141c8100f953b010608c3a65b38ae621806d366ac8f59385620fa0e195",
+   "path": "/w3/lib/wine/i386-windows/desk.cpl",
+   "base": "0x7ba20000"
+  },
+  {
+   "key": "19fb5609cd0e30d7f7d5cbd0bca8b69c2f1ef2adb243cf921854dcf42ed7926e",
+   "path": "/pfx/dosdevices/c:/Program Files/Internet Explorer/ieproxy.dll",
+   "base": "0x7ba30000"
+  }
+ ],
+ "modules": [
+  {
+   "path": "wasmprog:/w3/lib/wine/i386-unix/wine",
+   "content": "5890387:3328323847:47138154"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/wineboot.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/services.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/winedevice.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/plugplay.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/svchost.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/ntdll.dll",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/explorer.exe",
+   "content": "8973493:820925126:2031155099"
+  },
+  {
+   "path": "wasmdll:/w3/lib/wine/i386-windows/rpcss.exe",
+   "content": "8973493:820925126:2031155099"
+  }
+ ],
+ "files_read": [
+  "/pfx/.update-timestamp",
+  "/pfx/dll-bases",
+  "/pfx/drive_c/Program Files/Internet Explorer/ieproxy.dll",
+  "/pfx/drive_c/ProgramData/Microsoft/User Account Pictures/user.bmp",
+  "/pfx/drive_c/ProgramData/Microsoft/Windows/Caches/{6AF0698E-D558-4F6E-9B3C-3716689AF493}.2.ver0x0000000000000001.db",
+  "/pfx/drive_c/ProgramData/Microsoft/Windows/Caches/{DDF571F2-BE98-426D-8288-1A9A39C3FDA2}.2.ver0x0000000000000001.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Burn/Burn/desktop.ini",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_1024.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_256.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_32.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_96.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_idx.db",
+  "/pfx/drive_c/users/claude/AppData/Local/Microsoft/Windows/Explorer/thumbcache_sr.db",
+  "/pfx/drive_c/users/claude/AppData/Roaming/Microsoft/Windows/Recent/CustomDestinations/1b4dd67f29cb1962.customDestinations-ms",
+  "/pfx/drive_c/users/claude/AppData/Roaming/Microsoft/Windows/Recent/CustomDestinations/7e4dca80246863e3.customDestinations-ms",
+  "/pfx/drive_c/windows/Fonts/8514fix.fon",
+  "/pfx/drive_c/windows/Fonts/8514fixe.fon",
+  "/pfx/drive_c/windows/Fonts/8514fixg.fon",
+  "/pfx/drive_c/windows/Fonts/8514fixr.fon",
+  "/pfx/drive_c/windows/Fonts/8514fixt.fon",
+  "/pfx/drive_c/windows/Fonts/8514oem.fon",
+  "/pfx/drive_c/windows/Fonts/8514oeme.fon",
+  "/pfx/drive_c/windows/Fonts/8514oemg.fon",
+  "/pfx/drive_c/windows/Fonts/8514oemr.fon",
+  "/pfx/drive_c/windows/Fonts/8514oemt.fon",
+  "/pfx/drive_c/windows/Fonts/8514sys.fon",
+  "/pfx/drive_c/windows/Fonts/8514syse.fon",
+  "/pfx/drive_c/windows/Fonts/8514sysg.fon",
+  "/pfx/drive_c/windows/Fonts/8514sysr.fon",
+  "/pfx/drive_c/windows/Fonts/8514syst.fon",
+  "/pfx/drive_c/windows/Fonts/85775.fon",
+  "/pfx/drive_c/windows/Fonts/85855.fon",
+  "/pfx/drive_c/windows/Fonts/85f1255.fon",
+  "/pfx/drive_c/windows/Fonts/85f1256.fon",
+  "/pfx/drive_c/windows/Fonts/85f1257.fon",
+  "/pfx/drive_c/windows/Fonts/85f874.fon",
+  "/pfx/drive_c/windows/Fonts/85s1255.fon",
+  "/pfx/drive_c/windows/Fonts/85s1256.fon",
+  "/pfx/drive_c/windows/Fonts/85s1257.fon",
+  "/pfx/drive_c/windows/Fonts/85s874.fon",
+  "/pfx/drive_c/windows/Fonts/Candara.ttf",
+  "/pfx/drive_c/windows/Fonts/Candarab.ttf",
+  "/pfx/drive_c/windows/Fonts/Candarai.ttf",
+  "/pfx/drive_c/windows/Fonts/Candaraz.ttf",
+  "/pfx/drive_c/windows/Fonts/Gabriola.ttf",
+  "/pfx/drive_c/windows/Fonts/GlobalMonospace.CompositeFont",
+  "/pfx/drive_c/windows/Fonts/GlobalSansSerif.CompositeFont",
+  "/pfx/drive_c/windows/Fonts/GlobalSerif.CompositeFont",
+  "/pfx/drive_c/windows/Fonts/GlobalUserInterface.CompositeFont",
+  "/pfx/drive_c/windows/Fonts/KhmerUI.ttf",
+  "/pfx/drive_c/windows/Fonts/KhmerUIb.ttf",
+  "/pfx/drive_c/windows/Fonts/LaoUI.ttf",
+  "/pfx/drive_c/windows/Fonts/LaoUIb.ttf",
+  "/pfx/drive_c/windows/Fonts/Shonar.ttf",
+  "/pfx/drive_c/windows/Fonts/Shonarb.ttf",
+  "/pfx/drive_c/windows/Fonts/StaticCache.dat",
+  "/pfx/drive_c/windows/Fonts/Vani.ttf",
+  "/pfx/drive_c/windows/Fonts/Vanib.ttf",
+  "/pfx/drive_c/windows/Fonts/ahronbd.ttf",
+  "/pfx/drive_c/windows/Fonts/andlso.ttf",
+  "/pfx/drive_c/windows/Fonts/angsa.ttf",
+  "/pfx/drive_c/windows/Fonts/angsab.ttf",
+  "/pfx/drive_c/windows/Fonts/angsai.ttf",
+  "/pfx/drive_c/windows/Fonts/angsau.ttf",
+  "/pfx/drive_c/windows/Fonts/angsaub.ttf",
+  "/pfx/drive_c/windows/Fonts/angsaui.ttf",
+  "/pfx/drive_c/windows/Fonts/angsauz.ttf",
+  "/pfx/drive_c/windows/Fonts/angsaz.ttf",
+  "/pfx/drive_c/windows/Fonts/aparaj.ttf",
+  "/pfx/drive_c/windows/Fonts/aparajb.ttf",
+  "/pfx/drive_c/windows/Fonts/aparajbi.ttf",
+  "/pfx/drive_c/windows/Fonts/aparaji.ttf",
+  "/pfx/drive_c/windows/Fonts/app775.fon",
+  "/pfx/drive_c/windows/Fonts/app850.fon",
+  "/pfx/drive_c/windows/Fonts/app852.fon",
+  "/pfx/drive_c/windows/Fonts/app855.fon",
+  "/pfx/drive_c/windows/Fonts/app857.fon",
+  "/pfx/drive_c/windows/Fonts/app866.fon",
+  "/pfx/drive_c/windows/Fonts/app932.fon",
+  "/pfx/drive_c/windows/Fonts/app936.fon",
+  "/pfx/drive_c/windows/Fonts/app949.fon",
+  "/pfx/drive_c/windows/Fonts/app950.fon",
+  "/pfx/drive_c/windows/Fonts/arabtype.ttf",
+  "/pfx/drive_c/windows/Fonts/arial.ttf",
+  "/pfx/drive_c/windows/Fonts/arialbd.ttf",
+  "/pfx/drive_c/windows/Fonts/arialbi.ttf",
+  "/pfx/drive_c/windows/Fonts/ariali.ttf",
+  "/pfx/drive_c/windows/Fonts/ariblk.ttf",
+  "/pfx/drive_c/windows/Fonts/batang.ttc",
+  "/pfx/drive_c/windows/Fonts/browa.ttf",
+  "/pfx/drive_c/windows/Fonts/browab.ttf",
+  "/pfx/drive_c/windows/Fonts/browai.ttf",
+  "/pfx/drive_c/windows/Fonts/browau.ttf",
+  "/pfx/drive_c/windows/Fonts/browaub.ttf",
+  "/pfx/drive_c/windows/Fonts/browaui.ttf",
+  "/pfx/drive_c/windows/Fonts/browauz.ttf",
+  "/pfx/drive_c/windows/Fonts/browaz.ttf",
+  "/pfx/drive_c/windows/Fonts/c8514fix.fon",
+  "/pfx/drive_c/windows/Fonts/c8514oem.fon",
+  "/pfx/drive_c/windows/Fonts/c8514sys.fon",
+  "/pfx/drive_c/windows/Fonts/calibri.ttf",
+  "/pfx/drive_c/windows/Fonts/calibrib.ttf",
+  "/pfx/drive_c/windows/Fonts/calibrii.ttf",
+  "/pfx/drive_c/windows/Fonts/calibriz.ttf",
+  "/pfx/drive_c/windows/Fonts/cambria.ttc",
+  "/pfx/drive_c/windows/Fonts/cambriab.ttf",
+  "/pfx/drive_c/windows/Fonts/cambriai.ttf",
+  "/pfx/drive_c/windows/Fonts/cambriaz.ttf",
+  "/pfx/drive_c/windows/Fonts/cga40737.fon",
+  "/pfx/drive_c/windows/Fonts/cga40850.fon",
+  "/pfx/drive_c/windows/Fonts/cga40852.fon",
+  "/pfx/drive_c/windows/Fonts/cga40857.fon",
+  "/pfx/drive_c/windows/Fonts/cga40866.fon",
+  "/pfx/drive_c/windows/Fonts/cga40869.fon",
+  "/pfx/drive_c/windows/Fonts/cga40woa.fon",
+  "/pfx/drive_c/windows/Fonts/cga80737.fon",
+  "/pfx/drive_c/windows/Fonts/cga80850.fon",
+  "/pfx/drive_c/windows/Fonts/cga80852.fon",
+  "/pfx/drive_c/windows/Fonts/cga80857.fon",
+  "/pfx/drive_c/windows/Fonts/cga80866.fon",
+  "/pfx/drive_c/windows/Fonts/cga80869.fon",
+  "/pfx/drive_c/windows/Fonts/cga80woa.fon",
+  "/pfx/drive_c/windows/Fonts/comic.ttf",
+  "/pfx/drive_c/windows/Fonts/comicbd.ttf",
+  "/pfx/drive_c/windows/Fonts/consola.ttf",
+  "/pfx/drive_c/windows/Fonts/consolab.ttf",
+  "/pfx/drive_c/windows/Fonts/consolai.ttf",
+  "/pfx/drive_c/windows/Fonts/consolaz.ttf",
+  "/pfx/drive_c/windows/Fonts/constan.ttf",
+  "/pfx/drive_c/windows/Fonts/constanb.ttf",
+  "/pfx/drive_c/windows/Fonts/constani.ttf",
+  "/pfx/drive_c/windows/Fonts/constanz.ttf",
+  "/pfx/drive_c/windows/Fonts/corbel.ttf",
+  "/pfx/drive_c/windows/Fonts/corbelb.ttf",
+  "/pfx/drive_c/windows/Fonts/corbeli.ttf",
+  "/pfx/drive_c/windows/Fonts/corbelz.ttf",
+  "/pfx/drive_c/windows/Fonts/cordia.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiab.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiai.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiau.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiaub.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiaui.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiauz.ttf",
+  "/pfx/drive_c/windows/Fonts/cordiaz.ttf",
+  "/pfx/drive_c/windows/Fonts/coue1255.fon",
+  "/pfx/drive_c/windows/Fonts/coue1256.fon",
+  "/pfx/drive_c/windows/Fonts/coue1257.fon",
+  "/pfx/drive_c/windows/Fonts/couf1255.fon",
+  "/pfx/drive_c/windows/Fonts/couf1256.fon",
+  "/pfx/drive_c/windows/Fonts/couf1257.fon",
+  "/pfx/drive_c/windows/Fonts/cour.ttf",
+  "/pfx/drive_c/windows/Fonts/courbd.ttf",
+  "/pfx/drive_c/windows/Fonts/courbi.ttf",
+  "/pfx/drive_c/windows/Fonts/coure.fon",
+  "/pfx/drive_c/windows/Fonts/couree.fon",
+  "/pfx/drive_c/windows/Fonts/coureg.fon",
+  "/pfx/drive_c/windows/Fonts/courer.fon",
+  "/pfx/drive_c/windows/Fonts/couret.fon",
+  "/pfx/drive_c/windows/Fonts/courf.fon",
+  "/pfx/drive_c/windows/Fonts/courfe.fon",
+  "/pfx/drive_c/windows/Fonts/courfg.fon",
+  "/pfx/drive_c/windows/Fonts/courfr.fon",
+  "/pfx/drive_c/windows/Fonts/courft.fon",
+  "/pfx/drive_c/windows/Fonts/couri.ttf",
+  "/pfx/drive_c/windows/Fonts/cvgafix.fon",
+  "/pfx/drive_c/windows/Fonts/cvgasys.fon",
+  "/pfx/drive_c/windows/Fonts/daunpenh.ttf",
+  "/pfx/drive_c/windows/Fonts/david.ttf",
+  "/pfx/drive_c/windows/Fonts/davidbd.ttf",
+  "/pfx/drive_c/windows/Fonts/desktop.ini",
+  "/pfx/drive_c/windows/Fonts/dokchamp.ttf",
+  "/pfx/drive_c/windows/Fonts/dos737.fon",
+  "/pfx/drive_c/windows/Fonts/dos869.fon",
+  "/pfx/drive_c/windows/Fonts/dosapp.fon",
+  "/pfx/drive_c/windows/Fonts/ebrima.ttf",
+  "/pfx/drive_c/windows/Fonts/ebrimabd.ttf",
+  "/pfx/drive_c/windows/Fonts/ega40737.fon",
+  "/pfx/drive_c/windows/Fonts/ega40850.fon",
+  "/pfx/drive_c/windows/Fonts/ega40852.fon",
+  "/pfx/drive_c/windows/Fonts/ega40857.fon",
+  "/pfx/drive_c/windows/Fonts/ega40866.fon",
+  "/pfx/drive_c/windows/Fonts/ega40869.fon",
+  "/pfx/drive_c/windows/Fonts/ega40woa.fon",
+  "/pfx/drive_c/windows/Fonts/ega80737.fon",
+  "/pfx/drive_c/windows/Fonts/ega80850.fon",
+  "/pfx/drive_c/windows/Fonts/ega80852.fon",
+  "/pfx/drive_c/windows/Fonts/ega80857.fon",
+  "/pfx/drive_c/windows/Fonts/ega80866.fon",
+  "/pfx/drive_c/windows/Fonts/ega80869.fon",
+  "/pfx/drive_c/windows/Fonts/ega80woa.fon",
+  "/pfx/drive_c/windows/Fonts/estre.ttf",
+  "/pfx/drive_c/windows/Fonts/euphemia.ttf",
+  "/pfx/drive_c/windows/Fonts/fms_metadata.xml",
+  "/pfx/drive_c/windows/Fonts/framd.ttf",
+  "/pfx/drive_c/windows/Fonts/framdit.ttf",
+  "/pfx/drive_c/windows/Fonts/frank.ttf",
+  "/pfx/drive_c/windows/Fonts/gautami.ttf",
+  "/pfx/drive_c/windows/Fonts/gautamib.ttf",
+  "/pfx/drive_c/windows/Fonts/georgia.ttf",
+  "/pfx/drive_c/windows/Fonts/georgiab.ttf",
+  "/pfx/drive_c/windows/Fonts/georgiai.ttf",
+  "/pfx/drive_c/windows/Fonts/georgiaz.ttf",
+  "/pfx/drive_c/windows/Fonts/gisha.ttf",
+  "/pfx/drive_c/windows/Fonts/gishabd.ttf",
+  "/pfx/drive_c/windows/Fonts/gulim.ttc",
+  "/pfx/drive_c/windows/Fonts/h8514fix.fon",
+  "/pfx/drive_c/windows/Fonts/h8514oem.fon",
+  "/pfx/drive_c/windows/Fonts/h8514sys.fon",
+  "/pfx/drive_c/windows/Fonts/himalaya.ttf",
+  "/pfx/drive_c/windows/Fonts/hvgafix.fon",
+  "/pfx/drive_c/windows/Fonts/hvgasys.fon",
+  "/pfx/drive_c/windows/Fonts/impact.ttf",
+  "/pfx/drive_c/windows/Fonts/iskpota.ttf",
+  "/pfx/drive_c/windows/Fonts/iskpotab.ttf",
+  "/pfx/drive_c/windows/Fonts/j8514fix.fon",
+  "/pfx/drive_c/windows/Fonts/j8514oem.fon",
+  "/pfx/drive_c/windows/Fonts/j8514sys.fon",
+  "/pfx/drive_c/windows/Fonts/jsmalle.fon",
+  "/pfx/drive_c/windows/Fonts/jsmallf.fon",
+  "/pfx/drive_c/windows/Fonts/jvgafix.fon",
+  "/pfx/drive_c/windows/Fonts/jvgasys.fon",
+  "/pfx/drive_c/windows/Fonts/kaiu.ttf",
+  "/pfx/drive_c/windows/Fonts/kalinga.ttf",
+  "/pfx/drive_c/windows/Fonts/kalingab.ttf",
+  "/pfx/drive_c/windows/Fonts/kartika.ttf",
+  "/pfx/drive_c/windows/Fonts/kartikab.ttf",
+  "/pfx/drive_c/windows/Fonts/kokila.ttf",
+  "/pfx/drive_c/windows/Fonts/kokilab.ttf",
+  "/pfx/drive_c/windows/Fonts/kokilabi.ttf",
+  "/pfx/drive_c/windows/Fonts/kokilai.ttf",
+  "/pfx/drive_c/windows/Fonts/l_10646.ttf",
+  "/pfx/drive_c/windows/Fonts/latha.ttf",
+  "/pfx/drive_c/windows/Fonts/lathab.ttf",
+  "/pfx/drive_c/windows/Fonts/leelawad.ttf",
+  "/pfx/drive_c/windows/Fonts/leelawdb.ttf",
+  "/pfx/drive_c/windows/Fonts/lucon.ttf",
+  "/pfx/drive_c/windows/Fonts/lvnm.ttf",
+  "/pfx/drive_c/windows/Fonts/lvnmbd.ttf",
+  "/pfx/drive_c/windows/Fonts/majalla.ttf",
+  "/pfx/drive_c/windows/Fonts/majallab.ttf",
+  "/pfx/drive_c/windows/Fonts/malgun.ttf",
+  "/pfx/drive_c/windows/Fonts/malgunbd.ttf",
+  "/pfx/drive_c/windows/Fonts/mangal.ttf",
+  "/pfx/drive_c/windows/Fonts/mangalb.ttf",
+  "/pfx/drive_c/windows/Fonts/marlett.ttf",
+  "/pfx/drive_c/windows/Fonts/meiryo.ttc",
+  "/pfx/drive_c/windows/Fonts/meiryob.ttc",
+  "/pfx/drive_c/windows/Fonts/micross.ttf",
+  "/pfx/drive_c/windows/Fonts/mingliu.ttc",
+  "/pfx/drive_c/windows/Fonts/mingliub.ttc",
+  "/pfx/drive_c/windows/Fonts/modern.fon",
+  "/pfx/drive_c/windows/Fonts/monbaiti.ttf",
+  "/pfx/drive_c/windows/Fonts/moolbor.ttf",
+  "/pfx/drive_c/windows/Fonts/mriam.ttf",
+  "/pfx/drive_c/windows/Fonts/mriamc.ttf",
+  "/pfx/drive_c/windows/Fonts/msgothic.ttc",
+  "/pfx/drive_c/windows/Fonts/msjh.ttf",
+  "/pfx/drive_c/windows/Fonts/msjhbd.ttf",
+  "/pfx/drive_c/windows/Fonts/msmincho.ttc",
+  "/pfx/drive_c/windows/Fonts/msuighur.ttf",
+  "/pfx/drive_c/windows/Fonts/msyh.ttf",
+  "/pfx/drive_c/windows/Fonts/msyhbd.ttf",
+  "/pfx/drive_c/windows/Fonts/msyi.ttf",
+  "/pfx/drive_c/windows/Fonts/mvboli.ttf",
+  "/pfx/drive_c/windows/Fonts/nrkis.ttf",
+  "/pfx/drive_c/windows/Fonts/ntailu.ttf",
+  "/pfx/drive_c/windows/Fonts/ntailub.ttf",
+  "/pfx/drive_c/windows/Fonts/nyala.ttf",
+  "/pfx/drive_c/windows/Fonts/pala.ttf",
+  "/pfx/drive_c/windows/Fonts/palab.ttf",
+  "/pfx/drive_c/windows/Fonts/palabi.ttf",
+  "/pfx/drive_c/windows/Fonts/palai.ttf",
+  "/pfx/drive_c/windows/Fonts/phagspa.ttf",
+  "/pfx/drive_c/windows/Fonts/phagspab.ttf",
+  "/pfx/drive_c/windows/Fonts/plantc.ttf",
+  "/pfx/drive_c/windows/Fonts/raavi.ttf",
+  "/pfx/drive_c/windows/Fonts/raavib.ttf",
+  "/pfx/drive_c/windows/Fonts/rod.ttf",
+  "/pfx/drive_c/windows/Fonts/roman.fon",
+  "/pfx/drive_c/windows/Fonts/s8514fix.fon",
+  "/pfx/drive_c/windows/Fonts/s8514oem.fon",
+  "/pfx/drive_c/windows/Fonts/s8514sys.fon",
+  "/pfx/drive_c/windows/Fonts/script.fon",
+  "/pfx/drive_c/windows/Fonts/segoepr.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeprb.ttf",
+  "/pfx/drive_c/windows/Fonts/segoesc.ttf",
+  "/pfx/drive_c/windows/Fonts/segoescb.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeui.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeuib.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeuii.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeuil.ttf",
+  "/pfx/drive_c/windows/Fonts/segoeuiz.ttf",
+  "/pfx/drive_c/windows/Fonts/seguisb.ttf",
+  "/pfx/drive_c/windows/Fonts/seguisym.ttf",
+  "/pfx/drive_c/windows/Fonts/sere1255.fon",
+  "/pfx/drive_c/windows/Fonts/sere1256.fon",
+  "/pfx/drive_c/windows/Fonts/sere1257.fon",
+  "/pfx/drive_c/windows/Fonts/serf1255.fon",
+  "/pfx/drive_c/windows/Fonts/serf1256.fon",
+  "/pfx/drive_c/windows/Fonts/serf1257.fon",
+  "/pfx/drive_c/windows/Fonts/serife.fon",
+  "/pfx/drive_c/windows/Fonts/serifee.fon",
+  "/pfx/drive_c/windows/Fonts/serifeg.fon",
+  "/pfx/drive_c/windows/Fonts/serifer.fon",
+  "/pfx/drive_c/windows/Fonts/serifet.fon",
+  "/pfx/drive_c/windows/Fonts/seriff.fon",
+  "/pfx/drive_c/windows/Fonts/seriffe.fon",
+  "/pfx/drive_c/windows/Fonts/seriffg.fon",
+  "/pfx/drive_c/windows/Fonts/seriffr.fon",
+  "/pfx/drive_c/windows/Fonts/serifft.fon",
+  "/pfx/drive_c/windows/Fonts/shruti.ttf",
+  "/pfx/drive_c/windows/Fonts/shrutib.ttf",
+  "/pfx/drive_c/windows/Fonts/simfang.ttf",
+  "/pfx/drive_c/windows/Fonts/simhei.ttf",
+  "/pfx/drive_c/windows/Fonts/simkai.ttf",
+  "/pfx/drive_c/windows/Fonts/simpbdo.ttf",
+  "/pfx/drive_c/windows/Fonts/simpfxo.ttf",
+  "/pfx/drive_c/windows/Fonts/simpo.ttf",
+  "/pfx/drive_c/windows/Fonts/simsun.ttc",
+  "/pfx/drive_c/windows/Fonts/simsunb.ttf",
+  "/pfx/drive_c/windows/Fonts/smae1255.fon",
+  "/pfx/drive_c/windows/Fonts/smae1256.fon",
+  "/pfx/drive_c/windows/Fonts/smae1257.fon",
+  "/pfx/drive_c/windows/Fonts/smaf1255.fon",
+  "/pfx/drive_c/windows/Fonts/smaf1256.fon",
+  "/pfx/drive_c/windows/Fonts/smaf1257.fon",
+  "/pfx/drive_c/windows/Fonts/smalle.fon",
+  "/pfx/drive_c/windows/Fonts/smallee.fon",
+  "/pfx/drive_c/windows/Fonts/smalleg.fon",
+  "/pfx/drive_c/windows/Fonts/smaller.fon",
+  "/pfx/drive_c/windows/Fonts/smallet.fon",
+  "/pfx/drive_c/windows/Fonts/smallf.fon",
+  "/pfx/drive_c/windows/Fonts/smallfe.fon",
+  "/pfx/drive_c/windows/Fonts/smallfg.fon",
+  "/pfx/drive_c/windows/Fonts/smallfr.fon",
+  "/pfx/drive_c/windows/Fonts/smallft.fon",
+  "/pfx/drive_c/windows/Fonts/ssee1255.fon",
+  "/pfx/drive_c/windows/Fonts/ssee1256.fon",
+  "/pfx/drive_c/windows/Fonts/ssee1257.fon",
+  "/pfx/drive_c/windows/Fonts/ssee874.fon",
+  "/pfx/drive_c/windows/Fonts/ssef1255.fon",
+  "/pfx/drive_c/windows/Fonts/ssef1256.fon",
+  "/pfx/drive_c/windows/Fonts/ssef1257.fon",
+  "/pfx/drive_c/windows/Fonts/ssef874.fon",
+  "/pfx/drive_c/windows/Fonts/sserife.fon",
+  "/pfx/drive_c/windows/Fonts/sserifee.fon",
+  "/pfx/drive_c/windows/Fonts/sserifeg.fon",
+  "/pfx/drive_c/windows/Fonts/sserifer.fon",
+  "/pfx/drive_c/windows/Fonts/sserifet.fon",
+  "/pfx/drive_c/windows/Fonts/sseriff.fon",
+  "/pfx/drive_c/windows/Fonts/sseriffe.fon",
+  "/pfx/drive_c/windows/Fonts/sseriffg.fon",
+  "/pfx/drive_c/windows/Fonts/sseriffr.fon",
+  "/pfx/drive_c/windows/Fonts/sserifft.fon",
+  "/pfx/drive_c/windows/Fonts/svgafix.fon",
+  "/pfx/drive_c/windows/Fonts/svgasys.fon",
+  "/pfx/drive_c/windows/Fonts/sylfaen.ttf",
+  "/pfx/drive_c/windows/Fonts/symbol.ttf",
+  "/pfx/drive_c/windows/Fonts/tahoma.ttf",
+  "/pfx/drive_c/windows/Fonts/tahomabd.ttf",
+  "/pfx/drive_c/windows/Fonts/taile.ttf",
+  "/pfx/drive_c/windows/Fonts/taileb.ttf",
+  "/pfx/drive_c/windows/Fonts/times.ttf",
+  "/pfx/drive_c/windows/Fonts/timesbd.ttf",
+  "/pfx/drive_c/windows/Fonts/timesbi.ttf",
+  "/pfx/drive_c/windows/Fonts/timesi.ttf",
+  "/pfx/drive_c/windows/Fonts/tradbdo.ttf",
+  "/pfx/drive_c/windows/Fonts/trado.ttf",
+  "/pfx/drive_c/windows/Fonts/trebuc.ttf",
+  "/pfx/drive_c/windows/Fonts/trebucbd.ttf",
+  "/pfx/drive_c/windows/Fonts/trebucbi.ttf",
+  "/pfx/drive_c/windows/Fonts/trebucit.ttf",
+  "/pfx/drive_c/windows/Fonts/tunga.ttf",
+  "/pfx/drive_c/windows/Fonts/tungab.ttf",
+  "/pfx/drive_c/windows/Fonts/upcdb.ttf",
+  "/pfx/drive_c/windows/Fonts/upcdbi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcdi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcdl.ttf",
+  "/pfx/drive_c/windows/Fonts/upceb.ttf",
+  "/pfx/drive_c/windows/Fonts/upcebi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcei.ttf",
+  "/pfx/drive_c/windows/Fonts/upcel.ttf",
+  "/pfx/drive_c/windows/Fonts/upcfb.ttf",
+  "/pfx/drive_c/windows/Fonts/upcfbi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcfi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcfl.ttf",
+  "/pfx/drive_c/windows/Fonts/upcib.ttf",
+  "/pfx/drive_c/windows/Fonts/upcibi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcii.ttf",
+  "/pfx/drive_c/windows/Fonts/upcil.ttf",
+  "/pfx/drive_c/windows/Fonts/upcjb.ttf",
+  "/pfx/drive_c/windows/Fonts/upcjbi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcji.ttf",
+  "/pfx/drive_c/windows/Fonts/upcjl.ttf",
+  "/pfx/drive_c/windows/Fonts/upckb.ttf",
+  "/pfx/drive_c/windows/Fonts/upckbi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcki.ttf",
+  "/pfx/drive_c/windows/Fonts/upckl.ttf",
+  "/pfx/drive_c/windows/Fonts/upclb.ttf",
+  "/pfx/drive_c/windows/Fonts/upclbi.ttf",
+  "/pfx/drive_c/windows/Fonts/upcli.ttf",
+  "/pfx/drive_c/windows/Fonts/upcll.ttf",
+  "/pfx/drive_c/windows/Fonts/utsaah.ttf",
+  "/pfx/drive_c/windows/Fonts/utsaahb.ttf",
+  "/pfx/drive_c/windows/Fonts/utsaahbi.ttf",
+  "/pfx/drive_c/windows/Fonts/utsaahi.ttf",
+  "/pfx/drive_c/windows/Fonts/verdana.ttf",
+  "/pfx/drive_c/windows/Fonts/verdanab.ttf",
+  "/pfx/drive_c/windows/Fonts/verdanai.ttf",
+  "/pfx/drive_c/windows/Fonts/verdanaz.ttf",
+  "/pfx/drive_c/windows/Fonts/vga737.fon",
+  "/pfx/drive_c/windows/Fonts/vga775.fon",
+  "/pfx/drive_c/windows/Fonts/vga850.fon",
+  "/pfx/drive_c/windows/Fonts/vga852.fon",
+  "/pfx/drive_c/windows/Fonts/vga855.fon",
+  "/pfx/drive_c/windows/Fonts/vga857.fon",
+  "/pfx/drive_c/windows/Fonts/vga860.fon",
+  "/pfx/drive_c/windows/Fonts/vga861.fon",
+  "/pfx/drive_c/windows/Fonts/vga863.fon",
+  "/pfx/drive_c/windows/Fonts/vga865.fon",
+  "/pfx/drive_c/windows/Fonts/vga866.fon",
+  "/pfx/drive_c/windows/Fonts/vga869.fon",
+  "/pfx/drive_c/windows/Fonts/vga932.fon",
+  "/pfx/drive_c/windows/Fonts/vga936.fon",
+  "/pfx/drive_c/windows/Fonts/vga949.fon",
+  "/pfx/drive_c/windows/Fonts/vga950.fon",
+  "/pfx/drive_c/windows/Fonts/vgaf1255.fon",
+  "/pfx/drive_c/windows/Fonts/vgaf1256.fon",
+  "/pfx/drive_c/windows/Fonts/vgaf1257.fon",
+  "/pfx/drive_c/windows/Fonts/vgaf874.fon",
+  "/pfx/drive_c/windows/Fonts/vgafix.fon",
+  "/pfx/drive_c/windows/Fonts/vgafixe.fon",
+  "/pfx/drive_c/windows/Fonts/vgafixg.fon",
+  "/pfx/drive_c/windows/Fonts/vgafixr.fon",
+  "/pfx/drive_c/windows/Fonts/vgafixt.fon",
+  "/pfx/drive_c/windows/Fonts/vgaoem.fon",
+  "/pfx/drive_c/windows/Fonts/vgas1255.fon",
+  "/pfx/drive_c/windows/Fonts/vgas1256.fon",
+  "/pfx/drive_c/windows/Fonts/vgas1257.fon",
+  "/pfx/drive_c/windows/Fonts/vgas874.fon",
+  "/pfx/drive_c/windows/Fonts/vgasys.fon",
+  "/pfx/drive_c/windows/Fonts/vgasyse.fon",
+  "/pfx/drive_c/windows/Fonts/vgasysg.fon",
+  "/pfx/drive_c/windows/Fonts/vgasysr.fon",
+  "/pfx/drive_c/windows/Fonts/vgasyst.fon",
+  "/pfx/drive_c/windows/Fonts/vijaya.ttf",
+  "/pfx/drive_c/windows/Fonts/vijayab.ttf",
+  "/pfx/drive_c/windows/Fonts/vrinda.ttf",
+  "/pfx/drive_c/windows/Fonts/vrindab.ttf",
+  "/pfx/drive_c/windows/Fonts/webdings.ttf",
+  "/pfx/drive_c/windows/Fonts/wingding.ttf",
+  "/pfx/drive_c/windows/en-US/explorer.exe.mui",
+  "/pfx/drive_c/windows/explorer.exe",
+  "/pfx/drive_c/windows/resources/Themes/Aero/Shell/NormalColor/shellstyle.dll",
+  "/pfx/drive_c/windows/resources/Themes/Aero/aero.msstyles",
+  "/pfx/drive_c/windows/resources/Themes/Aero/en-US/aero.msstyles.mui",
+  "/pfx/drive_c/windows/system.ini",
+  "/pfx/drive_c/windows/system32/DeviceCenter.dll",
+  "/pfx/drive_c/windows/system32/ExplorerFrame.dll",
+  "/pfx/drive_c/windows/system32/SndVolSSO.dll",
+  "/pfx/drive_c/windows/system32/UXInit.dll",
+  "/pfx/drive_c/windows/system32/WindowsCodecs.dll",
+  "/pfx/drive_c/windows/system32/advapi32.dll",
+  "/pfx/drive_c/windows/system32/apphelp.dll",
+  "/pfx/drive_c/windows/system32/authui.dll",
+  "/pfx/drive_c/windows/system32/bcrypt.dll",
+  "/pfx/drive_c/windows/system32/cfgmgr32.dll",
+  "/pfx/drive_c/windows/system32/combase.dll",
+  "/pfx/drive_c/windows/system32/comctl32.dll",
+  "/pfx/drive_c/windows/system32/comdlg32.dll",
+  "/pfx/drive_c/windows/system32/coml2.dll",
+  "/pfx/drive_c/windows/system32/crypt32.dll",
+  "/pfx/drive_c/windows/system32/cryptbase.dll",
+  "/pfx/drive_c/windows/system32/cryptsp.dll",
+  "/pfx/drive_c/windows/system32/cryptui.dll",
+  "/pfx/drive_c/windows/system32/desk.cpl",
+  "/pfx/drive_c/windows/system32/difxapi.dll",
+  "/pfx/drive_c/windows/system32/dllhost.exe",
+  "/pfx/drive_c/windows/system32/dnsapi.dll",
+  "/pfx/drive_c/windows/system32/dui70.dll",
+  "/pfx/drive_c/windows/system32/duser.dll",
+  "/pfx/drive_c/windows/system32/dwmapi.dll",
+  "/pfx/drive_c/windows/system32/en-US/DeviceCenter.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/authui.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/comdlg32.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/duser.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/explorerframe.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/ntshrui.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/propsys.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/shdocvw.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/shell32.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/shlwapi.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/themeservice.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/thumbcache.dll.mui",
+  "/pfx/drive_c/windows/system32/en-US/userinit.exe.mui",
+  "/pfx/drive_c/windows/system32/en-US/uxtheme.dll.mui",
+  "/pfx/drive_c/windows/system32/explorer.exe",
+  "/pfx/drive_c/windows/system32/gameux.dll",
+  "/pfx/drive_c/windows/system32/gdi32.dll",
+  "/pfx/drive_c/windows/system32/gdiplus.dll",
+  "/pfx/drive_c/windows/system32/hal.dll",
+  "/pfx/drive_c/windows/system32/hid.dll",
+  "/pfx/drive_c/windows/system32/imagehlp.dll",
+  "/pfx/drive_c/windows/system32/imageres.dll",
+  "/pfx/drive_c/windows/system32/imm32.dll",
+  "/pfx/drive_c/windows/system32/iphlpapi.dll",
+  "/pfx/drive_c/windows/system32/jsproxy.dll",
+  "/pfx/drive_c/windows/system32/kerberos.dll",
+  "/pfx/drive_c/windows/system32/kernel32.dll",
+  "/pfx/drive_c/windows/system32/kernelbase.dll",
+  "/pfx/drive_c/windows/system32/mmdevapi.dll",
+  "/pfx/drive_c/windows/system32/mpr.dll",
+  "/pfx/drive_c/windows/system32/msacm32.dll",
+  "/pfx/drive_c/windows/system32/msctf.dll",
+  "/pfx/drive_c/windows/system32/msftedit.dll",
+  "/pfx/drive_c/windows/system32/msv1_0.dll",
+  "/pfx/drive_c/windows/system32/msvcrt.dll",
+  "/pfx/drive_c/windows/system32/ncrypt.dll",
+  "/pfx/drive_c/windows/system32/netapi32.dll",
+  "/pfx/drive_c/windows/system32/netutils.dll",
+  "/pfx/drive_c/windows/system32/newdev.dll",
+  "/pfx/drive_c/windows/system32/normaliz.dll",
+  "/pfx/drive_c/windows/system32/nsi.dll",
+  "/pfx/drive_c/windows/system32/ntdll.dll",
+  "/pfx/drive_c/windows/system32/ntoskrnl.exe",
+  "/pfx/drive_c/windows/system32/ntshrui.dll",
+  "/pfx/drive_c/windows/system32/ole32.dll",
+  "/pfx/drive_c/windows/system32/oleaut32.dll",
+  "/pfx/drive_c/windows/system32/plugplay.exe",
+  "/pfx/drive_c/windows/system32/powrprof.dll",
+  "/pfx/drive_c/windows/system32/profapi.dll",
+  "/pfx/drive_c/windows/system32/propsys.dll",
+  "/pfx/drive_c/windows/system32/psapi.dll",
+  "/pfx/drive_c/windows/system32/qmgr.dll",
+  "/pfx/drive_c/windows/system32/riched20.dll",
+  "/pfx/drive_c/windows/system32/rpcrt4.dll",
+  "/pfx/drive_c/windows/system32/rpcss.exe",
+  "/pfx/drive_c/windows/system32/rsaenh.dll",
+  "/pfx/drive_c/windows/system32/samcli.dll",
+  "/pfx/drive_c/windows/system32/samlib.dll",
+  "/pfx/drive_c/windows/system32/schedsvc.dll",
+  "/pfx/drive_c/windows/system32/sechost.dll",
+  "/pfx/drive_c/windows/system32/secur32.dll",
+  "/pfx/drive_c/windows/system32/services.exe",
+  "/pfx/drive_c/windows/system32/setupapi.dll",
+  "/pfx/drive_c/windows/system32/shacct.dll",
+  "/pfx/drive_c/windows/system32/shcore.dll",
+  "/pfx/drive_c/windows/system32/shdocvw.dll",
+  "/pfx/drive_c/windows/system32/shell32.dll",
+  "/pfx/drive_c/windows/system32/shlwapi.dll",
+  "/pfx/drive_c/windows/system32/slc.dll",
+  "/pfx/drive_c/windows/system32/srvcli.dll",
+  "/pfx/drive_c/windows/system32/srvsvc.dll",
+  "/pfx/drive_c/windows/system32/svchost.exe",
+  "/pfx/drive_c/windows/system32/themeservice.dll",
+  "/pfx/drive_c/windows/system32/thumbcache.dll",
+  "/pfx/drive_c/windows/system32/tzres.dll",
+  "/pfx/drive_c/windows/system32/ucrtbase.dll",
+  "/pfx/drive_c/windows/system32/user32.dll",
+  "/pfx/drive_c/windows/system32/userenv.dll",
+  "/pfx/drive_c/windows/system32/userinit.exe",
+  "/pfx/drive_c/windows/system32/uxtheme.dll",
+  "/pfx/drive_c/windows/system32/version.dll",
+  "/pfx/drive_c/windows/system32/win32u.dll",
+  "/pfx/drive_c/windows/system32/wineboot.exe",
+  "/pfx/drive_c/windows/system32/winedevice.exe",
+  "/pfx/drive_c/windows/system32/winewayland.drv",
+  "/pfx/drive_c/windows/system32/winhttp.dll",
+  "/pfx/drive_c/windows/system32/wininet.dll",
+  "/pfx/drive_c/windows/system32/winmm.dll",
+  "/pfx/drive_c/windows/system32/winsta.dll",
+  "/pfx/drive_c/windows/system32/wldap32.dll",
+  "/pfx/drive_c/windows/system32/ws2_32.dll",
+  "/pfx/drive_c/windows/system32/xmllite.dll",
+  "/pfx/drive_c/windows/web/Wallpaper/Windows/img0.jpg",
+  "/pfx/drive_c/windows/winsxs/manifests/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest",
+  "/pfx/drive_c/windows/winsxs/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef/comctl32.dll",
+  "/pfx/drive_c/windows/winsxs/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef/en-US/comctl32.dll.mui",
+  "/pfx/drive_c/winlogon.exe",
+  "/usr/share/X11/xkb/compat/accessx",
+  "/usr/share/X11/xkb/compat/basic",
+  "/usr/share/X11/xkb/compat/caps",
+  "/usr/share/X11/xkb/compat/complete",
+  "/usr/share/X11/xkb/compat/iso9995",
+  "/usr/share/X11/xkb/compat/ledcaps",
+  "/usr/share/X11/xkb/compat/lednum",
+  "/usr/share/X11/xkb/compat/ledscroll",
+  "/usr/share/X11/xkb/compat/level5",
+  "/usr/share/X11/xkb/compat/misc",
+  "/usr/share/X11/xkb/compat/mousekeys",
+  "/usr/share/X11/xkb/compat/xfree86",
+  "/usr/share/X11/xkb/keycodes/aliases",
+  "/usr/share/X11/xkb/keycodes/evdev",
+  "/usr/share/X11/xkb/rules/evdev.xml",
+  "/usr/share/X11/xkb/symbols/altwin",
+  "/usr/share/X11/xkb/symbols/keypad",
+  "/usr/share/X11/xkb/symbols/pc",
+  "/usr/share/X11/xkb/symbols/srvr_ctrl",
+  "/usr/share/X11/xkb/symbols/us",
+  "/usr/share/X11/xkb/types/basic",
+  "/usr/share/X11/xkb/types/complete",
+  "/usr/share/X11/xkb/types/extra",
+  "/usr/share/X11/xkb/types/iso9995",
+  "/usr/share/X11/xkb/types/level5",
+  "/usr/share/X11/xkb/types/mousekeys",
+  "/usr/share/X11/xkb/types/numpad",
+  "/usr/share/X11/xkb/types/pc",
+  "/w3/lib/wine/i386-unix/wine",
+  "/w3/lib/wine/i386-windows/advapi32.dll",
+  "/w3/lib/wine/i386-windows/apisetschema.dll",
+  "/w3/lib/wine/i386-windows/apphelp.dll",
+  "/w3/lib/wine/i386-windows/bcrypt.dll",
+  "/w3/lib/wine/i386-windows/cfgmgr32.dll",
+  "/w3/lib/wine/i386-windows/combase.dll",
+  "/w3/lib/wine/i386-windows/comctl32.dll",
+  "/w3/lib/wine/i386-windows/coml2.dll",
+  "/w3/lib/wine/i386-windows/crypt32.dll",
+  "/w3/lib/wine/i386-windows/cryptbase.dll",
+  "/w3/lib/wine/i386-windows/cryptsp.dll",
+  "/w3/lib/wine/i386-windows/cryptui.dll",
+  "/w3/lib/wine/i386-windows/desk.cpl",
+  "/w3/lib/wine/i386-windows/difxapi.dll",
+  "/w3/lib/wine/i386-windows/dllhost.exe",
+  "/w3/lib/wine/i386-windows/dnsapi.dll",
+  "/w3/lib/wine/i386-windows/dwmapi.dll",
+  "/w3/lib/wine/i386-windows/explorer.exe",
+  "/w3/lib/wine/i386-windows/gameux.dll",
+  "/w3/lib/wine/i386-windows/gdi32.dll",
+  "/w3/lib/wine/i386-windows/gdiplus.dll",
+  "/w3/lib/wine/i386-windows/hal.dll",
+  "/w3/lib/wine/i386-windows/hid.dll",
+  "/w3/lib/wine/i386-windows/imagehlp.dll",
+  "/w3/lib/wine/i386-windows/imm32.dll",
+  "/w3/lib/wine/i386-windows/iphlpapi.dll",
+  "/w3/lib/wine/i386-windows/jsproxy.dll",
+  "/w3/lib/wine/i386-windows/kerberos.dll",
+  "/w3/lib/wine/i386-windows/kernel32.dll",
+  "/w3/lib/wine/i386-windows/kernelbase.dll",
+  "/w3/lib/wine/i386-windows/mmdevapi.dll",
+  "/w3/lib/wine/i386-windows/mpr.dll",
+  "/w3/lib/wine/i386-windows/msacm32.dll",
+  "/w3/lib/wine/i386-windows/msctf.dll",
+  "/w3/lib/wine/i386-windows/msftedit.dll",
+  "/w3/lib/wine/i386-windows/msv1_0.dll",
+  "/w3/lib/wine/i386-windows/msvcrt.dll",
+  "/w3/lib/wine/i386-windows/ncrypt.dll",
+  "/w3/lib/wine/i386-windows/netapi32.dll",
+  "/w3/lib/wine/i386-windows/netutils.dll",
+  "/w3/lib/wine/i386-windows/newdev.dll",
+  "/w3/lib/wine/i386-windows/normaliz.dll",
+  "/w3/lib/wine/i386-windows/nsi.dll",
+  "/w3/lib/wine/i386-windows/ntdll.dll",
+  "/w3/lib/wine/i386-windows/ntoskrnl.exe",
+  "/w3/lib/wine/i386-windows/ole32.dll",
+  "/w3/lib/wine/i386-windows/oleaut32.dll",
+  "/w3/lib/wine/i386-windows/plugplay.exe",
+  "/w3/lib/wine/i386-windows/powrprof.dll",
+  "/w3/lib/wine/i386-windows/psapi.dll",
+  "/w3/lib/wine/i386-windows/qmgr.dll",
+  "/w3/lib/wine/i386-windows/riched20.dll",
+  "/w3/lib/wine/i386-windows/rpcrt4.dll",
+  "/w3/lib/wine/i386-windows/rpcss.exe",
+  "/w3/lib/wine/i386-windows/rsaenh.dll",
+  "/w3/lib/wine/i386-windows/samcli.dll",
+  "/w3/lib/wine/i386-windows/samlib.dll",
+  "/w3/lib/wine/i386-windows/schedsvc.dll",
+  "/w3/lib/wine/i386-windows/sechost.dll",
+  "/w3/lib/wine/i386-windows/secur32.dll",
+  "/w3/lib/wine/i386-windows/services.exe",
+  "/w3/lib/wine/i386-windows/setupapi.dll",
+  "/w3/lib/wine/i386-windows/shcore.dll",
+  "/w3/lib/wine/i386-windows/slc.dll",
+  "/w3/lib/wine/i386-windows/srvcli.dll",
+  "/w3/lib/wine/i386-windows/srvsvc.dll",
+  "/w3/lib/wine/i386-windows/svchost.exe",
+  "/w3/lib/wine/i386-windows/tzres.dll",
+  "/w3/lib/wine/i386-windows/ucrtbase.dll",
+  "/w3/lib/wine/i386-windows/user32.dll",
+  "/w3/lib/wine/i386-windows/userenv.dll",
+  "/w3/lib/wine/i386-windows/version.dll",
+  "/w3/lib/wine/i386-windows/win32u.dll",
+  "/w3/lib/wine/i386-windows/wineboot.exe",
+  "/w3/lib/wine/i386-windows/winedevice.exe",
+  "/w3/lib/wine/i386-windows/winepe.wasm",
+  "/w3/lib/wine/i386-windows/winewayland.drv",
+  "/w3/lib/wine/i386-windows/winhttp.dll",
+  "/w3/lib/wine/i386-windows/wininet.dll",
+  "/w3/lib/wine/i386-windows/winmm.dll",
+  "/w3/lib/wine/i386-windows/winsta.dll",
+  "/w3/lib/wine/i386-windows/wldap32.dll",
+  "/w3/lib/wine/i386-windows/ws2_32.dll",
+  "/w3/lib/wine/share/wine/nls/l_intl.nls",
+  "/w3/share/wine/fonts/courier.ttf",
+  "/w3/share/wine/fonts/fixedsys.ttf",
+  "/w3/share/wine/fonts/fixedsys_jp.ttf",
+  "/w3/share/wine/fonts/marlett.ttf",
+  "/w3/share/wine/fonts/ms_sans_serif.ttf",
+  "/w3/share/wine/fonts/small_fonts.ttf",
+  "/w3/share/wine/fonts/small_fonts_jp.ttf",
+  "/w3/share/wine/fonts/symbol.ttf",
+  "/w3/share/wine/fonts/system.ttf",
+  "/w3/share/wine/fonts/tahoma.ttf",
+  "/w3/share/wine/fonts/tahomabd.ttf",
+  "/w3/share/wine/fonts/webdings.ttf",
+  "/w3/share/wine/fonts/wingding.ttf",
+  "/w3/share/wine/nls/c_10000.nls",
+  "/w3/share/wine/nls/c_1252.nls",
+  "/w3/share/wine/nls/c_20127.nls",
+  "/w3/share/wine/nls/c_437.nls",
+  "/w3/share/wine/nls/l_intl.nls",
+  "/w3/share/wine/nls/locale.nls",
+  "/w3/share/wine/nls/normnfc.nls",
+  "/w3/share/wine/nls/sortdefault.nls",
+  "/w3/share/wine/wine.inf"
+ ]
+}

@@ -35,7 +35,8 @@ if [ "${1:-}" = --overrides ]; then ovr; echo; exit 0; fi
 IMG=$(cd "$1" && pwd); TPL=$2; OUT=$3
 S=$IMG/Windows/System32
 REG="python3 -I $T/hive-reg.py"
-export REGISTRY_LIB=${REGISTRY_LIB:-$HOME/gex-sandbox/scratch/X/pylib}
+# python-registry (docs/win7-shell.md: pip install --target DIR python-registry==1.3.1)
+export REGISTRY_LIB=${REGISTRY_LIB:?set REGISTRY_LIB to a directory holding python-registry 1.3.1}
 
 chmod -R u+w "$OUT" 2>/dev/null || true; rm -rf "$OUT"; cp -a "$TPL" "$OUT"
 D=$OUT/drive_c/windows

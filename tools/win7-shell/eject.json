@@ -1,0 +1,16 @@
+{
+  "about": "Your settings; gexc eject never rewrites this file. \"features\": the parts of gex's runtime the build keeps, false leaves one out (docs/eject.md, \"Features\"); rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run opened in the site's bundle and the rest as lazy files, fetched when the program first reads one (\"whole\": everything in the bundle); see docs/eject.md, \"The bundle split\". \"start\": defaults for the app library's start() (args, env, cwd, size, mtimes, strace, trapstack, persist), over the recording's; the page's own options win (docs/eject.md, \"The web build\").",
+  "features": {
+    "compositor": false,
+    "gl": true,
+    "multiprocess": true,
+    "translation": true
+  },
+  "bundle": "split",
+  "start": {
+    "env": {
+      "USER": "@USER@"
+    },
+    "size": "fit"
+  }
+}

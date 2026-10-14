@@ -4,7 +4,7 @@
 #   WINE_SRC  a checkout of the Wine fork, branch explorer/wine  (required for the Wine steps)
 #   MUSL_SRC  a checkout of musl-wasm, branch gex-wasm32-slim     (required for the sysroot)
 #   GEX_SRC   this gex checkout  [the tree this script is in]
-#   GEX_CRT_SRC  compiler-rt's lib/builtins (LLVM's or emsdk's)  [/usr/lib/emsdk/...]
+#   GEX_CRT_SRC  compiler-rt's lib/builtins  [LLVM 21.1.8's, downloaded by 10-sysroot.sh]
 #   JOBS      parallel jobs  [nproc]
 set -euo pipefail
 W7_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

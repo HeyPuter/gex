@@ -80,7 +80,8 @@ done
 # ratings), from which the Start menu's Games links and the most-used list's
 # Solitaire are made: as Windows setup writes them, but with the image's
 # system drive (D: while it was serviced offline) as the prefix's, C:.
-export REGISTRY_LIB=${REGISTRY_LIB:-$HOME/gex-sandbox/scratch/X/pylib}
+# python-registry (docs/win7-shell.md: pip install --target DIR python-registry==1.3.1)
+export REGISTRY_LIB=${REGISTRY_LIB:?set REGISTRY_LIB to a directory holding python-registry 1.3.1}
 gk='Microsoft\Windows\CurrentVersion\GameUX\Games'
 python3 -I "$T/hive-reg.py" "$OUT" "$S/config/SOFTWARE:$gk=Software\\$gk!"
 python3 -I - "$OUT/system.reg" <<'PY'

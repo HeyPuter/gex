@@ -31,14 +31,10 @@
 #        process made it); buttons.png shows the taskbar's buttons; with USERINIT=1, as the
 #        shell runs startup programs only in a session userinit set up)
 set -u
-. ~/gex-sandbox/scratch/env.sh
 here=$(cd "$(dirname "$0")" && pwd)
 tag=${1:-shell}
-X=~/gex-sandbox/scratch/X
 G=${GEXC:-$here/../../target/x86/release/gexc}
-DIST=${DIST:-$X/dist-sh6}
-PFX=${PFX:-$X/pfx-sh6}
-OUT=${OUT:-$X/runs}
+: "${DIST:?set DIST}" "${PFX:?set PFX}" "${WINLOGON:?set WINLOGON}" "${OUT:?set OUT}"
 # (APPS=1 runs until its click, 150 s after the first frame, has been answered)
 if [ "${APPS:-0}" = 1 ]; then SECS=${SECS:-560} SETTLE=${SETTLE:-200}; fi
 SECS=${SECS:-400}
@@ -46,13 +42,13 @@ SETTLE=${SETTLE:-30}
 out=$OUT/$tag; pfx=$OUT/pfx-$tag
 chmod -R u+w "$pfx" 2>/dev/null; rm -rf "$out" "$pfx"; mkdir -p "$out/frames"
 cp -a "$PFX" "$pfx"
-cp "${WINLOGON:-$X/tests/winlogon.exe}" "$pfx/drive_c/winlogon.exe" || exit 1
+cp "$WINLOGON" "$pfx/drive_c/winlogon.exe" || exit 1
 if [ "${APPS:-0}" = 1 ]; then
   # two programs the shell starts from HKCU's Run key, as a user's startup
   # programs: taskapp.c built as taskone.exe and tasktwo.exe (TASKAPP: a
   # prebuilt taskapp.exe, for a box without MinGW)
   if [ -n "${TASKAPP:-}" ]; then cp "$TASKAPP" "$pfx/drive_c/taskone.exe" || exit 1
-  else TMPDIR=${TMPDIR:-$X/tmp} i686-w64-mingw32-gcc -O2 -o "$pfx/drive_c/taskone.exe" "$here/taskapp.c" -mwindows || exit 1; fi
+  else i686-w64-mingw32-gcc -O2 -o "$pfx/drive_c/taskone.exe" "$here/taskapp.c" -mwindows || exit 1; fi
   cp "$pfx/drive_c/taskone.exe" "$pfx/drive_c/tasktwo.exe"
   python3 -I "$here/user-reg.py" "$pfx/user.reg" 'Software\Microsoft\Windows\CurrentVersion\Run' \
     'TaskOne=C:\\taskone.exe' 'TaskTwo=C:\\tasktwo.exe' || exit 1
@@ -82,7 +78,7 @@ while kill -0 $pid 2>/dev/null; do
   sleep 2
 done
 kill $pid 2>/dev/null; sleep 2; kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null
-START=${START:-0} APPS=${APPS:-0} python3 -I - "$out" "$X/bin/ppm2png.py" "$pfx/drive_c/taskapp.log" <<'PY'
+START=${START:-0} APPS=${APPS:-0} python3 -I - "$out" "$here/ppm2png.py" "$pfx/drive_c/taskapp.log" <<'PY'
 import os, re, subprocess, sys
 out, topng = sys.argv[1], sys.argv[2]
 fails = []
