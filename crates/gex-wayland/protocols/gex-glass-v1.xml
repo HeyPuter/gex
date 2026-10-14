@@ -60,5 +60,45 @@
       <arg name="balance" type="uint"/>
       <arg name="blur_balance" type="uint"/>
     </request>
+
+    <enum name="frame" bitfield="true">
+      <entry name="frame" value="1" summary="draw Windows 7's frame on the glass"/>
+      <entry name="active" value="2"/>
+      <entry name="maximized" value="4"/>
+      <entry name="tool" value="8" summary="a tool window's small frame"/>
+    </enum>
+
+    <enum name="button_state">
+      <entry name="hidden" value="0"/>
+      <entry name="normal" value="1"/>
+      <entry name="hot" value="2"/>
+      <entry name="pushed" value="3"/>
+      <entry name="disabled" value="4"/>
+    </enum>
+
+    <request name="set_frame">
+      <description summary="the frame the compositor draws">
+        What DWM draws on a window's glass frame: the frame itself, and the
+        caption buttons where the client's window system has them (it hit
+        tests them, so they are drawn where it says). Rectangles are in
+        surface coordinates. The caption text is the surface's title.
+      </description>
+      <arg name="flags" type="uint" enum="frame"/>
+      <arg name="close_x" type="int"/>
+      <arg name="close_y" type="int"/>
+      <arg name="close_width" type="int"/>
+      <arg name="close_height" type="int"/>
+      <arg name="close_state" type="uint" enum="button_state"/>
+      <arg name="max_x" type="int"/>
+      <arg name="max_y" type="int"/>
+      <arg name="max_width" type="int"/>
+      <arg name="max_height" type="int"/>
+      <arg name="max_state" type="uint" enum="button_state"/>
+      <arg name="min_x" type="int"/>
+      <arg name="min_y" type="int"/>
+      <arg name="min_width" type="int"/>
+      <arg name="min_height" type="int"/>
+      <arg name="min_state" type="uint" enum="button_state"/>
+    </request>
   </interface>
 </protocol>
