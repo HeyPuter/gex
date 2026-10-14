@@ -176,10 +176,6 @@ pub struct Image {
     /// than over them.
     hulls: Vec<(u64, u64, u32)>,
 
-    /// Runs of relocated words at a pointer stride: arrays of pointers,
-    /// kept whole as data whatever a linear decode made of them.
-    tables: Vec<(u64, u64)>,
-
     /// Every absolute address the image holds, as `(site, target)`, sorted:
     /// kept for the diagnosis of a function the closure did not reach.
     relocs: Vec<(u64, u64)>,
@@ -333,12 +329,6 @@ impl Image {
         (a < self.regions[k].1).then_some(k as u32)
     }
 
-    /// Whether an address is inside a pointer table, and so data.
-    fn in_table(&self, a: u64) -> bool {
-        let k = self.tables.partition_point(|&(s, _)| s <= a);
-        k.checked_sub(1).is_some_and(|k| a < self.tables[k].1)
-    }
-
     /// What an address reaches: the functions covering it, or the region
     /// holding it.
     ///
@@ -488,7 +478,6 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
         slot_addr: slot_addr.clone(),
         slot_of: slot_addr.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect(),
         hulls: Vec::new(),
-        tables: Vec::new(),
         relocs: Vec::new(),
         wasm_calls: wasm_calls.clone(),
     };
@@ -625,36 +614,22 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     relocs.sort_unstable();
 
-    // ---- pointer tables --------------------------------------------------
-    // A run of relocated words at a four-byte stride is an array of
-    // pointers -- a vtable, a jump table, a handler table -- whatever a
-    // linear decode made of it. Paint's images have no `.rdata`, so these
-    // sit between (and inside) the functions of `.text`, and recovery takes
-    // many of them for code: mspaint.exe's vtable at 0x10024e4 is a
-    // "function" whose first bytes decode and whose rest does not. Left at
-    // that, a pointer to the table reaches only the fragment recovery
-    // claimed, and every method past it is lost. So the runs are found here
-    // and kept whole, as data.
-    const TABLE_MIN: usize = 3;
-    let mut tables: Vec<(u64, u64)> = Vec::new();
-    {
-        let sites: Vec<u64> = pe.relocs.iter().map(|r| base + r.rva as u64).collect();
-        let mut i = 0;
-        while i < sites.len() {
-            let mut j = i;
-            while j + 1 < sites.len() && sites[j + 1] == sites[j] + ptr as u64 && sites[j].is_multiple_of(ptr as u64) {
-                j += 1;
-            }
-            if j - i + 1 >= TABLE_MIN && sites[i].is_multiple_of(ptr as u64) {
-                tables.push((sites[i], sites[j] + ptr as u64));
-            }
-            i = j + 1;
-        }
-    }
-    let in_table = |a: u64| -> bool {
-        let k = tables.partition_point(|&(s, _)| s <= a);
-        k.checked_sub(1).is_some_and(|k| a < tables[k].1)
-    };
+    // Where the image's code is. A recovered instruction outside an
+    // executable section is a misdecode of data, and letting it count as
+    // code cuts the object it sits in: ole32's and actxprxy's `.rdata` hold
+    // arrays of COM stub vtables, and the bogus instructions in them split
+    // each array into a region per entry, so a pointer to the array reached
+    // only its first entry and every proxy behind it was lost.
+    let exec: Vec<(u64, u64)> = pe
+        .sections
+        .iter()
+        .filter(|s| s.executable() && s.vsize.max(s.raw_size) > 0)
+        .map(|s| {
+            let a = base + s.rva as u64;
+            (a, a + s.vsize.max(s.raw_size) as u64)
+        })
+        .collect();
+    let in_exec = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e);
 
     // ---- regions ---------------------------------------------------------
     // What a decoded instruction covers is code; everything else, including
@@ -668,7 +643,7 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     for f in prog.functions.values() {
         for b in &f.blocks {
             for (i, &pc) in b.insts.iter().enumerate() {
-                if in_table(pc) {
+                if !in_exec(pc) {
                     continue;
                 }
                 covered.push((pc, b.insts.get(i + 1).copied().unwrap_or(b.end).max(pc)));
@@ -701,16 +676,7 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     let image_end = base + pe.image_size as u64;
     let in_image = |a: u64| a >= base && a < image_end;
-    for &(s, e) in &tables {
-        bounds.insert(s);
-        bounds.insert(e);
-    }
-    let bs: Vec<u64> = bounds
-        .iter()
-        .copied()
-        .filter(|&a| in_image(a))
-        .filter(|&a| !tables.iter().any(|&(s, e)| a > s && a < e))
-        .collect();
+    let bs: Vec<u64> = bounds.iter().copied().filter(|&a| in_image(a)).collect();
     for w in bs.windows(2) {
         let (s, e) = (w[0], w[1]);
         if e <= s {
@@ -739,7 +705,7 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     let mut insts: Vec<u64> = Vec::new();
     for f in prog.functions.values() {
         for b in &f.blocks {
-            insts.extend_from_slice(&b.insts);
+            insts.extend(b.insts.iter().copied().filter(|&pc| in_exec(pc)));
         }
     }
     insts.sort_unstable();
@@ -851,7 +817,6 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     me.func_refs = func_refs;
     me.relocs = relocs;
-    me.tables = tables;
     me.slot_of = slot_addr.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     me.slot_addr = slot_addr;
     me.wasm_calls = wasm_calls;
