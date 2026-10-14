@@ -148,6 +148,10 @@ python3 -I $T/user-reg.py "$OUT/user.reg" 'Software\Wine\DllOverrides' \
       comctl32.dll) echo "${b,,}=native,builtin" ;;  # v5 (system32) stays Wine's
       *) echo "${b,,}=native" ;; esac; done) \
   -- 'Software\Wine' Version=win7
+# Direct3D on WebGPU (wined3d's WebGPU renderer, /dev/gex-gpu with the
+# page's ?webgpu=1; docs/d3d-webgpu.md): the page has no OpenGL for the
+# default renderer, and a Wine without that renderer ignores the name
+python3 -I $T/user-reg.py "$OUT/user.reg" 'Software\Wine\Direct3D' renderer=webgpu
 # explorer.exe opens folder windows in a process of its own (Wine's explorer
 # owns the desktop, and is not a shell that could host them)
 python3 -I $T/user-reg.py "$OUT/user.reg" 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'SeparateProcess=dword:00000001'
