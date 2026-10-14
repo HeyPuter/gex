@@ -89,7 +89,7 @@ enum Use {
 }
 
 /// What a relocation, or a recovered edge, reaches.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 enum Ref {
     /// A byte a recovered function covers, by the function's index.
     Code(u32),
@@ -155,7 +155,8 @@ pub struct Image {
     region_name: Vec<Vec<String>>,
 
     /// What the relocation at an address reaches, for a word-sized read.
-    word_ref: HashMap<u64, (Ref, Use)>,
+    /// Several, where shared code puts the target in more than one function.
+    word_ref: HashMap<u64, Vec<(Ref, Use)>>,
     /// Import slots, by the address of the slot.
     iat: HashMap<u64, u32>,
     imports: Vec<Import>,
@@ -166,6 +167,20 @@ pub struct Image {
     /// The image has exports that only an ordinal names.
     ordinal_only: usize,
 
+    /// `(start, end, function)` of each function's extent -- its first block
+    /// to its last -- sorted: a relocation inside it that no block covers is
+    /// still that function's, since recovery decoded around the bytes rather
+    /// than over them.
+    hulls: Vec<(u64, u64, u32)>,
+
+    /// Runs of relocated words at a pointer stride: arrays of pointers,
+    /// kept whole as data whatever a linear decode made of them.
+    tables: Vec<(u64, u64)>,
+
+    /// Every absolute address the image holds, as `(site, target)`, sorted:
+    /// kept for the diagnosis of a function the closure did not reach.
+    relocs: Vec<(u64, u64)>,
+
     /// The unit's slots: their addresses, and its own calls between them.
     slot_addr: Vec<u64>,
     slot_of: HashMap<u64, u32>,
@@ -173,6 +188,102 @@ pub struct Image {
 }
 
 impl Image {
+    /// An index for the diagnosis: which relocation sites point at each
+    /// address, and which functions refer to each function.
+    pub fn back_index(&self) -> (HashMap<u64, Vec<u64>>, HashMap<u32, Vec<u32>>) {
+        let mut by_target: HashMap<u64, Vec<u64>> = HashMap::new();
+        for &(site, target) in &self.relocs {
+            by_target.entry(target).or_default().push(site);
+        }
+        let mut callers: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (g, refs) in self.func_refs.iter().enumerate() {
+            for &(r, _) in refs {
+                if let Ref::Code(f) = r {
+                    callers.entry(f).or_default().push(g as u32);
+                }
+            }
+        }
+        (by_target, callers)
+    }
+
+    /// Whether anything the closure *did* reach refers to the function
+    /// covering `addr`. A function the closure missed whose every referrer
+    /// it also missed is a consequence; one a reached function or region
+    /// points at, or a reached function calls, is the rule that is wrong.
+    pub fn frontier(&self, addr: u64, ke: &Kept, ix: &(HashMap<u64, Vec<u64>>, HashMap<u32, Vec<u32>>)) -> bool {
+        for &site in ix.0.get(&addr).map_or(&[][..], |v| v) {
+            match self.region_at(site) {
+                Some(r) => {
+                    if ke.reached_regions.contains(&r) {
+                        return true;
+                    }
+                }
+                None => {
+                    if self.holders(site).iter().any(|f| ke.reached_funcs.contains(f)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(&Ref::Code(f)) = self.at(addr).first() {
+            if ix.1.get(&f).is_some_and(|gs| gs.iter().any(|g| ke.reached_funcs.contains(g))) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Why the closure did not reach the function covering `addr`: what
+    /// refers to it, and whether each referrer was itself reached.
+    pub fn why(&self, addr: u64, ke: &Kept, ix: &(HashMap<u64, Vec<u64>>, HashMap<u32, Vec<u32>>)) -> String {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(e) = self.exports.iter().find(|e| e.addr == Some(addr)) {
+            out.push(format!(
+                "an export ({}) nothing looked up",
+                e.name.clone().unwrap_or_else(|| format!("#{}", e.ordinal))
+            ));
+        }
+        // Every absolute address in the image that points at it, and where
+        // that pointer sits.
+        let (mut sites, mut in_reached_func, mut in_pruned_func) = (0, 0, 0);
+        let (mut in_reached_region, mut in_pruned_region, mut nowhere) = (0, 0, 0);
+        for &site in ix.0.get(&addr).map_or(&[][..], |v| v) {
+            sites += 1;
+            let hs = if self.region_at(site).is_some() { Vec::new() } else { self.holders(site) };
+            if !hs.is_empty() {
+                if hs.iter().any(|f| ke.reached_funcs.contains(f)) {
+                    in_reached_func += 1;
+                } else {
+                    in_pruned_func += 1;
+                }
+            } else if let Some(r) = self.region_at(site) {
+                if ke.reached_regions.contains(&r) {
+                    in_reached_region += 1;
+                } else {
+                    in_pruned_region += 1;
+                }
+            } else {
+                nowhere += 1;
+            }
+        }
+        // What refers to the function at all, reached or not.
+        let callers: Vec<u32> = match self.at(addr).first() {
+            Some(&Ref::Code(f)) => ix.1.get(&f).cloned().unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let live = callers.iter().filter(|g| ke.reached_funcs.contains(g)).count();
+        if self.at(addr).is_empty() {
+            out.push("no recovered function covers it".into());
+        }
+        out.push(format!(
+            "{sites} pointer(s) to it ({in_reached_func} in a reached function, {in_pruned_func} in a pruned one, \
+             {in_reached_region} in a reached region, {in_pruned_region} in a pruned region, {nowhere} nowhere); \
+             {} referrer(s), {live} reached",
+            callers.len()
+        ));
+        out.join("; ")
+    }
+
     /// The unit's slot addresses, by slot index.
     pub fn slot_addrs(&self) -> &[u64] {
         &self.slot_addr
@@ -196,6 +307,22 @@ impl Image {
         out
     }
 
+    /// The functions whose extent holds an address, when no block does.
+    fn hull_holders(&self, a: u64) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &(s, e, f) in &self.hulls {
+            if s > a {
+                break;
+            }
+            if a < e {
+                out.push(f);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The region holding an address.
     fn region_at(&self, a: u64) -> Option<u32> {
         let k = self.regions.partition_point(|&(s, _)| s <= a);
@@ -203,14 +330,30 @@ impl Image {
         (a < self.regions[k].1).then_some(k as u32)
     }
 
+    /// Whether an address is inside a pointer table, and so data.
+    fn in_table(&self, a: u64) -> bool {
+        let k = self.tables.partition_point(|&(s, _)| s <= a);
+        k.checked_sub(1).is_some_and(|k| a < self.tables[k].1)
+    }
+
     /// What an address reaches: the functions covering it, or the region
     /// holding it.
+    ///
+    /// Inside a pointer table it is both. A table's relocations are the
+    /// region's, since no instruction covers them, so a pointer to the table
+    /// has to reach the region or its entries are lost; but a run of
+    /// relocated words can also fall over real code, and resolving to the
+    /// region alone would lose the function and everything it calls. Taking
+    /// both costs only what the wrong one of the two drags in.
     fn at(&self, a: u64) -> Vec<Ref> {
-        let hs = self.holders(a);
-        if !hs.is_empty() {
-            return hs.into_iter().map(Ref::Code).collect();
+        let mut out: Vec<Ref> = self.holders(a).into_iter().map(Ref::Code).collect();
+        if out.is_empty() {
+            out = self.hull_holders(a).into_iter().map(Ref::Code).collect();
         }
-        self.region_at(a).map(|r| vec![Ref::Region(r)]).unwrap_or_default()
+        if out.is_empty() {
+            out.extend(self.region_at(a).map(Ref::Region));
+        }
+        out
     }
 }
 
@@ -341,6 +484,9 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
         ordinal_only: 0,
         slot_addr: slot_addr.clone(),
         slot_of: slot_addr.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect(),
+        hulls: Vec::new(),
+        tables: Vec::new(),
+        relocs: Vec::new(),
         wasm_calls: wasm_calls.clone(),
     };
     let Some(base) = crate::reach::find_base(&pe, &addr_set) else {
@@ -376,6 +522,16 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     spans.sort_unstable();
     let longest = spans.iter().map(|&(s, e, _)| e - s).max().unwrap_or(0);
+    let mut hulls: Vec<(u64, u64, u32)> = Vec::new();
+    for (&e, f) in &prog.functions {
+        let k = fidx[&e];
+        let lo = f.blocks.iter().map(|b| b.start).chain(std::iter::once(e)).min().unwrap_or(e);
+        let hi = f.blocks.iter().map(|b| b.end).max().unwrap_or(e);
+        if hi > lo {
+            hulls.push((lo, hi, k));
+        }
+    }
+    hulls.sort_unstable();
 
     // A get-PC idiom computes code addresses from a return address: nothing
     // bounds what the image can reach.
@@ -397,6 +553,7 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     me.entries = entries;
     me.at_entry = at_entry;
     me.longest = longest;
+    me.hulls = hulls;
 
     // ---- imports and exports --------------------------------------------
     for d in &pe.imports {
@@ -465,11 +622,56 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     relocs.sort_unstable();
 
+    // ---- pointer tables --------------------------------------------------
+    // A run of relocated words at a four-byte stride is an array of
+    // pointers -- a vtable, a jump table, a handler table -- whatever a
+    // linear decode made of it. Paint's images have no `.rdata`, so these
+    // sit between (and inside) the functions of `.text`, and recovery takes
+    // many of them for code: mspaint.exe's vtable at 0x10024e4 is a
+    // "function" whose first bytes decode and whose rest does not. Left at
+    // that, a pointer to the table reaches only the fragment recovery
+    // claimed, and every method past it is lost. So the runs are found here
+    // and kept whole, as data.
+    const TABLE_MIN: usize = 3;
+    let mut tables: Vec<(u64, u64)> = Vec::new();
+    {
+        let sites: Vec<u64> = pe.relocs.iter().map(|r| base + r.rva as u64).collect();
+        let mut i = 0;
+        while i < sites.len() {
+            let mut j = i;
+            while j + 1 < sites.len() && sites[j + 1] == sites[j] + ptr as u64 && sites[j].is_multiple_of(ptr as u64) {
+                j += 1;
+            }
+            if j - i + 1 >= TABLE_MIN && sites[i].is_multiple_of(ptr as u64) {
+                tables.push((sites[i], sites[j] + ptr as u64));
+            }
+            i = j + 1;
+        }
+    }
+    let in_table = |a: u64| -> bool {
+        let k = tables.partition_point(|&(s, _)| s <= a);
+        k.checked_sub(1).is_some_and(|k| a < tables[k].1)
+    };
+
     // ---- regions ---------------------------------------------------------
-    // What a recovered function covers is not data. The rest of the image is
+    // What a decoded instruction covers is code; everything else, including
+    // the jump tables, vtables and literals an image with no `.rdata` keeps
+    // between its functions and inside their block ranges, is data. (Paint's
+    // images merge their read-only data into `.text`: of mspaint.exe's
+    // 17,792 relocations, 17,396 are in an executable section.) The data is
     // cut into regions at the addresses something stores a pointer to, and
     // at section bounds.
-    let mut covered: Vec<(u64, u64)> = spans.iter().map(|&(s, e, _)| (s, e)).collect();
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for f in prog.functions.values() {
+        for b in &f.blocks {
+            for (i, &pc) in b.insts.iter().enumerate() {
+                if in_table(pc) {
+                    continue;
+                }
+                covered.push((pc, b.insts.get(i + 1).copied().unwrap_or(b.end).max(pc)));
+            }
+        }
+    }
     covered.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for (s, e) in covered {
@@ -496,7 +698,16 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     }
     let image_end = base + pe.image_size as u64;
     let in_image = |a: u64| a >= base && a < image_end;
-    let bs: Vec<u64> = bounds.iter().copied().filter(|&a| in_image(a)).collect();
+    for &(s, e) in &tables {
+        bounds.insert(s);
+        bounds.insert(e);
+    }
+    let bs: Vec<u64> = bounds
+        .iter()
+        .copied()
+        .filter(|&a| in_image(a))
+        .filter(|&a| !tables.iter().any(|&(s, e)| a > s && a < e))
+        .collect();
     for w in bs.windows(2) {
         let (s, e) = (w[0], w[1]);
         if e <= s {
@@ -516,6 +727,8 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
         .iter()
         .map(|&(s, e)| region_names(&img, base, s, e))
         .collect();
+
+    let all_object = std::env::var_os("GEX_FANOUT_ALL_OBJECT").is_some();
 
     // ---- what each relocation reaches ------------------------------------
     // Every recovered instruction's address, to find the one covering a
@@ -538,15 +751,30 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
         if !in_image(target) {
             continue;
         }
-        let u = classify(&img, base, inst_at(site), target);
+        let inst = inst_at(site);
+        // GEX_FANOUT_ALL_OBJECT=1 drops the instruction's bound on every
+        // reference: a diagnostic that separates a wrong classification from
+        // a wrong graph. What it still misses is structural.
+        let u = if all_object { Use::Object } else { classify(&img, base, inst, target) };
+        let at = me.at(target);
+        // `Use::Word` says only the pointer-sized word at the target is
+        // touched, which bounds what a *data* reference reaches. An address
+        // a recovered function covers is code: the word at it is an
+        // instruction, not a pointer, so the reference is to the function,
+        // however the instruction spells it. Read as a word, the function
+        // was never reached at all and everything it calls went with it.
+        let code = matches!(at.first(), Some(Ref::Code(_)));
         let what: Vec<(Ref, Use)> = match u {
-            Use::Word => vec![(Ref::Word(target), Use::Word)],
-            Use::Object => me.at(target).into_iter().map(|r| (r, Use::Object)).collect(),
+            Use::Word if !code => vec![(Ref::Word(target), Use::Word)],
+            _ => at.into_iter().map(|r| (r, Use::Object)).collect(),
         };
         if what.is_empty() {
             continue;
         }
-        let hs = me.holders(site);
+        let mut hs = me.holders(site);
+        if hs.is_empty() {
+            hs = me.hull_holders(site);
+        }
         if !hs.is_empty() {
             for f in hs {
                 func_refs[f as usize].extend(what.iter().copied());
@@ -555,13 +783,15 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
             me.region_refs[r as usize].extend(what.iter().copied());
         }
     }
-    // The relocation at an address, for a word-sized read of it.
+    // The relocation at an address, for a word-sized read of it: a stored
+    // pointer the program may offset from.
     for &(site, target) in &relocs {
         if !in_image(target) {
             continue;
         }
-        if let Some(&r) = me.at(target).first() {
-            me.word_ref.insert(site, (r, Use::Object));
+        let rs: Vec<(Ref, Use)> = me.at(target).into_iter().map(|r| (r, Use::Object)).collect();
+        if !rs.is_empty() {
+            me.word_ref.insert(site, rs);
         }
     }
 
@@ -617,6 +847,8 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
         v.dedup();
     }
     me.func_refs = func_refs;
+    me.relocs = relocs;
+    me.tables = tables;
     me.slot_of = slot_addr.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     me.slot_addr = slot_addr;
     me.wasm_calls = wasm_calls;
@@ -697,6 +929,9 @@ pub struct Kept {
     pub exports_kept: usize,
     /// Slots kept.
     pub kept: usize,
+    /// The functions and data regions the closure reached.
+    pub reached_funcs: HashSet<u32>,
+    pub reached_regions: HashSet<u32>,
 }
 
 /// A node of the global worklist.
@@ -907,8 +1142,8 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
                         }
                     }
                 }
-                if let Some(&r) = im.word_ref.get(&a) {
-                    follow(&mut q, &mut seen, &[r]);
+                if let Some(rs) = im.word_ref.get(&a) {
+                    follow(&mut q, &mut seen, rs);
                 }
             }
             Node::Export(_, e) => {
@@ -957,6 +1192,168 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
         }
     }
 
+    // GEX_FANOUT_WHY=mspaint:0x101f4af,mspaint:0x10024e4 -- what the closure
+    // made of an address: the function or region holding it, and whether it
+    // was reached.
+    if let Ok(spec) = std::env::var("GEX_FANOUT_WHY") {
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let Some((m, a)) = item.rsplit_once(':') else { continue };
+            let m = m.trim_start_matches('^');
+            let Ok(addr) = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16) else { continue };
+            let Some((i, im)) = imgs.iter().enumerate().find(|(_, im)| im.module.contains(m)) else {
+                eprintln!("[why] {item}: no image named {m}");
+                continue;
+            };
+            let i = i as u32;
+            let what: Vec<String> = im
+                .at(addr)
+                .into_iter()
+                .map(|r| match r {
+                    Ref::Code(f) => format!(
+                        "function {} at {:#x}, reached={}",
+                        f,
+                        im.entries[f as usize],
+                        seen.contains(&Node::Func(i, f))
+                    ),
+                    Ref::Region(k) => format!(
+                        "region {k} [{:#x}, {:#x}), reached={}, {} refs, names {:?}",
+                        im.regions[k as usize].0,
+                        im.regions[k as usize].1,
+                        seen.contains(&Node::Region(i, k)),
+                        im.region_refs[k as usize].len(),
+                        im.region_name[k as usize]
+                    ),
+                    Ref::Word(w) => format!("word {w:#x}, reached={}", seen.contains(&Node::Word(i, w))),
+                })
+                .collect();
+            eprintln!("[why] {}:{addr:#x}: {}", im.module, if what.is_empty() { "nothing covers it".into() } else { what.join("; ") });
+            // Walk back through everything that refers to it -- functions
+            // and data regions alike -- until something the closure reached
+            // turns up. That edge is the rule that is wrong; without it the
+            // walk names the whole island the run entered and the proof did
+            // not.
+            if item.starts_with('^') || spec.starts_with('^') {
+                let (by_target, _) = im.back_index();
+                // Which relocation targets fall in each region, for walking
+                // back into one.
+                let mut q: VecDeque<(Ref, usize)> = VecDeque::new();
+                let mut seen_n: HashSet<Ref> = HashSet::new();
+                for r in im.at(addr) {
+                    if seen_n.insert(r) {
+                        q.push_back((r, 0));
+                    }
+                }
+                let mut found = false;
+                let mut sources: Vec<Ref> = Vec::new();
+                let (mut funcs, mut regions) = (0usize, 0usize);
+                while let Some((n, d)) = q.pop_front() {
+                    // The addresses whose pointers would reach this node.
+                    let addrs: Vec<u64> = match n {
+                        Ref::Code(f) => {
+                            funcs += 1;
+                            std::iter::once(im.entries[f as usize]).collect()
+                        }
+                        Ref::Region(r) => {
+                            regions += 1;
+                            let (s, e) = im.regions[r as usize];
+                            by_target.keys().copied().filter(|&t| t >= s && t < e).collect()
+                        }
+                        Ref::Word(_) => continue,
+                    };
+                    let mut up: Vec<Ref> = Vec::new();
+                    for a in addrs {
+                        for &site in by_target.get(&a).map_or(&[][..], |v| v) {
+                            match im.region_at(site) {
+                                Some(r) => up.push(Ref::Region(r)),
+                                None => up.extend(im.holders(site).into_iter().map(Ref::Code)),
+                            }
+                        }
+                    }
+                    if let Ref::Code(f) = n {
+                        up.extend(
+                            (0..im.func_refs.len() as u32)
+                                .filter(|&g| im.func_refs[g as usize].iter().any(|&(r, _)| r == Ref::Code(f)))
+                                .map(Ref::Code),
+                        );
+                    }
+                    if up.is_empty() {
+                        sources.push(n);
+                    }
+                    for u in up {
+                        let hit = match u {
+                            Ref::Code(f) => seen.contains(&Node::Func(i, f)),
+                            Ref::Region(r) => seen.contains(&Node::Region(i, r)),
+                            Ref::Word(a) => seen.contains(&Node::Word(i, a)),
+                        };
+                        if hit {
+                            eprintln!("[why]   REACHED {u:?} refers to it, {d} step(s) back");
+                            found = true;
+                            break;
+                        }
+                        if seen_n.insert(u) && d < 40 && seen_n.len() < 20000 {
+                            q.push_back((u, d + 1));
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if !found {
+                    eprintln!(
+                        "[why]   an island: nothing reached refers to it, through {funcs} function(s) and {regions} region(s)"
+                    );
+                    for n in sources.iter().take(10) {
+                        let a = match *n {
+                            Ref::Code(f) => im.entries[f as usize],
+                            Ref::Region(r) => im.regions[r as usize].0,
+                            Ref::Word(w) => w,
+                        };
+                        let ex = im.exports.iter().find(|e| e.addr == Some(a)).map(|e| {
+                            e.name.clone().unwrap_or_else(|| format!("#{}", e.ordinal))
+                        });
+                        eprintln!(
+                            "[why]     nothing refers to {n:?} at {a:#x}{}",
+                            ex.map(|n| format!(" (export {n})")).unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var_os("GEX_FANOUT_TRACE").is_some() {
+        for (i, im) in imgs.iter().enumerate() {
+            let i = i as u32;
+            let e = im.entry.unwrap_or(0);
+            let hs = im.at(e);
+            let entry_reached = hs.iter().any(|r| match r {
+                Ref::Code(f) => seen.contains(&Node::Func(i, *f)),
+                Ref::Region(r) => seen.contains(&Node::Region(i, *r)),
+                Ref::Word(a) => seen.contains(&Node::Word(i, *a)),
+            });
+            let nf = (0..im.entries.len() as u32).filter(|&f| seen.contains(&Node::Func(i, f))).count();
+            let nr = (0..im.regions.len() as u32).filter(|&r| seen.contains(&Node::Region(i, r))).count();
+            // How the unit's slots line up with this recovery: a slot that
+            // is not a function entry here means the two recoveries differ,
+            // and every mapping from a slot to a function is suspect.
+            let (mut as_entry, mut as_interior, mut nowhere) = (0usize, 0usize, 0usize);
+            for &a in &im.slot_addr {
+                if im.at_entry.contains_key(&a) {
+                    as_entry += 1;
+                } else if !im.holders(a).is_empty() {
+                    as_interior += 1;
+                } else {
+                    nowhere += 1;
+                }
+            }
+            eprintln!(
+                "[fanout] {}: base {:#x} entry {e:#x} at={:?} reached={entry_reached}; {nf}/{} functions, {nr}/{} regions, {} relocs; \
+                 slots {}: {as_entry} are a function entry, {as_interior} inside one, {nowhere} nowhere",
+                im.module, im.base, hs.len(), im.entries.len(), im.regions.len(), im.relocs.len(), im.slot_addr.len()
+            );
+        }
+    }
+
     // ---- what to keep ----------------------------------------------------
     let mut out = Vec::new();
     for (i, im) in imgs.iter().enumerate() {
@@ -975,6 +1372,8 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
                 whole: im.whole.clone(),
                 exports: im.exports.len(),
                 exports_kept: 0,
+                reached_funcs: HashSet::new(),
+                reached_regions: HashSet::new(),
             });
             continue;
         }
@@ -997,6 +1396,8 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
             whole: None,
             exports: im.exports.len(),
             exports_kept,
+            reached_regions: (0..im.regions.len() as u32).filter(|&r| seen.contains(&Node::Region(i, r))).collect(),
+            reached_funcs: reached,
         });
     }
     keeps.unresolved = imgs.iter().map(|i| i.unresolved).sum();
@@ -1240,7 +1641,8 @@ pub fn check(dir: &std::path::Path, log: &str) -> Result<String> {
         s.push_str("no [gex-cov] lines in the log: was the site built with \"cold\": \"instrument\"?\n");
         return Ok(s);
     }
-    let (mut covered, mut missed_all) = (0usize, 0usize);
+    let (mut covered, mut missed_all, mut frontier_all) = (0usize, 0usize, 0usize);
+    let mut run_roots: Vec<(String, Vec<u64>)> = Vec::new();
     let mut rows: Vec<(usize, String)> = Vec::new();
     for ((key, path, _, _), ke) in jobs.iter().zip(&a.kept) {
         let Some(hit) = ran.get(key.as_str()) else { continue };
@@ -1262,16 +1664,78 @@ pub fn check(dir: &std::path::Path, log: &str) -> Result<String> {
         if missed.len() > addrs.len() {
             addrs.push(format!("+{} more", missed.len() - addrs.len()));
         }
-        rows.push((missed.len(), format!("{:<44} {:>6} ran, {:>5} would be pruned: {}\n", ke.module, hit.len(), missed.len(), addrs.join(" "))));
+        // The frontier: the ones something reached points at. The rest
+        // follow from those, so fixing a frontier miss fixes a crowd.
+        let ix = img.map(|i| i.back_index());
+        // The run's own entry points into this image: functions that ran
+        // which nothing that ran refers to. Each is something outside the
+        // image called, so each is a root the proof has to explain.
+        if let (Some(i), Some(ix)) = (img, &ix) {
+            let covered_funcs: HashSet<u32> = hit
+                .iter()
+                .filter_map(|&k| i.slot_addrs().get(k as usize))
+                .filter_map(|&a| match i.at(a).first() {
+                    Some(&Ref::Code(f)) => Some(f),
+                    _ => None,
+                })
+                .collect();
+            let mut roots: Vec<u64> = Vec::new();
+            for &k in missed.iter() {
+                let Some(&a) = i.slot_addrs().get(k as usize) else { continue };
+                let from_data = ix.0.get(&a).map_or(false, |sites| {
+                    sites.iter().any(|&s| i.holders(s).iter().any(|f| covered_funcs.contains(f)))
+                });
+                let from_call = match i.at(a).first() {
+                    Some(&Ref::Code(f)) => ix.1.get(&f).is_some_and(|gs| gs.iter().any(|g| covered_funcs.contains(g))),
+                    _ => false,
+                };
+                if !from_data && !from_call {
+                    roots.push(a);
+                }
+            }
+            roots.sort_unstable();
+            run_roots.push((ke.module.clone(), roots));
+        }
+        let front: Vec<u32> = match (img, &ix) {
+            (Some(i), Some(ix)) => missed
+                .iter()
+                .copied()
+                .filter(|&k| i.slot_addrs().get(k as usize).is_some_and(|&a| i.frontier(a, ke, ix)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        frontier_all += front.len();
+        let mut row = format!(
+            "{:<30} {:>6} ran, {:>5} would be pruned, {:>4} of them at the frontier: {}\n",
+            ke.module,
+            hit.len(),
+            missed.len(),
+            front.len(),
+            addrs.join(" ")
+        );
+        if let (Some(i), Some(ix)) = (img, &ix) {
+            for &k in front.iter().take(6) {
+                if let Some(&a) = i.slot_addrs().get(k as usize) {
+                    row.push_str(&format!("    {a:#x}: {}\n", i.why(a, ke, ix)));
+                }
+            }
+        }
+        rows.push((missed.len(), row));
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     for (_, r) in &rows {
         s.push_str(r);
     }
+    s.push_str("\nwhat the run entered each image at that the proof missed:\n");
+    for (m, rs) in run_roots.iter().filter(|(_, r)| !r.is_empty()) {
+        let shown: Vec<String> = rs.iter().take(10).map(|a| format!("{a:#x}")).collect();
+        s.push_str(&format!("  {:<28} {:>5}: {}\n", m, rs.len(), shown.join(" ")));
+    }
     s.push_str(&format!(
-        "\n{covered} functions ran across {} unit(s); {missed_all} of them the proof would leave out{}\n",
+        "\n{covered} functions ran across {} unit(s); {missed_all} of them the proof would leave out, \
+         {frontier_all} at the frontier{}\n",
         ran.len(),
-        if missed_all == 0 { " -- sound over this run" } else { " (each one a rule to fix)" }
+        if missed_all == 0 { " -- sound over this run" } else { "" }
     ));
     Ok(s)
 }

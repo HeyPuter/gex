@@ -263,8 +263,17 @@ const keys = [
   ['grid', 'g', 'KeyG', 71, 2],
   ['full-screen', 'F11', 'F11', 122, 0],
 ];
+// The canvas first, so the accelerators go to Paint and not to whatever
+// ribbon control the band pass left focused. The screenshot is taken while
+// the dialog is still up: the dismiss is a step of its own, which also says
+// whether closing one runs a pruned function.
+await run('focus-canvas', () => click(X(0.3), Y(0.6)));
 for (const [name, k, code, vk, mod] of keys) {
-  await run(`key-${name}`, async () => { await key(k, code, vk, mod); await sleep(600); await esc(); await esc(); });
+  const before = (await wins()).length;
+  await run(`key-${name}`, async () => { await key(k, code, vk, mod); await sleep(900); });
+  const after = (await wins()).length;
+  console.log(`info: ${name}: ${before} -> ${after} window(s)`);
+  await run(`key-${name}-dismiss`, async () => { await esc(); await sleep(300); await esc(); });
 }
 
 // 6. Still alive, and still Paint.

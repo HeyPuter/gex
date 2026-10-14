@@ -775,6 +775,82 @@ compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
 round trips. A function the recording missed at startup is a fetch, too:
 add runs to the coverage.
 
+### Pruning
+
+A unit holds every function of its image, including the ones no execution
+can reach. `user/eject.json` `"prune"` leaves those out: the slot keeps a
+stub that calls `gex.pruned(slot)`, which names the function's guest
+address on the console and traps, so a proof that is wrong says so by name
+instead of corrupting a run.
+
+- `"none"` (the default) keeps every function.
+- `"fanout"` proves it across all the site's images at once
+  (crates/gex-eject/src/fanout.rs). A site ships a closed set of images --
+  the exe and every DLL it can load -- so what reaches an image's code is
+  only what the other images and the runtime do.
+- `"static"` proves it one image at a time (crates/gex-eject/src/reach.rs),
+  which holds whatever else a site ships and is therefore far weaker: it
+  has to treat every export as called and every relocated address as taken.
+  In a PE32 every absolute address is relocated, so on Paint it left out 0
+  of 116,343 functions. It is kept for an image whose callers are not in
+  the project.
+
+`"fanout"` iterates to a fixed point over every x86 PE in the bundle:
+
+- **Roots:** the exe's entry, and every image's entry and TLS callbacks --
+  any image in the bundle may be loaded, so its initialisation runs.
+- **Exports** count when a reachable import slot binds to them (an import
+  table, a delay import, or a reachable export forwarding to them), or when
+  a reachable address holds their name, which is what a `GetProcAddress` by
+  name can find. An ordinal-named export counts when a reachable address
+  names its module, since nothing bounds which ordinal a lookup passes.
+  `.eh_frame` and `.pdata` entries never root anything.
+- **Relocation targets** count when the relocation *site* is in a reachable
+  function's body or a reachable data region. The site's instruction says
+  how far the reference reaches: an absolute memory operand with no index
+  touches only the pointer-sized word at the target, while an address that
+  goes into a register or onto the stack may be used at any offset from the
+  object it points into, and so reaches that whole object.
+- **Data reachability propagates.** Once an object is reachable its own
+  relocations are followed, so a vtable's methods, a jump table's cases, a
+  handler table and a `WNDCLASS`'s `lpfnWndProc` are all reached from
+  whatever reachable code registers them. The entry points the runtime
+  calls itself need no rule of their own for the same reason.
+- **Objects** are bounded by the addresses something stores a pointer to: a
+  region runs from one relocation target to the next, cut at section bounds
+  and at every byte a recovered function covers. Since an absolute
+  reference is itself relocated in a PE32, a reference's target always
+  starts a region.
+- **The site's own native code** -- the Wine core, ntdll, explorer and the
+  other wasm32 modules in the bundle -- is not a unit and is never pruned,
+  but it reaches these images through `GetProcAddress`, so every name it
+  holds seeds the lookup set.
+- **Kept whole:** an image with no base relocations, with a CLR header,
+  with a get-PC idiom (`call $+5`, which computes code addresses from a
+  return address), or whose unit and image cannot be lined up.
+
+`build/prune.json` carries the per-image numbers and the conservative
+keeps by kind. Paint, 59 units:
+
+| | functions | units |
+| --- | --- | --- |
+| whole | 116,343 | 178.1 MB |
+| `"fanout"` | 53,251 kept, 63,092 left out | 83.2 MB |
+
+which is a 34.3 MB site download instead of 49.1 MB. The biggest images:
+uiribbon.dll, which nothing imports and everything in Paint's chrome
+reaches through COM, keeps 17,485 of 27,837; mfc42u.dll, of whose 6,936
+exports mspaint.exe imports 584, keeps 2,088 of 14,689; gdiplus.dll keeps
+1,852 of 8,930.
+
+Two ways to check a proof. `gexc eject prune <project>` prints the report
+without building a site. `gexc eject prune-check <project> <console log>`
+takes a run of a site built with `"cold": "instrument"` (every function
+reports itself; see "Cold code") and names every function that ran which
+the proof would have left out -- each one a rule to fix, never a keep-list
+entry. tests/eject/w3-prune.mjs drives Paint's ribbon tabs, canvas, File
+menu and dialogs in headless Chromium and fails on any `[pruned]` line.
+
 ## Limits
 
 - **Dynamic linking for the recorded program only.** An `execve` of a
