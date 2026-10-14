@@ -6335,6 +6335,9 @@ impl Kernel {
     /// of one name that a single program loads both of; the exact match still
     /// wins.
     pub fn pin_for(&self, path: &str) -> Option<u64> {
+        if self.pins.is_empty() {
+            return None;
+        }
         if let Some(&base) = self.pins.get(path) {
             return Some(base);
         }

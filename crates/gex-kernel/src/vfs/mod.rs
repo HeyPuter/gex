@@ -385,7 +385,7 @@ pub trait FileSystem: Send + Sync {
     /// filesystem mounted at `/` can say: see [`walk_links`]. A filesystem
     /// whose `read_link` is a round trip (the browser's [`remote::RemoteFs`])
     /// does the whole walk in one.
-    fn walk(&self, abs: &str, follow_final: bool, mounts: &[&str]) -> Result<Walked, Errno> {
+    fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<Walked, Errno> {
         walk_links(abs.to_string(), follow_final, mounts, &|rel| self.read_link(rel))
     }
     fn unlink(&self, path: &str) -> Result<(), Errno> {
@@ -448,11 +448,19 @@ pub trait FileSystem: Send + Sync {
     }
 }
 
+/// Whether absolute `abs` is `at` or below it.
+fn within(abs: &str, at: &str) -> bool {
+    abs.starts_with(at) && matches!(abs.as_bytes().get(at.len()), None | Some(b'/'))
+}
+
 /// The mount table.
 #[derive(Clone)]
 pub struct Vfs {
     /// Mount point (absolute, no trailing slash except for "/") to backend.
     mounts: BTreeMap<String, Arc<dyn FileSystem>>,
+    /// The mount points other than `/`, NUL-separated: what a walk of the
+    /// root filesystem stops at. Kept with `mounts`, not built per lookup.
+    others: String,
     /// Current working directory, always absolute and normalised.
     pub cwd: String,
 }
@@ -461,6 +469,7 @@ impl Vfs {
     pub fn new() -> Vfs {
         Vfs {
             mounts: BTreeMap::new(),
+            others: String::new(),
             cwd: "/".to_string(),
         }
     }
@@ -468,6 +477,12 @@ impl Vfs {
     pub fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
         let at = normalize(at, "/");
         self.mounts.insert(at, fs);
+        self.list_others();
+    }
+
+    fn list_others(&mut self) {
+        let others: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
+        self.others = others.join("\0");
     }
 
     /// Whether something is mounted at exactly this path.
@@ -479,7 +494,11 @@ impl Vfs {
     /// that unmounts `/` has nothing left to run from.
     pub fn unmount(&mut self, path: &str) -> bool {
         let at = normalize(path, &self.cwd);
-        at != "/" && self.mounts.remove(&at).is_some()
+        let gone = at != "/" && self.mounts.remove(&at).is_some();
+        if gone {
+            self.list_others();
+        }
+        gone
     }
 
     /// Find the backend responsible for `path`, and the path relative to it.
@@ -501,8 +520,7 @@ impl Vfs {
         let Some(root) = self.mounts.get("/") else {
             return Ok(None);
         };
-        let mounts: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
-        root.walk(abs, follow_final, &mounts).map(Some)
+        root.walk(abs, follow_final, &self.others).map(Some)
     }
 
     /// `abs` fully resolved in the root filesystem, final link and all, and
@@ -553,7 +571,7 @@ impl Vfs {
             let matches = if at == "/" {
                 true
             } else {
-                abs == *at || abs.starts_with(&format!("{at}/"))
+                within(abs, at)
             };
             if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
                 best = Some((at, fs));
@@ -568,7 +586,7 @@ impl Vfs {
             let matches = if at == "/" {
                 true
             } else {
-                abs == *at || abs.starts_with(&format!("{at}/"))
+                within(&abs, at)
             };
             if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
                 best = Some((at, fs));
@@ -805,28 +823,35 @@ pub struct Walked {
 pub fn walk_links(
     mut abs: String,
     follow_final: bool,
-    mounts: &[&str],
+    mounts: &str,
     read_link: &dyn Fn(&str) -> Result<String, Errno>,
 ) -> Result<Walked, Errno> {
-    let under = |p: &str| {
-        mounts.iter().any(|m| p == *m || (p.starts_with(m) && p.as_bytes().get(m.len()) == Some(&b'/')))
-    };
+    let under = |p: &str| mounts.split('\0').any(|m| !m.is_empty() && within(p, m));
+    if !is_normal(&abs) {
+        abs = normalize(&abs, "/");
+    }
     'again: for _ in 0..40 {
-        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
-        let mut prefix = String::with_capacity(abs.len());
-        for (i, c) in comps.iter().enumerate().take(comps.len().saturating_sub(1)) {
-            prefix.push('/');
-            prefix.push_str(c);
-            if under(&prefix) {
+        // Each directory's prefix is a slice of `abs` (normalised: one slash
+        // before every component), so a walk that meets no link builds
+        // nothing.
+        let last = abs.rfind('/').unwrap_or(0);
+        let mut end = 0;
+        while end < last {
+            end = abs[end + 1..].find('/').map_or(abs.len(), |i| end + 1 + i);
+            if end > last {
+                break;
+            }
+            let prefix = &abs[..end];
+            if under(prefix) {
                 return Ok(Walked { path: abs, at_mount: true });
             }
             if let Ok(target) = read_link(&prefix[1..]) {
                 let base = if target.starts_with('/') {
                     normalize(&target, "/")
                 } else {
-                    normalize(&target, &parent_of(&prefix))
+                    normalize(&target, &parent_of(prefix))
                 };
-                abs = normalize(&comps[i + 1..].join("/"), &base);
+                abs = normalize(&abs[end + 1..], &base);
                 continue 'again;
             }
         }
@@ -855,6 +880,9 @@ pub fn walk_links(
 /// Purely lexical, like `realpath -m`: symlinks are resolved separately, by
 /// the caller, so that a loop can be bounded.
 pub fn normalize(path: &str, cwd: &str) -> String {
+    if is_normal(path) {
+        return path.to_string();
+    }
     let combined = if path.starts_with('/') {
         path.to_string()
     } else if cwd == "/" {
@@ -877,6 +905,19 @@ pub fn normalize(path: &str, cwd: &str) -> String {
     } else {
         format!("/{}", parts.join("/"))
     }
+}
+
+/// Whether `path` is already what [`normalize`] makes of it: absolute, and
+/// no empty, `.` or `..` component (so no doubled or trailing slash).
+pub fn is_normal(path: &str) -> bool {
+    let b = path.as_bytes();
+    if b.first() != Some(&b'/') {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    b[1..].split(|&c| c == b'/').all(|c| !c.is_empty() && c != b"." && c != b"..")
 }
 
 /// The directory containing `path`.
@@ -934,6 +975,29 @@ mod tests {
         assert_eq!(normalize(".", "/a/b"), "/a/b");
         assert_eq!(normalize("//a///b//", "/"), "/a/b");
         assert_eq!(normalize("/", "/x"), "/");
+        // Already normal: returned as is, whatever the cwd.
+        for p in ["/", "/a", "/a/b.c/..d"] {
+            assert!(is_normal(p), "{p}");
+            assert_eq!(normalize(p, "/x"), p);
+        }
+        for p in ["", "a", "//", "/a/", "/a//b", "/a/./b", "/a/..", "/."] {
+            assert!(!is_normal(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn tmpfs_walks_under_one_lock_as_walk_links_does() {
+        let fs = TmpFs::new();
+        fs.add_dir("usr");
+        fs.add_dir("usr/bin");
+        fs.add_file("usr/bin/dash", vec![]);
+        fs.symlink("usr/bin", "bin").unwrap();
+        fs.symlink("dash", "usr/bin/sh").unwrap();
+        let w = |p: &str, f: bool| fs.walk(p, f, "/proc").unwrap();
+        assert_eq!(w("/bin/sh", false), Walked { path: "/usr/bin/sh".into(), at_mount: false });
+        assert_eq!(w("/bin/sh", true), Walked { path: "/usr/bin/dash".into(), at_mount: false });
+        assert_eq!(w("/proc/1/exe", true), Walked { path: "/proc/1/exe".into(), at_mount: true });
+        assert_eq!(w("//bin/./sh", true), Walked { path: "/usr/bin/dash".into(), at_mount: false });
     }
 
     #[test]
@@ -1014,7 +1078,7 @@ mod tests {
             "var/run" => Ok("/run".to_string()),
             _ => Err(Errno::EINVAL),
         };
-        let w = |p: &str, f: bool| walk_links(p.to_string(), f, &["/proc", "/run"], &links);
+        let w = |p: &str, f: bool| walk_links(p.to_string(), f, "/proc\0/run", &links);
         assert_eq!(w("/bin/sh", false).unwrap(), Walked { path: "/usr/bin/sh".into(), at_mount: false });
         assert_eq!(w("/bin/sh", true).unwrap(), Walked { path: "/usr/bin/dash".into(), at_mount: false });
         assert_eq!(w("/proc/self/exe", true).unwrap(), Walked { path: "/proc/self/exe".into(), at_mount: true });

@@ -771,6 +771,15 @@ impl FileSystem for TmpFs {
         }
     }
 
+    /// One lock for the whole walk, not one per component.
+    fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {
+        let inner = self.inner.lock().unwrap();
+        super::walk_links(abs.to_string(), follow_final, mounts, &|rel| match inner.nodes.get(rel) {
+            Some(Node::Symlink(t)) => Ok(t.clone()),
+            _ => Err(Errno::EINVAL),
+        })
+    }
+
     fn unlink(&self, path: &str) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {

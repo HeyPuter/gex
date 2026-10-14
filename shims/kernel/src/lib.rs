@@ -2665,10 +2665,8 @@ pub extern "C" fn k_fs_walk(
     cap: u32,
 ) -> i32 {
     let abs = path_of_raw(path, path_len);
-    let list = path_of_raw(mounts, mounts_len);
-    let mounts: Vec<&str> = list.split('\0').filter(|m| !m.is_empty()).collect();
-    let fs = rootfs();
-    match gex_kernel::vfs::walk_links(abs, follow != 0, &mounts, &|rel| fs.read_link(rel)) {
+    let mounts = path_of_raw(mounts, mounts_len);
+    match rootfs().walk(&abs, follow != 0, &mounts) {
         Ok(w) => {
             let b = w.path.as_bytes();
             if b.len() as u32 > cap {
