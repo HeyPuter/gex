@@ -273,10 +273,9 @@ impl FileSystem for RemoteFs {
         Ok(String::from_utf8_lossy(&buf[..got]).into_owned())
     }
 
-    fn walk(&self, abs: &str, follow_final: bool, mounts: &[&str]) -> Result<super::Walked, Errno> {
+    fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {
         let (a, n) = at(abs.as_bytes());
-        let list = mounts.join("\0");
-        let (ma, mn) = at(list.as_bytes());
+        let (ma, mn) = at(mounts.as_bytes());
         let mut buf = [0u8; 4096];
         let got = ok((self.remote.walk)(
             a,
