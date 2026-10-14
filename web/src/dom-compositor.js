@@ -246,6 +246,9 @@ class DomWindow {
     // with alpha of its own (ARGB: per-pixel layered) keeps it everywhere.
     // As compositor-worker.js's shader.
     const glass = s.format === 1 && this.glass?.rects?.length ? this.glass.rects : null;
+    // And with a frame DWM draws, the frame goes over the window outside
+    // its client area: the window's own pixels there do not show.
+    const c = this.glass?.frame & 1 && this.glass.client?.w > 0 ? this.glass.client : null;
     let o = 0;
     for (let row = 0; row < h; row++) {
       let i = s.addr + (y + row) * stride + x * 4;
@@ -257,8 +260,10 @@ class DomWindow {
         out[o] = mem[i + 2];
         out[o + 1] = mem[i + 1];
         out[o + 2] = mem[i];
-        if (glass) {
-          const xx = x + col;
+        const xx = x + col;
+        if (c && (xx < c.x || xx >= c.x + c.w || yy < c.y || yy >= c.y + c.h)) {
+          out[o + 3] = 0;
+        } else if (glass) {
           out[o + 3] = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
         } else {
           out[o + 3] = s.format === 1 ? 255 : mem[i + 3];

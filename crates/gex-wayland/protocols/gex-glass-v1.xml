@@ -84,8 +84,10 @@
       <description summary="the frame the compositor draws">
         What DWM draws on a window's glass frame: the frame itself, and the
         caption buttons where the client's window system has them (it hit
-        tests them, so they are drawn where it says). Rectangles are in
-        surface coordinates. The caption text is the surface's title.
+        tests them, so they are drawn where it says), and the client area:
+        outside it, as under DWM, the frame is drawn over the surface and
+        the surface's own pixels do not show. Rectangles are in surface
+        coordinates. The caption text is the surface's title.
       </description>
       <arg name="flags" type="uint" enum="frame"/>
       <arg name="close_x" type="int"/>
@@ -103,6 +105,10 @@
       <arg name="min_width" type="int"/>
       <arg name="min_height" type="int"/>
       <arg name="min_state" type="uint" enum="button_state"/>
+      <arg name="client_x" type="int"/>
+      <arg name="client_y" type="int"/>
+      <arg name="client_width" type="int"/>
+      <arg name="client_height" type="int"/>
     </request>
   </interface>
 </protocol>

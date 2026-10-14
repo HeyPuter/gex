@@ -322,6 +322,9 @@ pub struct Glass {
     /// maximize and minimize buttons as (x, y, width, height, state).
     pub frame: u32,
     pub buttons: [(i32, i32, i32, i32, u32); 3],
+    /// With a frame: the client area (x, y, width, height), outside which
+    /// the frame is drawn over the surface.
+    pub client: (i32, i32, i32, i32),
 }
 
 impl Glass {
@@ -329,7 +332,7 @@ impl Glass {
     /// `RECTS - 1` and the bounds of the rest.
     pub const RECTS: usize = 4;
     /// Words a record spends on glass (`R_GLASS`.. in `wl-bridge.mjs`).
-    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3 + 1;
+    pub const WORDS: usize = 3 + 4 * Self::RECTS + 1 + 5 * 3 + 1 + 4;
 
     /// Null (`None`) is the whole surface: one rectangle the host clips to
     /// the surface's size.
@@ -344,6 +347,7 @@ impl Glass {
             afterglow_balance: self.afterglow_balance,
             frame: self.frame,
             buttons: self.buttons,
+            client: self.client,
             ..Glass::default()
         };
         for (i, r) in rects.iter().enumerate() {
@@ -388,6 +392,10 @@ impl Glass {
             w[f + 5 + 5 * i] = b.4 as i32;
         }
         w[f + 16] = self.afterglow as i32;
+        w[f + 17] = self.client.0;
+        w[f + 18] = self.client.1;
+        w[f + 19] = self.client.2;
+        w[f + 20] = self.client.3;
         w
     }
 }
@@ -2643,7 +2651,8 @@ impl Client {
                 }
                 None => ok = false,
             },
-            // set_frame(flags, then x, y, width, height, state for close, max, min)
+            // set_frame(flags, then x, y, width, height, state for close, max,
+            // min, then the client area)
             3 => {
                 let Some(flags) = r.uint() else { return false };
                 let mut buttons = [(0, 0, 0, 0, 0); 3];
@@ -2653,9 +2662,13 @@ impl Client {
                         _ => return false,
                     }
                 }
+                let (Some(cx), Some(cy), Some(cw), Some(ch)) = (r.int(), r.int(), r.int(), r.int()) else {
+                    return false;
+                };
                 if let Some(s) = self.surfaces.get_mut(&surface) {
                     s.glass.frame = flags;
                     s.glass.buttons = buttons;
+                    s.glass.client = (cx, cy, cw, ch);
                     self.dirty = true;
                 }
             }
