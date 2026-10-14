@@ -15,7 +15,12 @@ set -eu
 OUT=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
 MUSL=$(realpath "${2:-$HERE/../../../musl-w64}")
-CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
+# compiler-rt's builtins sources: GEX_CRT_SRC, else an emsdk's
+CRT=${GEX_CRT_SRC:-}
+for c in "$HOME/emsdk" /usr/lib/emsdk; do
+  [ -n "$CRT" ] || [ ! -d "$c/upstream/emscripten/system/lib/compiler-rt/lib/builtins" ] || CRT=$c/upstream/emscripten/system/lib/compiler-rt/lib/builtins
+done
+[ -n "$CRT" ] && [ -f "$CRT/udivti3.c" ] || { echo "build-sysroot64: no compiler-rt builtins sources (GEX_CRT_SRC)" >&2; exit 2; }
 JOBS=${JOBS:-4}
 . "$HERE/flags64.sh"
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/libgex-build" "$OUT/sysroot/lib"
@@ -73,10 +78,19 @@ llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm64.a" $objs
 BINARYEN_VERSION=133
 if [ -n "${GEX_BINARYEN:-}" ]; then
   ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
-elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
-  t=binaryen-version_$BINARYEN_VERSION
-  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$OUT"
+else
+  # fetched once per host into the cache, linked from every sysroot
+  cache=${XDG_CACHE_HOME:-$HOME/.cache}/gex/binaryen-$BINARYEN_VERSION
+  if [ ! -x "$cache/bin/wasm-opt" ]; then
+    t=binaryen-version_$BINARYEN_VERSION
+    mkdir -p "$(dirname "$cache")"
+    tmp=$(mktemp -d "$(dirname "$cache")/.binaryen.XXXXXX")
+    curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$tmp"
+    rm -rf "$cache"
+    mv "$tmp/$t" "$cache"
+    rm -rf "$tmp"
+  fi
   rm -rf "$OUT/sysroot/binaryen"
-  mv "$OUT/$t" "$OUT/sysroot/binaryen"
+  ln -sfn "$cache" "$OUT/sysroot/binaryen"
 fi
 echo "sysroot: $OUT/sysroot"
