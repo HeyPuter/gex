@@ -1767,6 +1767,9 @@ export class Gex {
     // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
     // left numbered with no directory entry.
     if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
+    // Another (tests/x86-programs/served-entries.c): served modules are
+    // installed one at a time, as when the merger declines them.
+    if (globalThis.GEX_TEST_SERVE_UNMERGED || globalThis.process?.env?.GEX_TEST_SERVE_UNMERGED) e.gex_test_serve_unmerged?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
     if (opts.fjit && e.gex_set_fjit) {

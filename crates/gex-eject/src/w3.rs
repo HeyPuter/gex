@@ -205,9 +205,10 @@ fn template(off: &[String]) -> String {
                rebuild with ./build.sh. \"bundle\": \"split\" ships the files the recorded run \
                opened in the site's bundle and the rest as lazy files, fetched when the program \
                first reads one (\"whole\": everything in the bundle); see docs/eject.md, \
-               \"The bundle split\". \"cold\": how each unit's code the recording never ran is \
-               split off and fetched on first call (a clustering, \"instrument\" to build units \
-               that record the functions a run calls, or \"none\"); see docs/eject.md, \"Cold code\". \
+               \"The bundle split\". \"cold\": \"none\" ships every unit whole in one archive; a clustering \
+               (\"chunk:256\", ...) splits off each unit's code the recording never ran and \
+               fetches it on first call, \"instrument\" builds units that record the functions a \
+               run calls; see docs/eject.md, \"Cold code\". \
                \"start\": defaults for the app library's start() \
                (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (docs/eject.md, \"The web build\")."),
@@ -243,10 +244,12 @@ fn slot_ranges(r: &str) -> Result<std::collections::HashSet<u32>> {
     Ok(hot)
 }
 
-/// A new W3 project's `"cold"`: clusters of consecutive cold functions, up to
-/// 256 KiB of code each (docs/eject.md, "Cold code", has the trade-off). A
-/// recording without coverage builds whole units under it (said, not refused).
-const COLD_DEFAULT: &str = "chunk:256";
+/// A new W3 project's `"cold"`: none. Every unit ships whole, in the site's
+/// one units archive (web/eject-site.mjs), and nothing is fetched on a call.
+/// A split (`"chunk:256"` and the other clusterings) is opt-in: it cuts the
+/// download and costs a fetch per cluster at first call (docs/eject.md,
+/// "Cold code").
+const COLD_DEFAULT: &str = "none";
 
 /// `gexc eject build PROJECT` for a W3 project.
 pub fn build(dir: &Path) -> Result<W3Report> {

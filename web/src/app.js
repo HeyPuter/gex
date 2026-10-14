@@ -329,7 +329,9 @@ async function begin(opts, base, at, state, meter) {
       const e = await packedEntry(href, fetcher);
       if (e) { d.files++; d.total += e.zsize ?? 0; }
     }
-    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:')).length;
+    // A units archive (`tar:N`) holds N modules.
+    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:'))
+      .reduce((n, [name]) => n + (name.startsWith('tar:') ? Number(name.slice(4)) || 0 : 1), 0);
     meter.tick();
   }
   const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
@@ -401,7 +403,7 @@ async function begin(opts, base, at, state, meter) {
   if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
   const preModules = await preloading;
   await runtime;
-  if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
+  if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
   mark('running');
   if (keep) {
@@ -753,6 +755,29 @@ async function preloadUnits(list, f, at) {
       const [name, path] = list[i++];
       const href = at(path);
       try {
+        if (name.startsWith('tar:')) {
+          // Every unit in one archive (web/eject-site.mjs): its modules
+          // compiled, its other files shared, and `closed`: the Workers
+          // ask the host for no unit file the archive does not hold.
+          const t = untar((await fetchShared(href, f)).buffer);
+          const mods = [];
+          for (const [p, bytes] of Object.entries(t.files)) {
+            const rel = p.replace(/^\/+/, '');
+            if (rel.endsWith('/c.wasm')) {
+              mods.push(WebAssembly.compile(bytes).then((m) => {
+                f.meter?.compiled();
+                return [`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m];
+              }));
+              continue;
+            }
+            // Shared where there is a SharedArrayBuffer (the SP build has none).
+            const s = new Uint8Array(typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(bytes.byteLength) : new ArrayBuffer(bytes.byteLength));
+            s.set(bytes);
+            out.push([`file:${rel}`, s]);
+          }
+          out.push(...await Promise.all(mods), ['closed', true]);
+          continue;
+        }
         if (name.startsWith('file:')) {
           // A small file of the unit cache, which every Worker would
           // otherwise fetch synchronously: shared, so each gets it uncopied.

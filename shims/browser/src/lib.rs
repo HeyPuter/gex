@@ -13485,6 +13485,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     // byte-identical. See `gex_emit::merge`.
                     let mut slots = 0u64;
                     let mut dirs: Vec<(u64, u32)> = Vec::new();
+                    let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
                         h.jit.installed_mods.insert(*id);
                         slots = slots.max(*s);
@@ -13529,6 +13530,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         }
                         note_live(&keep);
                         dirs.extend_from_slice(&keep);
+                        kept.push(keep);
                         h.jit.reuse_served += 1;
                     }
                     // Does any of this answer the block that faulted? A unit
@@ -13546,13 +13548,21 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let covers = dirs.iter().any(|(p, _)| *p == page)
                         && SERVED_PAGE.0.borrow_mut().insert(page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
-                    match gex_xlate::merge::merge(&bytes) {
+                    let merged = if TEST_SERVE_UNMERGED.load(std::sync::atomic::Ordering::Relaxed) { None } else { gex_xlate::merge::merge(&bytes) };
+                    match merged {
                         Some(wasm) => push_pending(h, dirs, slots, wasm, 0),
                         None => {
                             // Not the shape the merger expects. One at a time
-                            // rather than lose the code.
-                            for (id, s, d, w) in ready {
-                                push_pending(h, d, s, w, id);
+                            // rather than lose the code, each with the entries
+                            // kept above, never its own whole list: those name
+                            // the pages of the program that built it, and
+                            // installing them pointed this process's page at
+                            // that program's blocks (W3: winlogon.exe, at
+                            // 0x400000 like the i386 winedevice.exe whose
+                            // sechost unit it was served, ran winedevice's
+                            // code and faulted at 0x90900040).
+                            for ((id, s, _, w), keep) in ready.into_iter().zip(kept) {
+                                push_pending(h, keep, s, w, id);
                             }
                         }
                     }
@@ -14066,6 +14076,16 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
         drop(log);
     }
     retire_ranges(h, ranges);
+}
+
+/// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
+/// at a miss are installed one at a time, as when `gex_xlate::merge`
+/// declines them. A test switch, off in every real run.
+static TEST_SERVE_UNMERGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_serve_unmerged(on: i32) {
+    TEST_SERVE_UNMERGED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `gex_test_unpublished_retire(1)` (GEX_TEST_UNPUBLISHED_RETIRE): see
