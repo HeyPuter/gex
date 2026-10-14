@@ -6444,9 +6444,11 @@ impl Kernel {
                 }
                 self.pin_landed.push((path, base, start));
             }
-            let mut tmp = vec![0u8; len as usize];
-            let n = file.pread(offset, &mut tmp)? as usize;
-            m.write(start, &tmp[..n])?;
+            // Straight into the mapping, as `read` does: through a host
+            // buffer it was a second copy of the file, and the buffer's own
+            // first touch, on every private file mapping (apt-get maps its
+            // two 44 MB package caches this way on every run).
+            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
@@ -6501,6 +6503,9 @@ impl Kernel {
         // loader runs at INTERP_BASE (docs/mem64.md §3).
         // What was known to be zero before the mapping (which forgets it).
         let clean_before = self.mem.clean_ranges().to_vec();
+        // Only what this mapping claims (another caller's claim may since
+        // have been written).
+        let _ = self.mem.take_fresh();
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
         let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
             self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
@@ -6519,6 +6524,19 @@ impl Kernel {
         // are stay untouched, so a large reservation costs no memory, and
         // ranges known to be zero (`MemoryMap::clean`) are not even read.
         let end = start + crate::mem::page_align_up(len);
+        // Arena the mapping had to claim is zero already: reading it to make
+        // sure faulted in every page of it (the guest's own first write then
+        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
+        // the claim took past the mapping is free arena, still zero, and
+        // known clean for the next mapping into it.
+        let mut clean_before = clean_before;
+        if let Some((fs, fe)) = self.mem.take_fresh() {
+            let at = clean_before.partition_point(|&(s, _)| s < fs);
+            clean_before.insert(at, (fs, fe));
+            if end < fe {
+                self.mem.mark_clean(end.max(fs), fe);
+            }
+        }
         for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
             m.zero_dirty(a, (b - a) as usize)?;
         }
