@@ -1,0 +1,7 @@
+# The modules of Wine's PE side that run as native wasm32 (one module,
+# winepe.wasm, under skeleton PE files; tools/wine-wasm/stage-native.sh), in
+# link order. The core DLLs, then the programs and drivers. winedevice.exe is
+# not here: its drivers load through ntoskrnl.exe's ZwLoadDriver, and
+# ntoskrnl.exe is an i386 PE, so the i386 winedevice.exe is staged.
+ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll vcruntime140.dll msvcp140.dll concrt140.dll win32u.dll user32.dll gdi32.dll winsta.dll
+opengl32.dll winewayland.drv explorer.exe plugplay.exe rpcss.exe rundll32.exe services.exe svchost.exe wineboot.exe conhost.exe
