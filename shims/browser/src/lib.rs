@@ -13356,6 +13356,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     // byte-identical. See `gex_emit::merge`.
                     let mut slots = 0u64;
                     let mut dirs: Vec<(u64, u32)> = Vec::new();
+                    let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
                         h.jit.installed_mods.insert(*id);
                         slots = slots.max(*s);
@@ -13400,6 +13401,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         }
                         note_live(&keep);
                         dirs.extend_from_slice(&keep);
+                        kept.push(keep);
                         h.jit.reuse_served += 1;
                     }
                     // Does any of this answer the block that faulted? A unit
@@ -13421,9 +13423,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         Some(wasm) => push_pending(h, dirs, slots, wasm, 0),
                         None => {
                             // Not the shape the merger expects. One at a time
-                            // rather than lose the code.
-                            for (id, s, d, w) in ready {
-                                push_pending(h, d, s, w, id);
+                            // rather than lose the code, each with the entries
+                            // kept above, never its own whole list: those name
+                            // the pages of the program that built it, and
+                            // installing them pointed this process's page at
+                            // that program's blocks (W3: winlogon.exe, at
+                            // 0x400000 like the i386 winedevice.exe whose
+                            // sechost unit it was served, ran winedevice's
+                            // code and faulted at 0x90900040).
+                            for ((id, s, _, w), keep) in ready.into_iter().zip(kept) {
+                                push_pending(h, keep, s, w, id);
                             }
                         }
                     }
