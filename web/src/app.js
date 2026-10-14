@@ -70,7 +70,8 @@ const PIECES = {
  *   onExit(status)  called when it exits
  *   onProgress(p)   the start-up's progress, for a loading screen: called
  *              when it moves (a few times a second at most while bytes
- *              arrive, at once on a phase change) with `state.progress`'s
+ *              arrive; at once on a phase change, when a file is whole and
+ *              when a fetch of the running program starts or ends) with `state.progress`'s
  *              copy (`progressMeter` says what is in it)
  *   ready      'frame' (the default): progress is 'ready' at the first frame
  *              shown; 'manual': the page says when, with the handle's ready()
@@ -157,10 +158,15 @@ function progressMeter(state, onProgress) {
         let last = null;
         for (const f of live.values()) last = f;
         p.fetch = last ? { ...files.get(last.key), inflight: live.size } : null;
-        this.tick();
+        // At once: a fetch shorter than a tick was otherwise never seen, and
+        // one that ended was still shown until the next.
+        emit();
       };
       ch.onmessage = ({ data: m }) => {
         if (!m || typeof m.what !== 'string') return;
+        // A unit's indirect-call side file: a probe the runtime makes, not
+        // code the program waits for.
+        if (m.what.startsWith('unit:icall/')) return;
         let key = m.what;
         let name;
         let kind = 'file';
@@ -190,7 +196,9 @@ function progressMeter(state, onProgress) {
     },
     /** Bytes in, a file whole, a size learned late, a unit compiled. */
     bytes(n) { p.download.done += n; this.tick(); },
-    fileDone() { p.download.filesDone++; this.tick(); },
+    // A file whole is said at once, so the count shown is never a tick
+    // behind the bytes (a phase change is, too: see `phase`).
+    fileDone() { p.download.filesDone++; emit(); },
     more(n) { p.download.total += n; },
     compiled() { p.compile.done++; this.tick(); },
     /** On to `name`, if it is further along than where it is. */

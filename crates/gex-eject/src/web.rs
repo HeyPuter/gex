@@ -27,8 +27,9 @@ pub const MANIFEST: &str = "build/web/manifest.json";
 /// The browser runtime's JavaScript, as built into this gexc.
 pub const GEX_MJS: &str = include_str!("../../../shims/browser/js/gex.mjs");
 /// The modules `gex.mjs` imports, vendored beside it.
-pub const GEX_MJS_DEPS: [(&str, &str); 3] = [
+pub const GEX_MJS_DEPS: [(&str, &str); 4] = [
     ("lazy-fetch.mjs", include_str!("../../../shims/browser/js/lazy-fetch.mjs")),
+    ("fetch-note.mjs", include_str!("../../../shims/browser/js/fetch-note.mjs")),
     ("xcache.mjs", include_str!("../../../shims/browser/js/xcache.mjs")),
     ("single.mjs", include_str!("../../../shims/browser/js/single.mjs")),
 ];
@@ -142,6 +143,19 @@ pub fn manifest(
     let (files, modes, dirs, mtimes) = files(dir)?;
     let int_args: &[u8] = if gex_abi::X86 { &[7, 6, 2, 1, 8, 9] } else { &[0, 1, 2, 3, 4, 5, 6, 7] };
     let exe_file = format!("build/{}", rootfs_rel(&project.program.exe)?.display());
+    // Every file the launcher reads, by its path here, and its size: the
+    // page's progress has its whole download from the start.
+    let sizes: Vec<(String, u64)> = {
+        let mut rels: Vec<String> = vec![SHIM.to_string(), module.clone(), exe_file.clone()];
+        rels.extend(closure.iter().map(|c| c.to_string()));
+        rels.extend(files.iter().map(|(_, r)| r.clone()));
+        rels.extend(repl.iter().filter(|r| !r.missing).map(|r| web_module(dir, &r.module)));
+        rels.sort();
+        rels.dedup();
+        rels.into_iter()
+            .filter_map(|r| std::fs::metadata(dir.join(&r)).ok().map(|md| (r, md.len())))
+            .collect()
+    };
     let m = obj(vec![
         ("format", json::s("gex-eject-web")),
         ("version", json::n(1)),
@@ -158,6 +172,7 @@ pub fn manifest(
         ("cwd", json::opt(project.program.cwd.as_ref())),
         ("dirs", json::strs(&dirs)),
         ("files", Json::Obj(files.into_iter().map(|(g, r)| (g, json::s(r))).collect())),
+        ("sizes", Json::Obj(sizes.into_iter().map(|(r, n)| (r, json::n(n))).collect())),
         ("modes", Json::Obj(modes.into_iter().map(|(g, m)| (g, json::n(m))).collect())),
         ("mtimes", Json::Obj(mtimes.into_iter().map(|(g, t)| (g, json::n(t))).collect())),
         (
@@ -631,15 +646,24 @@ export async function start(opts = {}) {
       console.warn(`[app] onProgress: ${e?.stack ?? e}`);
     }
   };
+  // The manifest's `sizes` are every file the launcher reads, so the totals
+  // are whole before the first byte; a file it does not list (an older
+  // build) adds its size when it arrives.
+  let sizes = {};
+  let loaded = null;
+  const counted = new Set();
   const read = async (p) => {
-    progress.download.files++;
     const r = await fetch(at(p));
     if (!r.ok) throw new Error(`fetching ${p}: ${r.status}`);
     const b = new Uint8Array(await r.arrayBuffer());
-    progress.download.total += b.length;
-    progress.download.done += b.length;
-    progress.download.filesDone++;
+    if (!counted.has(p)) {
+      counted.add(p);
+      if (!(p in sizes)) { progress.download.files++; progress.download.total += b.length; }
+      progress.download.done += b.length;
+      progress.download.filesDone++;
+    }
     tell();
+    if (loaded && progress.download.filesDone >= progress.download.files) { loaded(); loaded = null; }
     return b;
   };
   const r = await fetch(at('build/web/manifest.json'), { cache: 'no-cache' });
@@ -652,7 +676,12 @@ export async function start(opts = {}) {
     m = { ...m, env: [...m.env.filter((e) => !names.has(e.split('=')[0])), ...more] };
   }
   if (opts.cwd) m = { ...m, cwd: opts.cwd };
+  sizes = m.sizes ?? {};
+  for (const n of Object.values(sizes)) { progress.download.files++; progress.download.total += n; }
+  tell();
   const state = { out: '', status: null, phase: 'running', progress };
+  // What a driver reads, as a W3 page's start() leaves it.
+  globalThis.__nt = state;
   let pre = null;
   if (!opts.onLog) {
     pre = document.createElement('pre');
@@ -668,9 +697,13 @@ export async function start(opts = {}) {
   };
   let settle;
   const killed = new Promise((res) => { settle = res; });
-  tell('boot');
+  // Downloading until the launcher has read every file the manifest
+  // listed, then running: a program without windows is ready once it runs.
+  // An older manifest without `sizes` cannot say when that is: ready at once.
+  const listed = Object.keys(sizes).length;
+  const started = () => { tell('boot'); tell('ready'); };
+  if (listed) loaded = started; else started();
   const run = launch(m, read, { args: opts.args ?? null, write, jitFallback: opts.translation === true, strace: !!opts.strace });
-  tell('ready');
   const exited = Promise.race([run, killed]).then((status) => {
     state.status = status;
     state.phase = 'done';
@@ -693,3 +726,29 @@ export async function start(opts = {}) {
   };
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{EJECT_MJS, GEX_MJS, GEX_MJS_DEPS};
+
+    /// Every module a Linux program's vendored runtime imports (`'./x.mjs'`)
+    /// is vendored too, as pe.rs checks the NT layer's: lazy-fetch.mjs's
+    /// import of fetch-note.mjs, missed, failed every Linux page's load.
+    #[test]
+    fn the_linux_web_runtime_vendors_every_module_it_imports() {
+        let mut have: Vec<&str> = GEX_MJS_DEPS.iter().map(|(f, _)| *f).collect();
+        have.extend(["gex.mjs", "eject.mjs"]);
+        let all = GEX_MJS_DEPS.iter().copied().chain([("gex.mjs", GEX_MJS), ("eject.mjs", EJECT_MJS)]);
+        for (f, text) in all {
+            for q in ['\'', '"'] {
+                for part in text.split(&format!("{q}./")).skip(1) {
+                    let Some(end) = part.find(q) else { continue };
+                    let m = &part[..end];
+                    if m.ends_with(".mjs") {
+                        assert!(have.contains(&m), "{f} imports ./{m}, which GEX_MJS_DEPS leaves out");
+                    }
+                }
+            }
+        }
+    }
+}
