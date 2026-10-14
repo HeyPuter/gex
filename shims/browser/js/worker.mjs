@@ -103,6 +103,19 @@ let workerGex = null;
 /// (`pooledModules`): its runtime starts with them, and the start message
 /// carries only those it lacks.
 const pooled = new Map();
+/// The bridges every process of a page sets up (GL, Wayland, network), as
+/// modules once loaded. Imported while this Worker waits in the host's pool
+/// (the end of this function), and used from here without an `await import`
+/// when they have arrived: an import of a module already evaluated still
+/// waits for a turn of this Worker's event loop, which was 1.5 ms of every
+/// fork child's start on the demo page.
+const bridgeImports = {
+  gl: () => import('./gl-bridge.mjs'),
+  wl: () => import('./wl-bridge.mjs'),
+  net: () => import('./net-bridge.mjs'),
+};
+const bridges = {};
+const bridge = (k) => bridges[k] ?? bridgeImports[k]().then((m) => (bridges[k] = m));
 /// Whether this process's memory can go to the next fork child when it exits
 /// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
 /// compositor reading its pixels, the session reaching its door.
@@ -562,7 +575,7 @@ async function handle(msg) {
     // this process's memory: no copy, and no batch in flight unwaited.
     // An unwaited batch is waited for all the same; its answer is what the
     // Worker build's would be, the frames shown its PRESENT replied.
-    const { shownInReply } = await import('./gl-bridge.mjs');
+    const { shownInReply } = await bridge('gl');
     gex.useGl({
       submit: (memory, ring, client, unwaited) => {
         if (!globalThis.__gexGlInRealm) return -1;
@@ -572,7 +585,7 @@ async function handle(msg) {
       },
     });
   } else if (msg.glChannel) {
-    const { GlProxy } = await import('./gl-bridge.mjs');
+    const { GlProxy } = await bridge('gl');
     gex.useGl(new GlProxy(msg.glChannel, () => {
       // An OffscreenCanvas renderer waits on the control word directly. Keep
       // thousands of synchronous query wake-ups off the page event loop.
@@ -584,7 +597,7 @@ async function handle(msg) {
   // load, so it must run before `load` -- which binds `wayland-0` only when it
   // is on.
   if (msg.wlChannel) {
-    const { WlProxy, outputSize } = await import('./wl-bridge.mjs');
+    const { WlProxy, outputSize } = await bridge('wl');
     // The token is this process's pid, which is not known yet -- the process
     // has none until it is loaded or adopted -- so it is asked for lazily, on
     // the first publish.
@@ -622,7 +635,7 @@ async function handle(msg) {
     const dumpPath = globalThis.process?.env?.GEX_WL_DUMP;
     const covPath = globalThis.process?.env?.GEX_COVERAGE_OUT;
     const fs = (dumpPath || covPath) ? await import('node:fs') : null;
-    const bridge = await import('./wl-bridge.mjs');
+    const wlb = await bridge('wl');
     const dumpCoverage = () => {
       if (!fs || !covPath) return;
       try {
@@ -640,21 +653,21 @@ async function handle(msg) {
         count++;
         if (count === 1 || count % 30 === 0) dumpCoverage();
         const recs = [];
-        const words = new Int32Array(memory.buffer, ptr >>> 0, n * bridge.REC);
+        const words = new Int32Array(memory.buffer, ptr >>> 0, n * wlb.REC);
         for (let i = 0; i < n; i++) {
-          const r = i * bridge.REC;
+          const r = i * wlb.REC;
           recs.push({
-            surface: words[r + bridge.R_SURFACE],
-            role: words[r + bridge.R_ROLE],
-            x: words[r + bridge.R_REL_X],
-            y: words[r + bridge.R_REL_Y],
-            w: words[r + bridge.R_WIDTH],
-            h: words[r + bridge.R_HEIGHT],
-            addr: words[r + bridge.R_ADDR] >>> 0,
-            stride: words[r + bridge.R_STRIDE],
+            surface: words[r + wlb.R_SURFACE],
+            role: words[r + wlb.R_ROLE],
+            x: words[r + wlb.R_REL_X],
+            y: words[r + wlb.R_REL_Y],
+            w: words[r + wlb.R_WIDTH],
+            h: words[r + wlb.R_HEIGHT],
+            addr: words[r + wlb.R_ADDR] >>> 0,
+            stride: words[r + wlb.R_STRIDE],
           });
         }
-        const windows = recs.filter((s) => s.role === bridge.ROLE_TOPLEVEL && s.w > 0);
+        const windows = recs.filter((s) => s.role === wlb.ROLE_TOPLEVEL && s.w > 0);
         if (count === 1 || count % 60 === 0) {
           console.error(
             `[wlstub] publish #${count}: ${recs.length} surfaces, ${windows.length} windows`
@@ -669,7 +682,7 @@ async function handle(msg) {
         const body = Buffer.alloc(W * H * 3);
         const px = new Uint8Array(memory.buffer);
         for (const s of recs) {
-          if (s.role === bridge.ROLE_CURSOR || s.w <= 0 || s.h <= 0) continue;
+          if (s.role === wlb.ROLE_CURSOR || s.w <= 0 || s.h <= 0) continue;
           for (let y = 0; y < s.h; y++) {
             const oy = s.y + y;
             if (oy < 0 || oy >= H) continue;
@@ -710,7 +723,7 @@ async function handle(msg) {
     // The page's Wisp connection, called across shared memory (net-bridge.mjs):
     // a wasm32 program never hands this Worker's event loop back, so a
     // WebSocket of its own here would never deliver.
-    const { NetProxy } = await import('./net-bridge.mjs');
+    const { NetProxy } = await bridge('net');
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1));
   } else if (msg.wispUrl) {
     // The site's Wisp client, imported only when a proxy was named.
@@ -1121,9 +1134,7 @@ port.post({ kind: 'ready' });
 // start (12.8, 7.3 and 5.6 ms of 104 on apt's children, timed per phase). A
 // later `import` of each is then the module already evaluated.
 if (typeof self !== 'undefined') {
-  import('./gl-bridge.mjs').catch(() => {});
-  import('./wl-bridge.mjs').catch(() => {});
-  import('./net-bridge.mjs').catch(() => {});
+  for (const k of Object.keys(bridgeImports)) bridge(k).catch(() => {});
 }
 if (handed) handle(handed);
 }
