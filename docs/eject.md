@@ -800,17 +800,30 @@ instead of corrupting a run.
 - **Roots:** the exe's entry, and every image's entry and TLS callbacks --
   any image in the bundle may be loaded, so its initialisation runs.
 - **Exports** count when a reachable import slot binds to them (an import
-  table, a delay import, or a reachable export forwarding to them), or when
-  a reachable address holds their name, which is what a `GetProcAddress` by
-  name can find. An ordinal-named export counts when a reachable address
-  names its module, since nothing bounds which ordinal a lookup passes.
-  `.eh_frame` and `.pdata` entries never root anything.
+  table, a delay import, or a reachable export forwarding to them); when
+  their name is held as a string anywhere in the site, which is what a
+  `GetProcAddress` by name can find, since the program may carry that name
+  from a registry value or a configuration file and not only from data the
+  closure reaches; or when nothing in the set imports their image, which the
+  runtime therefore loaded by name from outside the set -- a service, a COM
+  server, a proxy -- and entered at an export of. An ordinal-named export
+  counts when a reachable address names its module, since nothing bounds
+  which ordinal a lookup passes. `.eh_frame` and `.pdata` entries never root
+  anything.
 - **Relocation targets** count when the relocation *site* is in a reachable
-  function's body or a reachable data region. The site's instruction says
-  how far the reference reaches: an absolute memory operand with no index
-  touches only the pointer-sized word at the target, while an address that
-  goes into a register or onto the stack may be used at any offset from the
-  object it points into, and so reaches that whole object.
+  function or a reachable data region. A site inside a recovered function's
+  extent is that function's whether or not a decoded instruction covers it:
+  recovery decodes *around* bytes it cannot read rather than over them, and
+  in an image whose read-only data is merged into `.text` (mspaint.exe has
+  no `.rdata`, and 17,396 of its 17,792 relocations are in the executable
+  section) those gaps hold the vtables and the operands recovery could not
+  place. Where there is an instruction it says how far the reference
+  reaches: an absolute memory operand with no index touches only the
+  pointer-sized word at the target, while an address that goes into a
+  register or onto the stack may be used at any offset from the object it
+  points into, and so reaches that whole object. A word-sized read of an
+  address a function covers is a reference to that function: what sits there
+  is an instruction, not a pointer.
 - **Data reachability propagates.** Once an object is reachable its own
   relocations are followed, so a vtable's methods, a jump table's cases, a
   handler table and a `WNDCLASS`'s `lpfnWndProc` are all reached from

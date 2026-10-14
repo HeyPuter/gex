@@ -15,25 +15,30 @@
 //!
 //! * **Roots.** The exe's entry; every image's entry and TLS callbacks (any
 //!   image in the bundle may be loaded, so its initialisation runs).
-//! * **An export** is reachable only when a *reachable* import slot binds to
-//!   it (an import table entry, a delay-import entry, or another reachable
-//!   export forwarding to it), or when its name, as a NUL-terminated string,
-//!   lives at an address reachable code or reachable data references -- which
-//!   is what a `GetProcAddress` by name can find. `.eh_frame` and `.pdata`
-//!   entries are never roots, and neither is an export nothing looks up.
+//! * **An export** is reachable when a *reachable* import slot binds to it
+//!   (an import table entry, a delay-import entry, or another reachable
+//!   export forwarding to it); when its name is held as a string anywhere in
+//!   the site, which is what a `GetProcAddress` by name can find, since the
+//!   program may carry that name from a registry value or a configuration
+//!   file and not only from data the closure reaches; or when its image is
+//!   one nothing in the set imports, which the runtime therefore loaded by
+//!   name from outside the set -- a service, a COM server, a proxy -- and
+//!   entered at an export of. An ordinal-named export is reachable when a
+//!   reachable address names its module, since nothing bounds which ordinal
+//!   a lookup passes. `.eh_frame` and `.pdata` entries are never roots.
 //! * **A relocation target** is reachable only when the relocation *site*
-//!   lies in a reachable function's body or in a reachable data region. The
-//!   site's instruction says how far the reference reaches
-//!   ([`Use`]): an absolute memory operand with no index touches only the
-//!   pointer-sized word at the target; an address that goes into a register
-//!   or onto the stack may be used at any offset from the object it points
-//!   into, so it reaches that whole object.
-//! * **Data reachability propagates.** An object's relocations are followed
-//!   once the object is reachable: code pointers in it become reachable
-//!   functions (vtables, jump tables, handler tables, a `WNDCLASS`'s
-//!   `lpfnWndProc`), data pointers reach further objects, and an import slot
-//!   makes its import reachable.
-//!
+//!   lies in a reachable function or in a reachable data region. A site in a
+//!   recovered function's extent is that function's, whether or not a decoded
+//!   instruction covers it: recovery decodes *around* bytes it cannot read
+//!   rather than over them, and in an image whose read-only data is merged
+//!   into `.text` those gaps hold the vtables and the operands recovery could
+//!   not place. The site's instruction, where there is one, says how far the
+//!   reference reaches ([`Use`]): an absolute memory operand with no index
+//!   touches only the pointer-sized word at the target, while an address that
+//!   goes into a register or onto the stack may be used at any offset from
+//!   the object it points into, so it reaches that whole object. A word-sized
+//!   read of an address a function covers is a reference to the function:
+//!   what sits there is an instruction, not a pointer.
 //! The entry points the runtime calls itself need no rule of their own: a
 //! callback registered with Wine, a window procedure reached through a
 //! registered class and a COM vtable reached from a live object are all
@@ -913,6 +918,10 @@ pub struct Keeps {
     pub import_bound: usize,
     /// Exports kept because the site's own native code holds their name.
     pub native_lookup: usize,
+    /// Exports kept because some image holds their name as a string.
+    pub string_lookup: usize,
+    /// Images nothing in the set imports: every export is a root.
+    pub unimported: Vec<(String, usize)>,
 }
 
 /// What the closure kept, per image.
@@ -1026,6 +1035,50 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
             if im.holders(a).is_empty() {
                 keeps.unknown_slots += 1;
                 push(&mut q, &mut seen, Node::Slot(i as u32, k as u32));
+            }
+        }
+    }
+
+    // An export whose name is held as a string anywhere in the site, in any
+    // image's data or in the native code, is one a `GetProcAddress` can
+    // find: the string need not be in a region the closure reaches, since
+    // the program can carry it from anywhere (a registry value, a
+    // configuration file, a name built at run time out of a literal). Only
+    // the name counts here, never the module, so this does not open an
+    // image's ordinal-named exports.
+    for im in imgs {
+        for names in &im.region_name {
+            for nm in names {
+                if let Some(ts) = by_name.get(nm.as_str()) {
+                    for &(j, e) in ts {
+                        if seen.insert(Node::Export(j, e)) {
+                            q.push_back(Node::Export(j, e));
+                            keeps.string_lookup += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // An image nothing in the set imports is one the runtime loaded by name
+    // from outside it -- a service, a COM server, a proxy -- and called an
+    // export of. Which export is not in any image, so they are all roots.
+    {
+        let mut imported: HashSet<&str> = HashSet::new();
+        for im in imgs {
+            for i in &im.imports {
+                imported.insert(i.module.as_str());
+            }
+        }
+        for (j, im) in imgs.iter().enumerate() {
+            if im.is_exe || imported.contains(im.module.as_str()) || im.exports.is_empty() {
+                continue;
+            }
+            keeps.unimported.push((im.path.clone(), im.exports.len()));
+            for e in 0..im.exports.len() as u32 {
+                if seen.insert(Node::Export(j as u32, e)) {
+                    q.push_back(Node::Export(j as u32, e));
+                }
             }
         }
     }
@@ -1522,6 +1575,14 @@ pub fn keeps_text(keeps: &Keeps) -> String {
     s.push_str(&format!("  exports kept for a reachable import slot:          {}\n", keeps.import_bound));
     s.push_str(&format!("  exports kept for a name a reachable address holds: {}\n", keeps.name_lookup));
     s.push_str(&format!("  exports kept for a name the site's native code holds: {}\n", keeps.native_lookup));
+    s.push_str(&format!("  exports kept for a name some image holds:          {}\n", keeps.string_lookup));
+    if !keeps.unimported.is_empty() {
+        s.push_str(&format!(
+            "  images nothing imports, so every export is a root:  {} ({} exports)\n",
+            keeps.unimported.len(),
+            keeps.unimported.iter().map(|(_, n)| n).sum::<usize>()
+        ));
+    }
     s.push_str(&format!("  slots recovery does not account for:               {}\n", keeps.unknown_slots));
     s.push_str(&format!(
         "  data regions reached:                              {} ({} bytes)\n",
@@ -1549,6 +1610,11 @@ pub fn keeps_json(keeps: &Keeps) -> String {
     crate::json::write(&obj(vec![
         ("import_bound", n(keeps.import_bound as u64)),
         ("native_lookup", n(keeps.native_lookup as u64)),
+        ("string_lookup", n(keeps.string_lookup as u64)),
+        (
+            "unimported",
+            Json::Arr(keeps.unimported.iter().map(|(p, k)| obj(vec![("path", js(p)), ("exports", n(*k as u64))])).collect()),
+        ),
         ("name_lookup", n(keeps.name_lookup as u64)),
         ("unknown_slots", n(keeps.unknown_slots as u64)),
         ("regions", n(keeps.regions as u64)),
