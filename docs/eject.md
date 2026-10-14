@@ -800,11 +800,9 @@ instead of corrupting a run.
 - **Roots:** the exe's entry, and every image's entry and TLS callbacks --
   any image in the bundle may be loaded, so its initialisation runs.
 - **Exports** count when a reachable import slot binds to them (an import
-  table, a delay import, or a reachable export forwarding to them); when
-  their name is held as a string anywhere in the site, which is what a
-  `GetProcAddress` by name can find, since the program may carry that name
-  from a registry value or a configuration file and not only from data the
-  closure reaches; or when nothing in the set imports their image, which the
+  table, a delay import, or a reachable export forwarding to them); when a
+  reachable address holds their name, which is what a `GetProcAddress` by
+  name can find; or when nothing in the set imports their image, which the
   runtime therefore loaded by name from outside the set -- a service, a COM
   server, a proxy -- and entered at an export of. An ordinal-named export
   counts when a reachable address names its module, since nothing bounds

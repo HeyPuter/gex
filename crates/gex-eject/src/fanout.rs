@@ -17,10 +17,8 @@
 //!   image in the bundle may be loaded, so its initialisation runs).
 //! * **An export** is reachable when a *reachable* import slot binds to it
 //!   (an import table entry, a delay-import entry, or another reachable
-//!   export forwarding to it); when its name is held as a string anywhere in
-//!   the site, which is what a `GetProcAddress` by name can find, since the
-//!   program may carry that name from a registry value or a configuration
-//!   file and not only from data the closure reaches; or when its image is
+//!   export forwarding to it); when a reachable address holds its name, which
+//!   is what a `GetProcAddress` by name can find; or when its image is
 //!   one nothing in the set imports, which the runtime therefore loaded by
 //!   name from outside the set -- a service, a COM server, a proxy -- and
 //!   entered at an export of. An ordinal-named export is reachable when a
@@ -918,8 +916,6 @@ pub struct Keeps {
     pub import_bound: usize,
     /// Exports kept because the site's own native code holds their name.
     pub native_lookup: usize,
-    /// Exports kept because some image holds their name as a string.
-    pub string_lookup: usize,
     /// Images nothing in the set imports: every export is a root.
     pub unimported: Vec<(String, usize)>,
 }
@@ -1039,27 +1035,6 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
         }
     }
 
-    // An export whose name is held as a string anywhere in the site, in any
-    // image's data or in the native code, is one a `GetProcAddress` can
-    // find: the string need not be in a region the closure reaches, since
-    // the program can carry it from anywhere (a registry value, a
-    // configuration file, a name built at run time out of a literal). Only
-    // the name counts here, never the module, so this does not open an
-    // image's ordinal-named exports.
-    for im in imgs {
-        for names in &im.region_name {
-            for nm in names {
-                if let Some(ts) = by_name.get(nm.as_str()) {
-                    for &(j, e) in ts {
-                        if seen.insert(Node::Export(j, e)) {
-                            q.push_back(Node::Export(j, e));
-                            keeps.string_lookup += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
     // An image nothing in the set imports is one the runtime loaded by name
     // from outside it -- a service, a COM server, a proxy -- and called an
     // export of. Which export is not in any image, so they are all roots.
@@ -1575,7 +1550,6 @@ pub fn keeps_text(keeps: &Keeps) -> String {
     s.push_str(&format!("  exports kept for a reachable import slot:          {}\n", keeps.import_bound));
     s.push_str(&format!("  exports kept for a name a reachable address holds: {}\n", keeps.name_lookup));
     s.push_str(&format!("  exports kept for a name the site's native code holds: {}\n", keeps.native_lookup));
-    s.push_str(&format!("  exports kept for a name some image holds:          {}\n", keeps.string_lookup));
     if !keeps.unimported.is_empty() {
         s.push_str(&format!(
             "  images nothing imports, so every export is a root:  {} ({} exports)\n",
@@ -1610,7 +1584,6 @@ pub fn keeps_json(keeps: &Keeps) -> String {
     crate::json::write(&obj(vec![
         ("import_bound", n(keeps.import_bound as u64)),
         ("native_lookup", n(keeps.native_lookup as u64)),
-        ("string_lookup", n(keeps.string_lookup as u64)),
         (
             "unimported",
             Json::Arr(keeps.unimported.iter().map(|(p, k)| obj(vec![("path", js(p)), ("exports", n(*k as u64))])).collect()),
