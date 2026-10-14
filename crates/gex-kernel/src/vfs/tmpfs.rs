@@ -238,6 +238,40 @@ struct Inner {
     /// own, see `FileNode`), set by `utimensat`; sparse like `modes`, and a
     /// path without one reports 0.
     mtimes: BTreeMap<String, i64>,
+    /// How many names each inode in `inos` has: a file's link count, kept
+    /// as names come and go (counting `inos` at every `stat` scanned the
+    /// whole tree, 16 us a call once a Python was installed).
+    links: BTreeMap<u64, u32>,
+}
+
+impl Inner {
+    /// Name `path` inode `ino`, and count the link.
+    fn set_ino(&mut self, path: String, ino: u64) {
+        if let Some(old) = self.inos.insert(path, ino) {
+            self.unlink_ino(old);
+        }
+        *self.links.entry(ino).or_insert(0) += 1;
+    }
+
+    /// Forget `path`'s inode, and the link; the inode it had.
+    fn drop_ino(&mut self, path: &str) -> Option<u64> {
+        let old = self.inos.remove(path)?;
+        self.unlink_ino(old);
+        Some(old)
+    }
+
+    fn unlink_ino(&mut self, ino: u64) {
+        if let Some(n) = self.links.get_mut(&ino) {
+            *n -= 1;
+            if *n == 0 {
+                self.links.remove(&ino);
+            }
+        }
+    }
+
+    fn nlink(&self, ino: u64) -> u32 {
+        self.links.get(&ino).copied().unwrap_or(0)
+    }
 }
 
 /// An in-memory filesystem.
@@ -272,7 +306,7 @@ impl TmpFs {
             ..Default::default()
         };
         inner.nodes.insert(String::new(), Node::Dir);
-        inner.inos.insert(String::new(), 1);
+        inner.set_ino(String::new(), 1);
         TmpFs {
             inner: Arc::new(Mutex::new(inner)),
         }
@@ -285,7 +319,7 @@ impl TmpFs {
         Self::ensure_parents(&mut inner, &path);
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.clone(), ino);
+        inner.set_ino(path.clone(), ino);
         inner.nodes.insert(
             path,
             Node::File(Arc::new(FileNode::new(contents, ino))),
@@ -304,7 +338,7 @@ impl TmpFs {
         Self::ensure_parents(&mut inner, &path);
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.clone(), ino);
+        inner.set_ino(path.clone(), ino);
         let f = FileNode::new(Vec::new(), ino);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
@@ -332,7 +366,9 @@ impl TmpFs {
         Self::ensure_parents(&mut inner, &path);
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.entry(path.clone()).or_insert(ino);
+        if !inner.inos.contains_key(&path) {
+            inner.set_ino(path.clone(), ino);
+        }
         inner.nodes.entry(path).or_insert(Node::Dir);
     }
 
@@ -345,7 +381,7 @@ impl TmpFs {
         Self::ensure_parents(&mut inner, &path);
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.clone(), ino);
+        inner.set_ino(path.clone(), ino);
         inner.nodes.insert(path, Node::Socket);
     }
 
@@ -355,7 +391,7 @@ impl TmpFs {
         Self::ensure_parents(&mut inner, &path);
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.clone(), ino);
+        inner.set_ino(path.clone(), ino);
         inner.nodes.insert(path, Node::Symlink(target.to_string()));
     }
 
@@ -374,7 +410,7 @@ impl TmpFs {
             if !inner.nodes.contains_key(&acc) {
                 let ino = inner.next_ino;
                 inner.next_ino += 1;
-                inner.inos.insert(acc.clone(), ino);
+                inner.set_ino(acc.clone(), ino);
                 inner.nodes.insert(acc.clone(), Node::Dir);
             }
         }
@@ -389,21 +425,38 @@ impl TmpFs {
     /// directory is 2, which is what programs test to decide it has no
     /// subdirectories without reading it.
     fn dir_nlink(inner: &Inner, path: &str) -> u32 {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
         let prefix = if path.is_empty() {
             String::new()
         } else {
             format!("{path}/")
         };
-        let subdirs = inner
-            .nodes
-            .iter()
-            .filter(|(k, v)| {
-                matches!(v, Node::Dir)
-                    && k.strip_prefix(&prefix)
-                        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-            })
-            .count();
-        2 + subdirs as u32
+        // The immediate children only: past each child's own subtree in one
+        // seek (a child's descendants are the keys from "child/" up to
+        // "child0", '0' following '/'), where a scan of every node in the
+        // tree was a directory `stat`.
+        let mut subdirs = 0u32;
+        let mut from = (Included(prefix.clone()), Unbounded);
+        loop {
+            let Some((k, v)) = inner.nodes.range::<String, _>(from).next() else {
+                break;
+            };
+            let Some(rest) = k.strip_prefix(&prefix) else {
+                break;
+            };
+            match rest.find('/') {
+                Some(i) => {
+                    from = (Included(format!("{prefix}{}0", &rest[..i])), Unbounded);
+                }
+                None => {
+                    if !rest.is_empty() && matches!(v, Node::Dir) {
+                        subdirs += 1;
+                    }
+                    from = (Excluded(k.clone()), Unbounded);
+                }
+            }
+        }
+        2 + subdirs
     }
 }
 
@@ -481,7 +534,7 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: f.mtime.load(Ordering::Relaxed),
                 // Every name that maps to this inode is a hard link to it.
-                nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
+                nlink: inner.nlink(ino),
                 rdev: 0,
                 times: f.times(),
             }),
@@ -654,7 +707,7 @@ impl FileSystem for TmpFs {
                     }
                     let ino = inner.next_ino;
                     inner.next_ino += 1;
-                    inner.inos.insert(path.clone(), ino);
+                    inner.set_ino(path.clone(), ino);
                     let f = Arc::new(FileNode::new(Vec::new(), ino));
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
                     Some(f)
@@ -724,7 +777,7 @@ impl FileSystem for TmpFs {
             Some(Node::Dir) => Err(Errno::EISDIR),
             Some(_) => {
                 inner.nodes.remove(path);
-                inner.inos.remove(path);
+                inner.drop_ino(path);
                 inner.mtimes.remove(path);
                 Ok(())
             }
@@ -743,7 +796,7 @@ impl FileSystem for TmpFs {
         }
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.to_string(), ino);
+        inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Dir);
         Ok(())
     }
@@ -764,7 +817,7 @@ impl FileSystem for TmpFs {
             return Err(Errno::ENOTEMPTY);
         }
         inner.nodes.remove(path);
-        inner.inos.remove(path);
+        inner.drop_ino(path);
         inner.modes.remove(path);
         Ok(())
     }
@@ -774,7 +827,7 @@ impl FileSystem for TmpFs {
         let Some(node) = inner.nodes.remove(from) else {
             return Err(Errno::ENOENT);
         };
-        let ino = inner.inos.remove(from).unwrap_or(1);
+        let ino = inner.drop_ino(from).unwrap_or(1);
         // The mode travels with the name. `dpkg` unpacks a program to
         // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
         // mode behind here means every binary a package installs arrives
@@ -790,7 +843,7 @@ impl FileSystem for TmpFs {
             }
         }
         inner.nodes.insert(to.to_string(), node);
-        inner.inos.insert(to.to_string(), ino);
+        inner.set_ino(to.to_string(), ino);
         match mode {
             Some(m) => {
                 inner.modes.insert(to.to_string(), m);
@@ -827,7 +880,7 @@ impl FileSystem for TmpFs {
         // link and has to be as executable as `perl5.36.0` is.
         let mode = inner.modes.get(from).copied();
         inner.nodes.insert(to.to_string(), node);
-        inner.inos.insert(to.to_string(), ino);
+        inner.set_ino(to.to_string(), ino);
         if let Some(m) = mode {
             inner.modes.insert(to.to_string(), m);
         }
@@ -844,7 +897,7 @@ impl FileSystem for TmpFs {
         }
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.to_string(), ino);
+        inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Socket);
         Ok(())
     }
@@ -856,7 +909,7 @@ impl FileSystem for TmpFs {
         }
         let ino = inner.next_ino;
         inner.next_ino += 1;
-        inner.inos.insert(path.to_string(), ino);
+        inner.set_ino(path.to_string(), ino);
         inner
             .nodes
             .insert(path.to_string(), Node::Symlink(target.to_string()));
@@ -867,6 +920,30 @@ impl FileSystem for TmpFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_counts_follow_links_unlinks_and_renames() {
+        let fs = TmpFs::new();
+        fs.add_dir("d");
+        fs.add_dir("d/a");
+        fs.add_dir("d/a-b");
+        fs.add_dir("d/a/x");
+        fs.add_dir("d/a-b/y");
+        fs.add_file("d/f", b"1".to_vec());
+        fs.add_file("d/a/x/g", b"2".to_vec());
+        assert_eq!(fs.metadata("d").unwrap().nlink, 4);
+        assert_eq!(fs.metadata("d/a").unwrap().nlink, 3);
+        assert_eq!(fs.metadata("").unwrap().nlink, 3);
+        assert_eq!(fs.metadata("d/f").unwrap().nlink, 1);
+        fs.link("d/f", "d/h").unwrap();
+        assert_eq!(fs.metadata("d/f").unwrap().nlink, 2);
+        fs.rename("d/h", "d/a/x/g").unwrap();
+        assert_eq!(fs.metadata("d/f").unwrap().nlink, 2);
+        fs.unlink("d/a/x/g").unwrap();
+        assert_eq!(fs.metadata("d/f").unwrap().nlink, 1);
+        fs.rmdir("d/a-b/y").unwrap();
+        assert_eq!(fs.metadata("d/a-b").unwrap().nlink, 2);
+    }
 
     #[test]
     fn create_write_read_roundtrip() {

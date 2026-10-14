@@ -283,6 +283,7 @@ extern "C" {
     fn k_fs_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -763,6 +764,9 @@ extern "C" fn rf_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kerne
 }
 extern "C" fn rf_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_fs_read_link(path, path_len, at, cap) }
+}
+extern "C" fn rf_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
+    unsafe { k_fs_walk(path, path_len, mounts, mounts_len, follow, at, cap) }
 }
 extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_unlink(path, path_len) }
@@ -1286,6 +1290,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             read_dir: rf_read_dir,
             path_meta: rf_path_meta,
             read_link: rf_read_link,
+            walk: rf_walk,
             unlink: rf_unlink,
             mkdir: rf_mkdir,
             rmdir: rf_rmdir,
