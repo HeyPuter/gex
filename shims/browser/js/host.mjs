@@ -878,6 +878,9 @@ export class ProcessHost {
                 : '') +
               // What the fork wrote into this process. There is no
               // copy-on-write, so this is paid in full, per fork.
+              // A posix_spawn child that ran in its parent's Worker, in its
+              // memory, until its exec: no copy, and this long to the exec.
+              (m.vforkMs !== undefined ? `, forked in place (${m.vforkMs.toFixed(1)}ms to exec, nothing copied)` : '') +
               (m.forkCopied
                 ? `, fork copied ${Math.round(m.forkCopied / 1048576)} MiB`
                   + (m.forkZeros ? ` (${Math.round(m.forkZeros / 1048576)} MiB of it zero, left alone)` : '')

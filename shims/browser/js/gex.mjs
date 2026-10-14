@@ -3072,7 +3072,7 @@ export class Gex {
     }
     let exec = null;
     if (why === 'exec') {
-      exec = this.#vforkExecRecord(pid, ctx);
+      exec = this.#vforkExecRecord(pid, ctx, performance.now() - t0);
       e.gex_vfork_exec_done();
     } else if (why === 'crash') {
       if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
@@ -3118,7 +3118,7 @@ export class Gex {
     let why = crash ? 'crash' : w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
     let exec = null;
     if (why === 'exec') {
-      exec = this.#vforkExecRecord(pid, ctx);
+      exec = this.#vforkExecRecord(pid, ctx, performance.now() - t0);
       e.gex_vfork_exec_done();
     } else if (why === 'crash') {
       if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
@@ -3137,7 +3137,7 @@ export class Gex {
   /** The record of an exec a vfork child staged (`vfork::stage_exec`): a
    *  fork record with no image, which the host starts as any child, and
    *  whose Worker runs the exec (`#adoptExec`). */
-  #vforkExecRecord(pid, ctx) {
+  #vforkExecRecord(pid, ctx, ms) {
     const e = this.#shim.exports;
     const part = (i) => {
       const p = e.gex_vfork_exec_ptr(i) >>> 0;
@@ -3165,6 +3165,9 @@ export class Gex {
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
       exe: null,
+      // How long the child ran in its parent's Worker before this exec, for
+      // the process's exit line: a child with this ran in place, nothing copied.
+      vforkMs: ms,
     };
   }
 

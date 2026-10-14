@@ -55,6 +55,11 @@ static int child(int n)
 	struct sigaction sa;
 	sigaction(SIGUSR2, 0, &sa);
 	/* fd 1 is the pipe the parent gave; fd 5 was closed for us. */
+	/* Late, so the parent's read of the pipe has to wait for this: the
+	 * call it waits in is the first the parent makes after posix_spawn
+	 * returned, and it once came back into clone's return instead. */
+	struct timespec late = { 0, 3000000 };
+	nanosleep(&late, 0);
 	char line[64];
 	int len = snprintf(line, sizeof line, "child %d usr1=%d usr2=%s fd5=%s\n", n,
 		sigismember(&m, SIGUSR1), sa.sa_handler == SIG_DFL ? "dfl" : "set",

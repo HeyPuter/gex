@@ -357,12 +357,14 @@ pub extern "C" fn gex_vfork_end() -> i64 {
     CURRENT.with(|c| c.set(cur));
     IDS.with(|c| c.set(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 }));
     with_host(|h| bind_mine(h, cur));
+    // The caller goes on at the returned pc itself. Left in `RESUME`, that
+    // pc was still there for the thread's next call that trapped without
+    // setting one (a `read` the child's pipe kept waiting), and the thread
+    // went back into `clone`'s return with that call's registers: rax 0,
+    // the child's path, on the parent's stack.
     set_resume_none();
     set_resume_ctx_none();
-    if resume != 0 {
-        set_resume(resume);
-        set_resume_ctx(ctx_addr);
-    }
+    ctx_addr_set(ctx_addr);
     resume as i64
 }
 
