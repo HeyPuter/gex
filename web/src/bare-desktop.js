@@ -17,12 +17,15 @@
 // the scene compositor (titles, the surface list, a content hash).
 
 import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_CURSOR } from './dom-compositor.js';
+import { domGlass } from './dom-glass.js';
 
 /** Lay `desktop`'s windows out in `mount` (a positioned element). */
 export function bareDesktop(desktop, mount) {
   const placed = new Map(); // key -> { x, y }
   let z = 1;
   let cascade = 0;
+  // Windows with glass (`gex_glass_v1`): their panes and frames (dom-glass.js).
+  const glassOf = new Map();
   const keyOfParent = (win) => `${win.token}:${win.client}:${win.parent}`;
   // A window its client places (`gex_window_placement_v1`: every Win32
   // window under Wine) has real coordinates: Wine centres a dialog on its
@@ -40,6 +43,7 @@ export function bareDesktop(desktop, mount) {
     placed.set(win.key, p);
     win.canvas.style.left = `${p.x}px`;
     win.canvas.style.top = `${p.y}px`;
+    glassOf.get(win)?.sync();
     // A placed window's client is told where it now is, in order with the
     // pointer events after this, which are relative to it: Wine adds it to
     // them (`gex_window_placement_v1.origin`). Without it Wine adds where it
@@ -52,12 +56,16 @@ export function bareDesktop(desktop, mount) {
   const size = (win) => {
     win.canvas.style.width = `${win.canvas.width}px`;
     win.canvas.style.height = `${win.canvas.height}px`;
+    glassOf.get(win)?.sync();
   };
   // Placed windows' stacking, bottom to top, per layer (0 normal, 1 topmost,
   // 2 menus); every layer above every unplaced window.
   const stacks = [[], [], []];
   const restack = () => {
-    stacks.forEach((list, layer) => list.forEach((w, i) => { w.canvas.style.zIndex = String(2000000 + layer * 100000 + i); }));
+    stacks.forEach((list, layer) => list.forEach((w, i) => {
+      w.canvas.style.zIndex = String(2000000 + layer * 100000 + i);
+      glassOf.get(w)?.sync();
+    }));
   };
   const unstack = (win) => { for (const list of stacks) { const i = list.indexOf(win); if (i >= 0) list.splice(i, 1); } };
   // `below`: the stack id of the window this one is directly under; 0 the top
@@ -90,7 +98,11 @@ export function bareDesktop(desktop, mount) {
       const roomY = Math.max(1, mount.clientHeight - win.height);
       placed.set(win.key, { x: (n * step) % roomX, y: (n * step) % roomY });
       c.style.zIndex = String(z++);
-      c.addEventListener('pointerdown', () => { if (!win.placed) c.style.zIndex = String(z++); });
+      c.addEventListener('pointerdown', () => {
+        if (win.placed) return;
+        c.style.zIndex = String(z++);
+        glassOf.get(win)?.sync();
+      });
       win.place(placed.get(win.key).x, placed.get(win.key).y);
     } else {
       // Popups and subsurfaces above every toplevel.
@@ -98,9 +110,25 @@ export function bareDesktop(desktop, mount) {
     }
     win.onplace = () => move(win);
     win.onresized = () => size(win);
-    win.onclosed = () => { c.remove(); placed.delete(win.key); unstack(win); };
+    win.onclosed = () => {
+      c.remove();
+      placed.delete(win.key);
+      unstack(win);
+      glassOf.get(win)?.remove();
+      glassOf.delete(win);
+    };
+    // Glass comes and goes with the client's say (DwmExtendFrameIntoClientArea,
+    // a frame Wine leaves to DWM): made when it first has some.
+    const glassChanged = () => {
+      if (win.glass && !glassOf.has(win)) glassOf.set(win, domGlass(win, mount));
+      glassOf.get(win)?.sync();
+    };
+    win.onglass = glassChanged;
+    const retitled = win.onretitle;
+    win.onretitle = (t) => { retitled?.(t); glassOf.get(win)?.sync(); };
     mount.append(c);
     move(win);
+    if (win.glass) glassChanged();
   };
 
   /** What the scene compositor's `describe()` says, as far as a harness reads

@@ -131,6 +131,11 @@ class DomWindow {
     this.external = !!s.external;
     /** The X window this is, or zero. */
     this.xid = s.xid || 0;
+    /** Its glass (`gex_glass_v1`), as `readScene` gives it, or null; and
+     * `onglass`, told when that changes (dom-glass.js). */
+    this.glass = s.glass || null;
+    this.glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    this.onglass = null;
     this.canvas = document.createElement('canvas');
     this.canvas.width = Math.max(1, s.width);
     this.canvas.height = Math.max(1, s.height);
@@ -233,16 +238,27 @@ class DomWindow {
     }
     const out = this.#image.data;
     const stride = s.stride;
+    // DWM's rule: with glass, the window's alpha counts in its glass and
+    // nowhere else, whatever its format (GDI leaves the alpha byte 0, so
+    // anything else would be see-through). As compositor-worker.js's shader.
+    const glass = this.glass?.rects?.length ? this.glass.rects : null;
     let o = 0;
     for (let row = 0; row < h; row++) {
       let i = s.addr + (y + row) * stride + x * 4;
+      const yy = y + row;
+      const spans = glass?.filter((r) => yy >= r.y && yy < r.y + r.h);
       for (let col = 0; col < w; col++, i += 4, o += 4) {
         // shm is ARGB8888 little-endian -- B, G, R, A in memory -- and
         // `ImageData` is R, G, B, A. One swizzle, over the damage only.
         out[o] = mem[i + 2];
         out[o + 1] = mem[i + 1];
         out[o + 2] = mem[i];
-        out[o + 3] = s.format === 1 ? 255 : mem[i + 3];
+        if (glass) {
+          const xx = x + col;
+          out[o + 3] = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
+        } else {
+          out[o + 3] = s.format === 1 ? 255 : mem[i + 3];
+        }
       }
     }
     ctx.putImageData(this.#image, x, y);
@@ -558,6 +574,15 @@ export class DomDesktop {
     if (s.placed && s.activate !== win.activate) {
       win.activate = s.activate;
       this.focus(win);
+    }
+    // Glass changed: the page moves its panes and frame, and the whole window
+    // is copied again, since which of its pixels are see-through changed.
+    const glassSig = s.glass ? JSON.stringify(s.glass) : '';
+    if (glassSig !== win.glassSig) {
+      win.glassSig = glassSig;
+      win.glass = s.glass || null;
+      win.serial = -1;
+      win.onglass?.(win.glass);
     }
     // Nothing to copy when there is no buffer: a window whose pixels are the
     // host's GL has none, and neither has one the window manager published

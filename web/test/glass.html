@@ -1,14 +1,20 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Glass test</title>
-<style>html, body { margin: 0; background: #000; } canvas { display: block; width: 800px; height: 600px; }</style>
+<style>html, body { margin: 0; background: #000; } #c { display: block; width: 800px; height: 600px; }
+#c[hidden] { display: none; }
+#d { position: relative; width: 800px; height: 600px; overflow: hidden; }</style>
 <canvas id="c" width="800" height="600"></canvas>
+<div id="d" hidden></div>
 <script type="module">
 // The compositor's glass (gex_glass_v1) without a guest: two surface
 // records written straight into the scene arena, as a process's shim would.
 // A colourful backdrop window, and above it a window whose frame band is
-// glass: transparent pixels there, an opaque client area in the middle.
+// glass: transparent pixels there, an opaque client area in the middle. `?dom=1`:
+// the page with no compositor instead (bare-desktop.js, dom-glass.js).
 import { Compositor } from '../src/compositor.js';
+import { DomDesktop } from '../src/dom-compositor.js';
+import { bareDesktop } from '../src/bare-desktop.js';
 import {
   makeWlChannel, WlProxy, REC, R_CLIENT, R_SURFACE, R_ROLE, R_REL_X, R_REL_Y, R_WIDTH, R_HEIGHT, R_ADDR,
   R_STRIDE, R_FORMAT, R_SERIAL, R_DAMAGE_W, R_DAMAGE_H, R_PLACE, R_STACK_ID, R_GLASS, R_GLASS_ARGB,
@@ -19,7 +25,15 @@ const params = new URLSearchParams(location.search);
 const glassOn = params.get('glass') !== '0';
 const channel = makeWlChannel();
 const canvas = document.getElementById('c');
-const comp = await Compositor.create(canvas, channel);
+let comp;
+if (params.get('dom') === '1') {
+  canvas.hidden = true;
+  const mount = document.getElementById('d');
+  mount.hidden = false;
+  comp = bareDesktop(DomDesktop.create(mount, channel, { width: 800, height: 600 }), mount);
+} else {
+  comp = await Compositor.create(canvas, channel);
+}
 const memory = new WebAssembly.Memory({ initial: 128, maximum: 128, shared: true });
 const bytes = new Uint8Array(memory.buffer);
 const TOKEN = 7;
