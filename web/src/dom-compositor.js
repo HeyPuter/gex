@@ -241,10 +241,11 @@ class DomWindow {
     }
     const out = this.#image.data;
     const stride = s.stride;
-    // DWM's rule: with glass, the window's alpha counts in its glass and
-    // nowhere else, whatever its format (GDI leaves the alpha byte 0, so
-    // anything else would be see-through). As compositor-worker.js's shader.
-    const glass = this.glass?.rects?.length ? this.glass.rects : null;
+    // DWM's rule: with glass, an opaque window's (XRGB: GDI's, which leaves
+    // the alpha byte 0) alpha counts in its glass and nowhere else. A window
+    // with alpha of its own (ARGB: per-pixel layered) keeps it everywhere.
+    // As compositor-worker.js's shader.
+    const glass = s.format === 1 && this.glass?.rects?.length ? this.glass.rects : null;
     let o = 0;
     for (let row = 0; row < h; row++) {
       let i = s.addr + (y + row) * stride + x * 4;
