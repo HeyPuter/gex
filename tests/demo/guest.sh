@@ -2,7 +2,8 @@
 # The guest-side legs of the demo (docs/gexcc.md §9), in the page, through
 # tests/demo/desktop.mjs: /proc lists every process (ps, htop's source), a
 # pty in raw mode reads keys, nvim takes typed keys, an epoll set survives
-# fork, ttyname and ps's TTY column. Run on edger:
+# fork, ttyname and ps's TTY column, and 40 MiB through a pipeline (dd, cat
+# and wc: two pipes between three processes) in under a second. Run on edger:
 #
 #   scratch/bench/bench.sh -s $PWD/web/dist-demo -s $PWD/tests -- \
 #       bash tests/demo/guest.sh [DIST]
@@ -15,7 +16,8 @@ STEPS=$(cat <<JSON
 {"install":"python"},{"install":"nvim"},{"install":"htop"},
 {"run":"n=\$(ls /proc | grep -c '^[0-9][0-9]*\$'); echo \$n pids; ps ax | head -5; test \$n -ge 3 && ps ax | grep -q '[x]term'","label":"procfs lists every process","show":true,"wall":60},
 {"run":"echo $(b64 tty.py) | base64 -d > /tmp/guest-tty.py; python3.13 /tmp/guest-tty.py","label":"terminals and fork","show":true,"wall":120},
-{"run":"echo $(b64 nvim.py) | base64 -d > /tmp/guest-nvim.py; python3.13 /tmp/guest-nvim.py","label":"nvim on a pty","show":true,"wall":120}
+{"run":"echo $(b64 nvim.py) | base64 -d > /tmp/guest-nvim.py; python3.13 /tmp/guest-nvim.py","label":"nvim on a pty","show":true,"wall":120},
+{"run":"s=\$EPOCHREALTIME; n=\$(dd if=/dev/zero bs=64k count=640 2>/dev/null | cat | wc -c); e=\$EPOCHREALTIME; ms=\$(( (\${e/./}-\${s/./})/1000 )); echo \"\$n bytes in \$ms ms, \$(( n / 1000 / (ms + 1) )) MB/s\"; test \$n = 41943040 && test \$ms -lt 1000","label":"40 MiB through cat","show":true,"wall":120}
 ]
 JSON
 )

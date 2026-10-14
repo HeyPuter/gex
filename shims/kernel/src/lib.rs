@@ -1932,27 +1932,37 @@ pub extern "C" fn k_pipe_close_end(id: i32, write: i32, pid: i32) {
 #[no_mangle]
 pub extern "C" fn k_pipe_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 }; // EBADF
-    let mut buf = vec![0u8; len as usize];
-    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
-    match p.write(&buf) {
+    // Straight from the caller's memory into the pipe's buffer, only as
+    // much as fits (`Pipe::write_with`): staged in a `Vec` first, a 1 MiB
+    // `write` from `cat` was that much allocated, zeroed and copied for the
+    // pipe's 64 KiB.
+    let r = p.write_with(len as usize, |dst, from| unsafe {
+        gex_kmem::pull_checked(dst.as_mut_ptr(), at + from as gex_kmem::PAddr, dst.len() as u32);
+    });
+    match r {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
     }
 }
 
-/// Read up to `len` bytes into the caller's memory. See [`k_pipe_write`].
+/// Read up to `len` bytes into the caller's memory, straight from the pipe's
+/// buffer. See [`k_pipe_write`].
 #[no_mangle]
 pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 };
     // No bigger than what is buffered, sized under the pipe's lock
-    // (`Pipe::read_vec`): a reader asking for 128 KiB of a pipe holding a few
-    // bytes zeroed the whole request on every call, and a size taken before
-    // the read could be a stale zero, a one-byte read that tore a record.
-    match p.read_vec(len as usize) {
-        Ok(buf) => {
-            unsafe { gex_kmem::push_checked(at, buf.as_ptr(), buf.len() as u32) };
-            buf.len() as i32
+    // (`Pipe::read_with`): a reader asking for 128 KiB of a pipe holding a
+    // few bytes zeroed the whole request on every call, and a size taken
+    // before the read could be a stale zero, a one-byte read that tore a
+    // record.
+    let r = p.read_with(len as usize, |a, b| unsafe {
+        gex_kmem::push_checked(at, a.as_ptr(), a.len() as u32);
+        if !b.is_empty() {
+            gex_kmem::push_checked(at + a.len() as gex_kmem::PAddr, b.as_ptr(), b.len() as u32);
         }
+    });
+    match r {
+        Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
     }
 }
