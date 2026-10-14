@@ -49,15 +49,16 @@ const bg = pixels(800, 600, (x, y) => {
 const W = 400, H = 300;
 const win = pixels(W, H, (x, y) => {
   const glass = x < 8 || x >= W - 8 || y < 30 || y >= H - 8;
-  return glass ? [0, 0, 0, 0] : [245, 245, 245, 255];
+  // As GDI leaves it: alpha 0 everywhere, black where the glass is.
+  return glass ? [0, 0, 0, 0] : [245, 245, 245, 0];
 });
 
 const recs = new Int32Array(memory.buffer, 1024, 2 * REC);
-function rec(i, { surface, x, y, w, h, addr, id, glass }) {
+function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0 }) {
   const r = i * REC;
   recs[r + R_CLIENT] = 1; recs[r + R_SURFACE] = surface; recs[r + R_ROLE] = ROLE_TOPLEVEL;
   recs[r + R_REL_X] = x; recs[r + R_REL_Y] = y; recs[r + R_WIDTH] = w; recs[r + R_HEIGHT] = h;
-  recs[r + R_ADDR] = addr; recs[r + R_STRIDE] = w * 4; recs[r + R_FORMAT] = 0; recs[r + R_SERIAL] = 1;
+  recs[r + R_ADDR] = addr; recs[r + R_STRIDE] = w * 4; recs[r + R_FORMAT] = format; recs[r + R_SERIAL] = 1;
   recs[r + R_DAMAGE_W] = w; recs[r + R_DAMAGE_H] = h;
   recs[r + R_PLACE] = P_PLACED | P_UNMANAGED; recs[r + R_STACK_ID] = id;
   if (glass) {
@@ -68,7 +69,7 @@ function rec(i, { surface, x, y, w, h, addr, id, glass }) {
   }
 }
 rec(0, { surface: 1, x: 0, y: 0, w: 800, h: 600, addr: bg, id: 1 });
-rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2,
+rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1,
   glass: glassOn ? [[0, 0, W, 30], [0, 30, 8, H - 38], [W - 8, 30, 8, H - 38], [0, H - 8, W, 8]] : null });
 const proxy = new WlProxy(channel, null, () => TOKEN);
 proxy.publish(memory, 1024, 2);
