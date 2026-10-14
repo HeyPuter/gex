@@ -47,7 +47,11 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # retired; in the page with GEX_TEST_UNPUBLISHED_RETIRE, which leaves a
 # retired page numbered with no directory entry (a publisher that never
 # installed), the block's page check must converge (Paint's startup stall).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn"}
+# served-entries: two programs at one base (it and its VAL=2 build, ARGV0-b,
+# which it execs) sharing a file of code; in the page with
+# GEX_TEST_SERVE_UNMERGED (served modules installed one at a time) the second
+# must not be pointed at the first's code on a page they both have.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -70,6 +74,9 @@ for src in "$HERE"/*.c; do
         [ "$target" = x86-linux-musl ] && extra="-Wl,--image-base=0x1000000"
         bin="$WORK/$name-$target"
         [ -x "$bin" ] || zig cc -target "$target" -O1 -static $extra -o "$bin" "$src" || { fail=1; continue; }
+        if [ $name = served-entries ]; then
+            [ -x "$bin-b" ] || zig cc -target "$target" -O1 -static $extra -DVAL=2 -o "$bin-b" "$src" || { fail=1; continue; }
+        fi
         native=$("$bin" 2>/dev/null); ns=$?
         # smc-race: the translator waits between decoding a JIT-code block
         # and fixing its guard, so the writer's stores land in between.
@@ -79,6 +86,8 @@ for src in "$HERE"/*.c; do
         # exec-signals execs itself: in the page, from the guest's filesystem.
         pageopts=""
         [ $name = exec-signals ] && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
+        [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
+            pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then
             env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
             # 125: run-node's flaky "nothing could wake it" after a threaded

@@ -13419,7 +13419,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let covers = dirs.iter().any(|(p, _)| *p == page)
                         && SERVED_PAGE.0.borrow_mut().insert(page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
-                    match gex_xlate::merge::merge(&bytes) {
+                    let merged = if TEST_SERVE_UNMERGED.load(std::sync::atomic::Ordering::Relaxed) { None } else { gex_xlate::merge::merge(&bytes) };
+                    match merged {
                         Some(wasm) => push_pending(h, dirs, slots, wasm, 0),
                         None => {
                             // Not the shape the merger expects. One at a time
@@ -13946,6 +13947,16 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
         drop(log);
     }
     retire_ranges(h, ranges);
+}
+
+/// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
+/// at a miss are installed one at a time, as when `gex_xlate::merge`
+/// declines them. A test switch, off in every real run.
+static TEST_SERVE_UNMERGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_serve_unmerged(on: i32) {
+    TEST_SERVE_UNMERGED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `gex_test_unpublished_retire(1)` (GEX_TEST_UNPUBLISHED_RETIRE): see
