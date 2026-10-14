@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""clang for W64's LP64 programs (docs/wine-native-x64.md §1.1).
+
+Like wcc, for code with x86-64 Linux's LP64 layout: compiles for wasm64
+(flags64.sh) against GEX_WASM64_SYSROOT (build-sysroot64.sh), links a
+position-independent wasm64 executable, lowers it to wasm32 with binaryen's
+--memory64-lowering (the one place an address becomes a memory index: every
+i64 address wrapped to i32 at its access), and wraps it in the ELF64 x86-64
+container gexc runs (wasm-elf.py --elf64). The module stays beside it as
+OUT.wasm (OUT.64.wasm is the module before lowering).
+
+-Wl,--gex-guest-x86-64 marks a program that runs x86-64 Windows code (the
+W64 loader). No fork (programs spawn by clone/vfork), no -shared yet."""
+import os, subprocess, sys, tempfile, atexit, shutil
+
+here = os.path.dirname(os.path.realpath(__file__))
+flags = {}
+for line in open(os.path.join(here, 'flags64.sh')):
+    if '=' in line and not line.startswith('#'):
+        k, v = line.strip().split('=', 1)
+        v = v.strip('"')
+        for kk, vv in flags.items():
+            v = v.replace('$' + kk, vv)
+        flags[k] = v
+sysroot = os.environ.get('GEX_WASM64_SYSROOT') or sys.exit('wcc64: set GEX_WASM64_SYSROOT')
+CC = ['clang'] + flags['WASM64_CFLAGS'].split() + ['--sysroot=' + sysroot, '-isystem', sysroot + '/include']
+if os.path.basename(sys.argv[0]).endswith('++'):
+    CC[0] = 'clang++'
+args = sys.argv[1:]
+if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
+       for a in args) or not args:
+    os.execvp(CC[0], CC + args)
+
+out = 'a.out'
+srcs, ld_in, ld_flags, cflags = [], [], [], []
+guest = False
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == '-o':
+        out = args[i + 1]; i += 2; continue
+    if a in ('-shared', '-r'):
+        sys.exit('wcc64: %s is not supported yet' % a)
+    if a.startswith('-Wl,'):
+        parts = [x for x in a[4:].split(',') if x]
+        guest = guest or '--gex-guest-x86-64' in parts
+        ld_flags += [x for x in parts if x not in ('--start-group', '--end-group', '--gex-guest-x86-64')]
+    elif a.startswith(('-l', '-L')):
+        if a in ('-l', '-L'):
+            ld_in += [a + args[i + 1]]; i += 2; continue
+        if a not in ('-lc', '-lm', '-lpthread', '-ldl', '-lrt', '-lutil'):
+            ld_in.append(a)
+    elif a.endswith(('.c', '.cc', '.cpp', '.s', '.S')) and not a.startswith('-'):
+        srcs.append(a)
+    elif a.endswith(('.o', '.a')) and not a.startswith('-'):
+        ld_in.append(a)
+    elif a in ('-pthread', '-rdynamic', '-static', '-pie', '-no-pie', '-fPIE', '-fpie'):
+        pass
+    elif a in ('-I', '-D', '-U', '-include', '-isystem', '-MF', '-MT', '-x'):
+        cflags += [a, args[i + 1]]; i += 2; continue
+    else:
+        cflags.append(a)
+    i += 1
+
+tmp = tempfile.mkdtemp(prefix='wcc64-')
+atexit.register(shutil.rmtree, tmp, True)
+objs = []
+for k, s in enumerate(srcs):
+    o = os.path.join(tmp, '%d.o' % k)
+    r = subprocess.call(CC + cflags + ['-c', s, '-o', o])
+    if r:
+        sys.exit(r)
+    objs.append(o)
+
+lib = sysroot + '/lib'
+w64 = out + '.64.wasm'
+wasm = out + '.wasm'
+# libgex before libc: its setjmp runtime, dlopen registry and signal frames.
+cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
+       '--max-memory=4294967296', '-L' + lib, '-pie', '--no-entry', '-o', w64, lib + '/crt1.o'] + \
+    objs + ld_in + ld_flags + [lib + '/libgex.a', '-lc', lib + '/libclang_rt.builtins-wasm64.a']
+r = subprocess.call(cmd)
+if r:
+    sys.exit(r)
+opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
+feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types',
+         '--enable-memory64']
+# Names kept (-g): gex binds the entries by name.
+r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ['--memory64-lowering', '-O2', '-o', wasm])
+if r:
+    sys.exit('wcc64: wasm-opt failed on ' + w64)
+sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out, '--elf64'] +
+                         (['--guest-x86-64'] if guest else [])))

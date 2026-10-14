@@ -5395,6 +5395,29 @@ pub(crate) fn set_signal_hook(state: &HostState, idx: u32) {
     v.push((key, idx));
 }
 
+/// The C stack pointer of the process's native Wine (a stateful provider's):
+/// the i64 one of W64's lowered LP64 modules where there is one, else
+/// W3's i32 one (`libprov::stack`, `libprov::stack64`).
+fn native_sp(d: &HostState) -> Option<wasmtime::Global> {
+    let s = d.jit.as_ref().and_then(|j| j.ftab.as_ref())?;
+    s.provider_sp64.clone().or_else(|| s.provider_sp.clone())
+}
+
+/// [`native_sp`]'s value as an address, whichever its width.
+fn sp_get(cx: impl wasmtime::AsContextMut, g: &wasmtime::Global) -> u64 {
+    match g.get(cx) {
+        Val::I64(v) => v as u64 & 0xffff_ffff,
+        v => v.i32().unwrap_or(0) as u32 as u64,
+    }
+}
+
+/// Set [`native_sp`] to an address, at its own width.
+fn sp_set(mut cx: impl wasmtime::AsContextMut, g: &wasmtime::Global, v: u64) -> Result<()> {
+    let val = if matches!(g.ty(&cx).content(), wasmtime::ValType::I64) { Val::I64(v as i64) } else { Val::I32(v as u32 as i32) };
+    g.set(&mut cx, val)?;
+    Ok(())
+}
+
 /// Run the signal frame gex-kernel just built at a safepoint through the
 /// process's signal hook (its handlers are wasm functions, not guest code):
 /// the hook's C frames below the frame, the guest resumed where sigreturn
@@ -5405,19 +5428,19 @@ fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Re
     let ctx_addr = caller.data().thread.ctx_addr;
     let f = crate::ftab::table_func(caller, hook)?;
     let typed = f.typed::<(i32, i32), ()>(&*caller).context("gex.signal_hook: the hook is not void(int, unsigned)")?;
-    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let sp = native_sp(caller.data());
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
-            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let cur = sp_get(&mut *caller, g);
             let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
-            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
         _ => None,
     };
     let r = typed.call(&mut *caller, (ctx_addr as i32, interrupted as u32 as i32));
     if let (Some(g), Some(cur)) = (&sp, saved) {
-        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+        sp_set(&mut *caller, g, cur)?;
     }
     r?;
     let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
@@ -5481,19 +5504,19 @@ fn guest_unix_call(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let ctx_addr = caller.data().thread.ctx_addr;
     let f = crate::ftab::table_func(caller, hook)?;
     let typed = f.typed::<i32, ()>(&*caller).context("the guest Unix-call hook is not void(int)")?;
-    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let sp = native_sp(caller.data());
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
-            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let cur = sp_get(&mut *caller, g);
             let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
-            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            sp_set(&mut *caller, g, (cur.min(esp).saturating_sub(256)) & !15)?;
             Some(cur)
         }
         _ => None,
     };
     let r = typed.call(&mut *caller, ctx_addr as i32);
     if let (Some(g), Some(cur)) = (&sp, saved) {
-        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+        sp_set(&mut *caller, g, cur)?;
     }
     r?;
     Ok(true)
@@ -5532,20 +5555,20 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
     // call from the guest last left it, above the live guest stack. The
     // red zone leaves the hook room to build the guest's exception frame
     // under that stack pointer (i386's is under a KiB).
-    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let sp = native_sp(caller.data());
     let saved = match &sp {
         Some(g) if !gex_abi::mem64() => {
-            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let cur = sp_get(&mut *caller, g);
             let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
             let new = (cur.min(esp).saturating_sub(4096)) & !15;
-            g.set(&mut *caller, Val::I32(new as u32 as i32))?;
+            sp_set(&mut *caller, g, new)?;
             Some(cur)
         }
         _ => None,
     };
     let r = typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32, kind as i32));
     if let (Some(g), Some(cur)) = (&sp, saved) {
-        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+        sp_set(&mut *caller, g, cur)?;
     }
     r?;
     let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);

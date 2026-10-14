@@ -13,8 +13,14 @@
 #include <setjmp.h>
 #include <stdint.h>
 
+/* The tag carries a pointer: i64 on wasm64 (W64's LP64 programs, lowered
+ * to wasm32 after linking: the tag keeps its type). */
 __asm__(
+#ifdef __wasm64__
+	"\t.tagtype __c_longjmp i64\n"
+#else
 	"\t.tagtype __c_longjmp i32\n"
+#endif
 	"\t.globl __c_longjmp\n"
 	"__c_longjmp:\n"
 );

@@ -89,6 +89,10 @@ pub(crate) struct Store {
     /// The stack pointer this thread's stateful providers share
     /// (`libprov::stack`), made at the first one's instantiation.
     pub provider_sp: Option<wasmtime::Global>,
+    /// The i64 stack pointer of this thread's lowered LP64 modules (W64,
+    /// docs/wine-native-x64.md §1.1: built for wasm64, run in this 32-bit
+    /// memory), on a stack of its own (`libprov::stack64`).
+    pub provider_sp64: Option<wasmtime::Global>,
     /// The lowest address of that stack (`libprov::STACK` bytes).
     pub provider_stack_lo: u64,
     /// The wasm exception tag of `gex.provider_throw` (wasm64 providers; [`crate::libprov::tag`]).
@@ -262,7 +266,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_stack_lo: 0, provider_tag: None, dyl: HashMap::new(), asyncify: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_sp64: None, provider_stack_lo: 0, provider_tag: None, dyl: HashMap::new(), asyncify: None, replayed: 0 });
     Ok(())
 }
 
@@ -343,7 +347,26 @@ fn instantiate(
             wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v as u32 as i32))
         }
     };
+    // A module built for wasm64 and lowered to this 32-bit memory (W64's
+    // LP64 Wine, docs/wine-native-x64.md §1.1) keeps i64 PIC globals, and
+    // takes an i32 copy of the table base for its element segment.
+    let lowered = !gex_abi::mem64() && module.imports().any(|imp| {
+        imp.module() == f::PIC_MODULE
+            && imp.name() == f::PIC_MEMORY_BASE
+            && matches!(imp.ty(), wasmtime::ExternType::Global(g) if matches!(g.content(), wasmtime::ValType::I64))
+    });
+    let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: u64, m: wasmtime::Mutability| {
+        if lowered {
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as i64))
+        } else {
+            i32c(cx, v, m)
+        }
+    };
     let mut c = cx.as_context_mut();
+    if lowered {
+        let g = wasmtime::Global::new(&mut c, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Const), Val::I32(base as i32))?;
+        l.define(&mut c, f::PIC_MODULE, "__table_base32", g)?;
+    }
     l.define(&mut c, gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
     l.define(&mut c, f::PIC_MODULE, "memory", memory.shared().clone())?;
     l.define(&mut c, gex_abi::IMPORT_MODULE, f::TABLE, table)?;
@@ -356,7 +379,7 @@ fn instantiate(
         Some(x) => {
             let g = i32c(&mut c, x.memory_base, wasmtime::Mutability::Const)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
-            let sp = crate::libprov::stack(&mut c)?;
+            let sp = if lowered { crate::libprov::stack64(&mut c)? } else { crate::libprov::stack(&mut c)? };
             l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, sp)?;
         }
         None => {
