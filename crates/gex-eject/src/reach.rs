@@ -75,7 +75,7 @@ fn whole(u: &gex_split::Unit, base: u64, why: impl Into<String>) -> Reach {
 
 /// The base the unit's image was placed at: the 64 KiB-aligned base at which
 /// most of the image's entry point and exports are slots.
-fn find_base(pe: &gex_ld::pe::PeImage, addrs: &HashSet<u64>) -> Option<u64> {
+pub(crate) fn find_base(pe: &gex_ld::pe::PeImage, addrs: &HashSet<u64>) -> Option<u64> {
     let mut rvas: Vec<u64> = pe
         .exports
         .entries

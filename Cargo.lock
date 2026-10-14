@@ -645,6 +645,7 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-ir",
+ "gex-isa-x86",
  "gex-kernel",
  "gex-key",
  "gex-ld",

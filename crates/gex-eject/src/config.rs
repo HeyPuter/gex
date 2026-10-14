@@ -115,11 +115,16 @@ pub struct Config {
     /// functions the recorded run called; the rest are fetched in clusters
     /// on first call (docs/eject.md, "Cold code").
     pub cold: Option<String>,
-    /// W3 pages: `"prune": "static"` leaves out of each unit the functions
-    /// no path from outside its image reaches (crate::reach); a pruned one
-    /// that runs traps, naming its address. `"none"` (the default) keeps
-    /// every function.
-    pub prune: bool,
+    /// W3 pages: which functions the build may leave out of the units. A
+    /// pruned function that runs traps, naming its address.
+    ///
+    /// * `"fanout"`: the ones no execution can reach, proved across all the
+    ///   site's images together (crate::fanout).
+    /// * `"static"`: the ones no path from *outside each image* reaches,
+    ///   proved one image at a time (crate::reach). Sound whatever else the
+    ///   site ships, and so much weaker.
+    /// * `"none"` (the default): keep every function.
+    pub prune: Option<String>,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (docs/eject.md,
@@ -146,7 +151,7 @@ impl Default for Config {
             features_off: Vec::new(),
             bundle_split: false,
             cold: None,
-            prune: false,
+            prune: None,
             start: "{}".to_string(),
         }
     }
@@ -374,10 +379,10 @@ impl Config {
             Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"instrument\" or \"none\""),
         };
         c.prune = match v.get("prune") {
-            None | Some(Json::Null) => false,
-            Some(Json::Str(x)) if x == "none" => false,
-            Some(Json::Str(x)) if x == "static" => true,
-            Some(_) => bail!("{what}: \"prune\" is \"static\" or \"none\""),
+            None | Some(Json::Null) => None,
+            Some(Json::Str(x)) if x == "none" => None,
+            Some(Json::Str(x)) if x == "static" || x == "fanout" => Some(x.clone()),
+            Some(_) => bail!("{what}: \"prune\" is \"fanout\", \"static\" or \"none\""),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

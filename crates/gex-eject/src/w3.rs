@@ -342,12 +342,13 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         }
     };
     let mut cold_units = 0;
-    // `"prune": "static"`: each unit without the functions no path from
-    // outside its image reaches (crate::reach), in parallel.
+    // `"prune"`: each unit without the functions the proof leaves out
+    // ("fanout": crate::fanout, across all the images together; "static":
+    // crate::reach, one image at a time), in parallel.
     let mut pruned: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    if config.prune {
+    if let Some(mode) = config.prune.as_deref() {
         if config.cold.is_some() {
-            bail!("user/eject.json: \"prune\": \"static\" goes with \"cold\": \"none\"");
+            bail!("user/eject.json: \"prune\": \"{mode}\" goes with \"cold\": \"none\"");
         }
         let tar_bytes = std::fs::read(dir.join("bundle/rootfs.tar"))?;
         let tar = crate::reach::Tar::parse(&tar_bytes)?;
@@ -355,62 +356,95 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             .iter()
             .map(|u| Ok((json::str_field(u, "key", what)?, json::str_field(u, "path", what)?)))
             .collect::<Result<_>>()?;
-        let next = std::sync::atomic::AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-        let results: Vec<Result<(Vec<u8>, crate::reach::PruneStat)>> = {
-            let slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, crate::reach::PruneStat)>>>> =
-                jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
-            std::thread::scope(|sc| {
-                for _ in 0..threads {
-                    sc.spawn(|| loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((key, path)) = jobs.get(i) else { break };
-                        let r = (|| {
-                            let wasm = std::fs::read(dir.join("units").join(key).join("c.wasm"))?;
-                            let image = tar.read(path).ok_or_else(|| anyhow!("{path}: not in bundle/rootfs.tar"))?;
-                            crate::reach::prune_unit(&wasm, image, key, path)
-                        })();
-                        *slots[i].lock().unwrap() = Some(r);
-                    });
-                }
-            });
-            slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
-        };
         let mut rows = Vec::new();
         let (mut before, mut after, mut slots_all, mut kept_all) = (0usize, 0usize, 0usize, 0usize);
-        for r in results {
-            let (wasm, st) = r?;
-            before += st.bytes_before;
-            after += st.bytes_after;
-            slots_all += st.slots;
-            kept_all += st.kept;
-            rows.push(obj(vec![
-                ("key", s(&st.key)),
-                ("path", s(&st.path)),
-                ("slots", json::n(st.slots as u64)),
-                ("kept", json::n(st.kept as u64)),
-                ("bytes_before", json::n(st.bytes_before as u64)),
-                ("bytes_after", json::n(st.bytes_after as u64)),
-                ("whole", st.whole.as_deref().map(s).unwrap_or(Json::Null)),
-            ]));
-            pruned.insert(st.key, wasm);
+        let mut extra = String::new();
+        if mode == "fanout" {
+            let mut work: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
+            for (key, path) in &jobs {
+                let wasm = std::fs::read(dir.join("units").join(key).join("c.wasm"))?;
+                let image = tar.read(path).ok_or_else(|| anyhow!("{path}: not in bundle/rootfs.tar"))?.to_vec();
+                work.push((key.clone(), path.clone(), wasm, image));
+            }
+            let native = crate::fanout::native_names(&v, &tar)?;
+            let (out, keeps) = crate::fanout::run(work, &native, threads)?;
+            for p in out {
+                before += p.bytes_before;
+                after += p.bytes_after;
+                slots_all += p.kept.slots;
+                kept_all += p.kept.kept;
+                rows.push(obj(vec![
+                    ("key", s(&p.key)),
+                    ("path", s(&p.path)),
+                    ("slots", json::n(p.kept.slots as u64)),
+                    ("kept", json::n(p.kept.kept as u64)),
+                    ("functions", json::n(p.kept.functions as u64)),
+                    ("exports", json::n(p.kept.exports as u64)),
+                    ("exports_kept", json::n(p.kept.exports_kept as u64)),
+                    ("bytes_before", json::n(p.bytes_before as u64)),
+                    ("bytes_after", json::n(p.bytes_after as u64)),
+                    ("whole", p.kept.whole.as_deref().map(s).unwrap_or(Json::Null)),
+                ]));
+                pruned.insert(p.key, p.wasm);
+            }
+            extra = crate::fanout::keeps_json(&keeps);
+            eprint!("{}", crate::fanout::keeps_text(&keeps));
+        } else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let results: Vec<Result<(Vec<u8>, crate::reach::PruneStat)>> = {
+                let slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, crate::reach::PruneStat)>>>> =
+                    jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                std::thread::scope(|sc| {
+                    for _ in 0..threads {
+                        sc.spawn(|| loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((key, path)) = jobs.get(i) else { break };
+                            let r = (|| {
+                                let wasm = std::fs::read(dir.join("units").join(key).join("c.wasm"))?;
+                                let image = tar.read(path).ok_or_else(|| anyhow!("{path}: not in bundle/rootfs.tar"))?;
+                                crate::reach::prune_unit(&wasm, image, key, path)
+                            })();
+                            *slots[i].lock().unwrap() = Some(r);
+                        });
+                    }
+                });
+                slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+            };
+            for r in results {
+                let (wasm, st) = r?;
+                before += st.bytes_before;
+                after += st.bytes_after;
+                slots_all += st.slots;
+                kept_all += st.kept;
+                rows.push(obj(vec![
+                    ("key", s(&st.key)),
+                    ("path", s(&st.path)),
+                    ("slots", json::n(st.slots as u64)),
+                    ("kept", json::n(st.kept as u64)),
+                    ("bytes_before", json::n(st.bytes_before as u64)),
+                    ("bytes_after", json::n(st.bytes_after as u64)),
+                    ("whole", st.whole.as_deref().map(s).unwrap_or(Json::Null)),
+                ]));
+                pruned.insert(st.key, wasm);
+            }
         }
         eprintln!(
-            "gexc eject build: pruned {} of {slots_all} functions; units {before} -> {after} bytes",
+            "gexc eject build: \"prune\": \"{mode}\" left out {} of {slots_all} functions; units {before} -> {after} bytes",
             slots_all - kept_all
         );
-        write_file(
-            &dir.join("build/prune.json"),
-            json::write(&obj(vec![
-                ("slots", json::n(slots_all as u64)),
-                ("kept", json::n(kept_all as u64)),
-                ("bytes_before", json::n(before as u64)),
-                ("bytes_after", json::n(after as u64)),
-                ("units", Json::Arr(rows)),
-            ]))
-            .as_bytes(),
-            false,
-        )?;
+        let mut fields = vec![
+            ("mode", s(mode)),
+            ("slots", json::n(slots_all as u64)),
+            ("kept", json::n(kept_all as u64)),
+            ("bytes_before", json::n(before as u64)),
+            ("bytes_after", json::n(after as u64)),
+        ];
+        if !extra.is_empty() {
+            fields.push(("keeps", Json::parse(&extra).map_err(|e| anyhow!("the prune report: {e}"))?));
+        }
+        fields.push(("units", Json::Arr(rows)));
+        write_file(&dir.join("build/prune.json"), json::write(&obj(fields)).as_bytes(), false)?;
     }
     for u in units {
         let key = json::str_field(u, "key", what)?;
@@ -508,7 +542,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             ("units", json::n(units.len() as u64)),
             ("bundle_split", json::b(config.bundle_split)),
             ("cold", config.cold.as_deref().map(s).unwrap_or(Json::Null)),
-            ("prune", s(if config.prune { "static" } else { "none" })),
+            ("prune", s(config.prune.as_deref().unwrap_or("none"))),
         ]))
         .as_bytes(),
         false,

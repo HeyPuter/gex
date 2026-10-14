@@ -7,6 +7,7 @@ description = "gex-eject: turn a recorded gex session into a standalone, customi
 
 [dependencies]
 gex-abi.workspace = true
+gex-isa-x86.workspace = true
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel"] }
 gex-emit.workspace = true
