@@ -103,7 +103,13 @@ pub(crate) fn find_base(pe: &gex_ld::pe::PeImage, addrs: &HashSet<u64>) -> Optio
             }
         }
     }
-    let (b, s) = cands.into_iter().map(|b| (b, score(b))).max_by_key(|&(b, s)| (s, b == pe.preferred_base))?;
+    // Sorted, and the last tie-break is the base itself: `max_by_key` keeps
+    // the last maximum it sees, so over a HashSet two bases that score alike
+    // would win by iteration order and the unit would be read at a different
+    // base from one run to the next.
+    let mut cands: Vec<u64> = cands.into_iter().collect();
+    cands.sort_unstable();
+    let (b, s) = cands.into_iter().map(|b| (b, score(b))).max_by_key(|&(b, s)| (s, b == pe.preferred_base, b))?;
     (2 * s >= rvas.len()).then_some(b)
 }
 
