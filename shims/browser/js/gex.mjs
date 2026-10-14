@@ -958,8 +958,11 @@ export class Gex {
     });
   }
 
-  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null } = {}) {
+  constructor(env = new Env(), { shared = false, memory = null, kernel = null, moduleStore = null, modules = null } = {}) {
     this.#env = env;
+    // Compiled modules this Worker was given before it had a process, kept
+    // as they are (a Map of key to Module), not copied one by one.
+    if (modules) this.#sharedModules = modules;
     // A thread joins its process's module store (`#moduleStore`) too.
     this.#moduleStore = moduleStore;
     // `memory` adopts a process's existing address space rather than making a
