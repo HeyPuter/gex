@@ -39,9 +39,10 @@ export function untar(buf, root = '') {
   const files = Object.create(null);
   const dirs = [];
   const links = Object.create(null);
-  // Only the modes that differ from the 0644 default, i.e. the execute bit --
+  // Only the modes that differ from the default: a file's execute bit --
   // which dpkg checks: "'sh' not found in PATH or not executable" for a
-  // `/bin/sh` that is plainly there. Keeps this to the few hundred binaries.
+  // `/bin/sh` that is plainly there -- and a directory's other than 0755.
+  // Keeps this to the few hundred binaries.
   const modes = Object.create(null);
   const hard = Object.create(null);
   // Each file's modification time (seconds), for a page that hands them on
@@ -80,6 +81,11 @@ export function untar(buf, root = '') {
     } else if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
+      // A directory's mode, when it is not the VFS's 0755: a read-only one
+      // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and
+      // the Windows shell reads a folder's desktop.ini names only then.
+      const mode = octal(b, off + 100, 8) & 0o7777;
+      if (p && mode && mode !== 0o755) modes[p] = mode;
     } else if (type === '2') {
       const p = path(name);
       const target = str(b, off + 157, 100);

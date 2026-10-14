@@ -1572,6 +1572,16 @@ export class Gex {
       free?.(dp, d.length);
     }
     if (partBuf) free?.(partBuf, PART);
+    // Directories' modes last, once their files are in (a read-only one
+    // keeps its mode: Wine reports it read only).
+    for (const path of opts.dirs ?? []) {
+      if (modes[path] === undefined) continue;
+      const p = enc.encode(path);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#shim.exports.gex_chmod?.(pp, p.length, modes[path]);
+      free?.(pp, p.length);
+    }
     // Files fetched as they are read (`gex_add_lazy`): [path, size, url],
     // after the bundle's, which win.
     for (const [path, size, url] of opts.lazy ?? []) {
