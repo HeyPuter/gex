@@ -1,7 +1,7 @@
 /* The client half of the gex WebGPU wire: a webgpu.h whose calls become
  * commands for a server that makes them on a real one (wire.h).
  *
- * Most entry points are generated (gen/wire-client-gen.c). Those here are
+ * Most entry points are generated (gen/wire-client-gen.inc). Those here are
  * the ones the client answers or tracks itself: callbacks, which come back
  * as events and fire in WaitAny/ProcessEvents as their mode allows; buffer
  * mappings, whose data the client holds a copy of (read data arrives with
@@ -609,7 +609,7 @@ void gexgpu_client_release(struct gexgpu_object *o)
     release_object(o);
 }
 
-#include "gen/wire-client-gen.c"
+#include "gen/wire-client-gen.inc"
 
 /* ---- instance ------------------------------------------------------------------------- */
 
