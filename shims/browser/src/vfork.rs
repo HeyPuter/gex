@@ -287,6 +287,9 @@ pub extern "C" fn gex_vfork_end() {
         clock_constants(h.kernel.compat, h.kernel.started);
         gex_xlate::set_compat(h.kernel.compat);
         publish_process(h);
+        // The thread that called vfork is this Worker's again (publishing
+        // binds the first): its turns ask its own run state (`pick_mine`).
+        crate::bind_mine(h, cur);
     });
     set_resume_none();
     set_resume_ctx_none();

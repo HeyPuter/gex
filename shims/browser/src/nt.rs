@@ -1251,7 +1251,10 @@ mod imp {
                     }
                     end_process(p.exit_code.load(Ordering::Acquire));
                 }
-                with_host(|h| h.threads[cur()].run().waiting = Waiting::Exited);
+                with_host(|h| {
+                    h.threads[cur()].run().waiting = Waiting::Exited;
+                    crate::end_if_all_exited(h);
+                });
                 set_resume_none();
                 set_resume_ctx_none_and_trap();
             }
