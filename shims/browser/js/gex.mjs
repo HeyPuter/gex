@@ -17,6 +17,10 @@ import { single, sched } from "./single.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
+/** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
+ *  process with one Worker, and for one with threads. */
+const FTAB_SPARE_ALONE = 4096;
+const FTAB_SPARE_THREADED = 65536;
 const LIMIT64_BYTES = 16 * 2 ** 30;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
@@ -2983,6 +2987,9 @@ export class Gex {
           'Give the Env a `spawnThread`, or the thread will never run.',
       );
     }
+    // Before the thread exists: from its first install it may publish
+    // indices past what this Worker has replayed.
+    this.#threaded();
     await this.#env.spawnThread(thread);
   }
 
@@ -2992,6 +2999,7 @@ export class Gex {
    * copy, a thread only pointed at what is already there.
    */
   async adoptThread(shimWasm, guestWasm, thread) {
+    this.#threaded();
     await this.attach(shimWasm, guestWasm, { devices: false });
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
@@ -3569,13 +3577,30 @@ export class Gex {
   }
 
   /** Grow this Worker's function table past every index handed out, with
-   *  room over, so an index another Worker published to the probe cache is
-   *  in range here (holding `resolve`) before this one replays it. */
+   *  room over (`#ftabSpare`), so an index another Worker published to the
+   *  probe cache is in range here (holding `resolve`) before this one
+   *  replays it. */
   #cgenGrow() {
     const st = this.#cgen;
-    const want = (this.#shim.exports.gex_ftab_size() >>> 0) + 65536;
+    const want = (this.#shim.exports.gex_ftab_size() >>> 0) + this.#ftabSpare;
     const have = Number(st.ftab.length);
     if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
+  }
+
+  /** The function table's room past the indices handed out. Only another
+   *  Worker of the process (a thread) publishes an index this one has not
+   *  replayed, so a process with one Worker needs little; growing every
+   *  process's table by 65536 `resolve`s was 4.5 ms of each fork's child
+   *  and 1.5 ms of each exec (the grow copies the whole table). A process
+   *  takes the full room when it gets its second Worker (`#threaded`). */
+  #ftabSpare = FTAB_SPARE_ALONE;
+
+  /** This Worker's process has more than one Worker from now on: grow to the
+   *  full room before any other Worker can publish an index. */
+  #threaded() {
+    if (this.#ftabSpare === FTAB_SPARE_THREADED) return;
+    this.#ftabSpare = FTAB_SPARE_THREADED;
+    if (this.#cgen) this.#cgenGrow();
   }
 
   /** Install unit `u` into this Worker: instantiate it with `__table_base` =
