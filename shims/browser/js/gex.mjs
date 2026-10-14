@@ -2138,9 +2138,13 @@ export class Gex {
     this.#imageStage = 0;
     // The scan in the shim (`gex_image_runs`, 16 bytes a load) when it has
     // one; the pairs it writes are the runs of pages that are not all zero.
+    // Not in a 64-bit memory: its addresses are u32, and a region above 4 GiB
+    // (a thread's stack in the high arena) was scanned at its address cut to
+    // 32 bits -- thread-churn's forked child got the parent's low pages over
+    // its own (module registry rows naming a module store it does not have).
     let runsCap = 0;
     let runsAt = 0;
-    const runsWasm = e.gex_image_runs
+    const runsWasm = e.gex_image_runs && !m64()
       ? (start, end) => {
         for (;;) {
           if (!runsCap) {
