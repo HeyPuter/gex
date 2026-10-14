@@ -949,8 +949,7 @@ async function runProgramHere(
       // Otherwise the export providers the dist carries (gex/cgen/providers/,
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
-      // `?provskip=a,b`: those exports left to the guest's own code (an A/B).
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', skip: globalThis.GEX_PROVIDER_SKIP, zstd: globalThis.GEX_CGEN_ZSTD }
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', zstd: globalThis.GEX_CGEN_ZSTD }
         : flag('providers') === '0' ? undefined
         : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a

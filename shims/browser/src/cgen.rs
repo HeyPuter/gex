@@ -1280,14 +1280,6 @@ pub extern "C" fn gex_ftab_twin(addr: i64) -> i32 {
 pub(crate) static TWIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TWIN_SEEN: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
 
-/// The exports no built-in provider binds (`?provskip=`, the native
-/// GEX_PROVIDER_SKIP): `len` bytes of comma-separated names at `ptr`.
-#[no_mangle]
-pub extern "C" fn gex_cgen_set_provider_skip(ptr: u32, len: u32) {
-    let s = String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned();
-    gex_cgen::provider::set_skip(&s);
-}
-
 /// The function table index serving `addr` now, if any.
 pub(crate) fn index_of(addr: u64) -> Option<u32> {
     ftab(|m| m.get(addr).map(|f| f.idx))
