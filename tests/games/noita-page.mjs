@@ -57,13 +57,16 @@ const { browser, page, state, evaluate, consoleLines, profile } = await openPage
   { width: 1340, height: 900 },
 );
 
+// describe({ pixels: false }): the counters without the output read back. A
+// readback is a full-scene copy, a 4 MiB MAP_READ buffer and a map, and this
+// asks every second; a timed run measured it as the page's own load.
 const produced = async () => {
-  const gl = (await evaluate('globalThis.__gexCompositor?.describe()', true))?.gl ?? '';
+  const gl = (await evaluate('globalThis.__gexCompositor?.describe({ pixels: false })', true))?.gl ?? '';
   const m = /produced=(\d+)/.exec(gl);
   return m ? Number(m[1]) : 0;
 };
 const noitaWindow = async () => {
-  const d = await evaluate('globalThis.__gexCompositor?.describe()', true);
+  const d = await evaluate('globalThis.__gexCompositor?.describe({ pixels: false })', true);
   const m = (d?.list ?? []).map((l) => /role=1 (\d+)x(\d+)@(-?\d+),(-?\d+).*"(.*)"/.exec(l)).find((x) => x && /Noita/.test(x[5]));
   return m ? { w: +m[1], h: +m[2], x: +m[3], y: +m[4] } : null;
 };

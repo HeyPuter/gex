@@ -1605,15 +1605,15 @@ class Compositor {
    * pipeline. Sampled every fourth pixel, because this is asked for once a
    * second at most and the answer only has to be nonzero.
    */
-  async describe() {
+  async describe({ pixels = true } = {}) {
     const wins = [...this.#windows.values()].filter((w) => w.role === ROLE_TOPLEVEL);
-    let lit = 0;
-    let brightest = 0;
+    let lit = pixels ? 0 : null;
+    let brightest = pixels ? 0 : null;
     // A content hash of the output, so a test can tell "the click did
     // something" from "the click did nothing" when what it did was three
     // pixels of a button going darker.
-    let hash = 2166136261;
-    try {
+    let hash = pixels ? 2166136261 : null;
+    if (pixels) try {
       const r = await this.#painter.read();
       const px = r?.px ?? new Uint8Array(0);
       // Above the desktop's own colour, so the background does not count as
@@ -1920,7 +1920,7 @@ const onMessage = ({ data: m }) => {
       // The composited output, read back (RGBA rows, top first): what a test saves as a picture.
       Promise.resolve(comp?.readout?.() ?? null).then((r) => post({ kind: 'readout', id: m.id, state: r }, r ? [r.px.buffer] : []));
     } else if (m.kind === 'describe') {
-      Promise.resolve(comp?.describe() ?? null).then((state) => post({ kind: 'describe', id: m.id, state }));
+      Promise.resolve(comp?.describe({ pixels: m.pixels !== false }) ?? null).then((state) => post({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {
       running = false;
     }
