@@ -147,8 +147,15 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         });
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
+    // Parsed once for everything below. Three parses and a name for every
+    // slot of the element segment (`slot_names`) made publishing bash 1.38 ms
+    // of every fork child's start; this is 0.85 ms (worldmachine, demo page).
+    let (info, libs) = match gex_dylink::Info::parse(&wasm).ok() {
+        Some(i) if !i.needed.is_empty() => (None, Some(i)),
+        other => (other, None),
+    };
     // One that names shared libraries: gex's loader (`dylink`).
-    if let Some(info) = super::dylink::wanted(&wasm) {
+    if let Some(info) = libs {
         let n = if relocate {
             super::dylink::install(wasm, info, mem_base as u32, entry, thread_entry)
         } else {
@@ -157,10 +164,11 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         CURRENT.store(entry, Ordering::Relaxed);
         return Ok(n);
     }
-    let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
-    let slot = |n: &str| names.iter().position(|s| s.as_deref() == Some(n)).map(|k| k as u32).ok_or(format!("{n} is not in its table"));
-    let pairs = vec![(entry, slot("__gex_start")?), (thread_entry, slot("__gex_thread_start")?)];
-    let len = super::dylink::static_program(&wasm, names.len() as u32);
+    const ENTRIES: [&str; 2] = ["__gex_start", "__gex_thread_start"];
+    let (found, elem_len) = named_slots(&wasm, ENTRIES)?;
+    let slot = |k: usize| found[k].ok_or(format!("{} is not in its table", ENTRIES[k]));
+    let pairs = vec![(entry, slot(0)?), (thread_entry, slot(1)?)];
+    let len = super::dylink::static_program(info.as_ref(), elem_len);
     let number = lock(&PROVIDERS).len() as u32;
     let install = ftab(|m| match want_base {
         Some(base) => {
@@ -178,12 +186,49 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     CURRENT_BASE.store(base, Ordering::Relaxed);
     let (regs, dirs, slots) = entry_bridges(&[entry, thread_entry]);
     let path = exe_path();
-    super::dylink::static_published(number, &wasm, &path, base, mem_base as u32);
+    super::dylink::static_published(number, info, &path, base, mem_base as u32);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
     let path = path.clone();
     lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
+}
+
+/// The element segment slots of the functions named `names` (as
+/// `gex_cgen::provider::slot_names` numbers them: every segment's
+/// functions in order), and how many slots the segments fill. Only the
+/// wanted names are compared; none is copied.
+fn named_slots<const N: usize>(wasm: &[u8], names: [&str; N]) -> Result<([Option<u32>; N], u32), String> {
+    let mut elems: Vec<u32> = Vec::new();
+    let mut funcs = [None; N];
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|e| e.to_string())? {
+            wasmparser::Payload::ElementSection(r) => {
+                for el in r {
+                    if let wasmparser::ElementItems::Functions(fs) = el.map_err(|e| e.to_string())?.items {
+                        for f in fs {
+                            elems.push(f.map_err(|e| e.to_string())?);
+                        }
+                    }
+                }
+            }
+            wasmparser::Payload::CustomSection(c) if c.name() == "name" => {
+                let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(c.data(), c.data_offset()));
+                for n in reader.flatten() {
+                    if let wasmparser::Name::Function(map) = n {
+                        for naming in map.into_iter().flatten() {
+                            if let Some(k) = names.iter().position(|&w| w == naming.name) {
+                                funcs[k] = Some(naming.index);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let slots = funcs.map(|f| f.and_then(|f| elems.iter().position(|&e| e == f)).map(|k| k as u32));
+    Ok((slots, elems.len() as u32))
 }
 
 /// The program's path, with the kernel told the process is a wasm32 one

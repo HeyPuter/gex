@@ -52,12 +52,6 @@ static ADOPT: Mutex<Option<String>> = Mutex::new(None);
 /// initialised): the init order and libc's index.
 static REGISTRY: Mutex<Option<(Vec<usize>, usize)>> = Mutex::new(None);
 
-/// Whether a program module needs the loader (it names libraries).
-pub(super) fn wanted(wasm: &[u8]) -> Option<Info> {
-    let info = Info::parse(wasm).ok()?;
-    (!info.needed.is_empty()).then_some(info)
-}
-
 fn read(path: &str) -> Option<Vec<u8>> {
     crate::with_host(|h| h.kernel.read_file(path))
 }
@@ -205,16 +199,16 @@ pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thre
 /// element segment get table slots (`dlsym` of a program linked
 /// `-rdynamic`, GtkBuilder's signal handlers), and `dlsym` sees them.
 /// Returns how many slots it takes.
-pub(super) fn static_program(wasm: &[u8], elem_len: u32) -> u32 {
-    match Info::parse(wasm) {
-        Ok(info) => info.slots().0.max(elem_len),
-        Err(_) => elem_len,
+pub(super) fn static_program(info: Option<&Info>, elem_len: u32) -> u32 {
+    match info {
+        Some(info) => info.slots().0.max(elem_len),
+        None => elem_len,
     }
 }
 
 /// After [`static_program`]'s module is published as `number` at `base`.
-pub(super) fn static_published(number: u32, wasm: &[u8], path: &str, base: u32, mem_base: u32) {
-    let Ok(info) = Info::parse(wasm) else { return };
+pub(super) fn static_published(number: u32, info: Option<Info>, path: &str, base: u32, mem_base: u32) {
+    let Some(info) = info else { return };
     let mut text = String::new();
     for (s, n) in info.extra_slots() {
         text.push_str(&format!("X\t{}\t{n}\n", base + s));
