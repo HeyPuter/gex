@@ -258,7 +258,7 @@ pub(crate) fn leave() {
 /// the lock: the wait may be over, a signal may have arrived, the
 /// compositor has work, or there is no wait in hand.
 pub(crate) fn idle_turn() -> Turn {
-    if unsafe { k_present() } == 0 || EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+    if unsafe { k_present() } == 0 || crate::exited() {
         return Turn::Locked;
     }
     WAIT.with(|w| {

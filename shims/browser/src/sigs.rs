@@ -55,7 +55,11 @@ thread_local! {
 
 /// Publish `k`'s process as this memory's (`set_host`).
 pub(crate) fn publish(k: &Kernel) {
-    let home = Box::new(Home {
+    HOME.store(Box::into_raw(Box::new(home_of(k))), Ordering::Release);
+}
+
+fn home_of(k: &Kernel) -> Home {
+    Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
         pid: k.pid,
@@ -65,11 +69,36 @@ pub(crate) fn publish(k: &Kernel) {
         map: Arc::clone(k.mem.view()),
         vfs: Arc::clone(k.vfs.view()),
         tty: Arc::clone(&k.tty),
-    });
-    HOME.store(Box::into_raw(home), Ordering::Release);
+    }
+}
+
+thread_local! {
+    /// A vfork child's [`Home`] while it runs in this Worker of its parent
+    /// (`publish_here`): this Worker's process is the child's, the memory's
+    /// other Workers the parent's.
+    static HERE: Cell<*mut Home> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Publish a vfork child's process for this Worker alone, or (`None`) go
+/// back to the memory's (vfork.rs).
+pub(crate) fn publish_here(k: Option<&Kernel>) {
+    let new = k.map_or(std::ptr::null_mut(), |k| Box::into_raw(Box::new(home_of(k))));
+    let old = HERE.with(|c| c.replace(new));
+    if !old.is_null() {
+        // SAFETY: made above by an earlier call, and only this Worker reads
+        // it, never across a call to here.
+        drop(unsafe { Box::from_raw(old) });
+    }
+    // The next collection is the new process's.
+    SEQ_SEEN.with(|c| c.set(0));
 }
 
 pub(crate) fn home() -> Option<&'static Home> {
+    let here = HERE.with(|c| c.get());
+    if !here.is_null() {
+        // SAFETY: freed only by `publish_here`, on this Worker, between calls.
+        return unsafe { here.as_ref() };
+    }
     // SAFETY: a published `Home` is never freed (see `HOME`).
     unsafe { HOME.load(Ordering::Acquire).as_ref() }
 }

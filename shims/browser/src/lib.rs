@@ -833,7 +833,15 @@ extern "C" fn rp_new(pid: i32) -> i32 {
 static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn my_pid() -> i32 {
-    MY_PID.load(std::sync::atomic::Ordering::Relaxed)
+    vfork::pid_here().unwrap_or_else(|| MY_PID.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Say which process this memory is ([`my_pid`]); a vfork child's pid is
+/// its Worker's alone (vfork.rs).
+fn set_my_pid(pid: i32) {
+    if vfork::pid_here().is_none() {
+        MY_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Traces every change to a pipe's ends, with who made it -- an aggregate
@@ -2882,6 +2890,44 @@ fn push_pending(h: &mut Host, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u
     h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
+/// A process's translation state, as its `Host` holds it: its own, or, in a
+/// vfork child running in a Worker of its parent, the parent's (vfork.rs).
+/// The child runs the parent's code in the parent's memory and this Worker's
+/// tables, which is what this state describes; a copy would hand out the
+/// same slots twice.
+struct JitRef {
+    ptr: *mut Jit,
+    _own: Option<Box<Jit>>,
+}
+
+impl JitRef {
+    fn own(jit: Jit) -> Self {
+        let mut b = Box::new(jit);
+        JitRef { ptr: &mut *b, _own: Some(b) }
+    }
+
+    /// The parent's, which outlives the child.
+    fn borrowed(ptr: *mut Jit) -> Self {
+        JitRef { ptr, _own: None }
+    }
+}
+
+impl std::ops::Deref for JitRef {
+    type Target = Jit;
+    fn deref(&self) -> &Jit {
+        // SAFETY: an owned `Jit` lives in `_own`'s box for as long as this;
+        // a borrowed one is the parent's, which outlives its vfork child.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl std::ops::DerefMut for JitRef {
+    fn deref_mut(&mut self) -> &mut Jit {
+        // SAFETY: as `deref`.
+        unsafe { &mut *self.ptr }
+    }
+}
+
 struct Jit {
     /// Which guest pages own which slots in the dispatch table.
     page_table: gex_xlate::PageTable,
@@ -3020,7 +3066,7 @@ struct Host {
     /// Every guest thread, the running one included.
     threads: Vec<Thread>,
     exit: Option<i32>,
-    jit: Jit,
+    jit: JitRef,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
@@ -3247,6 +3293,15 @@ pub(crate) fn all_futex_blocked() -> bool {
         let r = unsafe { &*p }.lock().unwrap_or_else(|e| e.into_inner());
         matches!(r.waiting, Waiting::Futex { deadline: None, .. }) && !wait_ready(&r.waiting, &r.blocked_on, now, false)
     })
+}
+
+/// [`publish_process`] for a vfork child entering its parent's Worker:
+/// what reads its process without the kernel reads the child's, from this
+/// Worker only (vfork.rs); the parent's other Workers keep the parent's.
+fn publish_vfork_child(h: &mut Host) {
+    sigs::publish_here(Some(&h.kernel));
+    vfork::set_fds_here(&h.kernel.fds);
+    bind_mine(h, 0);
 }
 
 /// Whether this Worker has a kernel yet.
@@ -3612,6 +3667,11 @@ fn holder() -> String {
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     let here = std::panic::Location::caller();
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: the child's boxed host (vfork.rs), which only this Worker
+        // reaches, until `gex_vfork_end` (outside any call here) drops it.
+        return f(unsafe { &mut *child });
+    }
     HOST.with(|h| {
         let mut b = match h.try_borrow_mut() {
             Ok(b) => b,
@@ -3641,6 +3701,10 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 /// the crash with a complaint about the reporter.
 #[cfg(not(feature = "shared-memory"))]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: as `with_host`.
+        return Some(f(unsafe { &mut *child }));
+    }
     HOST.with(|h| match h.try_borrow_mut() {
         Ok(mut b) => b.as_mut().map(f),
         Err(_) => None,
@@ -3652,6 +3716,10 @@ fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 /// gives, minus the initialisation panic.
 #[cfg(feature = "shared-memory")]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: as `with_host`.
+        return Some(f(unsafe { &mut *child }));
+    }
     // SAFETY: as `with_host`. Read-mostly and only from a reporter, which
     // runs when the guest has already stopped.
     unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut().map(f) }
@@ -3676,6 +3744,13 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     // than hoped for; taken here, given back before return; any non-return path
     // out of `f` is a trap that ends the process.
     let _guard = KLock::take();
+    // A vfork child running in this Worker has a process of its own
+    // (vfork.rs); the lock still, for the translation state it shares.
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: the child's boxed host, which only this Worker reaches,
+        // until `gex_vfork_end` (outside any call here) drops it.
+        return f(unsafe { &mut *child });
+    }
     unsafe {
         f((*core::ptr::addr_of_mut!(HOST))
             .as_mut()
@@ -4634,7 +4709,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     clock_constants(program.compat(), kernel.started);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
-    MY_PID.store(kernel.pid, std::sync::atomic::Ordering::Relaxed);
+    set_my_pid(kernel.pid);
     // The staged layout, now that there is somewhere to put it. Taken rather
     // than copied: this runs once, and a second `gex_load` in the same Worker
     // is an `execve`, which gets its placement from the global table like
@@ -4861,7 +4936,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             proc_state,
             threads: vec![Thread::new(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable)],
             exit: None,
-            jit: Jit {
+            jit: JitRef::own(Jit {
                 described: meta.next_slot != 0,
                 page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
@@ -4896,7 +4971,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             obj_wasm: Default::default(),
                 compiles: 0,
                 nanos: 0,
-            },
+            }),
         magic_tail: HOST_MAGIC,
     });
     entry
@@ -6958,7 +7033,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where the closure built it (otherwise invisible in a shell demo,
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
-        MY_PID.store(h.kernel.pid, std::sync::atomic::Ordering::Relaxed);
+        set_my_pid(h.kernel.pid);
         // What `ident_call` answers from until this thread's next full call.
         // No parent: asking for it is a call into the system-wide kernel, and
         // a reparent would go unseen; `getppid` takes the full path.
@@ -7049,7 +7124,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // Linux the thread would already be gone, so it goes now, without
         // the call. `exit_process` has torn the descriptor table down; the
         // call would only fail strangely.
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        if exited() {
             if tracing() {
                 trace_line(&format!(
                     "[gex] pid {} thread {} ends at its {} after the process exited\n",
@@ -7074,7 +7149,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         h.kernel.block_pc = 0;
         // The clocks never come here (`clock_syscall`); one that does is a
         // regression, said once, as an error every page test fails on.
-        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !exited() {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 warn_line(&format!("[gex] pid {}: clock call {} took the kernel lock\n", h.kernel.pid, h.kernel.syscall_nr));
@@ -7397,22 +7472,17 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 pid,
                 child_stack,
                 tls,
+                vfork,
             } => {
+                // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run in
+                // this Worker (vfork.rs).
+                vfork::note_clone(vfork);
                 if frames_stay() {
                     // A wasm32 process clones at its thread entry (the
                     // context's PC, as the musl fork's __clone leaves it);
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                    // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run
-                    // in this Worker (vfork.rs). The flags are the first
-                    // argument: ebx for a wasm32 program (the i386 ABI).
-                    let flags = if h.kernel.compat {
-                        gm.read_u64(kstate.ctx_addr + ctx::x(3) as u64).unwrap_or(0) & 0xffff_ffff
-                    } else {
-                        gm.read_u64(kstate.ctx_addr + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0)
-                    };
-                    vfork::note_clone(flags);
                     do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
                     WASM32_STAGED.with(|c| c.set(true));
                     return 0;
@@ -7727,7 +7797,7 @@ fn clock_syscall(ctx: i32) -> bool {
     let abi = CLOCK_ABI.load(Acquire);
     // Before the process is loaded there is no guest to make a call; once it
     // has exited, the full path ends the thread.
-    if abi == 0 || EXITED.load(Relaxed) {
+    if abi == 0 || exited() {
         return false;
     }
     let mut gm = GuestMem::new(guest_bytes());
@@ -7773,6 +7843,10 @@ static FDS: std::sync::atomic::AtomicPtr<gex_kernel::file::FdTable> =
 /// This process's descriptor table, without the kernel (`FDS`): `None`
 /// before a process is installed.
 pub(crate) fn fds_free() -> Option<&'static gex_kernel::file::FdTable> {
+    // A vfork child's own table, while it runs in this Worker (vfork.rs).
+    if let Some(t) = vfork::fds_here() {
+        return Some(t);
+    }
     let p = FDS.load(std::sync::atomic::Ordering::Acquire);
     // SAFETY: see `FDS`. Every use of the table goes through `&self`, its
     // state behind its own atomics and mutex.
@@ -7856,7 +7930,7 @@ fn wasm32_wait(pc: u64) -> i32 {
         // An idle turn saw this Worker's thread still in a registered wait;
         // any other way out of `schedule` must be asked.
         let idle = waitq::waiting_here();
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || SCHED_OVER.with(|c| c.replace(false)) {
+        if exited() || SCHED_OVER.with(|c| c.replace(false)) {
             return picked;
         }
         // Bit 4 of `paused()`: the idle turn found a wait only the page ends.
@@ -8856,11 +8930,15 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // through one ctx, wild stores, the SMP stack smash GTK's multi-threaded
     // startup hit (issue #126). Number clones strictly above the main tid.
     kernel.next_tid = kernel.next_tid.max(pid + 1);
-    PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    // The process's start, unless this is a vfork child's kernel: the
+    // memory's other Workers are its parent's threads (vfork.rs).
+    if vfork::pid_here().is_none() {
+        PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    }
     // Before anything opens a descriptor: the child rebuilds its fd table
     // before its first syscall, and if `MY_PID` were still unset every
     // inherited pipe end would be recorded against pid 0.
-    MY_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    set_my_pid(pid);
     // The shared filesystem: the parent's `TmpFs` is Rust data this Worker
     // cannot see, so without this the child's root is empty and `execve` cannot
     // find its program.
@@ -8915,7 +8993,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         // translation carries on where the build stopped: an empty table would
         // report "nothing to translate" almost at once, since `fork` returns
         // into libc.
-        jit: {
+        jit: JitRef::own({
             let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
             Jit {
             described: meta.next_slot != 0,
@@ -8952,7 +9030,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
             obj_wasm: Default::default(),
             compiles: 0,
             nanos: 0,
-        }},
+        }}),
         magic_tail: HOST_MAGIC,
     }
 }
@@ -8988,7 +9066,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     }
     // See `gex_exited`: tells a program that finished from one that abandoned
     // the wasm stack with no status set.
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
     let pid = h.kernel.pid;
     // Descriptors go first and explicitly: a trap out of wasm does not unwind,
@@ -11247,7 +11325,7 @@ fn pick_turn(h: &mut Host) -> Pick {
 /// thread does exactly this). It parks on the process's queue, which
 /// `exit_process` notifies.
 fn leader_waits() -> bool {
-    cur() == 0 && !EXITED.load(std::sync::atomic::Ordering::Relaxed)
+    cur() == 0 && !exited()
 }
 
 /// Whether a wait that is over timed out, and whether a signal and not the
@@ -11330,7 +11408,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
     let call = gex_kernel::syscalls::free_class(&gm, ctx_addr, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
-    if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+    if exited() {
         set_resume_none();
         if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
             run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
@@ -15702,7 +15780,7 @@ fn publish_exit(h: &mut Host, pid: i32, status: i32) {
 /// Record a guest exit, and say so where a trap handler can see it.
 fn set_exit(h: &mut Host, code: i32) {
     h.exit = Some(code);
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
 }
 
@@ -15716,7 +15794,7 @@ fn set_exit(h: &mut Host, code: i32) {
 /// a signal, not an exit code.
 #[no_mangle]
 pub extern "C" fn gex_process_gone(status: i32) -> u32 {
-    if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+    if exited() {
         // `EXITED` is process-wide shared memory.  A sibling thread can set it
         // while the original process Worker is parked, then that Worker sees
         // the flag and leaves `gex.run` without having run `exit_process` in
@@ -15731,7 +15809,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         });
         return 0;
     }
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
     let pid = my_pid();
     let n = unsafe {
@@ -15755,12 +15833,25 @@ pub extern "C" fn gex_exited() -> i32 {
     // Deliberately not `with_host`: this is asked on the way out of a trap,
     // which is exactly when the kernel may still be borrowed by whatever
     // trapped.
-    EXITED.load(std::sync::atomic::Ordering::Relaxed) as i32
+    exited() as i32
 }
 
 /// Set when a guest exit is recorded, so `gex_exited` need not borrow.
 static EXITED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this Worker's process has exited: its vfork child's, while one
+/// runs here (vfork.rs), whose exit is not the parent's.
+pub(crate) fn exited() -> bool {
+    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Record the exit [`exited`] answers.
+fn set_exited(v: bool) {
+    if !vfork::set_exited_here(v) {
+        EXITED.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The head of the pending queue, as three plain words read by JS between
 /// handing the wasm stack back and taking it again, without touching the kernel

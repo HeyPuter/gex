@@ -57,11 +57,16 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # process and to a forked child (step L5 on: sendmsg/recvmsg without the lock).
 # exec-futex: futexes in an exec'd image (the lock-free futex path's view of
 # the memory map must be the new program's).
+# spawn-threads: posix_spawn from a process of four threads, which the page
+# runs in the calling thread's Worker (shims/browser/src/vfork.rs): the
+# child's descriptors and signal state its own, the exec and its failure,
+# the other threads running on. Page only: natively gexc's posix_spawn says
+# ENOENT (it did before the page's vfork too).
 # served-entries: two programs at one base (it and its VAL=2 build, ARGV0-b,
 # which it execs) sharing a file of code; in the page with
 # GEX_TEST_SERVE_UNMERGED (served modules installed one at a time) the second
 # must not be pointed at the first's code on a page they both have.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -75,6 +80,7 @@ for src in "$HERE"/*.c; do
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
+    case $name in spawn-threads) tiers=${tiers#t1} ;; esac
     for target in $targets; do
     for tier in $tiers; do
         [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
@@ -95,7 +101,7 @@ for src in "$HERE"/*.c; do
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
-        { [ $name = exec-signals ] || [ $name = exec-futex ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
+        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then

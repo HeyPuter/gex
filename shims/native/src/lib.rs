@@ -3799,6 +3799,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     pid,
                     child_stack,
                     tls,
+                    ..
                 } => {
                     // A native wasm32 program: its frames are native code
                     // that cannot be resumed at a guest PC, so the child is

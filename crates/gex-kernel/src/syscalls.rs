@@ -249,6 +249,10 @@ pub enum SyscallOutcome {
         child_stack: u64,
         /// `CLONE_SETTLS`: the thread pointer for the child.
         tls: Option<u64>,
+        /// `CLONE_VM | CLONE_VFORK` (`posix_spawn`'s clone): the child shares
+        /// this memory and the calling thread waits until it execs or exits.
+        /// A host that cannot share the memory makes a fork of it.
+        vfork: bool,
     },
     /// `clone` set up a new thread's context; the host must run it.
     ///
@@ -451,6 +455,7 @@ impl BlockOp {
 /// `clone` flags gex understands.
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
+    pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
     pub const SETTLS: u64 = 0x0008_0000;
     pub const PARENT_SETTID: u64 = 0x0010_0000;
@@ -3865,6 +3870,7 @@ impl Kernel {
                     pid,
                     child_stack: sp,
                     tls: (flags & clone_flags::SETTLS != 0).then_some(tls),
+                    vfork: flags & (clone_flags::VM | clone_flags::VFORK) == clone_flags::VM | clone_flags::VFORK,
                 };
             }
             let ca = [flags, sp, parent_tid, tls, child_tid, 0];
@@ -3900,6 +3906,7 @@ impl Kernel {
                 pid,
                 child_stack: a[1],
                 tls: (a[0] & clone_flags::SETTLS != 0).then_some(a[3]),
+                vfork: a[0] & (clone_flags::VM | clone_flags::VFORK) == clone_flags::VM | clone_flags::VFORK,
             };
         }
         if n == nr::CLONE {
