@@ -343,11 +343,13 @@ export class Compositor {
     return { w: r.w, h: r.h, b64: btoa(s) };
   }
 
-  describe() {
+  /** `{ pixels: false }`: everything but `lit`/`brightest`/`hash`, which
+   *  read the whole output back from the GPU (a full-scene copy and map). */
+  describe({ pixels = true } = {}) {
     const id = this.#next++;
     return new Promise((resolve) => {
       this.#pending.set(id, resolve);
-      this.#worker.postMessage({ kind: 'describe', id });
+      this.#worker.postMessage({ kind: 'describe', id, pixels });
       setTimeout(() => {
         if (this.#pending.delete(id)) resolve(null);
       }, 2000);
