@@ -684,6 +684,46 @@ worldmachine, bench, headless Chromium, 3 alternated runs each):
 | browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
 | lazy reads to the window | | 0 |
 
+### Resources
+
+`"resources": "trim"` (the W3 template's; a config without the setting
+means `"whole"`) zeroes, in the site's bundle, every resource of every PE
+that no lookup the site's Wine makes can return (crate::rsrc). No file
+changes size: a resource directory loses entries, rewritten in place, and
+what nothing points at any more is zeros, which cost the download nothing.
+
+- **Languages.** Wine's `find_entry` (ntdll/resource.c) looks a language
+  up in a list made from the request, the neutral language, the thread,
+  user and system locales and English, and takes the first entry only
+  when none of them is there. The site's locale is the page environment's
+  (`LANG`, none: en-US), so an entry whose primary language is neither
+  neutral nor the locale's goes, unless it is all its name has. A program
+  that asked for another language by number would get not-found.
+- **Ribbon images.** A ribbon's markup (`UIFILE`) names each command's
+  images as `[05|06] id:u32 MinDPI:u16` records, one run per size, and the
+  ribbon takes the highest MinDPI not above the screen's. The DPI is the
+  prefix's `LogPixels` (only when every one the registry sets agrees). A
+  bitmap named only by records the ribbon never takes, whose id appears in
+  no other byte of the markup and in no section of the image outside its
+  resources, goes.
+- **Bytes no directory reaches**: what the rules above dropped, and copies
+  a resource editor left behind (Paint's merged MUI moved its directory
+  into `.rsrcmui` and left `.rsrc` unread).
+
+An image is left whole when a relocated word or another data directory
+points into what would be zeroed, or when it has code and no relocations.
+A unit's key hashes every byte of its image, so a trimmed image's unit is
+shipped under the key the page computes for the trimmed image. The build
+first checks that it computes the recorded key for the image as it was;
+only the project's own gexc (`runtime/gexc`, which build.sh runs) does,
+since a key hashes the sources and C header of the gexc that made it.
+Where the check fails the image is shipped whole, and the build says so.
+
+Paint: 9.97 MB of other languages, 2.21 MB of ribbon images for other
+DPIs and 5.57 MB no directory reached are zeroed; the bundle goes from
+18.20 MB to 17.43 MB zstd. Most of it compressed well already (the dead
+`.rsrc` was a copy of the live one, which zstd's window matched).
+
 ### Cold code
 
 A unit holds every function of its image, and a run to the window calls
@@ -774,6 +814,145 @@ compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
 `chunk:256` is the default. Behind a slow link, `chunk:1024` makes fewer
 round trips. A function the recording missed at startup is a fetch, too:
 add runs to the coverage.
+
+### Services
+
+`"services"` sets Windows services' start types in the site's prefix:
+`{"PlugPlay": "demand", "StiSvc": "disabled"}`, each `boot`, `system`,
+`auto`, `demand` or `disabled`. The build writes them into the bundle's
+`system.reg` in place (the key under `CurrentControlSet` and under
+`ControlSet001`), and fails on a service the prefix has no key for.
+
+What it is for: Wine's start-up is serial. `wineboot --init` starts
+`services.exe`, which starts every auto-start service one after another
+and waits for each to say it is running; only then does wineboot finish,
+and only then does the first program go on. A program that calls a
+demand-start service waits for that service's process to start in the
+same way. In gex a process start is a fork, a Worker and the Wine loader,
+and each service process starts threads of its own, so every service on
+that path costs time before the window appears. A service the site never
+uses can come off it.
+
+Paint (854551ad runtime, worldmachine, six timed loads each, the window
+from navigation): `PlugPlay`, `NDIS` and `nsiproxy` on `demand` (none of
+them reached by Paint; `NDIS` and `nsiproxy` are one `winedevice.exe`)
+put the window at 16.2 s against 17.1 s with them auto-started; then
+`StiSvc` (still image: scanners and cameras, which a browser has none of)
+`disabled`, at 12.6 s against 14.2 s, since Paint asks it at start-up
+whether there is a device and waited for `svchost -k imgsvc` to start.
+Paint's "From scanner or camera" is then unavailable. The whole of
+tests/eject/w3-prune.mjs passes with them so, and the theme is intact
+(`Themes`, Win7's theme service, stays `auto`: uxtheme needs it).
+
+### Cold code on the function JIT
+
+`"cold": "jit"` keeps the recording's coverage as clang's code and ships
+nothing else: no cold cluster, no fetch. Each unit keeps the functions the
+run called (and every slot without a guest address, a helper or a lifted
+twin). Every other slot holds a stub that leaves through the function
+table for its guest address, as a unit's own leave stub does (gex-cgen
+`add_leave_stub`): store `ctx.LAST_TARGET`, look in the probe cache, else
+tail-call the resolve slot (`gex_split::jit`). The unit's `c.entries` and
+`gex.funcs` hold 0 for those slots, so the host never maps the address to
+the stub. The host's lookup misses, and the page's function JIT
+(`fjit=1`, set in `w3.json`'s params by the build) translates the function
+from the guest's code on its first call. Tier-1 runs only what the JIT
+declines (writable code, an entry inside a function it is recovering).
+
+It wants the same coverage as a cluster split (`"cold": "instrument"`
+and `--coverage-into`, above), and `"prune": "none"`: a function the
+proof would leave out is cold here too, and the JIT serves it instead of
+trapping.
+
+Paint, with the coverage of one interaction pass (12,138 of 116,343
+functions): units 178.1 MB → 34.1 MB unpacked, 28.5 MB → 5.3 MB zstd.
+
+### Pruning
+
+A unit holds every function of its image, including the ones no execution
+can reach. `user/eject.json` `"prune"` leaves those out: the slot keeps a
+stub that calls `gex.pruned(slot)`, which names the function's guest
+address on the console and traps, so a proof that is wrong says so by name
+instead of corrupting a run.
+
+- `"none"` (the default) keeps every function.
+- `"fanout"` proves it across all the site's images at once
+  (crates/gex-eject/src/fanout.rs). A site ships a closed set of images --
+  the exe and every DLL it can load -- so what reaches an image's code is
+  only what the other images and the runtime do.
+- `"static"` proves it one image at a time (crates/gex-eject/src/reach.rs),
+  which holds whatever else a site ships and is therefore far weaker: it
+  has to treat every export as called and every relocated address as taken.
+  In a PE32 every absolute address is relocated, so on Paint it left out 0
+  of 116,343 functions. It is kept for an image whose callers are not in
+  the project.
+
+`"fanout"` iterates to a fixed point over every x86 PE in the bundle:
+
+- **Roots:** the exe's entry, and every image's entry and TLS callbacks --
+  any image in the bundle may be loaded, so its initialisation runs.
+- **Exports** count when a reachable import slot binds to them (an import
+  table, a delay import, or a reachable export forwarding to them); when a
+  reachable address holds their name, which is what a `GetProcAddress` by
+  name can find; or when nothing in the set imports their image, which the
+  runtime therefore loaded by name from outside the set -- a service, a COM
+  server, a proxy -- and entered at an export of. An ordinal-named export
+  counts when a reachable address names its module, since nothing bounds
+  which ordinal a lookup passes. `.eh_frame` and `.pdata` entries never root
+  anything.
+- **Relocation targets** count when the relocation *site* is in a reachable
+  function or a reachable data region. A site inside a recovered function's
+  extent is that function's whether or not a decoded instruction covers it:
+  recovery decodes *around* bytes it cannot read rather than over them, and
+  in an image whose read-only data is merged into `.text` (mspaint.exe has
+  no `.rdata`, and 17,396 of its 17,792 relocations are in the executable
+  section) those gaps hold the vtables and the operands recovery could not
+  place. Where there is an instruction it says how far the reference
+  reaches: an absolute memory operand with no index touches only the
+  pointer-sized word at the target, while an address that goes into a
+  register or onto the stack may be used at any offset from the object it
+  points into, and so reaches that whole object. A word-sized read of an
+  address a function covers is a reference to that function: what sits there
+  is an instruction, not a pointer.
+- **Data reachability propagates.** Once an object is reachable its own
+  relocations are followed, so a vtable's methods, a jump table's cases, a
+  handler table and a `WNDCLASS`'s `lpfnWndProc` are all reached from
+  whatever reachable code registers them. The entry points the runtime
+  calls itself need no rule of their own for the same reason.
+- **Objects** are bounded by the addresses something stores a pointer to: a
+  region runs from one relocation target to the next, cut at section bounds
+  and at every byte a recovered function covers. Since an absolute
+  reference is itself relocated in a PE32, a reference's target always
+  starts a region.
+- **The site's own native code** -- the Wine core, ntdll, explorer and the
+  other wasm32 modules in the bundle -- is not a unit and is never pruned,
+  but it reaches these images through `GetProcAddress`, so every name it
+  holds seeds the lookup set.
+- **Kept whole:** an image with no base relocations, with a CLR header,
+  with a get-PC idiom (`call $+5`, which computes code addresses from a
+  return address), or whose unit and image cannot be lined up.
+
+`build/prune.json` carries the per-image numbers and the conservative
+keeps by kind. Paint, 59 units:
+
+| | functions | units |
+| --- | --- | --- |
+| whole | 116,343 | 178.1 MB |
+| `"fanout"` | 53,251 kept, 63,092 left out | 83.2 MB |
+
+which is a 34.3 MB site download instead of 49.1 MB. The biggest images:
+uiribbon.dll, which nothing imports and everything in Paint's chrome
+reaches through COM, keeps 17,485 of 27,837; mfc42u.dll, of whose 6,936
+exports mspaint.exe imports 584, keeps 2,088 of 14,689; gdiplus.dll keeps
+1,852 of 8,930.
+
+Two ways to check a proof. `gexc eject prune <project>` prints the report
+without building a site. `gexc eject prune-check <project> <console log>`
+takes a run of a site built with `"cold": "instrument"` (every function
+reports itself; see "Cold code") and names every function that ran which
+the proof would have left out -- each one a rule to fix, never a keep-list
+entry. tests/eject/w3-prune.mjs drives Paint's ribbon tabs, canvas, File
+menu and dialogs in headless Chromium and fails on any `[pruned]` line.
 
 ## Limits
 

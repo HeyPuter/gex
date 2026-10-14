@@ -3840,7 +3840,8 @@ export class Gex {
   /** The imports a split unit's primary takes beyond a unit's: `gex.cold(c)`,
    *  which instantiates cold cluster `c` here (its start function fills its
    *  slots in this Worker's table, and the stub that called goes on to the
-   *  real body); and an instrumented unit's `gexcov.hit(slot)`. */
+   *  real body); a pruned unit's `gex.pruned(slot)`, which traps naming the
+   *  pruned function's address; and an instrumented unit's `gexcov.hit(slot)`. */
   #splitImports(mod, key, imports) {
     let names = this.#modImports.get(mod);
     if (!names) {
@@ -3857,6 +3858,19 @@ export class Gex {
         const m = this.#coldModule(key, c);
         new WebAssembly.Instance(m, { env: imports.env, gex: imports.gex });
         this.#coldMs += performance.now() - t0;
+      } };
+    }
+    if (names.has('gex.pruned')) {
+      // A pruned unit (gex_split::prune): a slot static reachability left
+      // out ran. Never recovered from: name its guest address and trap.
+      const sec = WebAssembly.Module.customSections(mod, 'gex.funcs')[0];
+      const dv = sec ? new DataView(sec) : null;
+      imports.gex = { ...imports.gex, pruned: (k) => {
+        k >>>= 0;
+        const pc = dv && 12 + 8 * k <= dv.byteLength ? dv.getBigUint64(4 + 8 * k, true) : null;
+        const msg = `gex-cgen: ${key}: pruned function ${pc === null ? '?' : '0x' + pc.toString(16)} (slot ${k}) ran`;
+        console.error(`[pruned] ${msg}`);
+        throw new Error(msg);
       } };
     }
     if (names.has('gexcov.hit')) {

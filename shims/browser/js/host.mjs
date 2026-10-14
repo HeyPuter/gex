@@ -742,8 +742,12 @@ export class ProcessHost {
         if (typeof WeakRef === 'function' && m.thread.memory) {
           (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
         }
-        if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, making Worker (t=${Date.now()})`);
-        const w2 = this.#makeWorker();
+        if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, taking a Worker (t=${Date.now()})`);
+        // From the warm pool, as a process's: a fresh Worker was ~100 ms of
+        // script load and shim instantiation before the thread could start,
+        // and a starting Wine process makes its threads one after another
+        // (61 of them before Paint's window, 13.5 s in all).
+        const w2 = this.#takeWorker();
         this.#workers.set(key, w2);
         // Keyed by the thread, so its end stops the right Worker and frees the
         // right kernel stack.
@@ -759,6 +763,15 @@ export class ProcessHost {
         w2.addEventListener?.('error', threadFailed);
         w2.on?.('error', threadFailed);
         this.#pending.set(key, { kind: 'thread', ...m.thread });
+        // A pooled Worker's 'ready' came while it sat in the pool: deliver it
+        // now that `#pending` names this thread.
+        const held = w2[EARLY];
+        if (held) {
+          delete w2[EARLY];
+          w2.removeEventListener?.('message', held.buf);
+          w2.off?.('message', held.buf);
+          for (const mm of held.early) deliver(mm);
+        }
         // A thread's start message is keyed by tid and handed over here, once.
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;

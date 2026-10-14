@@ -42,6 +42,23 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             build(&dir)?;
             Ok(None)
         }
+        Some("prune") => {
+            // A development view of the cross-image fan-out analysis: the
+            // report, without building the site.
+            let dir = PathBuf::from(args.get(1).context("gexc eject prune <project>")?);
+            let (out, keeps) = gex_eject::fanout::project(&dir)?;
+            print!("{}", gex_eject::fanout::report(&out, &keeps));
+            Ok(None)
+        }
+        Some("prune-check") => {
+            // The fan-out proof against a real run: a console log of a site
+            // built with "cold": "instrument" names every function that ran.
+            let dir = PathBuf::from(args.get(1).context("gexc eject prune-check <project> <console log>")?);
+            let log = args.get(2).context("gexc eject prune-check <project> <console log>")?;
+            let text = std::fs::read_to_string(log)?;
+            print!("{}", gex_eject::fanout::check(&dir, &text)?);
+            Ok(None)
+        }
         Some("run") => {
             let dir = PathBuf::from(args.get(1).context("gexc eject run <project> [args...]")?);
             let mut flags = gex_eject::run::RunFlags::default();

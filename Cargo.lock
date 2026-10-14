@@ -645,6 +645,7 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-ir",
+ "gex-isa-x86",
  "gex-kernel",
  "gex-key",
  "gex-ld",
@@ -837,6 +838,7 @@ name = "gex-split"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "gex-abi",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
 ]
