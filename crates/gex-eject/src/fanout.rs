@@ -1065,7 +1065,7 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
         let (i, im) = match n {
             Node::Func(i, _) | Node::Region(i, _) | Node::Word(i, _) | Node::Export(i, _) | Node::Slot(i, _) => (i, &imgs[i as usize]),
         };
-        let mut follow = |q: &mut VecDeque<Node>, seen: &mut HashSet<Node>, refs: &[(Ref, Use)]| {
+        let follow = |q: &mut VecDeque<Node>, seen: &mut HashSet<Node>, refs: &[(Ref, Use)]| {
             for &(r, u) in refs {
                 match (r, u) {
                     (Ref::Code(f), _) => {

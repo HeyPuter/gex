@@ -208,7 +208,9 @@ fn template(off: &[String]) -> String {
                \"The bundle split\". \"cold\": \"none\" ships every unit whole in one archive; a clustering \
                (\"chunk:256\", ...) splits off each unit's code the recording never ran and \
                fetches it on first call, \"instrument\" builds units that record the functions a \
-               run calls; see docs/eject.md, \"Cold code\". \
+               run calls; see docs/eject.md, \"Cold code\". \"resources\": \"trim\" ships no \
+               resource the site's locale and DPI cannot load (\"whole\": every one); see \
+               docs/eject.md, \"Resources\". \
                \"start\": defaults for the app library's start() \
                (args, env, cwd, size, mtimes, strace, trapstack, persist, ready), over the \
                recording's; the page's own options win (docs/eject.md, \"The web build\")."),
@@ -219,8 +221,118 @@ fn template(off: &[String]) -> String {
         ),
         ("bundle", s("split")),
         ("cold", s(COLD_DEFAULT)),
+        ("resources", s("trim")),
         ("start", obj(vec![])),
     ]))
+}
+
+/// `"resources": "trim"` (crate::rsrc): writes `web/rootfs.tar`, the bundle
+/// with every distinct PE trimmed, and `build/resources.json`. Returns the
+/// units' new keys, old to new. An image whose unit's key this gexc does not
+/// reproduce is shipped whole, at every path that holds it.
+fn trim_resources(dir: &Path, v: &Json, units: &[Json], web: &Path) -> Result<std::collections::HashMap<String, String>> {
+    use std::collections::{HashMap, HashSet};
+    let what = crate::project::PROJECT_FILE;
+    let bytes = std::fs::read(dir.join("bundle/rootfs.tar"))?;
+    let tar = crate::reach::Tar::parse(&bytes)?;
+    let env = json::str_list(json::field(v, "page", what)?, "env", what)?;
+    let prefix = env.iter().find_map(|e| e.strip_prefix("WINEPREFIX=")).unwrap_or("/pfx").to_string();
+    let site = crate::rsrc::site(&env, &tar, &prefix);
+    // Each distinct file once, in parallel.
+    let files = tar.files();
+    let mut distinct: HashMap<String, (usize, usize)> = HashMap::new();
+    for &(_, o, n) in &files {
+        if bytes[o..o + n].starts_with(b"MZ") {
+            distinct.entry(sha256(&bytes[o..o + n])).or_insert((o, n));
+        }
+    }
+    let jobs: Vec<(String, (usize, usize))> = distinct.into_iter().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: std::sync::Mutex<HashMap<String, (Vec<u8>, crate::rsrc::Stat)>> = Default::default();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((h, (o, n))) = jobs.get(i) else { break };
+                if let Some(t) = crate::rsrc::trim(&bytes[*o..*o + *n], &site) {
+                    done.lock().unwrap().insert(h.clone(), t);
+                }
+            });
+        }
+    });
+    let mut trimmed = done.into_inner().unwrap();
+    // The units of trimmed images: under the key of the trimmed image, when
+    // this gexc computes the recorded key for the image as it was.
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    let mut whole: HashSet<String> = HashSet::new();
+    for u in units {
+        let key = json::str_field(u, "key", what)?;
+        let path = json::str_field(u, "path", what)?;
+        let Some(orig) = tar.read(&path) else { continue };
+        let h = sha256(orig);
+        let Some((t, _)) = trimmed.get(&h) else { continue };
+        let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
+        match crate::rsrc::rekey(&wasm, orig, t, &key)? {
+            Some(new) => found.push((key, new, h)),
+            None => {
+                eprintln!("gexc eject build: \"resources\": \"trim\": {path}: its unit's key is not one this gexc makes for it (a project built by another gexc than its own?); shipped whole");
+                whole.insert(h);
+            }
+        }
+    }
+    trimmed.retain(|h, _| !whole.contains(h));
+    let rekeyed: HashMap<String, String> = found.into_iter().filter(|(_, _, h)| !whole.contains(h)).map(|(k, n, _)| (k, n)).collect();
+    // The bundle, each trimmed file's bytes in place (sizes are unchanged).
+    let mut out = bytes.clone();
+    let mut rows = Vec::new();
+    let (mut lang, mut dpi, mut dead, mut files_n) = (0usize, 0usize, 0usize, 0usize);
+    let mut counted: HashSet<&str> = HashSet::new();
+    for &(p, o, n) in &files {
+        if !bytes[o..o + n].starts_with(b"MZ") {
+            continue;
+        }
+        let h = sha256(&bytes[o..o + n]);
+        let Some((t, st)) = trimmed.get(&h) else { continue };
+        out[o..o + n].copy_from_slice(t);
+        files_n += 1;
+        if counted.insert(trimmed.get_key_value(&h).unwrap().0.as_str()) {
+            lang += st.languages;
+            dpi += st.dpi;
+            dead += st.dead;
+        }
+        rows.push(obj(vec![
+            ("path", s(p)),
+            ("languages", json::n(st.languages as u64)),
+            ("dpi", json::n(st.dpi as u64)),
+            ("dead", json::n(st.dead as u64)),
+            ("entries", json::n(st.entries as u64)),
+        ]));
+    }
+    write_file(&web.join("rootfs.tar"), &out, false)?;
+    eprintln!(
+        "gexc eject build: \"resources\": \"trim\" (language {}, DPI {}): {files_n} files, {} distinct; \
+         zeroed {lang} bytes of other languages, {dpi} of ribbon images for other DPIs, {dead} no directory reached; {} units rekeyed",
+        site.lang.map_or("kept".into(), |l| format!("{l:#x}")),
+        site.dpi.map_or("kept".into(), |d| d.to_string()),
+        trimmed.len(),
+        rekeyed.len()
+    );
+    write_file(
+        &dir.join("build/resources.json"),
+        json::write(&obj(vec![
+            ("lang", site.lang.map_or(Json::Null, |l| json::n(l as u64))),
+            ("dpi", site.dpi.map_or(Json::Null, |d| json::n(d as u64))),
+            ("languages", json::n(lang as u64)),
+            ("dpi_bytes", json::n(dpi as u64)),
+            ("dead", json::n(dead as u64)),
+            ("rekeyed", Json::Obj(rekeyed.iter().map(|(a, b)| (a.clone(), s(b))).collect())),
+            ("files", Json::Arr(rows)),
+        ]))
+        .as_bytes(),
+        false,
+    )?;
+    Ok(rekeyed)
 }
 
 #[derive(Debug, Default)]
@@ -325,8 +437,17 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     // The bundle and the units: as they are, or with `"cold"` each unit's
     // primary (the functions the run called, a stub for every other) and
     // its cold clusters, `cold/N.wasm` (web/eject-site.mjs packs them).
-    link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
     let units = list(&v, "units");
+    // `"resources": "trim"`: the bundle with the resources no lookup returns
+    // zeroed, and each trimmed image's unit under the key the page computes
+    // for the trimmed image.
+    let rekeyed = if config.resources_trim {
+        trim_resources(dir, &v, units, &web)?
+    } else {
+        link_or_copy(&dir.join("bundle/rootfs.tar"), &web.join("rootfs.tar"))?;
+        std::collections::HashMap::new()
+    };
+    let site_key = |k: &str| rekeyed.get(k).cloned().unwrap_or_else(|| k.to_string());
     let instrument = config.cold.as_deref() == Some("instrument");
     let coverage = match (&config.cold, v.get("coverage")) {
         (None, _) => None,
@@ -342,6 +463,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         }
     };
     let mut cold_units = 0;
+    let mut jit_units = 0;
     // `"prune"`: each unit without the functions the proof leaves out
     // ("fanout": crate::fanout, across all the images together; "static":
     // crate::reach, one image at a time), in parallel.
@@ -448,8 +570,11 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     }
     for u in units {
         let key = json::str_field(u, "key", what)?;
-        let to = web.join("units").join(&key);
-        link_or_copy(&dir.join("units").join(&key).join("c.entries"), &to.join("c.entries"))?;
+        let to = web.join("units").join(site_key(&key));
+        let jit = coverage.is_some() && config.cold.as_deref() == Some("jit");
+        if !jit {
+            link_or_copy(&dir.join("units").join(&key).join("c.entries"), &to.join("c.entries"))?;
+        }
         if instrument {
             let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
             write_file(&to.join("c.wasm"), &gex_split::instrument(&wasm)?, false)?;
@@ -468,6 +593,15 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             _ => std::collections::HashSet::new(),
         };
         let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
+        if jit {
+            // Only what the run called is the unit's; the rest is the
+            // function JIT's, translated in the page on first call.
+            let (module, entries) = gex_split::jit(&wasm, &hot).with_context(|| format!("unit {key}"))?;
+            write_file(&to.join("c.wasm"), &module, false)?;
+            write_file(&to.join("c.entries"), &entries.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>(), false)?;
+            jit_units += 1;
+            continue;
+        }
         let (primary, clusters, _) = gex_split::split(&wasm, &hot, how.parse()?)
             .with_context(|| format!("splitting unit {key}"))?;
         write_file(&to.join("c.wasm"), &primary, false)?;
@@ -493,6 +627,11 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     let mut params = params;
     if cold_units > 0 {
         params.push(("cold".to_string(), s("1")));
+    }
+    // `"cold": "jit"`: what the units leave out is the function JIT's.
+    if jit_units > 0 {
+        params.retain(|(k, _)| k != "fjit");
+        params.push(("fjit".to_string(), s("1")));
     }
     // `"bundle": "split"`: the files the recorded run opened, which the site
     // keeps in its bundle (web/eject-site.mjs).
@@ -524,7 +663,16 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("params", Json::Obj(params)),
         ("features_off", strs(&off)),
-        ("units", Json::Arr(units.to_vec())),
+        ("units", Json::Arr(units.iter().map(|u| {
+            let k = json::opt_str(u, "key").unwrap_or_default();
+            let mut u = u.clone();
+            if let Json::Obj(kv) = &mut u {
+                for (_, x) in kv.iter_mut().filter(|(f, _)| f == "key") {
+                    *x = s(&site_key(&k));
+                }
+            }
+            u
+        }).collect())),
         ("bundle", bundle),
         // user/eject.json "start": the app library's start() defaults, over
         // the recording's (docs/eject.md, "The web build").

@@ -684,6 +684,46 @@ worldmachine, bench, headless Chromium, 3 alternated runs each):
 | browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
 | lazy reads to the window | | 0 |
 
+### Resources
+
+`"resources": "trim"` (the W3 template's; a config without the setting
+means `"whole"`) zeroes, in the site's bundle, every resource of every PE
+that no lookup the site's Wine makes can return (crate::rsrc). No file
+changes size: a resource directory loses entries, rewritten in place, and
+what nothing points at any more is zeros, which cost the download nothing.
+
+- **Languages.** Wine's `find_entry` (ntdll/resource.c) looks a language
+  up in a list made from the request, the neutral language, the thread,
+  user and system locales and English, and takes the first entry only
+  when none of them is there. The site's locale is the page environment's
+  (`LANG`, none: en-US), so an entry whose primary language is neither
+  neutral nor the locale's goes, unless it is all its name has. A program
+  that asked for another language by number would get not-found.
+- **Ribbon images.** A ribbon's markup (`UIFILE`) names each command's
+  images as `[05|06] id:u32 MinDPI:u16` records, one run per size, and the
+  ribbon takes the highest MinDPI not above the screen's. The DPI is the
+  prefix's `LogPixels` (only when every one the registry sets agrees). A
+  bitmap named only by records the ribbon never takes, whose id appears in
+  no other byte of the markup and in no section of the image outside its
+  resources, goes.
+- **Bytes no directory reaches**: what the rules above dropped, and copies
+  a resource editor left behind (Paint's merged MUI moved its directory
+  into `.rsrcmui` and left `.rsrc` unread).
+
+An image is left whole when a relocated word or another data directory
+points into what would be zeroed, or when it has code and no relocations.
+A unit's key hashes every byte of its image, so a trimmed image's unit is
+shipped under the key the page computes for the trimmed image. The build
+first checks that it computes the recorded key for the image as it was;
+only the project's own gexc (`runtime/gexc`, which build.sh runs) does,
+since a key hashes the sources and C header of the gexc that made it.
+Where the check fails the image is shipped whole, and the build says so.
+
+Paint: 9.97 MB of other languages, 2.21 MB of ribbon images for other
+DPIs and 5.57 MB no directory reached are zeroed; the bundle goes from
+18.20 MB to 17.43 MB zstd. Most of it compressed well already (the dead
+`.rsrc` was a copy of the live one, which zstd's window matched).
+
 ### Cold code
 
 A unit holds every function of its image, and a run to the window calls
@@ -774,6 +814,29 @@ compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
 `chunk:256` is the default. Behind a slow link, `chunk:1024` makes fewer
 round trips. A function the recording missed at startup is a fetch, too:
 add runs to the coverage.
+
+### Cold code on the function JIT
+
+`"cold": "jit"` keeps the recording's coverage as clang's code and ships
+nothing else: no cold cluster, no fetch. Each unit keeps the functions the
+run called (and every slot without a guest address, a helper or a lifted
+twin). Every other slot holds a stub that leaves through the function
+table for its guest address, as a unit's own leave stub does (gex-cgen
+`add_leave_stub`): store `ctx.LAST_TARGET`, look in the probe cache, else
+tail-call the resolve slot (`gex_split::jit`). The unit's `c.entries` and
+`gex.funcs` hold 0 for those slots, so the host never maps the address to
+the stub. The host's lookup misses, and the page's function JIT
+(`fjit=1`, set in `w3.json`'s params by the build) translates the function
+from the guest's code on its first call. Tier-1 runs only what the JIT
+declines (writable code, an entry inside a function it is recovering).
+
+It wants the same coverage as a cluster split (`"cold": "instrument"`
+and `--coverage-into`, above), and `"prune": "none"`: a function the
+proof would leave out is cold here too, and the JIT serves it instead of
+trapping.
+
+Paint, with the coverage of one interaction pass (12,138 of 116,343
+functions): units 178.1 MB → 34.1 MB unpacked, 28.5 MB → 5.3 MB zstd.
 
 ### Pruning
 

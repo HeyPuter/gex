@@ -838,6 +838,7 @@ name = "gex-split"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "gex-abi",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
 ]

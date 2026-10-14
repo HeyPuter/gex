@@ -6,6 +6,7 @@ license.workspace = true
 description = "Function-level splitting of a linked function-tier unit into a primary and cold clusters"
 
 [dependencies]
+gex-abi.workspace = true
 anyhow = "1"
 wasmparser = "0.219.2"
 wasm-encoder = { version = "0.219.2", features = ["wasmparser"] }

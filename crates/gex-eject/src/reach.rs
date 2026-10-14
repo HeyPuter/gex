@@ -430,6 +430,17 @@ impl<'a> Tar<'a> {
         Ok(Tar { data, entries })
     }
 
+    /// Every regular file: its path, and where its bytes are in the tar.
+    pub fn files(&self) -> Vec<(&str, usize, usize)> {
+        self.entries
+            .iter()
+            .filter_map(|(p, e)| match e {
+                TarEntry::File(o, n) => Some((p.as_str(), *o, *n)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// A file's bytes by its guest path, following links.
     pub fn read(&self, path: &str) -> Option<&'a [u8]> {
         let mut parts: VecDeque<String> = clean(path).split('/').filter(|s| !s.is_empty()).map(String::from).collect();

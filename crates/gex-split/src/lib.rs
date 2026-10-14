@@ -299,13 +299,17 @@ struct Plan<'p> {
     /// The stubs are for pruned functions: `gex.pruned(slot)`, then a trap
     /// (never a cluster to load).
     pruned: bool,
+    /// The stubs leave through the function table ([`jit`]): no import, no
+    /// cluster, and the stubs' slots have no address in `gex.funcs`.
+    jit: bool,
 }
 
 fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
     let owned_f: Vec<u32> = plan.owned.iter().map(|&k| u.slots[k as usize]).collect();
     let helpers = u.helpers_of(&owned_f);
-    let need_cold = plan.stubs.is_some_and(|s| s.iter().any(|c| c.is_some()));
+    let need_cold = !plan.jit && plan.stubs.is_some_and(|s| s.iter().any(|c| c.is_some()));
     let extra_import = need_cold || plan.cov;
+    let addrs = u.addresses();
     if plan.pruned && plan.cov {
         bail!("a pruned unit is not instrumented");
     }
@@ -403,6 +407,41 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
             for (k, &f) in u.slots.iter().enumerate() {
                 match stubs[k] {
                     None => seg.push(*map.get(&f).ok_or_else(|| anyhow!("hot slot {k} is not held"))?),
+                    Some(_) if plan.jit => {
+                        // Leave through the table for the guest address: the
+                        // probe cache, or the resolve slot, which asks the
+                        // host (whose miss is the function JIT's). As a
+                        // unit's own leave stub (gex-cgen `add_leave_stub`).
+                        let addr = addrs[k];
+                        funcs.function(u.body_ty);
+                        let mut s = Function::new([(1, ValType::I64)]);
+                        let ctx_at = |off: usize| wasm_encoder::MemArg { offset: off as u64, align: 3, memory_index: 0 };
+                        s.instruction(&I::LocalGet(0));
+                        s.instruction(&I::I64Const(addr as i64));
+                        s.instruction(&I::I64Store(ctx_at(gex_abi::ctx::LAST_TARGET)));
+                        for p in 0..4 {
+                            s.instruction(&I::LocalGet(p));
+                        }
+                        let probe = ((addr as u32).wrapping_mul(gex_abi::FCACHE_MUL) >> (32 - gex_abi::FCACHE_BITS)) << 3;
+                        s.instruction(&I::I32Const(probe as i32));
+                        s.instruction(&I::I64Load(wasm_encoder::MemArg { offset: gex_abi::FCACHE, align: 3, memory_index: 0 }));
+                        s.instruction(&I::LocalTee(4));
+                        s.instruction(&I::I64Const(32));
+                        s.instruction(&I::I64ShrU);
+                        s.instruction(&I::I32WrapI64);
+                        s.instruction(&I::I32Const(gex_abi::ftab::RESOLVE as i32));
+                        s.instruction(&I::LocalGet(4));
+                        s.instruction(&I::I64Const(0xffff_ffff));
+                        s.instruction(&I::I64And);
+                        s.instruction(&I::I64Const(addr as i64));
+                        s.instruction(&I::I64Eq);
+                        s.instruction(&I::Select);
+                        s.instruction(&I::ReturnCallIndirect { type_index: u.body_ty, table_index: 0 });
+                        s.instruction(&I::End);
+                        code.function(&s);
+                        seg.push(next);
+                        next += 1;
+                    }
                     Some(_) if plan.pruned => {
                         // A pruned function: say which, then trap. Its body
                         // is not in the module, so nothing else can run.
@@ -486,9 +525,13 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
     let mut ns = NameSection::new();
     ns.functions(&names);
     m.section(&ns);
-    if plan.stubs.is_some() {
+    if let Some(stubs) = plan.stubs {
         if let Some((_, d)) = u.keep_custom.iter().find(|(n, _)| n == "gex.funcs") {
-            m.section(&CustomSection { name: "gex.funcs".into(), data: (*d).into() });
+            if plan.jit {
+                m.section(&CustomSection { name: "gex.funcs".into(), data: funcs_section(&jit_entries(&addrs, stubs)).into() });
+            } else {
+                m.section(&CustomSection { name: "gex.funcs".into(), data: (*d).into() });
+            }
         }
     }
     Ok(m.finish())
@@ -509,7 +552,49 @@ impl Reencode for Remap<'_> {
 pub fn instrument(wasm: &[u8]) -> Result<Vec<u8>> {
     let u = Unit::parse(wasm)?;
     let all: Vec<u32> = (0..u.slots.len() as u32).collect();
-    build(&u, &Plan { owned: &all, stubs: Some(&vec![None; u.slots.len()]), cov: true, pruned: false })
+    build(&u, &Plan { owned: &all, stubs: Some(&vec![None; u.slots.len()]), cov: true, pruned: false, jit: false })
+}
+
+/// Each slot's address with the stubs' made 0 (none): what the host
+/// publishes for a [`jit`] unit.
+fn jit_entries(addrs: &[u64], stubs: &[Option<u32>]) -> Vec<u64> {
+    addrs.iter().zip(stubs).map(|(&a, s)| if s.is_some() { 0 } else { a }).collect()
+}
+
+/// A `gex.funcs` section's bytes: the count, then each address.
+fn funcs_section(addrs: &[u64]) -> Vec<u8> {
+    let mut v = (addrs.len() as u32).to_le_bytes().to_vec();
+    for a in addrs {
+        v.extend_from_slice(&a.to_le_bytes());
+    }
+    v
+}
+
+/// The unit with only the slots in `hot` compiled: every other guest
+/// function's body is left out, and its slot holds a stub that leaves
+/// through the function table for its guest address. Its address is not
+/// published (the returned entries, `c.entries`, hold 0 there), so the
+/// host's lookup misses and the page's function JIT translates it from the
+/// guest's code, on first call: nothing is fetched. A slot without an
+/// address (a helper) or a lifted twin stays compiled.
+pub fn jit(wasm: &[u8], hot: &HashSet<u32>) -> Result<(Vec<u8>, Vec<u64>)> {
+    let u = Unit::parse(wasm)?;
+    if u.imports.iter().any(|(_, _, t)| matches!(t, TypeRef::Memory(m) if m.memory64)) {
+        bail!("a unit over 64-bit memory: the JIT split's stubs address memory with i32");
+    }
+    if !u.keep_custom.iter().any(|(n, _)| n == "gex.funcs") {
+        bail!("no gex.funcs section: the slots' guest addresses are unknown");
+    }
+    let addrs = u.addresses();
+    if addrs.len() != u.slots.len() {
+        bail!("gex.funcs has {} addresses for {} slots", addrs.len(), u.slots.len());
+    }
+    let n = u.slots.len() as u32;
+    let keep = |k: u32| hot.contains(&k) || addrs[k as usize] == 0 || addrs[k as usize] >> 63 != 0 || addrs[k as usize] > u32::MAX as u64;
+    let of: Vec<Option<u32>> = (0..n).map(|k| if keep(k) { None } else { Some(0) }).collect();
+    let owned: Vec<u32> = (0..n).filter(|&k| keep(k)).collect();
+    let module = build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: false, jit: true })?;
+    Ok((module, jit_entries(&addrs, &of)))
 }
 
 /// How cold functions are grouped into what the page fetches.
@@ -686,7 +771,7 @@ pub fn split(wasm: &[u8], hot: &HashSet<u32>, how: Clustering) -> Result<(Vec<u8
     let u = Unit::parse(wasm)?;
     let (of, count) = clusters(&u, hot, how);
     let hot_slots: Vec<u32> = (0..u.slots.len() as u32).filter(|k| of[*k as usize].is_none()).collect();
-    let primary = build(&u, &Plan { owned: &hot_slots, stubs: Some(&of), cov: false, pruned: false })?;
+    let primary = build(&u, &Plan { owned: &hot_slots, stubs: Some(&of), cov: false, pruned: false, jit: false })?;
     let mut members: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (k, c) in of.iter().enumerate() {
         if let Some(c) = c {
@@ -696,7 +781,7 @@ pub fn split(wasm: &[u8], hot: &HashSet<u32>, how: Clustering) -> Result<(Vec<u8
     let mut out = Vec::with_capacity(count as usize);
     for c in 0..count {
         let ks = members.get(&c).map(|v| v.as_slice()).unwrap_or(&[]);
-        out.push(build(&u, &Plan { owned: ks, stubs: None, cov: false, pruned: false })?);
+        out.push(build(&u, &Plan { owned: ks, stubs: None, cov: false, pruned: false, jit: false })?);
     }
     Ok((primary, out, of))
 }
@@ -711,5 +796,5 @@ pub fn prune(wasm: &[u8], keep: &HashSet<u32>) -> Result<Vec<u8>> {
     let n = u.slots.len() as u32;
     let of: Vec<Option<u32>> = (0..n).map(|k| if keep.contains(&k) { None } else { Some(0) }).collect();
     let owned: Vec<u32> = (0..n).filter(|k| keep.contains(k)).collect();
-    build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: true })
+    build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: true, jit: false })
 }
