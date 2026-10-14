@@ -58,7 +58,25 @@ fn main() {
         }
     }
     std::fs::write(out.join("gexgl-hand-ops.h"), names).unwrap();
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    // macOS has no system EGL or desktop GL headers; Homebrew's mesa has
+    // both, and the libEGL/libGLESv2 that src/host.rs links.
+    // `GEX_MESA_PREFIX` overrides where it is looked for.
+    println!("cargo:rerun-if-env-changed=GEX_MESA_PREFIX");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let prefix = std::env::var_os("GEX_MESA_PREFIX").map(std::path::PathBuf::from).or_else(|| {
+            ["/opt/homebrew/opt/mesa", "/usr/local/opt/mesa"]
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .find(|p| p.join("include/EGL/egl.h").exists())
+        });
+        let Some(prefix) = prefix else {
+            panic!("gex-gl: no EGL/GL headers on macOS; `brew install mesa` or set GEX_MESA_PREFIX");
+        };
+        build.include(prefix.join("include"));
+        println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
+    }
+    build
         .cpp(true)
         .include(&out)
         .std("c++17")

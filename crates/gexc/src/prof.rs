@@ -32,17 +32,33 @@ extern "C" fn on_prof(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut libc::c_
         {
             uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         {
             uc.uc_mcontext.pc
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            (*uc.uc_mcontext).__ss.__pc
         }
     };
     let i = NEXT.fetch_add(1, Ordering::Relaxed);
     if i < N {
         SAMPLES[i].store(pc, Ordering::Relaxed);
-        // SAFETY: gettid is async-signal-safe.
-        TIDS[i].store(unsafe { libc::syscall(libc::SYS_gettid) } as u32, Ordering::Relaxed);
+        TIDS[i].store(tid(), Ordering::Relaxed);
     }
+}
+
+/// The calling thread's id (async-signal-safe).
+#[cfg(target_os = "linux")]
+fn tid() -> u32 {
+    // SAFETY: gettid is async-signal-safe.
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+#[cfg(target_os = "macos")]
+fn tid() -> u32 {
+    // SAFETY: pthread_mach_thread_np only reads the calling thread's port.
+    unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
 }
 
 /// Start profiling if `GEX_PROF` names a file. Once per process.
