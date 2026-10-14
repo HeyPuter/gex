@@ -1217,19 +1217,44 @@ class Compositor {
       [g.max, active ? 'BUTTONACTIVECAPTION' : 'BUTTONINACTIVECAPTION', maximized ? 'BUTTONRESTOREGLYPH96' : 'BUTTONMAXGLYPH96'],
       [g.close, active ? 'BUTTONACTIVECLOSE' : 'BUTTONINACTIVECLOSE', 'BUTTONCLOSEGLYPH96'],
     ];
+    const hovered = this.#hoveredButton(win);
     for (const [b, bg, glyph] of buttons) {
       if (!b.state || b.w <= 0 || b.h <= 0) continue;
       const x = f.x + b.x, y = f.y + b.y;
-      const back = part(bg, b.state);
+      // Hover is the compositor's to see, as it was DWM's: a normal button
+      // under the pointer is hot, with its glow behind it.
+      const state = b.state === 1 && hovered === b ? 2 : b.state;
+      if (state === 2 && aero) {
+        const glow = part(glyph === 'BUTTONCLOSEGLYPH96' ? 'BUTTONCLOSEGLOW' : 'BUTTONGLOW', 0)
+          ?? part(glyph === 'BUTTONCLOSEGLYPH96' ? 'BUTTONCLOSEGLOW' : 'BUTTONGLOW', 1);
+        if (glow) {
+          const [, , gw, gh] = glow.rect;
+          p.tinted(x + (b.w - gw) / 2, y + (b.h - gh) / 2, gw, gh, aero.tex, [1, 1, 1, 1],
+            [glow.rect[0] / aero.tex.width, glow.rect[1] / aero.tex.height, gw / aero.tex.width, gh / aero.tex.height]);
+        }
+      }
+      const back = part(bg, state);
       if (back) p.nineGrid(aero.tex, back.rect, back.sizingMargins, x, y, b.w, b.h);
       else p.solid(x, y, b.w, b.h, glyph === 'BUTTONCLOSEGLYPH96' ? [0.78, 0.25, 0.2, 0.9] : [0.85, 0.9, 1, 0.6]);
-      const gl = part(glyph, b.state);
+      const gl = part(glyph, state);
       if (gl) {
         const [, , gw, gh] = gl.rect;
         p.tinted(x + Math.floor((b.w - gw) / 2), y + Math.floor((b.h - gh) / 2), gw, gh, aero.tex, [1, 1, 1, 1],
           [gl.rect[0] / aero.tex.width, gl.rect[1] / aero.tex.height, gw / aero.tex.width, gh / aero.tex.height]);
       }
     }
+  }
+
+  /** The caption button of a glass frame under the pointer, if any. */
+  #hoveredButton(win) {
+    const g = win.info?.glass;
+    if (!g || !(g.frame & 1)) return null;
+    const f = this.#frameOf(win);
+    const { x, y } = this.#pointer;
+    for (const b of [g.close, g.max, g.min]) {
+      if (b.state && x >= f.x + b.x && x < f.x + b.x + b.w && y >= f.y + b.y && y < f.y + b.y + b.h) return b;
+    }
+    return null;
   }
 
   #drawSurface(k, win, glass = null) {
@@ -1323,7 +1348,8 @@ class Compositor {
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
         win.placed ? `p${win.layer}${win.unmanaged ? 'u' : ''}` : '',
         f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null),
-        JSON.stringify(win.info?.glass ?? null),
+        JSON.stringify(win.info?.glass ?? null), win.info?.glass ? [win.info.glass.close, win.info.glass.max,
+          win.info.glass.min].indexOf(this.#hoveredButton(win)) : '',
         glFrameFor(win)?.serial ?? '');
     }
     return parts.join('|');
