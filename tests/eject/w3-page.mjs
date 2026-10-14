@@ -153,13 +153,19 @@ const browser = await Cdp.connect(ws);
 const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
 const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
 await browser.send('Runtime.enable', {}, page);
-// W3PAGE_CONSOLE=FILE: every target's console lines (the page's and its
-// Workers', with the guests' stderr), timestamped, for a diagnosis.
-if (process.env.W3PAGE_CONSOLE) {
+// Every target's console (the page's and its Workers', with the guests'
+// stderr): the function-tier units each image hit or missed
+// ("[gex-record] unit KEY hit|miss PATH"), and with W3PAGE_CONSOLE=FILE
+// every line, timestamped, for a diagnosis.
+const units = { hit: new Set(), miss: new Set() };
+{
   const { appendFileSync } = await import('node:fs');
   const t0 = Date.now();
   browser.on('Runtime.consoleAPICalled', (p) => {
-    appendFileSync(process.env.W3PAGE_CONSOLE, `${Date.now() - t0} ${p.args.map((a) => a.value ?? a.description ?? '').join(' ')}\n`);
+    const line = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
+    const u = /\[gex-record\] unit [0-9a-f-]+ (hit|miss) (\S+)/.exec(line);
+    if (u) units[u[1]].add(u[2]);
+    if (process.env.W3PAGE_CONSOLE) appendFileSync(process.env.W3PAGE_CONSOLE, `${Date.now() - t0} ${line}\n`);
   });
   browser.on('Target.attachedToTarget', async (p) => {
     const s = p.sessionId;
@@ -188,6 +194,16 @@ while (Date.now() - t0 < timeout) {
 }
 const secs = ((Date.now() - t0) / 1000).toFixed(1);
 if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleRe.source}/ (${secs} s; titles ${JSON.stringify(d?.titles ?? [])})`)) done();
+// The site's units are the ones the runtime looks for: a runtime whose unit
+// keys moved (gex-cgen's sources changed under it) misses every one and runs
+// the program on tier 1 -- it still reaches the window, slowly. An image
+// missed is one the recording had no unit for, or one the site does not
+// ship; most of what ran must hit.
+{
+  const hit = units.hit.size;
+  const miss = [...units.miss].filter((p) => !units.hit.has(p)).length;
+  check(hit > 0 && hit >= 2 * miss, `the units are the runtime's: ${hit} image(s) hit a unit, ${miss} missed`);
+}
 
 // 3. Drawn by the page itself when the compositor is out.
 if (off.includes('compositor')) {
