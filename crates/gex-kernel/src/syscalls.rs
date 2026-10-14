@@ -837,6 +837,38 @@ pub fn share_monotonic_base(f: fn(u64) -> u64) {
     let _ = MONOTONIC_SHARED.set(f);
 }
 
+/// How much faster than real time the monotonic clocks run, as f64 bits
+/// (0: real time). For benchmarks only, off unless a host sets it
+/// ([`set_guest_clock`]).
+static CLOCK_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Seconds taken off the wall clock (CLOCK_REALTIME, gettimeofday, time) as
+/// the guest reads it: 0, or now less a fixed starting instant.
+static WALL_SHIFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The benchmark clocks, as pewasm's PEWASM_TIME_SCALE and PEWASM_FIXED_TIME
+/// make them (its src/x86/host.c): the monotonic clocks -- which Wine's
+/// QueryPerformanceCounter, GetTickCount and timeGetTime all come from --
+/// run `scale` times faster than real time, so a program that caps its own
+/// frame rate against them stops sleeping and runs as fast as it can; the
+/// wall clock runs at real time but `wall_shift` seconds behind, so it
+/// starts at a fixed date (pewasm: the fixed date plus the real time since
+/// start). Sleeps and timeouts stay real time, as in pewasm: Wine's
+/// NtDelayExecution counts on the wall clock, and a relative wait on the
+/// monotonic one waits its length in real time. Every process of a host
+/// must be given the same values (the browser's kernel hands them out).
+pub fn set_guest_clock(scale: f64, wall_shift: i64) {
+    use std::sync::atomic::Ordering;
+    let bits = if scale > 0.0 && scale != 1.0 { scale.to_bits() } else { 0 };
+    CLOCK_SCALE.store(bits, Ordering::Relaxed);
+    WALL_SHIFT.store(wall_shift, Ordering::Relaxed);
+}
+
+/// The wall clock as the guest reads it: see [`set_guest_clock`].
+fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
+    let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+    (secs.wrapping_sub(shift as u64), nanos)
+}
+
 /// A monotonic clock reading made from a wall clock reading: seconds since
 /// a shared boot instant, not since the epoch. Programs truncate monotonic
 /// milliseconds to 32 bits and compare them across processes -- X server
@@ -854,7 +886,7 @@ pub fn clock_ns(clock: ClockFn, clk: u64) -> u64 {
     let (secs, nanos) = match clk {
         2 | 3 => return 0,
         c if is_monotonic_clock(c) => monotonic_from(clock()),
-        _ => clock(),
+        _ => guest_wall(clock()),
     };
     secs * 1_000_000_000 + nanos as u64
 }
@@ -872,7 +904,13 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
             Err(other) => other,
         };
     }
-    (secs.saturating_sub(base), nanos)
+    let (secs, nanos) = (secs.saturating_sub(base), nanos);
+    let scale = CLOCK_SCALE.load(Ordering::Relaxed);
+    if scale == 0 {
+        return (secs, nanos);
+    }
+    let ns = ((secs as f64 * 1e9 + nanos as f64) * f64::from_bits(scale)) as u64;
+    (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
 /// Answer one of the calls that only read the clock -- `clock_gettime`,
@@ -980,7 +1018,7 @@ pub fn clock_call(
                     ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
                 }
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
-                _ => clock(),
+                _ => guest_wall(clock()),
             };
             buf != 0 && pair(m, buf, secs, nanos as u64, w32).is_ok()
         }
@@ -989,7 +1027,7 @@ pub fn clock_call(
             if buf == 0 {
                 true
             } else {
-                let (secs, nanos) = clock();
+                let (secs, nanos) = guest_wall(clock());
                 pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
             }
         }
@@ -2165,8 +2203,10 @@ impl FutexCx<'_> {
         }
     }
 
+    /// The wall clock as the guest reads it ([`guest_wall`]): the clock an
+    /// absolute CLOCK_REALTIME deadline the guest names is on.
     fn now_nanos(&self) -> u128 {
-        let (secs, nanos) = (self.clock)();
+        let (secs, nanos) = guest_wall((self.clock)());
         secs as u128 * 1_000_000_000 + nanos as u128
     }
 
@@ -8002,7 +8042,7 @@ impl Kernel {
     }
 
     fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
-        let (secs, _) = (self.clock)();
+        let (secs, _) = guest_wall((self.clock)());
         if tloc != 0 {
             m.write_u64(tloc, secs)?;
         }
@@ -8082,7 +8122,7 @@ impl Kernel {
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
             c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
-            _ => (self.clock)(),
+            _ => guest_wall((self.clock)()),
         };
         m.write_u64(buf, secs)?;
         m.write_u64(buf + 8, nanos as u64)?;
@@ -8102,7 +8142,7 @@ impl Kernel {
         if buf == 0 {
             return Ok(0);
         }
-        let (secs, nanos) = (self.clock)();
+        let (secs, nanos) = guest_wall((self.clock)());
         m.write_u64(buf, secs)?;
         m.write_u64(buf + 8, (nanos / 1000) as u64)?;
         Ok(0)
@@ -8110,6 +8150,13 @@ impl Kernel {
 
     fn sys_nanosleep(&mut self, m: &GuestMem<'_>, req: u64) -> SysResult {
         nanosleep_answer(m, req)
+    }
+
+    /// The wall clock in nanoseconds as the guest reads it: an absolute
+    /// CLOCK_REALTIME deadline the guest names is on this clock.
+    fn guest_now_nanos(&mut self) -> u128 {
+        let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        (self.now_nanos() as i128 - shift as i128 * 1_000_000_000).max(0) as u128
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since

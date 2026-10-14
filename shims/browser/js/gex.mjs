@@ -2292,6 +2292,30 @@ export class Gex {
     // has none and keeps the linked stack.
     if (stackTop) inst.exports.__stack_pointer.value = stackTop | 0;
     this.#kernel = inst.exports;
+    // `?timescale=N&fixedtime=S`: the benchmark clocks (gex-kernel
+    // `set_guest_clock`, as pewasm's PEWASM_TIME_SCALE and FIXED_TIME). The
+    // first process sets them for all.
+    const scale = Number(globalThis.GEX_TIME_SCALE) || 0, fixed = Number(globalThis.GEX_FIXED_TIME) || 0;
+    if ((scale > 0 && scale !== 1) || fixed) {
+      const shift = fixed ? Math.floor(Number(this.#env.now() / 1000000000n)) - fixed : 0;
+      inst.exports.k_guest_clock?.(Math.round((scale || 1) * 1000), shift | 0);
+    }
+    this.#guestClock();
+  }
+
+  /** The benchmark clocks the kernel holds: monotonic speed, wall shift (s). */
+  #guestClock() {
+    if (this.#clockSet) return this.#clockSet;
+    const gc = BigInt.asUintN(64, BigInt(this.#kernel?.k_guest_clock?.(0, 0) ?? 0));
+    this.#clockSet = { scale: Number(gc >> 32n) / 1000 || 1, shift: BigInt(BigInt.asIntN(32, gc & 0xffffffffn)) };
+    return this.#clockSet;
+  }
+  #clockSet = null;
+
+  /** Monotonic ns since boot as the guest reads it. */
+  #guestMono(ns) {
+    const c = this.#guestClock(), m = ns - BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n;
+    return c.scale === 1 ? m : BigInt(Math.floor(Number(m) * c.scale));
   }
 
   /**
@@ -4776,9 +4800,9 @@ export class Gex {
         const clk = arg(3), buf = nr === 78 ? arg(3) : arg(1);
         if (nr === 78 || clk === 0 || clk === 5 || clk === 8 || [1, 4, 6, 7, 9].includes(clk)) {
           if (!buf) { ret(nr === 78 ? 0 : -14); return; }
-          const ns = this.#env.now();
-          let secs = Number(ns / 1000000000n), nanos = Number(ns % 1000000000n);
-          if (nr !== 78 && [1, 4, 6, 7, 9].includes(clk)) secs -= this.#kernel?.k_boot_secs?.(0) ?? 0;
+          const now = this.#env.now();
+          const ns = nr !== 78 && [1, 4, 6, 7, 9].includes(clk) ? this.#guestMono(now) : now - this.#guestClock().shift * 1000000000n;
+          const secs = Number(ns / 1000000000n), nanos = Number(ns % 1000000000n);
           if (nr === 403) { dv.setBigUint64(buf, BigInt(secs), true); dv.setBigUint64(buf + 8, BigInt(nanos), true); }
           else { dv.setUint32(buf, secs >>> 0, true); dv.setUint32(buf + 4, nr === 78 ? Math.floor(nanos / 1000) : nanos, true); }
           ret(0);
@@ -4928,8 +4952,9 @@ export class Gex {
         // The time, as set_current_time would read it (gettimeofday,
         // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
         // of the door saved.
-        const ns = this.#env.now();
-        r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+        const ns = this.#env.now(), c = this.#guestClock();
+        const wall = ns - c.shift * 1000000000n, mono = c.scale === 1 ? ns - di.bootNs : this.#guestMono(ns);
+        r = di.dispatch(pid, tid, wall / 100n + 116444736000000000n, mono / 100n) >>> 0;
       }
       if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }

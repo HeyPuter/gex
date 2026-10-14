@@ -523,6 +523,8 @@ async function handle(msg) {
   // the fault it was being used to look at.
   if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
   if (msg.doorStats) globalThis.GEX_DOOR_STATS = msg.doorStats;
+  if (msg.timeScale) globalThis.GEX_TIME_SCALE = msg.timeScale;
+  if (msg.fixedTime) globalThis.GEX_FIXED_TIME = msg.fixedTime;
   if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
