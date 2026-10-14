@@ -11,6 +11,8 @@ SANITIZE=${GEX_MESA_SANITIZE:-0}
 # without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
 # Built in its own directory and published under web/public/gex/st/, beside
 # the threaded one.
+# GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (the gate's web build), not
+# the softpipe replay and smokes the tests/mesa-* scripts use.
 THREADS=${GEX_MESA_THREADS:-1}
 VARIANT=mt
 [ "$THREADS" = 0 ] && VARIANT=st
@@ -132,6 +134,11 @@ if [ "$SANITIZE" = 1 ]; then
         src/gallium/targets/gex-wasm/gex-wgpu-smoke.js \
         src/gallium/targets/gex-wasm/gex-gallium-softpipe-conformance.js \
         -j"${JOBS:-$(nproc)}"
+elif [ "${GEX_MESA_PAGE_ONLY:-0}" = 1 ]; then
+    # Only what the page loads. The softpipe replay and the smokes are for the
+    # tests/mesa-* scripts; each of their links (wasm-opt, SPLIT_MODULE) costs
+    # minutes, which the gate's web build doesn't need to spend.
+    ninja -C "$BUILD" src/gallium/targets/gex-wasm/gex-wgpu-replay.js -j"${JOBS:-$(nproc)}"
 else
     ninja -C "$BUILD" \
         src/gallium/targets/gex-wasm/gex-mesa-smoke.js \
