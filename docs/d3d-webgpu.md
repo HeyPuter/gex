@@ -249,11 +249,21 @@ Revisit (a) only if exact Flip3D or animations become the goal.
   visible rect (frame bands, extended margins, blur-behind) whenever the
   window's rects change, and hands them to the new user-driver entry
   `pSetWindowGlass`. winewayland.drv implements it with `gex_glass_v1`.
-- **Not yet**: the frame. Composited windows' non-client areas should be
-  glass with the caption, buttons and borders drawn from aero.msstyles'
-  `DWMWindow` parts (`WINDOW_GLASS_FRAME` is plumbed but nothing sets
-  it); thumbnails; the Windows 7 colorization formula beyond
-  colour-over-blur.
+- **Frames**: `tools/aero/extract-dwm-frame.py` extracts DWM's frame atlas
+  and its parts (rectangles, nine-grid margins, states) from a Windows 7
+  aero.msstyles; the page serves them from the user's own copy at
+  `/gex/aero/` (Microsoft's artwork: gex ships only the tool).
+  `gex_glass_v1.set_frame` carries a frame's flags (frame, active,
+  maximized, tool) and the caption buttons' rectangles and states; the
+  compositor draws the frame pieces, the title in black on its glow, and
+  the buttons and glyphs. In Wine, win32u makes every captioned top-level
+  window's frame glass when the driver draws glass (the glass surrounds
+  the box inside borders and caption; a menu bar stays opaque) and passes
+  the buttons where its own hit testing has them, pressed state included.
+- **Not yet**: hover glow on caption buttons (win32u does not track
+  hover), the reflection streaks, thumbnails and Flip3D, the Windows 7
+  colorization formula beyond colour-over-blur, and an end-to-end run:
+  W3 (winewayland in the page) is not reproducible from the repo yet.
 
 ## 4. Reproducing (macOS, Apple silicon)
 
