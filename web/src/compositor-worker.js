@@ -99,7 +99,9 @@ struct U {
   output: vec2f,    // output size in pixels
   mode: u32,        // 0 = texture, 1 = solid colour, 2 = blur (color.xy: step in texels)
   swizzle: u32,     // 1 = the texture holds BGRA bytes (wl_shm)
-  opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha)
+  opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha), 2 = but in glass
+  glassCount: u32,
+  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels)
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
@@ -139,6 +141,16 @@ fn blur(uv: vec2f) -> vec4f {
   if (u.mode == 2u) { return vec4f(blur(v.uv).rgb, 1.0); }
   if (u.swizzle == 1u) { c = c.bgra; }
   if (u.opaque == 1u) { c.a = 1.0; }
+  // DWM's rule: a window's alpha counts in its glass and nowhere else (GDI
+  // leaves the alpha byte 0, so anything else would be see-through).
+  if (u.opaque == 2u) {
+    var inGlass = false;
+    for (var i = 0u; i < min(u.glassCount, 4u); i++) {
+      let g = u.glass[i];
+      inGlass = inGlass || (all(v.pos.xy >= g.xy) && all(v.pos.xy < g.xy + g.zw));
+    }
+    if (!inGlass) { c.a = 1.0; }
+  }
   return c;
 }`;
 
@@ -226,7 +238,7 @@ class Painter {
       g = this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.uniforms, size: 80 } },
+          { binding: 0, resource: { buffer: this.uniforms, size: 160 } },
           { binding: 1, resource: nearest ? this.nearest : this.sampler },
           { binding: 2, resource: tex.createView() },
         ],
@@ -259,7 +271,7 @@ class Painter {
     return true;
   }
 
-  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv) {
+  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv, glass = null) {
     if (this.n >= MAX_DRAWS) return;
     const o = (this.n * SLOT) / 4;
     const f = this.f32;
@@ -268,6 +280,11 @@ class Painter {
     f[o + 8] = color[0]; f[o + 9] = color[1]; f[o + 10] = color[2]; f[o + 11] = color[3];
     f[o + 12] = this.w; f[o + 13] = this.h;
     this.u32[o + 14] = mode; this.u32[o + 15] = swizzle; this.u32[o + 16] = opaque;
+    this.u32[o + 17] = glass ? Math.min(glass.length, 4) : 0;
+    for (let i = 0; glass && i < Math.min(glass.length, 4); i++) {
+      const g = glass[i];
+      f[o + 20 + 4 * i] = g.x; f[o + 21 + 4 * i] = g.y; f[o + 22 + 4 * i] = g.w; f[o + 23 + 4 * i] = g.h;
+    }
     // 1:1 and on whole pixels: nearest, so a terminal's glyphs are the
     // client's own pixels and not a blend of two neighbours.
     const nearest = mode === 1 || (w === Math.round(w) && h === Math.round(h) && x === Math.round(x)
@@ -339,9 +356,9 @@ class Painter {
     }
   }
 
-  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1] } = {}) {
+  textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1], glass = null } = {}) {
     if (!tex) return;
-    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, opaque, uv);
+    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, glass ? 2 : opaque, uv, glass);
   }
 
   end() {
@@ -1083,9 +1100,10 @@ class Compositor {
     const alpha = ((c >>> 24) / 255) * (g.balance / 100);
     const tint = [((c >> 16) & 0xff) / 255, ((c >> 8) & 0xff) / 255, (c & 0xff) / 255, alpha];
     this.#painter.glass(rects, tint, g.blurBalance / 100);
+    return rects;
   }
 
-  #drawSurface(k, win) {
+  #drawSurface(k, win, glass = null) {
     const f = this.#frameOf(win);
     // A window whose pixels are the host's GL, not the guest's memory: Mesa's
     // frame, a texture on this device (gpu-device.js textureCanvas).
@@ -1106,9 +1124,12 @@ class Compositor {
       return;
     }
     if (!t) return;
+    // With glass, the window's alpha counts in the glass only, whatever its
+    // format, as under DWM.
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
       opaque: win.info?.format === 1 ? 1 : 0,
+      glass: glass?.length ? glass : null,
     });
   }
 
@@ -1387,8 +1408,8 @@ class Compositor {
       const win = this.#windows.get(k);
       if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
       if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
-      if (win.info?.glass) this.#drawGlass(win);
-      this.#drawSurface(k, win);
+      const glass = win.info?.glass ? this.#drawGlass(win) : null;
+      this.#drawSurface(k, win, glass);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);
