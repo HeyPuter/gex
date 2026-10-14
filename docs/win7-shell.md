@@ -95,7 +95,7 @@ prefix is made for and the site runs as; `GEX_CRT_SRC`.
 | `15-wine-i386.sh` | the fork's i386 PE build, installed | `wine-i386-install/usr/local` |
 | `16-dist.sh` | the dist: the native wasm32 module (`winepe.wasm`) and its skeletons for `pe-native.txt` (`tools/wine-wasm/stage-native.sh`), every other i386 module, wine.inf, nls, fonts, winmd | `dist/` (the bundle's `/w3`) |
 | `20-runtime.sh` | gexc for x86 guests, the browser shim, kernel and seed, `npm ci` in web/ | in the gex checkout: `target/x86/release/gexc`, `web/public/gex/*.x86*.wasm` |
-| `30-prefix.sh` | Wine's install (`wineboot -u`) under gexc on the dist, then `tools/wine-wasm/page-prefix.sh` (the W3 session's registry, Wayland driver) | `base-prefix/` |
+| `30-prefix.sh` | Wine's install (`wineboot -u`) under gexc on the dist, a `wineboot -r` that carries out its pending renames, then `tools/wine-wasm/page-prefix.sh` (the W3 session's registry, Wayland driver) | `base-prefix/` |
 | `31-stage.sh` | Windows 7's shell from the image into a copy of the base prefix (`tools/explorer/stage.sh`, `SHELL_KIND=windows`, the images in `native-explorer.txt`); winlogon.exe (`tools/explorer/build-winlogon.sh`) | `prefix/` |
 | `32-bundle.sh` | the bundle: `pfx/` (the prefix with `dll-bases`), `w3/` (the dist), `usr/` (xkb, zoneinfo) | `shell.tar`, `bundle/`, `units.txt` |
 | `33-units.sh` | the function-tier units (`gexc cgen-image` at each pinned base) and the session (the recording with this build's unit keys) | `units/`, `rec/w3-session.json` |
