@@ -18,7 +18,9 @@
 //!   stack per thread), and it may `#include` the files in [`INCLUDES`];
 //! * `nowine`: not for Wine's own build of the library (one whose DOS stub
 //!   says "Wine builtin DLL"), whose internals reach the same state by
-//!   other paths ([`for_image`]).
+//!   other paths ([`for_image`]);
+//! * `onlywine`: only for Wine's own build (the counterpart of a `nowine`
+//!   provider, written against Wine's internals).
 //! * `buildid=<hex>[,<hex>...]` (ELF): only for those builds of the
 //!   library, for a provider that depends on a layout outside the library's
 //!   versioned ABI (docs/elf-providers.md §2).
@@ -67,6 +69,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("crt_math", include_str!("../providers/crt_math.c")),
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
+    ("crt_heap_wine", include_str!("../providers/crt_heap_wine.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
     ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
@@ -128,6 +131,8 @@ pub struct Provider {
     pub stateful: bool,
     /// Not for Wine's build of the library (`nowine` on the first line).
     pub nowine: bool,
+    /// Only for Wine's build of the library (`onlywine`).
+    pub onlywine: bool,
     /// (C function, export), in source order.
     pub binds: Vec<(String, String)>,
     /// Exports that bind together or not at all (`GEX_GROUP`).
@@ -158,10 +163,11 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
-        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64|aarch64> [stateful] [nowine]`");
+        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64|aarch64> [stateful] [nowine|onlywine]`");
     }
     let stateful = w[4..].contains(&"stateful");
     let nowine = w[4..].contains(&"nowine");
+    let onlywine = w[4..].contains(&"onlywine");
     let build_ids = w[4..]
         .iter()
         .filter_map(|x| x.strip_prefix("buildid="))
@@ -202,7 +208,7 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     // `memcpy@@GLIBC_2.14`).
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e || e.split('@').next() == Some(s)));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, arch, class32, stateful, nowine, binds, groups, build_ids })
+    Ok(Provider { name, text, dlls, arch, class32, stateful, nowine, onlywine, binds, groups, build_ids })
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
@@ -233,11 +239,12 @@ pub fn trampoline_exports(unix_call_32: u32) -> HashMap<String, u32> {
 }
 
 /// [`for_dll`] for an image whose file is `data`: without the `nowine`
-/// providers when it is Wine's own build.
+/// providers when it is Wine's own build, and without the `onlywine` ones
+/// when it is not.
 pub fn for_image(dll: &str, class32: bool, data: &[u8]) -> Vec<Provider> {
     let wine = data.get(0x40..0x50) == Some(&b"Wine builtin DLL"[..]);
     let mut v = for_dll(dll, class32);
-    v.retain(|p| !(p.nowine && wine));
+    v.retain(|p| if wine { !p.nowine } else { !p.onlywine });
     v
 }
 
