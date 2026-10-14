@@ -119,6 +119,7 @@ function progressMeter(state, onProgress) {
     at: { download: 0 },
     elapsed: 0,
     error: null,
+    fetch: null,
   };
   state.progress = p;
   let timer = null;
@@ -130,7 +131,7 @@ function progressMeter(state, onProgress) {
     p.elapsed = Math.round(last - t0);
     if (!onProgress) return;
     try {
-      onProgress({ ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at } });
+      onProgress({ ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch } });
     } catch (e) {
       console.warn(`[app] onProgress: ${e?.stack ?? e}`);
     }
@@ -140,6 +141,48 @@ function progressMeter(state, onProgress) {
     /** A count moved: tell the page soon (every 100 ms at most). */
     tick() {
       if (!timer) timer = setTimeout(emit, Math.max(0, 100 - (performance.now() - last)));
+    },
+    /** The program's own fetches while it runs (shims/browser/js/fetch-note.mjs):
+     *  `p.fetch` is the latest in flight, {name, done, total, inflight}, or
+     *  null when none is. A lazy file's `done`/`total` are its bytes read so
+     *  far and its size; a unit's are what it is and 0 until it is in. */
+    watchFetches(lazyNames, unitNames) {
+      if (typeof BroadcastChannel !== 'function') return;
+      const ch = new BroadcastChannel('gex-fetch');
+      const live = new Map(); // id -> { name, key }
+      const files = new Map(); // key -> { name, done, total }
+      const show = () => {
+        let last = null;
+        for (const f of live.values()) last = f;
+        p.fetch = last ? { ...files.get(last.key), inflight: live.size } : null;
+        this.tick();
+      };
+      ch.onmessage = ({ data: m }) => {
+        if (!m || typeof m.what !== 'string') return;
+        let key = m.what;
+        let name;
+        let total = 0;
+        if (m.what.startsWith('unit:')) {
+          const unit = m.what.split('/')[1] ?? '';
+          name = `code for ${unitNames[unit] || 'the program'}`;
+        } else {
+          try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
+          const l = lazyNames.get(key);
+          name = l?.name ?? key.split('/').pop();
+          total = l?.size ?? 0;
+        }
+        const f = files.get(key) ?? { name, done: 0, total };
+        files.set(key, f);
+        if (m.phase === 'start') {
+          live.set(m.id, { key });
+        } else {
+          live.delete(m.id);
+          f.done += m.bytes || 0;
+          if (!f.total || f.done > f.total) f.total = Math.max(f.total, f.done);
+        }
+        show();
+      };
+      state.stopFetches = () => ch.close();
     },
     /** Bytes in, a file whole, a size learned late, a unit compiled. */
     bytes(n) { p.download.done += n; this.tick(); },
@@ -303,6 +346,7 @@ async function begin(opts, base, at, state, meter) {
   // Lazy files: read from the host when the guest first reads them (a bundle
   // split's, docs/eject.md "The bundle split").
   let lazy = [];
+  const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
   if (b.lazy) {
     const m = await fetchJson(at(b.lazy), 'the lazy files\' list');
@@ -311,6 +355,7 @@ async function begin(opts, base, at, state, meter) {
     const lazyBase = new URL(at(m.base)).pathname;
     for (const f of m.files) if (f[3] !== undefined) lazyMtimes[f[0]] = f[3];
     lazy = m.files.map(([path, size, rel]) => [path, size, lazyBase + rel.split('/').map(encodeURIComponent).join('/')]);
+    for (const [path, size, url] of lazy) lazyNames.set(decodeURIComponent(url), { name: path.split('/').pop(), size });
     mark(`lazy: ${lazy.length} files, ${(lazy.reduce((a, f) => a + f[1], 0) / 1048576).toFixed(0)} MiB`);
   }
   const exe = opts.exe ?? b.exe;
@@ -353,6 +398,7 @@ async function begin(opts, base, at, state, meter) {
   let desktop = null;
   let settle;
   meter.phase('boot');
+  meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
   const run = runProgram(term, {
     elf: exeBytes,
@@ -503,6 +549,8 @@ function launchBuild(m, at) {
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
+      // A unit's module, by key: what the page names while one is fetched.
+      unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
     };
   }

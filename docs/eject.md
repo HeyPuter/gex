@@ -429,6 +429,7 @@ at most while bytes arrive, at once on a phase change), and the handle's
 | `at` | each phase's start, ms since `start()` |
 | `elapsed` | ms since `start()`, at this call |
 | `error` | with `'failed'`: why |
+| `fetch` | after the start, what the program is fetching: `{name, done, total, inflight}` (a lazy file: bytes read of its size; translated code: `code for NAME`), or `null` when nothing is in flight; the phase stays `'ready'` |
 
 `'boot'` is the program's first process started, `'first-frame'` a
 window's first pixels in the page. `'ready'` is the first frame unless the
