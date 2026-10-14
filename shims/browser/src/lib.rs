@@ -4327,6 +4327,80 @@ pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
     })
 }
 
+/// The runs of 4 KiB pages in `[start, end)` that are not all zero, for a
+/// fork's image (`#processImage` in gex.mjs): `(at, len)` u32 pairs at `out`,
+/// at most `cap` of them. Returns how many, or -1 when they do not fit (the
+/// caller asks again with more room). The scan was a JS loop over an
+/// `Int32Array`, a word at a time; here it is 16 bytes a load.
+#[no_mangle]
+pub extern "C" fn gex_image_runs(start: u32, end: u32, out: u32, cap: u32) -> i32 {
+    const PAGE: u32 = 4096;
+    let dst = shim_slice_mut(out, cap.saturating_mul(8));
+    let mut n = 0u32;
+    let mut i = start;
+    let mut run: Option<u32> = None;
+    while i < end {
+        let pe = end.min(i.saturating_add(PAGE));
+        if unsafe { page_blank(i, pe) } {
+            if let Some(at) = run.take() {
+                if n == cap {
+                    return -1;
+                }
+                let o = n as usize * 8;
+                dst[o..o + 4].copy_from_slice(&at.to_le_bytes());
+                dst[o + 4..o + 8].copy_from_slice(&(i - at).to_le_bytes());
+                n += 1;
+            }
+        } else if run.is_none() {
+            run = Some(i);
+        }
+        i = pe;
+    }
+    if let Some(at) = run {
+        if n == cap {
+            return -1;
+        }
+        let o = n as usize * 8;
+        dst[o..o + 4].copy_from_slice(&at.to_le_bytes());
+        dst[o + 4..o + 8].copy_from_slice(&(end - at).to_le_bytes());
+        n += 1;
+    }
+    n as i32
+}
+
+/// Whether `[a, b)` of this memory is all zero bytes.
+#[cfg_attr(target_arch = "wasm32", target_feature(enable = "simd128"))]
+unsafe fn page_blank(a: u32, b: u32) -> bool {
+    let p = |x: u32| std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(x as usize));
+    let mut i = a;
+    while i < b && i % 16 != 0 {
+        if unsafe { p(i).read_volatile() } != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::arch::wasm32::*;
+        // Four vectors a test: an early out per 64 bytes is often enough.
+        while i + 64 <= b {
+            let q = p(i) as *const v128;
+            let v = { v128_or(v128_or(v128_load(q), v128_load(q.add(1))), v128_or(v128_load(q.add(2)), v128_load(q.add(3)))) };
+            if v128_any_true(v) {
+                return false;
+            }
+            i += 64;
+        }
+    }
+    while i < b {
+        if unsafe { p(i).read_volatile() } != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// How much of the shim's heap is in use, in KiB. -1 without the counters.
 ///
 /// Worth measuring because the heap is fixed, so exhausting it is a real

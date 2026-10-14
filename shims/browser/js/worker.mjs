@@ -1024,6 +1024,17 @@ const handed = await (async () => {
 })();
 
 port.post({ kind: 'ready' });
+
+// The bridges every process of a page sets up before it runs (GL, Wayland,
+// network), loaded now, while this Worker waits in the host's pool: imported
+// only when a process arrived, they were about a quarter of a forked child's
+// start (12.8, 7.3 and 5.6 ms of 104 on apt's children, timed per phase). A
+// later `import` of each is then the module already evaluated.
+if (typeof self !== 'undefined') {
+  import('./gl-bridge.mjs').catch(() => {});
+  import('./wl-bridge.mjs').catch(() => {});
+  import('./net-bridge.mjs').catch(() => {});
+}
 if (handed) handle(handed);
 }
 

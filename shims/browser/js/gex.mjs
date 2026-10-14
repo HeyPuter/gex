@@ -2021,7 +2021,38 @@ export class Gex {
       return true;
     };
     const out = [];
-    const runs = (start, end) => {
+    // The scan in the shim (`gex_image_runs`, 16 bytes a load) when it has
+    // one; the pairs it writes are the runs of pages that are not all zero.
+    let runsCap = 0;
+    let runsAt = 0;
+    const runsWasm = e.gex_image_runs
+      ? (start, end) => {
+        for (;;) {
+          if (!runsCap) {
+            runsCap = 1024;
+            runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+          }
+          const n = e.gex_image_runs(start, end, runsAt, runsCap);
+          if (n >= 0) {
+            // Views made now: the allocation above may have grown memory.
+            const pairs = new Uint32Array(this.#memory.buffer, runsAt, n * 2);
+            const mem = this.#bytes();
+            let dense = 0;
+            for (let j = 0; j < n; j++) {
+              const at = pairs[j * 2];
+              const len = pairs[j * 2 + 1];
+              out.push({ at, bytes: mem.slice(at, at + len), dense: true });
+              dense += len;
+            }
+            return end - start - dense;
+          }
+          e.gex_free?.(runsAt, runsCap * 8);
+          runsCap *= 4;
+          runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+        }
+      }
+      : null;
+    const runs = runsWasm ?? ((start, end) => {
       const PAGE = 4096;
       let zeros = 0;
       let i = start;
@@ -2042,7 +2073,7 @@ export class Gex {
         i = run;
       }
       return zeros;
-    };
+    });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
@@ -2061,6 +2092,7 @@ export class Gex {
       }
     }
     e.gex_free?.(scratch, 24);
+    if (runsCap) e.gex_free?.(runsAt, runsCap * 8);
     // A checksum per region, so the child can say whether what it runs on is
     // what was sent: a corrupt copy and a good copy under a disagreeing kernel
     // look identical otherwise (#96).
