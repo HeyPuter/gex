@@ -18,7 +18,9 @@
 //!   stack per thread), and it may `#include` the files in [`INCLUDES`];
 //! * `nowine`: not for Wine's own build of the library (one whose DOS stub
 //!   says "Wine builtin DLL"), whose internals reach the same state by
-//!   other paths ([`for_image`]).
+//!   other paths ([`for_image`]);
+//! * `wineonly`: only for Wine's own build (the counterpart of a `nowine`
+//!   provider, written against Wine's internals).
 //! * `buildid=<hex>[,<hex>...]` (ELF): only for those builds of the
 //!   library, for a provider that depends on a layout outside the library's
 //!   versioned ABI (docs/elf-providers.md §2).
@@ -68,6 +70,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("wine_libm", include_str!("../providers/wine_libm.c")),
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
+    ("crt_heap_wine", include_str!("../providers/crt_heap_wine.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
     ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
