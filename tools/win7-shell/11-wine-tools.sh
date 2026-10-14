@@ -8,5 +8,8 @@ mkdir -p "$B"; cd "$B"
 [ -f Makefile ] || "$WINE_SRC/configure" $WINE_OPTS --without-mingw --without-freetype --without-wayland --without-opengl \
   > "$W7_OUT/logs/wine-tools-configure.log" 2>&1 || { tail -20 "$W7_OUT/logs/wine-tools-configure.log"; exit 1; }
 nice make -j"$JOBS" __tooldeps__ > "$W7_OUT/logs/wine-tools-make.log" 2>&1 || { grep -m20 -i error "$W7_OUT/logs/wine-tools-make.log"; exit 1; }
-ls tools/winebuild/winebuild tools/widl/widl tools/wrc/wrc > /dev/null
+# wrc and wmc read the locale table from the tools tree's nls/ (a build of
+# all would link it there from the source)
+ln -sfn "$WINE_SRC/nls/locale.nls" nls/locale.nls
+ls tools/winebuild/winebuild tools/widl/widl tools/wrc/wrc nls/locale.nls > /dev/null
 step "done: $B"
