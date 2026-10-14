@@ -10,8 +10,10 @@
 #
 # PASS: the world comes up, keeps running (no 30 s without a world frame), and
 # runs at LEG_MIN_WFPS world frames/s or more (default below, from baseline
-# runs on edger). FAIL also when noita.exe has no function-tier unit: it would
-# run on tier-1, and the number would mean nothing.
+# runs on edger; 1 for BENCH_CLASS=check, a correctness run, e.g. LEG_SECS=60).
+# BENCH_HOST=worldmachine runs it there (bench.sh); the pulls follow it.
+# FAIL also when noita.exe has no function-tier unit: it would run on tier-1,
+# and the number would mean nothing.
 #
 # The frozen inputs, in NOITA_LEG_DIR (default ~/gex-sandbox/scratch/W/gate-noitapage):
 #   base/   a W3 page tree (W's tree C, 2026-10-10: Mesa, node_modules), never
@@ -32,8 +34,19 @@
 # The provider modules go in too, with the same gexc and GEX_CGEN_CACHE:
 # `gexc cgen-image --providers` (units/providers; no image's unit carries
 # them). The page names a missing one as "missing unit:", and the leg fails on
-# it at once. (So does the NT shim's trampoline unit, `--nt-trampolines32`,
+# it at once, as on any image with code that has no unit at the base it landed
+# at (NOITA_UNITLESS_OK: a regex of images without code, default tzres and
+# normaliz). (So does the NT shim's trampoline unit, `--nt-trampolines32`,
 # which W3 runs do not place.)
+# The units are built with gex's own indirect-call profile of Noita,
+# tests/games/noita-icall (a counting run's, at the bases it ran at): after
+# a first build, `tests/games/noita-icall/place.py units LIST BUILDLOG`
+# (LIST the images and bases built, BUILDLOG that build's log, which names
+# each one's identity) moves it to these bases as units/icall/, and a second
+# build devirtualises the hot table calls. A new profile: build the units
+# with GEX_CGEN_ICALL_COUNT=1, run with NOITA_Q='&cgen=1&icallcount=1' and
+# NOITA_KEEP=icall, and split the run's dumps (tmp/noita-err.txt on the
+# bench box) with tests/games/noita-icall/split.py.
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
@@ -41,11 +54,13 @@ set -u
 if [ "${1:-}" = --remote ]; then
   # The bench box's half: TREE NOITA_EXE UNITS SECS, from the sandbox root.
   T=$(cd $2 && pwd) X=$(realpath $3) U=$(cd $4 && pwd) secs=$5
+  # NOITA_SHOT comes relative to the project root, which differs per box.
+  [ -n "${NOITA_SHOT:-}" ] && export NOITA_SHOT=$(realpath -m "$NOITA_SHOT")
   free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
   CP=$(free_port); VP=$(free_port)
   mkdir -p $T/../tmp
   export TMPDIR=$(cd $T/.. && pwd)/tmp GEX_NT_CHROME_PORT=$CP GEX_NT_VITE_PORT=$VP GEX_WEBGPU_SOFTWARE=0
-  export GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
+  export GEX_NT_BROWSER_MAX_LINES=200000 GEX_CGEN_CACHE=$U GEX_NT_BROWSER_KEEP="no function-tier unit|validation${NOITA_KEEP:+|$NOITA_KEEP}"
   kill_ours() { for p in $(pgrep -f -- "--remote-debugging-port=$CP\b"); do kill $p 2>/dev/null; done; }
   trap 'kill_ours; [ -n "${np:-}" ] && kill $np 2>/dev/null; exit 143' TERM INT
   node $T/tests/games/noita-page.mjs $T $X $secs 2> $TMPDIR/noita-err.txt & np=$!
@@ -73,12 +88,20 @@ fi
 W=$(cd "${1:?usage: noita-page-leg.sh TREE [--no-build]}" && pwd)
 . ~/gex-sandbox/scratch/env.sh 2>/dev/null
 B=~/gex-sandbox/scratch/bench/bench.sh
+# The bench box (bench.sh's BENCH_HOST) and its project root, for the pulls.
+case ${BENCH_HOST:-edger} in
+  edger) RH=claude@edger RR=gex-sandbox ;;
+  worldmachine) RH=velzie@worldmachine RR=src/noita-wasm ;;
+  *) echo "FAIL noita page: unknown BENCH_HOST ${BENCH_HOST}"; exit 1 ;;
+esac
 # Baselines (edger, 300 s windows, run alternately against master):
 # step/klock-9 7ee38ef2 (the poll family lock-free) 13.1, 16.3 and 16.2
 # world frames/s, the world up at 74-78 s; master 3.2 and 3.4 (2026-10-12,
 # master 3a61c3d8: 3.6, 3.6, 3.7). The floor is about 23% under klock-9's
 # 16.2 median, leaving room for a cold first run like the 13.1.
-MIN=${LEG_MIN_WFPS:-12.5}
+# A check-class run (BENCH_CLASS=check: shares the box, e.g. LEG_SECS=60 in the
+# core gate) is a correctness run: the world must come up and move, at any speed.
+if [ "${BENCH_CLASS:-timed}" = check ]; then MIN=${LEG_MIN_WFPS:-1}; else MIN=${LEG_MIN_WFPS:-12.5}; fi
 if [ "${2:-}" != "--no-build" ]; then
   mkdir -p $W/web/public/gex
   for s in kernel browser; do
@@ -100,19 +123,25 @@ for f in gex_browser.x86.shared.wasm gex_browser.x86.wasm gex_kernel.x86.plain.w
   rm -f $T/web/public/gex/$f; cp $W/web/public/gex/$f $T/web/public/gex/$f
 done
 R=${A#$HOME/gex-sandbox/}
-# NOITA_SHOTS=1: screenshots of each click and every 30 s, back into $A/shots
-# (edger only).
+# NOITA_SHOTS=1: screenshots of each click and every 30 s (and NOITA_PROF's
+# profiles), back into $A/shots.
 # WDBG: Wine's debug channels for the run (noita-page.mjs's default otherwise).
 shots="env NOITA_WORLD_BY_MIN=${NOITA_WORLD_BY_MIN:-12}"
-[ -n "${NOITA_SHOTS:-}" ] && shots="$shots NOITA_SHOT=$HOME/gex-sandbox/$R/shots"
+[ -n "${NOITA_SHOTS:-}" ] && shots="$shots NOITA_SHOT=$R/shots"
 [ -n "${WDBG:-}" ] && shots="$shots WDBG=$WDBG"
 # NOITA_PROF=AT,MS (a profiling run, see noita-page.mjs), NOITA_Q (the page's
 # query flags, default &cgen=1), NOITA_KEEP (console lines to keep).
 [ -n "${NOITA_PROF:-}" ] && shots="$shots NOITA_PROF=$NOITA_PROF"
 [ -n "${NOITA_Q:-}" ] && shots="$shots NOITA_Q=$NOITA_Q"
 [ -n "${NOITA_KEEP:-}" ] && shots="$shots NOITA_KEEP=$NOITA_KEEP"
+# NOITA_ENV=K=V,...: more environment for the program (GEX_NT_ENTRY_LOG=1 with
+# NOITA_KEEP='web entry' records the profile's function starts, noita-icall/entries.py).
+[ -n "${NOITA_ENV:-}" ] && shots="$shots NOITA_ENV=$NOITA_ENV"
+[ -n "${NOITA_UNITLESS_OK:-}" ] && shots="$shots NOITA_UNITLESS_OK=$NOITA_UNITLESS_OK"
 BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} $B -s $T -s $A/units -- $shots bash $R/tree/tests/games/noita-page-leg.sh --remote $R/tree Noita/noita.exe $R/units ${LEG_SECS:-300} > $A/last.txt 2>&1
-[ -n "${NOITA_SHOTS:-}" ] && { rm -rf $A/shots; rsync -a claude@edger:gex-sandbox/$R/shots/ $A/shots/; ssh claude@edger "rm -rf gex-sandbox/$R/shots"; }
+[ -n "${NOITA_SHOTS:-}" ] && { rm -rf $A/shots; rsync -a $RH:$RR/$R/shots/ $A/shots/; ssh $RH "rm -rf $RR/$R/shots"; }
+# The page's stderr (Wine's and the console's kept lines), back into $A/noita-err.txt.
+rsync -a $RH:$RR/$R/tmp/noita-err.txt $A/noita-err.txt 2>/dev/null || rm -f $A/noita-err.txt
 res=$(grep -m1 '^== noita' $A/last.txt)
 if grep -q '^unitless: .*/noita\.exe ' $A/last.txt; then echo "FAIL noita page: noita.exe has no function-tier unit (rebuild $A/units for this gex-cgen); ${res:-no result}"; exit 1; fi
 wfps=$(echo "$res" | sed -n 's/.*, world \([0-9.]*\) frames\/s.*/\1/p')

@@ -106,24 +106,32 @@ impl Pipe {
                 self.queue.notify();
     }
 
-    /// Read up to `max` bytes into a buffer of what was there, sized under
-    /// the pipe's own lock: a size taken from [`Pipe::buffered`] first can be
-    /// stale by the time of the read (another reader drained it, a writer
-    /// filled it), and a one-byte read of a pipe that then received a whole
-    /// record tears that record.
-    pub fn read_vec(&self, max: usize) -> Result<Vec<u8>, Errno> {
+    /// Read up to `max` bytes, handing what was there to `take` as the
+    /// buffer's two slices (the second empty unless the ring wrapped), sized
+    /// under the pipe's own lock: a size taken from [`Pipe::buffered`] first
+    /// can be stale by the time of the read (another reader drained it, a
+    /// writer filled it), and a one-byte read of a pipe that then received a
+    /// whole record tears that record. `take` copies them out (into another
+    /// process's memory, `k_pipe_read`) before they are dropped: collecting
+    /// them into a `Vec` first went a byte at a time, and cost 270-460 us
+    /// for a full 64 KiB pipe in the page, most of the time a writer blocked
+    /// on that pipe waited to be woken.
+    pub fn read_with(&self, max: usize, take: impl FnOnce(&[u8], &[u8])) -> Result<usize, Errno> {
         if max == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let mut s = self.state.lock().unwrap();
         if s.buf.is_empty() {
-            return if s.writers == 0 { Ok(Vec::new()) } else { Err(Errno::EAGAIN) };
+            return if s.writers == 0 { Ok(0) } else { Err(Errno::EAGAIN) };
         }
         let n = max.min(s.buf.len());
-        let out: Vec<u8> = s.buf.drain(..n).collect();
+        let (front, back) = s.buf.as_slices();
+        let k = n.min(front.len());
+        take(&front[..k], &back[..n - k]);
+        s.buf.drain(..n);
         self.ready.notify_all();
         self.queue.notify();
-        Ok(out)
+        Ok(n)
     }
 
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
@@ -158,7 +166,15 @@ impl Pipe {
     }
 
     pub fn write(&self, buf: &[u8]) -> SysResult {
-        if buf.is_empty() {
+        self.write_with(buf.len(), |dst, from| dst.copy_from_slice(&buf[from..from + dst.len()]))
+    }
+
+    /// [`Pipe::write`] of `len` bytes that `fill` copies in: `fill(dst, from)`
+    /// writes the source's bytes `from..from + dst.len()` into `dst`, which is
+    /// the pipe's own buffer -- so a write from another process's memory
+    /// (`k_pipe_write`) is one copy, not one into a staging `Vec` first.
+    pub fn write_with(&self, len: usize, mut fill: impl FnMut(&mut [u8], usize)) -> SysResult {
+        if len == 0 {
             return Ok(0);
         }
         let mut s = self.state.lock().unwrap();
@@ -176,23 +192,40 @@ impl Pipe {
             let room = PIPE_BUF.saturating_sub(s.buf.len());
             // A small write waits for room for all of it (`EAGAIN` here; the
             // syscall layer parks a blocking one and tries it whole again).
-            if buf.len() <= PIPE_ATOMIC && room < buf.len() {
+            if len <= PIPE_ATOMIC && room < len {
                 s.refused += 1;
                 return Err(Errno::EAGAIN);
             }
             if room > 0 {
-                let n = room.min(buf.len() - written);
-                s.buf.extend(&buf[written..written + n]);
+                let n = room.min(len - written);
+                let old = s.buf.len();
+                s.buf.resize(old + n, 0);
+                // The `n` bytes just added are the deque's last: the end of
+                // its second slice, or of the first and all of the second
+                // when they wrap.
+                let (front, back) = s.buf.as_mut_slices();
+                if back.len() >= n {
+                    let at = back.len() - n;
+                    fill(&mut back[at..], written);
+                } else {
+                    let k = n - back.len();
+                    let at = front.len() - k;
+                    fill(&mut front[at..], written);
+                    if !back.is_empty() {
+                        fill(back, written + k);
+                    }
+                }
                 s.writes += 1;
                 s.written += n as u64;
                 // Bounded, and the *first* bytes rather than the last: a
                 // protocol line says what it is in its first word.
-                s.last.clear();
-                s.last.extend(buf[written..written + n].iter().take(160));
+                let st = &mut *s;
+                st.last.clear();
+                st.last.extend(st.buf.range(old..old + n.min(160)));
                 written += n;
                 self.ready.notify_all();
                 self.queue.notify();
-                if written == buf.len() {
+                if written == len {
                     return Ok(written as u64);
                 }
             }
@@ -288,16 +321,44 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// `read_vec` takes up to what is there, sized under the lock: never a
-    /// stale size that splits a record.
+    /// `read_with` takes up to what is there, sized under the lock: never a
+    /// stale size that splits a record; and hands over a wrapped buffer
+    /// whole, in order.
     #[test]
-    fn read_vec_takes_whole_records() {
+    fn read_with_takes_whole_records() {
         let p = Pipe::new();
-        assert_eq!(p.read_vec(64), Err(Errno::EAGAIN));
+        let take = |p: &Pipe, max: usize| {
+            let mut out = Vec::new();
+            p.read_with(max, |a, b| {
+                out.extend_from_slice(a);
+                out.extend_from_slice(b);
+            })
+            .map(|n| {
+                assert_eq!(n, out.len());
+                out
+            })
+        };
+        assert_eq!(take(&p, 64), Err(Errno::EAGAIN));
         p.write(&[3u8; 64]).unwrap();
         p.write(&[4u8; 64]).unwrap();
-        assert_eq!(p.read_vec(64).unwrap(), vec![3u8; 64]);
-        assert_eq!(p.read_vec(1000).unwrap(), vec![4u8; 64]);
+        assert_eq!(take(&p, 64).unwrap(), vec![3u8; 64]);
+        assert_eq!(take(&p, 1000).unwrap(), vec![4u8; 64]);
+        // Around the end of the ring: fill, drain part, fill again.
+        let all: Vec<u8> = (0..PIPE_BUF).map(|i| i as u8).collect();
+        assert_eq!(p.write(&all).unwrap(), PIPE_BUF as u64);
+        assert_eq!(take(&p, 1000).unwrap(), all[..1000]);
+        let more: Vec<u8> = (0..1000).map(|i| (i * 7) as u8).collect();
+        assert_eq!(p.write(&more).unwrap(), 1000);
+        let got = take(&p, PIPE_BUF).unwrap();
+        assert_eq!(got[..PIPE_BUF - 1000], all[1000..]);
+        assert_eq!(got[PIPE_BUF - 1000..], more[..]);
+        // A write that wraps the ring, filled through `write_with`.
+        let big: Vec<u8> = (0..PIPE_BUF).map(|i| (i * 13) as u8).collect();
+        assert_eq!(p.write(&big[..5000]).unwrap(), 5000);
+        assert_eq!(take(&p, 5000).unwrap(), big[..5000]);
+        let n = p.write_with(PIPE_BUF, |d, from| d.copy_from_slice(&big[from..from + d.len()])).unwrap();
+        assert_eq!(n, PIPE_BUF as u64);
+        assert_eq!(take(&p, PIPE_BUF).unwrap(), big);
     }
 
     #[test]

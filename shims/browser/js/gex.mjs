@@ -419,6 +419,12 @@ const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
  * A cheap content hash for whether two copies of a region agree. FNV-1a over
  * words, not bytes: only ever answers same-or-different.
  */
+/// How many bytes a fork image entry carries: its `bytes`, or, staged in the
+/// global kernel's memory (`#processImage`), its `len`.
+function imageLen(r) {
+  return r.len ?? r.bytes?.byteLength ?? 0;
+}
+
 function sum32(buf) {
   const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, Math.floor(buf.byteLength / 4));
   let h = 0x811c9dc5;
@@ -1062,6 +1068,8 @@ export class Gex {
   static wasmDlls = '';
   /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
   static elfUnits = '';
+  /** `export,...` (the page's `?provskip=`): exports no provider binds (`GEX_PROVIDER_SKIP`). */
+  static providerSkip = '';
   /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
   static fjitLibs = '';
   static #whySlot = 0;
@@ -1132,6 +1140,42 @@ export class Gex {
    * (`gex_worker_release`). The last call into this instance: the slot's next
    * holder runs on the same stack.
    */
+  /** This process's memory, every non-zero page zeroed, for another
+   *  process to start in; null where that cannot be done (the memory is not
+   *  shared, mem64, no global kernel). Only after the process is gone and
+   *  nothing will run in this instance again. The non-zero runs are found by
+   *  the shim's scan (`gex_image_runs`) and cleared by the kernel's
+   *  `memory.fill` (`k_proc_zero`), so only pages the process wrote are
+   *  written again. */
+  recycleMemory() {
+    const e = this.#shim?.exports;
+    const k = this.#kernel;
+    if (!e?.gex_image_runs || !k?.k_proc_zero || m64() || single.on) return null;
+    if (!isShared(this.#memory.buffer)) return null;
+    const size = this.#memory.buffer.byteLength;
+    let cap = 4096;
+    let at = e.gex_alloc(cap * 8) >>> 0;
+    const runs = [];
+    const CHUNK = 64 << 20;
+    for (let s = 0; s < size; ) {
+      const end = Math.min(size, s + CHUNK);
+      const n = e.gex_image_runs(s, end, at, cap);
+      if (n < 0) {
+        e.gex_free?.(at, cap * 8);
+        cap *= 4;
+        at = e.gex_alloc(cap * 8) >>> 0;
+        continue;
+      }
+      const pairs = new Uint32Array(this.#memory.buffer, at, n * 2);
+      for (let j = 0; j < n; j++) runs.push(pairs[j * 2], pairs[j * 2 + 1]);
+      s = end;
+    }
+    for (let j = 0; j < runs.length; j += 2) {
+      if (k.k_proc_zero(runs[j], runs[j + 1]) !== 0) return null;
+    }
+    return this.#memory;
+  }
+
   releaseWorker() {
     if (this.#stackTop === null) return;
     try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
@@ -1300,6 +1344,10 @@ export class Gex {
           }
         },
         now: () => this.#env.now(),
+        // The clock's hot path (lib.rs `host_now_ns`): an f64 per call, the
+        // BigInt origin once per thread. `hostNowNs` is the same sum.
+        perf_now: () => performance.now(),
+        clock_origin: () => ORIGIN_NS,
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
         // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
@@ -1463,6 +1511,7 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+    this.#providerSkipApply();
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
@@ -1763,6 +1812,8 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      // A counting unit's table calls (cgen.rs `gex_icall_note`).
+      icall_note: e.gex_icall_note,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
@@ -1779,6 +1830,9 @@ export class Gex {
     // A test switch (tests/x86-programs/page-cross-entry.c): a retired page
     // left numbered with no directory entry.
     if (globalThis.GEX_TEST_UNPUBLISHED_RETIRE || globalThis.process?.env?.GEX_TEST_UNPUBLISHED_RETIRE) e.gex_test_unpublished_retire?.(1);
+    // Another (tests/x86-programs/served-entries.c): served modules are
+    // installed one at a time, as when the merger declines them.
+    if (globalThis.GEX_TEST_SERVE_UNMERGED || globalThis.process?.env?.GEX_TEST_SERVE_UNMERGED) e.gex_test_serve_unmerged?.(1);
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
     if (opts.fjit && e.gex_set_fjit) {
@@ -1977,6 +2031,7 @@ export class Gex {
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      this.#providerSkipApply();
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
       this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
@@ -1995,6 +2050,8 @@ export class Gex {
       safepoint: single.on ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
       x87: e.gex_x87,
+      // A counting unit's table calls (cgen.rs `gex_icall_note`).
+      icall_note: e.gex_icall_note,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
@@ -2023,6 +2080,40 @@ export class Gex {
    * switch for the life of both, which is what the switcher was built to cope
    * with.
    */
+  /** Copy the runs `#processImage` left as `len` into one staging buffer,
+   *  noting each one's offset (`stage`) and the buffer (`#imageStage`, sent
+   *  as the record's `imageStage`); the child copies them out and frees it.
+   *  Sliced as before when the kernel cannot hold them. */
+  #stageImage(out) {
+    const k = this.#kernel;
+    const staged = out.filter((r) => r.len !== undefined);
+    const total = staged.reduce((n, r) => n + r.len, 0);
+    let id = total ? k.k_stage_take(total) : 0;
+    let off = 0;
+    for (const r of id > 0 ? staged : []) {
+      if (k.k_stage_pull(id, off, r.at, r.len) !== 0) {
+        k.k_stage_drop(id);
+        id = 0;
+        break;
+      }
+      r.stage = off;
+      off += r.len;
+    }
+    if (id > 0) {
+      this.#imageStage = id;
+      return;
+    }
+    const mem = this.#bytes();
+    for (const r of staged) {
+      r.bytes = mem.slice(r.at, r.at + r.len);
+      delete r.len;
+      delete r.stage;
+    }
+  }
+
+  /// The staging buffer of the image `#processImage` built last (0: none).
+  #imageStage = 0;
+
   #processImage() {
     const t0 = performance.now();
     const e = this.#shim.exports;
@@ -2046,7 +2137,53 @@ export class Gex {
       return true;
     };
     const out = [];
-    const runs = (start, end) => {
+    // The runs go through a staging buffer in the global kernel's memory where
+    // there is one to share (`k_stage_*`): `memory.copy` both ways, into pages
+    // a previous fork already touched, where a fresh ArrayBuffer per run cost
+    // ~50 ms here and ~100 ms in the child for apt-get's 62.6 MiB. Not with
+    // `GEX_DEBUG_EXIT`, whose checksums read the bytes; not in a build whose
+    // memories are not shared (the single-thread page), which transfers them.
+    const k = this.#kernel;
+    const staging = !globalThis.GEX_DEBUG_EXIT && !m64() && !!k?.k_stage_take
+      && isShared(this.#memory.buffer)
+      && isShared(this.#kernelSpec?.memory?.buffer);
+    this.#imageStage = 0;
+    // The scan in the shim (`gex_image_runs`, 16 bytes a load) when it has
+    // one; the pairs it writes are the runs of pages that are not all zero.
+    // Not in a 64-bit memory: its addresses are u32, and a region above 4 GiB
+    // (a thread's stack in the high arena) was scanned at its address cut to
+    // 32 bits -- thread-churn's forked child got the parent's low pages over
+    // its own (module registry rows naming a module store it does not have).
+    let runsCap = 0;
+    let runsAt = 0;
+    const runsWasm = e.gex_image_runs && !m64()
+      ? (start, end) => {
+        for (;;) {
+          if (!runsCap) {
+            runsCap = 1024;
+            runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+          }
+          const n = e.gex_image_runs(start, end, runsAt, runsCap);
+          if (n >= 0) {
+            // Views made now: the allocation above may have grown memory.
+            const pairs = new Uint32Array(this.#memory.buffer, runsAt, n * 2);
+            const mem = this.#bytes();
+            let dense = 0;
+            for (let j = 0; j < n; j++) {
+              const at = pairs[j * 2];
+              const len = pairs[j * 2 + 1];
+              out.push(staging ? { at, len, dense: true } : { at, bytes: mem.slice(at, at + len), dense: true });
+              dense += len;
+            }
+            return end - start - dense;
+          }
+          e.gex_free?.(runsAt, runsCap * 8);
+          runsCap *= 4;
+          runsAt = e.gex_alloc(runsCap * 8) >>> 0;
+        }
+      }
+      : null;
+    const runs = runsWasm ?? ((start, end) => {
       const PAGE = 4096;
       let zeros = 0;
       let i = start;
@@ -2067,7 +2204,7 @@ export class Gex {
         i = run;
       }
       return zeros;
-    };
+    });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
@@ -2086,6 +2223,8 @@ export class Gex {
       }
     }
     e.gex_free?.(scratch, 24);
+    if (runsCap) e.gex_free?.(runsAt, runsCap * 8);
+    if (staging) this.#stageImage(out);
     // A checksum per region, so the child can say whether what it runs on is
     // what was sent: a corrupt copy and a good copy under a disagreeing kernel
     // look identical otherwise (#96).
@@ -2496,7 +2635,12 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + r.bytes.byteLength), 0));
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.end ?? 0, r.at + imageLen(r)), 0));
+    // A staged image (`#stageImage`) is copied out by the global kernel, here
+    // before `attach` as the transferred one is: its instance only needs this
+    // memory, and starting it again there is a no-op.
+    const stage = child.imageStage > 0 ? child.imageStage : 0;
+    if (stage) await this.#startKernel();
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -2516,12 +2660,19 @@ export class Gex {
     let skipped = 0;
     let zeros = 0;
     for (const r of child.image) {
-      const n = r.bytes.byteLength;
+      const n = imageLen(r);
       if (n > skipOver) {
         skipped += n;
         continue;
       }
       zeros += r.zeros ?? 0;
+      if (r.stage !== undefined) {
+        if (this.#kernel.k_stage_push(stage, r.stage, r.at, n) !== 0) {
+          throw new Error(`fork image: staged run at 0x${r.at.toString(16)} (${n} bytes) did not copy`);
+        }
+        copied += n;
+        continue;
+      }
       if (r.dense) {
         u8.set(new Uint8Array(r.bytes), r.at);
         copied += n;
@@ -2531,6 +2682,7 @@ export class Gex {
       copied += wrote;
       zeros += blank;
     }
+    if (stage) this.#kernel.k_stage_drop(stage);
     this.#forkCopied = copied;
     this.#forkSkipped = skipped;
     this.#forkZeros = zeros;
@@ -2561,7 +2713,7 @@ export class Gex {
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
     this.#forkChild = true;
-    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + r.bytes.byteLength));
+    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + imageLen(r)));
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -2690,7 +2842,7 @@ export class Gex {
           // to Chrome's own coarse counter.
           + ` used=${performance.memory?.usedJSHeapSize ?? 'n/a'}`
           + ` limit=${performance.memory?.jsHeapSizeLimit ?? 'n/a'}`
-          + ` image=${(child.image ?? []).reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0)}`
+          + ` image=${(child.image ?? []).reduce((n, r) => n + imageLen(r), 0)}`
           + ` modules=${(child.modules ?? []).length}`,
       );
     }
@@ -3013,10 +3165,13 @@ export class Gex {
         const t0 = performance.now();
         const img = this.#processImage();
         this.#imageMs = performance.now() - t0;
-        this.#imageBytes = img.reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0);
+        this.#imageBytes = img.reduce((n, r) => n + imageLen(r), 0);
         this.#imageRegions = img.length;
         return img;
       })(),
+      // Where the image's runs are staged, in the global kernel's memory (0:
+      // they travel as `bytes`). The child copies them out and frees it.
+      imageStage: this.#imageStage,
       // The map, separately from the bytes: names and code identities the child
       // needs to recognise a page as belonging to an already-translated library.
       vmaBlob: this.#vmaBlob(),
@@ -3303,6 +3458,23 @@ export class Gex {
   }
 
   #cgenMode = 0;
+  /** Exports the built-in providers leave alone (`?provskip=a,b`, as
+   *  GEX_PROVIDER_SKIP natively): every process of the run, before the
+   *  shim keys its units. */
+  providerSkip(list) {
+    this.#providerSkip = String(list ?? '');
+    if (this.#shim) this.#providerSkipApply();
+  }
+  #providerSkip = '';
+  #providerSkipApply() {
+    const e = this.#shim.exports;
+    if (!this.#providerSkip || !e.gex_cgen_set_provider_skip) return;
+    const b = new TextEncoder().encode(this.#providerSkip);
+    const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+    this.#bytes().set(b, p);
+    e.gex_cgen_set_provider_skip(p, b.length);
+    e.gex_free?.(p, Math.max(8, b.length));
+  }
   /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
    *  the run (a forked child's Worker is told too). Before the shim exists. */
   /** `?wasmdlls=soname=path,...`: libraries this process replaces with wasm64
@@ -3314,6 +3486,13 @@ export class Gex {
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
       this.#bytes().set(b, p);
       e.gex_fjit_libs(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
+    if (Gex.providerSkip && e.gex_provider_skip) {
+      const b = new TextEncoder().encode(Gex.providerSkip);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_provider_skip(p, b.length);
       e.gex_free?.(p, Math.max(8, b.length));
     }
     if (Gex.elfUnits && e.gex_cgen_elf_units) {
@@ -3520,6 +3699,9 @@ export class Gex {
         ...(prov >= 0 ? {
           // The shim's exports themselves: a wasm-to-wasm call, no JS.
           nt_qpc: e.gex_nt_qpc,
+          clock_ns: e.gex_clock_ns,
+          // A provider's fallback to the lifted body (provider.h gp_lifted).
+          ftab_twin: e.gex_ftab_twin,
           provider_alloc_top: e.gex_provider_alloc_top,
           // Wine's Unix side (W3.1): its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults
@@ -3563,6 +3745,9 @@ export class Gex {
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     };
+    // A unit split by function (gex_split): its cold clusters' loader,
+    // or the recorder's hit map of an instrumented unit.
+    if (prov < 0 && jit < 0) this.#splitImports(mod, this.#cgenStr(e.gex_cgen_key, u), imports);
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).
     const extra = wasmprog ? this.#wasmprogBind(prov, imports, st) : [];
     // What a door instance needs to run this program again on its memory
@@ -3607,6 +3792,136 @@ export class Gex {
     const ms = performance.now() - tInst;
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
+  }
+
+  /** Each module's imports, as `module.name`. */
+  #modImports = new WeakMap();
+
+  /** The imports a split unit's primary takes beyond a unit's: `gex.cold(c)`,
+   *  which instantiates cold cluster `c` here (its start function fills its
+   *  slots in this Worker's table, and the stub that called goes on to the
+   *  real body); and an instrumented unit's `gexcov.hit(slot)`. */
+  #splitImports(mod, key, imports) {
+    let names = this.#modImports.get(mod);
+    if (!names) {
+      names = new Set(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`));
+      this.#modImports.set(mod, names);
+    }
+    if (names.has('gex.cold')) {
+      const loaded = new Set();
+      imports.gex = { ...imports.gex, cold: (c) => {
+        c >>>= 0;
+        if (loaded.has(c)) throw new Error(`gex-cgen: ${key}: cold cluster ${c} is in, yet its stub ran`);
+        loaded.add(c);
+        const t0 = performance.now();
+        const m = this.#coldModule(key, c);
+        new WebAssembly.Instance(m, { env: imports.env, gex: imports.gex });
+        this.#coldMs += performance.now() - t0;
+      } };
+    }
+    if (names.has('gexcov.hit')) {
+      // A byte per slot: the slot count is the first word of `gex.funcs`.
+      const sec = WebAssembly.Module.customSections(mod, 'gex.funcs')[0];
+      const n = sec ? new DataView(sec).getUint32(0, true) : 65536;
+      imports.gexcov = { hit: this.#covHit(key, n) };
+    }
+  }
+
+  /** Time this Worker spent bringing in cold clusters, and how many. */
+  #coldMs = 0;
+  #coldIndex = new Map();
+
+  /** Cold cluster `c` of the unit `key`, compiled: a sibling's, or fetched
+   *  (a range of `<key>/cold.bin`, by `<key>/cold.json`) and compiled here. */
+  #coldModule(key, c) {
+    const name = `cold:${key}:${c}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    let ix = this.#coldIndex.get(key);
+    if (!ix) {
+      // `cold.idx`: u32 unpacked length, then a zstd frame of u32 n, the n
+      // clusters' compressed lengths, then their unpacked lengths.
+      const b = this.#env.loadFile?.(`${key}/cold.idx`) ?? null;
+      const z = this.#env.zstd;
+      if (!b) throw new Error(`gex-cgen: ${key}: a split unit with no cold.idx`);
+      if (!z) throw new Error(`gex-cgen: ${key}: a split unit, and this Worker has no zstd decoder`);
+      const raw = z.decode(b.subarray(4), new DataView(b.buffer, b.byteOffset, 4).getUint32(0, true));
+      const r = raw.slice();
+      const w = new Uint32Array(r.buffer, 0, r.byteLength >> 2);
+      const n = w[0];
+      const offs = new Float64Array(n + 1);
+      for (let i = 0; i < n; i++) offs[i + 1] = offs[i] + w[1 + i];
+      ix = { n, w, offs };
+      this.#coldIndex.set(key, ix);
+    }
+    if (!(c >= 0 && c < ix.n)) throw new Error(`gex-cgen: ${key}: no cold cluster ${c}`);
+    const off = ix.offs[c], zlen = ix.w[1 + c], len = ix.w[1 + ix.n + c];
+    const t0 = performance.now();
+    let bytes = this.#env.loadRange?.(`${key}/cold.bin`, off, zlen) ?? null;
+    if (!bytes) throw new Error(`gex-cgen: ${key}: cold cluster ${c} (${zlen} bytes at ${off}) could not be read`);
+    const t1 = performance.now();
+    bytes = this.#env.zstd.decode(bytes, len);
+    const t2 = performance.now();
+    mod = new WebAssembly.Module(bytes);
+    const t3 = performance.now();
+    console.warn(`[cold] ${key.slice(0, 16)} ${c}: ${zlen} bytes (${len} unpacked), fetch ${(t1 - t0).toFixed(1)} ms, `
+      + `decode ${(t2 - t1).toFixed(1)} ms, compile ${(t3 - t2).toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
+  /** An instrumented unit's hit map in this Worker (a byte per slot), and the
+   *  slots already said. */
+  #cov = new Map();
+  #covTimer = null;
+  #covHit(key, slots) {
+    let h = this.#cov.get(key);
+    if (!h) {
+      // One memory per Worker for every unit's map (each Memory reserves
+      // address space: one per unit ran a page out of it), at an offset per
+      // unit. (module (import "m" "m" (memory 1)) (import "m" "o" (global i32))
+      //   (func (export "hit") (param i32) local.get 0 global.get 0 i32.add
+      //   i32.const 1 i32.store8))
+      const wasm = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 1, 127, 0,
+        2, 15, 2, 1, 109, 1, 109, 2, 0, 1, 1, 109, 1, 111, 3, 127, 0, 3, 2, 1, 0, 7, 7, 1, 3, 104, 105, 116, 0, 0,
+        10, 14, 1, 12, 0, 32, 0, 35, 0, 106, 65, 1, 58, 0, 0, 11]);
+      this.#covMod ??= new WebAssembly.Module(wasm);
+      this.#covMem ??= new WebAssembly.Memory({ initial: 1 });
+      const off = this.#covUsed;
+      this.#covUsed += slots;
+      const need = Math.ceil(this.#covUsed / 65536) - this.#covMem.buffer.byteLength / 65536;
+      if (need > 0) this.#covMem.grow(need);
+      const inst = new WebAssembly.Instance(this.#covMod, { m: { m: this.#covMem, o: new WebAssembly.Global({ value: 'i32' }, off) } });
+      h = { off, n: slots, hit: inst.exports.hit, said: new Uint8Array(slots) };
+      this.#cov.set(key, h);
+      this.#covTimer ??= setInterval(() => this.covFlush(), 2000);
+    }
+    return h.hit;
+  }
+  #covMod = null;
+  #covAt = 0;
+  #covMem = null;
+  #covUsed = 0;
+
+  /** Say the slots instrumented units were entered at since the last time:
+   *  `[gex-cov] <key> <slot or a-b>,...` (tools/eject/record-w3.mjs). */
+  covFlush() {
+    for (const [key, h] of this.#cov) {
+      const m = new Uint8Array(this.#covMem.buffer, h.off, h.n);
+      const runs = [];
+      let a = -1;
+      for (let k = 0; k <= h.n; k++) {
+        const fresh = k < h.n && m[k] && !h.said[k];
+        if (fresh && a < 0) a = k;
+        if (!fresh && a >= 0) {
+          runs.push(a === k - 1 ? `${a}` : `${a}-${k - 1}`);
+          h.said.fill(1, a, k);
+          a = -1;
+        }
+      }
+      if (runs.length) console.warn(`[gex-cov] ${key} ${runs.join(',')}`);
+    }
   }
 
   /** This Worker's stack for stateful providers (one per guest thread, as
@@ -3850,6 +4165,7 @@ export class Gex {
         throw new ProviderThrow(code);
       },
       provider_ctx: () => e.gex_provider_ctx(),
+      ftab_twin: (addr) => e.gex_ftab_twin(addr),
       provider_time: (which) => (which === 0 ? Date.now() / 1000 : performance.now() / 1000),
       provider_missing: (addr) => e.gex_provider_missing(addr),
       provider_alloc: (size) => e.gex_provider_alloc(size),
@@ -4353,6 +4669,9 @@ export class Gex {
         wake_pipe: () => -1,
         wake_write: (id, buf, len) => this.#doorWake(id, buf >>> 0, len >>> 0),
         wake_close: () => {},
+        // The lazy clock of a DOOR_VERSION 2 server (door_time_refresh): the
+        // shim's export, a wasm-to-wasm call.
+        clock_ns: this.#shim.exports.gex_clock_ns,
       },
     };
     for (const f of got) (imports[f[1]] ??= {})[f[2]] = new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0);
@@ -4376,7 +4695,11 @@ export class Gex {
       if (!(err instanceof DoorExit)) throw err;
     }
     const dispatch = table.get(v.dv.getUint32(a + 60, true));
-    return { door: d, dispatch, sp, stackTop, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
+    // DOOR_VERSION 2 (area +40): the server reads the clock itself, lazily
+    // (`dispatch(pid, tid, 0, 1)`), so a request that never looks at the
+    // time costs no clock read (Chrome: performance.now() alone is ~0.5 us).
+    const lazyTime = v.dv.getInt32(a + 40, true) >= 2;
+    return { door: d, dispatch, sp, stackTop, lazyTime, bootNs: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n };
   }
 
   /** A system call from server code inside a door (i386 numbers, the
@@ -4446,47 +4769,81 @@ export class Gex {
   }
 
   /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
-   *  1 use the pipes, 2 the thread died in the request. */
+   *  1 use the pipes, 2 the thread died in the request. The hot path is kept
+   *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
+   *  it stays optimised: every server request of a W3 process comes here
+   *  (docs/wine-overhead.md). */
   #doorCall(req, pid, tid) {
+    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid);
     const d = this.#door;
-    const st = this.#doorStats;
-    if (!d || single.on) {
-      if (globalThis.GEX_DOOR_STATS && !(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
-      return 1;
+    if (!d || single.on) return 1;
+    return this.#doorRun(d, req, pid, tid, null);
+  }
+
+  /** GEX_DOOR_STATS, read once per Worker (a page sets it before it starts). */
+  #doorStatsOn = !!globalThis.GEX_DOOR_STATS;
+
+  /** The guest memory's DataView, rebuilt as `#bytes` is. */
+  #gdv = null;
+  #guestView() {
+    const cm = this.#bytes();
+    let v = this.#gdv;
+    if (!v || v.buffer !== cm.buffer || v.byteLength !== cm.byteLength) v = this.#gdv = new DataView(cm.buffer, 0, cm.byteLength);
+    return v;
+  }
+
+  /** Views of the guest's memory for door calls: { u8, i32, dv } (word
+   *  indices with `>>> 2`: the memory passes 2 GiB). A shared
+   *  memory never detaches (an old SharedArrayBuffer stays valid at its old
+   *  length), so a view is good for any range inside it and is rebuilt only
+   *  when a range reaches past it. Reading `memory.buffer` for every call,
+   *  as `#bytes` does, was about 15% of a door call in Chrome. */
+  #doorGv = null;
+  #doorGuest(end) {
+    let g = this.#doorGv;
+    if (!g || end > g.u8.length) {
+      const buf = this.#memory.buffer;
+      g = this.#doorGv = { u8: new Uint8Array(buf), i32: new Int32Array(buf, 0, buf.byteLength >>> 2), dv: new DataView(buf) };
     }
-    const T = globalThis.GEX_DOOR_STATS ? performance.now() : 0;
+    return g;
+  }
+
+  /** The door memory's views (`#doorView`), checked the same way. */
+  #doorMem(end) {
+    const v = this.#doorViews;
+    return v && end <= v.len ? v : this.#doorView();
+  }
+
+  /** One door call under the door lock (`st`: the statistics, or null). */
+  #doorRun(d, req, pid, tid, st) {
+    const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
-    const cm = this.#bytes();
-    const cdv = new DataView(cm.buffer);
+    let g = this.#doorGuest(req + 136);
+    const cdv = g.dv;
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
     const replyData = cdv.getUint32(req + 68, true);
-    const { u8, i32, dv } = this.#doorView();
     const a = d.area;
-    const buf = dv.getUint32(a + 44, true), bufSize = dv.getUint32(a + 48, true);
+    // The door buffer's place and size never change: read once per door.
+    let buf = d.kBuf, bufSize = d.kBufSize;
+    if (buf === undefined) {
+      const v0 = this.#doorMem(a + 144);
+      buf = d.kBuf = v0.dv.getUint32(a + 44, true);
+      bufSize = d.kBufSize = v0.dv.getUint32(a + 48, true);
+    }
+    const { u8, i32, dv } = this.#doorMem(buf + bufSize);
     const replyOff = (64 + reqSize + 7) & ~7;
-    if (replyOff + 64 + replyMax > bufSize) { st.fallbacks++; return 1; }
+    if (replyOff + 64 + replyMax > bufSize) { if (st) st.fallbacks++; return 1; }
     // the lock: 0 free, 1 held, 2 held with waiters
     const L = a >> 2;
     // Poisoned (a door call died midway): no more doors; the pipes say the
-    // rest when the server goes.
-    if (Atomics.load(i32, (a + 124) >> 2) !== 0) return 1;
-    let waitedMs = 0;
-    for (let spins = 0; ; spins++) {
-      const v = Atomics.compareExchange(i32, L, 0, 1);
-      if (v === 0) break;
-      if (spins < 200) continue;
-      if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
-      Atomics.wait(i32, L, 2, 1);
-      // A lock held this long is a stuck door (a Worker ended inside one,
-      // or a deadlock): say who holds it, every 5 s of waiting.
-      if (++waitedMs % 5000 === 0) {
-        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
-      }
-    }
+    // rest when the server goes. A plain read, before the lock as the
+    // atomic load was: the flag only ever goes from 0 to set.
+    if (i32[(a + 124) >> 2] !== 0) return 1;
+    if (Atomics.compareExchange(i32, L, 0, 1) !== 0) this.#doorLockSlow(i32, a, L, pid, tid);
     i32[(a + 116) >> 2] = tid;
     i32[(a + 120) >> 2] = pid;
     let r;
@@ -4495,29 +4852,42 @@ export class Gex {
       // the one door stack and context.
       let di = this.#doorInst;
       if (!di || di.door !== d) di = this.#doorInst = this.#doorInstantiate(d);
-      u8.set(cm.subarray(req, req + 64), buf);
+      // The 64-byte header as 16 words (no subarray views), then the data.
+      if (((req | buf) & 3) === 0) {
+        const gi = g.i32, s0 = req >>> 2, d0 = buf >>> 2;
+        for (let k = 0; k < 16; k++) i32[d0 + k] = gi[s0 + k];
+      } else u8.set(g.u8.subarray(req, req + 64), buf);
       let at = buf + 64;
       for (let k = 0; k < count; k++) {
         const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
-        u8.set(cm.subarray(ptr, ptr + size), at);
+        if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
+        u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
       }
       di.sp.value = di.stackTop;
-      const T1 = T ? performance.now() : 0;
-      // The time, as set_current_time would read it (gettimeofday,
-      // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
-      // of the door saved.
-      const ns = this.#env.now();
-      r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
-      if (T) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
-      if (r === 0xffffffff) { st.fallbacks++; r = 1; }
+      const T1 = st ? performance.now() : 0;
+      if (di.lazyTime) r = di.dispatch(pid, tid, 0n, 1n) >>> 0;
+      else {
+        // The time, as set_current_time would read it (gettimeofday,
+        // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
+        // of the door saved.
+        const ns = this.#env.now();
+        r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+      }
+      if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
+      if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
       else if (r === 0xfffffffe) r = 2;
       else {
         const ro = buf + r;
-        cm.set(u8.subarray(ro, ro + 64), req);
+        // the dispatch may have grown the guest's memory (a request that maps)
+        g = this.#doorGuest(Math.max(req + 64, replyData + replyMax));
+        if (((req | ro) & 3) === 0) {
+          const gi = g.i32, s0 = ro >>> 2, d0 = req >>> 2;
+          for (let k = 0; k < 16; k++) gi[d0 + k] = i32[s0 + k];
+        } else g.u8.set(u8.subarray(ro, ro + 64), req);
         const size = Math.min(dv.getUint32(ro + 4, true), replyMax);
-        if (size && replyData) cm.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
-        st.calls++;
+        if (size && replyData) g.u8.set(u8.subarray(ro + 64, ro + 64 + size), replyData);
+        if (st) st.calls++;
         r = 0;
       }
     } catch (err) {
@@ -4529,28 +4899,61 @@ export class Gex {
       console.error(`[gex-door] the wineserver trapped in a door call (pid ${pid} tid ${tid}); the server is poisoned: ${err?.stack ?? err}`);
       r = 1;
     }
-    const kick = Atomics.exchange(i32, (a + 80) >> 2, 0) !== 0;
+    // kick_needed is written only under the lock (by this call's dispatch,
+    // or the pump): plain accesses, ordered by the lock's own atomics.
+    const K = (a + 80) >> 2, kick = i32[K] !== 0;
+    if (kick) i32[K] = 0;
     if (Atomics.exchange(i32, L, 0) === 2) Atomics.notify(i32, L);
     if (kick) this.#doorKick();
-    if (globalThis.GEX_DOOR_STATS) {
-      const now = performance.now();
-      if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
-      if (!st.t0) st.t0 = now;
-      else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
-        const sa = dv.getUint32(a + 96, true) >> 2;
-        const top = [];
-        if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
-        top.sort((x, y) => y[0] - x[0]);
-        console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
-          + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
-          + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
-          + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
-          + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
-          + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
-        st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
-        st.byNr = {};
-        st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
+    return r;
+  }
+
+  /** The door lock, contended: spin, then wait (the lock word 2: waiters). */
+  #doorLockSlow(i32, a, L, pid, tid) {
+    let waitedMs = 0;
+    for (let spins = 0; ; spins++) {
+      const v = Atomics.compareExchange(i32, L, 0, 1);
+      if (v === 0) return;
+      if (spins < 200) continue;
+      if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
+      Atomics.wait(i32, L, 2, 1);
+      // A lock held this long is a stuck door (a Worker ended inside one,
+      // or a deadlock): say who holds it, every 5 s of waiting.
+      if (++waitedMs % 5000 === 0) {
+        console.error(`[gex-door] pid ${pid} tid ${tid}: ${waitedMs / 1000} s waiting for the door lock, held by tid ${i32[(a + 116) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
       }
+    }
+  }
+
+  /** `#doorCall` with GEX_DOOR_STATS: the same call, timed, and a report
+   *  every GEX_DOOR_STATS ms (default 10 s) or 50,000 calls. */
+  #doorCallStats(req, pid, tid) {
+    const d = this.#door;
+    const st = this.#doorStats;
+    if (!d || single.on) {
+      if (!(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
+      return 1;
+    }
+    const r = this.#doorRun(d, req, pid, tid, st);
+    const { i32, dv } = this.#doorView();
+    const a = d.area;
+    const now = performance.now();
+    if (st.T2) { st.tPost += now - st.T2; st.T2 = 0; }
+    if (!st.t0) st.t0 = now;
+    else if (now - st.t0 >= (globalThis.GEX_DOOR_STATS > 1 ? globalThis.GEX_DOOR_STATS : 10000) || st.calls + st.fallbacks >= 50000) {
+      const sa = dv.getUint32(a + 96, true) >> 2;
+      const top = [];
+      if (sa) for (let n = 0; n < 512; n++) if (i32[sa + n]) top.push([i32[sa + n], n]);
+      top.sort((x, y) => y[0] - x[0]);
+      console.error(`[gex-door] pid ${pid} tid ${tid}: ${st.calls} door calls, ${st.fallbacks} fallbacks, ${st.proxies} proxies in ${Math.round(now - st.t0)} ms;`
+        + ` server: ${i32[(a + 104) >> 2]} calls, ${i32[(a + 100) >> 2]} proxies (${top.slice(0, 16).map(([c, n]) => `${n}:${c}`).join(' ')});`
+        + ` per call us: in ${(st.tPre / st.calls * 1000).toFixed(2)} dispatch ${(st.tDisp / st.calls * 1000).toFixed(2)} out ${(st.tPost / st.calls * 1000).toFixed(2)};`
+        + ` in-door syscalls ${st.sys} (${(st.tSys / Math.max(1, st.sys) * 1000).toFixed(2)} us each);`
+        + ` proxied ${st.proxies} waited ${st.tProxy.toFixed(1)} ms [${Object.entries(st.byNr).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => `${n}:${c}`).join(' ')}];`
+        + ` in doors ${(st.tPre + st.tDisp + st.tPost).toFixed(1)} ms`);
+      st.tPre = st.tDisp = st.tPost = st.tSys = st.sys = st.tProxy = 0;
+      st.byNr = {};
+      st.t0 = now; st.calls = st.fallbacks = st.proxies = 0;
     }
     return r;
   }
@@ -4862,6 +5265,8 @@ export class Gex {
     try {
       return await this.#runLoop(entry, startCtx);
     } finally {
+      // An instrumented unit's hits, before a short-lived process is gone.
+      if (this.#cov.size) this.covFlush();
       Error.stackTraceLimit = limit;
     }
   }
@@ -4877,6 +5282,10 @@ export class Gex {
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
     for (;;) {
+      if (this.#cov.size && performance.now() - this.#covAt > 250) {
+        this.#covAt = performance.now();
+        this.covFlush();
+      }
       if (trappedAt) {
         this.#shim.exports.gex_nt_note_js_ns?.(ctx, (performance.now() - trappedAt) * 1e6);
         trappedAt = 0;
@@ -5808,6 +6217,13 @@ export class Gex {
         const [op, a, b, c, d, x] = r.value;
         v = op === 'enter' ? this.#guest.exports.enter(a, b) : a(b, c, d, x);
       } catch (err) {
+        // A nested loop never yields to the event loop (a Wine thread's
+        // whole life can be one call-out): an instrumented unit's hits go
+        // from here too.
+        if (this.#cov.size && performance.now() - this.#covAt > 250) {
+          this.#covAt = performance.now();
+          this.covFlush();
+        }
         r = g.throw(err);
         continue;
       }

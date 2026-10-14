@@ -15,7 +15,7 @@
 //   _headers       caching and isolation headers (Netlify, Cloudflare Pages)
 //   serve.mjs      a static server with the same headers (node serve.mjs [port])
 //   README.txt     hosting notes
-// Every file of the bundle and the units over 64 KiB is zstd-compressed (-19
+// Every file of the bundle over 64 KiB, and the units' over 4 KiB, is zstd-compressed (-19
 // --long=27, cached beside OUT in OUT.zcache by content) as FILE.zst, which
 // the library fetches and decodes itself (app.js, pack.json). No service
 // worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
@@ -62,7 +62,9 @@ function place(src, path) {
   const dst = join(out, path);
   mkdirSync(dirname(dst), { recursive: true });
   const size = statSync(src).size;
-  if (size < 65536) {
+  // A unit's files are fetched one by one whatever their size, and wasm and
+  // entry lists halve or better under zstd: packed from 4 KiB.
+  if (size < (/\/units\//.test(path) ? 4096 : 65536)) {
     copyFileSync(src, dst);
     return;
   }
@@ -71,6 +73,37 @@ function place(src, path) {
   if (!existsSync(z)) execFileSync('zstd', [`-${level}`, '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
   copyFileSync(z, `${dst}.zst`);
   files[`/${path}`] = { size, zsize: statSync(z).size };
+}
+
+/** A split unit's cold clusters (`gexc eject build` with "cold": DIR/N.wasm)
+ *  at site path `path`: `cold.bin`, each cluster its own zstd frame, which
+ *  the page fetches by Range on the cluster's first call (gex.mjs `gex.cold`),
+ *  and `cold.idx`, the u32 length of its index, then the index as a zstd
+ *  frame: u32 n, the n frames' lengths, the n clusters' unpacked lengths. */
+function coldPack(dir, path) {
+  const n = readdirSync(dir).filter((f) => /^\d+\.wasm$/.test(f)).length;
+  const z = join(`${out.replace(/\/+$/, '')}.work`, 'cold', path);
+  rmSync(z, { recursive: true, force: true });
+  mkdirSync(z, { recursive: true });
+  for (let i = 0; i < n; i++) copyFileSync(join(dir, `${i}.wasm`), join(z, `${i}.wasm`));
+  // Thousands of small frames: many zstd processes at once, each a batch.
+  execFileSync('sh', ['-c', `ls | grep '\\.wasm$' | xargs -P 16 -n 256 zstd -${level} -q -f`], { cwd: z });
+  const frames = [];
+  const zl = new Uint32Array(n), ul = new Uint32Array(n);
+  for (let i = 0; i < n; i++) {
+    const f = readFileSync(join(z, `${i}.wasm.zst`));
+    frames.push(f);
+    zl[i] = f.length;
+    ul[i] = statSync(join(z, `${i}.wasm`)).size;
+  }
+  mkdirSync(join(out, path), { recursive: true });
+  writeFileSync(join(out, path, 'cold.bin'), Buffer.concat(frames));
+  const raw = Buffer.concat([Buffer.from(new Uint32Array([n]).buffer), Buffer.from(zl.buffer), Buffer.from(ul.buffer)]);
+  const zi = execFileSync('zstd', [`-${level}`, '-q', '-c'], { input: raw });
+  const head = Buffer.alloc(4);
+  head.writeUInt32LE(raw.length);
+  writeFileSync(join(out, path, 'cold.idx'), Buffer.concat([head, zi]));
+  rmSync(z, { recursive: true, force: true });
 }
 
 function walk(dir, fn, base = dir) {
@@ -322,6 +355,12 @@ function w3Site() {
   // only what the page itself fetches and decodes (the bundle, the units:
   // app.js, pack.json) is packed. A host's own compression still applies.
   walk(join(web, 'page'), (p, rel) => {
+    // The runtime's wasm (shim, seed, kernel) is fetched by the page itself
+    // (app.js primes runtime.js with it): packed, as the units are.
+    if (/^gex\/(gex_browser|gex_kernel|seed)[^/]*\.wasm$/.test(rel)) {
+      place(stripped(p), rel);
+      return;
+    }
     const dst = join(out, rel);
     mkdirSync(dirname(dst), { recursive: true });
     copyFileSync(stripped(p), dst);
@@ -359,11 +398,18 @@ function w3Site() {
       const store = join(out, 'project/build/web/lazy');
       mkdirSync(store, { recursive: true });
       const lazy = [];
+      // A file with the same bytes as one the run read stays too: zstd's
+      // window stores it as a match, so it costs the download nothing, and a
+      // read the recording missed (Paint opens WinSxS's copy of gdiplus.dll
+      // in some runs) is not a lazy fetch of the whole raw file.
+      const kept = new Set();
+      walk(x, (p, rel) => { if (lstatSync(p).isFile() && split.has(`/${rel}`)) kept.add(sha(readFileSync(p))); });
       walk(x, (p, rel) => {
         const st = lstatSync(p);
         if (!st.isFile() || split.has(`/${rel}`)) return;
         const b = readFileSync(p);
         const h = sha(b);
+        if (kept.has(h)) return;
         if (!existsSync(join(store, h))) writeFileSync(join(store, h), b);
         // Its time, for `mtimes=1` (wineboot compares wine.inf's with the prefix's).
         lazy.push([`/${rel}`, st.size, h, Math.trunc(st.mtimeMs / 1000)]);
@@ -398,17 +444,34 @@ function w3Site() {
   // download has of it; nt.json carries the rest's manifest by URL.
   if (w3.bundle) w3.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
   place(tar, 'project/build/web/rootfs.tar');
-  // The units, largest first in the preload list.
+  // The units. Whole units (no "cold" split, the default): one archive,
+  // units.tar, every unit's c.wasm and c.entries, packed as one zstd file.
+  // The page decodes it once, compiles every module while the bundle
+  // downloads, and asks the host for no other unit file: a Worker's lookup
+  // of anything the archive does not hold is a miss, not a request
+  // (preload.json `tar:N`, N the number of modules in it).
   const preload = [];
-  for (const u of w3.units) {
+  const coldUnits = w3.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
+  if (!coldUnits) {
+    const list = join(work, 'units-list');
+    const names = w3.units.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]);
+    writeFileSync(list, `${names.join('\n')}\n`);
+    const ut = join(work, 'units.tar');
+    execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '-cf', ut, '-T', list]);
+    place(ut, 'project/build/web/units.tar');
+    mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${w3.units.length}`, '/project/build/web/units.tar']]));
+  }
+  for (const u of coldUnits ? w3.units : []) {
     const d = join(web, 'units', u.key);
     place(join(d, 'c.wasm'), `project/build/web/units/${u.key}/c.wasm`);
     place(join(d, 'c.entries'), `project/build/web/units/${u.key}/c.entries`);
     preload.push([`cgen:${u.key}`, `/project/build/web/units/${u.key}/c.wasm`, statSync(join(d, 'c.wasm')).size]);
     preload.push([`file:${u.key}/c.entries`, `/project/build/web/units/${u.key}/c.entries`, 0]);
+    if (existsSync(join(d, 'cold'))) coldPack(join(d, 'cold'), `project/build/web/units/${u.key}`);
   }
   preload.sort((a, b) => b[2] - a[2]);
-  writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
+  if (coldUnits) writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
   writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
   // The page (the user's). No service worker: the host sends the isolation
   // headers (COOP/COEP), and the library decodes what is packed.
@@ -424,8 +487,13 @@ function w3Site() {
   const total = Object.values(files).reduce((a, f) => a + f.size, 0);
   const ztotal = Object.values(files).reduce((a, f) => a + f.zsize, 0);
   let small = 0;
-  walk(out, (p, rel) => { if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size; });
-  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null }, null, 1));
+  // Cold clusters are fetched on first call, not with the download.
+  let cold = 0;
+  walk(out, (p, rel) => {
+    if (rel.endsWith('/cold.bin')) cold += statSync(p).size;
+    else if (!p.endsWith('.zst') && !rel.startsWith('project/build/web/lazy/')) small += statSync(p).size;
+  });
+  writeFileSync(join(out, 'site.json'), JSON.stringify({ build, kind: 'w3', features_off: w3.features_off, units: w3.units.length, download: ztotal + small, unpacked: total + small, lazy: split ? { files: lazyFiles, bytes: lazyBytes } : null, cold: cold || null }, null, 1));
   console.log(`${out}: W3 build ${build}; features off: ${w3.features_off.join(', ') || 'none'}; ${w3.units.length} units; download ${mb(ztotal + small)} MB, unpacked ${mb(total + small)} MB`
     + (split ? `; bundle split: ${split.size} files read by the recorded run in it, ${lazyFiles} lazy (${mb(lazyBytes)} MB, read on demand)` : ''));
 }

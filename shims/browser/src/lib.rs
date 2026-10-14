@@ -77,6 +77,15 @@ extern "C" {
     fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
+    /// `performance.now()`, in milliseconds: the clock's hot path. An f64,
+    /// not an i64: an i64 import result is a BigInt per call, most of a
+    /// clock read's cost (Chrome: about 650 ns of a 757 ns
+    /// QueryPerformanceCounter, docs/wine-overhead.md F2).
+    fn perf_now() -> f64;
+    /// The epoch `now` counts from in this Worker, in ns (`ORIGIN_NS`):
+    /// `now() == clock_origin() + round(perf_now() * 1e6)`. Read once per
+    /// thread.
+    fn clock_origin() -> i64;
     /// Block until the host has delivered every `write` so far. Called just
     /// before this process's exit is published: output from different
     /// processes reaches the host by different routes, so without it a parent
@@ -348,6 +357,10 @@ extern "C" {
     fn k_obj_translated(obj: u64, produced: u32);
     /// The translation cache across page loads (docs/gexcc.md §8).
     fn k_key_path(key: u64, path: gex_kernel::PAddr, len: u32, size: u64, mtime: i64) -> i32;
+    /// A wasm32 program's content key by its file, system-wide
+    /// (`cgen/wasmprog.rs` `known_key`): 1 and the key's two lanes at `out`, or 0.
+    fn k_progkey_get(path: gex_kernel::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, out: gex_kernel::PAddr) -> i32;
+    fn k_progkey_put(path: gex_kernel::PAddr, path_len: u32, ino: u64, mtime: i64, size: u64, len: u32, a: u64, c: u64);
     fn k_xcache_on() -> u32;
     fn k_store_restore() -> i32;
     fn k_obj_is_translated(obj: u64) -> u32;
@@ -1319,9 +1332,36 @@ fn install_bundle_remote() {
 const SAFEPOINT_INTERVAL: u32 = 1024;
 
 /// The host's clock, in the shape `gex-kernel` wants.
-fn browser_clock() -> (u64, u32) {
-    let ns = unsafe { now() } as u64;
+pub(crate) fn browser_clock() -> (u64, u32) {
+    let ns = host_now_ns();
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+}
+
+thread_local! {
+    /// This Worker's `clock_origin()`: each Worker's `performance.now()`
+    /// counts from its own start, so the origin is per thread, not shared.
+    static CLOCK_ORIGIN: Cell<i64> = const { Cell::new(i64::MIN) };
+}
+
+/// The host clock in ns, as the `now` import reads it (the same value:
+/// `hostNowNs` in gex.mjs is `ORIGIN_NS + round(performance.now() * 1e6)`),
+/// without a BigInt per call.
+pub(crate) fn host_now_ns() -> u64 {
+    let ms = unsafe { perf_now() };
+    // try_with: a clock read during thread teardown (after the TLS is
+    // destroyed) asks the host again rather than panicking.
+    let origin = CLOCK_ORIGIN
+        .try_with(|c| {
+            let o = c.get();
+            if o != i64::MIN {
+                return o;
+            }
+            let o = unsafe { clock_origin() };
+            c.set(o);
+            o
+        })
+        .unwrap_or_else(|_| unsafe { clock_origin() });
+    (origin + (ms * 1e6).round() as i64) as u64
 }
 
 /// The guest's standard input, as a queue the page appends to.
@@ -4332,6 +4372,80 @@ pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
     })
 }
 
+/// The runs of 4 KiB pages in `[start, end)` that are not all zero, for a
+/// fork's image (`#processImage` in gex.mjs): `(at, len)` u32 pairs at `out`,
+/// at most `cap` of them. Returns how many, or -1 when they do not fit (the
+/// caller asks again with more room). The scan was a JS loop over an
+/// `Int32Array`, a word at a time; here it is 16 bytes a load.
+#[no_mangle]
+pub extern "C" fn gex_image_runs(start: u32, end: u32, out: u32, cap: u32) -> i32 {
+    const PAGE: u32 = 4096;
+    let dst = shim_slice_mut(out, cap.saturating_mul(8));
+    let mut n = 0u32;
+    let mut i = start;
+    let mut run: Option<u32> = None;
+    while i < end {
+        let pe = end.min(i.saturating_add(PAGE));
+        if unsafe { page_blank(i, pe) } {
+            if let Some(at) = run.take() {
+                if n == cap {
+                    return -1;
+                }
+                let o = n as usize * 8;
+                dst[o..o + 4].copy_from_slice(&at.to_le_bytes());
+                dst[o + 4..o + 8].copy_from_slice(&(i - at).to_le_bytes());
+                n += 1;
+            }
+        } else if run.is_none() {
+            run = Some(i);
+        }
+        i = pe;
+    }
+    if let Some(at) = run {
+        if n == cap {
+            return -1;
+        }
+        let o = n as usize * 8;
+        dst[o..o + 4].copy_from_slice(&at.to_le_bytes());
+        dst[o + 4..o + 8].copy_from_slice(&(end - at).to_le_bytes());
+        n += 1;
+    }
+    n as i32
+}
+
+/// Whether `[a, b)` of this memory is all zero bytes.
+#[cfg_attr(target_arch = "wasm32", target_feature(enable = "simd128"))]
+unsafe fn page_blank(a: u32, b: u32) -> bool {
+    let p = |x: u32| std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(x as usize));
+    let mut i = a;
+    while i < b && i % 16 != 0 {
+        if unsafe { p(i).read_volatile() } != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::arch::wasm32::*;
+        // Four vectors a test: an early out per 64 bytes is often enough.
+        while i + 64 <= b {
+            let q = p(i) as *const v128;
+            let v = { v128_or(v128_or(v128_load(q), v128_load(q.add(1))), v128_or(v128_load(q.add(2)), v128_load(q.add(3)))) };
+            if v128_any_true(v) {
+                return false;
+            }
+            i += 64;
+        }
+    }
+    while i < b {
+        if unsafe { p(i).read_volatile() } != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// How much of the shim's heap is in use, in KiB. -1 without the counters.
 ///
 /// Worth measuring because the heap is fixed, so exhausting it is a real
@@ -6250,7 +6364,7 @@ pub extern "C" fn gex_park(_max_ms: u32) -> i32 {
 /// the one its wait registered with.
 #[no_mangle]
 pub extern "C" fn gex_wait_bound_ms(max_ms: u32) -> u32 {
-    let ms = waitq::park_ns(now_ns()).map_or(max_ms as u64, |ns| (ns / 1_000_000).min(max_ms as u64));
+    let ms = waitq::park_ns(turn_now()).map_or(max_ms as u64, |ns| (ns / 1_000_000).min(max_ms as u64));
     ms.max(1) as u32
 }
 
@@ -6428,9 +6542,15 @@ pub extern "C" fn gex_cmdline(out: u32, max: u32) -> u32 {
     n as u32
 }
 
-/// Nanoseconds spent inside syscalls, and how many there were. Always kept.
+/// Nanoseconds spent inside syscalls, and how many there were: kept while
+/// [`sys_timed`] (a heartbeat or a trace), so both read 0 in a plain run.
 static SYS_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether syscalls are timed and counted (`SYS_TOTAL_NS`, `SYS_CALLS`).
+fn sys_timed() -> bool {
+    (unsafe { HEARTBEAT } != 0) || tracing()
+}
 
 /// How long this process has spent in syscalls, in microseconds.
 #[no_mangle]
@@ -6534,6 +6654,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if let Some(p) = nt::process() {
         return nt::syscall(p, ctx, pc);
     }
+    // One clock reading for the whole call (`turn_now`), taken when first
+    // asked: most calls never ask.
+    let _now = NowScope::open();
     // A stateful provider's syscall (`PROVIDER_SYSCALL` set by the page's glue,
     // cgen/libprov.rs): its wasm frames cannot be left, so it is served as a
     // wasm32 program's is -- a blocking call waits here, a thread or a child
@@ -6756,11 +6879,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // done inside the locked section below: each took the host lock on its
     // own, and with a W3 game's ~25 Wine Workers contending for it every take
     // costs (Undertale's game thread spent ~14 ms a frame on this path).
-    // Time every syscall, always: a blocking call parks the Worker here, so
-    // this covers waiting as well as work, and `guest` is the majority of a
-    // warm process. The per-number census above stays behind the heartbeat.
-    let began = now_ns();
-    SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Every syscall timed, with a heartbeat or a trace on (`sys_timed`): a
+    // blocking call parks the Worker here, so this covers waiting as well as
+    // work. Off by default: two clock reads (JS calls) and two read-modify-
+    // writes on counters every Worker shares cost more than a lock-free call.
+    let timed = sys_timed();
+    let began = if timed { now_ns() } else { 0 };
+    if timed {
+        SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
     let mut mapped = Vec::new();
@@ -7149,16 +7276,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         // if the kernel gave none, which it always does for a
                         // real FUTEX_WAIT.
                         parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
-                        deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
+                        deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
                     },
-                    gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
+                    gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(turn_now() + d.as_nanos() as u64),
                     // A priority-inheritance lock: tried when the thread runs
                     // again (`finish_parked`), and the syscall made again until
                     // it is taken (`PI_RETRY`); a short sleep between tries.
                     gex_kernel::BlockOp::FutexLockPi { uaddr, deadline, .. } => Waiting::Pi {
                         addr: *uaddr,
                         gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
-                        deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
+                        deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
@@ -7186,7 +7313,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // scheduler on its way round.
                     gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
                     gex_kernel::BlockOp::Poll { deadline, .. } => {
-                        Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64))
+                        Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64))
                     }
                     // `WNOHANG` answers straight away; anything else waits
                     // for the child, which may not have started yet.
@@ -7324,7 +7451,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     gl::DEFER.with(|d| d.set(false));
     gl::submit_pending(ctx as u32 as u64);
     gpu::submit_pending(ctx as u32 as u64);
-    {
+    if timed {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         if unsafe { HEARTBEAT } != 0 {
@@ -7689,6 +7816,9 @@ fn wasm32_wait(pc: u64) -> i32 {
     // Worker's wait slot.
     let mut said = PAGE_WAIT_SAID.with(|c| c.get());
     loop {
+        // A pass reads the clock once (`turn_now`); the park below lets
+        // time pass, and the next pass reads it again.
+        let _now = NowScope::open();
         let picked = schedule();
         if picked == 1 {
             let here = my_ctx();
@@ -10270,7 +10400,58 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
 
 /// Nanoseconds on the host clock.
 fn now_ns() -> u64 {
-    unsafe { now() as u64 }
+    host_now_ns()
+}
+
+thread_local! {
+    /// The clock as this pass first read it ([`turn_now`]); 0 for unread.
+    static TURN_NOW: Cell<u64> = const { Cell::new(0) };
+    /// Whether a [`NowScope`] is open on this Worker.
+    static NOW_SCOPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The clock for one pass through the kernel: inside a [`NowScope`] (a
+/// syscall, a turn of a wasm32 program's wait loop) it is read once, lazily,
+/// and every later question in the pass gets the same answer; outside one,
+/// each call reads it. The host's clock is a JS call (`performance.now`,
+/// about 0.5 us in Chrome), and a syscall that blocked asked it up to five
+/// times (its deadline, the process timer, readiness, how the wait ended,
+/// how long to park): 37% of a pipe ping-pong's busy time.
+pub(crate) fn turn_now() -> u64 {
+    if !NOW_SCOPED.with(|s| s.get()) {
+        return now_ns();
+    }
+    TURN_NOW.with(|c| match c.get() {
+        0 => {
+            let n = now_ns().max(1);
+            c.set(n);
+            n
+        }
+        n => n,
+    })
+}
+
+/// Time has passed (this Worker parked): the next [`turn_now`] reads again.
+pub(crate) fn stale_now() {
+    TURN_NOW.with(|c| c.set(0));
+}
+
+/// A pass whose clock questions share one reading ([`turn_now`]). Nested
+/// scopes start their own reading; the outer one reads again after.
+pub(crate) struct NowScope(bool);
+
+impl NowScope {
+    pub(crate) fn open() -> NowScope {
+        stale_now();
+        NowScope(NOW_SCOPED.with(|s| s.replace(true)))
+    }
+}
+
+impl Drop for NowScope {
+    fn drop(&mut self) {
+        NOW_SCOPED.with(|s| s.set(self.0));
+        stale_now();
+    }
 }
 
 /// What a scheduler turn that found nothing to run saw, under the one lock
@@ -10671,7 +10852,7 @@ fn idle_look(h: &mut Host) -> IdleLook {
     // through, let its Worker pick it, and only the genuinely
     // all-blocked case (no thread ready) reaches the report.
     let all_blocked = why == 0 && {
-        let now = now_ns();
+        let now = turn_now();
         let k = &mut h.kernel;
         h.threads
             .iter()
@@ -10979,7 +11160,7 @@ fn pick_turn(h: &mut Host) -> Pick {
         h.exit.get_or_insert(code);
         return Pick::Over;
     }
-    let now = now_ns();
+    let now = turn_now();
     // Nothing to choose: this Worker owns one table entry and the
     // engine schedules the rest, so picking any *other* runnable thread
     // would put two Workers on one set of registers.
@@ -11022,7 +11203,7 @@ fn pick_turn(h: &mut Host) -> Pick {
         if fresh
             && {
                 let sig = any_signal(h);
-                thread_ready(&h.threads[i], now_ns(), sig)
+                thread_ready(&h.threads[i], turn_now(), sig)
             }
         {
             return Pick::Again;
@@ -11083,7 +11264,7 @@ fn finish_mine(signalled: bool) -> i32 {
         SCHED_OVER.with(|c| c.set(true));
         return 2;
     }
-    let now = now_ns();
+    let now = turn_now();
     if !wait_ready(&r.waiting, &r.blocked_on, now, signalled) {
         // What the idle turn asked was the registered copy of this same
         // wait; the next turn asks again.
@@ -11172,7 +11353,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         gex_kernel::BlockOp::WriteStream { handle, .. } => Waiting::Write(Arc::clone(handle)),
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
-        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64)),
+        gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
         _ => unreachable!("a class call parks only on a stream or a poll"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
@@ -11202,7 +11383,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
     loop {
         let sig = sigs::ready();
         let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
-        let now = now_ns();
+        let now = turn_now();
         if wait_ready(&r.waiting, &r.blocked_on, now, sig) {
             let (timed_out, by_signal) = how_ended(&r, now, sig);
             waitq::leave();
@@ -11230,7 +11411,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         if fresh && {
             let sig = sigs::ready();
             let r = run.lock().unwrap_or_else(|e| e.into_inner());
-            wait_ready(&r.waiting, &r.blocked_on, now_ns(), sig)
+            wait_ready(&r.waiting, &r.blocked_on, turn_now(), sig)
         } {
             continue;
         }
@@ -12118,7 +12299,7 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact.
-        -3 => unsafe { now() },
+        -3 => host_now_ns() as i64,
         // MIDR_EL1: a plausible Cortex-A72, the same one the native host
         // claims to be.
         -7 => 0x410f_d083,
@@ -13518,7 +13699,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let covers = dirs.iter().any(|(p, _)| *p == page)
                         && SERVED_PAGE.0.borrow_mut().insert(page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
-                    match gex_xlate::merge::merge(&bytes) {
+                    let merged = if TEST_SERVE_UNMERGED.load(std::sync::atomic::Ordering::Relaxed) { None } else { gex_xlate::merge::merge(&bytes) };
+                    match merged {
                         Some(wasm) => push_pending(h, dirs, slots, wasm, 0),
                         None => {
                             // Not the shape the merger expects. One at a time
@@ -14045,6 +14227,16 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
         drop(log);
     }
     retire_ranges(h, ranges);
+}
+
+/// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
+/// at a miss are installed one at a time, as when `gex_xlate::merge`
+/// declines them. A test switch, off in every real run.
+static TEST_SERVE_UNMERGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_test_serve_unmerged(on: i32) {
+    TEST_SERVE_UNMERGED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `gex_test_unpublished_retire(1)` (GEX_TEST_UNPUBLISHED_RETIRE): see

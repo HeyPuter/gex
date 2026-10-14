@@ -4,9 +4,23 @@
 # and exit status must match. The gexcc build runs itself under gexc (the
 # container's host launcher).
 #
-#   tests/gexcc/run.sh             (gexcc on PATH: tools/gexcc/install.sh)
-#   GEXCC_RUNNER=GEXC tests/gexcc/run.sh   to pick the gexc
+#   tests/gexcc/run.sh [GEXC]      (gexcc on PATH: tools/gexcc/install.sh)
+#
+# GEXC, or the GEXC environment variable, is the gexc the programs run
+# under; without either, the one the gexcc install names (gexcc-exec's
+# default, GEXCC_GEXC). A gexcc program is an ELF launcher that execs
+# gexcc-exec, which reads GEXCC_GEXC -- not GEXC -- so a gate that set only
+# GEXC tested whatever gexc the install was made with (wt/gexcc's, three
+# days stale: sarestart, sockclose and sockpair "failed" on fixes it did
+# not have).
 set -u
+G=${1:-${GEXC:-}}
+if [ -n "$G" ]; then
+    [ -x "$G" ] || { echo "no gexc at $G"; exit 2; }
+    GEXCC_GEXC=$(cd "$(dirname "$G")" && pwd)/$(basename "$G")
+    export GEXCC_GEXC
+    echo "gexc: $GEXCC_GEXC"
+fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$(mktemp -d)}
 command -v gexcc > /dev/null || { echo "gexcc not on PATH (tools/gexcc/install.sh)"; exit 2; }

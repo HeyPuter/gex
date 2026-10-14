@@ -684,6 +684,97 @@ worldmachine, bench, headless Chromium, 3 alternated runs each):
 | browser footprint at settle | 3.39-3.41 GiB | 3.01-3.05 GiB (0.37 GiB less) |
 | lazy reads to the window | | 0 |
 
+### Cold code
+
+A unit holds every function of its image, and a run to the window calls
+about one in twelve of them (Paint: 10,040 of 116,343 across 59 units).
+The default (`user/eject.json` `"cold": "none"`, the W3 template's, and
+what a config without the setting means) ships every unit whole, in one
+archive: web/eject-site.mjs tars every unit's `c.wasm` and `c.entries`
+into `project/build/web/units.tar`, packed as one zstd file
+(preload.json `tar:N`). The page decodes it once and compiles every module
+while the bundle downloads. The Workers ask the host for no other unit
+file: a lookup the archive does not answer is a miss, not a request
+(worker.mjs, `closed`). Nothing is fetched on a call. Paint's site: one
+4-file download of 49.1 MB, 328 requests to the window and none of them
+for code (the split site below made 1075, 61 of them cold fetches each
+blocking a process).
+
+A split is opt-in: a clustering in `"cold"` ships only the functions the
+recording ran up front. The rest are fetched the first time something
+calls one. Everything is still compiled ahead of time at build time, and
+nothing is lifted in the page.
+
+- **Coverage.** Build with `"cold": "instrument"`. Every guest function of
+  every unit then calls `gexcov.hit(slot)` on entry (`gexc cgen-split
+  instrument`), and gex.mjs flushes the slots hit as `[gex-cov]` lines.
+  Record that site with `record-w3.mjs URL OUT --serve SITE --coverage-into
+  REC/w3-session.json`, which adds the run's functions to the recording the
+  project is ejected from. Runs add up: record the paths users take. Then
+  eject again (`gexc eject REC ...`; user/ is kept) and set the clustering.
+- **Build.** For each unit, `gexc eject build` keeps the functions in the
+  recording's `coverage` in its primary module. Every other slot gets a
+  stub that calls `gex.cold(cluster)` and then tail-calls its own table
+  slot. The other functions go into cluster modules `cold/N.wasm`
+  (gex_split). Each cluster module is a PIC module with the
+  primary's imports. It fills its slots with `table.init` from a passive
+  segment. A direct call from one module to a function in another becomes
+  a `call_indirect` through the slot. The entry list does not change, so
+  the shim sees the same unit.
+- **Site.** web/eject-site.mjs packs each unit's clusters into `cold.bin`,
+  one zstd frame per cluster, plus `cold.idx`, a zstd-packed list of frame
+  and unpacked lengths. On a cluster's first call the Worker reads the
+  index once per unit, fetches the frame with a synchronous Range request,
+  decodes it with zstddec, compiles it, shares the Module with its
+  siblings and instantiates it into the table. The Worker that runs the
+  call blocks for that time, as for a lazy file.
+
+Clustering (`gex_split::Clustering`) sets how much one fetch brings:
+
+- `function`: each cold function is its own module.
+- `graph[:KiB]`: the cold functions a root reaches by direct calls.
+- `chunk[:KiB]`: consecutive cold functions by address, up to that much
+  code. An image's code from one source file sits together, so a dialog's
+  functions mostly come as a few chunks.
+- `graphchunk[:KiB]`: the graph's clusters, then packed by address.
+- `unit`: all of a unit's cold code in one module.
+
+Paint's first use of three cold features, from the action to the dialog's
+window, with the same recording and hot set in every split site
+(worldmachine, bench, headless Chromium, localhost, 3 alternated runs each):
+
+| | whole | chunk:256 | chunk:64 | graph:64 |
+| --- | --- | --- | --- | --- |
+| download (units) | 30.0 MB | 4.37 MB | 4.38 MB | 4.52 MB |
+| cold, fetched on use | | 31.2 MB, 619 clusters | 35.2 MB, 2406 | 79.7 MB, 77,874 |
+| to the window | 16.4, 16.4, 16.1 s | 16.5, 16.5, 16.4 s | 16.5, 16.2, 16.5 s | 16.8, 16.7, 16.7 s |
+| Resize/Skew (Ctrl+W) | 594, 508, 516 ms | 799, 686, 698 ms (34 fetches, 1.9 MB) | 767, 764, 764 ms (46, 0.7 MB) | 944, 955, 1042 ms (105, 0.2 MB) |
+| Open (Ctrl+O) | 1865, 1506, 1976 ms | 2269, 2147, 2253 ms (34, 1.6 MB) | 2542, 2478, 2582 ms (95, 1.4 MB) | 3833, 3818, 3855 ms (340, 1.0 MB) |
+| Print (Ctrl+P) | 994, 1020, 995 ms | 1010, 1009, 1062 ms (6, 0.4 MB) | 995, 1059, 1066 ms (10, 0.2 MB) | 1094, 1004, 988 ms (22, 0.07 MB) |
+
+On localhost a fetch costs 4-6 ms: Range, decode, compile. On a real
+network it costs a round trip, so the number of fetches decides the wait.
+Computed from an instrumented run's per-action coverage, modelled as
+(round trip + 1 ms) per fetch plus bytes at 50 Mbit/s:
+
+| clustering | clusters | cold MB | Open: fetches, MB | Open at 3 ms / 50 ms round trip |
+| --- | --- | --- | --- | --- |
+| function | 106,303 | 94.1 | 788, 0.98 | 3.3 s / 40.3 s |
+| graph:64 | 77,874 | 79.7 | 424, 1.36 | 1.9 s / 21.8 s |
+| chunk:64 | 2406 | 35.2 | 149, 2.35 | 1.0 s / 8.0 s |
+| chunk:256 | 619 | 31.2 | 71, 3.97 | 0.9 s / 4.3 s |
+| chunk:1024 | 181 | 28.7 | 31, 5.98 | 1.1 s / 2.5 s |
+| unit | 59 | 26.1 | 11, 13.4 | 2.2 s / 2.7 s |
+
+Fetching per function is too chatty: the Open dialog alone calls 788 cold
+functions. The call graph alone hardly helps either, because most calls
+between them go through tables (vtables, callbacks) that the direct-call
+graph cannot see. Grouping by address keeps the fetch count low and still
+compresses well (whole-unit frames 26 MB, per-function frames 94 MB).
+`chunk:256` is the default. Behind a slow link, `chunk:1024` makes fewer
+round trips. A function the recording missed at startup is a fetch, too:
+add runs to the coverage.
+
 ## Limits
 
 - **Dynamic linking for the recorded program only.** An `execve` of a

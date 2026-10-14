@@ -39,6 +39,8 @@ const WORLD = 0x122374c;
 const IMAGE = 0x400000;
 // Minutes from the page's start to the world, at most (tier-1 or a hang).
 const worldBy = Number(process.env.NOITA_WORLD_BY_MIN || 12) * 60000;
+// Images that have no code to build a unit from (NOITA_UNITLESS_OK, a regex).
+const unitlessOk = new RegExp(process.env.NOITA_UNITLESS_OK || '/(tzres|normaliz)\\.dll$');
 
 // noita.exe's PE signature and file header (24 bytes at e_lfanew: machine,
 // sections, link time stamp...), as mapped at its base.
@@ -48,7 +50,7 @@ const sig = [...exe.subarray(lfanew, lfanew + 24)];
 
 const tars = `/gex/nt/w3d.tar,/gex/nt/${process.env.NOITA_TAR || 'noita.tar'}`;
 const argv = encodeURIComponent(JSON.stringify(['noita.exe', '-single_threaded_loading']));
-const env = encodeURIComponent(`WINEPREFIX=/pfx,WINEDEBUG=${process.env.WDBG || 'err+all,fixme-all'},XDG_RUNTIME_DIR=/tmp,WAYLAND_DISPLAY=wayland-0`);
+const env = encodeURIComponent(`WINEPREFIX=/pfx,WINEDEBUG=${process.env.WDBG || 'err+all,fixme-all'},XDG_RUNTIME_DIR=/tmp,WAYLAND_DISPLAY=wayland-0${process.env.NOITA_ENV ? ',' + process.env.NOITA_ENV : ''}`);
 const { browser, page, state, evaluate, consoleLines, profile } = await openPage(
   `tar=${tars}&exe=/w3/lib/wine/i386-unix/wine&mtimes=1&cwd=/g&gl=1&glbackend=wgpu&size=1320x800`
     + `&argv=${argv}&env=${env}${process.env.NOITA_Q ?? '&cgen=1'}`,
@@ -112,7 +114,7 @@ const click = async (x, y) => {
 };
 
 const prof = process.env.NOITA_PROF
-  ? (([at = '60', ms = '20000']) => ({ at: +at, ms: +ms, done: false }))(process.env.NOITA_PROF.split(','))
+  ? (([at = '60', ms = '20000']) => ({ at: +at.replace(/^e/, ''), early: at.startsWith('e'), ms: +ms, done: false }))(process.env.NOITA_PROF.split(','))
   : null;
 const steps = [
   { at: 12, x: 85, y: 661, what: 'dismissing the release notes' },
@@ -134,11 +136,19 @@ for (;;) {
   // unit) runs, but slower, or at a crawl that looks like a hang.
   const lacking = consoleLines.find((l) => /missing unit: /.test(l));
   if (lacking) { why = `the unit cache is incomplete: ${lacking.replace(/^.*missing unit: /, '').slice(0, 400)}`; break; }
+  // So is an image with code that has no unit at the base it landed at
+  // (Wine's builtins are all relocated, so a base can move between builds):
+  // it runs on tier-1. Data-only images (no unit can be built) excepted.
+  const unitless = consoleLines.map((l) => /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l)).find((m) => m && !unitlessOk.test(m[1]));
+  if (unitless) { why = `${unitless[1]} at ${unitless[2]} has no function-tier unit (rebuild the units for its base)`; break; }
   if (tRun === null && s && s.phase !== 'loading' && s.phase !== 'fetching') tRun = now;
   const n = tRun === null ? 0 : await produced();
   if (steps.length && n >= steps[0].at) {
     const w = await noitaWindow();
-    if (w) {
+    // Only once the window has its 1280x720 client area: Wine maps it small
+    // first (10x10), and a click then lands outside the game (K: a New Game
+    // lost that way cost a 12-minute run). The step waits for the next poll.
+    if (w && w.w >= 1280 && w.h >= 720) {
       // The surface holds Wine's own window frame around the 1280x720
       // client area the recipe's points are in: a 3-pixel border and a
       // caption, the client at (3,29) in the surface (read off the
@@ -169,7 +179,7 @@ for (;;) {
       // into the world for MS ms, summarised (and saved beside NOITA_SHOT's
       // pictures). The measurement goes on through it: a profiling run's
       // world rate is not a baseline.
-      if (prof && !prof.done && now - world.t >= prof.at * 1000) {
+      if (prof && !prof.early && !prof.done && now - world.t >= prof.at * 1000) {
         prof.done = true;
         const v0 = p.v, tp = Date.now();
         const profs = await profile('', prof.ms, true);
@@ -188,6 +198,19 @@ for (;;) {
         break;
       }
     }
+  }
+  // NOITA_PROF=eAT,MS: the same AT s after the start, world or not (a
+  // run that never gets there).
+  if (prof && prof.early && !prof.done && now - t0 >= prof.at * 1000) {
+    prof.done = true;
+    const profs = await profile('', prof.ms, true);
+    console.log(`== profile ${prof.at} s after the start for ${prof.ms / 1000} s`);
+    profs.forEach(({ url, profile: pr }, k) => {
+      if (process.env.NOITA_SHOT) writeFileSync(join(process.env.NOITA_SHOT, `prof.${k}.cpuprofile`), JSON.stringify(pr));
+      const sum = summariseProfile(pr, 25);
+      console.log(`-- profile ${k} ${url}`);
+      console.log(typeof sum === 'string' ? sum : JSON.stringify(sum, null, 1).slice(0, 5000));
+    });
   }
   if (!world && now - t0 > worldBy) {
     const p = steps.length ? null : await peek();

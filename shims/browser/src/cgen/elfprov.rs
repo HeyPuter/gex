@@ -32,6 +32,17 @@ struct Bound {
 static BOUND: Mutex<Vec<Bound>> = Mutex::new(Vec::new());
 /// Provider-only units JS has still to serve.
 static QUEUE: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+/// `QUEUE`'s length, kept with every change, so a syscall that mapped
+/// nothing asks it without the lock ([`maps`]).
+static QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `QUEUE`, changed under its lock, with `QUEUED` kept equal to its length.
+fn queue<R>(f: impl FnOnce(&mut VecDeque<usize>) -> R) -> R {
+    let mut q = lock(&QUEUE);
+    let r = f(&mut q);
+    QUEUED.store(q.len(), Ordering::Release);
+    r
+}
 /// The process the state above is for: a forked child's shim may start
 /// with its parent's copy, which describes the parent's table.
 static PID: AtomicI32 = AtomicI32::new(0);
@@ -71,7 +82,7 @@ fn rescan_if_new() -> bool {
         return false;
     }
     lock(&BOUND).clear();
-    lock(&QUEUE).clear();
+    queue(|q| q.clear());
     let mapped: Vec<gex_kernel::CodeMap> = crate::with_host(|h| {
         use gex_kernel::mem::prot;
         h.kernel
@@ -88,14 +99,19 @@ fn rescan_if_new() -> bool {
 /// After a syscall: bind the providers of each newly mapped object. Returns
 /// whether JS has providers to serve before the guest goes on.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
+    // Nothing mapped (almost every call): only whether JS has a unit queued
+    // from before. The rest takes three locks and copies two lists.
+    if mapped.is_empty() {
+        return QUEUED.load(Ordering::Acquire) != 0;
+    }
     // A replaced library (a stateful Linux provider, libprov.rs) is served the same way.
     if let Some(u) = super::libprov::maps(mapped) {
-        lock(&QUEUE).push_back(u);
+        queue(|q| q.push_back(u));
     }
     // Function-tier units for listed shared objects (libprov.rs, B4).
     let unit = super::libprov::elf_unit_maps(mapped);
     if !on() {
-        return unit || !lock(&QUEUE).is_empty();
+        return unit || QUEUED.load(Ordering::Acquire) != 0;
     }
     if PID.load(Ordering::Acquire) == 0 {
         PID.store(crate::my_pid(), Ordering::Release);
@@ -136,6 +152,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
                 stateful: None,
                 data: p.stateful,
                 skeleton: None,
+                lifted: false,
             });
         }
         if !addrs.is_empty() && !lock(&BOUND).iter().any(|b| b.path == m.path && b.start == m.start) {
@@ -161,9 +178,9 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
             });
             units.len() - 1
         };
-        lock(&QUEUE).push_back(u);
+        queue(|q| q.push_back(u));
     }
-    unit || !lock(&QUEUE).is_empty()
+    unit || QUEUED.load(Ordering::Acquire) != 0
 }
 
 /// Whether install `i` is an export provider's module.
@@ -204,7 +221,7 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
 /// hold other code at -- was re-bridged to the old provider.
 pub(crate) fn on_exec() {
     lock(&BOUND).clear();
-    lock(&QUEUE).clear();
+    queue(|q| q.clear());
     lock(&REBRIDGE).clear();
     lock(&REBRIDGED).clear();
 }
@@ -220,9 +237,9 @@ pub extern "C" fn gex_elfprov_wanted() -> i32 {
     // Replaced libraries too, with providers on or off (after the rescan,
     // which starts the queue over).
     if let Some(u) = super::libprov::rescan_if_new() {
-        lock(&QUEUE).push_back(u);
+        queue(|q| q.push_back(u));
     }
-    lock(&QUEUE).pop_front().map_or(-1, |u| u as i32)
+    queue(|q| q.pop_front()).map_or(-1, |u| u as i32)
 }
 
 /// Dispatch slots (table, slot pairs, as `bridges` gives them) JS must point

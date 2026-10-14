@@ -176,6 +176,9 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
 /// clock; `None` with none armed. No kernel lock (`Kernel::timer_in_ns`).
 pub(crate) fn timer_in_ns() -> Option<u64> {
     let home = home()?;
+    if !home.sig.timers_armed() {
+        return None;
+    }
     let (secs, nanos) = (home.clock)();
     home.sig.timer_in_ns(secs as u128 * 1_000_000_000 + nanos as u128)
 }

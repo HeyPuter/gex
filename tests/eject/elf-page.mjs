@@ -3,35 +3,36 @@
 // own serve.mjs, its page (user/index.html, the example gexc eject writes)
 // calling app.mjs's start() (docs/eject.md, "The web build").
 //
-//   node tests/eject/elf-page.mjs PROJECT --expect TEXT [--status N] [--port N] [--chrome PATH]
+//   node tests/eject/elf-page.mjs PROJECT --expect TEXT [--status N] [--port N (default: any free one)] [--chrome PATH]
 //
 // Checks: the page loads once; the program's output (a <pre> start() puts in
 // the container) has TEXT; with --status N, the page says the program
 // exited N. Prints PASS or FAIL lines; exits 0 only when all pass.
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
+import { Cdp } from '../../web/test/cdp.mjs';
 
 const av = process.argv.slice(2);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const project = resolve(av.find((a, i) => !a.startsWith('--') && !['--expect', '--status', '--port', '--chrome'].includes(av[i - 1])) ?? '');
 const expect = opt('--expect', '');
 const status = opt('--status', null);
-const port = Number(opt('--port', '8751'));
+// Port 0 by default (any free one), Chromium's too: two runs on one box
+// never collide.
+const askPort = Number(opt('--port', '0'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
 const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${what}`); if (!ok) failed++; return ok; };
 
-const server = spawn(process.execPath, [join(project, 'serve.mjs'), String(port)], { stdio: ['ignore', 'pipe', 'inherit'] });
-await new Promise((r) => server.stdout.once('data', r));
+const server = spawn(process.execPath, [join(project, 'serve.mjs'), String(askPort)], { stdio: ['ignore', 'pipe', 'inherit'] });
+const port = await new Promise((r) => server.stdout.once('data', (d) => r(Number(/:(\d+)\//.exec(String(d))?.[1]))));
 const profile = mkdtempSync(join(tmpdir(), 'gex-elf-leg-'));
-const cport = port + 1;
 const chrome = spawn(opt('--chrome', process.env.CHROME || '/usr/bin/chromium'), [
   '--headless', '--no-sandbox', '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
-  `--remote-debugging-port=${cport}`, `--user-data-dir=${profile}`, 'about:blank',
+  '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank',
 ], { detached: true, stdio: 'ignore' });
 const done = () => {
   try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
@@ -41,7 +42,14 @@ const done = () => {
   process.exit(failed ? 1 : 0);
 };
 let ws = null;
-for (let i = 0; i < 80 && !ws; i++) { ws = await browserWsUrl(cport); if (!ws) await sleep(250); }
+// Chromium writes the port it got, and the browser target's path, here.
+const activePort = () => {
+  try {
+    const [p, path] = readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n');
+    return Number(p) > 0 && path ? `ws://127.0.0.1:${Number(p)}${path}` : null;
+  } catch { return null; }
+};
+for (let i = 0; i < 80 && !ws; i++) { ws = activePort(); if (!ws) await sleep(250); }
 if (!check(!!ws, 'Chromium started')) done();
 const browser = await Cdp.connect(ws);
 const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });

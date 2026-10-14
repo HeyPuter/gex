@@ -1069,6 +1069,63 @@ One general mechanism serves Windows and Linux guests on every tier.
 first, since that's Noita. Steps 5 and 6 follow, once Noita's profile no
 longer shows libc.
 
+### 9.10 Base-independent units (2026-10-13)
+
+A unit is keyed by its image *and the base it is mapped at*, so an image
+that lands somewhere else (Wine's i386 builtins are all relocated from
+ImageBase 0x10000000, first fit and top-down; games' own ASLR DLLs; P's
+mspaint) has no unit and runs on tier-1. Wine's builtins get fixed bases at
+stage time (K, tools/wine-wasm). Everything else gets units that do not
+depend on the base, by one mechanism: relocation at install time. A base
+global added per address (`global.get $base; i32.add K`) was considered and
+rejected, also as a fallback for cold units: about 3.2M extra adds and +7%
+code in noita.exe's unit, on hot paths (return checks, devirtualised
+compares), since V8 does not fold an imported global.
+
+**What depends on the base.** Every guest address a unit holds as a
+constant: entry and return pcs (return checks, `LAST_TARGET`, fcache
+keys, devirtualisation guards) and the absolute data addresses of the x86
+code, with whatever clang folds into them (K + off). Noita's noita.exe unit
+(140.9 MB c.wasm) has at most 3.19M i32/i64 constants in the image's range
+(of 9.12M constants; an upper bound, some are integers that only look like
+addresses), and noita.exe 360,575 HIGHLOW relocations. A unit has no data
+segment, so only code is touched.
+
+**Mechanism.**
+- cgen writes each base-relative constant as `(uintptr_t)&gex_image + off`,
+  so clang keeps folded arithmetic as symbol + addend.
+- The unit is linked keeping wasm-ld's relocation records for that symbol
+  (R_WASM_MEMORY_ADDR_LEB / SLEB / LEB64: fixed-width LEBs at known code
+  offsets) in a custom section, built at a nominal base. The key no longer
+  includes the base.
+- At install, if the image is at the nominal base, nothing happens: no
+  cost, and the engine's code cache still applies. Otherwise each LEB is
+  rewritten in place with delta = actual - nominal before the module is
+  compiled, and the entries (c.entries, the FuncMap) are shifted by delta
+  when published. Hot code pays nothing.
+
+**Provenance.** cgen must relocate addresses and never an integer that looks
+like one. A constant is relocatable if and only if it is a guest pc, or its
+source field in the instruction is covered by the image's .reloc. An image
+without .reloc cannot move, so it is never relocated. Something to check in
+the prototype: that clang never turns a comparison against
+`&gex_image + off` into a form that drops the relocation.
+
+**Estimated costs (noita.exe).** Code about +3 MB (+2%: immediates padded
+from about 4 to 5 bytes). The relocation section about +6-10 MB, which can
+be dropped for images whose base never moves. Install about 10-30 ms of
+in-place writes. A moved base cannot reuse a compile cached for the nominal
+base.
+
+**Prototype and gates** (after the libm and icall rounds):
+- Start on msvcr120, then noita.exe. Report the relocation count, the code
+  and section sizes, the patch time, and timed world fps on the pinned
+  edger.
+- Correctness: a unit installed at a moved base runs a differential test
+  against the same image at its build base.
+- Check the provenance rule on an image whose .reloc covers a field that is
+  genuinely data only, to show a non-address is never relocated.
+
 ## 10. A native gex wasm target for any program (future, noted 2026-10-04)
 
 Stream W's Wine work (docs/wine-native.md §3.10, §4.1) created a general

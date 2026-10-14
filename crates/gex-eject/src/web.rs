@@ -418,7 +418,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const port = Number(process.argv[2] ?? 8000);
 const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript',
   '.json': 'application/json', '.wasm': 'application/wasm' };
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
   if (path.includes('..')) { res.writeHead(403).end(); return; }
   try {
@@ -433,7 +433,8 @@ createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end();
   }
-}).listen(port, () => console.log(`http://localhost:${port}/`));
+// Port 0 is any free one; the line says which it got.
+}).listen(port, () => console.log(`http://localhost:${server.address().port}/`));
 "#;
 
 /// `user/index.html`: the example page, the same for every kind of project

@@ -207,7 +207,7 @@ def main():
             open(os.path.join(t, 'DEBIAN', 'control'), 'w').write('\n'.join(ctl) + '\n')
             maintainer_scripts(t, b)
             deb = os.path.join(a.out, f'{b}_{version.split(":", 1)[-1]}_{arch}.deb')
-            subprocess.run(['dpkg-deb', '--root-owner-group', '-Zxz', '--build', t, deb],
+            subprocess.run(['dpkg-deb', '--root-owner-group', '-Zzstd', '-z19', '--build', t, deb],
                            check=True, stdout=subprocess.DEVNULL)
             print(b, version, deb)
 

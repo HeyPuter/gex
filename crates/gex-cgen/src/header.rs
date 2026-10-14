@@ -102,6 +102,7 @@ pub fn header() -> String {
     decl(w, imports::CACHE_OP, "void", "gex_cache_op", "int ctx, int64_t pc, int32_t op, int64_t addr");
     decl(w, imports::FMA, "int64_t", "gex_fma", "int ctx, int64_t a, int64_t b, int64_t c, int32_t dbl");
     decl(w, imports::SAFEPOINT, "void", "gex_safepoint", "int ctx, int64_t pc");
+    decl(w, imports::ICALL_NOTE, "void", "gex_icall_note", "int ctx, int64_t ret, int64_t target");
     decl(w, gex_abi::ftab::LOOKUP, "int32_t", "gex_lookup", "int ctx, int64_t addr");
     decl(
         w,

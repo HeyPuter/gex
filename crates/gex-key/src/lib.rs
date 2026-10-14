@@ -29,12 +29,25 @@ pub fn image_identity(image: &Image) -> String {
 }
 
 /// The identity of an image's function-tier recovery: the sources that decide
-/// it (`recovery_inputs`, gex-cgen's `RECOVERY_INPUTS`) and the image as
-/// placed. gex-cgen's `image::recovery_key` passes its own constants.
+/// it (`recovery_inputs`, gex-cgen's `RECOVERY_INPUTS`), the guest it is
+/// decoded as, and the image as placed. gex-cgen's `image::recovery_key`
+/// passes its own constants.
+///
+/// The guest is not in the sources' hash: every gexc flavour is built from
+/// the same sources, and each decodes an image as its own guest's code. An
+/// aarch64 gexc run on an i386 DLL wrote a recovery of AArch64 instructions
+/// under the key the x86 gexc reads, and the x86 units built from it hung
+/// Wine's boot (1014b: rpcrt4 recovered as 1619 functions, not 2666;
+/// wineboot went silent after tzres). x86 adds nothing, so its keys, and
+/// every cache built with them, stay as they were.
 pub fn recovery_key(image: &Image, recovery_inputs: &str) -> String {
     let mut h = sha256::Sha256::new();
     h.update(b"gex-cgen-recovery 1");
     h.update(recovery_inputs.as_bytes());
+    if !gex_abi::X86 {
+        h.update(b":");
+        h.update(gex_abi::ARCH_NAME.as_bytes());
+    }
     h.update(image_identity(image).as_bytes());
     sha256::hex(&h.finish())
 }
@@ -109,7 +122,15 @@ mod tests {
     fn keys_are_pinned() {
         let img = fixture();
         assert_eq!(image_identity(&img), "image:f9c66b197e4206a0b666bb966e724f0e60ac7f4f6a6fc0540b9915025a3a1dbb");
-        assert_eq!(recovery_key(&img, "recovery-inputs"), "e586c60522f7c873ddc04a9652df01f404529981dbb33ec325609e23d972b437");
-        assert_eq!(unit_key(&img, "gex-cgen-image 3", "unit-inputs", 1, "recovery-inputs"), "cfb86de8e01048b353148fa2d7afdff15a1263bbec2bfb80c7f35dbfaf3b0059");
+        // The x86 keys; another guest's differ from them (`recovery_key`).
+        let rec = recovery_key(&img, "recovery-inputs");
+        let unit = unit_key(&img, "gex-cgen-image 3", "unit-inputs", 1, "recovery-inputs");
+        if gex_abi::X86 {
+            assert_eq!(rec, "e586c60522f7c873ddc04a9652df01f404529981dbb33ec325609e23d972b437");
+            assert_eq!(unit, "cfb86de8e01048b353148fa2d7afdff15a1263bbec2bfb80c7f35dbfaf3b0059");
+        } else {
+            assert_ne!(rec, "e586c60522f7c873ddc04a9652df01f404529981dbb33ec325609e23d972b437");
+            assert_ne!(unit, "cfb86de8e01048b353148fa2d7afdff15a1263bbec2bfb80c7f35dbfaf3b0059");
+        }
     }
 }

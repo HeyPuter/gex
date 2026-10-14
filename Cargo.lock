@@ -649,6 +649,7 @@ dependencies = [
  "gex-key",
  "gex-ld",
  "gex-native",
+ "gex-split",
  "gex-xlate",
  "wasmparser 0.219.2",
 ]
@@ -745,6 +746,7 @@ dependencies = [
 name = "gex-key"
 version = "0.0.1"
 dependencies = [
+ "gex-abi",
  "gex-ld",
 ]
 
@@ -832,6 +834,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-split"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "wasm-encoder 0.219.2",
+ "wasmparser 0.219.2",
+]
+
+[[package]]
 name = "gex-wayland"
 version = "0.0.1"
 
@@ -882,6 +893,7 @@ dependencies = [
  "gex-kernel",
  "gex-ld",
  "gex-native",
+ "gex-split",
  "gex-xlate",
  "libc",
 ]

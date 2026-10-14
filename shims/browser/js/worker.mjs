@@ -99,6 +99,10 @@ async function workerMain(port) {
 // This Worker's runtime, once its start message builds it. Module-scope so a
 // `sharedModule` message (relayed sibling-Worker compiles) can reach it.
 let workerGex = null;
+/// Whether this process's memory can go to the next fork child when it exits
+/// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
+/// compositor reading its pixels, the session reaching its door.
+let recyclable = true;
 
 // Standard input, as it arrives. A guest read that finds nothing asks the
 // host and waits here; `readStdin` below is what the run loop awaits.
@@ -295,6 +299,22 @@ async function handle(msg) {
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
   // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
   const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
+  // `closed` (an ejected page's units archive): the page fetched every unit
+  // file there is, so a file not among them is a miss, not a request.
+  const preClosed = (msg.preModules ?? []).some(([k]) => k === 'closed');
+  // A zstd decoder for a split unit's cold clusters (gex_split), made
+  // before the guest runs: its loads are synchronous.
+  let zstd = null;
+  if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
+    try {
+      const { ZSTDDecoder } = await import(msg.cgen.zstd);
+      zstd = new ZSTDDecoder();
+      await zstd.init();
+    } catch (err) {
+      console.error(`[gex] no zstd decoder for cold clusters (${msg.cgen.zstd}): ${err?.message ?? err}`);
+      zstd = null;
+    }
+  }
   class WorkerEnv extends Env {
     /**
      * Wait until the host has delivered everything this Worker wrote: called
@@ -360,6 +380,7 @@ async function handle(msg) {
     // `WebAssembly.Memory` crosses `postMessage` as itself, so the other Worker
     // is on this process's address space.
     async spawnThread(thread) {
+      recyclable = false;
       port.post({ kind: 'thread', thread });
     }
     // A module this Worker just compiled, up to the host to relay to the sibling
@@ -372,6 +393,7 @@ async function handle(msg) {
     // The wineserver published its door (docs/wineserver-kernel.md): up to
     // the host, which hands it to every Worker of the session.
     publishDoor(door) {
+      recyclable = false;
       port.post({ kind: 'doorPublish', door });
     }
     // A function-tier unit's files by key (`gex.useCgen`): `msg.cgen.root`, a
@@ -395,6 +417,47 @@ async function handle(msg) {
         },
       };
     }
+    // `len` bytes at `off` of a unit-cache file (a split unit's
+    // `cold.bin`), synchronously; null when they cannot be read.
+    loadRange(rel, off, len) {
+      const c = msg.cgen;
+      if (!c) return null;
+      try {
+        if (c.root) {
+          const fs = globalThis.process?.getBuiltinModule?.('node:fs');
+          if (!fs) return null;
+          const fd = fs.openSync(`${c.root}/${rel}`, 'r');
+          try {
+            const b = new Uint8Array(len);
+            return fs.readSync(fd, b, 0, len, off) === len ? b : null;
+          } finally {
+            fs.closeSync(fd);
+          }
+        }
+        const x = new XMLHttpRequest();
+        x.open('GET', `${c.url}/${rel}`, false);
+        x.responseType = 'arraybuffer';
+        x.setRequestHeader('Range', `bytes=${off}-${off + len - 1}`);
+        // Said to the page, as a unit's own files are: a cold cluster is
+        // code the program is waiting for.
+        const done = noteFetch(`unit:${rel}`, len);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
+        const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
+        // 206 is the range; a server without ranges sends the whole file.
+        const at = x.status === 206 ? 0 : x.status === 200 ? off : -1;
+        return at >= 0 && got.length >= at + len ? got.slice(at, at + len) : null;
+      } catch {
+        return null;
+      }
+    }
+    // The zstd decoder made above, or null.
+    get zstd() {
+      return zstd;
+    }
     // Any file of the unit cache by its relative path (an export
     // provider's module: `providers/<name>-<fingerprint>.wasm`), or null.
     loadFile(rel) {
@@ -403,6 +466,7 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
+      if (preClosed) return null;
       try {
         if (c.root) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
@@ -451,6 +515,7 @@ async function handle(msg) {
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
+  if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
@@ -461,7 +526,9 @@ async function handle(msg) {
     kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
     // A thread joins its process's memory; a process makes one. `shared` only
     // decides whether the memory a process builds can have threads later.
-    memory: msg.memory ?? null,
+    // A fork child may be given an exited process's memory, zeroed
+    // (`recycledMemory`, host.mjs): the same as a new one, its pages touched.
+    memory: msg.memory ?? msg.recycledMemory ?? null,
     moduleStore: msg.moduleStore ?? null,
     shared: !!msg.shared,
   });
@@ -469,11 +536,12 @@ async function handle(msg) {
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
   if (msg.door) gex.setDoor(msg.door);
+  if (msg.cgen?.skip) gex.providerSkip(msg.cgen.skip);
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
-  for (const [key, mod] of msg.preModules ?? []) if (!key.startsWith('file:')) gex.addSharedModule(key, mod);
+  for (const [key, mod] of msg.preModules ?? []) if (key.startsWith('cgen:') || key.startsWith('cgenfile:')) gex.addSharedModule(key, mod);
   if (globalThis.GEX_SHARE_TRACE || globalThis.process?.env?.GEX_SHARE_TRACE || msg.shareTrace) console.warn(`[share] ${msg.kind} start with ${(msg.sharedModules ?? []).length} shared modules (${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('cgen:')).length} units, ${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('wasm:')).length} programs)`);
 
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
@@ -532,6 +600,7 @@ async function handle(msg) {
     // The memory object, not its buffer: a shared memory that grows gives out a
     // new buffer, and the compositor has to be able to see the new length.
     gex.onWlToken = (token) => {
+      recyclable = false;
       port.post({ kind: 'wl-memory', token, memory: gex.memory, kernel: gex.kernelWake()?.memory });
     };
     proxy.onToken = gex.onWlToken;
@@ -863,7 +932,7 @@ async function handle(msg) {
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
-    port.post({
+    const exitMsg = {
       kind: 'exit',
       status,
       guestMillis,
@@ -949,9 +1018,16 @@ async function handle(msg) {
       arena: gex.shim.exports.gex_arena_spent_mib
         ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,
-    });
+    };
     // Last: nothing calls into this instance after (`releaseWorker`).
     gex.releaseWorker?.();
+    // This process's memory, zeroed, for the host to give the next fork child
+    // (`Gex#recycleMemory`): its pages are touched, which a fresh memory's are
+    // not. After the kernel has the process gone, so no parent waits on it.
+    if (recyclable && msg.kind !== 'thread' && !msg.child?.exec) {
+      exitMsg.recycle = gex.recycleMemory?.() ?? undefined;
+    }
+    port.post(exitMsg);
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the
     // shim reaches the host as `unreachable`, and the guest pc and object are
@@ -1036,6 +1112,17 @@ const handed = await (async () => {
 })();
 
 port.post({ kind: 'ready' });
+
+// The bridges every process of a page sets up before it runs (GL, Wayland,
+// network), loaded now, while this Worker waits in the host's pool: imported
+// only when a process arrived, they were about a quarter of a forked child's
+// start (12.8, 7.3 and 5.6 ms of 104 on apt's children, timed per phase). A
+// later `import` of each is then the module already evaluated.
+if (typeof self !== 'undefined') {
+  import('./gl-bridge.mjs').catch(() => {});
+  import('./wl-bridge.mjs').catch(() => {});
+  import('./net-bridge.mjs').catch(() => {});
+}
 if (handed) handle(handed);
 }
 

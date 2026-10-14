@@ -19,7 +19,7 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
-import { runProgram, globalKernel, singleMode } from './runtime.js';
+import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 
@@ -264,6 +264,9 @@ async function begin(opts, base, at, state, meter) {
   globalThis.GEX_PAGE_SEARCH = `?${sq}`;
   globalThis.GEX_ASSET_BASE = base.href;
   setGlobals((k) => sq.get(k), b);
+  // A unit split by function (gex_cgen::split): its Workers decode the cold
+  // clusters they fetch with the same zstd decoder.
+  if (sq.get('cold')) globalThis.GEX_CGEN_ZSTD = at(b.zstd ?? 'vendor/zstddec-stream.mjs');
 
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
@@ -320,10 +323,23 @@ async function begin(opts, base, at, state, meter) {
       d.files++;
       d.total += (await packedEntry(href, fetcher))?.zsize ?? 0;
     }
-    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:')).length;
+    // The runtime's modules, the ones the site packed (the rest load as
+    // they always did, outside these counts).
+    for (const href of Object.values(runtimeUrls())) {
+      const e = await packedEntry(href, fetcher);
+      if (e) { d.files++; d.total += e.zsize ?? 0; }
+    }
+    // A units archive (`tar:N`) holds N modules.
+    meter.p.compile.total = (preList ?? []).filter(([name]) => !name.startsWith('file:'))
+      .reduce((n, [name]) => n + (name.startsWith('tar:') ? Number(name.slice(4)) || 0 : 1), 0);
     meter.tick();
   }
   const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
+  // The runtime's wasm, compressed in the pack when the site packed it
+  // (plain, the shim alone was 6.6 MB of Paint's download).
+  const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
+    [k, (await packedEntry(url, fetcher)) ? await fetchShared(url, fetcher) : null]))
+    .then((kv) => primeRuntime(Object.fromEntries(kv.filter(([, v]) => v))));
   const trees = [];
   const buffers = [];
   for (const url of b.tar) {
@@ -395,7 +411,8 @@ async function begin(opts, base, at, state, meter) {
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
   const preModules = await preloading;
-  if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
+  await runtime;
+  if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
   mark('running');
   if (keep) {
@@ -620,12 +637,16 @@ export function setGlobals(get, b = {}) {
   if (fjit !== null && fjit !== '0') globalThis.GEX_FJIT = Number(fjit) || 1;
   if (get('wasmdlls')) globalThis.GEX_WASM_DLLS = get('wasmdlls');
   if (get('elfunits')) globalThis.GEX_ELF_UNITS = get('elfunits');
+  // provskip=export,...: exports no provider binds, as GEX_PROVIDER_SKIP natively (units built with the same skip).
+  if (get('provskip')) globalThis.GEX_PROVIDER_SKIP = get('provskip');
   if (get('fjitlibs')) globalThis.GEX_FJIT_LIBS = get('fjitlibs');
   if (get('pins')) globalThis.GEX_PINS = get('pins');
   if (get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (get('dense') === '2') globalThis.GEX_DENSE = 2;
   // cgen=1|2 (prefer|require units), the unguarded flavour unless unguarded=0.
-  if (get('cgen')) globalThis.GEX_CGEN = Number(get('cgen')) | (get('unguarded') === '0' ? 0 : 4);
+  // icallcount=1: the counting flavour of units (16), whose run prints the
+  // indirect-call profile (cgen.rs gex_icall_dump; GEX_CGEN_ICALL_COUNT=1 units).
+  if (get('cgen')) globalThis.GEX_CGEN = Number(get('cgen')) | (get('unguarded') === '0' ? 0 : 4) | (get('icallcount') === '1' ? 16 : 0);
   if (get('cgenurl')) globalThis.GEX_CGEN_URL = get('cgenurl');
   if (get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (get('aot')) globalThis.GEX_AOT = 1;
@@ -743,6 +764,29 @@ async function preloadUnits(list, f, at) {
       const [name, path] = list[i++];
       const href = at(path);
       try {
+        if (name.startsWith('tar:')) {
+          // Every unit in one archive (web/eject-site.mjs): its modules
+          // compiled, its other files shared, and `closed`: the Workers
+          // ask the host for no unit file the archive does not hold.
+          const t = untar((await fetchShared(href, f)).buffer);
+          const mods = [];
+          for (const [p, bytes] of Object.entries(t.files)) {
+            const rel = p.replace(/^\/+/, '');
+            if (rel.endsWith('/c.wasm')) {
+              mods.push(WebAssembly.compile(bytes).then((m) => {
+                f.meter?.compiled();
+                return [`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m];
+              }));
+              continue;
+            }
+            // Shared where there is a SharedArrayBuffer (the SP build has none).
+            const s = new Uint8Array(typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(bytes.byteLength) : new ArrayBuffer(bytes.byteLength));
+            s.set(bytes);
+            out.push([`file:${rel}`, s]);
+          }
+          out.push(...await Promise.all(mods), ['closed', true]);
+          continue;
+        }
         if (name.startsWith('file:')) {
           // A small file of the unit cache, which every Worker would
           // otherwise fetch synchronously: shared, so each gets it uncopied.

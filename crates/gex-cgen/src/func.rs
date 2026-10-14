@@ -1360,7 +1360,14 @@ impl FnUnit {
                                     e.line("    } }");
                                 }
                             }
-                            None => ftab_call(e, &t, &depth, need_back, &ret_arg, fail),
+                            None => {
+                                if crate::image::icall_count() {
+                                    // The counting flavor: the profile the
+                                    // hints come from (`image::icall_count`).
+                                    e.line(format!("  gex_icall_note(ctx, 0x{ret_pc:x}ull, {t});"));
+                                }
+                                ftab_call(e, &t, &depth, need_back, &ret_arg, fail)
+                            }
                         }
                     }
                     Callee::Direct(t) if known.contains(t) => {

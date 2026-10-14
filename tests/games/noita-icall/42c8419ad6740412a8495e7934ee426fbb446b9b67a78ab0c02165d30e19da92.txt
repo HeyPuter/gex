@@ -1,0 +1,6 @@
+# /w3/lib/wine/i386-windows/cryptbase.dll at 0x7b780000: (return address, target, calls) at table calls, counted by gex (icallcount units)
+icall 0x7b7818e4 0x7bfa1338 1
+icall 0x7b7819b8 0x7b781fa0 1
+icall 0x7b781d73 0x7bfd1884 2
+icall 0x7b781de8 0x7bfd1460 2
+icall 0x7b781e96 0x7bfd1b94 2

@@ -115,7 +115,7 @@ let kernelBytes = null;
  */
 function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
-  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
+  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
@@ -127,6 +127,8 @@ function xcacheName() {
 export function primeRuntime(r) {
   if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
   if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
+  // An ejected site's page fetches the kernel through its pack too (app.js).
+  if (r?.kernelBytes && !kernelBytes) kernelBytes = r.kernelBytes;
 }
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */
@@ -137,6 +139,11 @@ export async function loadRuntime(onProgress) {
 }
 
 export { fetchBytes };
+
+/** Where the runtime's three modules are (an ejected site packs them). */
+export function runtimeUrls() {
+  return { shimBytes: SHIM_URL(), seedBytes: SEED_URL(), kernelBytes: KERNEL_URL() };
+}
 
 /**
  * A `?name=` switch, from wherever this is running. `location` does not exist
@@ -357,7 +364,7 @@ async function loadKernel() {
     return null;
   }
   try {
-    const bytes = await fetchBytes(KERNEL_URL());
+    const bytes = kernelBytes ?? await fetchBytes(KERNEL_URL());
     kernelBytes = bytes;
     kernelSpec = {
       // The maximum must match `--max-memory` in `shims/kernel/build.sh`
@@ -983,7 +990,8 @@ async function runProgramHere(
       // Otherwise the export providers the dist carries (gex/cgen/providers/,
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' }
+      // `?provskip=a,b`: those exports left to the guest's own code (an A/B).
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', skip: globalThis.GEX_PROVIDER_SKIP, zstd: globalThis.GEX_CGEN_ZSTD }
         : flag('providers') === '0' ? undefined
         : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a
@@ -1011,6 +1019,8 @@ async function runProgramHere(
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+      // `?provskip=export,...`: exports no provider binds (gex-cgen `set_skip`).
+      providerSkip: globalThis.GEX_PROVIDER_SKIP || undefined,
       // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
       fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
