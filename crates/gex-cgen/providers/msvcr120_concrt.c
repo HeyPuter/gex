@@ -8,11 +8,18 @@
  * §9.9.2 step 1).
  *
  * Object state lives in the first words of each ConcRT object, which the
- * callers allocate at its real (larger) size. Waits are bounded at 1 ms so a
- * missed wake costs 1 ms; every wait loop polls the safepoint before it has
- * changed anything, so a thread stopped there restarts the call. */
+ * callers allocate at its real (larger) size. The waits that poll the
+ * safepoint (a lock, an event) are bounded at 1 ms, so a thread is stopped
+ * there (exit, a signal) within 1 ms and restarts the call; they poll before
+ * they have changed anything. A condition variable's wait has no safepoint
+ * and waits once for its whole timeout (cond_wait). */
 
 #define COOPERATIVE_WAIT_TIMEOUT 0xffffffffu
+
+/* gp_wait in nanoseconds, -1 for no timeout. */
+static void gp_wait_ns(uint32_t a, uint32_t v, int64_t ns) {
+    (void)__builtin_wasm_memory_atomic_wait32((int *)GEX_P(a), (int)v, ns);
+}
 
 /* The NT yield park's generation word (gex_kernel::nt::sync::YIELD_GEN, in
  * KUSER_SHARED_DATA's page past the structure). A thread spinning in
@@ -173,19 +180,28 @@ static GEX_PROVIDER(cond_ctor) {
 }
 /* Unlocks `cs`, waits for a notification (at most `timeout` ms, ~0 for
  * none), relocks. No safepoint once `cs` is released: the call cannot be
- * restarted from its entry after that. */
+ * restarted from its entry after that.
+ *
+ * One wait on the generation word for the whole timeout, not 1 ms waits
+ * re-armed: a notification always changes the word before its wake, and the
+ * wait compares the word first, so no wake is missed; and with no safepoint
+ * here there is nothing for a bounded wait to poll. Re-arming every 1 ms woke
+ * each idle thread ~1000 times a second (Noita: four Workers parked here,
+ * docs/wine-overhead.md). Only notifications wake this word, so a wake with
+ * the word unchanged is spurious and waits again (with no timeout; a timed
+ * wait ends then, as a wait that may end early is allowed to). */
 static int cond_wait(int ctx, uint32_t c, uint32_t cs, uint32_t timeout) {
-    uint32_t gen = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST), waited = 0;
+    uint32_t gen = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST);
     cs_unlock(cs);
-    int signaled;
-    while (!(signaled = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST) != gen) && (timeout == 0xffffffffu || waited < timeout)) {
-        if (!waited) {
-            yield_kick();
-        }
+    int signaled = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST) != gen;
+    if (!signaled && timeout) {
+        yield_kick();
         __atomic_fetch_add(GA(c + 4), 1u, __ATOMIC_SEQ_CST);
-        gp_wait(c, gen, 1);
+        do {
+            gp_wait_ns(c, gen, timeout == 0xffffffffu ? -1 : (int64_t)timeout * 1000000);
+            signaled = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST) != gen;
+        } while (!signaled && timeout == 0xffffffffu);
         __atomic_fetch_sub(GA(c + 4), 1u, __ATOMIC_SEQ_CST);
-        ++waited;
     }
     cs_lock(ctx, cs, 0xffffffffu, 0);
     return signaled;
