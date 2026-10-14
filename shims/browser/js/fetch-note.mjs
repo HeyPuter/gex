@@ -5,6 +5,9 @@
 // the start while it waits. Nothing listens unless a page asked.
 
 const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('gex-fetch') : null;
+// Under Node an open channel keeps the event loop alive: a run with no Workers to terminate
+// (the single-thread build, run-node.mjs) printed its output and never exited.
+channel?.unref?.();
 let next = 0;
 
 /** A fetch starts: `what` (a URL or a unit cache path), `bytes` expected (0
