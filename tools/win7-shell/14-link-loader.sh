@@ -29,9 +29,11 @@ for c in $(sed -n '/^server\/wineserver:/,/^\t/p' Makefile | grep -o "server/[a-
   objs="$objs gexw3/server/$b"
 done
 reg=""
-for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy mountmgr.sys:mountmgr; do
+# webgpu: Direct3D on WebGPU (wined3d's WebGPU renderer, /dev/gex-gpu)
+for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy mountmgr.sys:mountmgr webgpu:webgpu; do
   dir=${spec%%:*}; lib=${spec##*:}; mkdir -p "gexw3/unix/$lib"
-  for c in $(sed -n "/^dlls\/$dir\/$lib.so:/,/^\t/p" Makefile | grep -o "dlls/$dir/[a-z_0-9]*\.o" | sort -u); do
+  [ -d "$F/dlls/$dir" ] || continue
+  for c in $(sed -n "/^dlls\/$dir\/$lib.so:/,/^\t/p" Makefile | grep -o "dlls/$dir/[a-z_0-9-]*\.o" | sort -u); do
     b=$(basename "$c" .o); compile "$F/dlls/$dir/$b.c" "$c" "gexw3/unix/$lib/$b.o" "-D__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
     objs="$objs gexw3/unix/$lib/$b.o"
   done
