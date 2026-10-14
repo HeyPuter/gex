@@ -688,10 +688,22 @@ worldmachine, bench, headless Chromium, 3 alternated runs each):
 
 A unit holds every function of its image, and a run to the window calls
 about one in twelve of them (Paint: 10,040 of 116,343 across 59 units).
-`user/eject.json` `"cold"` (the W3 template's is `"chunk:256"`; a config
-without it means `"none"`) ships only those functions up front. The rest
-are fetched the first time something calls one. Everything is still
-compiled ahead of time at build time, and nothing is lifted in the page.
+The default (`user/eject.json` `"cold": "none"`, the W3 template's, and
+what a config without the setting means) ships every unit whole, in one
+archive: web/eject-site.mjs tars every unit's `c.wasm` and `c.entries`
+into `project/build/web/units.tar`, packed as one zstd file
+(preload.json `tar:N`). The page decodes it once and compiles every module
+while the bundle downloads. The Workers ask the host for no other unit
+file: a lookup the archive does not answer is a miss, not a request
+(worker.mjs, `closed`). Nothing is fetched on a call. Paint's site: one
+4-file download of 49.1 MB, 328 requests to the window and none of them
+for code (the split site below made 1075, 61 of them cold fetches each
+blocking a process).
+
+A split is opt-in: a clustering in `"cold"` ships only the functions the
+recording ran up front. The rest are fetched the first time something
+calls one. Everything is still compiled ahead of time at build time, and
+nothing is lifted in the page.
 
 - **Coverage.** Build with `"cold": "instrument"`. Every guest function of
   every unit then calls `gexcov.hit(slot)` on entry (`gexc cgen-split

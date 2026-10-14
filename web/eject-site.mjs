@@ -428,9 +428,25 @@ function w3Site() {
   // download has of it; nt.json carries the rest's manifest by URL.
   if (w3.bundle) w3.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
   place(tar, 'project/build/web/rootfs.tar');
-  // The units, largest first in the preload list.
+  // The units. Whole units (no "cold" split, the default): one archive,
+  // units.tar, every unit's c.wasm and c.entries, packed as one zstd file.
+  // The page decodes it once, compiles every module while the bundle
+  // downloads, and asks the host for no other unit file: a Worker's lookup
+  // of anything the archive does not hold is a miss, not a request
+  // (preload.json `tar:N`, N the number of modules in it).
   const preload = [];
-  for (const u of w3.units) {
+  const coldUnits = w3.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
+  if (!coldUnits) {
+    const list = join(work, 'units-list');
+    const names = w3.units.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]);
+    writeFileSync(list, `${names.join('\n')}\n`);
+    const ut = join(work, 'units.tar');
+    execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '-cf', ut, '-T', list]);
+    place(ut, 'project/build/web/units.tar');
+    mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${w3.units.length}`, '/project/build/web/units.tar']]));
+  }
+  for (const u of coldUnits ? w3.units : []) {
     const d = join(web, 'units', u.key);
     place(join(d, 'c.wasm'), `project/build/web/units/${u.key}/c.wasm`);
     place(join(d, 'c.entries'), `project/build/web/units/${u.key}/c.entries`);
@@ -439,7 +455,7 @@ function w3Site() {
     if (existsSync(join(d, 'cold'))) coldPack(join(d, 'cold'), `project/build/web/units/${u.key}`);
   }
   preload.sort((a, b) => b[2] - a[2]);
-  writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
+  if (coldUnits) writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));
   writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(w3, null, 2));
   // The page (the user's). No service worker: the host sends the isolation
   // headers (COOP/COEP), and the library decodes what is packed.

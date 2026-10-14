@@ -295,6 +295,9 @@ async function handle(msg) {
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
   // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
   const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
+  // `closed` (an ejected page's units archive): the page fetched every unit
+  // file there is, so a file not among them is a miss, not a request.
+  const preClosed = (msg.preModules ?? []).some(([k]) => k === 'closed');
   // A zstd decoder for a split unit's cold clusters (gex_split), made
   // before the guest runs: its loads are synchronous.
   let zstd = null;
@@ -457,6 +460,7 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
+      if (preClosed) return null;
       try {
         if (c.root) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
@@ -527,7 +531,7 @@ async function handle(msg) {
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
-  for (const [key, mod] of msg.preModules ?? []) if (!key.startsWith('file:')) gex.addSharedModule(key, mod);
+  for (const [key, mod] of msg.preModules ?? []) if (key.startsWith('cgen:') || key.startsWith('cgenfile:')) gex.addSharedModule(key, mod);
   if (globalThis.GEX_SHARE_TRACE || globalThis.process?.env?.GEX_SHARE_TRACE || msg.shareTrace) console.warn(`[share] ${msg.kind} start with ${(msg.sharedModules ?? []).length} shared modules (${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('cgen:')).length} units, ${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('wasm:')).length} programs)`);
 
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
