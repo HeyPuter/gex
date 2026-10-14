@@ -24,14 +24,17 @@ use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, SysResult
 /// host can fill them in from wasm imports; see [`crate::proc::Remote`].
 #[derive(Clone, Copy)]
 pub struct Remote {
-    /// Open, returning a handle id or a negated errno.
-    pub open: extern "C" fn(path: crate::PAddr, path_len: u32, flags: u64, mode: u32) -> i32,
+    /// Open, returning a handle id or a negated errno. A file created or
+    /// truncated is stamped at `now`, the caller's clock.
+    pub open: extern "C" fn(path: crate::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32,
     pub close: extern "C" fn(handle: i32),
     /// A second id for one open file, for a child to inherit. Returns the
     /// new id or a negated errno.
     pub dup: extern "C" fn(handle: i32) -> i32,
     pub read: extern "C" fn(handle: i32, offset: u64, at: crate::PAddr, len: u32) -> i32,
-    pub write: extern "C" fn(handle: i32, offset: u64, at: crate::PAddr, len: u32) -> i32,
+    /// Write, and stamp the file at `now` (the caller's clock: the global
+    /// kernel has none) when anything was written.
+    pub write: extern "C" fn(handle: i32, offset: u64, at: crate::PAddr, len: u32, now: i64) -> i32,
     /// Write this handle's metadata as [`META_BYTES`] bytes at `at`.
     pub meta: extern "C" fn(handle: i32, at: crate::PAddr) -> i32,
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
@@ -48,6 +51,8 @@ pub struct Remote {
     pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
     pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
+    /// `fchmod` on an open handle.
+    pub fchmod: extern "C" fn(handle: i32, mode: u32) -> i32,
     pub symlink: extern "C" fn(target: crate::PAddr, target_len: u32, path: crate::PAddr, path_len: u32) -> i32,
     pub link: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
     /// Put a socket node at a path.
@@ -232,11 +237,8 @@ impl FileSystem for RemoteFs {
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let p = path.as_bytes();
         let (a, n) = at(p);
-        let h = ok((self.remote.open)(a, n, flags, mode))?;
         // Created or truncated: written now, by this process's clock.
-        if flags & (crate::fs::oflags::O_CREAT | crate::fs::oflags::O_TRUNC) != 0 {
-            (self.remote.touch)(h, super::tmpfs::now());
-        }
+        let h = ok((self.remote.open)(a, n, flags, mode, super::tmpfs::now()))?;
         Ok(Arc::new(RemoteHandle {
             id: h,
             remote: self.remote,
@@ -249,6 +251,11 @@ impl FileSystem for RemoteFs {
         let mut buf = [0u8; META_BYTES];
         ok((self.remote.path_meta)(a, n, buf.as_mut_ptr() as crate::PAddr))?;
         Ok(decode_meta(&buf))
+    }
+
+    /// The global kernel's `TmpFs` answers for a link itself.
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        self.metadata(path)
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -388,10 +395,8 @@ impl FileHandle for RemoteHandle {
             offset,
             buf.as_ptr() as crate::PAddr,
             buf.len() as u32,
+            super::tmpfs::now(),
         ))?;
-        if n > 0 {
-            (self.remote.touch)(self.id, super::tmpfs::now());
-        }
         Ok(n as u64)
     }
 
@@ -425,6 +430,10 @@ impl FileHandle for RemoteHandle {
                 n => return Err(Errno(-n)),
             }
         }
+    }
+
+    fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
+        Some(ok((self.remote.fchmod)(self.id, mode)).map(|_| ()))
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {

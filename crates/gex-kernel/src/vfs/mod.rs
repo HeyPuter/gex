@@ -184,6 +184,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = len;
         Err(Errno::EINVAL)
     }
+    /// `fchmod` on what this handle is open on, when the handle can do it
+    /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.
+    fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
+        let _ = mode;
+        None
+    }
     /// True when reads and writes ignore the offset, as for a terminal or
     /// pipe. Such files also report `ESPIPE` from `lseek`.
     fn is_stream(&self) -> bool {
@@ -369,6 +375,24 @@ pub trait FileSystem: Send + Sync {
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     fn metadata(&self, path: &str) -> Result<Metadata, Errno>;
+    /// [`FileSystem::metadata`] of a symlink itself rather than what it
+    /// names (`lstat`). The default asks [`FileSystem::read_link`] first; a
+    /// filesystem whose `metadata` never follows a link answers in one.
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        if let Ok(target) = self.read_link(path) {
+            return Ok(Metadata {
+                file_type: FileType::Symlink,
+                size: target.len() as u64,
+                mode: 0o777,
+                ino: 1,
+                mtime: 0,
+                nlink: 1,
+                rdev: 0,
+                times: Default::default(),
+            });
+        }
+        self.metadata(path)
+    }
     /// `access(2)`: whether the caller may use `path` as `mode` asks
     /// (`R_OK` 4, `W_OK` 2, `X_OK` 1; 0 is existence). Filesystems that do
     /// not model permissions say yes to anything that exists.
@@ -448,6 +472,12 @@ pub trait FileSystem: Send + Sync {
     }
 }
 
+/// Whether open `flags` ask to write, which a directory refuses (`EISDIR`).
+pub(crate) fn writes(flags: u64) -> bool {
+    let acc = flags & crate::fs::oflags::ACCMODE;
+    acc == crate::fs::oflags::O_WRONLY || acc == crate::fs::oflags::O_RDWR
+}
+
 /// The mount table.
 #[derive(Clone)]
 pub struct Vfs {
@@ -509,7 +539,13 @@ impl Vfs {
     /// that filesystem with the path relative to it; `None` when the walk
     /// reached another mount, which the caller resolves the long way.
     fn resolve_final(&self, abs: &str) -> Result<Option<(&Arc<dyn FileSystem>, String)>, Errno> {
-        match self.walk(abs, true)? {
+        self.resolve_walked(abs, true)
+    }
+
+    /// [`Vfs::resolve_final`], following the final link only with
+    /// `follow_final`.
+    fn resolve_walked(&self, abs: &str, follow_final: bool) -> Result<Option<(&Arc<dyn FileSystem>, String)>, Errno> {
+        match self.walk(abs, follow_final)? {
             Some(w) if !w.at_mount => self.mount_of(w.path).map(Some),
             _ => Ok(None),
         }
@@ -654,19 +690,7 @@ impl Vfs {
     /// Metadata without following a final symlink, for `lstat`.
     pub fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         let (fs, rel) = self.resolve(path)?;
-        if let Ok(target) = fs.read_link(&rel) {
-            return Ok(Metadata {
-                file_type: FileType::Symlink,
-                size: target.len() as u64,
-                mode: 0o777,
-                ino: 1,
-                mtime: 0,
-                nlink: 1,
-                rdev: 0,
-                times: Default::default(),
-            });
-        }
-        fs.metadata(&rel)
+        fs.metadata_nofollow(&rel)
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -714,6 +738,12 @@ impl Vfs {
     /// following a final symlink when `follow`.
     pub fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, follow: bool) -> Result<(), Errno> {
         let mut current = normalize(path, &self.cwd);
+        // On the root filesystem one walk names the node (the link itself
+        // without `follow`), and setting its times says `ENOENT` for a
+        // name that is not there.
+        if let Some((fs, rel)) = self.resolve_walked(&current, follow)? {
+            return fs.set_times(&rel, atime, mtime);
+        }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
             match fs.read_link(&rel) {
@@ -1003,6 +1033,34 @@ mod tests {
         let (buf, n) = encode_dirents(&entries, 0, 8);
         assert!(buf.is_empty());
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn one_lookup_answers_eisdir_enoent_and_a_links_own_times() {
+        use crate::fs::oflags::{O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
+        let fs = Arc::new(tmpfs::TmpFs::new());
+        fs.add_dir("d");
+        fs.add_file("d/f", b"x".to_vec());
+        fs.symlink("gone", "d/dangling").unwrap();
+        let mut vfs = Vfs::new();
+        vfs.mount("/", fs.clone());
+        // A directory opens for reading only, with or without O_CREAT.
+        assert!(vfs.open("/d", O_RDONLY, 0).is_ok());
+        assert_eq!(vfs.open("/d", O_WRONLY, 0).unwrap_err(), Errno::EISDIR);
+        assert_eq!(vfs.open("/d", O_RDWR | O_CREAT, 0o644).unwrap_err(), Errno::EISDIR);
+        // Times on a missing name: ENOENT, following or not.
+        let t = Some((5, 0));
+        assert_eq!(vfs.set_times("/d/nope", t, t, true), Err(Errno::ENOENT));
+        assert_eq!(vfs.set_times("/d/nope", t, t, false), Err(Errno::ENOENT));
+        // A dangling link's own times are set; through it there is nothing.
+        assert_eq!(vfs.set_times("/d/dangling", t, t, false), Ok(()));
+        assert_eq!(vfs.set_times("/d/dangling", t, t, true), Err(Errno::ENOENT));
+        assert_eq!(vfs.set_times("/d/f", t, Some((7, 0)), true), Ok(()));
+        assert_eq!(vfs.metadata("/d/f").unwrap().mtime, 7);
+        // fchmod by handle: the name it was opened under.
+        let h = vfs.open("/d/f", O_RDWR, 0).unwrap();
+        assert_eq!(h.chmod(0o600), Some(Ok(())));
+        assert_eq!(vfs.metadata("/d/f").unwrap().mode & 0o7777, 0o600);
     }
 
     #[test]

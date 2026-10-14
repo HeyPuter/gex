@@ -4867,13 +4867,8 @@ impl Kernel {
             {
                 return Err(Errno::ELOOP);
             }
-            // A directory opens for reading only, whatever the filesystem.
-            let acc = flags & oflags::ACCMODE;
-            if (acc == oflags::O_WRONLY || acc == oflags::O_RDWR)
-                && self.vfs.metadata(&p).is_ok_and(|md| md.file_type == FileType::Directory)
-            {
-                return Err(Errno::EISDIR);
-            }
+            // A directory opens for reading only: each filesystem's `open`
+            // says `EISDIR`, without a lookup of its own here.
             let h = self.vfs.open(&p, flags, mode)?;
             // And arm a placement, for an object nobody pinned. Only for a
             // shared object: the executable's own base is fixed by the
@@ -6035,13 +6030,13 @@ impl Kernel {
         }
         let p = self.at_path(m, dirfd, path)?;
         let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        if follow {
+        if atime.is_some() || mtime.is_some() {
+            // Which says `ENOENT` itself.
+            self.vfs.set_times(&p, atime, mtime, follow)?;
+        } else if follow {
             self.vfs.metadata(&p)?;
         } else {
             self.vfs.metadata_nofollow(&p)?;
-        }
-        if atime.is_some() || mtime.is_some() {
-            self.vfs.set_times(&p, atime, mtime, follow)?;
         }
         Ok(0)
     }
@@ -6092,7 +6087,13 @@ impl Kernel {
     /// descriptor kept; the second names a path directly.
     fn sys_chmod(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
         let (path, mode, flags) = if n == nr::FCHMOD {
-            (self.fds.get(a[0] as i32)?.path.clone(), a[1] as u32, 0)
+            let f = self.fds.get(a[0] as i32)?;
+            // The handle, when it can: no walk of the name it kept, and
+            // what it is open on is not a symlink.
+            if let Some(r) = f.handle.chmod(a[1] as u32) {
+                return r.map(|_| 0);
+            }
+            (f.path.clone(), a[1] as u32, 0)
         } else {
             (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32, a[3])
         };

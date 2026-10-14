@@ -245,6 +245,22 @@ struct Inner {
 }
 
 impl Inner {
+    /// `chmod` on `path`: its mode kept only where it is not the default.
+    fn chmod(&mut self, path: &str, mode: u32) -> Result<(), Errno> {
+        let default = match self.nodes.get(path) {
+            None => return Err(Errno::ENOENT),
+            Some(Node::Dir) => Metadata::dir().mode,
+            Some(_) => 0o644,
+        };
+        let mode = mode & 0o7777;
+        if mode == default {
+            self.modes.remove(path);
+        } else {
+            self.modes.insert(path.to_string(), mode);
+        }
+        Ok(())
+    }
+
     /// Name `path` inode `ino`, and count the link.
     fn set_ino(&mut self, path: String, ino: u64) {
         if let Some(old) = self.inos.insert(path, ino) {
@@ -654,6 +670,16 @@ impl FileHandle for TmpHandle {
         file.touch();
         Ok(())
     }
+
+    /// By the name it was opened under, as `chmod` on that name: a mode
+    /// lives with the name here, not the node.
+    fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
+        let mut inner = self.inner.lock().unwrap();
+        if matches!(inner.nodes.get(&self.path), Some(Node::Symlink(_))) {
+            return Some(Err(Errno::EOPNOTSUPP));
+        }
+        Some(inner.chmod(&self.path, mode))
+    }
 }
 
 impl FileSystem for TmpFs {
@@ -662,9 +688,14 @@ impl FileSystem for TmpFs {
         let file = {
             let mut inner = self.inner.lock().unwrap();
             match inner.nodes.get(&path) {
-                Some(_) => {
+                Some(node) => {
                     if flags & oflags::O_EXCL != 0 && flags & oflags::O_CREAT != 0 {
                         return Err(Errno::EEXIST);
+                    }
+                    // A directory opens for reading only.
+                    let acc = flags & oflags::ACCMODE;
+                    if matches!(node, Node::Dir) && (acc == oflags::O_WRONLY || acc == oflags::O_RDWR) {
+                        return Err(Errno::EISDIR);
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
@@ -731,18 +762,12 @@ impl FileSystem for TmpFs {
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.nodes.contains_key(path) {
-            return Err(Errno::ENOENT);
-        }
-        let mode = mode & 0o7777;
-        let default = if matches!(inner.nodes.get(path), Some(Node::Dir)) { Metadata::dir().mode } else { 0o644 };
-        if mode == default {
-            inner.modes.remove(path);
-        } else {
-            inner.modes.insert(path.to_string(), mode);
-        }
-        Ok(())
+        self.inner.lock().unwrap().chmod(path, mode)
+    }
+
+    /// A name here is its node, link or not: `metadata` never follows.
+    fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
+        self.metadata(path)
     }
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
