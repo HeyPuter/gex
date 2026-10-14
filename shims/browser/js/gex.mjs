@@ -3352,7 +3352,7 @@ export class Gex {
         ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     };
-    // A unit split by function (gex_cgen::split): its cold clusters' loader,
+    // A unit split by function (gex_split): its cold clusters' loader,
     // or the recorder's hit map of an instrumented unit.
     if (prov < 0 && jit < 0) this.#splitImports(mod, this.#cgenStr(e.gex_cgen_key, u), imports);
     // A wasm32 program's or shared library's binding list (cgen/dylink.rs).

@@ -107,8 +107,8 @@ pub struct Config {
     /// for a config without the setting) ships everything.
     pub bundle_split: bool,
     /// W3 pages: `"cold"`, how the units' code the recording never ran is
-    /// split off (gex_cgen::split): a clustering (`"chunk:256"`, `"graph:64"`,
-    /// `"unit"`, `"function"`; [`gex_cgen::split::Clustering`]) or `"none"`, the
+    /// split off (gex_split): a clustering (`"chunk:256"`, `"graph:64"`,
+    /// `"unit"`, `"function"`; [`gex_split::Clustering`]) or `"none"`, the
     /// default for a config without the setting. `"instrument"` builds
     /// units that report the functions a run calls, for a recording of the
     /// site to take its coverage from (tools/eject/record-w3.mjs). Each unit keeps the
@@ -362,7 +362,7 @@ impl Config {
             Some(Json::Str(x)) if x == "none" => None,
             Some(Json::Str(x)) if x == "instrument" => Some(x.clone()),
             Some(Json::Str(x)) => {
-                x.parse::<gex_cgen::split::Clustering>().map_err(|e| anyhow::anyhow!("{what}: \"cold\": {e}"))?;
+                x.parse::<gex_split::Clustering>().map_err(|e| anyhow::anyhow!("{what}: \"cold\": {e}"))?;
                 Some(x.clone())
             }
             Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"instrument\" or \"none\""),

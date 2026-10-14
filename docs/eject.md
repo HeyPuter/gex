@@ -704,7 +704,7 @@ compiled ahead of time at build time, and nothing is lifted in the page.
   recording's `coverage` in its primary module. Every other slot gets a
   stub that calls `gex.cold(cluster)` and then tail-calls its own table
   slot. The other functions go into cluster modules `cold/N.wasm`
-  (gex_cgen::split). Each cluster module is a PIC module with the
+  (gex_split). Each cluster module is a PIC module with the
   primary's imports. It fills its slots with `table.init` from a passive
   segment. A direct call from one module to a function in another becomes
   a `call_indirect` through the slot. The entry list does not change, so
@@ -717,7 +717,7 @@ compiled ahead of time at build time, and nothing is lifted in the page.
   siblings and instantiates it into the table. The Worker that runs the
   call blocks for that time, as for a lazy file.
 
-Clustering (`gex_cgen::split::Clustering`) sets how much one fetch brings:
+Clustering (`gex_split::Clustering`) sets how much one fetch brings:
 
 - `function`: each cold function is its own module.
 - `graph[:KiB]`: the cold functions a root reaches by direct calls.

@@ -345,7 +345,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         link_or_copy(&dir.join("units").join(&key).join("c.entries"), &to.join("c.entries"))?;
         if instrument {
             let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
-            write_file(&to.join("c.wasm"), &gex_cgen::split::instrument(&wasm)?, false)?;
+            write_file(&to.join("c.wasm"), &gex_split::instrument(&wasm)?, false)?;
             continue;
         }
         let (Some(cov), Some(how)) = (coverage, config.cold.as_deref()) else {
@@ -357,7 +357,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             _ => std::collections::HashSet::new(),
         };
         let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
-        let (primary, clusters, _) = gex_cgen::split::split(&wasm, &hot, how.parse()?)
+        let (primary, clusters, _) = gex_split::split(&wasm, &hot, how.parse()?)
             .with_context(|| format!("splitting unit {key}"))?;
         write_file(&to.join("c.wasm"), &primary, false)?;
         std::fs::create_dir_all(to.join("cold"))?;

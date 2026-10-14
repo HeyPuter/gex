@@ -295,7 +295,7 @@ async function handle(msg) {
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
   // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
   const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
-  // A zstd decoder for a split unit's cold clusters (gex_cgen::split), made
+  // A zstd decoder for a split unit's cold clusters (gex_split), made
   // before the guest runs: its loads are synchronous.
   let zstd = null;
   if (msg.cgen?.zstd && typeof XMLHttpRequest === 'function') {
