@@ -1657,8 +1657,10 @@ crypt (no provider registered), pipe (the x64 architecture check).
 - **No Wine fork patch** for GL.
 
 **Child processes without the session's shared memory (2026-10-07).**
-The user's decision: no cross-process shared memory in gex-eject; Wine is
-patched instead. Scope, as found:
+gex gives each process its own wasm memory, so a `MAP_SHARED` mapping is
+not coherent across processes today, and a child cannot map the session
+the server writes. Wine is patched so a child reads it through requests.
+Scope, as found:
 - win32u reads the session in six places: the **user handle table**
   (`get_user_entry*`, `is_valid_entry`: every HWND check, IsWindow,
   GetWindowThreadProcessId, the handle-table walks), **window** objects
@@ -1806,11 +1808,11 @@ what would let it go:
 | user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
-| **a child process reads the session through requests** (`read_session_data`, server/mapping.c; win32u keeps a local copy laid out as the mapping, refreshed per seqlock acquire and per user handle entry; the handle-table walk skips entries the process has no object for) | a child has its own wasm memory and cannot map the session the server thread writes (user 2026-10-07: gex-eject never ships cross-process shared memory) | never under that decision; the process hosting the server keeps its direct read |
-| `wineserver_session_data` answers only in the process the session was created in | a child process starts as a copy of the first, server state included: it read a frozen snapshot | with the request path (never, under the no-shared-memory decision) |
+| **a child process reads the session through requests** (`read_session_data`, server/mapping.c; win32u keeps a local copy laid out as the mapping, refreshed per seqlock acquire and per user handle entry; the handle-table walk skips entries the process has no object for) | a child has its own wasm memory and cannot map the session the server thread writes (`MAP_SHARED` is not coherent across processes today) | when processes can share the session mapping; the process hosting the server keeps its direct read |
+| `wineserver_session_data` answers only in the process the session was created in | a child process starts as a copy of the first, server state included: it read a frozen snapshot | with the request path, when processes can share the session mapping |
 | one desktop thread per session (a named mutant held by its host process); the wait for its shell window is 60 s | with children reading the session, each process started a desktop thread of its own | explorer as its own process (needs cross-process shared memory) |
-| a child keeps its last 16 session reads per thread and skips a read covered, younger than 1 ms, with no other server request since (`__wine_session_writes`, ntdll server.c) | a request per read cost 0.1-0.6 ms a call | with the request path (never, under the no-shared-memory decision) |
-| a child process's USD is a private page kept by a 1 ms clock thread (ntdll virtual.c) | a child's copy of the USD had stopped clocks, and win32u then sent set_queue_mask every call | coherent shared memory (never, under that decision) |
+| a child keeps its last 16 session reads per thread and skips a read covered, younger than 1 ms, with no other server request since (`__wine_session_writes`, ntdll server.c) | a request per read cost 0.1-0.6 ms a call | with the request path, when processes can share the session mapping |
+| a child process's USD is a private page kept by a 1 ms clock thread (ntdll virtual.c) | a child's copy of the USD had stopped clocks, and win32u then sent set_queue_mask every call | coherent shared memory across processes |
 | ntdll's Unix-call dispatcher returns STATUS_DLL_NOT_FOUND for a null library handle | a DLL whose Unix library is not linked into the closed-world program still makes calls (wineps.drv's DllMain failure path) and trapped | every such Unix library linked in |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 | win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): **not being upstreamed (user 2026-10-07)**: kept as a fork patch; the ungated patch stays in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch` for reference |
