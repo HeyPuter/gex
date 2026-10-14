@@ -1284,12 +1284,13 @@ class Compositor {
       return;
     }
     if (!t) return;
-    // With glass, the window's alpha counts in the glass only, whatever its
-    // format, as under DWM.
+    // With glass, an opaque window's (XRGB) alpha counts in the glass only,
+    // as under DWM; a window with alpha of its own (ARGB) keeps it.
+    const opaque = win.info?.format === 1;
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
-      opaque: win.info?.format === 1 ? 1 : 0,
-      glass: glass?.length ? glass : null,
+      opaque: opaque ? 1 : 0,
+      glass: opaque && glass?.length ? glass : null,
     });
   }
 
