@@ -429,7 +429,14 @@ async function handle(msg) {
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
         x.setRequestHeader('Range', `bytes=${off}-${off + len - 1}`);
-        x.send();
+        // Said to the page, as a unit's own files are: a cold cluster is
+        // code the program is waiting for.
+        const done = noteFetch(`unit:${rel}`, len);
+        try {
+          x.send();
+        } finally {
+          done(x.response?.byteLength ?? 0);
+        }
         const got = new Uint8Array(x.response ?? new ArrayBuffer(0));
         // 206 is the range; a server without ranges sends the whole file.
         const at = x.status === 206 ? 0 : x.status === 200 ? off : -1;
