@@ -429,7 +429,7 @@ at most while bytes arrive, at once on a phase change), and the handle's
 | `at` | each phase's start, ms since `start()` |
 | `elapsed` | ms since `start()`, at this call |
 | `error` | with `'failed'`: why |
-| `fetch` | after the start, what the program is fetching: `{name, done, total, inflight}` (a lazy file: bytes read of its size; translated code: `code for NAME`), or `null` when nothing is in flight; the phase stays `'ready'` |
+| `fetch` | after the start, what the program is fetching, or `null` when nothing is in flight (the phase stays `'ready'`): `{kind, name, done, total, inflight}`. `kind` `'file'`: a lazy file (`"bundle": "split"`), `name` its file name, `done` its bytes read so far, `total` its size. `kind` `'code'`: a unit of translated code, `name` the module it is for (`''` if not known), `done` its bytes once in, `total` 0. `inflight`: how many fetches are under way. The page decides what to show; the example page shows one line in a corner |
 
 `'boot'` is the program's first process started, `'first-frame'` a
 window's first pixels in the page. `'ready'` is the first frame unless the

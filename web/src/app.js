@@ -143,9 +143,11 @@ function progressMeter(state, onProgress) {
       if (!timer) timer = setTimeout(emit, Math.max(0, 100 - (performance.now() - last)));
     },
     /** The program's own fetches while it runs (shims/browser/js/fetch-note.mjs):
-     *  `p.fetch` is the latest in flight, {name, done, total, inflight}, or
-     *  null when none is. A lazy file's `done`/`total` are its bytes read so
-     *  far and its size; a unit's are what it is and 0 until it is in. */
+     *  `p.fetch` is the latest in flight, {kind, name, done, total,
+     *  inflight}, or null when none is: kind 'file' (a lazy file: name its
+     *  file name, done/total its bytes read so far and its size) or 'code'
+     *  (a unit of translated code: name the module it is for, '' if not
+     *  known; done the bytes in, total 0). */
     watchFetches(lazyNames, unitNames) {
       if (typeof BroadcastChannel !== 'function') return;
       const ch = new BroadcastChannel('gex-fetch');
@@ -161,17 +163,19 @@ function progressMeter(state, onProgress) {
         if (!m || typeof m.what !== 'string') return;
         let key = m.what;
         let name;
+        let kind = 'file';
         let total = 0;
         if (m.what.startsWith('unit:')) {
           const unit = m.what.split('/')[1] ?? '';
-          name = `code for ${unitNames[unit] || 'the program'}`;
+          kind = 'code';
+          name = unitNames[unit] || '';
         } else {
           try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
         }
-        const f = files.get(key) ?? { name, done: 0, total };
+        const f = files.get(key) ?? { kind, name, done: 0, total };
         files.set(key, f);
         if (m.phase === 'start') {
           live.set(m.id, { key });
