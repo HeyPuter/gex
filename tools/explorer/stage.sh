@@ -105,6 +105,15 @@ $REG "$OUT" \
   "$H/SOFTWARE:Microsoft\\Windows NT\\CurrentVersion\\Svchost=Software\\Microsoft\\Windows NT\\CurrentVersion\\Svchost" \
   "$H/SOFTWARE:Microsoft\\Windows\\CurrentVersion\\ThemeManager=Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager" \
   "$H/SOFTWARE:Microsoft\\Windows\\CurrentVersion\\Themes=Software\\Microsoft\\Windows\\CurrentVersion\\Themes"
+# the security zones' policies (Windows' own: Wine's zones have none, and
+# Windows 7's urlmon then refuses to start a program, as from the Start
+# menu: "Your Internet security settings prevented one or more files from
+# being opened"), for the machine and, as Internet Explorer's per-user
+# setup copies them, for the user
+$REG "$OUT" \
+  "$H/SOFTWARE:Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Zones=Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Zones@user" \
+  "$H/SOFTWARE:Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Zones=Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Zones" \
+  "$H/SOFTWARE:Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Lockdown_Zones=Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Lockdown_Zones"
 # the default user's window metrics (Wine's own defaults out of the way)
 $REG "$OUT" "$IMG/Users/Default/NTUSER.DAT:Control Panel\\Desktop\\WindowMetrics@user"
 # the COM classes the native images serve
