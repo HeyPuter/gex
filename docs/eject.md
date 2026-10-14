@@ -418,7 +418,8 @@ build names `"features": {"compositor": true}` in user/eject.json). Options:
 **The loading screen.** The library draws nothing over the desktop while it
 starts; it says how far along it is, and the page draws that.
 `onProgress(p)` is called whenever the start-up moves (a few times a second
-at most while bytes arrive, at once on a phase change), and the handle's
+at most while bytes arrive; at once on a phase change, when a file is whole,
+and when a fetch of the running program starts or ends), and the handle's
 `state.progress` holds the same, for a page that polls:
 
 | `p.` | What |
@@ -430,6 +431,12 @@ at most while bytes arrive, at once on a phase change), and the handle's
 | `elapsed` | ms since `start()`, at this call |
 | `error` | with `'failed'`: why |
 | `fetch` | after the start, what the program is fetching, or `null` when nothing is in flight (the phase stays `'ready'`): `{kind, name, done, total, inflight}`. `kind` `'file'`: a lazy file (`"bundle": "split"`), `name` its file name, `done` its bytes read so far, `total` its size. `kind` `'code'`: a unit of translated code, `name` the module it is for (`''` if not known), `done` its bytes once in, `total` 0. `inflight`: how many fetches are under way. The page decides what to show; the example page shows one line in a corner |
+
+The totals are whole from the first call: a W3 page counts its bundle and
+units from the site's pack, a Linux program's page from its manifest's
+`sizes` (every file the launcher reads, and its size). A Linux program
+without windows downloads until the launcher has read them all, then goes
+to `'boot'` and `'ready'` together.
 
 `'boot'` is the program's first process started, `'first-frame'` a
 window's first pixels in the page. `'ready'` is the first frame unless the
