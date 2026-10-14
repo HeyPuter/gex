@@ -100,7 +100,8 @@ pub(crate) fn begin_turn() {
 /// Publish when this process's next timer fires, from its signal state
 /// (`sigs::timer_in_ns`): no kernel lock.
 pub(crate) fn publish_timer() {
-    let at = crate::sigs::timer_in_ns().map_or(u64::MAX, |d| now_ns().saturating_add(d));
+    // No timer armed (almost always): no clock to read.
+    let at = crate::sigs::timer_in_ns().map_or(u64::MAX, |d| turn_now().saturating_add(d));
     let was = TIMER_AT.swap(at, std::sync::atomic::Ordering::Relaxed);
     // Sooner than the threads parked in other Workers sleep to: they look
     // again (`park_ns` reads it when they park).
@@ -184,7 +185,7 @@ pub(crate) fn enter(i: usize, t: &Run, why: u8, all_blocked: bool, ends_by_itsel
     if unsafe { k_present() } == 0 {
         return false;
     }
-    let now = now_ns();
+    let now = turn_now();
     publish_timer();
     let fresh = WAIT.with(|w| {
         let mut w = w.borrow_mut();
@@ -278,7 +279,7 @@ pub(crate) fn idle_turn() -> Turn {
         if !matches!(m.waiting, Waiting::Exited) && crate::sigs::ready() {
             return Turn::Ready(true);
         }
-        if wait_ready(&m.waiting, &m.blocked_on, now_ns(), false) {
+        if wait_ready(&m.waiting, &m.blocked_on, turn_now(), false) {
             return Turn::Ready(false);
         }
         Turn::Idle(m.why, m.ends_by_itself)
@@ -328,18 +329,22 @@ const DEADLOCK_LOOK_NS: u64 = 20_000_000;
 /// Park this Worker on its slot: until a notify, or `park_ns`. Returns the
 /// wait instruction's answer (0 woken, 1 moved already, 2 timed out).
 pub(crate) fn park() -> i32 {
-    let now = now_ns();
+    let now = turn_now();
     let ns = park_ns(now).map_or(-1, |n| n as i64);
     let seq = SEQ.with(|q| q.get());
-    unsafe { k_ws_park(slot(), seq, ns) }
+    let r = unsafe { k_ws_park(slot(), seq, ns) };
+    stale_now();
+    r
 }
 
 /// Park on the slot for at most `ns`: a wait on the page, from a Worker
 /// whose frames keep it from turning its event loop (`wasm32_wait`).
 pub(crate) fn park_bounded(ns: u64) -> i32 {
-    let ns = park_ns(now_ns()).map_or(ns, |n| n.min(ns));
+    let ns = park_ns(turn_now()).map_or(ns, |n| n.min(ns));
     let seq = SEQ.with(|q| q.get());
-    unsafe { k_ws_park(slot(), seq, ns as i64) }
+    let r = unsafe { k_ws_park(slot(), seq, ns as i64) };
+    stale_now();
+    r
 }
 
 /// The slot word's address and the value this turn sampled, for a wait the
