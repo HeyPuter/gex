@@ -43,5 +43,5 @@ Description: wasm providers for arm64 programs' libraries (gex)
  wasm instead of translated arm64.
 CTL
 out=$POOL/gex-providers-arm64_${V}_arm64.deb
-dpkg-deb --root-owner-group -Zxz --build "$P" "$out" >/dev/null
+dpkg-deb --root-owner-group -Zzstd -z19 --build "$P" "$out" >/dev/null
 echo "gex-providers-arm64 $V $out"
