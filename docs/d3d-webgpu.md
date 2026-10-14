@@ -157,17 +157,18 @@ Native tests (macOS, Apple M4 Pro, Rosetta x86_64 Wine):
 | webgpu.dll | 40 of 40 |
 | d3d11 (FL 9_3) | 3925 checks, 3 failing, 190 skipped |
 | d3d10_1 (FL 9_3 / 10_1) | 97 / 318 checks, none failing |
-| d3d10core (FL 10_1) | runs to the end: 187492 checks, 855 failing (348 depth bias: D24S8 depth cannot be read back; texture LOD bias; 56 stream output) |
+| d3d10core (FL 10_1) | runs to the end: 194656 checks, 480 failing (depth bias 205: Metal's depth24plus is float underneath; stream output ~100; layered rendering needs geometry shaders) |
 | d3d9 visual | 332 failing checks to test_depth_stencil (the 20-minute limit), 120 in test_signed_formats; shader fog fixed |
 
-Known gaps: 16-bit packed formats (B5G6R5 and the like: no WebGPU
-format, conversion not written), D3D9 sRGB write control, partial colour
-clears (CPU), stream output, occlusion and timestamp queries (answered,
-not measured), UAV clears, mipmap generation, triangle fans, instance
-divisors above 1, wireframe, depth bias for lines, comparison sampling of
-non-depth textures, and presentation (GDI read-back for now). Typed buffer
-views are read as storage buffers and decoded in the shader (the format
-is part of the shader variant).
+Known gaps: D3D9 sRGB write control, stream output (WebGPU's vertex
+shaders cannot write storage), occlusion and timestamp queries (answered,
+not measured), UAV clears, triangle fans, instance divisors above 1,
+wireframe, depth bias for lines, comparison sampling of non-depth
+textures, geometry and tessellation shaders, and presentation (GDI
+read-back for now). Done by other means than the GL and Vulkan renderers:
+typed buffer views (storage buffers decoded in the shader, the format part
+of the variant), sampler LOD bias (in the shader), depth24plus read-back
+(drawn into r32float), mipmap generation and partial clears (draws).
 
 ### 2.4 Next
 
