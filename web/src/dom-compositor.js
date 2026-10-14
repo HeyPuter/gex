@@ -90,8 +90,9 @@ const MOD_CONTROL = 4;
 const MOD_MOD1 = 8;
 const MOD_MOD4 = 64;
 
-/** Browser mouse buttons (0 left, 1 middle, 2 right) to Linux `BTN_*` codes. */
-const BTN = { 0: 0x110, 1: 0x112, 2: 0x111 };
+/** Browser mouse buttons by `buttons` bit (1 left, 2 right, 4 middle) to
+ *  Linux `BTN_*` codes. */
+const BUTTON_BITS = [[1, 0x110], [2, 0x111], [4, 0x112]];
 
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
 
@@ -777,6 +778,24 @@ export class DomDesktop {
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
     });
+    // Buttons by the event's `buttons` mask, not its `button`: a second
+    // button pressed while one is held comes as a pointermove, and a release
+    // the page never sees -- the browser's own menu took the pointer, the
+    // window lost focus -- is sent all the same (`releaseButtons`), or the
+    // client would think the button still held and ignore every click after.
+    const sync = (e) => {
+      const p = at(e);
+      const was = this.#held.get(win) ?? 0;
+      const now = e.buttons & 7;
+      if (now === was) return;
+      for (const [bit, code] of BUTTON_BITS) {
+        if ((was & bit) === (now & bit)) continue;
+        sendEvent(this.#channel, win.block, EV_BUTTON, code, now & bit ? 1 : 0,
+                  p.t, 0, win.client, win.surface);
+      }
+      if (now) this.#held.set(win, now);
+      else this.#held.delete(win);
+    };
     c.addEventListener('pointerdown', (e) => {
       const p = at(e);
       this.focus(win);
@@ -785,15 +804,19 @@ export class DomDesktop {
       try { c.setPointerCapture?.(e.pointerId); } catch { /* no capture */ }
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
-      sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 1,
-                p.t, 0, win.client, win.surface);
+      sync(e);
     });
     c.addEventListener('pointerup', (e) => {
-      const p = at(e);
-      try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
-      sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 0,
-                p.t, 0, win.client, win.surface);
+      if (!(e.buttons & 7)) {
+        try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
+      }
+      sync(e);
     });
+    c.addEventListener('pointermove', (e) => { if (e.button >= 0) sync(e); });
+    c.addEventListener('pointercancel', () => this.#releaseButtons(win));
+    // The middle button's default is the browser's autoscroll, which then
+    // keeps the pointer.
+    c.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
       // Wayland's axis is a fixed-point number of surface units; the browser's
@@ -807,6 +830,21 @@ export class DomDesktop {
       send(0, e.deltaY);
       send(1, e.deltaX);
     }, { passive: false });
+  }
+
+  /** Buttons held down in a window, by its `buttons` mask. */
+  #held = new Map();
+
+  /** Release whatever buttons a window (or every window) still has down, as
+   *  if the page had seen them go up. */
+  #releaseButtons(only = null) {
+    for (const [win, mask] of [...this.#held]) {
+      if (only && win !== only) continue;
+      for (const [bit, code] of BUTTON_BITS) {
+        if (mask & bit) sendEvent(this.#channel, win.block, EV_BUTTON, code, 0, Math.round(performance.now()), 0, win.client, win.surface);
+      }
+      this.#held.delete(win);
+    }
   }
 
   /** The keyboard belongs to the desktop, not to a canvas: a page may put its
@@ -831,11 +869,21 @@ export class DomDesktop {
     const up = (e) => onKey(e, false);
     this.#mount.addEventListener('keydown', down);
     this.#mount.addEventListener('keyup', up);
+    // A right click is the client's: the browser's own menu would take the
+    // pointer, and the button's release with it.
+    const menu = (e) => e.preventDefault();
+    this.#mount.addEventListener('contextmenu', menu);
+    // Focus gone elsewhere (another tab, the browser's chrome): nothing is
+    // held any more as far as the page can tell.
+    const blur = () => this.#releaseButtons();
+    globalThis.addEventListener?.('blur', blur);
     // A desktop takes the keyboard, so it has to be focusable.
     if (!this.#mount.hasAttribute('tabindex')) this.#mount.tabIndex = 0;
     this.#detach = () => {
       this.#mount.removeEventListener('keydown', down);
       this.#mount.removeEventListener('keyup', up);
+      this.#mount.removeEventListener('contextmenu', menu);
+      globalThis.removeEventListener?.('blur', blur);
     };
   }
 
