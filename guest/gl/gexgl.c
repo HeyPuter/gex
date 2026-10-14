@@ -1398,6 +1398,47 @@ static unsigned client_active_texture;
 
 static void gexgl_upload_ff_arrays(size_t vertices);
 
+/* Client arrays go to the host as CLIENT_ARRAY (proto.rs): the bytes and the
+   pointer command in one, which the host runs with the bytes' address as the
+   pointer and no GL_ARRAY_BUFFER bound -- the way GL takes a user array, so
+   st/mesa streams it through its upload buffer. Copying each array into a
+   scratch buffer of ours with glBufferData before every draw made every one
+   of them a rewrite of a buffer the pending batch already read, which a
+   batched WebGPU backend can only do as a staged copy that ends the render
+   pass: Noita, through Wine, drew 56 times a frame from client memory and
+   paid ~140 copies and a render pass per draw for it (pewasm, handing the
+   same arrays to Mesa directly: 15 passes, no copies). The NT layer has sent
+   them this way since bdb682d9. GEXGL_CLIENT_ARRAYS=buffer keeps the scratch
+   buffers, for A/B runs. */
+static int client_array_mode = -1; /* 1 CLIENT_ARRAY, 0 scratch buffers */
+static int client_array_op(void) {
+    if (client_array_mode < 0) {
+        const char *v = getenv("GEXGL_CLIENT_ARRAYS");
+        client_array_mode = !(v && strcmp(v, "buffer") == 0);
+    }
+    return client_array_mode;
+}
+/* The planned opcodes of the generic attribute pointers (compat_plans.rs),
+   whose pointer is 64 bits: VERTEX_ATTRIB_POINTER's is 32, which a 64-bit
+   host would truncate. */
+#define GEXGL_VERTEX_ATTRIB_POINTER_PLAN 11331   /* "v w w w w w P" */
+#define GEXGL_VERTEX_ATTRIB_I_POINTER_PLAN 11282 /* "v w w w w P" */
+/* Slots name the host's copy of each array: the fixed-function ones first,
+   then the generic attributes. */
+#define GEXGL_CLIENT_SLOT_ATTRIB 32u
+/* Returns whether it went: a command larger than the whole batch does not,
+   and the caller takes the scratch buffer instead. */
+static int client_array_send(uint32_t slot, uint32_t inner, const uint32_t *words,
+                             uint32_t n, const void *data, size_t len) {
+    if (len > UINT32_MAX - 4u) return 0;
+    uint32_t *p = begin(GEXGL_CLIENT_ARRAY, 3u + n, 4u + len);
+    if (!p) return 0;
+    p[0] = slot; p[1] = inner; p[2] = n;
+    for (uint32_t i = 0; i < n; ++i) p[3 + i] = words[i];
+    put_blob(p + 3 + n, data, len);
+    return 1;
+}
+
 static void gexgl_upload_client_arrays(size_t vertices, int instances) {
     if (ff_client_count > 0) gexgl_upload_ff_arrays(vertices);
     if (vertex_attrib_client_count <= 0) return;
@@ -1419,6 +1460,20 @@ static void gexgl_upload_client_arrays(size_t vertices, int instances) {
            reading a stride past it would fault on a tight allocation. */
         if (needed - 1 > (SIZE_MAX - element) / stride) continue;
         const size_t bytes = (needed - 1) * stride + element;
+        if (client_array_op()) {
+            uint32_t w[5];
+            uint32_t n = 0, inner;
+            if (a->integer) {
+                w[n++] = i; w[n++] = (uint32_t)a->size; w[n++] = a->type; w[n++] = (uint32_t)a->stride;
+                inner = GEXGL_VERTEX_ATTRIB_I_POINTER_PLAN;
+            } else {
+                w[n++] = i; w[n++] = (uint32_t)a->size; w[n++] = a->type; w[n++] = a->normalized;
+                w[n++] = (uint32_t)a->stride;
+                inner = GEXGL_VERTEX_ATTRIB_POINTER_PLAN;
+            }
+            if (client_array_send(GEXGL_CLIENT_SLOT_ATTRIB + i, inner, w, n, a->pointer, bytes))
+                continue;
+        }
         if (!a->scratch) {
             unsigned name = 0;
             glGenBuffers(1, &name);
@@ -1440,6 +1495,8 @@ static void gexgl_upload_client_arrays(size_t vertices, int instances) {
                      p[3]=a->normalized; p[4]=(uint32_t)a->stride; p[5]=0; }
         }
     }
+    /* Both ways leave another GL_ARRAY_BUFFER bound on the host (a scratch
+       buffer, or none after CLIENT_ARRAY): put back the application's. */
     glBindBuffer(0x8892u, previous);
 }
 
@@ -1473,6 +1530,23 @@ static void gexgl_upload_ff_arrays(size_t vertices) {
         const size_t stride = a->stride > 0 ? (size_t)a->stride : element;
         if (vertices - 1 > (SIZE_MAX - element) / stride) continue;
         const size_t bytes = (vertices - 1) * stride + element;
+        if (client_array_op()) {
+            /* The pointer command's words before its pointer, as
+               ff_pointer_command sends them. */
+            static const uint32_t ops[3] = { GEXGL_VERTEX_POINTER, GEXGL_COLOR_POINTER, GEXGL_TEX_COORD_POINTER };
+            uint32_t w[3];
+            uint32_t n, inner;
+            if (i == GEXGL_FF_NORMAL || i == GEXGL_FF_FOG) {
+                inner = i == GEXGL_FF_NORMAL ? GEXGL_NORMAL_POINTER_PLAN : GEXGL_FOG_COORD_POINTER_PLAN;
+                w[0] = a->type; w[1] = (uint32_t)a->stride; n = 2;
+            } else {
+                inner = i == GEXGL_FF_SECONDARY ? GEXGL_SECONDARY_COLOR_POINTER_PLAN : ops[i < 2 ? i : 2];
+                w[0] = (uint32_t)a->size; w[1] = a->type; w[2] = (uint32_t)a->stride; n = 3;
+            }
+            if (i >= 2 && i < GEXGL_FF_NORMAL) CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + (i - 2));
+            if (client_array_send(i, inner, w, n, a->pointer, bytes))
+                continue;
+        }
         if (!a->scratch) {
             unsigned name = 0;
             glGenBuffers(1, &name);
