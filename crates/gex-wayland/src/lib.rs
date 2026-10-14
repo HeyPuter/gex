@@ -1580,27 +1580,49 @@ impl Client {
                         // A client that attached a buffer and declared no
                         // damage gets a full upload: it is the only safe
                         // reading, and shm clients do it.
-                        let mut damage = state.pending_damage.unwrap_or_else(Damage::all);
-                        if resized || state.addr == 0 {
-                            damage = Damage::all();
+                        //
+                        // A commit that attaches nothing keeps the buffer it
+                        // had, and its pixels are new only where the client
+                        // says so: no damage, no change. Taking it as a full
+                        // reattach re-uploaded the whole buffer on every
+                        // commit that only moved a subsurface or set a
+                        // viewport -- Noita through winewayland commits its
+                        // toplevel twice a frame for its GL subsurface, and
+                        // each one was all 4 MiB of the window again.
+                        let attached = state.pending_buffer.is_some();
+                        let mut damage = match state.pending_damage {
+                            Some(d) => Some(d),
+                            None if attached => Some(Damage::all()),
+                            None => None,
+                        };
+                        if resized || state.addr == 0 || (!attached && addr != state.addr) {
+                            damage = Some(Damage::all());
                         }
                         if let Some(s) = self.surfaces.get_mut(&surface) {
-                            s.addr = addr;
-                            s.shown_fd = Some(spec.fd);
-                            s.stride = spec.stride;
-                            s.width = spec.width;
-                            s.height = spec.height;
-                            s.format = spec.format;
-                            s.serial = s.serial.wrapping_add(1);
-                            s.damage = Some(match s.damage {
-                                Some(mut held) => {
-                                    held.merge(damage);
-                                    held
-                                }
-                                None => damage,
-                            });
                             s.pending_damage = None;
                         }
+                        if let Some(damage) = damage {
+                            if let Some(s) = self.surfaces.get_mut(&surface) {
+                                s.addr = addr;
+                                s.shown_fd = Some(spec.fd);
+                                s.stride = spec.stride;
+                                s.width = spec.width;
+                                s.height = spec.height;
+                                s.format = spec.format;
+                                s.serial = s.serial.wrapping_add(1);
+                                s.damage = Some(match s.damage {
+                                    Some(mut held) => {
+                                        held.merge(damage);
+                                        held
+                                    }
+                                    None => damage,
+                                });
+                                s.pending_damage = None;
+                            }
+                        }
+                        // The scene may still have changed (a subsurface
+                        // moved, a viewport): it is re-sent, but with the
+                        // serial unmoved the host uploads nothing.
                         self.dirty = true;
                     }
                     None if showable => {
@@ -3589,6 +3611,32 @@ mod tests {
         assert_eq!((d.x, d.y, d.w, d.h), (2, 3, 10, 9), "the damage union");
         c.clear_damage(surface);
         assert_eq!(c.scene()[0].damage.w, 0, "drawn damage is not uploaded twice");
+    }
+
+    #[test]
+    fn a_commit_with_no_attach_and_no_damage_changes_no_pixels() {
+        let pool = Placed(0x10_0000, 8192);
+        let (mut c, surface) = placed_window(32, 32, 128);
+        let first = c.scene()[0].serial;
+        c.clear_damage(surface);
+        // A commit for a subsurface's position or a viewport: no attach, no
+        // damage. The host must have nothing new to upload.
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        assert_eq!(c.scene()[0].serial, first, "a bare commit moved the serial");
+        // Damage without an attach: the same buffer, new pixels there.
+        c.receive(&Writer::new(surface, 2).int(1).int(1).int(4).int(4).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        let s = &c.scene()[0];
+        assert_eq!(s.serial, first.wrapping_add(1));
+        assert_eq!((s.damage.x, s.damage.y, s.damage.w, s.damage.h), (1, 1, 4, 4));
+        // An attach with no damage is still all of it.
+        c.clear_damage(surface);
+        c.receive(&Writer::new(surface, 1).object(10).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        let s = &c.scene()[0];
+        assert_eq!(s.serial, first.wrapping_add(2));
+        assert!(s.damage.is_all());
     }
 
     #[test]
