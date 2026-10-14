@@ -503,6 +503,20 @@ in the scheduler pick after each wake of the global WAKE word: about
    published VMA snapshot for readers (dispatch_miss, faults,
    /proc/self/maps).
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
+   - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
+     `pick_mine` on the thread's own run state, the first turn of a
+     kernel-parked call included (it was made under the call's take, and
+     a turn with no registered wait took one of its own: the last per-turn
+     taker in every Noita-page process, 60 a second in Noita's and 16 in
+     each idle Wine process's). `pick_turn`, `idle_look` and `any_signal`
+     are deleted. The last thread out ends its process under its own exit
+     call's take (`end_if_all_exited`), and a vfork parent's thread is
+     bound back to its Worker when the child is done. The compositor's
+     pump still takes the lock, for the pump alone and only when it has
+     work (`pump_compositor`); that is §3.10's. Legs: the page tier's
+     thread and signal programs (`main-thread-exit`, `thread-churn`,
+     `thread-signals`, `kernel-contend`) in the shared, memory64 and
+     single-thread builds.
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
