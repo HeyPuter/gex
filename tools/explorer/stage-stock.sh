@@ -64,10 +64,16 @@ if [ -n "$g" ]; then
   done
 fi
 # The images above that replace Wine's own load natively (STOCK_NATIVE:
-# module names for DllOverrides)
-STOCK_NATIVE=${STOCK_NATIVE-"uiribbon uiribbonres gdiplus mfc42u"}
+# module names for DllOverrides). GDI+ is native for Paint only
+# (STOCK_APP_NATIVE: PROGRAM:MODULE, AppDefaults overrides): the shell
+# keeps Wine's, as site-7h's did.
+STOCK_NATIVE=${STOCK_NATIVE-"uiribbon uiribbonres mfc42u"}
 [ -z "$STOCK_NATIVE" ] || python3 -I "$T/user-reg.py" "$OUT/user.reg" 'Software\Wine\DllOverrides' \
   $(for n in $STOCK_NATIVE; do echo "$n=native"; done)
+STOCK_APP_NATIVE=${STOCK_APP_NATIVE-"mspaint.exe:gdiplus"}
+for a in $STOCK_APP_NATIVE; do
+  python3 -I "$T/user-reg.py" "$OUT/user.reg" "Software\\Wine\\AppDefaults\\${a%%:*}\\DllOverrides" "${a#*:}=native"
+done
 IFS=: read -r -a stock_dirs <<< "$STOCK_DIRS"
 for d in "${stock_dirs[@]}"; do
   [ -n "$d" ] || continue

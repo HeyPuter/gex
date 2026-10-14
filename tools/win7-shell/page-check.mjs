@@ -2,7 +2,9 @@
 // 127.0.0.1, open it in headless Chromium (WebGPU) at a 1280x720 viewport,
 // and check, from screenshots, that Windows 7's desktop comes up:
 //   - the taskbar: Windows 7 Basic's blue bar along the bottom (y 680-719);
-//   - the wallpaper (img0.jpg: blue sky);
+//   - the wallpaper (img0.jpg: blue sky, and its Windows logo's orange
+//     pane, not Windows' plain default background);
+//   - the desktop's Recycle Bin: its icon and its label, top left;
 //   - the pins: Internet Explorer's, Windows Explorer's and Windows Media
 //     Player's icons in the taskbar's first three slots after Start;
 //   - the clock: the notification area's time and date text;
@@ -76,6 +78,8 @@ const bar = (p) => p[2] >= 180 && p[2] - p[0] >= 30;               // Basic's ta
 const sky = (p) => p[2] >= 150 && p[2] > p[0] + 40;                 // img0.jpg's sky
 const light = (p) => Math.min(...p) >= 215;                         // the clock's text (light on the tray's grey)
 const white = (p) => p[0] >= 250 && p[1] >= 250 && p[2] >= 250;
+const orange = (p) => p[0] >= 200 && p[1] < 170 && p[2] < 120;      // the logo's top left pane
+const bin = (p) => p[0] >= 120 && Math.abs(p[0] - p[2]) < 40;       // the Recycle Bin's grey basket
 const fails = [];
 const check = (ok, what) => { const l = `${ok ? 'ok  ' : 'FAIL'} ${what}`; console.log(l); log(l); if (!ok) fails.push(what); };
 
@@ -128,7 +132,10 @@ if (seen !== null) {
   await sleep(settle * 1000);
   im = await shot(`${out}-desktop.png`);
   check(taskbar(im), 'the taskbar is still up after settling');
-  check([[640, 60], [1000, 300], [60, 300]].every(([x, y]) => sky(im.at(x, y))), 'the desktop shows the wallpaper');
+  const logo = count(im, 515, 215, 670, 340, orange);
+  check([[640, 60], [1000, 300], [60, 300]].every(([x, y]) => sky(im.at(x, y))) && logo >= 2000, `the desktop shows the wallpaper (${logo} logo pixels)`);
+  const icon = count(im, 15, 8, 56, 54, bin), label = count(im, 4, 58, 66, 72, light);
+  check(icon >= 100 && label >= 50, `the desktop shows the Recycle Bin (icon ${icon}, label ${label} pixels)`);
   // each pin: an icon of its own colours, not the bar's (slots 60 wide from x 60)
   const pins = [['Internet Explorer', 60], ['Windows Explorer', 120], ['Windows Media Player', 180]]
     .map(([name, x]) => [name, count(im, x + 12, 686, x + 48, 716, (p) => !bar(p))]);

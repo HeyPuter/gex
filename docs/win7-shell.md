@@ -101,9 +101,12 @@ prefix is made for and the site runs as; `GEX_CRT_SRC`.
 | `33-units.sh` | the function-tier units (`gexc cgen-image` at each pinned base) and the session (the recording with this build's unit keys) | `units/`, `rec/w3-session.json` |
 | `34-site.sh` | `gexc eject` (compositor off), `user/eject.json`, the project's build, `web/eject-site.mjs --strip --prune --dedupe` | `project/`, `site/` |
 
-Times on a 24-thread host with `JOBS=16`: the image 2 minutes, the Wine
-trees about 20 minutes each, the runtime 10 minutes, the install up to an
-hour, the units about 40 minutes.
+Times of a run from fresh clones on a 24-thread host with `JOBS=8`
+(1 h 51 min in all): the image 1 minute; the sysroot, Wine's tools and the
+dependencies 4 minutes; the wasm32 tree 26 minutes; the i386 build 33
+minutes; the loader 5 minutes; the runtime 7 minutes; the install 4
+minutes; staging and the bundle 1 minute; the units 27 minutes; the site
+5 minutes.
 
 ## The result
 
@@ -123,8 +126,9 @@ node gex/tools/win7-shell/page-check.mjs $W7_OUT/site $W7_OUT/check
 ```
 
 serves the site, opens it in headless Chromium at 1280x720 and checks from
-screenshots that the taskbar comes up, the wallpaper shows, the three pins
-and the clock are drawn, and a click on Start opens the Start menu
+screenshots that the taskbar comes up, the wallpaper (with its Windows
+logo) and the Recycle Bin show, the three pins and the clock are drawn,
+and a click on Start opens the Start menu
 (`check-desktop.png`, `check-start.png`, `check.log`; exit status 0 on
 PASS).
 
@@ -145,3 +149,11 @@ PASS).
 - `tools/explorer/shell-leg.sh` runs the same prefix natively (gexc
   `--wayland-gpu`), with `DIST`, `PFX`, `WINLOGON` and `OUT` set, and
   `USERINIT=1` to start the shell through userinit.exe as the site does.
+- Known difference from site-7h: in about half of the page's runs the
+  desktop stays unpainted (Windows' plain blue background, no wallpaper,
+  no Recycle Bin; the taskbar, pins, clock and Start menu are unaffected),
+  and page-check then fails its wallpaper and Recycle Bin checks. Wine's
+  desktop process (`explorer.exe /desktop`) deadlocks on the loader lock:
+  one of its threads loads Windows 7's uxtheme.dll during the theme logon
+  and does not release the lock (16 of 28 runs of the recipe's sites;
+  site-7h: 0 of 8 runs).
