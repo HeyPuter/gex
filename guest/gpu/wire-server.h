@@ -9,6 +9,11 @@ struct gexgpu_server;
  * fills them with the webgpu.h the caller is compiled against). */
 struct gexgpu_server *gexgpu_server_create(const struct gexgpu_procs *procs);
 
+/* Every adapter and device request of the server's client gets these (the
+ * host's own, such as a compositor's), and the client cannot destroy the
+ * device. */
+void gexgpu_server_set_shared(struct gexgpu_server *server, WGPUAdapter adapter, WGPUDevice device);
+
 /* Releases everything the client made and frees the server. */
 void gexgpu_server_destroy(struct gexgpu_server *server);
 

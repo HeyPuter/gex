@@ -15,6 +15,8 @@
 #include "wire.h"
 #include "wire-server.h"
 
+#define ARRAYSIZE_GEXGPU(a) (sizeof(a) / sizeof((a)[0]))
+
 struct gexgpu_arena_chunk
 {
     struct gexgpu_arena_chunk *next;
@@ -38,6 +40,10 @@ struct gexgpu_server
 {
     struct gexgpu_procs procs;
     WGPUInstance instance;
+    /* A device the server's host already has, which every client's
+     * requests get (gexgpu_server_set_shared). */
+    WGPUAdapter shared_adapter;
+    WGPUDevice shared_device;
     struct gexgpu_server_object *objects;
     uint32_t object_capacity;
     struct gexgpu_server_future *futures;
@@ -428,6 +434,14 @@ static bool gexgpu_server_dispatch_handwritten(struct gexgpu_server *server, uin
             id = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (server->shared_adapter)
+            {
+                /* The host's: answered at once, with no future to wait for. */
+                server->procs.adapterAddRef(server->shared_adapter);
+                request_adapter_callback(WGPURequestAdapterStatus_Success, server->shared_adapter,
+                        (WGPUStringView)WGPU_STRING_VIEW_INIT, request_context(server, cookie, id, 0), NULL);
+                return true;
+            }
             info.mode = WGPUCallbackMode_AllowProcessEvents;
             info.callback = request_adapter_callback;
             info.userdata1 = request_context(server, cookie, id, 0);
@@ -451,6 +465,16 @@ static bool gexgpu_server_dispatch_handwritten(struct gexgpu_server *server, uin
             error_cookie = gexgpu_r_u32(r);
             if (r->error)
                 return false;
+            if (server->shared_device && adapter == server->shared_adapter)
+            {
+                /* The host's device, whatever was asked of it: it has the
+                 * features and limits the host asked for. Its errors are the
+                 * host's to report. */
+                server->procs.deviceAddRef(server->shared_device);
+                request_device_callback(WGPURequestDeviceStatus_Success, server->shared_device,
+                        (WGPUStringView)WGPU_STRING_VIEW_INIT, request_context(server, cookie, id, queue_id), NULL);
+                return true;
+            }
             if (!desc)
                 desc = &empty;
             desc->deviceLostCallbackInfo = (WGPUDeviceLostCallbackInfo)WGPU_DEVICE_LOST_CALLBACK_INFO_INIT;
@@ -656,6 +680,43 @@ static bool gexgpu_server_dispatch_handwritten(struct gexgpu_server *server, uin
 
         default:
             return false;
+    }
+}
+
+/* A client may not destroy the host's device. */
+static WGPUProcDeviceDestroy real_device_destroy;
+static WGPUDevice shared_devices[16];
+
+static void WGPU_FUNCTION_ATTRIBUTE shared_device_destroy(WGPUDevice device)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAYSIZE_GEXGPU(shared_devices); ++i)
+        if (shared_devices[i] == device)
+            return;
+    real_device_destroy(device);
+}
+
+void gexgpu_server_set_shared(struct gexgpu_server *server, WGPUAdapter adapter, WGPUDevice device)
+{
+    unsigned int i;
+
+    server->shared_adapter = adapter;
+    server->shared_device = device;
+    if (server->procs.deviceDestroy != shared_device_destroy)
+    {
+        real_device_destroy = server->procs.deviceDestroy;
+        server->procs.deviceDestroy = shared_device_destroy;
+    }
+    for (i = 0; i < ARRAYSIZE_GEXGPU(shared_devices); ++i)
+    {
+        if (shared_devices[i] == device)
+            break;
+        if (!shared_devices[i])
+        {
+            shared_devices[i] = device;
+            break;
+        }
     }
 }
 

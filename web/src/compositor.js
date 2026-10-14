@@ -61,6 +61,21 @@ export class Compositor {
    * Not on the page: the frames have to be textures in the context that draws
    * the scene, or a GL window costs a readback and an upload every frame. The
    * ring is the same shared one the page-side device would have served. */
+  /** Serve the guests' WebGPU (gpu-bridge.mjs) in the compositor's worker,
+   *  on its device. Resolves once the server is up. */
+  hostGpu(channel, url) {
+    return new Promise((resolve, reject) => {
+      const onMessage = ({ data: m }) => {
+        if (m.kind !== 'gpu-ready' && m.kind !== 'gpu-failed') return;
+        this.#worker.removeEventListener('message', onMessage);
+        if (m.kind === 'gpu-ready') resolve();
+        else reject(new Error(m.error));
+      };
+      this.#worker.addEventListener('message', onMessage);
+      this.#worker.postMessage({ kind: 'gpu', channel, url });
+    });
+  }
+
   hostGl(channel, opts = {}) {
     return new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {

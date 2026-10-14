@@ -19,6 +19,30 @@ EMSCRIPTEN_KEEPALIVE struct gexgpu_server *gexgpu_web_create(void)
     return gexgpu_server_create(&procs);
 }
 
+/* The host's adapter and device (Module.gexAdapter, Module.gexDevice),
+ * imported once. */
+EM_JS(WGPUAdapter, gexgpu_web_import_adapter, (void), {
+    if (!Module.gexAdapterPtr) Module.gexAdapterPtr = WebGPU.importJsAdapter(Module.gexAdapter);
+    return Module.gexAdapterPtr;
+});
+EM_JS(WGPUDevice, gexgpu_web_import_device, (WGPUAdapter adapter), {
+    if (!Module.gexDevicePtr) Module.gexDevicePtr = WebGPU.importJsDevice(Module.gexDevice, adapter);
+    return Module.gexDevicePtr;
+});
+
+/* A server whose client gets the host's device. */
+EMSCRIPTEN_KEEPALIVE struct gexgpu_server *gexgpu_web_create_shared(void)
+{
+    struct gexgpu_server *server;
+    WGPUAdapter adapter;
+
+    if (!(server = gexgpu_web_create()))
+        return NULL;
+    adapter = gexgpu_web_import_adapter();
+    gexgpu_server_set_shared(server, adapter, gexgpu_web_import_device(adapter));
+    return server;
+}
+
 EMSCRIPTEN_KEEPALIVE void gexgpu_web_destroy(struct gexgpu_server *server)
 {
     gexgpu_server_destroy(server);
