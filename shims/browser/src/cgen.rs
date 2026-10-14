@@ -1404,6 +1404,13 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
             m.retire(addr);
             return None;
         }
+        // Under the table's lock, as `on_retire` clears it: written after
+        // the lock, a retirement on another Worker in between (its bit set,
+        // the slot cleared) would be undone, and a Worker whose table still
+        // holds the retired body would find itself in the slot when the body
+        // sees its page patched and leaves through the cache -- calling
+        // itself forever (explorer's uxtheme.dll DllMain, reloaded).
+        gex_kernel::ftab::fcache_write(mem, addr, f.idx);
         Some(f.idx)
     });
     // An ejected project's training run (`run.mjs --record-entries`): an
@@ -1414,9 +1421,12 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         note_web_entry(addr);
     }
     // Nothing serves it: the function JIT makes it, if it is on.
+    let served = hit.is_some();
     let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
-    gex_kernel::ftab::fcache_write(mem, addr, idx);
+    if !served {
+        gex_kernel::ftab::fcache_write(mem, addr, idx);
+    }
     if libprov::any_registered() {
         LOOKUP_RING.with(|r| {
             let mut r = r.borrow_mut();
@@ -1967,19 +1977,27 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
     libprov::forget_gone(gone);
     // After the bits: a lookup once the probe cache is cleared sees them.
+    // Every entry's probe cache slot first, the units' that retire here
+    // included (as natively, ftab.rs `on_retire`): cleared after the
+    // retirement, they were no longer in the map, and their slots kept
+    // naming the retired body. A Worker that had not yet replayed the
+    // retirement (its table still holding that body) then entered it from
+    // the cache; the body found its page patched and left through the same
+    // slot, to itself, forever: explorer's uxtheme.dll, unloaded and loaded
+    // again at its base, hung its DllMain with the loader lock held.
     let memory = crate::guest_bytes();
     ftab(|m| {
+        for &(start, end) in ranges {
+            for (a, _) in m.range(start, end).collect::<Vec<_>>() {
+                gex_kernel::ftab::fcache_clear(memory, a);
+            }
+        }
         for &(start, end) in gone {
             for (a, f) in m.range(start, end).collect::<Vec<_>>() {
                 let i = m.install(f.install);
                 if i.tier == Tier::Unit && i.module < PROVIDER {
                     m.retire(a);
                 }
-            }
-        }
-        for &(start, end) in ranges {
-            for (a, _) in m.range(start, end).collect::<Vec<_>>() {
-                gex_kernel::ftab::fcache_clear(memory, a);
             }
         }
     });
