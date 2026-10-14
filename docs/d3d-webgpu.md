@@ -17,9 +17,10 @@ D3D8/9/10/11, DXGI (Wine's front ends, unchanged)
        shaders: vkd3d-shader -> WGSL (new target)
   -> webgpu.dll (new Wine DLL): webgpu.h exports, the gex wire's client
        Unix side: the wire's server
-         native host: on Dawn (Metal, Vulkan, D3D12), in-process
-         W3: forwarded through /dev/gex-gpu (to do)
-  -> page: the wire's server on the browser's WebGPU (to do)
+         native Wine: on Dawn (Metal, Vulkan, D3D12), in-process
+         in a gex guest (W3): forwarded through /dev/gex-gpu
+  -> /dev/gex-gpu: gexc's on Dawn (crates/gex-webgpu), or the page's
+     server on the browser's WebGPU (emdawnwebgpu, gpu-bridge.mjs)
 ```
 
 Decisions and why:
@@ -98,6 +99,34 @@ client, the Unix side the server on Dawn, every call made from one thread
 (Dawn keeps error scopes per thread). Its tests pass natively (x86_64,
 Metal).
 
+### 2.2a /dev/gex-gpu (working: gexc, browser runtime under Node)
+
+A guest reaches a host WebGPU through `/dev/gex-gpu`
+(`guest/gpu/transport-dev.h`): one ioctl per wire message, carrying the
+message's and the reply buffer's addresses in the guest's memory; a reply
+too big for the buffer is held for `GEX_GPU_FETCH`. Every open is a
+connection with a server of its own (ids are the client's). The guest's
+transport is `guest/gpu/transport-dev.c`; webgpu.dll's Unix side opens the
+device when there is one, and without Dawn (no `DAWN_LIBS`) that is its
+only server.
+
+- **gexc** (`--features webgpu`, `GEX_DAWN_PREFIX=<Dawn release>`):
+  `shims/native/src/gpu.rs`, the servers on Dawn from `crates/gex-webgpu`,
+  all on one thread.
+- **Browser runtime**: `shims/browser/src/gpu.rs` (the submit deferred
+  past the kernel's lock, like the GL device's), `gpu-bridge.mjs` (a
+  SharedArrayBuffer channel: the Worker blocks in `Atomics.wait`, the
+  server answers), and the server, `web/build-gexgpu-server.sh`:
+  wire-server.c on emdawnwebgpu with JSPI, so a WAIT suspends the server's
+  promise rather than the page. A page serves it with `?webgpu=1`
+  (`runProgram`'s `webgpu`); `run-node.mjs` with `GEX_GPU=1` over Dawn's
+  Node bindings (the `webgpu` npm package) and `--experimental-wasm-jspi`.
+
+`guest/gpu/test/gpu-smoke.c` (static aarch64, `build-guest.sh`: Alpine in
+Docker) runs a compute shader and checks the result: "gpu-smoke: ok" under
+`gexc run` and under `run-node.mjs`. The emdawnwebgpu package must match
+`third_party/dawn-api` (the Dawn release `v20261009.190412` for both).
+
 ### 2.3 wined3d's WebGPU renderer (working natively)
 
 `WINE_D3D_CONFIG=renderer=webgpu`. Modelled on the Vulkan renderer, but
@@ -137,8 +166,9 @@ non-depth textures, and presentation (GDI read-back for now).
 
 ### 2.4 Next
 
-1. W3: webgpu.dll's Unix side forwards the wire through `/dev/gex-gpu`;
-   the page runs the server on the browser's WebGPU.
+1. W3 end to end: a D3D program under W3 in the page with `?webgpu=1`
+   and `renderer=webgpu` (waits on the W3 page bring-up being reproducible
+   here).
 2. Presentation: a swap chain's texture is a compositor surface on the same
    device (the compositor today assumes one GL frame:
    web/src/compositor-worker.js, "one canvas and one frame").
