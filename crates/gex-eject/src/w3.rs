@@ -342,6 +342,76 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         }
     };
     let mut cold_units = 0;
+    // `"prune": "static"`: each unit without the functions no path from
+    // outside its image reaches (crate::reach), in parallel.
+    let mut pruned: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    if config.prune {
+        if config.cold.is_some() {
+            bail!("user/eject.json: \"prune\": \"static\" goes with \"cold\": \"none\"");
+        }
+        let tar_bytes = std::fs::read(dir.join("bundle/rootfs.tar"))?;
+        let tar = crate::reach::Tar::parse(&tar_bytes)?;
+        let jobs: Vec<(String, String)> = units
+            .iter()
+            .map(|u| Ok((json::str_field(u, "key", what)?, json::str_field(u, "path", what)?)))
+            .collect::<Result<_>>()?;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let results: Vec<Result<(Vec<u8>, crate::reach::PruneStat)>> = {
+            let slots: Vec<std::sync::Mutex<Option<Result<(Vec<u8>, crate::reach::PruneStat)>>>> =
+                jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((key, path)) = jobs.get(i) else { break };
+                        let r = (|| {
+                            let wasm = std::fs::read(dir.join("units").join(key).join("c.wasm"))?;
+                            let image = tar.read(path).ok_or_else(|| anyhow!("{path}: not in bundle/rootfs.tar"))?;
+                            crate::reach::prune_unit(&wasm, image, key, path)
+                        })();
+                        *slots[i].lock().unwrap() = Some(r);
+                    });
+                }
+            });
+            slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+        };
+        let mut rows = Vec::new();
+        let (mut before, mut after, mut slots_all, mut kept_all) = (0usize, 0usize, 0usize, 0usize);
+        for r in results {
+            let (wasm, st) = r?;
+            before += st.bytes_before;
+            after += st.bytes_after;
+            slots_all += st.slots;
+            kept_all += st.kept;
+            rows.push(obj(vec![
+                ("key", s(&st.key)),
+                ("path", s(&st.path)),
+                ("slots", json::n(st.slots as u64)),
+                ("kept", json::n(st.kept as u64)),
+                ("bytes_before", json::n(st.bytes_before as u64)),
+                ("bytes_after", json::n(st.bytes_after as u64)),
+                ("whole", st.whole.as_deref().map(s).unwrap_or(Json::Null)),
+            ]));
+            pruned.insert(st.key, wasm);
+        }
+        eprintln!(
+            "gexc eject build: pruned {} of {slots_all} functions; units {before} -> {after} bytes",
+            slots_all - kept_all
+        );
+        write_file(
+            &dir.join("build/prune.json"),
+            json::write(&obj(vec![
+                ("slots", json::n(slots_all as u64)),
+                ("kept", json::n(kept_all as u64)),
+                ("bytes_before", json::n(before as u64)),
+                ("bytes_after", json::n(after as u64)),
+                ("units", Json::Arr(rows)),
+            ]))
+            .as_bytes(),
+            false,
+        )?;
+    }
     for u in units {
         let key = json::str_field(u, "key", what)?;
         let to = web.join("units").join(&key);
@@ -349,6 +419,10 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         if instrument {
             let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm"))?;
             write_file(&to.join("c.wasm"), &gex_split::instrument(&wasm)?, false)?;
+            continue;
+        }
+        if let Some(w) = pruned.get(&key) {
+            write_file(&to.join("c.wasm"), w, false)?;
             continue;
         }
         let (Some(cov), Some(how)) = (coverage, config.cold.as_deref()) else {
@@ -434,6 +508,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             ("units", json::n(units.len() as u64)),
             ("bundle_split", json::b(config.bundle_split)),
             ("cold", config.cold.as_deref().map(s).unwrap_or(Json::Null)),
+            ("prune", s(if config.prune { "static" } else { "none" })),
         ]))
         .as_bytes(),
         false,

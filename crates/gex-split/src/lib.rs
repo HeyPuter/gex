@@ -53,6 +53,10 @@ pub const COLD_NAME: &str = "cold";
 /// Import module and name an instrumented unit calls on each function entry.
 pub const COV_MODULE: &str = "gexcov";
 pub const COV_NAME: &str = "hit";
+/// Import module and name a pruned unit's stubs call ([`prune`]): the host
+/// reports the slot's guest address and fails the call.
+pub const PRUNED_MODULE: &str = "gex";
+pub const PRUNED_NAME: &str = "pruned";
 
 /// A unit's module, parsed.
 pub struct Unit<'a> {
@@ -292,6 +296,9 @@ struct Plan<'p> {
     stubs: Option<&'p [Option<u32>]>,
     /// Instrumented: `gexcov.hit(slot)` on each guest function's entry.
     cov: bool,
+    /// The stubs are for pruned functions: `gex.pruned(slot)`, then a trap
+    /// (never a cluster to load).
+    pruned: bool,
 }
 
 fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
@@ -299,6 +306,9 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
     let helpers = u.helpers_of(&owned_f);
     let need_cold = plan.stubs.is_some_and(|s| s.iter().any(|c| c.is_some()));
     let extra_import = need_cold || plan.cov;
+    if plan.pruned && plan.cov {
+        bail!("a pruned unit is not instrumented");
+    }
     // Types: the unit's, then (i32) -> () for the extra import.
     let mut types = TypeSection::new();
     {
@@ -316,7 +326,9 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
         imports.import(m, n, ty);
     }
     let extra_idx = u.nfi;
-    if need_cold {
+    if need_cold && plan.pruned {
+        imports.import(PRUNED_MODULE, PRUNED_NAME, EntityType::Function(ty_i32));
+    } else if need_cold {
         imports.import(COLD_MODULE, COLD_NAME, EntityType::Function(ty_i32));
     } else if plan.cov {
         imports.import(COV_MODULE, COV_NAME, EntityType::Function(ty_i32));
@@ -391,6 +403,19 @@ fn build(u: &Unit, plan: &Plan) -> Result<Vec<u8>> {
             for (k, &f) in u.slots.iter().enumerate() {
                 match stubs[k] {
                     None => seg.push(*map.get(&f).ok_or_else(|| anyhow!("hot slot {k} is not held"))?),
+                    Some(_) if plan.pruned => {
+                        // A pruned function: say which, then trap. Its body
+                        // is not in the module, so nothing else can run.
+                        funcs.function(u.body_ty);
+                        let mut s = Function::new([]);
+                        s.instruction(&I::I32Const(k as i32));
+                        s.instruction(&I::Call(extra_idx));
+                        s.instruction(&I::Unreachable);
+                        s.instruction(&I::End);
+                        code.function(&s);
+                        seg.push(next);
+                        next += 1;
+                    }
                     Some(c) => {
                         funcs.function(u.body_ty);
                         let mut s = Function::new([]);
@@ -484,7 +509,7 @@ impl Reencode for Remap<'_> {
 pub fn instrument(wasm: &[u8]) -> Result<Vec<u8>> {
     let u = Unit::parse(wasm)?;
     let all: Vec<u32> = (0..u.slots.len() as u32).collect();
-    build(&u, &Plan { owned: &all, stubs: Some(&vec![None; u.slots.len()]), cov: true })
+    build(&u, &Plan { owned: &all, stubs: Some(&vec![None; u.slots.len()]), cov: true, pruned: false })
 }
 
 /// How cold functions are grouped into what the page fetches.
@@ -661,7 +686,7 @@ pub fn split(wasm: &[u8], hot: &HashSet<u32>, how: Clustering) -> Result<(Vec<u8
     let u = Unit::parse(wasm)?;
     let (of, count) = clusters(&u, hot, how);
     let hot_slots: Vec<u32> = (0..u.slots.len() as u32).filter(|k| of[*k as usize].is_none()).collect();
-    let primary = build(&u, &Plan { owned: &hot_slots, stubs: Some(&of), cov: false })?;
+    let primary = build(&u, &Plan { owned: &hot_slots, stubs: Some(&of), cov: false, pruned: false })?;
     let mut members: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (k, c) in of.iter().enumerate() {
         if let Some(c) = c {
@@ -671,7 +696,20 @@ pub fn split(wasm: &[u8], hot: &HashSet<u32>, how: Clustering) -> Result<(Vec<u8
     let mut out = Vec::with_capacity(count as usize);
     for c in 0..count {
         let ks = members.get(&c).map(|v| v.as_slice()).unwrap_or(&[]);
-        out.push(build(&u, &Plan { owned: ks, stubs: None, cov: false })?);
+        out.push(build(&u, &Plan { owned: ks, stubs: None, cov: false, pruned: false })?);
     }
     Ok((primary, out, of))
+}
+
+/// The unit with only the slots in `keep`: every other slot's body is left
+/// out and its slot holds a stub that calls `gex.pruned(slot)` (the host
+/// names the guest address) and traps. For code proved unreachable
+/// (gex-eject's static closure): a stub that runs is a wrong proof, and it
+/// fails there, loudly, never quietly elsewhere.
+pub fn prune(wasm: &[u8], keep: &HashSet<u32>) -> Result<Vec<u8>> {
+    let u = Unit::parse(wasm)?;
+    let n = u.slots.len() as u32;
+    let of: Vec<Option<u32>> = (0..n).map(|k| if keep.contains(&k) { None } else { Some(0) }).collect();
+    let owned: Vec<u32> = (0..n).filter(|k| keep.contains(k)).collect();
+    build(&u, &Plan { owned: &owned, stubs: Some(&of), cov: false, pruned: true })
 }
