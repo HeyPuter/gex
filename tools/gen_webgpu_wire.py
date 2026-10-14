@@ -579,6 +579,12 @@ class Gen:
             out.append('            result_id = gexgpu_r_u32(r);')
         out.append('            if (r->error)')
         out.append('                return false;')
+        if obj:
+            # A null receiver (a client's object that was never made) would
+            # crash the webgpu.h below: the call is skipped, and the batch
+            # goes on. One with a reply cannot be skipped quietly.
+            out.append('            if (!self)')
+            out.append('                ' + ('break;' if kind in ('object', 'void') else 'return false;'))
         call = f'server->procs.{proc}({", ".join(call_args)})'
         if kind == 'object':
             out.append(f'            gexgpu_server_set_object(server, result_id, GEXGPU_TYPE_{camel(ret_type(m))}, {call});')
