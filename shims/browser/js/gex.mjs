@@ -3091,6 +3091,49 @@ export class Gex {
     return true;
   }
 
+  /** A translated program's posix_spawn child, running in this Worker's
+   *  run loop in place of the thread that cloned it (vfork.rs); null when
+   *  none is. */
+  #vfork = null;
+
+  /** Start the staged vfork child here: where to enter it, or null when
+   *  there was nothing to start. */
+  #vforkEnter() {
+    const e = this.#shim.exports;
+    const t0 = performance.now();
+    const entry = e.gex_vfork_begin();
+    if (!entry) return null;
+    const ctx = Number(e.gex_fork_ctx());
+    this.#vfork = { t0, pid: e.gex_vfork_pid(), ctx };
+    return { pc: entry, ctx };
+  }
+
+  /** The vfork child is done (its exit, its exec, or `crash`): hand an exec
+   *  to a new Worker, and go back to the thread that cloned it, after its
+   *  `clone`. */
+  #vforkLeave(crash) {
+    const e = this.#shim.exports;
+    const { t0, pid, ctx } = this.#vfork;
+    const w = e.gex_vfork_why();
+    let why = crash ? 'crash' : w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
+    let exec = null;
+    if (why === 'exec') {
+      exec = this.#vforkExecRecord(pid, ctx);
+      e.gex_vfork_exec_done();
+    } else if (why === 'crash') {
+      if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
+      try { e.gex_process_gone?.(137); } catch {}
+    }
+    const resume = e.gex_vfork_end();
+    this.#vfork = null;
+    if (exec) {
+      this.#env.spawnProcess(exec).catch((err) => console.error(`[gex] starting pid ${pid} after its exec: ${err.message ?? err}`));
+    }
+    this.#vforks++;
+    vforkTrace(`[vfork] pid ${pid}: ${why} after ${(performance.now() - t0).toFixed(1)}ms`);
+    return { pc: resume, ctx };
+  }
+
   /** The record of an exec a vfork child staged (`vfork::stage_exec`): a
    *  fork record with no image, which the host starts as any child, and
    *  whose Worker runs the exec (`#adoptExec`). */
@@ -5316,7 +5359,16 @@ export class Gex {
         // exit 0. `trap()` sets a flag; nothing else does. First because the
         // recovery below calls into the shim, whose kernel a crash may leave
         // borrowed -- a second call would bury the first error.
-        if (!err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+        // Asked once: the answer is taken with it.
+        const crashed = !err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff();
+        if (crashed && this.#vfork && !/table index is out of bounds/.test(err?.message ?? '')) {
+          // posix_spawn's child crashed in this Worker: it ends, and the
+          // thread that cloned it goes on.
+          this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+          ({ pc, ctx } = this.#vforkLeave(err));
+          continue;
+        }
+        if (crashed) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -5519,6 +5571,23 @@ export class Gex {
         this.#where = 'catchUp';
         await this.#catchUp();
         this.#cgenServe();
+        // posix_spawn's child in this Worker, in place of the thread that
+        // cloned it (shims/browser/src/vfork.rs): over when it exits or
+        // execs, and then that thread goes on after its `clone`.
+        if (this.#vfork && e.gex_vfork_over()) {
+          ({ pc, ctx } = this.#vforkLeave(null));
+          continue;
+        }
+        if (!this.#vfork) {
+          const ok = e.gex_vfork_ok?.() ?? 0;
+          if (ok > 0) {
+            const at = this.#vforkEnter();
+            if (at) {
+              ({ pc, ctx } = at);
+              continue;
+            }
+          } else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+        }
         this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
