@@ -187,7 +187,7 @@ Native tests (macOS, Apple M4 Pro, Rosetta x86_64 Wine):
 | d3d11 (FL 9_3) | 3925 checks, 3 failing, 190 skipped |
 | d3d10_1 (FL 9_3 / 10_1) | 97 / 318 checks, none failing |
 | d3d10core (FL 10_1) | runs to the end: 194656 checks, 480 failing (depth bias 205: Metal's depth24plus is float underneath; stream output ~100; layered rendering needs geometry shaders) |
-| d3d9 visual | runs to the end: 202515 checks, 646 failing |
+| d3d9 visual | runs to the end: 204498 checks, 511 failing (then projected textures and D16_LOCKABLE clears fixed: about 440); most in test_fog's orthographic table fog with depth bias |
 
 Known gaps: D3D9 sRGB write control, stream output (WebGPU's vertex
 shaders cannot write storage), occlusion and timestamp queries (answered,
