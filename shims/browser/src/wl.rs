@@ -636,8 +636,13 @@ impl WaylandDevice {
     /// times a second, nearly all with nothing to move, and the pump was 311
     /// of the 546 ms a 10 s window held the lock for the turn (census,
     /// worldmachine) -- the turn that is 70% of the game's lock wait.
+    ///
+    /// The floor reads the turn's clock (`turn_now`): inside a syscall or a
+    /// wait-loop pass that is the reading the pass already took, not one more
+    /// host call per turn (the largest clock caller left in a pipe ping-pong,
+    /// 213 of 561 ms on worldmachine); a 50 ms floor does not mind it.
     pub fn needs_pump(&self) -> bool {
-        let now = crate::now_ns();
+        let now = crate::turn_now();
         if now.saturating_sub(self.inner.last_pump.load(std::sync::atomic::Ordering::Relaxed)) >= PUMP_FLOOR_NS {
             return true;
         }
