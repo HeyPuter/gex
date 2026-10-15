@@ -11545,6 +11545,9 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A `recvmsg` on a blocking socket: until it is readable, then made
         // again (`Owed::reissue`).
         gex_kernel::BlockOp::AcceptWait { socket } => Waiting::Accept(Arc::clone(socket)),
+        // A blocking `connect` (L18), as the kernel's park: until the
+        // connection is up, refused or gone (`wait_ready`'s `Net`).
+        gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
         _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep or a socket"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });

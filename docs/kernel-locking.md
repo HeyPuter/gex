@@ -796,6 +796,23 @@ in the scheduler pick after each wake of the global WAKE word: about
      directory (`ProcSource::task_owner`). Legs:
      `thread_ids_are_numbered_with_the_processes`; `task-ids` (x86-64,
      i386; page tier, SP and gexc).
+   - The socket calls without the kernel lock (L18): `socket`,
+     `socketpair`, `bind`, `listen`, `accept`/`accept4`, `connect`,
+     `sendto`, `recvfrom`, `sendmmsg`, `recvmmsg`, `getsockname`,
+     `getpeername`, `setsockopt`, `getsockopt` and `shutdown` run on the
+     free path (`is_socket_call`, `NetIo`): the descriptor table (`FdIo`),
+     the network, resolver and ports, the global kernel's sockets and the
+     socket name tables, all shared and locking themselves. A unix
+     socket's relative name resolves against the calling thread's
+     fs_struct. A blocking `connect` parks until the connection is up or
+     refused (`BlockOp::Connect`, now also a class call's park); a blocking
+     `accept` or `recvfrom` with nothing there parks until there is and is
+     made again (`AcceptWait`). Legs:
+     `free_socket_calls_answer_as_the_kernel_does`; `sock-threads`
+     (x86-64, i386; page tier, SP and gexc): a listener serving two
+     connecting threads through a blocking accept, the options and names of
+     what they made, shutdown seen as the end, socketpairs with
+     `sendmmsg`/`recvmmsg`, and internet sockets made and asked their kind.
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
    - The compositor's pump (L8): no lock. What it asked of the kernel is

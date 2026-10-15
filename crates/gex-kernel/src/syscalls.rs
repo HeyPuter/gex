@@ -3490,6 +3490,583 @@ impl MapIo<'_> {
     }
 }
 
+/// The socket calls (L18): `socket`, `socketpair`, `bind`, `listen`,
+/// `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmmsg`,
+/// `recvmmsg`, the names (`getsockname`, `getpeername`), the options and
+/// `shutdown` (canonical numbers). `sendmsg` and `recvmsg` are [`FdIo`]'s.
+pub fn is_socket_call(n: u64) -> bool {
+    matches!(
+        n,
+        nr::SOCKET
+            | nr::SOCKETPAIR
+            | nr::BIND
+            | nr::LISTEN
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::CONNECT
+            | nr::GETSOCKNAME
+            | nr::GETPEERNAME
+            | nr::SENDTO
+            | nr::RECVFROM
+            | nr::SETSOCKOPT
+            | nr::GETSOCKOPT
+            | nr::SHUTDOWN
+            | nr::SENDMMSG
+            | nr::RECVMMSG
+    )
+}
+
+/// What the socket calls need of their process beside its descriptor table
+/// ([`FdIo`]), none of it behind the kernel lock (docs/kernel-locking.md
+/// step 9, L18): the network and the name tables are shared and lock
+/// themselves, the global kernel's sockets are another module's.
+#[derive(Clone, Copy)]
+pub struct NetIo<'a> {
+    /// The network stack (`Kernel::net`); none is loopback only.
+    pub net: Option<&'a Arc<dyn net::NetStack>>,
+    pub resolver: &'a Arc<net::Resolver>,
+    pub ports: &'a Arc<net::Ports>,
+    /// The global kernel's unix sockets, when there is one.
+    pub unix_remote: Option<unix::Remote>,
+    /// The system's bound names, and this process's host's own.
+    pub socket_names: &'a Arc<unix::SocketNames>,
+    pub host_names: &'a Arc<unix::SocketNames>,
+}
+
+const SOCK_NONBLOCK: u64 = 0o4000;
+const SOCK_CLOEXEC: u64 = 0o2000000;
+
+impl NetIo<'_> {
+    /// A socket call ([`is_socket_call`]), with the calling thread's working
+    /// directory `cwd` for a unix socket's relative name.
+    pub fn call(&self, io: &FdIo<'_>, m: &mut GuestMem<'_>, n: u64, a: [u64; 6], cwd: &str) -> SysResult {
+        let fd = a[0] as i32;
+        match n {
+            nr::SOCKET => self.socket(io, a[0], a[1], a[2]),
+            // A unix socket and an internet socket are different concrete
+            // types behind the same descriptor, so which `connect` this is
+            // depends on what the descriptor turned out to be.
+            nr::CONNECT => match self.unix_connect(io, m, fd, a[1], a[2], cwd) {
+                Err(Errno::ENOTSOCK) => inet_connect(io, m, fd, a[1], a[2]),
+                other => other,
+            },
+            nr::SENDTO => sendto(io, m, fd, a[1], a[2], a[4]),
+            nr::RECVFROM => recvfrom(io, m, fd, a[1], a[2], a[3], a[4], a[5]),
+            nr::SENDMMSG => sendmmsg(io, m, fd, a[1], a[2]),
+            nr::RECVMMSG => recvmmsg(io, m, fd, a[1], a[2], a[3]),
+            nr::GETPEERNAME => {
+                let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
+                io.write_sockaddr(m, ip, port, a[1], a[2])
+            }
+            // One interface, unnamed. A guest that asks where it is calling
+            // from gets 0.0.0.0, which is what an unbound socket reports.
+            //
+            // A unix socket is AF_UNIX and unnamed: libuv's
+            // `uv_guess_handle` decides from the family whether a socket on
+            // stdout is a pipe or TCP, and node made the stdout of every
+            // child it spawned a black hole when told AF_INET.
+            nr::GETSOCKNAME => match socket_family_type(io, fd) {
+                // AF_UNIX
+                Ok((1, _)) => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+                _ => {
+                    let (ip, port) = io.socket_of(fd).map(|s| s.local()).unwrap_or((0, 0));
+                    io.write_sockaddr(m, ip, port, a[1], a[2])
+                }
+            },
+            // Nothing here has an option worth setting -- no timeouts, no
+            // buffer sizes that mean anything -- and refusing makes libraries
+            // treat the socket as broken.
+            // agreed to without effect, on a descriptor that exists
+            nr::SETSOCKOPT => io.fds.get(fd).map(|_| 0),
+            nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3]),
+            // A unix socket's directions close as asked, local or in the
+            // global kernel; the proxied network's as it can; anything else
+            // just agrees.
+            nr::SHUTDOWN => match io.unix_of(fd) {
+                Ok(sock) => sock.shutdown_how(a[1]),
+                // A global-kernel one too (a socketpair's ends in two
+                // Workers): SHUT_WR is how libuv ends a child's stdin.
+                Err(_) => match io.remote_unix_of(fd) {
+                    Ok(sock) => sock.shutdown_how(a[1]),
+                    Err(_) => match io.socket_of(fd) {
+                        Ok(s) => s.shutdown(a[1]),
+                        Err(_) => io.fds.get(fd).map(|_| 0),
+                    },
+                },
+            },
+            // A local address means nothing when there is one interface and
+            // it is a proxy, but a resolver binds its socket before it sends
+            // and gives up if that fails.
+            nr::BIND => match self.unix_bind(io, m, fd, a[1], a[2], cwd) {
+                Err(Errno::ENOTSOCK) => match io.socket_of(fd) {
+                    // An internet socket remembers where it is (`listen`,
+                    // `getsockname`).
+                    Ok(sock) => m
+                        .read(a[1], (a[2] as usize).min(128))
+                        .and_then(|b| net::parse_sockaddr(b))
+                        .and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
+                    Err(_) => io.fds.get(fd).map(|_| 0),
+                },
+                other => other,
+            },
+            // A socket in the global kernel was bound and listening in one
+            // call; there is nothing left for this to do but agree.
+            nr::LISTEN => match io.remote_unix_of(fd) {
+                Ok(_) => Ok(0),
+                Err(_) => match io.unix_of(fd) {
+                    Ok(s) => s.listen(),
+                    // A TCP listener, for guests on this machine.
+                    Err(Errno::ENOTSOCK) => io.socket_of(fd).and_then(|s| s.listen()).map(|_| 0),
+                    Err(e) => Err(e),
+                },
+            },
+            nr::ACCEPT => accept(io, m, fd, a[1], a[2], 0),
+            nr::ACCEPT4 => accept(io, m, fd, a[1], a[2], a[3]),
+            nr::SOCKETPAIR => self.socketpair(io, m, a[0], a[1], a[3]),
+            _ => Err(Errno::ENOSYS),
+        }
+    }
+
+    /// Where a socket call made without the kernel lock waits, as the full
+    /// call does: a blocking `connect` until the connection is up or not
+    /// (started here; the call made afterwards only reports on it), and a
+    /// blocking `accept` or `recvfrom` with nothing there until there is,
+    /// then the call made again (`BlockOp::AcceptWait`).
+    pub fn park(&self, io: &FdIo<'_>, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let file = io.fds.get(a[0] as i32).ok()?;
+        match n {
+            nr::CONNECT => {
+                let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
+                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
+                let socket = io.socket_of(a[0] as i32).ok()?;
+                let started = socket.connect(ip, port);
+                let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
+                waits.then_some(BlockOp::Connect { socket })
+            }
+            nr::ACCEPT | nr::ACCEPT4 | nr::RECVFROM => {
+                if n == nr::RECVFROM && a[3] & Kernel::MSG_DONTWAIT != 0 {
+                    return None;
+                }
+                let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
+                if !file.would_block() || socket.poll_readable() {
+                    return None;
+                }
+                Some(BlockOp::AcceptWait { socket })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn socket(&self, io: &FdIo<'_>, domain: u64, ty: u64, protocol: u64) -> SysResult {
+        const AF_UNIX: u64 = 1;
+        const AF_INET: u64 = 2;
+        const SOCK_STREAM: u64 = 1;
+        const SOCK_DGRAM: u64 = 2;
+        // A unix socket needs no network behind it: both ends are in this
+        // machine, and one of them may be the host rather than a guest.
+        if domain == AF_UNIX {
+            let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if kind != SOCK_STREAM && kind != 5 {
+                // SOCK_SEQPACKET is 5 and behaves closely enough to a stream
+                // for what uses it here; datagram unix sockets are not.
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let sock = Arc::new(unix::UnixSocket::new(true));
+            let nonblock = ty & SOCK_NONBLOCK != 0;
+            sock.set_nonblocking(nonblock);
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            return install_unix(io, sock, flags, ty & SOCK_CLOEXEC != 0);
+        }
+        // AF_NETLINK, which libudev's device monitor opens (SDL's joystick
+        // and haptic start-up through it; a failure there made SDL_Init undo
+        // its video subsystem too, and Unity 6 then saw no display). There
+        // are no devices to announce, so the socket binds, takes its options
+        // and never has a message: an empty eventfd behind the descriptor.
+        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
+        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
+        // request with the 8-byte counter its own send wrote, which glibc
+        // aborts on (apt's http method). Without a route socket it assumes
+        // IPv4 and IPv6 are there.
+        const AF_NETLINK: u64 = 16;
+        const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        if domain == AF_NETLINK {
+            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
+            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
+            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
+        }
+        if domain != AF_INET {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        // Without a network stack (the browser with no relay), loopback still
+        // works: Wine's in-process server and Winsock use it.
+        let net = self.net.cloned().unwrap_or_else(|| Arc::new(net::NoNet) as Arc<dyn net::NetStack>);
+        let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
+            SOCK_STREAM => net::Kind::Tcp,
+            SOCK_DGRAM => net::Kind::Udp,
+            _ => return Err(Errno::EPROTONOSUPPORT),
+        };
+        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(self.resolver), Arc::clone(self.ports), self.unix_remote));
+        sock.set_self();
+        sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
+        let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        io.fds.insert(file, ty & SOCK_CLOEXEC != 0)
+    }
+
+    pub fn socketpair(&self, io: &FdIo<'_>, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
+        const AF_UNIX: u64 = 1;
+        if domain != AF_UNIX {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        let nonblock = ty & SOCK_NONBLOCK != 0;
+        // A stream pair in the global kernel when there is one: its ends are
+        // often for two processes (Wine makes one per new process, keeps an
+        // end and hands the other to the child), and with a Worker per
+        // process a local pair cannot cross a fork.
+        const SOCK_STREAM: u64 = 1;
+        if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
+            let mut ids = [0u8; 8];
+            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
+            if rc < 0 {
+                return Err(Errno(-rc));
+            }
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let cloexec = ty & SOCK_CLOEXEC != 0;
+            let mut fds = [0i32; 2];
+            for (i, fd) in fds.iter_mut().enumerate() {
+                let id = i32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
+                let sock = Arc::new(unix::RemoteUnix::new(id, false, None, r));
+                sock.set_nonblocking(nonblock);
+                *fd = insert_remote_unix(io, sock, flags, cloexec)?;
+            }
+            m.write_u32(out, fds[0] as u32)?;
+            m.write_u32(out + 4, fds[1] as u32)?;
+            return Ok(0);
+        }
+        let (a, b) = unix::UnixSocket::pair();
+        a.set_nonblocking(nonblock);
+        b.set_nonblocking(nonblock);
+        let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+        let cloexec = ty & SOCK_CLOEXEC != 0;
+        let fa = install_unix(io, a, flags, cloexec)?;
+        let fb = install_unix(io, b, flags, cloexec)?;
+        m.write_u32(out, fa as u32)?;
+        m.write_u32(out + 4, fb as u32)?;
+        Ok(0)
+    }
+
+    pub fn unix_bind(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
+        let sock = io.unix_of(fd)?;
+        let path = Kernel::sockaddr_un(m, addr, len)?;
+        // A filesystem socket resolves against the guest's root the way any
+        // other path does; an abstract one has no filesystem existence.
+        let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // In the global kernel when there is one, because the client that
+        // will connect is another process -- and with a Worker per process
+        // that is another memory, where a name bound here means nothing.
+        //
+        // Bound and listening in one call: what a guest does between `bind`
+        // and `listen` is local to itself, and what the far end can see is
+        // only whether the name answers.
+        if let Some(r) = self.unix_remote {
+            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            if id < 0 {
+                return Err(Errno(-id));
+            }
+            let flags = io.fds.get(fd)?.flags();
+            let cloexec = io.fds.cloexec(fd).unwrap_or(false);
+            let remote = Arc::new(unix::RemoteUnix::new(id, true, Some(path.clone()), r));
+            install_remote_unix(io, fd, remote, flags, cloexec)?;
+            if !path.starts_with('\0') {
+                let _ = io.ns.mksocket(&path);
+            }
+            return Ok(0);
+        }
+        sock.bind(&path)?;
+        self.socket_names.bind(&path, sock)?;
+        // And a node in the filesystem, so the name can be seen as well as
+        // connected to. Xvfb binds /tmp/.X11-unix/X0 and every X client waits
+        // for that path to appear before trying it; without the node the
+        // server was listening and nothing could tell.
+        //
+        // A filesystem that will not take one is not an error here: the
+        // socket is bound and reachable either way, which is the part that
+        // matters.
+        if !path.starts_with('\0') {
+            let _ = io.ns.mksocket(&path);
+        }
+        Ok(0)
+    }
+
+    pub fn unix_connect(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
+        let sock = io.unix_of(fd)?;
+        let path = Kernel::sockaddr_un(m, addr, len)?;
+        let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+        // The global kernel first, because that is where a name another
+        // process bound will be. A host-bound name -- the virtio-gpu socket --
+        // is in *this* process's table and never in the kernel's, so the
+        // local path is still tried when the kernel does not know the name.
+        if let Some(r) = self.unix_remote {
+            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
+            if id >= 0 {
+                let flags = io.fds.get(fd)?.flags();
+                let cloexec = io.fds.cloexec(fd).unwrap_or(false);
+                let remote = Arc::new(unix::RemoteUnix::new(id, false, Some(path.clone()), r));
+                install_remote_unix(io, fd, remote, flags, cloexec)?;
+                return Ok(0);
+            }
+        }
+        // This process's own host first -- its compositor, its GPU device --
+        // then the system-wide table, which is where a guest server (an X
+        // server's socket) lives.
+        if let Ok(r) = self.host_names.connect(&sock, &path) {
+            return Ok(r);
+        }
+        self.socket_names.connect(&sock, &path)
+    }
+}
+
+/// Put a unix socket in the descriptor table.
+fn install_unix(io: &FdIo<'_>, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
+    let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
+    io.fds.insert(file, cloexec)
+}
+
+/// Put a socket that lives in the global kernel at `fd`, replacing whatever
+/// was there.
+///
+/// Replacing, because a unix socket becomes remote only at `bind` or
+/// `connect` -- `socket()` has no name to decide by, so the descriptor
+/// starts as an ordinary local socket and is swapped when its name is
+/// known.
+fn install_remote_unix(io: &FdIo<'_>, fd: i32, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<(), Errno> {
+    let handle: Arc<dyn crate::vfs::FileHandle> = sock;
+    let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+    io.fds.install(fd, file, cloexec)?;
+    Ok(())
+}
+
+/// Put a socket that lives in the global kernel at the lowest free
+/// descriptor.
+fn insert_remote_unix(io: &FdIo<'_>, sock: Arc<unix::RemoteUnix>, flags: u64, cloexec: bool) -> Result<i32, Errno> {
+    let handle: Arc<dyn crate::vfs::FileHandle> = sock;
+    let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+    Ok(io.fds.insert(file, cloexec)? as i32)
+}
+
+fn inet_connect(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
+    let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
+    let (ip, port) = net::parse_sockaddr(&bytes)?;
+    io.socket_of(fd)?.connect(ip, port).map(|_| 0)
+}
+
+/// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
+fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+    match unix_accept(io, m, fd, addr, len_out, flags) {
+        Err(Errno::ENOTSOCK) => inet_accept(io, m, fd, addr, len_out, flags),
+        other => other,
+    }
+}
+
+fn inet_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+    let listener = io.socket_of(fd)?;
+    let sock = listener.accept()?;
+    let (ip, port) = sock.peer().unwrap_or((0, 0));
+    let nonblock = flags & SOCK_NONBLOCK != 0;
+    sock.set_nonblocking(nonblock);
+    let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+    let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+    let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
+    let new_fd = io.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
+    io.write_sockaddr(m, ip, port, addr, len_out)?;
+    Ok(new_fd)
+}
+
+fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+    // A listener in the global kernel answers with an id, and the
+    // descriptor made from it is the same kind.
+    if let Ok(listener) = io.remote_unix_of(fd) {
+        let session = listener.accept()?;
+        let path = listener.bound_path().unwrap_or_default();
+        Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+        let nonblock = flags & SOCK_NONBLOCK != 0;
+        session.set_nonblocking(nonblock);
+        let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+        let handle: Arc<dyn crate::vfs::FileHandle> = session.clone();
+        let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
+        return io.fds.insert(file, flags & SOCK_CLOEXEC != 0);
+    }
+    let listener = io.unix_of(fd)?;
+    let session = listener.accept()?;
+    let path = listener.bound_path().unwrap_or_default();
+    Kernel::write_sockaddr_un(m, addr, len_out, &path)?;
+    let nonblock = flags & SOCK_NONBLOCK != 0;
+    session.set_nonblocking(nonblock);
+    let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+    install_unix(io, session, oflag, flags & SOCK_CLOEXEC != 0)
+}
+
+fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u64) -> SysResult {
+    if dest != 0 {
+        if let Ok(sock) = io.socket_of(fd) {
+            let bytes = m.read(dest, 16)?.to_vec();
+            if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
+                sock.set_peer(ip, port);
+            }
+        }
+    }
+    let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+    io.fds.get(fd)?.write(&data)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> SysResult {
+    let len = (len as usize).min(1 << 22);
+    let mut tmp = vec![0u8; len];
+    let n = match io.socket_of(fd) {
+        Ok(sock) if flags & Kernel::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
+        _ => io.fds.get(fd)?.read(&mut tmp)?,
+    };
+    m.write(buf, &tmp[..n as usize])?;
+    if addr != 0 {
+        // Where the datagram came from (a guest's port, the resolver),
+        // else the connected peer.
+        let peer = io.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
+        let (ip, port) = peer.unwrap_or((0, 0));
+        io.write_sockaddr(m, ip, port, addr, addrlen)?;
+    }
+    Ok(n)
+}
+
+/// The family and type of the socket behind `fd`.
+fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
+    const AF_INET: u64 = 2;
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u32 = 1;
+    const SOCK_DGRAM: u32 = 2;
+    if let Ok(s) = io.socket_of(fd) {
+        return Ok((AF_INET, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
+    }
+    if io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok() {
+        return Ok((AF_UNIX, SOCK_STREAM));
+    }
+    let f = io.fds.get(fd)?;
+    match f.handle.metadata() {
+        Ok(md) if md.file_type == crate::vfs::FileType::Socket => Ok((AF_UNIX, SOCK_STREAM)),
+        _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64) -> SysResult {
+    const SOL_SOCKET: u64 = 1;
+    const SO_TYPE: u64 = 3;
+    const SO_ERROR: u64 = 4;
+    const SO_PROTOCOL: u64 = 38;
+    const SO_DOMAIN: u64 = 39;
+    // What kind of socket this is, which libuv asks before it decides
+    // how to wrap a descriptor it was handed (`uv_guess_handle`): a type
+    // of 0 is no kind at all, and node's stdout became a black hole.
+    if level == SOL_SOCKET && matches!(name, SO_TYPE | SO_DOMAIN | SO_PROTOCOL) {
+        let (family, ty) = socket_family_type(io, fd)?;
+        let v = match name {
+            SO_TYPE => ty as u64,
+            SO_DOMAIN => family,
+            _ => 0,
+        };
+        if val != 0 {
+            m.write_u32(val, v as u32)?;
+        }
+        return Ok(0);
+    }
+    let err = if name == SO_ERROR {
+        // A unix socket (local or the global kernel's) has no connect
+        // in progress to report: zero, as for a socketpair end on Linux.
+        let Ok(sock) = io.socket_of(fd) else {
+            socket_family_type(io, fd)?;
+            if val != 0 {
+                m.write_u32(val, 0)?;
+            }
+            return Ok(0);
+        };
+        match sock.status() {
+            net::Status::Refused => Errno::ECONNREFUSED.0,
+            // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
+            // *finished*, and Linux leaves it zero until one has; a
+            // caller is meant to learn "not yet" from the descriptor not
+            // being writable, which is what `poll_writable` now says.
+            // Reporting it here made `apt` treat "still connecting" as
+            // the error that stopped it.
+            net::Status::Connecting => 0,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    if val != 0 {
+        m.write_u32(val, err as u32)?;
+    }
+    Ok(0)
+}
+
+/// One `struct mmsghdr` is a `msghdr` and the length it carried: 64
+/// bytes with the length at 56, or 32 with it at 28 for i386.
+fn mmsghdr(compat: bool) -> (u64, u64) {
+    if compat {
+        (32, 28)
+    } else {
+        (64, 56)
+    }
+}
+
+/// `sendmmsg`: several datagrams in one call. glibc's resolver sends its A
+/// and AAAA queries this way and does not fall back to `sendto` on
+/// `ENOSYS`, so it must be real or name resolution fails.
+fn sendmmsg(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
+    let (size, len_at) = mmsghdr(io.compat);
+    let mut sent = 0u64;
+    for i in 0..n.min(1024) {
+        let hdr = vec + i * size;
+        match io.sendmsg(m, fd, hdr) {
+            Ok(len) => {
+                m.write_u32(hdr + len_at, len as u32)?;
+                sent += 1;
+            }
+            // A failure on the first is the call's failure; after that
+            // the count is the answer, as it is for `sendmsg`.
+            Err(e) if sent == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(sent)
+}
+
+fn recvmmsg(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64, flags: u64) -> SysResult {
+    let (size, len_at) = mmsghdr(io.compat);
+    let mut got = 0u64;
+    for i in 0..n.min(1024) {
+        let hdr = vec + i * size;
+        match io.recvmsg(m, fd, hdr, flags) {
+            Ok(len) => {
+                m.write_u32(hdr + len_at, len as u32)?;
+                got += 1;
+                // A datagram socket delivers one message per call; if
+                // this one came up short there is nothing else waiting.
+                if len == 0 {
+                    break;
+                }
+            }
+            Err(e) if got == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(got)
+}
+
 /// What a call [`free_call`] answers needs of its process, none of it
 /// behind a kernel lock.
 pub struct Free<'a> {
@@ -3516,6 +4093,8 @@ pub struct Free<'a> {
     pub started: u128,
     /// Its resource limits, for `prlimit64`.
     pub rlimits: &'a Rlimits,
+    /// The network and the socket names, for the socket calls.
+    pub net: NetIo<'a>,
 }
 
 /// How a call [`free_call`] answers ended.
@@ -3674,6 +4253,21 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SETPRIORITY => nr::SETPRIORITY,
             x::SYSINFO => nr::SYSINFO,
             x::GETRLIMIT | x::UGETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
+            x::SOCKET => nr::SOCKET,
+            x::SOCKETPAIR => nr::SOCKETPAIR,
+            x::BIND => nr::BIND,
+            x::CONNECT => nr::CONNECT,
+            x::LISTEN => nr::LISTEN,
+            x::ACCEPT4 => nr::ACCEPT4,
+            x::GETSOCKOPT => nr::GETSOCKOPT,
+            x::SETSOCKOPT => nr::SETSOCKOPT,
+            x::GETSOCKNAME => nr::GETSOCKNAME,
+            x::GETPEERNAME => nr::GETPEERNAME,
+            x::SENDTO => nr::SENDTO,
+            x::RECVFROM => nr::RECVFROM,
+            x::SHUTDOWN => nr::SHUTDOWN,
+            x::SENDMMSG => nr::SENDMMSG,
+            x::RECVMMSG_TIME64 => nr::RECVMMSG,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -3751,6 +4345,22 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SETPRIORITY => nr::SETPRIORITY,
             x::SYSINFO => nr::SYSINFO,
             x::GETRLIMIT | x::SETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
+            x::SOCKET => nr::SOCKET,
+            x::SOCKETPAIR => nr::SOCKETPAIR,
+            x::BIND => nr::BIND,
+            x::CONNECT => nr::CONNECT,
+            x::LISTEN => nr::LISTEN,
+            x::ACCEPT => nr::ACCEPT,
+            x::ACCEPT4 => nr::ACCEPT4,
+            x::GETSOCKOPT => nr::GETSOCKOPT,
+            x::SETSOCKOPT => nr::SETSOCKOPT,
+            x::GETSOCKNAME => nr::GETSOCKNAME,
+            x::GETPEERNAME => nr::GETPEERNAME,
+            x::SENDTO => nr::SENDTO,
+            x::RECVFROM => nr::RECVFROM,
+            x::SHUTDOWN => nr::SHUTDOWN,
+            x::SENDMMSG => nr::SENDMMSG,
+            x::RECVMMSG => nr::RECVMMSG,
             _ => return None,
         }
     } else {
@@ -3764,6 +4374,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             // No `alarm` in this ABI.
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
+            n if is_socket_call(n) => raw,
             _ => return None,
         }
     };
@@ -3929,6 +4540,15 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::SYSINFO => sysinfo(m, compat, a[0]),
             _ => prlimit(f.rlimits, f.io.fds, f.uid, m, a[1], a[2], a[3]),
         }
+    } else if is_socket_call(n) {
+        // As the full call: a blocking `connect`, `accept` or `recvfrom`
+        // parks ([`NetIo::park`]).
+        if let Some(op) = f.net.park(&f.io, m, n, a) {
+            return FreeOutcome::Blocking(op, None);
+        }
+        // A unix socket's relative name is the calling thread's.
+        let cwd = if matches!(n, nr::BIND | nr::CONNECT) { f.path.fs.get() } else { String::new() };
+        f.net.call(&f.io, m, n, a, &cwd)
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
     } else if n == nr::RECVMSG {
@@ -6202,6 +6822,18 @@ impl Kernel {
         FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks, pipes: self.pipes }
     }
 
+    /// The socket calls' part of this kernel ([`NetIo`]).
+    pub fn net_io(&self) -> NetIo<'_> {
+        NetIo {
+            net: self.net.as_ref(),
+            resolver: &self.resolver,
+            ports: &self.ports,
+            unix_remote: self.unix_remote,
+            socket_names: &self.socket_names,
+            host_names: &self.host_names,
+        }
+    }
+
     /// The path calls' part of this kernel ([`PathIo`]): the namespace
     /// itself, whose working directory is the calling thread's while its
     /// call runs (`syscall_cwd`).
@@ -6378,7 +7010,7 @@ impl Kernel {
         // new socket in.
         let r = match self.retry_accept.take() {
             Some((fd, addr, len, flags)) if r.is_ok() => {
-                self.sys_accept(m, fd, addr, len, flags)
+                accept(&self.fd_io(), m, fd, addr, len, flags)
             }
             _ => r,
         };
@@ -6573,86 +7205,14 @@ impl Kernel {
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
             // -- sockets -----------------------------------------------------
-            nr::SOCKET => self.sys_socket(a[0], a[1], a[2]),
-            // A unix socket and an internet socket are different concrete
-            // types behind the same descriptor, so which `connect` this is
-            // depends on what the descriptor turned out to be.
-            nr::CONNECT => match self.sys_unix_connect(m, a[0] as i32, a[1], a[2]) {
-                Err(Errno::ENOTSOCK) => self.sys_connect(m, a[0] as i32, a[1], a[2]),
-                other => other,
-            },
-            nr::SENDTO => self.sys_sendto(m, a[0] as i32, a[1], a[2], a[4]),
-            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
-            nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
+            // The socket calls ([`NetIo`]), against the calling thread's
+            // working directory (entered into the namespace for the call).
+            nr::SENDMSG => self.fd_io().sendmsg(m, a[0] as i32, a[1]),
             nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1], a[2]),
-            nr::SENDMMSG => self.sys_sendmmsg(m, a[0] as i32, a[1], a[2]),
-            nr::RECVMMSG => self.sys_recvmmsg(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
-            // One interface, unnamed. A guest that asks where it is calling
-            // from gets 0.0.0.0, which is what an unbound socket reports.
-            //
-            // A unix socket is AF_UNIX and unnamed: libuv's
-            // `uv_guess_handle` decides from the family whether a socket on
-            // stdout is a pipe or TCP, and node made the stdout of every
-            // child it spawned a black hole when told AF_INET.
-            nr::GETSOCKNAME => match self.socket_family_type(a[0] as i32) {
-                // AF_UNIX
-                Ok((1, _)) => Self::write_sockaddr_unnamed(m, a[1], a[2]),
-                _ => {
-                    let (ip, port) = self.socket_of(a[0] as i32).map(|s| s.local()).unwrap_or((0, 0));
-                    self.sys_write_sockaddr(m, ip, port, a[1], a[2])
-                }
-            },
-            // Nothing here has an option worth setting -- no timeouts, no
-            // buffer sizes that mean anything -- and refusing makes libraries
-            // treat the socket as broken.
-            // agreed to without effect, on a descriptor that exists
-            nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[1], a[2], a[3]),
-            // A unix socket's directions close as asked, local or in the
-            // global kernel; the proxied network's as it can; anything else
-            // just agrees.
-            nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
-                Ok(sock) => sock.shutdown_how(a[1]),
-                // A global-kernel one too (a socketpair's ends in two
-                // Workers): SHUT_WR is how libuv ends a child's stdin.
-                Err(_) => match self.remote_unix_of(a[0] as i32) {
-                    Ok(sock) => sock.shutdown_how(a[1]),
-                    Err(_) => match self.socket_of(a[0] as i32) {
-                        Ok(s) => s.shutdown(a[1]),
-                        Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
-                    },
-                },
-            },
-            // A local address means nothing when there is one interface and
-            // it is a proxy, but a resolver binds its socket before it sends
-            // and gives up if that fails.
-            nr::BIND => match self.sys_unix_bind(m, a[0] as i32, a[1], a[2]) {
-                Err(Errno::ENOTSOCK) => match self.socket_of(a[0] as i32) {
-                    // An internet socket remembers where it is (`listen`,
-                    // `getsockname`).
-                    Ok(sock) => m
-                        .read(a[1], (a[2] as usize).min(128))
-                        .and_then(|b| net::parse_sockaddr(b))
-                        .and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
-                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
-                },
-                other => other,
-            },
-            // A socket in the global kernel was bound and listening in one
-            // call; there is nothing left for this to do but agree.
-            nr::LISTEN => match self.remote_unix_of(a[0] as i32) {
-                Ok(_) => Ok(0),
-                Err(_) => match self.unix_of(a[0] as i32) {
-                    Ok(s) => s.listen(),
-                    // A TCP listener, for guests on this machine.
-                    Err(Errno::ENOTSOCK) => self.socket_of(a[0] as i32).and_then(|s| s.listen()).map(|_| 0),
-                    Err(e) => Err(e),
-                },
-            },
-            nr::ACCEPT => self.sys_accept(m, a[0] as i32, a[1], a[2], 0),
-            nr::ACCEPT4 => self.sys_accept(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
+            n if is_socket_call(n) => {
+                let cwd = self.vfs.cwd.clone();
+                self.net_io().call(&self.fd_io(), m, n, a, &cwd)
+            }
             nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
             nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
@@ -7106,7 +7666,7 @@ impl Kernel {
             nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
             // A blocking `recvfrom`/`recv` that waited for a datagram or
             // bytes (the classifier below).
-            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
+            nr::RECVFROM => recvfrom(&self.fd_io(), m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
             nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
             _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
         }
@@ -8203,110 +8763,9 @@ impl Kernel {
 
     // -- sockets ---------------------------------------------------------------
 
-    /// `socket`. AF_UNIX, an inert AF_NETLINK (below), and AF_INET with only the two kinds that matter: a stream,
-    /// which the host carries, and a datagram, which only ever goes to the
-    /// resolver this kernel is.
-    fn sys_socket(&mut self, domain: u64, ty: u64, protocol: u64) -> SysResult {
-        const AF_UNIX: u64 = 1;
-        const AF_INET: u64 = 2;
-        const SOCK_STREAM: u64 = 1;
-        const SOCK_DGRAM: u64 = 2;
-        const SOCK_NONBLOCK: u64 = 0o4000;
-        const SOCK_CLOEXEC: u64 = 0o2000000;
-        // A unix socket needs no network behind it: both ends are in this
-        // machine, and one of them may be the host rather than a guest.
-        if domain == AF_UNIX {
-            let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
-            if kind != SOCK_STREAM && kind != 5 {
-                // SOCK_SEQPACKET is 5 and behaves closely enough to a stream
-                // for what uses it here; datagram unix sockets are not.
-                return Err(Errno::EPROTONOSUPPORT);
-            }
-            let sock = Arc::new(unix::UnixSocket::new(true));
-            let nonblock = ty & SOCK_NONBLOCK != 0;
-            sock.set_nonblocking(nonblock);
-            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
-            return self.install_unix(sock, flags, ty & SOCK_CLOEXEC != 0);
-        }
-        // AF_NETLINK, which libudev's device monitor opens (SDL's joystick
-        // and haptic start-up through it; a failure there made SDL_Init undo
-        // its video subsystem too, and Unity 6 then saw no display). There
-        // are no devices to announce, so the socket binds, takes its options
-        // and never has a message: an empty eventfd behind the descriptor.
-        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
-        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
-        // request with the 8-byte counter its own send wrote, which glibc
-        // aborts on (apt's http method). Without a route socket it assumes
-        // IPv4 and IPv6 are there.
-        const AF_NETLINK: u64 = 16;
-        const NETLINK_KOBJECT_UEVENT: u64 = 15;
-        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
-            return Err(Errno::EAFNOSUPPORT);
-        }
-        if domain == AF_NETLINK {
-            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
-            let flags = if ty & SOCK_NONBLOCK != 0 { crate::fs::oflags::O_NONBLOCK } else { 0 };
-            let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
-            return self.fds.insert(file, ty & SOCK_CLOEXEC != 0);
-        }
-        // Without a network stack (the browser with no relay), loopback still
-        // works: Wine's in-process server and Winsock use it.
-        let net = self.net.clone().unwrap_or_else(|| Arc::new(net::NoNet) as Arc<dyn net::NetStack>);
-        if domain != AF_INET {
-            return Err(Errno::EAFNOSUPPORT);
-        }
-        let _ = &net;
-        let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
-            SOCK_STREAM => net::Kind::Tcp,
-            SOCK_DGRAM => net::Kind::Udp,
-            _ => return Err(Errno::EPROTONOSUPPORT),
-        };
-        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports), self.unix_remote));
-        sock.set_self();
-        sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
-        let flags = if ty & SOCK_NONBLOCK != 0 {
-            crate::fs::oflags::O_NONBLOCK
-        } else {
-            0
-        };
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
-        let fd = self.fds.insert(file, ty & SOCK_CLOEXEC != 0)?;
-        Ok(fd)
-    }
 
-    /// The unix socket behind a descriptor, if it is one. Asked of the
-    /// handle itself: a per-process table of the sockets this process made
-    /// did not know one that arrived over `SCM_RIGHTS`, so sending or
-    /// receiving descriptors through it silently carried none.
-    fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
-        self.fd_io().unix_of(fd)
-    }
 
-    /// The same for a socket that lives in the global kernel.
-    fn remote_unix_of(&self, fd: i32) -> Result<Arc<unix::RemoteUnix>, Errno> {
-        self.fd_io().remote_unix_of(fd)
-    }
 
-    /// Put a socket that lives in the global kernel at `fd`, replacing
-    /// whatever was there.
-    ///
-    /// Replacing, because a unix socket becomes remote only at `bind` or
-    /// `connect` -- `socket()` has no name to decide by, so the descriptor
-    /// starts as an ordinary local socket and is swapped when its name is
-    /// known.
-    fn install_remote_unix(
-        &mut self,
-        fd: i32,
-        sock: Arc<unix::RemoteUnix>,
-        flags: u64,
-        cloexec: bool,
-    ) -> Result<(), Errno> {
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
-        self.fds.install(fd, file, cloexec)?;
-        Ok(())
-    }
 
     /// Put a socket that lives in the global kernel at the lowest free
     /// descriptor.
@@ -8322,11 +8781,6 @@ impl Kernel {
         Arc::clone(&file.handle).as_remote_unix()
     }
 
-    /// Put a unix socket in the descriptor table.
-    fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
-        let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
-        self.fds.insert(file, cloexec)
-    }
 
     /// The path out of a `struct sockaddr_un`: a two-byte family then up to
     /// 108 bytes of NUL-terminated path.
@@ -8467,260 +8921,20 @@ impl Kernel {
         self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
 
-    fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
-        const AF_UNIX: u64 = 1;
-        const SOCK_NONBLOCK: u64 = 0o4000;
-        const SOCK_CLOEXEC: u64 = 0o2000000;
-        if domain != AF_UNIX {
-            return Err(Errno::EAFNOSUPPORT);
-        }
-        let nonblock = ty & SOCK_NONBLOCK != 0;
-        // A stream pair in the global kernel when there is one: its ends are
-        // often for two processes (Wine makes one per new process, keeps an
-        // end and hands the other to the child), and with a Worker per
-        // process a local pair cannot cross a fork.
-        const SOCK_STREAM: u64 = 1;
-        if let (Some(r), SOCK_STREAM) = (self.unix_remote, ty & 0xf) {
-            let mut ids = [0u8; 8];
-            let rc = (r.pair)(ids.as_mut_ptr() as crate::PAddr);
-            if rc < 0 {
-                return Err(Errno(-rc));
-            }
-            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
-            let cloexec = ty & SOCK_CLOEXEC != 0;
-            let mut fds = [0i32; 2];
-            for (i, fd) in fds.iter_mut().enumerate() {
-                let id = i32::from_le_bytes(ids[i * 4..i * 4 + 4].try_into().unwrap());
-                let sock = Arc::new(unix::RemoteUnix::new(id, false, None, r));
-                sock.set_nonblocking(nonblock);
-                *fd = self.insert_remote_unix(sock, flags, cloexec)?;
-            }
-            m.write_u32(out, fds[0] as u32)?;
-            m.write_u32(out + 4, fds[1] as u32)?;
-            return Ok(0);
-        }
-        let (a, b) = unix::UnixSocket::pair();
-        a.set_nonblocking(nonblock);
-        b.set_nonblocking(nonblock);
-        let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
-        let cloexec = ty & SOCK_CLOEXEC != 0;
-        let fa = self.install_unix(a, flags, cloexec)?;
-        let fb = self.install_unix(b, flags, cloexec)?;
-        m.write_u32(out, fa as u32)?;
-        m.write_u32(out + 4, fb as u32)?;
-        Ok(0)
-    }
 
-    fn sys_unix_bind(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
-        let sock = self.unix_of(fd)?;
-        let path = Self::sockaddr_un(m, addr, len)?;
-        // A filesystem socket resolves against the guest's root the way any
-        // other path does; an abstract one has no filesystem existence.
-        let path = if path.starts_with('\0') {
-            path
-        } else {
-            self.vfs.absolute(&path)
-        };
-        // In the global kernel when there is one, because the client that
-        // will connect is another process -- and with a Worker per process
-        // that is another memory, where a name bound here means nothing.
-        //
-        // Bound and listening in one call: what a guest does between `bind`
-        // and `listen` is local to itself, and what the far end can see is
-        // only whether the name answers.
-        if let Some(r) = self.unix_remote {
-            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
-            if id < 0 {
-                return Err(Errno(-id));
-            }
-            let flags = self.fds.get(fd)?.flags();
-            let cloexec = self.fds.cloexec(fd).unwrap_or(false);
-            let remote = Arc::new(unix::RemoteUnix::new(id, true, Some(path.clone()), r));
-            self.install_remote_unix(fd, remote, flags, cloexec)?;
-            if !path.starts_with('\0') {
-                let _ = self.vfs.mksocket(&path);
-            }
-            return Ok(0);
-        }
-        sock.bind(&path)?;
-        self.socket_names.bind(&path, sock)?;
-        // And a node in the filesystem, so the name can be seen as well as
-        // connected to. Xvfb binds /tmp/.X11-unix/X0 and every X client waits
-        // for that path to appear before trying it; without the node the
-        // server was listening and nothing could tell.
-        //
-        // A filesystem that will not take one is not an error here: the
-        // socket is bound and reachable either way, which is the part that
-        // matters.
-        if !path.starts_with('\0') {
-            let _ = self.vfs.mksocket(&path);
-        }
-        Ok(0)
-    }
 
-    fn sys_unix_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
-        let sock = self.unix_of(fd)?;
-        let path = Self::sockaddr_un(m, addr, len)?;
-        let path = if path.starts_with('\0') {
-            path
-        } else {
-            self.vfs.absolute(&path)
-        };
-        // The global kernel first, because that is where a name another
-        // process bound will be. A host-bound name -- the virtio-gpu socket --
-        // is in *this* process's table and never in the kernel's, so the
-        // local path is still tried when the kernel does not know the name.
-        if let Some(r) = self.unix_remote {
-            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
-            if id >= 0 {
-                let flags = self.fds.get(fd)?.flags();
-                let cloexec = self.fds.cloexec(fd).unwrap_or(false);
-                let remote = Arc::new(unix::RemoteUnix::new(id, false, Some(path.clone()), r));
-                self.install_remote_unix(fd, remote, flags, cloexec)?;
-                return Ok(0);
-            }
-        }
-        // This process's own host first -- its compositor, its GPU device --
-        // then the system-wide table, which is where a guest server (an X
-        // server's socket) lives.
-        let mine = Arc::clone(&self.host_names);
-        if let Ok(r) = mine.connect(&sock, &path) {
-            return Ok(r);
-        }
-        let names = Arc::clone(&self.socket_names);
-        names.connect(&sock, &path)
-    }
 
-    /// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
-    fn sys_accept(&mut self, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
-        match self.sys_unix_accept(m, fd, addr, len_out, flags) {
-            Err(Errno::ENOTSOCK) => self.sys_inet_accept(m, fd, addr, len_out, flags),
-            other => other,
-        }
-    }
 
-    fn sys_inet_accept(&mut self, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
-        const SOCK_NONBLOCK: u64 = 0o4000;
-        const SOCK_CLOEXEC: u64 = 0o2000000;
-        let listener = self.socket_of(fd)?;
-        let sock = listener.accept()?;
-        let (ip, port) = sock.peer().unwrap_or((0, 0));
-        let nonblock = flags & SOCK_NONBLOCK != 0;
-        sock.set_nonblocking(nonblock);
-        let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
-        let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-        self.sys_write_sockaddr(m, ip, port, addr, len_out)?;
-        Ok(new_fd)
-    }
 
-    fn sys_unix_accept(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        addr: u64,
-        len_out: u64,
-        flags: u64,
-    ) -> SysResult {
-        const SOCK_NONBLOCK: u64 = 0o4000;
-        const SOCK_CLOEXEC: u64 = 0o2000000;
-        // A listener in the global kernel answers with an id, and the
-        // descriptor made from it is the same kind.
-        if let Ok(listener) = self.remote_unix_of(fd) {
-            let session = listener.accept()?;
-            let path = listener.bound_path().unwrap_or_default();
-            Self::write_sockaddr_un(m, addr, len_out, &path)?;
-            let nonblock = flags & SOCK_NONBLOCK != 0;
-            session.set_nonblocking(nonblock);
-            let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
-            let handle: Arc<dyn crate::vfs::FileHandle> = session.clone();
-            let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
-            let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-            return Ok(new_fd);
-        }
-        let listener = self.unix_of(fd)?;
-        let session = listener.accept()?;
-        let path = listener.bound_path().unwrap_or_default();
-        Self::write_sockaddr_un(m, addr, len_out, &path)?;
-        let nonblock = flags & SOCK_NONBLOCK != 0;
-        session.set_nonblocking(nonblock);
-        let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
-        self.install_unix(session, oflag, flags & SOCK_CLOEXEC != 0)
-    }
 
     fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
         self.fd_io().socket_of(fd)
     }
 
-    fn sys_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
-        let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
-        let (ip, port) = net::parse_sockaddr(&bytes)?;
-        let sock = self.socket_of(fd)?;
-        match sock.connect(ip, port) {
-            Ok(()) => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn sys_sendto(
-        &mut self,
-        m: &GuestMem<'_>,
-        fd: i32,
-        buf: u64,
-        len: u64,
-        dest: u64,
-    ) -> SysResult {
-        if dest != 0 {
-            if let Ok(sock) = self.socket_of(fd) {
-                let bytes = m.read(dest, 16)?.to_vec();
-                if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
-                    sock.set_peer(ip, port);
-                }
-            }
-        }
-        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
-        self.fds.get(fd)?.write(&data)
-    }
-
-    fn sys_recvfrom(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        buf: u64,
-        len: u64,
-        flags: u64,
-        addr: u64,
-        addrlen: u64,
-    ) -> SysResult {
-        let len = (len as usize).min(1 << 22);
-        let mut tmp = vec![0u8; len];
-        let n = match self.socket_of(fd) {
-            Ok(sock) if flags & Self::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
-            _ => self.fds.get(fd)?.read(&mut tmp)?,
-        };
-        m.write(buf, &tmp[..n as usize])?;
-        if addr != 0 {
-            // Where the datagram came from (a guest's port, the resolver),
-            // else the connected peer.
-            let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
-            let (ip, port) = peer.unwrap_or((0, 0));
-            self.sys_write_sockaddr(m, ip, port, addr, addrlen)?;
-        }
-        Ok(n)
-    }
 
 
-    fn sys_getpeername(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        addr: u64,
-        addrlen: u64,
-    ) -> SysResult {
-        let (ip, port) = self.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
-        self.sys_write_sockaddr(m, ip, port, addr, addrlen)
-    }
+
+
 
     /// `getsockopt`. The only one anybody asks: has the connection come up?
     /// An unnamed `sockaddr_un`: the family alone, two bytes long.
@@ -8737,76 +8951,6 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `(family, type)` of the socket at `fd`: AF_INET for the proxied
-    /// network, AF_UNIX for a local, global-kernel or shared-pair unix socket.
-    fn socket_family_type(&self, fd: i32) -> Result<(u64, u32), Errno> {
-        const AF_INET: u64 = 2;
-        const AF_UNIX: u64 = 1;
-        const SOCK_STREAM: u32 = 1;
-        const SOCK_DGRAM: u32 = 2;
-        if let Ok(s) = self.socket_of(fd) {
-            return Ok((AF_INET, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
-        }
-        if self.unix_of(fd).is_ok() || self.remote_unix_of(fd).is_ok() {
-            return Ok((AF_UNIX, SOCK_STREAM));
-        }
-        let f = self.fds.get(fd)?;
-        match f.handle.metadata() {
-            Ok(md) if md.file_type == crate::vfs::FileType::Socket => Ok((AF_UNIX, SOCK_STREAM)),
-            _ => Err(Errno::ENOTSOCK),
-        }
-    }
-
-    fn sys_getsockopt(&mut self, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64) -> SysResult {
-        const SOL_SOCKET: u64 = 1;
-        const SO_TYPE: u64 = 3;
-        const SO_ERROR: u64 = 4;
-        const SO_PROTOCOL: u64 = 38;
-        const SO_DOMAIN: u64 = 39;
-        // What kind of socket this is, which libuv asks before it decides
-        // how to wrap a descriptor it was handed (`uv_guess_handle`): a type
-        // of 0 is no kind at all, and node's stdout became a black hole.
-        if level == SOL_SOCKET && matches!(name, SO_TYPE | SO_DOMAIN | SO_PROTOCOL) {
-            let (family, ty) = self.socket_family_type(fd)?;
-            let v = match name {
-                SO_TYPE => ty as u64,
-                SO_DOMAIN => family,
-                _ => 0,
-            };
-            if val != 0 {
-                m.write_u32(val, v as u32)?;
-            }
-            return Ok(0);
-        }
-        let err = if name == SO_ERROR {
-            // A unix socket (local or the global kernel's) has no connect
-            // in progress to report: zero, as for a socketpair end on Linux.
-            let Ok(sock) = self.socket_of(fd) else {
-                self.socket_family_type(fd)?;
-                if val != 0 {
-                    m.write_u32(val, 0)?;
-                }
-                return Ok(0);
-            };
-            match sock.status() {
-                net::Status::Refused => Errno::ECONNREFUSED.0,
-                // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
-                // *finished*, and Linux leaves it zero until one has; a
-                // caller is meant to learn "not yet" from the descriptor not
-                // being writable, which is what `poll_writable` now says.
-                // Reporting it here made `apt` treat "still connecting" as
-                // the error that stopped it.
-                net::Status::Connecting => 0,
-                _ => 0,
-            }
-        } else {
-            0
-        };
-        if val != 0 {
-            m.write_u32(val, err as u32)?;
-        }
-        Ok(0)
-    }
 
 
 
@@ -8816,78 +8960,15 @@ impl Kernel {
 
 
 
-    fn sys_write_sockaddr(&self, m: &mut GuestMem<'_>, ip: u32, port: u16, addr: u64, addrlen: u64) -> SysResult {
-        self.fd_io().write_sockaddr(m, ip, port, addr, addrlen)
-    }
 
-    fn sys_sendmsg(&self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
-        self.fd_io().sendmsg(m, fd, msg)
-    }
+
 
     fn sys_recvmsg(&self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         self.fd_io().recvmsg(m, fd, msg, flags)
     }
 
-    /// One `struct mmsghdr` is a `msghdr` and the length it carried: 64
-    /// bytes with the length at 56, or 32 with it at 28 for i386.
-    fn mmsghdr(&self) -> (u64, u64) {
-        if self.compat {
-            (32, 28)
-        } else {
-            (64, 56)
-        }
-    }
 
-    /// `sendmmsg`: several datagrams in one call. glibc's resolver sends its A
-    /// and AAAA queries this way and does not fall back to `sendto` on
-    /// `ENOSYS`, so it must be real or name resolution fails.
-    fn sys_sendmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
-        let (size, len_at) = self.mmsghdr();
-        let mut sent = 0u64;
-        for i in 0..n.min(1024) {
-            let hdr = vec + i * size;
-            match self.sys_sendmsg(m, fd, hdr) {
-                Ok(len) => {
-                    m.write_u32(hdr + len_at, len as u32)?;
-                    sent += 1;
-                }
-                // A failure on the first is the call's failure; after that
-                // the count is the answer, as it is for `sendmsg`.
-                Err(e) if sent == 0 => return Err(e),
-                Err(_) => break,
-            }
-        }
-        Ok(sent)
-    }
 
-    fn sys_recvmmsg(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        vec: u64,
-        n: u64,
-        flags: u64,
-    ) -> SysResult {
-        let (size, len_at) = self.mmsghdr();
-        let mut got = 0u64;
-        for i in 0..n.min(1024) {
-            let hdr = vec + i * size;
-            match self.sys_recvmsg(m, fd, hdr, flags) {
-                Ok(len) => {
-                    m.write_u32(hdr + len_at, len as u32)?;
-                    got += 1;
-                    // A datagram socket delivers one message per call; if
-                    // this one came up short there is nothing else waiting.
-                    if len == 0 {
-                        break;
-                    }
-                }
-                Err(e) if got == 0 => return Err(e),
-                Err(_) => break,
-            }
-        }
-        Ok(got)
-    }
 
     /// `recvmsg` flags. `MSG_DONTWAIT` is decided in `blocking_op`; here it
     /// only matters that an empty socket answers `EAGAIN`, which the stream
@@ -9439,12 +9520,12 @@ mod tests {
         assert_eq!(k.sys_fcntl(wfd, F_SETFL, oflags::O_NONBLOCK), Ok(0));
         assert_eq!(k.sys_fcntl(wfd, F_GETFL, 0), Ok(oflags::O_WRONLY | oflags::O_NONBLOCK));
         let (a, _b) = unix::UnixSocket::pair();
-        let sfd = k.install_unix(a, 0, false).unwrap() as i32;
+        let sfd = install_unix(&k.fd_io(), a, 0, false).unwrap() as i32;
         assert_eq!(k.sys_fcntl(sfd, F_GETFL, 0), Ok(oflags::O_RDWR));
         // And the socket says what it is, which is how libuv tells a pipe
         // from TCP (`uv_guess_handle`).
-        assert_eq!(k.socket_family_type(sfd), Ok((1, 1)));
-        assert_eq!(k.socket_family_type(wfd), Err(Errno::ENOTSOCK));
+        assert_eq!(socket_family_type(&k.fd_io(), sfd), Ok((1, 1)));
+        assert_eq!(socket_family_type(&k.fd_io(), wfd), Err(Errno::ENOTSOCK));
     }
 
     /// A unix socket that arrived over SCM_RIGHTS is placed straight in the
@@ -9459,7 +9540,7 @@ mod tests {
             .fds
             .insert(OpenFile::new(a.clone(), "socket".into(), 0, true, true), false)
             .unwrap() as i32;
-        assert!(Arc::ptr_eq(&k.unix_of(fd).unwrap(), &a));
+        assert!(Arc::ptr_eq(&k.fd_io().unix_of(fd).unwrap(), &a));
         // Anything else is not.
         let r = Arc::new(Pipe::new());
         let pfd = k
@@ -9469,7 +9550,7 @@ mod tests {
                 false,
             )
             .unwrap() as i32;
-        assert_eq!(k.unix_of(pfd).err(), Some(Errno::ENOTSOCK));
+        assert_eq!(k.fd_io().unix_of(pfd).err(), Some(Errno::ENOTSOCK));
     }
 
     /// `ident_call` answers the id calls as the kernel does, and declines
@@ -9995,6 +10076,119 @@ mod tests {
     /// reads back.
     /// The small descriptor and process calls (L17), lock-free and in the
     /// kernel, give the same answers and change the same state.
+    /// The socket calls (L18) answer on the free path as the kernel does:
+    /// a pair carries bytes, a named listener takes a connection and hands
+    /// it out, the names and options are the same, a blocking `accept` with
+    /// nothing waiting parks, and the errors are the kernel's.
+    #[test]
+    fn free_socket_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        const AF_UNIX: u64 = 1;
+        const SOCK_STREAM: u64 = 1;
+        for lock_free in [true, false] {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(done(free(k, m, at)), "lock_free {lock_free}");
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            // A pair: bytes one way, then the other end's name is AF_UNIX.
+            set_args(&mut m, at, nr::SOCKETPAIR, &[AF_UNIX, SOCK_STREAM, 0, 0x20000]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0, "lock_free {lock_free}");
+            let (p0, p1) = (m.read_u32(0x20000).unwrap() as u64, m.read_u32(0x20004).unwrap() as u64);
+            m.write(0x20100, b"pair").unwrap();
+            set_args(&mut m, at, nr::SENDTO, &[p0, 0x20100, 4, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 4);
+            set_args(&mut m, at, nr::RECVFROM, &[p1, 0x20200, 16, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 4);
+            assert_eq!(m.read(0x20200, 4).unwrap(), b"pair");
+            m.write_u32(0x20300, 16).unwrap();
+            set_args(&mut m, at, nr::GETSOCKNAME, &[p1, 0x20310, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x20300).unwrap(), m.read(0x20310, 2).unwrap()), (0, 2, &[1u8, 0][..]));
+
+            // A named listener: bind, listen, connect, accept.
+            let name = if lock_free { "/sock-a" } else { "/sock-b" };
+            let mut sa = vec![1u8, 0];
+            sa.extend_from_slice(name.as_bytes());
+            sa.push(0);
+            m.write(0x20400, &sa).unwrap();
+            set_args(&mut m, at, nr::SOCKET, &[AF_UNIX, SOCK_STREAM, 0]);
+            call(&mut m, &mut k);
+            let l = ret(&m, at) as u64;
+            set_args(&mut m, at, nr::BIND, &[l, 0x20400, sa.len() as u64]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0, "bind, lock_free {lock_free}");
+            set_args(&mut m, at, nr::LISTEN, &[l, 4]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            if lock_free {
+                // Nothing waiting on a blocking listener: it parks.
+                set_args(&mut m, at, nr::ACCEPT4, &[l, 0, 0, 0]);
+                assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::AcceptWait { .. }, None))));
+            }
+            set_args(&mut m, at, nr::SOCKET, &[AF_UNIX, SOCK_STREAM, 0]);
+            call(&mut m, &mut k);
+            let c = ret(&m, at) as u64;
+            set_args(&mut m, at, nr::CONNECT, &[c, 0x20400, sa.len() as u64]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0, "connect, lock_free {lock_free}");
+            set_args(&mut m, at, nr::ACCEPT4, &[l, 0, 0, oflags::O_CLOEXEC]);
+            call(&mut m, &mut k);
+            let s = ret(&m, at);
+            assert!(s > 0, "accept, lock_free {lock_free}: {s}");
+            assert!(k.fds.cloexec(s as i32).unwrap());
+            // The options: a stream, no error.
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 3, 0x20500, 0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap()), (0, 1));
+            set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 4, 0x20500, 0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap()), (0, 0));
+            set_args(&mut m, at, nr::SETSOCKOPT, &[c, 1, 2, 0x20500, 4]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            // Shut for writing: the accepted end reads its end.
+            set_args(&mut m, at, nr::SHUTDOWN, &[c, 1]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::RECVFROM, &[s as u64, 0x20200, 16, 0x40, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0, "EOF after shutdown, lock_free {lock_free}");
+
+            // The errors.
+            set_args(&mut m, at, nr::SOCKET, &[10, SOCK_STREAM, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EAFNOSUPPORT.0 as i64));
+            set_args(&mut m, at, nr::GETPEERNAME, &[p0, 0x20310, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::ENOTSOCK.0 as i64));
+            set_args(&mut m, at, nr::SETSOCKOPT, &[999, 1, 2, 0x20500, 4]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
+            for f in [p0, p1, l, c, s as u64] {
+                set_args(&mut m, at, nr::CLOSE, &[f]);
+                k.syscall(&mut m, 0);
+            }
+        }
+    }
+
     #[test]
     fn free_fd_misc_calls_answer_as_the_kernel_does() {
         if gex_abi::PPC {
@@ -10006,7 +10200,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10129,7 +10323,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10227,7 +10421,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10405,7 +10599,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10466,7 +10660,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10878,7 +11072,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -10955,7 +11149,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -11053,7 +11247,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11135,7 +11329,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11201,7 +11395,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -11303,7 +11497,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -11340,7 +11534,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11408,7 +11602,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11519,7 +11713,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11595,7 +11789,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11702,7 +11896,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11783,7 +11977,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11822,7 +12016,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;

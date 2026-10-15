@@ -96,7 +96,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # process calls without the kernel lock).
 # task-ids: thread and process ids are one numbering; kill, tgkill and
 # /proc/<tid> agree on which task an id is (L15b).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids"}
+# sock-threads: a unix listener, its clients, socketpairs and internet
+# sockets from several threads at once (L18: the socket calls without the
+# kernel lock).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
