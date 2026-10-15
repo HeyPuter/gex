@@ -102,9 +102,11 @@ export function nineGrid(ctx, img, src, m, x, y, w, h) {
     for (let i = 0; i < 3; i++) {
       if (dw[i] > 0 && dh[j] > 0 && sw[i] > 0 && sh[j] > 0) {
         let u = sx, v = sy, uw = sw[i], vh = sh[j];
-        if (i === 1 && dw[i] !== sw[i]) { u += 0.5; uw -= 1; }
-        if (j === 1 && dh[j] !== sh[j]) { v += 0.5; vh -= 1; }
-        if (uw > 0 && vh > 0) ctx.drawImage(img, u, v, uw, vh, dx, dy, dw[i], dh[j]);
+        // a one-texel strip stretched samples its centre: a source a sliver
+        // wide there (drawImage draws nothing from an empty one)
+        if (i === 1 && dw[i] !== sw[i]) { u += 0.5; uw = Math.max(uw - 1, 1 / 64); }
+        if (j === 1 && dh[j] !== sh[j]) { v += 0.5; vh = Math.max(vh - 1, 1 / 64); }
+        ctx.drawImage(img, u, v, uw, vh, dx, dy, dw[i], dh[j]);
       }
       sx += sw[i];
       dx += dw[i];
