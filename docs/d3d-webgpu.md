@@ -325,11 +325,15 @@ nothing of theirs is in the repository but what the code computes).
   WebGPU, a CSS `backdrop-filter` approximates the glass
   (`glass-colorization.js`'s matrix after a Gaussian). `DomWindow.paint`
   applies the alpha-in-glass rule. `web/test/glass.html?dom=1`.
-- **Not yet**: the window's icon in the caption (DWM draws the small icon;
-  the protocol does not carry it), the outward inflation of thin dialog
-  frames (`CalculateOutsideMargins`), the button cross-fade (0.16 s),
-  ColorizationGlassReflectionIntensity (50 assumed), Aero Peek, Flip3D
-  and thumbnails.
+- **Caption icon** (`gex_glass_v1.set_icon`): win32u renders a framed
+  window's small icon to 16 x 16 premultiplied ARGB, winewayland.drv sends
+  it, gex-wayland keeps it and the record's word 77 says where; dwm-frame.js
+  draws it where uDWM does. A thin frame (a dialog's, or any frame of a
+  program older than Vista's, which gets no padded border) is drawn out to
+  DWM's thick frame (`CalculateOutsideMargins`), outside the window. Window
+  pixels with alpha are premultiplied, as wl_shm's are and DWM blends them.
+- **Not yet**: ColorizationGlassReflectionIntensity (50 assumed), Aero
+  Peek, Flip3D and thumbnails.
 
 ## 4. Reproducing (macOS, Apple silicon)
 
