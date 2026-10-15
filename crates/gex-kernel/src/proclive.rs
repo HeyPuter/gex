@@ -16,18 +16,24 @@ use crate::mem::Mm;
 use crate::proc::ProcTable;
 use crate::syscalls::Kernel;
 use crate::vfs::{ProcSource, VfsView};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// The handles a process's `/proc` reads, and its image.
+///
+/// The descriptor table and the namespace are held weakly. The namespace
+/// mounts this process's `/proc`, whose source holds this: strong handles
+/// made a cycle, so an ended process's descriptor table was never dropped
+/// and its pipes and sockets never closed (native W3: the wineserver never
+/// saw a client go, and the process that waited for it hung).
 struct Live {
     pid: i32,
     procs: Arc<ProcTable>,
     ptys: Option<crate::pty::Remote>,
     mm: Mm,
-    fds: Arc<FdTable>,
-    vfs: Arc<VfsView>,
+    fds: Weak<FdTable>,
+    vfs: Weak<VfsView>,
     /// The process's fs_struct: its working directory.
-    fs: Arc<crate::syscalls::FsCwd>,
+    fs: Weak<crate::syscalls::FsCwd>,
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
@@ -93,9 +99,9 @@ impl ProcSource for KernelProcSource {
         self.0.get().map(|l| l.exe.clone()).unwrap_or_default()
     }
     fn cwd(&self) -> String {
-        self.0.get().map_or_else(
+        self.0.get().and_then(|l| l.fs.upgrade()).map_or_else(
             || "/".to_string(),
-            |l| match l.fs.get() {
+            |fs| match fs.get() {
                 // Removed, as Linux shows one.
                 c if c == crate::syscalls::GONE_CWD => "/ (deleted)".to_string(),
                 c => c,
@@ -107,7 +113,8 @@ impl ProcSource for KernelProcSource {
         // how `ttyname` and `ps` find it.
         self.0
             .get()
-            .map(|l| l.fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect())
+            .and_then(|l| l.fds.upgrade())
+            .map(|fds| fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect())
             .unwrap_or_default()
     }
     fn stat(&self) -> String {
@@ -164,9 +171,13 @@ impl Kernel {
             o.pid == self.pid
                 && o.exe == self.exe_path
                 && Arc::ptr_eq(&o.procs, &self.procs)
-                && Arc::ptr_eq(&o.fds, &self.fds)
-                && Arc::ptr_eq(&o.vfs, self.vfs.view())
-                && Arc::ptr_eq(&o.fs, &self.proc_fs)
+                // (A dead handle's address may be reused: only a live one matches.)
+                && o.fds.strong_count() > 0
+                && o.vfs.strong_count() > 0
+                && std::ptr::eq(o.fds.as_ptr(), Arc::as_ptr(&self.fds))
+                && std::ptr::eq(o.vfs.as_ptr(), Arc::as_ptr(self.vfs.view()))
+                && o.fs.strong_count() > 0
+                && std::ptr::eq(o.fs.as_ptr(), Arc::as_ptr(&self.proc_fs))
                 && o.mm.same(&self.mem)
                 && o.ptys.is_some() == self.ptys.is_some()
                 && o.argv == self.argv
@@ -180,9 +191,9 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ptys: self.ptys,
             mm: self.mem.shared(),
-            fds: Arc::clone(&self.fds),
-            vfs: Arc::clone(self.vfs.view()),
-            fs: Arc::clone(&self.proc_fs),
+            fds: Arc::downgrade(&self.fds),
+            vfs: Arc::downgrade(self.vfs.view()),
+            fs: Arc::downgrade(&self.proc_fs),
             exe: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -231,5 +242,45 @@ mod tests {
         assert_eq!(src.cmdline(), b"a\0one\0");
         k.publish_proc(&src.0);
         assert_eq!(src.cmdline(), b"a\0two\0");
+    }
+
+    /// A process that mounts its own `/proc` (as every gex process does)
+    /// and ends lets go of its descriptors: the source must not keep the
+    /// table or the namespace alive through the mount that holds it.
+    #[test]
+    fn an_ended_process_drops_its_descriptors() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        k.vfs.mkdir("/proc", 0o755).unwrap();
+        let cell = Arc::new(ProcCell::default());
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&cell))))));
+        k.publish_proc(&cell);
+        let fds = Arc::downgrade(&k.fds);
+        drop(cell);
+        drop(k);
+        assert!(fds.upgrade().is_none(), "the descriptor table outlived its process");
+    }
+
+    /// The same with the process's working directory in /proc: its
+    /// fs_struct holds that directory open, and `Live` holds the fs_struct
+    /// (weakly, like the table; a /proc directory handle does not hold the
+    /// cell today, so this guards the shape rather than a known cycle).
+    #[test]
+    fn an_ended_process_in_proc_drops_its_descriptors() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        k.vfs.mkdir("/proc", 0o755).unwrap();
+        let cell = Arc::new(ProcCell::default());
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&cell))))));
+        k.publish_proc(&cell);
+        k.set_cwd("/proc/self").unwrap();
+        k.publish_proc(&cell);
+        assert_eq!(KernelProcSource(Arc::clone(&cell)).cwd(), "/proc/self");
+        let fds = Arc::downgrade(&k.fds);
+        let fs = Arc::downgrade(&k.proc_fs);
+        drop(cell);
+        drop(k);
+        assert!(fds.upgrade().is_none(), "the descriptor table outlived its process");
+        assert!(fs.upgrade().is_none(), "the fs_struct outlived its process");
     }
 }
