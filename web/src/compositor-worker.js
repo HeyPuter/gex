@@ -2,6 +2,7 @@
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
+import { drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -1072,12 +1073,13 @@ class Compositor {
   #drawGlass(win) {
     const g = win.info.glass;
     const f = this.#frameOf(win);
-    const rects = [];
+    const inside = [];
     for (const r of g.rects) {
       const x = Math.max(0, r.x), y = Math.max(0, r.y);
       const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
-      if (w > 0 && h > 0) rects.push({ x: f.x + x, y: f.y + y, w, h });
+      if (w > 0 && h > 0) inside.push({ x, y, w, h });
     }
+    const rects = dwmGlassClips(g, win.width, win.height, f.x, f.y, inside);
     this.#painter.glass(rects, dwmGlassConstants(g, this.#colorizationOpacity(win)));
     return rects;
   }
@@ -1087,7 +1089,7 @@ class Compositor {
   // tools/aero/extract-dwm-frame.py pulls DWM's frame atlas and its parts out
   // of a Windows 7 aero.msstyles; a page that has them serves them at
   // /gex/aero/. Without them, glass is drawn with no frame artwork.
-  #aero = null; // null: not tried; false: none; else { tex, parts }
+  #aero = null; // null: not tried; false: none; else { img, parts }
 
   #aeroAtlas() {
     if (this.#aero !== null) return this.#aero || null;
@@ -1098,98 +1100,45 @@ class Compositor {
         fetch('/gex/aero/dwm-atlas.png').then((r) => (r.ok ? r.blob() : null)),
       ]);
       if (!json || !png) return;
-      const bitmap = await createImageBitmap(png, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
-      const tex = gpuTexture(this.#painter.device, bitmap.width, bitmap.height);
-      this.#painter.device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: tex, premultipliedAlpha: false },
-        [bitmap.width, bitmap.height]);
+      const img = await createImageBitmap(png, { premultiplyAlpha: 'premultiply', colorSpaceConversion: 'none' });
       const parts = new Map();
-      for (const p of json.parts) if (p.rect) parts.set(`${p.partName}:${p.state}`, p);
-      this.#aero = { tex, parts };
+      for (const p of json.parts) parts.set(`${p.partName}:${p.state}`, p);
+      this.#aero = { img, parts };
       this.#lastSig = null;
     })().catch((e) => console.warn('[compositor] no Aero frame artwork', e));
     return null;
   }
 
-  /** DWM's frame on a window with glass: the edges, the caption text with
-   *  its glow, and the caption buttons where the client's window system put
-   *  them (`gex_glass_v1.set_frame`). */
-  #drawAeroFrame(win, glassRects) {
+  /** DWM's frame on a window with glass (dwm-frame.js): drawn with a 2D
+   *  context into an OffscreenCanvas the window's size plus the shadows'
+   *  room, uploaded when it changes, and drawn under the window's client
+   *  area as DWM's frame mesh is. */
+  #drawAeroFrame(win) {
     const aero = this.#aeroAtlas();
+    if (!aero) return;
     const g = win.info.glass;
     const f = this.#frameOf(win);
     const p = this.#painter;
-    const active = (g.frame & 2) !== 0;
-    const part = (name, state) => aero?.parts.get(`${name}:${state}`);
-    const fs = active ? 1 : 2;
-    if (aero && glassRects?.length) {
-      // The edge pieces over the glass bands: top, bottom, left, right.
-      const [top] = glassRects;
-      const edges = [
-        ['TOPFRAME', top],
-        ['BOTTOMFRAME', glassRects.find((r) => r !== top && r.y > top.y + top.h && r.w >= top.w - 1)],
-        ['LEFTFRAME', glassRects.find((r) => r.x === top.x && r.y > top.y && r.w < top.w / 2)],
-        ['RIGHTFRAME', glassRects.find((r) => r.x > top.x && r.y > top.y && r.w < top.w / 2 && r.x + r.w === top.x + top.w)],
-      ];
-      for (const [name, r] of edges) {
-        const q = part(name, fs);
-        if (!q || !r) continue;
-        // The theme gives margins only across a piece (top and bottom of
-        // TOPFRAME): along it, it is two ends and a middle stretched.
-        const [l, rr, t, b] = q.sizingMargins ?? [0, 0, 0, 0];
-        const half = (n) => Math.max(0, Math.floor((n - 1) / 2));
-        const m = name === 'TOPFRAME' || name === 'BOTTOMFRAME'
-          ? [l || half(q.rect[2]), rr || half(q.rect[2]), t, b]
-          : [l, rr, t || half(q.rect[3]), b || half(q.rect[3])];
-        p.nineGrid(aero.tex, q.rect, m, r.x, r.y, r.w, r.h, [1, 1, 1, 1]);
-      }
-    }
-    // The caption text, black on a white glow, left of the buttons.
-    const title = win.title || '';
-    if (title) {
-      const t = this.#text.get(title, 'black', `${Math.round(12 * UI)}px "Segoe UI", system-ui, sans-serif`);
-      const left = f.x + Math.round(30 * UI);
-      const right = Math.min(...[g.close, g.max, g.min].filter((b) => b.state).map((b) => f.x + b.x), f.x + win.width);
-      const w = Math.min(t.w, right - left - Math.round(8 * UI));
-      const y = f.y + Math.round(((glassRects?.[0]?.h ?? 30 * UI) - t.h) / 2);
-      if (w > 4) {
-        const glow = part('TEXTGLOW', 0);
-        if (aero && glow) p.nineGrid(aero.tex, glow.rect, glow.sizingMargins, left - 17, y - 8, w + 34, t.h + 16, [1, 1, 1, active ? 0.9 : 0.6]);
-        p.tinted(left, y, w, t.h, t.tex, [1, 1, 1, active ? 1 : 0.7], [0, 0, w / t.w, 1]);
-      }
-    }
-    // The buttons: their backgrounds, then their glyphs, centred.
-    const maximized = (g.frame & 4) !== 0;
-    const buttons = [
-      [g.min, active ? 'BUTTONACTIVECAPTIONEND' : 'BUTTONINACTIVECAPTIONEND', 'BUTTONMINGLYPH96'],
-      [g.max, active ? 'BUTTONACTIVECAPTION' : 'BUTTONINACTIVECAPTION', maximized ? 'BUTTONRESTOREGLYPH96' : 'BUTTONMAXGLYPH96'],
-      [g.close, active ? 'BUTTONACTIVECLOSE' : 'BUTTONINACTIVECLOSE', 'BUTTONCLOSEGLYPH96'],
-    ];
+    const S = DWM_SHADOW;
+    const W = win.width + S.l + S.r, H = win.height + S.t + S.b;
     const hovered = this.#hoveredButton(win);
-    for (const [b, bg, glyph] of buttons) {
-      if (!b.state || b.w <= 0 || b.h <= 0) continue;
-      const x = f.x + b.x, y = f.y + b.y;
-      // Hover is the compositor's to see, as it was DWM's: a normal button
-      // under the pointer is hot, with its glow behind it.
-      const state = b.state === 1 && hovered === b ? 2 : b.state;
-      if (state === 2 && aero) {
-        const glow = part(glyph === 'BUTTONCLOSEGLYPH96' ? 'BUTTONCLOSEGLOW' : 'BUTTONGLOW', 0)
-          ?? part(glyph === 'BUTTONCLOSEGLYPH96' ? 'BUTTONCLOSEGLOW' : 'BUTTONGLOW', 1);
-        if (glow) {
-          const [, , gw, gh] = glow.rect;
-          p.tinted(x + (b.w - gw) / 2, y + (b.h - gh) / 2, gw, gh, aero.tex, [1, 1, 1, 1],
-            [glow.rect[0] / aero.tex.width, glow.rect[1] / aero.tex.height, gw / aero.tex.width, gh / aero.tex.height]);
-        }
-      }
-      const back = part(bg, state);
-      if (back) p.nineGrid(aero.tex, back.rect, back.sizingMargins, x, y, b.w, b.h);
-      else p.solid(x, y, b.w, b.h, glyph === 'BUTTONCLOSEGLYPH96' ? [0.78, 0.25, 0.2, 0.9] : [0.85, 0.9, 1, 0.6]);
-      const gl = part(glyph, state);
-      if (gl) {
-        const [, , gw, gh] = gl.rect;
-        p.tinted(x + Math.floor((b.w - gw) / 2), y + Math.floor((b.h - gh) / 2), gw, gh, aero.tex, [1, 1, 1, 1],
-          [gl.rect[0] / aero.tex.width, gl.rect[1] / aero.tex.height, gw / aero.tex.width, gh / aero.tex.height]);
-      }
+    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y]]);
+    let d = win.dwmFrame;
+    if (!d || d.canvas.width !== W || d.canvas.height !== H) {
+      d?.tex.destroy();
+      d = win.dwmFrame = { canvas: new OffscreenCanvas(W, H), tex: gpuTexture(p.device, W, H), sig: null };
     }
+    if (d.sig !== sig) {
+      d.sig = sig;
+      const ctx = d.canvas.getContext('2d');
+      ctx.clearRect(0, 0, W, H);
+      ctx.save();
+      ctx.translate(S.l, S.t);
+      drawDwmFrame(ctx, aero, dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered));
+      ctx.restore();
+      p.device.queue.copyExternalImageToTexture({ source: d.canvas }, { texture: d.tex, premultipliedAlpha: false }, [W, H]);
+    }
+    p.textured(f.x - S.l, f.y - S.t, W, H, d.tex);
   }
 
   /** The caption button of a glass frame under the pointer, if any. */
@@ -1516,8 +1465,8 @@ class Compositor {
       if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
       if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
       const glass = win.info?.glass ? this.#drawGlass(win) : null;
+      if (win.info?.glass?.frame & 1) this.#drawAeroFrame(win);
       this.#drawSurface(k, win, glass);
-      if (win.info?.glass?.frame & 1) this.#drawAeroFrame(win, glass);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
         if (child) this.#drawSurface(ck, child);

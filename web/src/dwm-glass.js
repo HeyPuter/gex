@@ -99,11 +99,15 @@ struct G {
   bufOrigin: vec2f,   // the buffer texture's top-left in buffer texels
   bufWidth: f32,      // W >> 2
   blur: f32,          // blur balance
-  pad: vec2f,
+  clipOn: f32,        // 1: clip to the round rect below (a GDI region)
+  pad: f32,
   colour: vec4f,      // colour * colour balance
   afterglow: vec4f,   // afterglow * afterglow balance
   pos: array<vec4f, 2>,  // the 8 tap positions
   wt: array<vec4f, 2>,   // the 8 tap weights
+  clip: vec4f,           // the round rect: left, top, right, bottom (exclusive)
+  clipTop: array<vec4f, 2>, // its rows' insets from the top, one per row
+  clipBot: array<vec4f, 2>, // and from the bottom up
 };
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -146,8 +150,27 @@ fn bilinear(p: vec2f, origin: vec2f, size: vec2f) -> vec4f {
   return vec4f(c, 1.0);
 }
 
+fn clipped(p: vec2f) -> bool {
+  let x = floor(p.x);
+  let y = floor(p.y);
+  let c = g.clip;
+  if (x < c.x || x >= c.z || y < c.y || y >= c.w) { return true; }
+  let k = u32(y - c.y);
+  if (k < 8u) {
+    let i = g.clipTop[k / 4u][k % 4u];
+    if (x < c.x + i || x >= c.z - i) { return true; }
+  }
+  let j = u32(c.w - 1.0 - y);
+  if (j < 8u) {
+    let i = g.clipBot[j / 4u][j % 4u];
+    if (x < c.x + i || x >= c.z - i) { return true; }
+  }
+  return false;
+}
+
 @fragment fn compose(@builtin(position) at: vec4f) -> @location(0) vec4f {
   // at.xy: the screen pixel's centre (the scene is the screen)
+  if (g.clipOn > 0.5 && clipped(at.xy)) { discard; }
   let bx = at.x * g.bufWidth / g.screen.x;
   var c = vec3f(0.0);
   for (var i = 0u; i < 8u; i++) {
@@ -223,7 +246,9 @@ export class DwmGlass {
     return g;
   }
 
-  /** `rects`: the glass, in screen pixels; `c`: dwmGlassConstants'. The
+  /** `rects`: the glass, in screen pixels, each with an optional `clip`
+   *  (a roundRectRegion, screen pixels: DWM's frame glass's top and bottom
+   *  bands are cut to the window's round rect); `c`: dwmGlassConstants'. The
    *  screen is `scene`, W x H. Returns false when out of uniform slots. */
   encode(encoder, scene, W, H, rects, c) {
     if (!rects.length || this.n + 1 + rects.length > this.maxDraws) return false;
@@ -247,9 +272,19 @@ export class DwmGlass {
     this.src = this.#grow(this.src, sw, bh, this.format);
     this.buf = this.#grow(this.buf, bw, bh, 'rgba8unorm');
     encoder.copyTextureToTexture({ texture: scene, origin: [sx0, by0] }, { texture: this.src }, [sw, bh]);
-    const slot = (rect, viewport) => {
+    const slot = (rect, viewport, clip = null) => {
       const f = this.data;
       f.fill(0);
+      if (clip) {
+        // a roundRectRegion: its rows' insets, top down and bottom up
+        f[14] = 1;
+        f[40] = clip.left; f[41] = clip.top; f[42] = clip.right; f[43] = clip.bottom;
+        for (const [y, l] of clip.rows) {
+          const k = y - clip.top, j = clip.bottom - 1 - y;
+          if (k < 8 && k <= j) f[44 + k] = l - clip.left;
+          else if (j < 8) f[52 + j] = l - clip.left;
+        }
+      }
       f.set(rect, 0); f.set(viewport, 4); f[6] = W; f[7] = H;
       f[8] = sx0; f[9] = by0; f[10] = bx0; f[11] = by0;
       f[12] = bufWidth; f[13] = c.blur;
@@ -270,7 +305,7 @@ export class DwmGlass {
     });
     pass.setPipeline(this.compose);
     for (const r of rects) {
-      pass.setBindGroup(0, this.#group(this.buf), [slot([r.x, r.y, r.w, r.h], [W, H])]);
+      pass.setBindGroup(0, this.#group(this.buf), [slot([r.x, r.y, r.w, r.h], [W, H], r.clip)]);
       pass.draw(4);
     }
     pass.end();
