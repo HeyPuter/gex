@@ -12322,9 +12322,13 @@ pub extern "C" fn gex_compat() -> i32 {
 /// state has been adopted, before any block is translated there.
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
+    // Once per process, at a child's adoption in its own Worker, before any
+    // of its threads run: the process is this Worker's alone. A thread's
+    // Worker never calls it (what it sets is shared); the adoption's own
+    // lock goes with the rest of adoption (L25).
     with_host(|h| {
         h.kernel.compat = on != 0;
-        // A child's process starts now; a thread's is its process's, already set.
+        // A child's process starts now.
         if h.kernel.started == 0 {
             h.kernel.started = now_ns() as u128;
         }

@@ -3076,7 +3076,9 @@ export class Gex {
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
     if (thread.procOpts) this.#opts = thread.procOpts;
-    if (thread.compat) this.#shim.exports.gex_set_compat?.(1);
+    // Nothing of the process's to set: its ABI, start time and decode mode
+    // (`gex_set_compat`) are process constants in the shared memory, set
+    // once by the process's own Worker before its first guest instruction.
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
     // A spawned thread runs almost none of the process's modules, so registering
     // them lazily (instance on the branch that wants it) skips compiling and
