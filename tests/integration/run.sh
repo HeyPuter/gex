@@ -302,6 +302,15 @@ cross_engine() {
     pass=$((pass + 1))
 }
 
+# The runtime's narration: its own notes on stderr, never the guest's output.
+# A compare of stderr takes them out of both sides.
+strip_narration() {
+    grep -avE '^(\[(gex|host|sig|worker|pending|gex-console-error)[^]]*\]|gexc?: )' "$1" || true
+}
+stderr_same() {
+    cmp -s <(strip_narration "$1") <(strip_narration "$2")
+}
+
 # Run a program under the browser runtime and check it against QEMU.
 #
 # This is the real thing, not the cross-engine harness: gex-kernel compiled to
@@ -311,8 +320,23 @@ cross_engine() {
 # through the dispatch miss at run time -- because a page will want the second
 # and a deployment that must not compile later wants the first.
 #
+# Only stdout is compared: the runtime narrates on stderr (`[host] ...`,
+# `[gex] ...`), and narration is never part of a compare. `--stderr` adds a
+# compare of stderr with the narration taken out, for a test about stderr.
+# `--shared` builds and runs the shared-memory configuration, which a program
+# that starts threads needs (each thread is a Worker on one memory).
+#
 # Skipped when node or the shim build is absent.
 browser() {
+    br_stderr=0
+    br_shared=0
+    while :; do
+        case "$1" in
+            --stderr) br_stderr=1; shift ;;
+            --shared) br_shared=1; shift ;;
+            *) break ;;
+        esac
+    done
     label="$1"; prog="$2"; shift 2
     shim=target/wasm32-unknown-unknown/release/gex_browser.wasm
     if [ -z "$NODE" ] || [ ! -f "$shim" ]; then
@@ -322,22 +346,39 @@ browser() {
     # host directory to resolve a relative argv[0] against.
     prog="$(cd "$(dirname "$prog")" && pwd)/$(basename "$prog")"
     set +e
-    "$QEMU" "$prog" "$@" >"$WORK/$label.qemu2" 2>&1
+    "$QEMU" "$prog" "$@" >"$WORK/$label.qemu2" 2>"$WORK/$label.qemu2.stderr"
     set -e
+    memflag=--no-shared-memory
+    shared_env=
+    if [ "$br_shared" -eq 1 ]; then
+        memflag=
+        shared_env=GEX_SHARED=1
+    fi
     for mode in aot jit; do
         wasm="$WORK/$label.$mode.wasm"
         set +e
         case "$mode" in
-            aot) "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
-            jit) "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
+            # shellcheck disable=SC2086 -- an empty memflag is no argument
+            aot) "$GEXC" build --exhaustive $memflag "$prog" -o "$wasm" >/dev/null 2>&1 ;;
+            # shellcheck disable=SC2086
+            jit) "$GEXC" build $memflag "$prog" -o "$wasm" >/dev/null 2>&1 ;;
         esac
-        "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.$mode.br" 2>&1
+        # shellcheck disable=SC2086
+        env $shared_env "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" \
+            >"$WORK/$label.$mode.br" 2>"$WORK/$label.$mode.br.stderr"
         set -e
         name="browser-$label"
         [ "$mode" = jit ] && name="browser-jit-$label"
         if ! cmp -s "$WORK/$label.qemu2" "$WORK/$label.$mode.br"; then
             echo "FAIL $name: the browser runtime and QEMU disagree"
             diff -u "$WORK/$label.qemu2" "$WORK/$label.$mode.br" | head -20 || true
+            sed 's/^/     stderr: /' "$WORK/$label.$mode.br.stderr" | tail -5
+            fail=$((fail + 1))
+            continue
+        fi
+        if [ "$br_stderr" -eq 1 ] && ! stderr_same "$WORK/$label.qemu2.stderr" "$WORK/$label.$mode.br.stderr"; then
+            echo "FAIL $name: stderr differs (narration aside)"
+            diff -u <(strip_narration "$WORK/$label.qemu2.stderr") <(strip_narration "$WORK/$label.$mode.br.stderr") | head -20 || true
             fail=$((fail + 1))
             continue
         fi
@@ -365,13 +406,16 @@ browser_dynamic() {
     wasm="$WORK/$label.dyn.wasm"
     set +e
     "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
-    "$QEMU" -L "$SYSROOT" "$prog" "$@" >"$WORK/$label.qemu3" 2>&1
+    "$QEMU" -L "$SYSROOT" "$prog" "$@" >"$WORK/$label.qemu3" 2>"$WORK/$label.qemu3.stderr"
     # shellcheck disable=SC2086
-    "$NODE" shims/browser/js/run-node.mjs $bundle "$wasm" "$prog" "$@" >"$WORK/$label.dyn.br" 2>&1
+    "$NODE" shims/browser/js/run-node.mjs $bundle "$wasm" "$prog" "$@" \
+        >"$WORK/$label.dyn.br" 2>"$WORK/$label.dyn.br.stderr"
     set -e
+    # stdout only, as `browser`.
     if ! cmp -s "$WORK/$label.qemu3" "$WORK/$label.dyn.br"; then
         echo "FAIL browser-dynamic-$label: the browser runtime and QEMU disagree"
         diff -u "$WORK/$label.qemu3" "$WORK/$label.dyn.br" | head -20 || true
+        sed 's/^/     stderr: /' "$WORK/$label.dyn.br.stderr" | tail -5
         fail=$((fail + 1))
         return
     fi
@@ -384,7 +428,7 @@ label_of() {
     while :; do
         case "$1" in
             --native-oracle) shift 2 ;;
-            --ignore-stderr|--quiet) shift ;;
+            --stderr|--quiet) shift ;;
             *) break ;;
         esac
     done
@@ -393,18 +437,18 @@ label_of() {
 
 compare_once() {
     oracle=""
-    check_stderr=1
+    check_stderr=0
     quiet=0
     while :; do
         case "$1" in
             --quiet) quiet=1; shift ;;
             --native-oracle) oracle="$2"; shift 2 ;;
-            # For a process killed by a signal the contract is stdout and the
-            # exit status. What the *supervisor* prints is not the guest's
-            # behaviour: QEMU announces "uncaught target signal", the shell
-            # announces "Terminated", and Linux itself announces nothing —
-            # which is what gex does.
-            --ignore-stderr) check_stderr=0; shift ;;
+            # stdout and the exit status are the contract. stderr is
+            # compared, narration aside, only for a test about stderr: it is
+            # where gex narrates, and for a process killed by a signal where
+            # the *supervisor* speaks (QEMU's "uncaught target signal", a
+            # shell's "Terminated"; Linux itself says nothing, as gex).
+            --stderr) check_stderr=1; shift ;;
             *) break ;;
         esac
     done
@@ -449,10 +493,10 @@ compare_once() {
         fi
         return 1
     fi
-    if [ "$check_stderr" -eq 1 ] && ! cmp -s "$q_out.stderr" "$g_out.stderr"; then
+    if [ "$check_stderr" -eq 1 ] && ! stderr_same "$q_out.stderr" "$g_out.stderr"; then
         if [ "$quiet" -eq 0 ]; then
-            echo "FAIL $label: stderr differs"
-            diff -u "$q_out.stderr" "$g_out.stderr" | head -20 || true
+            echo "FAIL $label: stderr differs (narration aside)"
+            diff -u <(strip_narration "$q_out.stderr") <(strip_narration "$g_out.stderr") | head -20 || true
         fi
         return 1
     fi
@@ -582,9 +626,11 @@ if command -v cc >/dev/null 2>&1 && cc -O0 -o "$WORK/suite-native" "$HERE/progra
     SUITE_NATIVE="$WORK/suite-native"
 fi
 
-for area in arith float mem flow sys; do
+for area in arith float mem flow; do
     compare "static-$area" "$WORK/suite" "$area"
 done
+# The sys area writes to stderr ("stderr-works").
+compare --stderr "static-sys" "$WORK/suite" sys
 for area in arith float mem flow; do
     compare "pie-$area" "$WORK/suite-pie" "$area"
     compare --native-oracle "$SUITE_NATIVE" "O0-$area" "$WORK/suite-O0" "$area"
@@ -600,7 +646,7 @@ compare "openat2" "$WORK/openat2"
 compare "utimensat" "$WORK/utimensat"
 compare "nlink" "$WORK/nlink"
 for mode in fatal-default fatal-abort; do
-    compare --ignore-stderr "signal-$mode" "$WORK/signals" "$mode"
+    compare "signal-$mode" "$WORK/signals" "$mode"
 done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
@@ -703,14 +749,18 @@ browser "neon-move" "$WORK/neon-move"
 browser "cross-block-flags" "$WORK/flags"
 browser "loops" "$WORK/loops"
 for area in arith float mem flow sys; do
-    browser "suite-$area" "$WORK/suite" "$area"
+    if [ "$area" = sys ]; then
+        browser --stderr "suite-$area" "$WORK/suite" "$area"
+    else
+        browser "suite-$area" "$WORK/suite" "$area"
+    fi
 done
 browser "vfs" "$WORK/vfs"
 browser "signal-all" "$WORK/signals" all
-# Guest threads, on one wasm stack: pthreads, mutexes, condition variables,
+# Guest threads, each a Worker on one shared memory: pthreads, mutexes, condition variables,
 # thread-local storage, and a main that calls exit_group while others spin.
-browser "threads" "$WORK/threads"
-browser "thread-exit-race" "$WORK/exitrace"
+browser --shared "threads" "$WORK/threads"
+browser --shared "thread-exit-race" "$WORK/exitrace"
 if [ -n "$CPP" ]; then
     browser "cpp" "$WORK/cpp"
 fi
