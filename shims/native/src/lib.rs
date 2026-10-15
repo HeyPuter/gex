@@ -3802,6 +3802,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     pid,
                     child_stack,
                     tls,
+                    ..
                 } => {
                     // A native wasm32 program: its frames are native code
                     // that cannot be resumed at a guest PC, so the child is
@@ -4700,7 +4701,13 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // What is already translated, asked of the shared state per address
     // rather than copied: a copy of the set (half a million entries for
     // Noita) per miss was 0.7% of tier-1's CPU in memcpy alone.
-    let known = |a: u64| shared.lock().unwrap_or_else(|e| e.into_inner()).translated.contains(&a);
+    // An address a function serves counts too: a miss there gets its bridge
+    // (`ftab::serves`), and its bytes may be no code at all (a W3 builtin's
+    // `ud2` stub).
+    let known = |a: u64| {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        s.translated.contains(&a) || ftab::serves(&s, memory.bytes(), a)
+    };
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
             .vmas()

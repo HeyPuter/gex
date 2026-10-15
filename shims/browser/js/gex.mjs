@@ -3076,7 +3076,7 @@ export class Gex {
     }
     let exec = null;
     if (why === 'exec') {
-      exec = this.#vforkExecRecord(pid, ctx);
+      exec = this.#vforkExecRecord(pid, ctx, performance.now() - t0);
       e.gex_vfork_exec_done();
     } else if (why === 'crash') {
       if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
@@ -3095,10 +3095,53 @@ export class Gex {
     return true;
   }
 
+  /** A translated program's posix_spawn child, running in this Worker's
+   *  run loop in place of the thread that cloned it (vfork.rs); null when
+   *  none is. */
+  #vfork = null;
+
+  /** Start the staged vfork child here: where to enter it, or null when
+   *  there was nothing to start. */
+  #vforkEnter() {
+    const e = this.#shim.exports;
+    const t0 = performance.now();
+    const entry = e.gex_vfork_begin();
+    if (!entry) return null;
+    const ctx = Number(e.gex_fork_ctx());
+    this.#vfork = { t0, pid: e.gex_vfork_pid(), ctx };
+    return { pc: entry, ctx };
+  }
+
+  /** The vfork child is done (its exit, its exec, or `crash`): hand an exec
+   *  to a new Worker, and go back to the thread that cloned it, after its
+   *  `clone`. */
+  #vforkLeave(crash) {
+    const e = this.#shim.exports;
+    const { t0, pid, ctx } = this.#vfork;
+    const w = e.gex_vfork_why();
+    let why = crash ? 'crash' : w === 2 ? 'exec' : w === 3 ? 'crash' : 'exit';
+    let exec = null;
+    if (why === 'exec') {
+      exec = this.#vforkExecRecord(pid, ctx, performance.now() - t0);
+      e.gex_vfork_exec_done();
+    } else if (why === 'crash') {
+      if (crash) console.error(`[gex] pid ${pid} (posix_spawn's child) crashed: ${crash?.message ?? crash}`);
+      try { e.gex_process_gone?.(137); } catch {}
+    }
+    const resume = e.gex_vfork_end();
+    this.#vfork = null;
+    if (exec) {
+      this.#env.spawnProcess(exec).catch((err) => console.error(`[gex] starting pid ${pid} after its exec: ${err.message ?? err}`));
+    }
+    this.#vforks++;
+    vforkTrace(`[vfork] pid ${pid}: ${why} after ${(performance.now() - t0).toFixed(1)}ms`);
+    return { pc: resume, ctx };
+  }
+
   /** The record of an exec a vfork child staged (`vfork::stage_exec`): a
    *  fork record with no image, which the host starts as any child, and
    *  whose Worker runs the exec (`#adoptExec`). */
-  #vforkExecRecord(pid, ctx) {
+  #vforkExecRecord(pid, ctx, ms) {
     const e = this.#shim.exports;
     const part = (i) => {
       const p = e.gex_vfork_exec_ptr(i) >>> 0;
@@ -3126,6 +3169,9 @@ export class Gex {
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
       exe: null,
+      // How long the child ran in its parent's Worker before this exec, for
+      // the process's exit line: a child with this ran in place, nothing copied.
+      vforkMs: ms,
     };
   }
 
@@ -3805,7 +3851,8 @@ export class Gex {
   /** The imports a split unit's primary takes beyond a unit's: `gex.cold(c)`,
    *  which instantiates cold cluster `c` here (its start function fills its
    *  slots in this Worker's table, and the stub that called goes on to the
-   *  real body); and an instrumented unit's `gexcov.hit(slot)`. */
+   *  real body); a pruned unit's `gex.pruned(slot)`, which traps naming the
+   *  pruned function's address; and an instrumented unit's `gexcov.hit(slot)`. */
   #splitImports(mod, key, imports) {
     let names = this.#modImports.get(mod);
     if (!names) {
@@ -3822,6 +3869,19 @@ export class Gex {
         const m = this.#coldModule(key, c);
         new WebAssembly.Instance(m, { env: imports.env, gex: imports.gex });
         this.#coldMs += performance.now() - t0;
+      } };
+    }
+    if (names.has('gex.pruned')) {
+      // A pruned unit (gex_split::prune): a slot static reachability left
+      // out ran. Never recovered from: name its guest address and trap.
+      const sec = WebAssembly.Module.customSections(mod, 'gex.funcs')[0];
+      const dv = sec ? new DataView(sec) : null;
+      imports.gex = { ...imports.gex, pruned: (k) => {
+        k >>>= 0;
+        const pc = dv && 12 + 8 * k <= dv.byteLength ? dv.getBigUint64(4 + 8 * k, true) : null;
+        const msg = `gex-cgen: ${key}: pruned function ${pc === null ? '?' : '0x' + pc.toString(16)} (slot ${k}) ran`;
+        console.error(`[pruned] ${msg}`);
+        throw new Error(msg);
       } };
     }
     if (names.has('gexcov.hit')) {
@@ -5329,7 +5389,16 @@ export class Gex {
         // exit 0. `trap()` sets a flag; nothing else does. First because the
         // recovery below calls into the shim, whose kernel a crash may leave
         // borrowed -- a second call would bury the first error.
-        if (!err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+        // Asked once: the answer is taken with it.
+        const crashed = !err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff();
+        if (crashed && this.#vfork && !/table index is out of bounds/.test(err?.message ?? '')) {
+          // posix_spawn's child crashed in this Worker: it ends, and the
+          // thread that cloned it goes on.
+          this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
+          ({ pc, ctx } = this.#vforkLeave(err));
+          continue;
+        }
+        if (crashed) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -5532,6 +5601,23 @@ export class Gex {
         this.#where = 'catchUp';
         await this.#catchUp();
         this.#cgenServe();
+        // posix_spawn's child in this Worker, in place of the thread that
+        // cloned it (shims/browser/src/vfork.rs): over when it exits or
+        // execs, and then that thread goes on after its `clone`.
+        if (this.#vfork && e.gex_vfork_over()) {
+          ({ pc, ctx } = this.#vforkLeave(null));
+          continue;
+        }
+        if (!this.#vfork) {
+          const ok = e.gex_vfork_ok?.() ?? 0;
+          if (ok > 0) {
+            const at = this.#vforkEnter();
+            if (at) {
+              ({ pc, ctx } = at);
+              continue;
+            }
+          } else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+        }
         this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --

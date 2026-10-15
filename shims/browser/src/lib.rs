@@ -833,7 +833,15 @@ extern "C" fn rp_new(pid: i32) -> i32 {
 static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn my_pid() -> i32 {
-    MY_PID.load(std::sync::atomic::Ordering::Relaxed)
+    vfork::pid_here().unwrap_or_else(|| MY_PID.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Say which process this memory is ([`my_pid`]); a vfork child's pid is
+/// its Worker's alone (vfork.rs).
+fn set_my_pid(pid: i32) {
+    if vfork::pid_here().is_none() {
+        MY_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Traces every change to a pipe's ends, with who made it -- an aggregate
@@ -2882,6 +2890,44 @@ fn push_pending(h: &mut Host, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u
     h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
+/// A process's translation state, as its `Host` holds it: its own, or, in a
+/// vfork child running in a Worker of its parent, the parent's (vfork.rs).
+/// The child runs the parent's code in the parent's memory and this Worker's
+/// tables, which is what this state describes; a copy would hand out the
+/// same slots twice.
+struct JitRef {
+    ptr: *mut Jit,
+    _own: Option<Box<Jit>>,
+}
+
+impl JitRef {
+    fn own(jit: Jit) -> Self {
+        let mut b = Box::new(jit);
+        JitRef { ptr: &mut *b, _own: Some(b) }
+    }
+
+    /// The parent's, which outlives the child.
+    fn borrowed(ptr: *mut Jit) -> Self {
+        JitRef { ptr, _own: None }
+    }
+}
+
+impl std::ops::Deref for JitRef {
+    type Target = Jit;
+    fn deref(&self) -> &Jit {
+        // SAFETY: an owned `Jit` lives in `_own`'s box for as long as this;
+        // a borrowed one is the parent's, which outlives its vfork child.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl std::ops::DerefMut for JitRef {
+    fn deref_mut(&mut self) -> &mut Jit {
+        // SAFETY: as `deref`.
+        unsafe { &mut *self.ptr }
+    }
+}
+
 struct Jit {
     /// Which guest pages own which slots in the dispatch table.
     page_table: gex_xlate::PageTable,
@@ -3020,7 +3066,7 @@ struct Host {
     /// Every guest thread, the running one included.
     threads: Vec<Thread>,
     exit: Option<i32>,
-    jit: Jit,
+    jit: JitRef,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
@@ -3196,6 +3242,7 @@ fn set_host(host: Host) {
 fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
+    wl::publish_process(&h.kernel);
     publish_runs(h);
     bind_mine(h, 0);
 }
@@ -3247,6 +3294,15 @@ pub(crate) fn all_futex_blocked() -> bool {
         let r = unsafe { &*p }.lock().unwrap_or_else(|e| e.into_inner());
         matches!(r.waiting, Waiting::Futex { deadline: None, .. }) && !wait_ready(&r.waiting, &r.blocked_on, now, false)
     })
+}
+
+/// [`publish_process`] for a vfork child entering its parent's Worker:
+/// what reads its process without the kernel reads the child's, from this
+/// Worker only (vfork.rs); the parent's other Workers keep the parent's.
+fn publish_vfork_child(h: &mut Host) {
+    sigs::publish_here(Some(&h.kernel));
+    vfork::set_fds_here(&h.kernel.fds);
+    bind_mine(h, 0);
 }
 
 /// Whether this Worker has a kernel yet.
@@ -3612,6 +3668,11 @@ fn holder() -> String {
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     let here = std::panic::Location::caller();
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: the child's boxed host (vfork.rs), which only this Worker
+        // reaches, until `gex_vfork_end` (outside any call here) drops it.
+        return f(unsafe { &mut *child });
+    }
     HOST.with(|h| {
         let mut b = match h.try_borrow_mut() {
             Ok(b) => b,
@@ -3641,6 +3702,10 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 /// the crash with a complaint about the reporter.
 #[cfg(not(feature = "shared-memory"))]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: as `with_host`.
+        return Some(f(unsafe { &mut *child }));
+    }
     HOST.with(|h| match h.try_borrow_mut() {
         Ok(mut b) => b.as_mut().map(f),
         Err(_) => None,
@@ -3652,6 +3717,10 @@ fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 /// gives, minus the initialisation panic.
 #[cfg(feature = "shared-memory")]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: as `with_host`.
+        return Some(f(unsafe { &mut *child }));
+    }
     // SAFETY: as `with_host`. Read-mostly and only from a reporter, which
     // runs when the guest has already stopped.
     unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut().map(f) }
@@ -3676,6 +3745,13 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     // than hoped for; taken here, given back before return; any non-return path
     // out of `f` is a trap that ends the process.
     let _guard = KLock::take();
+    // A vfork child running in this Worker has a process of its own
+    // (vfork.rs); the lock still, for the translation state it shares.
+    if let Some(child) = vfork::host_here() {
+        // SAFETY: the child's boxed host, which only this Worker reaches,
+        // until `gex_vfork_end` (outside any call here) drops it.
+        return f(unsafe { &mut *child });
+    }
     unsafe {
         f((*core::ptr::addr_of_mut!(HOST))
             .as_mut()
@@ -4634,7 +4710,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     clock_constants(program.compat(), kernel.started);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
-    MY_PID.store(kernel.pid, std::sync::atomic::Ordering::Relaxed);
+    set_my_pid(kernel.pid);
     // The staged layout, now that there is somewhere to put it. Taken rather
     // than copied: this runs once, and a second `gex_load` in the same Worker
     // is an `execve`, which gets its placement from the global table like
@@ -4861,7 +4937,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             proc_state,
             threads: vec![Thread::new(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable)],
             exit: None,
-            jit: Jit {
+            jit: JitRef::own(Jit {
                 described: meta.next_slot != 0,
                 page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
@@ -4896,7 +4972,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             obj_wasm: Default::default(),
                 compiles: 0,
                 nanos: 0,
-            },
+            }),
         magic_tail: HOST_MAGIC,
     });
     entry
@@ -6958,7 +7034,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where the closure built it (otherwise invisible in a shell demo,
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
-        MY_PID.store(h.kernel.pid, std::sync::atomic::Ordering::Relaxed);
+        set_my_pid(h.kernel.pid);
         // What `ident_call` answers from until this thread's next full call.
         // No parent: asking for it is a call into the system-wide kernel, and
         // a reparent would go unseen; `getppid` takes the full path.
@@ -7049,7 +7125,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // Linux the thread would already be gone, so it goes now, without
         // the call. `exit_process` has torn the descriptor table down; the
         // call would only fail strangely.
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        if exited() {
             if tracing() {
                 trace_line(&format!(
                     "[gex] pid {} thread {} ends at its {} after the process exited\n",
@@ -7074,7 +7150,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         h.kernel.block_pc = 0;
         // The clocks never come here (`clock_syscall`); one that does is a
         // regression, said once, as an error every page test fails on.
-        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        if is_clock_nr(h.kernel.syscall_nr) && !IN_PROVIDER.with(|c| c.get()) && !exited() {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 warn_line(&format!("[gex] pid {}: clock call {} took the kernel lock\n", h.kernel.pid, h.kernel.syscall_nr));
@@ -7257,6 +7333,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
+                end_if_all_exited(h);
                 // Nowhere to resume this thread. A resume left from before
                 // (a call-out's return, `cgen::returned`, which a call-out
                 // that was not the one returned to leaves set) would be
@@ -7385,34 +7462,25 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     r.blocked_on = Some(op);
                     r.owed = owed;
                 }
-                // The scheduler's first turn, under this same take: most
-                // parked calls are ready at once, or register their wait
-                // here. The slot is read first, as `schedule` does.
-                waitq::begin_turn();
-                let pick = pick_turn(h);
-                FIRST_PICK.with(|c| *c.borrow_mut() = Some(pick));
+                // The scheduler's first turn is `schedule`'s, after this
+                // take (`pick_mine`): the wait is the thread's own now.
                 3
             }
             SyscallOutcome::SpawnProcess {
                 pid,
                 child_stack,
                 tls,
+                vfork,
             } => {
+                // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run in
+                // this Worker (vfork.rs).
+                vfork::note_clone(vfork);
                 if frames_stay() {
                     // A wasm32 process clones at its thread entry (the
                     // context's PC, as the musl fork's __clone leaves it);
                     // the call returns, and `#wasmprogSyscall` hands the
                     // child to the host.
                     let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                    // posix_spawn's CLONE_VM | CLONE_VFORK: its child can run
-                    // in this Worker (vfork.rs). The flags are the first
-                    // argument: ebx for a wasm32 program (the i386 ABI).
-                    let flags = if h.kernel.compat {
-                        gm.read_u64(kstate.ctx_addr + ctx::x(3) as u64).unwrap_or(0) & 0xffff_ffff
-                    } else {
-                        gm.read_u64(kstate.ctx_addr + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0)
-                    };
-                    vfork::note_clone(flags);
                     do_fork(h, pid, pc as u64, child_stack, tls, Some(start));
                     WASM32_STAGED.with(|c| c.set(true));
                     return 0;
@@ -7727,7 +7795,7 @@ fn clock_syscall(ctx: i32) -> bool {
     let abi = CLOCK_ABI.load(Acquire);
     // Before the process is loaded there is no guest to make a call; once it
     // has exited, the full path ends the thread.
-    if abi == 0 || EXITED.load(Relaxed) {
+    if abi == 0 || exited() {
         return false;
     }
     let mut gm = GuestMem::new(guest_bytes());
@@ -7773,6 +7841,10 @@ static FDS: std::sync::atomic::AtomicPtr<gex_kernel::file::FdTable> =
 /// This process's descriptor table, without the kernel (`FDS`): `None`
 /// before a process is installed.
 pub(crate) fn fds_free() -> Option<&'static gex_kernel::file::FdTable> {
+    // A vfork child's own table, while it runs in this Worker (vfork.rs).
+    if let Some(t) = vfork::fds_here() {
+        return Some(t);
+    }
     let p = FDS.load(std::sync::atomic::Ordering::Acquire);
     // SAFETY: see `FDS`. Every use of the table goes through `&self`, its
     // state behind its own atomics and mutex.
@@ -7856,7 +7928,7 @@ fn wasm32_wait(pc: u64) -> i32 {
         // An idle turn saw this Worker's thread still in a registered wait;
         // any other way out of `schedule` must be asked.
         let idle = waitq::waiting_here();
-        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || SCHED_OVER.with(|c| c.replace(false)) {
+        if exited() || SCHED_OVER.with(|c| c.replace(false)) {
             return picked;
         }
         // Bit 4 of `paused()`: the idle turn found a wait only the page ends.
@@ -8579,7 +8651,7 @@ fn set_current(h: &mut Host, i: usize) {
 
 /// Make thread `i`'s own state this Worker's: what it asks about its thread
 /// without the kernel (its context, its tid, its signals).
-fn bind_mine(h: &mut Host, i: usize) {
+pub(crate) fn bind_mine(h: &mut Host, i: usize) {
     if let Some(t) = h.threads.get(i) {
         let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
         MY_CTX.with(|c| c.set(ctx_addr));
@@ -8590,8 +8662,8 @@ fn bind_mine(h: &mut Host, i: usize) {
 }
 
 thread_local! {
-    /// The first turn of the `schedule` a blocking call goes on to, made
-    /// under the call's own take of the kernel lock (`pick_turn`).
+    /// The first turn of the `schedule` a class call's park goes on to,
+    /// made in the call (`park_free`).
     static FIRST_PICK: RefCell<Option<Pick>> = const { RefCell::new(None) };
     /// The last `schedule` found this Worker's thread exited, or its whole
     /// process: what `wasm32_wait` asks instead of the thread table.
@@ -8856,11 +8928,15 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // through one ctx, wild stores, the SMP stack smash GTK's multi-threaded
     // startup hit (issue #126). Number clones strictly above the main tid.
     kernel.next_tid = kernel.next_tid.max(pid + 1);
-    PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    // The process's start, unless this is a vfork child's kernel: the
+    // memory's other Workers are its parent's threads (vfork.rs).
+    if vfork::pid_here().is_none() {
+        PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    }
     // Before anything opens a descriptor: the child rebuilds its fd table
     // before its first syscall, and if `MY_PID` were still unset every
     // inherited pipe end would be recorded against pid 0.
-    MY_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    set_my_pid(pid);
     // The shared filesystem: the parent's `TmpFs` is Rust data this Worker
     // cannot see, so without this the child's root is empty and `execve` cannot
     // find its program.
@@ -8915,7 +8991,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         // translation carries on where the build stopped: an empty table would
         // report "nothing to translate" almost at once, since `fork` returns
         // into libc.
-        jit: {
+        jit: JitRef::own({
             let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
             Jit {
             described: meta.next_slot != 0,
@@ -8952,7 +9028,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
             obj_wasm: Default::default(),
             compiles: 0,
             nanos: 0,
-        }},
+        }}),
         magic_tail: HOST_MAGIC,
     }
 }
@@ -8988,7 +9064,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     }
     // See `gex_exited`: tells a program that finished from one that abandoned
     // the wasm stack with no status set.
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
     let pid = h.kernel.pid;
     // Descriptors go first and explicitly: a trap out of wasm does not unwind,
@@ -9159,6 +9235,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
+    // The program the compositor's pump asks about (`wl::ProcCx`).
+    wl::publish_process(&h.kernel);
     if let Some(p) = program.as_ref() {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());
@@ -10499,28 +10577,6 @@ enum Pick {
     Again,
 }
 
-/// Whether a pending signal would actually *do* something to this process.
-/// Drains the cross-process inbox into this process's pending set, then asks of
-/// the *disposition*, not the bit: an ignored signal interrupts nothing, and
-/// default-ignored `SIGCHLD` would otherwise wake a shell off a pipe with
-/// `EINTR` every time a child exits.
-///
-/// For THIS Worker's thread: the kernel's loaded signal state is whichever
-/// thread made the last syscall in any Worker, so asking it answered for the
-/// wrong thread, and a `tgkill` aimed at a thread parked on a futex never ended
-/// its wait (Boehm's stop-the-world: the collector's `sem_wait` for suspend
-/// acknowledgements never returned; Unity's own Mono stalled at
-/// "ReloadAssembly"). The native host asks `signal_pending_for` the same way.
-fn any_signal(h: &mut Host) -> bool {
-    match h.threads.get(cur()).map(|t| t.kstate.tid) {
-        Some(tid) => h.kernel.signal_pending_for(tid),
-        None => {
-            h.kernel.collect_signals();
-            h.kernel.signals.would_deliver()
-        }
-    }
-}
-
 /// Whether a thread could make progress if given the stack. Asked of threads in
 /// other processes too (what lets the scheduler cross a process boundary): all
 /// it consults is reference-counted and outside guest memory.
@@ -10851,57 +10907,10 @@ fn report_idle(why: u8) {
     ));
 }
 
-/// The idle half of a scheduler turn, asked under the same lock as the pick.
-fn idle_look(h: &mut Host) -> IdleLook {
-    let why = idle_why(h);
-    // Every thread parked on a futex AND not one of them already
-    // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
-    // a sibling marks its waiter `woken` (or bumps the shared
-    // generation) but leaves `waiting` as `Futex` until the thread is
-    // picked, so a check on the variant alone counts an already-woken
-    // thread as blocked. During thread startup that is exactly the
-    // window -- one thread runs a `pthread_once` init and wakes the
-    // others, which sit `Futex`-typed-but-woken for an instant -- and
-    // declaring deadlock there killed the process's Workers ("nothing
-    // could wake it") while a wake was in hand. `thread_ready` sees
-    // the wake, so a ready thread means this is not a deadlock: fall
-    // through, let its Worker pick it, and only the genuinely
-    // all-blocked case (no thread ready) reaches the report.
-    let all_blocked = why == 0 && {
-        let now = turn_now();
-        let k = &mut h.kernel;
-        h.threads
-            .iter()
-            .all(|t| matches!(t.run().waiting, Waiting::Futex { deadline: None, .. }))
-            && !h.threads.iter().any(|t| thread_ready(t, now, k.signal_pending_for(t.kstate.tid)))
-    };
-    // A wait that ends by itself: a sleep (the clock), a `wait4` (the child,
-    // in another Worker, exits), a futex (another Worker wakes it). This
-    // Worker's thread only: a Worker owns exactly one.
-    let ends_by_itself = h.threads.get(cur()).is_none_or(|t| {
-        matches!(
-            t.run().waiting,
-            Waiting::Sleep(_)
-                | Waiting::Child
-                | Waiting::Futex { .. }
-                | Waiting::Signal
-                | Waiting::Pi { .. }
-                | Waiting::Exited
-                | Waiting::Elsewhere
-        )
-    });
-    IdleLook { why, all_blocked, ends_by_itself }
-}
-
-/// What the page must supply for this Worker's thread's wait to end, as
-/// `paused()` bits: 1 a keystroke, 2 the event loop to turn, 4 only the page
-/// can end it. Its own thread only: a Worker runs one, and another thread's
-/// wait is its own Worker's to report.
-fn idle_why(h: &Host) -> u8 {
-    h.threads.get(cur()).map_or(0, |t| wait_why(&t.run()))
-}
-
-/// [`idle_why`] of one thread's run state `r`, without the kernel.
+/// What the page must supply for a thread's wait to end, as `paused()`
+/// bits: 1 a keystroke, 2 the event loop to turn, 4 only the page can end
+/// it; of its run state `r`, without the kernel. Its own thread only: a
+/// Worker runs one, and another thread's wait is its own Worker's to report.
 fn wait_why(r: &Run) -> u8 {
     // Only a terminal is a keystroke; a pipe or socket is written by
     // another process (apt's http method, a pipeline) and wants the
@@ -11016,7 +11025,7 @@ fn schedule() -> i32 {
     // thread woken by something it does not wait for, or by nothing, looks
     // and parks again (docs/kernel-locking.md §5.2 step 2); one whose wait
     // is over finishes its call and runs (§3.7).
-    match if first { waitq::Turn::Locked } else { waitq::idle_turn() } {
+    match if first { waitq::Turn::Full } else { waitq::idle_turn() } {
         waitq::Turn::Idle(why, ends_by_itself) => {
             if why != 0 {
                 report_idle(why);
@@ -11039,7 +11048,7 @@ fn schedule() -> i32 {
             set_paused_to(2);
             return 2;
         }
-        waitq::Turn::Locked => {}
+        waitq::Turn::Full => {}
     }
     loop {
         // Before anything is chosen, the compositor: a wayland client writes
@@ -11050,7 +11059,16 @@ fn schedule() -> i32 {
         // cheap Arc clone that aliases none of the host's mutable state.
         let pick = match FIRST_PICK.with(|c| c.take()) {
             Some(pick) => pick,
-            None => with_host(pick_turn),
+            None => {
+                pump_compositor();
+                match MY_RUN.with(|c| c.borrow().clone()) {
+                    Some(run) => pick_mine(&run),
+                    None => {
+                        set_paused_to(2);
+                        return 2;
+                    }
+                }
+            }
         };
         // Going round again is what picks a thread and, crucially, finishes the
         // syscall it parked in; resuming its saved pc directly leaves x0 with
@@ -11164,78 +11182,24 @@ fn report_deadlock() {
     with_host(|h| set_exit(h, 128 + 31));
 }
 
-/// One locked turn of `schedule` for this Worker's thread: run it again if
-/// its wait is over (finishing the call it parked in), or register the wait
-/// and say why nothing can run. The turn a blocking call makes under its own
-/// take (`FIRST_PICK`), and one with work for the kernel (the compositor's
-/// pump) or no registered wait to ask; the others take no lock
-/// ([`finish_mine`]).
-fn pick_turn(h: &mut Host) -> Pick {
-    // Only when it has anything to move (`needs_pump`): most turns it
-    // has not. What it writes to a client's socket (a frame callback,
-    // a buffer release, input) notifies the socket's waiters -- Wine's
-    // Wayland reader thread, parked in `poll` in another Worker.
-    if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
-        let gm = GuestMem::new(guest_bytes());
-        w.pump(&h.kernel, &gm);
-    }
-    // Every thread gone ends this process, all this Worker has; the
-    // status is in the shared table for whoever waits.
+/// The compositor's work, when it has any, before a scheduler turn: a
+/// wayland client writes a request then blocks on the reply, so it must run
+/// where every thread passes on its way to waiting. What it writes to a
+/// client's socket (a frame callback, a buffer release, input) notifies the
+/// socket's waiters. No kernel lock: what it needs of the process is
+/// published (`wl::ProcCx`).
+fn pump_compositor() {
+    wl::pump_if_wanted();
+}
+
+/// Every thread gone ends this process, all this Worker has; the status is
+/// in the shared table for whoever waits. Asked where a thread exits, under
+/// that call's take: the last one out ends it.
+pub(crate) fn end_if_all_exited(h: &mut Host) {
     if h.threads.iter().all(|t| matches!(t.run().waiting, Waiting::Exited)) {
         let code = h.exit.take().unwrap_or(0);
         exit_process(h, code);
         h.exit.get_or_insert(code);
-        return Pick::Over;
-    }
-    let now = turn_now();
-    // Nothing to choose: this Worker owns one table entry and the
-    // engine schedules the rest, so picking any *other* runnable thread
-    // would put two Workers on one set of registers.
-    let sig = any_signal(h);
-    let i = cur();
-    let (ctx_addr, tid) = (h.threads[i].kstate.ctx_addr, h.threads[i].kstate.tid);
-    let run = Arc::clone(&h.threads[i].run);
-    let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
-    if wait_ready(&r.waiting, &r.blocked_on, now, sig) {
-        let (timed_out, by_signal) = how_ended(&r, now, sig);
-        // Picked, and finished under this same take: the wait it was
-        // registered for is over.
-        waitq::leave();
-        IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
-        set_current(h, i);
-        match finish_wait(&mut r, i, ctx_addr, tid, timed_out, by_signal) {
-            Done::At(c, pc) => Pick::Resumed(Some((c, pc))),
-            Done::Ends(code) => {
-                drop(r);
-                exit_process(h, code);
-                Pick::Resumed(None)
-            }
-        }
-    } else if matches!(r.waiting, Waiting::Exited) && !leader_waits() {
-        // This Worker's thread is done; the process is not (others are
-        // their own Workers, and a joiner is parked on its futex).
-        Pick::Over
-    } else {
-        drop(r);
-        // Nothing this Worker owns can run; everything else is a Worker
-        // the engine already runs.
-        let look = idle_look(h);
-        // Its slot goes on the queues of what it waits for, and once
-        // it is there any change notifies it. A change before that is
-        // seen here: ask again.
-        let fresh = {
-            let r = run.lock().unwrap_or_else(|e| e.into_inner());
-            waitq::enter(i, &r, look.why, look.all_blocked, look.ends_by_itself)
-        };
-        if fresh
-            && {
-                let sig = any_signal(h);
-                thread_ready(&h.threads[i], turn_now(), sig)
-            }
-        {
-            return Pick::Again;
-        }
-        Pick::Idle(look)
     }
 }
 
@@ -11247,7 +11211,7 @@ fn pick_turn(h: &mut Host) -> Pick {
 /// thread does exactly this). It parks on the process's queue, which
 /// `exit_process` notifies.
 fn leader_waits() -> bool {
-    cur() == 0 && !EXITED.load(std::sync::atomic::Ordering::Relaxed)
+    cur() == 0 && !exited()
 }
 
 /// Whether a wait that is over timed out, and whether a signal and not the
@@ -11330,7 +11294,7 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
     let call = gex_kernel::syscalls::free_class(&gm, ctx_addr, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
-    if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+    if exited() {
         set_resume_none();
         if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
             run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
@@ -11442,10 +11406,12 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
     3
 }
 
-/// [`pick_turn`] for this Worker's thread in a wait the kernel has no part
-/// in (a class call's, [`park_free`]): finish its call if the wait is over,
-/// or register the wait and say why nothing runs. No kernel lock: its run
-/// state, its signals and its wait slot are its own.
+/// One turn of `schedule` for this Worker's thread: finish its parked call
+/// if the wait is over, or register the wait and say why nothing runs. No
+/// kernel lock: its run state, its signals and its wait slot are its own,
+/// and what the call owes was taken from the kernel when it parked
+/// (docs/kernel-locking.md §3.7). The first turn of a class call's park
+/// ([`park_free`]) and every turn with no registered wait to ask.
 fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
     loop {
         let sig = sigs::ready();
@@ -11473,8 +11439,20 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
         // the deadlock watch confirms (`all_futex_blocked`). A stream does
         // neither.
         let why = wait_why(&r);
-        // A sleep ends by itself too (the clock), as in `pick_turn`.
-        let ends = matches!(r.waiting, Waiting::Futex { .. } | Waiting::Pi { .. } | Waiting::Sleep(_));
+        // A wait that ends by itself: a sleep (the clock), a `wait4` (the
+        // child, in another Worker, exits), a futex (another Worker wakes
+        // it), a signal's, an exited leader's (its process ends), a thread
+        // running elsewhere.
+        let ends = matches!(
+            r.waiting,
+            Waiting::Futex { .. }
+                | Waiting::Pi { .. }
+                | Waiting::Sleep(_)
+                | Waiting::Child
+                | Waiting::Signal
+                | Waiting::Exited
+                | Waiting::Elsewhere
+        );
         let untimed = matches!(r.waiting, Waiting::Futex { deadline: None, .. });
         let fresh = waitq::enter(cur(), &r, why, false, ends);
         drop(r);
@@ -13873,11 +13851,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let translated = match pre {
         MissPre::Done(t) => t,
         MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
+    // A provider's address counts as known: a miss there is bridged again
+    // (`cgen::provider_serves`), its bytes may be a `ud2` stub.
     let (mut unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&a),
+            &|a| known.contains(&a) || crate::cgen::provider_serves(a),
             table,
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
@@ -14579,7 +14559,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         map.end,
         &seeds,
         &|a| exec.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-        &|a| known.contains(&a),
+        &|a| known.contains(&a) || crate::cgen::provider_serves(a),
         page_table,
         Default::default(),
         MAX_OBJECT_BLOCKS,
@@ -15702,7 +15682,7 @@ fn publish_exit(h: &mut Host, pid: i32, status: i32) {
 /// Record a guest exit, and say so where a trap handler can see it.
 fn set_exit(h: &mut Host, code: i32) {
     h.exit = Some(code);
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
 }
 
@@ -15716,7 +15696,7 @@ fn set_exit(h: &mut Host, code: i32) {
 /// a signal, not an exit code.
 #[no_mangle]
 pub extern "C" fn gex_process_gone(status: i32) -> u32 {
-    if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+    if exited() {
         // `EXITED` is process-wide shared memory.  A sibling thread can set it
         // while the original process Worker is parked, then that Worker sees
         // the flag and leaves `gex.run` without having run `exit_process` in
@@ -15731,7 +15711,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         });
         return 0;
     }
-    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    set_exited(true);
     waitq::wake_process();
     let pid = my_pid();
     let n = unsafe {
@@ -15755,12 +15735,25 @@ pub extern "C" fn gex_exited() -> i32 {
     // Deliberately not `with_host`: this is asked on the way out of a trap,
     // which is exactly when the kernel may still be borrowed by whatever
     // trapped.
-    EXITED.load(std::sync::atomic::Ordering::Relaxed) as i32
+    exited() as i32
 }
 
 /// Set when a guest exit is recorded, so `gex_exited` need not borrow.
 static EXITED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this Worker's process has exited: its vfork child's, while one
+/// runs here (vfork.rs), whose exit is not the parent's.
+pub(crate) fn exited() -> bool {
+    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Record the exit [`exited`] answers.
+fn set_exited(v: bool) {
+    if !vfork::set_exited_here(v) {
+        EXITED.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The head of the pending queue, as three plain words read by JS between
 /// handing the wasm stack back and taking it again, without touching the kernel

@@ -258,17 +258,17 @@ pub(crate) fn leave() {
 /// the lock: the wait may be over, a signal may have arrived, the
 /// compositor has work, or there is no wait in hand.
 pub(crate) fn idle_turn() -> Turn {
-    if unsafe { k_present() } == 0 || EXITED.load(std::sync::atomic::Ordering::Relaxed) {
-        return Turn::Locked;
+    if unsafe { k_present() } == 0 || crate::exited() {
+        return Turn::Full;
     }
     WAIT.with(|w| {
         let w = w.borrow();
-        let Some(m) = w.as_ref() else { return Turn::Locked };
+        let Some(m) = w.as_ref() else { return Turn::Full };
         if m.thread != cur() {
-            return Turn::Locked;
+            return Turn::Full;
         }
         if crate::wl::pump_wanted() {
-            return Turn::Locked;
+            return Turn::Full;
         }
         // A signal for this thread, from another process (`kill`), from
         // one of its own threads (`tgkill`), or from its timer, that would
@@ -311,9 +311,9 @@ pub(crate) enum Turn {
     /// The wait is over (`true`: a signal that would do something ended
     /// it): the thread's own Worker finishes its call (`finish_mine`).
     Ready(bool),
-    /// The turn is the kernel's: the compositor has work, or there is no
-    /// wait in hand.
-    Locked,
+    /// A full turn (`schedule`'s: the compositor's pump, then `pick_mine`):
+    /// the compositor has work, or there is no wait in hand.
+    Full,
     /// Every thread of the process is parked on a futex nothing has woken:
     /// a deadlock, once it has lasted (`schedule`'s `DEADLOCK_WATCH`).
     Stuck,

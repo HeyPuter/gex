@@ -249,6 +249,10 @@ pub enum SyscallOutcome {
         child_stack: u64,
         /// `CLONE_SETTLS`: the thread pointer for the child.
         tls: Option<u64>,
+        /// `CLONE_VM | CLONE_VFORK` (`posix_spawn`'s clone): the child shares
+        /// this memory and the calling thread waits until it execs or exits.
+        /// A host that cannot share the memory makes a fork of it.
+        vfork: bool,
     },
     /// `clone` set up a new thread's context; the host must run it.
     ///
@@ -451,6 +455,7 @@ impl BlockOp {
 /// `clone` flags gex understands.
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
+    pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
     pub const SETTLS: u64 = 0x0008_0000;
     pub const PARENT_SETTID: u64 = 0x0010_0000;
@@ -694,7 +699,7 @@ pub struct Kernel {
     /// reported rather than executed.
     pub pin_landed: Vec<(String, u64, u64)>,
     /// File mappings whose writes are meant to reach the file.
-    pub shared_maps: Vec<SharedMap>,
+    pub shared_maps: SharedMaps,
     /// The working directories of threads that left the process's
     /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
     /// the length of each of that thread's system calls.
@@ -1846,6 +1851,9 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::WRITE => nr::WRITE,
             x::READV => nr::READV,
             x::WRITEV => nr::WRITEV,
+            x::PREAD64 => nr::PREAD64,
+            x::PWRITE64 => nr::PWRITE64,
+            x::LSEEK | x::LLSEEK => nr::LSEEK,
             x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
             x::POLL | x::PPOLL | x::PPOLL_TIME64 => nr::PPOLL,
             x::NEWSELECT | x::PSELECT6 | x::PSELECT6_TIME64 => nr::PSELECT6,
@@ -1908,8 +1916,8 @@ pub struct FreeCall {
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
 /// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
 /// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
-/// `sendmsg`, `recvmsg` and `ioctl`. The 32-bit ABI's
-/// positioned calls and `_llseek` are not in it.
+/// `sendmsg`, `recvmsg` and `ioctl`; the 32-bit ABI's `pread64`,
+/// `pwrite64` and `_llseek` too, translated as the full call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1960,9 +1968,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
-    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP)) {
+    let mut post = crate::i386::Post::None;
+    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK)) {
         let t = if compat {
-            crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr).0
+            let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
+            post = p;
+            t
         } else if gex_abi::X86 {
             crate::x86::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, f.signals.blocked())
         } else {
@@ -2057,7 +2068,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // Linux sends it as the writer itself sending it (SI_USER).
         f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.uid });
     }
-    let _ = set_result(m, ctx_addr, encode(r));
+    // `_llseek` answers through memory (`i386::Post`).
+    let ret = match r {
+        Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, v))),
+        r => encode(r),
+    };
+    let _ = set_result(m, ctx_addr, ret);
     let d = if f.signals.has_pending() {
         signal::dispatch(f.signals, m, ctx_addr, compat).unwrap_or(Delivery::None)
     } else {
@@ -2992,12 +3008,94 @@ impl CodeMap {
 /// A file mapping here is an eager copy rather than a page table pointed at
 /// the file, so the two are only the same thing until somebody writes. This
 /// is what makes them the same thing again.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SharedMap {
     pub start: u64,
     pub len: u64,
     pub file: Arc<OpenFile>,
     pub offset: u64,
+}
+
+/// A process's shared file mappings ([`SharedMap`]), and their published
+/// copy ([`SharedMaps::view`]): what a caller without the kernel lock reads
+/// (the page's compositor, finding a client's pool; docs/kernel-locking.md
+/// §3.10). Read as a slice (`Deref`); the two changes, a mapping added and
+/// mappings dropped, are this type's, and publish.
+#[derive(Debug)]
+pub struct SharedMaps {
+    list: Vec<SharedMap>,
+    view: Arc<SharedMapView>,
+}
+
+/// A [`SharedMaps`]'s list as other threads read it: replaced whole on every
+/// change, so a reader holds one consistent list for as long as it likes.
+pub struct SharedMapView {
+    cur: gex_atomic::rcu::Published<Arc<[SharedMap]>>,
+}
+
+impl std::fmt::Debug for SharedMapView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedMapView")
+    }
+}
+
+impl SharedMapView {
+    fn new(list: &[SharedMap]) -> SharedMapView {
+        SharedMapView { cur: gex_atomic::rcu::Published::new(list.into(), crate::file::FD_READER_SLOTS) }
+    }
+
+    /// The mappings as they stand.
+    pub fn get(&self) -> Arc<[SharedMap]> {
+        self.cur.read(crate::sync::me() as usize, Arc::clone)
+    }
+
+    /// The mapping of `file`, if it is mapped shared.
+    pub fn of(&self, file: &Arc<OpenFile>) -> Option<SharedMap> {
+        self.cur.read(crate::sync::me() as usize, |l| l.iter().find(|m| Arc::ptr_eq(&m.file, file)).cloned())
+    }
+}
+
+impl SharedMaps {
+    pub fn new() -> SharedMaps {
+        SharedMaps { list: Vec::new(), view: Arc::new(SharedMapView::new(&[])) }
+    }
+
+    /// The published list, the same view for this process's whole life.
+    pub fn view(&self) -> &Arc<SharedMapView> {
+        &self.view
+    }
+
+    fn publish(&self) {
+        let l: Arc<[SharedMap]> = self.list.as_slice().into();
+        self.view.cur.write(|_| (Some(l), ()));
+    }
+
+    pub fn push(&mut self, map: SharedMap) {
+        self.list.push(map);
+        self.publish();
+    }
+
+    /// Keep the mappings `keep` says to; publishes only on a change.
+    pub fn retain(&mut self, keep: impl FnMut(&SharedMap) -> bool) {
+        let n = self.list.len();
+        self.list.retain(keep);
+        if self.list.len() != n {
+            self.publish();
+        }
+    }
+}
+
+impl Default for SharedMaps {
+    fn default() -> SharedMaps {
+        SharedMaps::new()
+    }
+}
+
+impl std::ops::Deref for SharedMaps {
+    type Target = [SharedMap];
+    fn deref(&self) -> &[SharedMap] {
+        &self.list
+    }
 }
 
 /// A child process the kernel is tracking.
@@ -3266,7 +3364,7 @@ impl Kernel {
             wasm32: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
-            shared_maps: Vec::new(),
+            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -3524,7 +3622,7 @@ impl Kernel {
             wasm32: self.wasm32,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
-            shared_maps: Vec::new(),
+            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -3865,6 +3963,7 @@ impl Kernel {
                     pid,
                     child_stack: sp,
                     tls: (flags & clone_flags::SETTLS != 0).then_some(tls),
+                    vfork: flags & (clone_flags::VM | clone_flags::VFORK) == clone_flags::VM | clone_flags::VFORK,
                 };
             }
             let ca = [flags, sp, parent_tid, tls, child_tid, 0];
@@ -3900,6 +3999,7 @@ impl Kernel {
                 pid,
                 child_stack: a[1],
                 tls: (a[0] & clone_flags::SETTLS != 0).then_some(a[3]),
+                vfork: a[0] & (clone_flags::VM | clone_flags::VFORK) == clone_flags::VM | clone_flags::VFORK,
             };
         }
         if n == nr::CLONE {
@@ -6609,7 +6709,7 @@ impl Kernel {
             return Ok(());
         }
         let (lo, hi) = (addr, addr.saturating_add(len));
-        for map in &self.shared_maps {
+        for map in self.shared_maps.iter() {
             let from = map.start.max(lo);
             let to = (map.start + map.len).min(hi);
             if from >= to {
@@ -10057,6 +10157,100 @@ mod tests {
         set_args(&mut m, at, nr::IOCTL, &[pr, FIONBIO, 0x26000]);
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
         assert_ne!(k.fds.get(pr as i32).unwrap().flags() & oflags::O_NONBLOCK, 0);
+    }
+
+    /// The shared mappings' published view (docs/kernel-locking.md §3.10,
+    /// L8) follows the list: what the page's compositor reads without the
+    /// kernel to find a client's pool. A mapping added is seen, one dropped
+    /// is gone, a reader's copy stays whole, and a forked copy's view is
+    /// its own.
+    #[test]
+    fn the_shared_map_view_follows_the_list() {
+        let file = |name: &str| OpenFile::new(Arc::new(crate::unix::MemFd::new(name)), name.into(), 0, true, true);
+        let (a, b) = (file("a"), file("b"));
+        let mut maps = SharedMaps::new();
+        let view = Arc::clone(maps.view());
+        assert!(view.of(&a).is_none());
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0 });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0 });
+        let held = view.get();
+        assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
+        assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
+        maps.retain(|m| m.start != 0x10000);
+        assert!(view.of(&a).is_none(), "gone when dropped");
+        assert!(view.of(&b).is_some());
+        assert_eq!(held.len(), 2, "a reader's copy is whole");
+        assert_eq!(maps.len(), 1);
+    }
+
+    /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class
+    /// (docs/kernel-locking.md §5.2, L9) answer as the full call does: the
+    /// 64-bit offset from two registers, `_llseek`'s result through memory.
+    #[test]
+    fn free_i386_positioned_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        set_args(&mut m, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        k.syscall(&mut m, 0);
+        let fd = ret(&m, at) as u64;
+        m.write(0x21000, b"hello world").unwrap();
+        set_args(&mut m, at, nr::WRITE, &[fd, 0x21000, 11]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 11);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            for (i, v) in a.iter().enumerate() {
+                m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+            }
+        };
+        let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+        use crate::i386::raw;
+        for lock_free in [true, false] {
+            let mut call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            // _llseek(fd, 0, 6, &result, SEEK_SET): 0, and 6 at result.
+            m.write_u64(0x22000, !0).unwrap();
+            set32(&mut m, raw::LLSEEK, [fd, 0, 6, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0, "lock_free {lock_free}");
+            assert_eq!(m.read_u64(0x22000).unwrap(), 6);
+            // pread64(fd, buf, 5, lo 6, hi 0): "world", the offset kept.
+            set32(&mut m, raw::PREAD64, [fd, 0x23000, 5, 6, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 5);
+            assert_eq!(m.read(0x23000, 5).unwrap(), b"world");
+            // pwrite64 at 0, then the offset still 6 (_llseek SEEK_CUR 0).
+            m.write(0x24000, b"J").unwrap();
+            set32(&mut m, raw::PWRITE64, [fd, 0x24000, 1, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 1);
+            set32(&mut m, raw::LLSEEK, [fd, 0, 0, 0x22000, 1]);
+            call(&mut m, &mut k);
+            assert_eq!(m.read_u64(0x22000).unwrap(), 6);
+            // A bad descriptor: EBADF, with nothing written.
+            m.write_u64(0x22000, 77).unwrap();
+            set32(&mut m, raw::LLSEEK, [99, 0, 0, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), -(Errno::EBADF.0 as i32));
+            assert_eq!(m.read_u64(0x22000).unwrap(), 77);
+        }
     }
 
     #[test]

@@ -113,8 +113,32 @@ pub struct Config {
     /// units that report the functions a run calls, for a recording of the
     /// site to take its coverage from (tools/eject/record-w3.mjs). Each unit keeps the
     /// functions the recorded run called; the rest are fetched in clusters
-    /// on first call (docs/eject.md, "Cold code").
+    /// on first call (docs/eject.md, "Cold code"). `"jit"`: the rest are not
+    /// in the site at all; the page's function JIT translates each from the
+    /// guest's code on first call (gex_split::jit).
     pub cold: Option<String>,
+    /// W3 pages: which functions the build may leave out of the units. A
+    /// pruned function that runs traps, naming its address.
+    ///
+    /// * `"fanout"`: the ones no execution can reach, proved across all the
+    ///   site's images together (crate::fanout).
+    /// * `"static"`: the ones no path from *outside each image* reaches,
+    ///   proved one image at a time (crate::reach). Sound whatever else the
+    ///   site ships, and so much weaker.
+    /// * `"none"` (the default): keep every function.
+    pub prune: Option<String>,
+    /// W3 pages: `"resources": "trim"` zeroes, in the site's bundle, the
+    /// resources no lookup the site makes can return (crate::rsrc);
+    /// `"whole"`, the default for a config without the setting, ships them
+    /// as they are.
+    pub resources_trim: bool,
+    /// W3 pages: `"services": {"Name": "demand", ...}`, each Windows
+    /// service's start type in the site's prefix (`boot`, `system`, `auto`,
+    /// `demand`, `disabled`), set in the bundle's `system.reg` at build.
+    /// A service a site never uses but the prefix starts with Wine (or on a
+    /// program's first call) is a process start or more on the way to the
+    /// window.
+    pub services: Vec<(String, u32)>,
     /// The web build's start defaults (`"start"`): what the app library's
     /// `start()` uses when the page passes no such option. Only options
     /// that change nothing in the build's output belong here (docs/eject.md,
@@ -141,6 +165,9 @@ impl Default for Config {
             features_off: Vec::new(),
             bundle_split: false,
             cold: None,
+            prune: None,
+            resources_trim: false,
+            services: Vec::new(),
             start: "{}".to_string(),
         }
     }
@@ -199,7 +226,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "start") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups" | "features" | "bundle" | "cold" | "prune" | "resources" | "services" | "start") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -360,12 +387,46 @@ impl Config {
         c.cold = match v.get("cold") {
             None | Some(Json::Null) => None,
             Some(Json::Str(x)) if x == "none" => None,
-            Some(Json::Str(x)) if x == "instrument" => Some(x.clone()),
+            Some(Json::Str(x)) if x == "instrument" || x == "jit" => Some(x.clone()),
             Some(Json::Str(x)) => {
                 x.parse::<gex_split::Clustering>().map_err(|e| anyhow::anyhow!("{what}: \"cold\": {e}"))?;
                 Some(x.clone())
             }
-            Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"instrument\" or \"none\""),
+            Some(_) => bail!("{what}: \"cold\" is a clustering (\"chunk:256\", \"graph:64\", \"unit\", \"function\"), \"jit\", \"instrument\" or \"none\""),
+        };
+        c.prune = match v.get("prune") {
+            None | Some(Json::Null) => None,
+            Some(Json::Str(x)) if x == "none" => None,
+            Some(Json::Str(x)) if x == "static" || x == "fanout" => Some(x.clone()),
+            Some(_) => bail!("{what}: \"prune\" is \"fanout\", \"static\" or \"none\""),
+        };
+        c.resources_trim = match v.get("resources") {
+            None | Some(Json::Null) => false,
+            Some(Json::Str(x)) if x == "whole" => false,
+            Some(Json::Str(x)) if x == "trim" => true,
+            Some(_) => bail!("{what}: \"resources\" is \"trim\" or \"whole\""),
+        };
+        c.services = match v.get("services") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Obj(kv)) => {
+                let mut out = Vec::new();
+                for (k, t) in kv {
+                    let start = match t {
+                        Json::Str(x) => match x.as_str() {
+                            "boot" => 0,
+                            "system" => 1,
+                            "auto" => 2,
+                            "demand" => 3,
+                            "disabled" => 4,
+                            _ => bail!("{what}: \"services\": \"{k}\": \"{x}\" is not boot, system, auto, demand or disabled"),
+                        },
+                        _ => bail!("{what}: \"services\": \"{k}\" is a start type (a string)"),
+                    };
+                    out.push((k.clone(), start));
+                }
+                out
+            }
+            Some(_) => bail!("{what}: \"services\" is an object of service names to start types"),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

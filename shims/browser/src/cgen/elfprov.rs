@@ -263,7 +263,9 @@ use gex_kernel::ftab::REBRIDGE_LIMIT;
 /// back (JS writes it before the guest goes on, `#cgenServe`) and the
 /// dispatch is retried. False when it is not a provided address.
 pub(crate) fn rebridge(pc: u64) -> bool {
-    if !provided(pc) || super::index_of(pc).is_none() {
+    // Any provider's address, a W3 builtin's export included: retiring its
+    // page (a hook written beside it) forgot its bridge (`provider_serves`).
+    if !(provided(pc) || super::provider_serves(pc)) || super::index_of(pc).is_none() {
         return false;
     }
     {

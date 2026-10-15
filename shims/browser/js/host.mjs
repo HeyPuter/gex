@@ -346,7 +346,13 @@ export class ProcessHost {
   }
 
   /// Start Workers up to the pool size, one per call so a burst of forks does
-  /// not spend its first moments making Workers it will not reach.
+  /// not spend its first moments making Workers it will not reach. Called on
+  /// a take and again when a pooled Worker is ready, so the pool fills one
+  /// Worker after another: called on a take alone, a take removed one and
+  /// added one, and the pool never held more than one Worker. The second
+  /// and third processes of a pipeline (`echo a | cat | cat`) then each
+  /// waited about 20 ms for a Worker made at their fork (worldmachine,
+  /// demo page).
   #topUp() {
     if (this.#warm.length >= this.#warmWanted) return;
     try {
@@ -360,6 +366,8 @@ export class ProcessHost {
         early.push(m);
         // Listening now (`ready` is posted once its handler is on).
         if (m?.kind === 'ready' && !w[POOLED]) this.#poolModules(w);
+        // Still pooled (not taken, the host not stopped): start the next.
+        if (m?.kind === 'ready' && this.#warm.includes(w)) this.#topUp();
       };
       w.addEventListener?.('message', buf);
       w.on?.('message', buf);
@@ -734,8 +742,12 @@ export class ProcessHost {
         if (typeof WeakRef === 'function' && m.thread.memory) {
           (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
         }
-        if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, making Worker (t=${Date.now()})`);
-        const w2 = this.#makeWorker();
+        if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, taking a Worker (t=${Date.now()})`);
+        // From the warm pool, as a process's: a fresh Worker was ~100 ms of
+        // script load and shim instantiation before the thread could start,
+        // and a starting Wine process makes its threads one after another
+        // (61 of them before Paint's window, 13.5 s in all).
+        const w2 = this.#takeWorker();
         this.#workers.set(key, w2);
         // Keyed by the thread, so its end stops the right Worker and frees the
         // right kernel stack.
@@ -751,6 +763,15 @@ export class ProcessHost {
         w2.addEventListener?.('error', threadFailed);
         w2.on?.('error', threadFailed);
         this.#pending.set(key, { kind: 'thread', ...m.thread });
+        // A pooled Worker's 'ready' came while it sat in the pool: deliver it
+        // now that `#pending` names this thread.
+        const held = w2[EARLY];
+        if (held) {
+          delete w2[EARLY];
+          w2.removeEventListener?.('message', held.buf);
+          w2.off?.('message', held.buf);
+          for (const mm of held.early) deliver(mm);
+        }
         // A thread's start message is keyed by tid and handed over here, once.
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;
@@ -857,6 +878,9 @@ export class ProcessHost {
                 : '') +
               // What the fork wrote into this process. There is no
               // copy-on-write, so this is paid in full, per fork.
+              // A posix_spawn child that ran in its parent's Worker, in its
+              // memory, until its exec: no copy, and this long to the exec.
+              (m.vforkMs !== undefined ? `, forked in place (${m.vforkMs.toFixed(1)}ms to exec, nothing copied)` : '') +
               (m.forkCopied
                 ? `, fork copied ${Math.round(m.forkCopied / 1048576)} MiB`
                   + (m.forkZeros ? ` (${Math.round(m.forkZeros / 1048576)} MiB of it zero, left alone)` : '')

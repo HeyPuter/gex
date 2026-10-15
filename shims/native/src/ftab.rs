@@ -643,6 +643,17 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 /// Whether the function `f` at `addr` may still run: a run-time
 /// translation's pages hold the values it was made under; a unit's entry
 /// page was not rewritten since it was installed.
+/// Whether a function the table holds serves `addr` now: a dispatch miss
+/// there is answered by [`serve`] (a bridge), so tier-1 must not lift the
+/// bytes at it. Its discovery follows `call [iat]` into other images, and a
+/// retirement forgets the bridges of a page's providers while keeping the
+/// providers (a Detours hook in a W3 builtin's skeleton): lifted, the
+/// untouched exports beside the hook ran their `ud2` stubs (IE8's
+/// RegisterClassW, c000001d).
+pub(crate) fn serves(s: &JitShared, memory: &[u8], addr: u64) -> bool {
+    !s.ftab.tier1_only.contains(&addr) && s.ftab.map.get(addr).is_some_and(|f| current(s, memory, addr, f))
+}
+
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);

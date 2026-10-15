@@ -44,6 +44,9 @@ pub mod libs {
 #[cfg(feature = "build")]
 pub mod plt;
 pub mod project;
+pub mod fanout;
+pub mod reach;
+pub mod rsrc;
 pub mod run;
 pub mod templates;
 #[cfg(feature = "build")]

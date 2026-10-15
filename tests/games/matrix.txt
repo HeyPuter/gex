@@ -3,8 +3,14 @@
 #
 #   slug | kind | directory | program | arguments | menu | gameplay | input
 #
-# kind:      pe (a Windows program, run with --wine-prefix), linux, or
-#            linux-x11 (an X11-only program, on Xwayland inside the guest).
+# kind:      w3 (an i386 Windows program on W3, Wine's own Unix side as
+#            native wasm32: W3_DIST/lib/wine/i386-unix/wine under gexc, on a
+#            copy of W3_PREFIX), pe (the legacy NT layer, --wine-prefix; no
+#            new work there, user 2026-10-06), linux, or linux-x11 (an
+#            X11-only program, on Xwayland inside the guest).
+#            Rows that are listed but not run: dotnet (stream U's .NET work;
+#            stream G skips them), blocked and idea (not attempted; ask the
+#            user first). Their program field is the reason.
 # directory: relative to GAMES (Windows builds, default ~/gex-sandbox/games)
 #            or GAMES_LINUX (Linux builds, default ~/gex-sandbox/games-linux).
 # program:   relative to the directory; the run's working directory is the
@@ -12,37 +18,52 @@
 # menu, gameplay: the presented frame at which the game shows its menu and
 #            its gameplay with the scripted input (`-` when not reached yet).
 #            matrix.sh reports the furthest stage whose frame was presented.
-# input:     a script in tests/games/ (`-` for none): GEX_NT_INPUT's for
-#            Windows games, GEX_WL_INPUT's (*.wl) for Linux ones.
+# input:     a script in tests/games/ (`-` for none): *.wl is the
+#            compositor's GEX_WL_INPUT (Linux games and W3, which draws
+#            through winewayland), anything else GEX_NT_INPUT (pe).
 #
 # Optional per-game gexc flags go after the input, as a ninth field;
 # `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST.
-#
-# Only games whose code is native (no .NET/Mono/XNA, no JVM). In scope
-# (2026-10-05): i386 Windows games on stream W's native Wine, and Linux
-# builds. x64 Windows games wait for 64-bit native Wine; they are kept
-# below, commented out. Isaac (SteamStub DRM) and Antichamber (needs a CLR)
-# are left out.
-undertale    |pe   |Undertale                            |UNDERTALE.exe                       | |650|1500|undertale-input.txt
-katana-zero  |pe   |Katana ZERO                          |Katana ZERO.exe                     | |900|-|katana-zero-input.txt
-npp          |pe   |N++                                  |N++.exe                             | |-|-|-
-momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
-retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
+
+# i386 Windows games on W3.
+undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |-|-|undertale-w3.wl
+katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |-|-|katana-zero-w3.wl
+npp          |w3   |N++                                  |N++.exe                             | |-|-|-
+momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
+retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl
+hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-
+
+# Linux builds (no Wine).
 baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|4000|baba.wl|--lazy seed=seed/baba@~/.local/share/Baba_Is_You
 retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
+warfork-linux|linux|Warfork                              |@warfork.x86_64                     | |-|-|-
 
-# x64 Windows games: waiting for 64-bit native Wine (OneShot's game is
-# oneshot.exe, x64).
-# oneshot      |pe   |OneShot                              |oneshot.exe                         | |-|-|-
-# hades-x86    |pe   |Hades                                |x86/Hades.exe                       | |-|-|-
-# deltarune    |pe   |DELTARUNE                            |DELTARUNE.exe                       | |-|-|-|--mem64
-# will-you-snail|pe  |Will You Snail                       |Will You Snail.exe                  | |-|-|-|--mem64
-# hyper-light  |pe   |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
-# dicey        |pe   |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|-
-# geometry-dash|pe   |Geometry Dash                        |GeometryDash.exe                    | |90|-|geometry-dash-input.txt
-# 5d-chess     |pe   |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |600|900|5d-chess-input.txt
-# mosa-lina    |pe   |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
-# spelunky2    |pe   |Spelunky 2                           |Spel2.exe                           | |-|-|-|--mem64
-# hades        |pe   |Hades                                |x64/Hades.exe                       | |-|-|-
-# cruelty-squad|pe   |Cruelty Squad                        |crueltysquad.exe                    | |-|-|-
-# buckshot     |pe   |Buckshot Roulette                    |Buckshot Roulette_windows/Buckshot Roulette.exe| |-|-|-
+# Listed, not run.
+isaac        |blocked|The Binding of Isaac Rebirth      |SteamStub DRM: isaac-ng.exe relaunches through steam://run (the user's call)| |-|-|-
+antichamber  |blocked|Antichamber                       |UDK.exe is a mixed-mode CLR image: needs a CLR (stream U's area)| |-|-|-
+oneshot      |blocked|OneShot                           |x64 (oneshot.exe; only a stub is i386): waits on W64, 64-bit native Wine| |-|-|-
+deltarune    |blocked|DELTARUNE                         |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
+will-you-snail|blocked|Will You Snail                    |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
+hyper-light  |blocked|Hyper Light Drifter               |x64: waits on W64| |-|-|-
+dicey        |blocked|Dicey Dungeons                    |x64: waits on W64| |-|-|-
+geometry-dash|blocked|Geometry Dash                     |x64: waits on W64 (NT layer reached its menu)| |-|-|-
+5d-chess     |blocked|5D Chess With Multiverse Time Travel|x64: waits on W64 (NT layer reached gameplay)| |-|-|-
+mosa-lina    |blocked|Mosa Lina                         |x64: waits on W64| |-|-|-
+spelunky2    |blocked|Spelunky 2                        |x64: waits on W64| |-|-|-
+hades        |blocked|Hades                             |x64 build: waits on W64 (the i386 build is hades-x86)| |-|-|-
+baba         |blocked|Baba Is You                       |x64: waits on W64 (the Linux build is baba-linux)| |-|-|-
+warfork      |blocked|Warfork                           |x64: waits on W64 (the Linux build is warfork-linux)| |-|-|-
+tunic        |blocked|TUNIC                             |x64 Unity IL2CPP: waits on W64| |-|-|-
+cruelty-squad|idea |Cruelty Squad                       |Godot 3: engine substitution, unassigned (ask the user)| |-|-|-
+buckshot     |idea |Buckshot Roulette                   |Godot 4: engine substitution, unassigned (ask the user)| |-|-|-
+wildermyth   |idea |Wildermyth                          |Java (libGDX, bundled JRE): unassigned (ask the user)| |-|-|-
+muck         |dotnet|Muck                               |Unity Mono: stream U| |-|-|-
+hollow-knight|dotnet|Hollow Knight                      |Unity Mono: stream U (also games-linux)| |-|-|-
+silksong     |dotnet|Hollow Knight Silksong             |Unity Mono: stream U| |-|-|-
+rain-world   |dotnet|Rain World                         |Unity Mono: stream U| |-|-|-
+ror2         |dotnet|Risk of Rain 2                     |Unity Mono: stream U| |-|-|-
+ultrakill    |dotnet|ULTRAKILL                          |Unity Mono: stream U| |-|-|-
+gungeon      |dotnet|Enter the Gungeon                  |Unity Mono (x64 and i386 builds): stream U| |-|-|-
+stardew      |dotnet|Stardew Valley                     |MonoGame on .NET 6: stream U (also games-linux)| |-|-|-
+celeste      |dotnet|Celeste                            |XNA/FNA: stream U (also games-linux)| |-|-|-
+towerfall    |dotnet|TowerFall Ascension                |XNA: stream U| |-|-|-
