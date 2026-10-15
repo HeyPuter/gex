@@ -72,15 +72,17 @@ check() {
 	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
 	local wl=()
 	if [ -n "${WL:-}" ]; then
-		# the Wayland driver, gexc's compositor, its frames as PPMs
+		# the Wayland driver, gexc's compositor, its frames as PPMs; display
+		# modes emulated (Wayland sets none), as W3's game prefix has them
 		printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="wayland"\n' >> "$p/user.reg"
+		printf '\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' >> "$p/user.reg"
 		# the prefix is made without a display (w64-dist.sh: native
 		# wineboot, no Wayland libraries): the driver's file, as wineboot
 		# would install it
 		[ -e "$p/drive_c/windows/system32/winewayland.drv" ] ||
 			cp "$dist/lib/wine/x86_64-windows/winewayland.drv" "$p/drive_c/windows/system32/"
 		rm -f "$w/$name"-*.ppm
-		wl=(--wayland "$w/wl-$name" --wayland-size 640x480 --wayland-out "$w/$name")
+		wl=(--wayland "$w/wl-$name" --wayland-size "${WL_SIZE:-640x480}" --wayland-out "$w/$name")
 	fi
 	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${wl[@]}" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
@@ -88,7 +90,8 @@ check() {
 	code=${out##*exit=}
 	out=${out%$'\n'exit=*}; out=${out%exit=*}; out=${out//$'\r'/}
 	local fr=""
-	[ -z "${WL:-}" ] || fr=$(python3 "$here/frame.py" "$w/$name" "${WL_MIN:-1000}" $WL 2>&1) || code="$code, $fr"
+	# (WL=- : the display without a frame check)
+	[ -z "${WL:-}" ] || [ "$WL" = - ] || fr=$(python3 "$here/frame.py" "$w/$name" "${WL_MIN:-1000}" $WL 2>&1) || code="$code, $fr"
 	if [ "$code" = "$want_code" ] && [[ "$out" =~ ^${want_out}$ ]]; then
 		pass=$((pass + 1)); echo "ok   x64/$name ($tag)"
 	else
@@ -119,6 +122,15 @@ if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/wineway
 	# its caption, edit field, and the text of title, menu bar and status
 	# bar (black: about 740 pixels, 335 of them the menus')
 	WL="50,150,250:5000 255,255,255:50000 0,0,0:600" check notepad 0 "title [^$nl]*Notepad${nl}closed 0" notepadrun.exe 5
+	# tests/nt's GUI programs on the display (they check themselves);
+	# display.exe fails 2 checks: a named section mapped twice in one
+	# process does not share its pages (wasm memory has no aliases; the
+	# kernel hands a second MAP_SHARED the first's address, and MAP_FIXED
+	# views cannot have it). x86/display fails under W3 too (known-fail,
+	# w3_boot). Its 800x600 must fit the output: emulated modes go up to
+	# the output's size.
+	for t in user_win gdi input; do WL=- check $t 0 "$allok" $t.exe; done
+	WL=- WL_SIZE=1024x768 check display 0 "$allok" display.exe
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c)
 if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
