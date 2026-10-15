@@ -390,6 +390,9 @@ async function begin(opts, base, at, state, meter) {
   // The lazy files' list, beside the bundle rather than after it.
   const lazyList = b.lazy ? fetchJson(at(b.lazy), 'the lazy files\' list') : null;
   lazyList?.catch(() => {});
+  // The background fill's list (eject-site.mjs --late): lazy files the page
+  // downloads once the boot's files are in, while the guest runs.
+  const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
   const fetcher = { pack, zstd, base, state, meter };
   // What is to come, for the progress: the bundle's files and the units'.
   // The two small lists are read before the bundle starts, so the totals
@@ -491,6 +494,21 @@ async function begin(opts, base, at, state, meter) {
   const preModules = await preloading;
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
+  // The fill: its buffer and counter made now, every Worker given them; its
+  // download started now, after the boot's, so it does not share their link.
+  let fill = null;
+  const fl = fillList ? await fillList : null;
+  if (fl && typeof SharedArrayBuffer === 'function') {
+    const buf = new SharedArrayBuffer(fl.size);
+    const counter = new Int32Array(new SharedArrayBuffer(4));
+    fill = { buf, at: counter, files: fl.files };
+    const t0 = performance.now();
+    fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
+      into: buf,
+      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); },
+    }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
+      .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
+  }
   state.phase = 'running';
   mark('running');
   if (keep) {
@@ -538,6 +556,7 @@ async function begin(opts, base, at, state, meter) {
     onSystem: (s) => { sys = s; },
     hostX: !!b.hostx && opts.hostx !== false,
     preModules,
+    fill,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
@@ -651,6 +670,8 @@ function launchBuild(m, at) {
     const p = { ...(m.params ?? {}) };
     const lazy = p.lazy ?? null;
     delete p.lazy;
+    const fill = p.fill ?? null;
+    delete p.fill;
     return {
       tar: ['project/build/web/rootfs.tar'],
       exe: m.exe,
@@ -665,6 +686,7 @@ function launchBuild(m, at) {
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
+      fill,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
@@ -803,7 +825,7 @@ async function fetchShared(url, f, { shared = false } = {}) {
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f) {
+async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
@@ -811,7 +833,7 @@ async function fetchPacked(url, { size, zsize, build }, shared, f) {
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
   // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
-  const out = new Uint8Array(shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size));
+  const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
   const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
@@ -826,6 +848,7 @@ async function fetchPacked(url, { size, zsize, build }, shared, f) {
       const { done, value } = await reader.read();
       if (done) break;
       z.push(value, emit);
+      progress?.(n);
       at += value.length;
       f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
       f.meter?.bytes(value.length);

@@ -66,6 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
+import { setFill } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
@@ -548,6 +549,9 @@ async function handle(msg) {
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
+  // Lazy files the page is filling in the background (app.js `fill`): their
+  // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
+  if (msg.fill) setFill(msg.fill);
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {

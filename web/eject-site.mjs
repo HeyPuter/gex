@@ -34,7 +34,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late'].includes(av[i - 1]));
 // A W3 page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -372,6 +372,9 @@ function w3Site() {
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
   const split = w3.bundle?.split ? new Set(w3.bundle.read ?? []) : null;
+  // --late FILE: see the fill below.
+  const late = opt('--late', null) ? readFileSync(opt('--late', null), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')) : [];
+  if (split) for (const p of late) split.delete(p);
   let lazyFiles = 0, lazyBytes = 0;
   if (strip || flag('--prune') || flag('--dedupe') || split) {
     const x = join(work, 'tarx');
@@ -419,6 +422,33 @@ function w3Site() {
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
       w3.params = { ...(w3.params ?? {}), lazy: '/project/build/web/lazy.json' };
+      // --late FILE (guest paths, one a line, in the order wanted): files of
+      // the run's read set that left the bundle above for the background fill,
+      // fill.bin (packed): each lazy file's bytes once, in that order, which
+      // the page downloads after the bundle while the guest runs (app.js
+      // `fill`); fill.json says where each starts.
+      if (late.length) {
+        const byPath = new Map(lazy.map((f) => [f[0], f]));
+        const seen = new Map();
+        const parts = [];
+        let off = 0;
+        for (const p of late) {
+          const f = byPath.get(p);
+          if (!f || seen.has(f[2])) continue;
+          seen.set(f[2], [off, f[1]]);
+          parts.push(readFileSync(join(store, f[2])));
+          off += f[1];
+        }
+        const fb = join(work, 'fill.bin');
+        writeFileSync(fb, Buffer.concat(parts));
+        place(fb, 'project/build/web/fill.bin');
+        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({
+          url: '/project/build/web/fill.bin', size: off,
+          files: [...seen].map(([h, [o, n]]) => [`/project/build/web/lazy/${h}`, o, n]),
+        }));
+        w3.params.fill = '/project/build/web/fill.json';
+        console.log(`eject-site: the fill: ${seen.size} files, ${off} bytes, after the bundle`);
+      }
     }
     tar = join(work, 'rootfs.tar');
     const dirs = [];

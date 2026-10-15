@@ -5,13 +5,47 @@
 // Where there is no XMLHttpRequest (Node), lazy files cannot be read.
 import { noteFetch } from './fetch-note.mjs';
 
+// The background fill (app.js `fill`): lazy files the page downloads, packed
+// one after another in one stream, while the guest runs. `buf` (a
+// SharedArrayBuffer) holds them as decoded so far, `at` (an Int32Array on a
+// SharedArrayBuffer) how many bytes of `buf` are there (-1: the fill failed),
+// `files` their URL paths and where each starts. A read of one of them waits
+// for its bytes here instead of asking the server for them (a second download
+// of the same bytes, beside the fill's, on the same link).
+let fill = null;
+export function setFill(f) {
+  if (!f?.buf || !f?.at || !f?.files) return;
+  fill = { buf: new Uint8Array(f.buf), at: f.at, files: new Map(f.files.map(([path, off, size]) => [path, [off, size]])) };
+}
+function fromFill(href, from, memory, dst, len) {
+  if (!fill) return -1;
+  let path;
+  try { path = decodeURIComponent(new URL(href, 'http://x').pathname); } catch { return -1; }
+  const f = fill.files.get(path);
+  if (!f || from + len > f[1]) return -1;
+  const end = f[0] + from + len;
+  for (;;) {
+    const at = Atomics.load(fill.at, 0);
+    if (at < 0) return -1;
+    if (at >= end) break;
+    // Workers may block; the page's thread never reads lazy files.
+    if (Atomics.wait(fill.at, 0, at, 10000) === 'timed-out' && Atomics.load(fill.at, 0) === at) return -1;
+  }
+  new Uint8Array(memory.buffer, dst, len).set(fill.buf.subarray(f[0] + from, end));
+  return len;
+}
+
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
   return (url, urlLen, offset, dst, len) => {
-    if (typeof XMLHttpRequest !== 'function') return -1;
     url >>>= 0; urlLen >>>= 0; dst >>>= 0; len >>>= 0;
     const from = Number(offset);
     const href = new TextDecoder().decode(new Uint8Array(memory.buffer, url, urlLen).slice());
+    if (fill) {
+      const n = fromFill(href, from, memory, dst, len);
+      if (n >= 0) return n;
+    }
+    if (typeof XMLHttpRequest !== 'function') return -1;
     let last = 'no response';
     const done = noteFetch(href, len);
     try {
