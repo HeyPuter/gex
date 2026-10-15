@@ -353,6 +353,44 @@ above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
 images, stacks and the 512 MiB transient reservation are placed. So all
 three need a 64-bit guest memory (docs/mem64.md).
 
+## Games matrix, 2026-10-14 update (stream G, parked until W64)
+
+`tests/games/matrix.txt` now lists every game in the corpus. The rows that
+run are i386 Windows games on W3 (kind `w3`) and the Linux builds. Rows of
+kind `dotnet` (stream U), `blocked` and `idea` are only listed, with their
+reason. The x64 Windows games wait on W64 (64-bit native Wine). Isaac is
+SteamStub DRM, the user's call. Antichamber is a mixed-mode CLR image.
+OneShot's game is x64. Hades has an i386 build, x86/Hades.exe (`hades-x86`).
+
+- **W3 runs:** `W3_DIST/lib/wine/i386-unix/wine ./GAME.exe` under gexc, with
+  `--gl --wayland`, on a copy of `W3_PREFIX` (Graphics=wayland).
+  - Defaults: scratch/K/gate-w3legs/{dist,pfx}.
+  - W3_LAUNCHER puts a program first, e.g. `C:\winlogon.exe`.
+  - Input is `*-w3.wl` (GEX_WL_INPUT, since W3 draws through winewayland).
+- **Summary columns:** the summary has `host`, `first` and `menu`: the host
+  the run used, and seconds from launch to the first frame and to the menu
+  frame.
+  - These say where a game's check runs. Under the user's 2026-10-14 rule,
+    8 minutes or more to the title on gooner moves the game to edger or
+    worldmachine through bench.sh with BENCH_CLASS=check, unless that box is
+    no faster.
+  - They are never a speed result.
+  - `host=H` in a row's extra field and `--host H` select by host.
+- **Other options:**
+  - Games run in a systemd user scope with TasksMax (TASKS_MAX, default
+    1024).
+  - `--table DIR` prints DIR/summary.txt as a markdown table.
+  - MATRIX_STATE (the run copies) must be on the games' filesystem, since
+    copies are hard links: not the tmpfs `hot/`.
+
+First pass on gooner (master 45a3d903; both runs were stopped early when G
+was parked; correctness only):
+
+| game | reached | note |
+|---|---|---|
+| undertale (W3, gate-w3legs dist and prefix) | intro story, frame 12320, picture and text drawn | the intro picture missing on 10-06 now shows; still in the intro when stopped |
+| baba-linux | gameplay, frame 13580: the first level | as on 10-06 |
+
 ## Games matrix (stream G, 2026-10-05): untested non-.NET games
 
 `tests/games/matrix.sh` (games listed in `tests/games/matrix.txt`) runs each
