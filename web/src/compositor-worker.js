@@ -2,7 +2,7 @@
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { DwmButtonFades, drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
+import { DwmButtonFades, attachDwmIcon, drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -770,6 +770,8 @@ class Compositor {
       // A cursor's hotspot, in its surface's units (CSS pixels for the page).
       win.hotX = s.relX;
       win.hotY = s.relY;
+      // the caption's icon out of the process's memory (dwm-frame.js)
+      attachDwmIcon(s.glass, this.#memoryOf(s.token));
       win.info = s;
       // A configure the client has not acked yet: an interactive resize
       // sends its next size once this clears.

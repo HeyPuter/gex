@@ -110,5 +110,14 @@
       <arg name="client_width" type="int"/>
       <arg name="client_height" type="int"/>
     </request>
+
+    <request name="set_icon">
+      <description summary="the caption's icon">
+        With a frame the host draws: the window's small icon (DWM draws it
+        in the caption), 16 by 16 pixels in wl_shm's ARGB8888 (premultiplied,
+        little-endian), rows top down: 1024 bytes. An empty array is none.
+      </description>
+      <arg name="pixels" type="array"/>
+    </request>
   </interface>
 </protocol>

@@ -300,6 +300,10 @@ pub struct SurfaceInfo {
     pub input: Option<Region>,
     /// Blur-behind and tint (`gex_glass_v1`).
     pub glass: Glass,
+    /// The caption's icon for a frame the host draws (`gex_glass_v1.set_icon`):
+    /// the address of 16 by 16 premultiplied ARGB8888 pixels, rows top down,
+    /// which the surface's state keeps; 0 for none.
+    pub glass_icon: usize,
 }
 
 /// A surface's glass (`protocols/gex-glass-v1.xml`): where the compositor
@@ -693,6 +697,9 @@ struct BufferSpec {
 /// effect at `commit`, per Wayland's double-buffered model.
 #[derive(Clone, Debug, Default)]
 struct SurfaceState {
+    /// The caption's icon pixels (`gex_glass_v1.set_icon`); `SurfaceInfo`
+    /// carries their address.
+    glass_icon: Option<Box<[u32]>>,
     pending_buffer: Option<u32>,
     committed_buffer: Option<u32>,
     /// Frame callbacks, delivered after the commit they belong to. A client
@@ -2631,6 +2638,7 @@ impl Client {
             0 => {
                 if let Some(s) = self.surfaces.get_mut(&surface) {
                     s.glass = Glass::default();
+                    s.glass_icon = None;
                     self.dirty = true;
                 }
                 self.objects.remove(&object);
@@ -2672,6 +2680,19 @@ impl Client {
                     self.dirty = true;
                 }
             }
+            // set_icon(pixels): 16 x 16 ARGB8888, or none
+            4 => match r.array() {
+                Some(a) => {
+                    let icon = (a.len() == 16 * 16 * 4).then(|| {
+                        a.chunks_exact(4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect::<Box<[u32]>>()
+                    });
+                    if let Some(s) = self.surfaces.get_mut(&surface) {
+                        s.glass_icon = icon;
+                        self.dirty = true;
+                    }
+                }
+                None => ok = false,
+            },
             // set_colorization(argb, balance, blur_balance, afterglow, afterglow_balance)
             2 => match (r.uint(), r.uint(), r.uint(), r.uint(), r.uint()) {
                 (Some(argb), Some(balance), Some(blur_balance), Some(afterglow), Some(afterglow_balance)) => {
@@ -2790,6 +2811,7 @@ impl Client {
                 placement: s.placement,
                 input: s.input.clone(),
                 glass: s.glass,
+                glass_icon: s.glass_icon.as_ref().map_or(0, |p| p.as_ptr() as usize),
             });
         }
         // A stable order, so a host that keys textures by index rather than by

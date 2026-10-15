@@ -43,6 +43,7 @@
 // guest's GL. Such a window gets its canvas handed to that worker instead --
 // see `hostGlWindow` below -- and is drawn there.
 
+import { attachDwmIcon } from './dwm-frame.js';
 import {
   readScene,
   ackBlock,
@@ -606,6 +607,8 @@ export class DomDesktop {
     }
     // Glass changed: the page moves its panes and frame, and the whole window
     // is copied again, since which of its pixels are see-through changed.
+    // the caption's icon out of the process's memory (dwm-frame.js)
+    attachDwmIcon(s.glass, this.#memoryOf(s.token));
     const glassSig = s.glass ? JSON.stringify(s.glass) : '';
     if (glassSig !== win.glassSig) {
       win.glassSig = glassSig;

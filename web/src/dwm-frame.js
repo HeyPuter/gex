@@ -367,7 +367,12 @@ export function drawDwmFrame(ctx, atlas, f) {
 
   // 6. The caption: its glow (TEXTGLOW stretched around the text), then the
   //    text, in the band [0, N.t) right of the icon and left of the buttons.
-  const iconW = f.icon === false ? 0 : 16;
+  // The icon: SM_CXSMICON square at the left of the caption band, centred
+  // in it (UpdateNCAreaPositionsAndSizes); the text after it, 5 px on.
+  const iconW = f.icon ? 16 : 0;
+  if (f.icon) {
+    ctx.drawImage(iconCanvas(f.icon.pixels, f.icon.key), N.l, Math.trunc((N.t - 16) / 2));
+  }
   const tx = N.l + (iconW ? iconW + 5 : 0);
   const shown = (f.buttons ?? []).filter((b) => b.state);
   const tr = shown.length ? Math.min(...shown.map((b) => b.x)) : W - N.r;
@@ -514,6 +519,7 @@ export function dwmFrameOf(glass, w0, h0, title, x0, y0, W, H, hovered = null) {
     active: (g.frame & 2) !== 0,
     maximized: (g.frame & 4) !== 0,
     title: title || '',
+    icon: g.iconPixels ? { pixels: g.iconPixels, key: g.iconKey } : null,
     buttons: [button('min', g.min), button('max', g.max), button('close', g.close)],
     screen: { x, y, vx: 0, vy: 0, vcx: W, vcy: H },
   };
@@ -547,4 +553,44 @@ export function dwmOutsideMargins(glass, w, h) {
     B.b = Math.min(B.b, h - (r.y + r.h));
   }
   return B;
+}
+
+/** The caption's icon out of a process's memory (`view`, a Uint8Array) at
+ *  `addr` (gex_glass_v1.set_icon's 16 x 16 premultiplied ARGB8888), as
+ *  { key, pixels } with the pixels straight RGBA, or null. */
+export function readDwmIcon(view, addr) {
+  if (!view || !addr || addr + 1024 > view.length) return null;
+  const src = view.subarray(addr, addr + 1024);
+  const pixels = new Uint8ClampedArray(1024);
+  let key = 2166136261;
+  for (let i = 0; i < 1024; i += 4) {
+    const b = src[i], g = src[i + 1], r = src[i + 2], a = src[i + 3];
+    key = Math.imul(key ^ (b | g << 8 | r << 16 | a << 24), 16777619) >>> 0;
+    const k = a ? 255 / a : 0;
+    pixels[i] = r * k; pixels[i + 1] = g * k; pixels[i + 2] = b * k; pixels[i + 3] = a;
+  }
+  return { key, pixels };
+}
+
+/** Attach the icon read from `view` to `glass` (a record's): its key as
+ *  `iconKey` (so a change shows in the glass's signature) and its pixels as
+ *  a hidden `iconPixels`. */
+export function attachDwmIcon(glass, view) {
+  if (!glass) return;
+  const icon = readDwmIcon(view, glass.icon);
+  glass.iconKey = icon?.key ?? 0;
+  Object.defineProperty(glass, 'iconPixels', { value: icon?.pixels ?? null, enumerable: false, configurable: true });
+}
+
+const iconCanvases = new Map(); // key -> 16 x 16 canvas
+function iconCanvas(pixels, key) {
+  let c = iconCanvases.get(key);
+  if (!c) {
+    c = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(16, 16)
+      : Object.assign(document.createElement('canvas'), { width: 16, height: 16 });
+    c.getContext('2d').putImageData(new ImageData(pixels, 16, 16), 0, 0);
+    if (iconCanvases.size > 256) iconCanvases.clear();
+    iconCanvases.set(key, c);
+  }
+  return c;
 }

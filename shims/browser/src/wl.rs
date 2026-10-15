@@ -834,6 +834,9 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[33..37].copy_from_slice(&info.input_words());
     // Its glass, if its client asked for some (`gex_glass_v1`).
     r[37..77].copy_from_slice(&info.glass.record_words());
+    // The caption's icon (`gex_glass_v1.set_icon`): where its 256 pixels
+    // are in this process's memory, 0 for none.
+    r[77] = info.glass_icon as i32;
 }
 
 impl HostListener for WaylandDevice {
