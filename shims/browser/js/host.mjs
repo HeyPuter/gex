@@ -62,6 +62,9 @@ const POOLED = Symbol('gex.pooled');
 /// A pooled Worker's global-kernel stack slice, taken when it was sent
 /// `preattach` (keyed `pool:N` until a process or thread takes the Worker).
 const STACK_KEY = Symbol('gex.stackKey');
+/// A pooled Worker has said `ready` (its handler is on): it can be sent
+/// `preattach`.
+const READY = Symbol('gex.ready');
 /// A process Worker's listeners (`#spawn`), taken off when it is given back.
 const LISTENING = Symbol('gex.listening');
 /// How many processes a Worker has run after its first (`#giveBack`).
@@ -178,6 +181,13 @@ export class ProcessHost {
    * of a process is in it, so a Worker taken for anything else drops it.
    * About what a fresh process's memory holds before it runs: the shim's
    * data and the Worker's shim stack.
+   *
+   * One pooled Worker at a time has it (`#preattachOne`), and only an exec'd
+   * child is given that one (`#takeWorker`): its memory is grown to 177 MiB
+   * at once, and a Worker taken for a thread or a fork dropped it unfreed --
+   * the Worker then sits in wasm or a wait, its isolate never collects, and
+   * the dropped memory stays in the renderer's VmData (Paint: 24 of them
+   * alive at its window, 4.15 GiB; the Win7 shell: 58, 10 GiB).
    */
   #preattach(w) {
     if (!this.#kernel || !this.#stacks || !this.#extra?.shared || w[STACK_KEY]) return;
@@ -202,6 +212,13 @@ export class ProcessHost {
     }));
   }
   #poolSeq = 0;
+
+  /** A runtime made ahead in one pooled Worker, unless one already has it. */
+  #preattachOne() {
+    if (this.#warm.some((w) => w[STACK_KEY] !== undefined)) return;
+    const w = this.#warm.find((x) => x[READY]);
+    if (w) this.#preattach(w);
+  }
 
   /** The kernel stack slice for the Worker `w` starting `key`: the one it
    *  was given in the pool (`#preattach`), now `key`'s, or a new one. */
@@ -358,7 +375,7 @@ export class ProcessHost {
     // When this process was asked for, to measure the gap before it runs.
     this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
-      const w = this.#takeWorker();
+      const w = this.#takeWorker(msg.kind === 'adopt' && !!msg.child?.exec);
       this.#workers.set(pid, w);
       if (pid === 1) this.#first = w;
       const onEvent = (e) => this.#onMessage(pid, w, e.data, resolve, reject);
@@ -404,11 +421,16 @@ export class ProcessHost {
    * A Worker, from the pool if one is warm. Tops up after the take, so the
    * Worker started now serves the next process, not this one.
    */
-  #takeWorker() {
-    const w = this.#warm.shift();
+  #takeWorker(exec = false) {
+    // An exec'd child takes the Worker with a runtime made ahead, anything
+    // else one without (`#preattach`), whichever comes first otherwise.
+    let i = this.#warm.findIndex((x) => (x[STACK_KEY] !== undefined) === exec);
+    if (i < 0 && this.#warm.length) i = 0;
+    const w = i < 0 ? null : this.#warm.splice(i, 1)[0];
     if (w) this.#warmUsed++;
     const got = w ?? this.#makeWorker();
     this.#topUp();
+    this.#preattachOne();
     return got;
   }
 
@@ -441,6 +463,8 @@ export class ProcessHost {
     // out: nothing before its next `ready` is kept.
     const early = [];
     let readied = !givenBack;
+    // A given-back Worker is ready again once it has reset.
+    w[READY] = false;
     const buf = (e) => {
       const m = e && e.data !== undefined ? e.data : e;
       if (m?.kind === 'ready') readied = true;
@@ -448,8 +472,9 @@ export class ProcessHost {
       early.push(m);
       // Listening now (`ready` is posted once its handler is on).
       if (m?.kind === 'ready') {
+        w[READY] = true;
         if (!w[POOLED]) this.#poolModules(w);
-        this.#preattach(w);
+        if (this.#warm.includes(w)) this.#preattachOne();
       }
       // Still pooled (not taken, the host not stopped): start the next.
       if (m?.kind === 'ready' && !givenBack && this.#warm.includes(w)) this.#topUp();
@@ -749,6 +774,8 @@ export class ProcessHost {
         break;
       case 'kernelStacks':
         this.#stacks = m;
+        // A pooled Worker that was ready before the stacks were known.
+        this.#preattachOne();
         break;
       case 'output': {
         this.#onOutput(m.fd, m.text, pid, m);

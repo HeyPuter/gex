@@ -669,6 +669,10 @@ async function handle(msg) {
   // of its own as that one does, on the same kernel stack.
   const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
     && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
+  // Made for an exec'd child and taken by something else: its memory is
+  // dropped unused, and stays committed until this Worker's isolate collects
+  // (host.mjs `#preattach`; tests/browser-spawn.sh counts these).
+  if (preattached && !pre) vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: a runtime made ahead was left unused (${msg.kind})`);
   preattached = null;
   // A runtime made in the pool that does not fit the process it was made
   // for is a host bug, not a choice: said, and the process gets a new one.
