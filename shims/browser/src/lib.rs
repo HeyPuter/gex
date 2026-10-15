@@ -110,7 +110,21 @@ extern "C" {
 }
 
 /// Whether the page gave the shim a network at all.
-static mut HAVE_NET: bool = false;
+static HAVE_NET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn have_net() -> bool {
+    HAVE_NET.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The page's network, when it has one: one stack for every process in this
+/// memory (`WispNet` holds nothing of its own). Read by each socket call
+/// (`sigs`'s `NetIo`) and by a kernel as it is built, so a network the page
+/// turns on later reaches every process at its next call, with no kernel to
+/// tell.
+pub(crate) fn page_net() -> Option<&'static Arc<dyn net::NetStack>> {
+    static WISP: std::sync::LazyLock<Arc<dyn net::NetStack>> = std::sync::LazyLock::new(|| Arc::new(WispNet));
+    have_net().then(|| &*WISP)
+}
 
 /// Say that the page has a Wisp connection behind the `net_*` imports.
 ///
@@ -119,15 +133,7 @@ static mut HAVE_NET: bool = false;
 /// every connection hangs.
 #[no_mangle]
 pub extern "C" fn gex_set_network(on: i32) {
-    unsafe { HAVE_NET = on != 0 };
-    // Only when there is a kernel to tell: a Worker between `attach` and
-    // `gex_adopt_child` has none, and a kernel built later reads the flag anyway.
-    if gex_has_host() != 0 {
-        with_host(|h| {
-            h.kernel.net =
-                unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
-        });
-    }
+    HAVE_NET.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
 /// One Wisp stream, as the kernel's [`net::Transport`].
@@ -2862,6 +2868,10 @@ enum Waiting {
     Net(Option<u64>),
     /// In `sigsuspend`: only a signal ends it (`thread_ready`'s first test).
     Signal,
+    /// In `rt_sigtimedwait` (`BlockOp::SigWait`, which says for which
+    /// signals): until one of its set is pending, until this deadline, or a
+    /// signal outside the set ends it.
+    SigWait(Option<u64>),
     /// Waiting to take a priority-inheritance lock held by another thread:
     /// until its futex is woken (`gen`, as `Futex::wake_gen`), the lock word
     /// shows no owner, or `deadline`.
@@ -4407,9 +4417,21 @@ fn with_px<R>(f: impl FnOnce(&Px<'_>) -> R) -> R {
 }
 
 /// Sockets the host holds one end of, so JS can carry a guest's stream
-/// somewhere the guest cannot reach -- another Worker, in particular.
-static HOST_SOCKETS: SingleThreaded<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
-    SingleThreaded(const { RefCell::new(Vec::new()) });
+/// somewhere the guest cannot reach -- another Worker, in particular. Their
+/// own lock: the browser's Xwayland<->compositor bridge calls send and recv
+/// from several Workers at once while others connect and accept.
+static HOST_SOCKETS: gex_kernel::sync::Mutex<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
+    gex_kernel::sync::Mutex::new(Vec::new());
+
+fn host_socket(handle: i32) -> Option<Arc<gex_kernel::unix::UnixSocket>> {
+    HOST_SOCKETS.lock().get(handle.max(0) as usize).cloned()
+}
+
+fn host_socket_add(sock: Arc<gex_kernel::unix::UnixSocket>) -> i32 {
+    let mut table = HOST_SOCKETS.lock();
+    table.push(sock);
+    (table.len() - 1) as i32
+}
 
 /// Connect the host to a unix socket the *guest* has bound: the mirror of
 /// `bind_host`, needed so a guest that *serves* a socket (an X server in one
@@ -4422,35 +4444,20 @@ pub extern "C" fn gex_host_connect(path: u32, path_len: u32) -> i32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return -1;
     };
-    with_host(|h| {
-        let sock = Arc::new(gex_kernel::unix::UnixSocket::new(true));
-        if h.kernel.socket_names.connect(&sock, name).is_err() {
-            return -1;
-        }
-        let mut table = HOST_SOCKETS.0.borrow_mut();
-        table.push(sock);
-        (table.len() - 1) as i32
-    })
+    let Some(home) = sigs::home() else { return -1 };
+    let sock = Arc::new(gex_kernel::unix::UnixSocket::new(true));
+    if home.socket_names().connect(&sock, name).is_err() {
+        return -1;
+    }
+    host_socket_add(sock)
 }
 
 /// Write to the guest through a handle from [`gex_host_connect`].
 #[no_mangle]
 pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
     let bytes = shim_slice(ptr, len);
-    // Clone the Arc under KLOCK: `HOST_SOCKETS` is a `SingleThreaded<Vec>` that
-    // `gex_host_connect` pushes to (a realloc) under KLOCK, and the browser's
-    // Xwayland<->compositor IPC calls send/recv from several Workers at once.
-    // An unlocked `borrow()` racing that push aliases freed backing storage --
-    // the browser-only residual after the closure-JIT races were fixed. The I/O
-    // itself stays outside the lock.
-    let sock = with_host(|_| {
-        HOST_SOCKETS
-            .0
-            .borrow()
-            .get(handle.max(0) as usize)
-            .cloned()
-    });
-    match sock {
+    // The socket cloned out of the table, the I/O outside its lock.
+    match host_socket(handle) {
         Some(s) => s.send(bytes).map(|n| n as i32).unwrap_or(-1),
         None => -1,
     }
@@ -4460,15 +4467,7 @@ pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
 /// which is not the same as end of stream -- the caller comes back.
 #[no_mangle]
 pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
-    // Clone under KLOCK -- see `gex_host_send`.
-    let sock = with_host(|_| {
-        HOST_SOCKETS
-            .0
-            .borrow()
-            .get(handle.max(0) as usize)
-            .cloned()
-    });
-    let Some(s) = sock else { return -1 };
+    let Some(s) = host_socket(handle) else { return -1 };
     let out = shim_slice_mut(ptr, max);
     s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
 }
@@ -4490,8 +4489,8 @@ impl gex_kernel::unix::HostListener for JsListener {
     }
 }
 
-static HOST_LISTENERS: SingleThreaded<Vec<Arc<JsListener>>> =
-    SingleThreaded(const { RefCell::new(Vec::new()) });
+/// The host's listeners, behind their own lock as [`HOST_SOCKETS`] is.
+static HOST_LISTENERS: gex_kernel::sync::Mutex<Vec<Arc<JsListener>>> = gex_kernel::sync::Mutex::new(Vec::new());
 
 /// Serve a unix socket at `path` from the host. Returns a listener id.
 ///
@@ -4502,49 +4501,28 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return -1;
     };
+    let Some(home) = sigs::home() else { return -1 };
     let listener = Arc::new(JsListener::default());
-    with_host(|h| {
-        h.kernel.socket_names.bind_host(
-            name,
-            Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>,
-        );
-        // Also in the filesystem: `connect` goes through the name table, but
-        // anything that checks the path exists first (Xlib, `test -S`; not
-        // Mesa) needs a node. Through the mount, since with a global kernel
-        // `h.root` is this process's own `TmpFs` with nothing mounted on it.
-        let _ = h.kernel.vfs.mksocket(name);
-        // Under the same KLOCK: `HOST_LISTENERS`/`HOST_SOCKETS` are pushed to
-        // from other Workers (`gex_host_accept`) while the browser's socket
-        // bridge runs on several threads. An unlocked push races the Vec.
-        let mut table = HOST_LISTENERS.0.borrow_mut();
-        table.push(listener);
-        (table.len() - 1) as i32
-    })
+    home.socket_names().bind_host(name, Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>);
+    // Also in the filesystem: `connect` goes through the name table, but
+    // anything that checks the path exists first (Xlib, `test -S`; not
+    // Mesa) needs a node. Through the mount, since with a global kernel the
+    // root is this process's own `TmpFs` with nothing mounted on it.
+    let _ = home.ns().mksocket(name);
+    let mut table = HOST_LISTENERS.lock();
+    table.push(listener);
+    (table.len() - 1) as i32
 }
 
 /// Take one waiting connection, as a handle for [`gex_host_send`] and
 /// [`gex_host_recv`]. -1 when nothing is waiting.
 #[no_mangle]
 pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
-    // Whole body under KLOCK: reads `HOST_LISTENERS` and pushes `HOST_SOCKETS`,
-    // both shared Vecs other Workers touch on the browser's socket bridge.
-    with_host(|_| {
-        let l = HOST_LISTENERS
-            .0
-            .borrow()
-            .get(listener.max(0) as usize)
-            .cloned();
-        let Some(l) = l else { return -1 };
-        let sock = l
-            .accepted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop();
-        let Some(sock) = sock else { return -1 };
-        let mut table = HOST_SOCKETS.0.borrow_mut();
-        table.push(sock);
-        (table.len() - 1) as i32
-    })
+    let l = HOST_LISTENERS.lock().get(listener.max(0) as usize).cloned();
+    let Some(l) = l else { return -1 };
+    let sock = l.accepted.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let Some(sock) = sock else { return -1 };
+    host_socket_add(sock)
 }
 
 /// How many regions of guest memory this process actually owns. Anything that
@@ -4936,15 +4914,15 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.clock = browser_clock;
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
-    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    kernel.net = page_net().cloned();
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
             let _ = kernel.set_cwd(&cwd);
         }
     }
-    kernel.uid = unsafe { IDENTITY.0 };
-    kernel.gid = unsafe { IDENTITY.1 };
+    kernel.creds.set_uid(unsafe { IDENTITY.0 });
+    kernel.creds.set_gid(unsafe { IDENTITY.1 });
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
     install_console(&mut kernel);
@@ -6520,7 +6498,7 @@ fn wait_needs_page(r: &Run) -> bool {
         match h.metadata().map(|m| m.file_type) {
             Ok(FileType::Fifo) => true,
             // (`HAVE_NET` is what the kernel's `net` is made from.)
-            Ok(FileType::Socket) => !unsafe { HAVE_NET },
+            Ok(FileType::Socket) => !have_net(),
             // And whatever else says its waits are ended by another process:
             // a pseudoterminal, whose two ends live in the global kernel with a
             // terminal emulator in another Worker holding one of them. It was
@@ -6586,7 +6564,7 @@ fn wait_needs_page(r: &Run) -> bool {
         // was 34 seconds of a 115 second run, waking and re-parking every two
         // milliseconds because it dared not sleep longer.
         Waiting::Net(Some(_)) => true,
-        Waiting::Net(None) => unsafe { HAVE_NET },
+        Waiting::Net(None) => have_net(),
         _ => false,
     }
 }
@@ -6700,7 +6678,7 @@ pub extern "C" fn gex_set_stdin(ptr: u32, len: u32) {
 /// against whatever this process last set.
 #[no_mangle]
 pub extern "C" fn gex_tty_lflag() -> u32 {
-    with_host(|h| u32::from_le_bytes(h.kernel.tty.termios()[12..16].try_into().unwrap()))
+    sigs::home().map_or(0, |h| u32::from_le_bytes(h.tty().termios()[12..16].try_into().unwrap()))
 }
 
 /// Tell the guest how big the terminal is, and `SIGWINCH` the foreground group
@@ -6708,17 +6686,15 @@ pub extern "C" fn gex_tty_lflag() -> u32 {
 /// only when the size actually changed.
 #[no_mangle]
 pub extern "C" fn gex_set_winsize(rows: u32, cols: u32) {
-    with_host(|h| {
-        let (_, _, x, y) = h.kernel.tty.winsize();
-        if h.kernel.tty.set_winsize((rows as u16, cols as u16, x, y)) {
-            let fg = h.kernel.tty.fg();
-            let g = if fg > 0 { fg } else { h.kernel.pid };
-            let _ = h
-                .kernel
-                .procs
-                .kill_group(h.kernel.pid, g, gex_kernel::signal::sig::SIGWINCH);
-        }
-    });
+    // The terminal and the process table lock themselves.
+    let Some(h) = sigs::home() else { return };
+    let tty = h.tty();
+    let (_, _, x, y) = tty.winsize();
+    if tty.set_winsize((rows as u16, cols as u16, x, y)) {
+        let fg = tty.fg();
+        let g = if fg > 0 { fg } else { h.pid };
+        let _ = h.procs().kill_group(h.pid, g, gex_kernel::signal::sig::SIGWINCH);
+    }
 }
 
 /// Say that stdin is a terminal (what makes a shell print a prompt), and claim
@@ -7185,18 +7161,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
         set_my_pid(h.kernel.pid);
-        // What `ident_call` answers from until this thread's next full call.
-        // No parent: asking for it is a call into the system-wide kernel, and
-        // a reparent would go unseen; `getppid` takes the full path.
-        IDS.with(|c| {
-            c.set(gex_kernel::syscalls::Idents {
-                pid: h.kernel.pid as u32,
-                ppid: 0,
-                tid: h.threads[cur()].kstate.tid as u32,
-                uid: h.kernel.uid,
-                gid: h.kernel.gid,
-            })
-        });
         report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -7304,59 +7268,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
-        // A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
-        // caught fatal signal) prints nothing of its own if the message path is
-        // gone, so name who did it: the stack from the raiser holds `abort`'s
-        // saved return address (its caller), and x30 the nearest frame -- enough
-        // to say which library and function a silent abort came from.
+        // A signal sent: the process's waits look again, and an abort is
+        // named (`kill_sent`).
         {
             use gex_kernel::syscalls::nr as knr;
             // The kernel's own (canonical) number: `nr` is the raw one, which
             // for an x86 or i386 process is in that ABI's numbering.
             let canon = h.kernel.syscall_nr;
-            let is_kill = matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL);
-            let sig = if canon == knr::TGKILL { a2 } else { a1 };
-            // A signal for a thread of this process is raised here, on that
-            // thread's own pending word, which its safepoints read (`sigs`);
-            // the thread may be parked in another Worker.
-            if is_kill {
-                waitq::wake_process();
-            }
-            if is_kill && sig == 6 {
-                let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
-                let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
-                let mut bt = String::new();
-                // The frame-pointer chain: at each aarch64 frame `[x29]` is the
-                // caller's x29 and `[x29+8]` its return address -- a clean call
-                // stack, unlike raw stack words which are half stale data.
-                let mut fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
-                for _ in 0..40 {
-                    if fp == 0 || fp & 7 != 0 {
-                        break;
-                    }
-                    let ret = gm.read_u64(fp + 8).unwrap_or(0);
-                    let o = object_off_at(ret);
-                    if !o.is_empty() {
-                        bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
-                    }
-                    let next = gm.read_u64(fp).unwrap_or(0);
-                    if next <= fp {
-                        break;
-                    }
-                    fp = next;
-                }
-                for i in 0..80u64 {
-                    let w = gm.read_u64(sp + i * 8).unwrap_or(0);
-                    let o = object_off_at(w);
-                    if o.contains(".so") || o.starts_with('/') {
-                        bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
-                    }
-                }
-                warn_line(&format!(
-                    "gex: SIGABRT raised by pid {} x30={x30:#x} {}, stack refs:{bt}\n",
-                    h.kernel.pid,
-                    object_name_at(&Px::of(h), x30),
-                ));
+            if matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL) {
+                let sig = if canon == knr::TGKILL { a2 } else { a1 };
+                kill_sent(&gm, kstate.ctx_addr, h.kernel.pid, sig, &Px::of(h));
             }
         }
         // Relay every futex this syscall woke to the shared per-address counter,
@@ -7585,6 +7506,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                             Waiting::Signal
                         }
                     }
+                    // `rt_sigtimedwait`, woken as `sigsuspend` is, or by its
+                    // deadline; made again when it ends with one of its set
+                    // pending (`finish_parked`), which takes it.
+                    gex_kernel::BlockOp::SigWait { timeout, .. } => {
+                        Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
+                    }
                 };
                 // A new wait: whatever this Worker's thread was registered
                 // for is over.
@@ -7594,6 +7521,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // kernel (`finish_wait`). A call the kernel would redo once
                 // its wait is over is made again instead.
                 let k = &mut h.kernel;
+                // The kernel's own finish for a wait it parked; here the call
+                // is made again instead (`finish_parked`).
+                k.retry_sigwait = None;
                 let owed = Owed {
                     restore_sigmask: k.restore_sigmask.take(),
                     write_blocked: std::mem::take(&mut k.write_blocked),
@@ -7930,12 +7860,6 @@ fn clock_constants(compat: bool, started: u128) {
     CLOCK_ABI.store(if compat { 1 } else { 2 }, Release);
 }
 
-thread_local! {
-    /// This thread's ids as its last full syscall saw them (`ident_call`).
-    static IDS: Cell<gex_kernel::syscalls::Idents> = const {
-        Cell::new(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 })
-    };
-}
 
 /// The clocks, with no kernel lock (docs/kernel-locking.md §5.2 step 1):
 /// `clock_gettime`, `clock_getres`, `gettimeofday`, `getrusage` and
@@ -7951,8 +7875,7 @@ thread_local! {
 /// check); and a provider collection's stop (cgen/libprov.rs), which parks
 /// the thread on its way back to guest code, as after any syscall.
 ///
-/// The getpid family is answered here too, from this thread's ids as its
-/// last full syscall left them (`ident_call`, step 6a).
+/// The getpid family is answered here too (`ident_syscall`, step 6a).
 fn clock_syscall(ctx: i32) -> bool {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let abi = CLOCK_ABI.load(Acquire);
@@ -7965,7 +7888,7 @@ fn clock_syscall(ctx: i32) -> bool {
     let started = CLOCK_STARTED.load(Acquire) as u128;
     let at = ctx as u32 as u64;
     if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started)
-        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, at, abi == 1, &c.get()))
+        && !ident_syscall(&mut gm, at, abi == 1)
     {
         return false;
     }
@@ -7978,7 +7901,7 @@ fn clock_syscall(ctx: i32) -> bool {
     // A provider's collection running: park here, as the full path does on
     // its way back to guest code.
     if cgen::libprov::stop_active() {
-        let tid = IDS.with(|c| c.get().tid);
+        let tid = my_tid();
         if tid != 0 {
             cgen::libprov::park_if_stopping(tid as u32, false);
         }
@@ -7991,6 +7914,79 @@ fn clock_syscall(ctx: i32) -> bool {
         ));
     }
     true
+}
+
+/// After a `kill`, `tkill` or `tgkill` of signal `sig` from the thread whose
+/// context is at `ctx_addr`, with the kernel lock or without it (L22d).
+///
+/// A signal for a thread of this process is raised on that thread's own
+/// pending word, which its safepoints read (`sigs`); the thread may be
+/// parked in another Worker, so the process's waits look again.
+///
+/// A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
+/// caught fatal signal) prints nothing of its own if the message path is
+/// gone, so name who did it: the stack from the raiser holds `abort`'s
+/// saved return address (its caller), and x30 the nearest frame -- enough
+/// to say which library and function a silent abort came from.
+fn kill_sent(gm: &GuestMem<'_>, ctx_addr: u64, pid: i32, sig: u64, p: &Px<'_>) {
+    waitq::wake_process();
+    if sig != 6 {
+        return;
+    }
+    let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+    let x30 = gm.read_u64(ctx_addr + ctx::x(30) as u64).unwrap_or(0);
+    let mut bt = String::new();
+    // The frame-pointer chain: at each aarch64 frame `[x29]` is the
+    // caller's x29 and `[x29+8]` its return address -- a clean call
+    // stack, unlike raw stack words which are half stale data.
+    let mut fp = gm.read_u64(ctx_addr + ctx::x(29) as u64).unwrap_or(0);
+    for _ in 0..40 {
+        if fp == 0 || fp & 7 != 0 {
+            break;
+        }
+        let ret = gm.read_u64(fp + 8).unwrap_or(0);
+        let o = object_off_at(ret);
+        if !o.is_empty() {
+            bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
+        }
+        let next = gm.read_u64(fp).unwrap_or(0);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    for i in 0..80u64 {
+        let w = gm.read_u64(sp + i * 8).unwrap_or(0);
+        let o = object_off_at(w);
+        if o.contains(".so") || o.starts_with('/') {
+            bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
+        }
+    }
+    warn_line(&format!(
+        "gex: SIGABRT raised by pid {} x30={x30:#x} {}, stack refs:{bt}\n",
+        pid,
+        object_name_at(p, x30),
+    ));
+}
+
+/// The getpid family for this Worker's thread (`ident_call`): its pid as
+/// its process's load or fork set it (`MY_PID`), its tid as its thread's
+/// start bound it (`bind_mine`), and the process's ids as they are now
+/// (`Creds`). No parent: asking for it is a call into the process table,
+/// and a reparent must be seen; `getppid` is a quiet call. A vfork child
+/// runs on its parent's thread, whose tid is not its own: its calls take
+/// the full path.
+fn ident_syscall(gm: &mut GuestMem<'_>, at: u64, compat: bool) -> bool {
+    if vfork::pid_here().is_some() {
+        return false;
+    }
+    let Some(home) = sigs::home() else { return false };
+    let ids = gex_kernel::syscalls::Idents {
+        pid: MY_PID.load(std::sync::atomic::Ordering::Relaxed) as u32,
+        ppid: 0,
+        tid: my_tid() as u32,
+    };
+    ids.pid != 0 && gex_kernel::syscalls::ident_call(gm, at, compat, &ids, home.creds())
 }
 
 /// This process's descriptor table, which needs no kernel lock
@@ -8360,7 +8356,7 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 /// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
 #[no_mangle]
 pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
-    with_host(|h| h.kernel.fds.get(fd).ok().and_then(|f| pipe_id(&f.path)).unwrap_or(-1))
+    fds_free().and_then(|fds| fds.get(fd).ok()).and_then(|f| pipe_id(&f.path)).unwrap_or(-1)
 }
 
 fn pipe_id(path: &str) -> Option<i32> {
@@ -9158,8 +9154,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     let mut kernel = Kernel::new(ctx_addr, brk as u64, String::new());
     // Who this process is: `Kernel::new` defaults to uid 1000, so a child that
     // did not copy `IDENTITY` here is not root and every forked `dpkg` refuses.
-    kernel.uid = unsafe { IDENTITY.0 };
-    kernel.gid = unsafe { IDENTITY.1 };
+    kernel.creds.set_uid(unsafe { IDENTITY.0 });
+    kernel.creds.set_gid(unsafe { IDENTITY.1 });
     kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     if nt::windows_space() != 0 {
         w3_address_space(&mut kernel.mem.lock(), nt::windows_space());
@@ -9226,7 +9222,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     kernel.clock = browser_clock;
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
-    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    kernel.net = page_net().cloned();
     // The dispositions, mask, umask and limits the parent had (`do_fork`'s
     // `FORK_STATE`, staged here by the host with `gex_set_child_state`).
     {
@@ -10636,22 +10632,22 @@ fn chunk_sums(b: &[u8]) -> Vec<u64> {
 /// The first registry module whose bytes changed since they were pushed:
 /// its index, address, the changed chunk's offset and its bytes now. Each
 /// module is reported once.
-pub(crate) fn verify_registry(h: &mut Host) -> Option<String> {
-    for i in 0..h.jit.registry.len() {
-        let now = chunk_sums(&h.jit.registry[i]);
-        if let Some(c) = now.iter().zip(&h.jit.registry_sums[i]).position(|(a, b)| a != b) {
-            let m = &h.jit.registry[i];
+pub(crate) fn verify_registry(j: &mut Jit) -> Option<String> {
+    for i in 0..j.registry.len() {
+        let now = chunk_sums(&j.registry[i]);
+        if let Some(c) = now.iter().zip(&j.registry_sums[i]).position(|(a, b)| a != b) {
+            let m = &j.registry[i];
             let at = c * 256;
             let bytes: Vec<String> = m[at..(at + 256).min(m.len())].iter().map(|b| format!("{b:02x}")).collect();
             let s = format!(
                 "module {i} at {:#x}+{:#x} (of {} modules): chunk at +{at:#x} (address {:#x}) changed; now {}",
                 m.as_ptr() as usize,
                 m.len(),
-                h.jit.registry.len(),
+                j.registry.len(),
                 m.as_ptr() as usize + at,
                 bytes.join(" ")
             );
-            h.jit.registry_sums[i] = now;
+            j.registry_sums[i] = now;
             return Some(s);
         }
     }
@@ -11006,6 +11002,14 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         },
         Waiting::Accept(socket) => socket.poll_readable(),
         Waiting::Signal => false,
+        // One of the set pending: the thread's own, or the process's (what
+        // other processes sent is collected before this is asked,
+        // `sigs::ready`).
+        Waiting::SigWait(deadline) => {
+            deadline.is_some_and(|d| now >= d)
+                || matches!(blocked_on, Some(gex_kernel::BlockOp::SigWait { set, thread, process, .. })
+                    if (thread.pending() | process.shared()) & set != 0)
+        }
         Waiting::Pi { addr, gen, deadline } => {
             deadline.is_some_and(|d| now >= d)
                 || (unsafe { k_present() } != 0 && unsafe { k_futex_gen(*addr) } != *gen)
@@ -11111,6 +11115,7 @@ fn waiting_name(w: &Waiting) -> &'static str {
         Waiting::Net(Some(_)) => "net+timeout",
         Waiting::Net(None) => "net",
         Waiting::Signal => "sigsuspend",
+        Waiting::SigWait(_) => "sigtimedwait",
         Waiting::Pi { .. } => "pi-lock",
         Waiting::Exited => "exited",
     }
@@ -11547,7 +11552,7 @@ fn how_ended(r: &Run, now: u64, signalled: bool) -> (bool, bool) {
         // test therefore handed ETIMEDOUT to every such untimed
         // glibc lock wait, which glibc correctly treats as a fatal
         // futex result. Only an expired deadline is a timeout.
-        Waiting::Futex { deadline, .. } => deadline.is_some_and(|at| now >= at),
+        Waiting::Futex { deadline, .. } | Waiting::SigWait(deadline) => deadline.is_some_and(|at| now >= at),
         _ => false,
     };
     // Woken by the signal and not by the wait: ask the same
@@ -11663,6 +11668,11 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         // again (as the locked call's end does).
         waitq::publish_timer();
     }
+    if matches!(n, nr::KILL | nr::TKILL | nr::TGKILL) {
+        // As the locked call's end: the waits look again, an abort is named.
+        let sig = if n == nr::TGKILL { a2 } else { a1 };
+        with_px(|p| kill_sent(&gm, ctx_addr, my_pid(), sig, p));
+    }
     if let FreeOutcome::Done(_) = &outcome {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
@@ -11684,6 +11694,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
         FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
+        // A wasm32 program's sigreturn put back a call its handler
+        // interrupted: that call, made now as a syscall of its own (without
+        // the lock if it is a class call, as any other).
+        FreeOutcome::Again => return free_syscall(ctx, pc, mapped),
     })
 }
 
@@ -11729,7 +11743,22 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A blocking `connect` (L18), as the kernel's park: until the
         // connection is up, refused or gone (`wait_ready`'s `Net`).
         gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
-        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep or a socket"),
+        // `rt_sigsuspend` (L22d), as the kernel's park: until a signal it
+        // can see arrives (another process's notifies this process's wait
+        // queue, a thread's of its own `waitq::wake_process`, a timer's is
+        // the wait's deadline), or at once if one already can be.
+        gex_kernel::BlockOp::SigSuspend { .. } => {
+            if sigs::ready() || unsafe { k_present() } == 0 {
+                Waiting::Runnable
+            } else {
+                Waiting::Signal
+            }
+        }
+        // `rt_sigtimedwait`, as the kernel's park.
+        gex_kernel::BlockOp::SigWait { timeout, .. } => {
+            Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
+        }
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket or a signal"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     let reissue = matches!(op, gex_kernel::BlockOp::AcceptWait { .. });
@@ -11795,6 +11824,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
                 | Waiting::Sleep(_)
                 | Waiting::Child
                 | Waiting::Signal
+                | Waiting::SigWait(_)
                 | Waiting::Exited
                 | Waiting::Elsewhere
         );
@@ -12145,6 +12175,16 @@ fn finish_parked(
         }
         // `sigsuspend` only ever ends one way, whether or not a handler ran.
         gex_kernel::BlockOp::SigSuspend { .. } => Err(Errno::EINTR),
+        // `rt_sigtimedwait`: one of its set pending is taken by the call
+        // made again (with its `siginfo_t`); none, at the deadline, is
+        // `EAGAIN`; none before it (another thread took it) waits again.
+        gex_kernel::BlockOp::SigWait { set, thread, process, .. } => {
+            if (thread.pending() | process.shared()) & set == 0 && timed_out {
+                Err(Errno::EAGAIN)
+            } else {
+                Err(PI_RETRY)
+            }
+        }
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,
@@ -15772,7 +15812,7 @@ pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
 /// survive `execve`. See [`gex_shared_dump`] for why the child needs it.
 #[no_mangle]
 pub extern "C" fn gex_shared_count() -> u32 {
-    with_host(|h| h.jit.shared.len() as u32)
+    with_jit_only(|j| j.shared.len() as u32)
 }
 
 /// Write the identity map to `out`: a `u64` page, a `u64` key and a `u32`
@@ -15788,13 +15828,13 @@ pub extern "C" fn gex_shared_count() -> u32 {
 /// receiver actually mapped.
 #[no_mangle]
 pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
-    with_host(|h| {
-        let n = h.jit.shared.len();
+    with_jit_only(|j| {
+        let n = j.shared.len();
         if (n * 20) as u32 > cap {
             return -1;
         }
         let dst = shim_slice_mut(out, (n * 20) as u32);
-        for (i, ((page, key), base)) in h.jit.shared.iter().enumerate() {
+        for (i, ((page, key), base)) in j.shared.iter().enumerate() {
             dst[i * 20..i * 20 + 8].copy_from_slice(&page.to_le_bytes());
             dst[i * 20 + 8..i * 20 + 16].copy_from_slice(&key.to_le_bytes());
             dst[i * 20 + 16..i * 20 + 20].copy_from_slice(&base.to_le_bytes());
@@ -15812,14 +15852,14 @@ pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
 pub extern "C" fn gex_shared_seed(ptr: u32, count: u32) -> u32 {
     phase(4);
     let src = shim_slice(ptr, count.saturating_mul(20));
-    with_host(|h| {
+    with_jit_only(|j| {
         let mut n = 0u32;
         for r in src.chunks_exact(20) {
             let page = u64::from_le_bytes(r[0..8].try_into().unwrap());
             let key = u64::from_le_bytes(r[8..16].try_into().unwrap());
             let base = u32::from_le_bytes(r[16..20].try_into().unwrap());
             if let std::collections::hash_map::Entry::Vacant(v) =
-                h.jit.shared.entry((page, key))
+                j.shared.entry((page, key))
             {
                 v.insert(base);
                 n += 1;
@@ -16647,8 +16687,8 @@ pub extern "C" fn gex_set_heartbeat(every: i64) {
 /// code to translate.
 #[no_mangle]
 pub extern "C" fn gex_jit_by_object(out: u32, max: u32) -> u32 {
-    let text = with_host(|h| {
-        let mut v: Vec<(&String, &(u64, u64, u64))> = h.jit.by_object.iter().collect();
+    let text = with_jit_only(|j| {
+        let mut v: Vec<(&String, &(u64, u64, u64))> = j.by_object.iter().collect();
         v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         v.iter()
             .take(8)
@@ -16720,12 +16760,12 @@ pub extern "C" fn gex_lift_why(i: u32) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_jit_blocks() -> i64 {
-    with_host(|h| h.jit.blocks as i64)
+    with_jit_only(|j| j.blocks as i64)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_jit_compiles() -> i64 {
-    with_host(|h| h.jit.compiles as i64)
+    with_jit_only(|j| j.compiles as i64)
 }
 
 /// Blocks lifted on a page a closure library already claims.
@@ -16735,7 +16775,7 @@ pub extern "C" fn gex_jit_compiles() -> i64 {
 /// block static recompilation already produced.
 #[no_mangle]
 pub extern "C" fn gex_lift_in_closure() -> i64 {
-    with_host(|h| h.jit.lift_in_closure as i64)
+    with_jit_only(|j| j.lift_in_closure as i64)
 }
 
 /// How the shared-slot lookup went, packed so one call answers.
@@ -16744,19 +16784,19 @@ pub extern "C" fn gex_lift_in_closure() -> i64 {
 /// program that misses a hundred thousand times.
 #[no_mangle]
 pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
-    with_host(|h| {
+    with_jit_only(|j| {
         (match which {
-            0 => h.jit.reuse_have,
-            1 => h.jit.reuse_hit,
-            2 => h.jit.reuse_miss,
-            4 => h.jit.reuse_served,
-            5 => h.jit.store_ok,
-            6 => h.jit.store_full,
+            0 => j.reuse_have,
+            1 => j.reuse_hit,
+            2 => j.reuse_miss,
+            4 => j.reuse_served,
+            5 => j.store_ok,
+            6 => j.store_full,
             7 => SERVE_NONE.with(|c| c.borrow().0),
             8 => SERVE_NONE.with(|c| c.borrow().1),
             9 => NOIDENT_WHY.with(|c| c.borrow().0),
             10 => NOIDENT_WHY.with(|c| c.borrow().1),
-            _ => h.jit.reuse_noident,
+            _ => j.reuse_noident,
         }) as i64
     })
 }
@@ -16764,7 +16804,7 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
 /// Milliseconds the shim itself spent translating.
 #[no_mangle]
 pub extern "C" fn gex_jit_millis() -> i64 {
-    with_host(|h| (h.jit.nanos / 1_000_000) as i64)
+    with_jit_only(|j| (j.nanos / 1_000_000) as i64)
 }
 
 /// `GEX_EXC_TRACE`-style narration of NtRaiseException's nesting decision

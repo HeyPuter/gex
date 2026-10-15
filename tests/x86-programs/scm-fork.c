@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -53,8 +54,9 @@ static int recv_fds(int s, int *a, int *b) {
 }
 
 int main(void) {
-    const char *path = "/tmp/scm-fork.txt";
-    int f = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    /* A name of its own: concurrent runs under gexc share /tmp. */
+    char path[] = "/tmp/scm-fork-XXXXXX";
+    int f = mkstemp(path);
     if (f < 0 || write(f, "skip:payload", 12) != 12) {
         perror("file");
         return 1;

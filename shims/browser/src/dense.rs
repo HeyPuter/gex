@@ -288,9 +288,8 @@ pub extern "C" fn gex_dense_want() -> u32 {
 /// or -1.
 #[no_mangle]
 pub extern "C" fn gex_dense_owner(d: u32) -> i32 {
-    crate::with_host(|h| {
-        h.jit
-            .registry_dense
+    crate::with_jit_only(|j| {
+        j.registry_dense
             .iter()
             .rposition(|&(b, n)| d >= b && d < b + n)
             .map_or(-1, |i| i as i32)

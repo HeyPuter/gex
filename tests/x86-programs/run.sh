@@ -9,7 +9,12 @@
 # x86-64 build under the browser shim in Node (run-node.mjs, memory64 shared
 # seed) for the programs listed in PAGE_PROGRAMS, when that seed has been built
 # (GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh) and node is on PATH.
+#
+# TIERS limits the run to those tiers (a space-separated list of t1, fjit,
+# page; all by default): a job that only wants the page, beside another that
+# runs the rest, sets TIERS=page.
 set -u
+TIERS=${TIERS:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 WORK=${WORK:-$(mktemp -d)}
@@ -110,7 +115,35 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # first starts threads; none may share the main thread's context.
 # fork-twice-thread: a shell forked from a second thread launches two
 # children in quick succession from a thread of its own; all keep running.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread"}
+# quiet-threads: uname, the scheduling calls, getcpu, fsync, getgroups,
+# getppid, arch_prctl, times and time from several threads at once while
+# children are forked (L22: the calls that need nothing of the process,
+# without the kernel lock).
+# fdobj-threads: eventfds ping-ponged between blocking readers, timerfds,
+# epoll sets, memfds grown with fallocate and mapped, and a splice that
+# blocks on an empty pipe, then sendfile and copy_file_range, from several
+# threads at once (L22b: the calls that make or work a descriptor's object,
+# without the kernel lock).
+# cred-threads: one thread changes the process's uid and gid while two
+# others check in turn that getuid, getresuid, a new file's owner and the
+# sender of a signal they send themselves all show the new ids, and another
+# asks getpgid and getsid (L22c: the credential and session calls without
+# the kernel lock; the ids every thread reads are the process's, now).
+# kill-threads: a token passed round four threads by tgkill, a read
+# interrupted by one, sigsuspend woken by one twenty times, the process's
+# own kill taken by sigtimedwait, and a child ended by kill (L22d: the
+# signal calls without the kernel lock).
+# sigwait-threads: sigwaitinfo and sigtimedwait that wait, taking SIGUSR1s
+# sent by tgkill, by kill to two waiters, and by a child; a timeout that
+# says EAGAIN after its time, and a wait a handled signal interrupts.
+# fork-maps-threads (native tiers only for now): forks while other threads
+# map, protect and unmap memory and files (L19: a fork's image, code names
+# and the translator's file reads come from the published map, not the
+# kernel lock). Not in the page tier: in the memory64 page a forked child
+# of a threaded parent can fault walking musl's thread list, whose
+# descriptors sit on thread stacks above 4 GiB that its memory was not grown
+# to cover (fails the same on 31a21cad).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -128,6 +161,7 @@ for src in "$HERE"/*.c; do
     for target in $targets; do
     for tier in $tiers; do
         [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
+        case " ${TIERS:-$tier} " in *" $tier "*) ;; *) continue ;; esac
         flags=$gexflags
         [ $tier = fjit ] && flags="$flags --fjit"
         extra=""

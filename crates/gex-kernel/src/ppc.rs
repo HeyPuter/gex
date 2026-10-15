@@ -36,12 +36,13 @@ pub const UNKNOWN: u64 = u64::MAX;
 const AT_FDCWD: u64 = (-100i64) as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
-/// ppc's `O_LARGEFILE`/`O_DIRECT` and the canonical (AArch64) ones: the two
-/// bits are swapped between the ABIs.
+/// ppc's `O_LARGEFILE`/`O_DIRECT` and the asm-generic ones: the two bits are
+/// swapped between the ABIs. ppc's other open flags are spelled the generic
+/// way, which the kernel's own spelling (x86's) is not.
 const PPC_O_LARGEFILE: u64 = 0o200000;
 const PPC_O_DIRECT: u64 = 0o400000;
-const O_DIRECT: u64 = 0o200000;
-const O_LARGEFILE: u64 = 0o400000;
+const O_DIRECT: u64 = crate::fs::oflags::generic::O_DIRECT;
+const O_LARGEFILE: u64 = crate::fs::oflags::generic::O_LARGEFILE;
 
 /// ppc's `MAP_NORESERVE`/`MAP_LOCKED`, and the canonical values.
 const PPC_MAP_NORESERVE: u64 = 0x40;
@@ -58,8 +59,18 @@ fn pair_hi_lo(hi: u64, lo: u64) -> u64 {
     ((hi & 0xffff_ffff) << 32) | (lo & 0xffff_ffff)
 }
 
-/// Open flags, ppc spelling to canonical.
+/// Open flags, ppc spelling to the kernel's.
 pub fn open_flags(f: u64) -> u64 {
+    crate::fs::oflags::from_generic(swap_direct_largefile(f))
+}
+
+/// Open flags, the kernel's spelling to ppc's (`fcntl(F_GETFL)`).
+pub fn open_flags_out(f: u64) -> u64 {
+    swap_direct_largefile(crate::fs::oflags::to_generic(f))
+}
+
+/// ppc spelling to generic for two bits that trade places; its own inverse.
+fn swap_direct_largefile(f: u64) -> u64 {
     let mut out = f & !(PPC_O_LARGEFILE | PPC_O_DIRECT);
     if f & PPC_O_LARGEFILE != 0 {
         out |= O_LARGEFILE;
@@ -70,17 +81,6 @@ pub fn open_flags(f: u64) -> u64 {
     out
 }
 
-/// Open flags, canonical to ppc spelling (`fcntl(F_GETFL)`).
-pub fn open_flags_out(f: u64) -> u64 {
-    let mut out = f & !(O_LARGEFILE | O_DIRECT);
-    if f & O_LARGEFILE != 0 {
-        out |= PPC_O_LARGEFILE;
-    }
-    if f & O_DIRECT != 0 {
-        out |= PPC_O_DIRECT;
-    }
-    out
-}
 
 fn mmap_flags(f: u64) -> u64 {
     let mut out = f & !(PPC_MAP_NORESERVE | PPC_MAP_LOCKED);
@@ -935,7 +935,13 @@ mod tests {
 
     #[test]
     fn open_flags_swap_direct_and_largefile() {
-        assert_eq!(open_flags(PPC_O_LARGEFILE | 2), O_LARGEFILE | 2);
-        assert_eq!(open_flags_out(O_LARGEFILE), PPC_O_LARGEFILE);
+        use crate::fs::oflags as k;
+        assert_eq!(open_flags(PPC_O_LARGEFILE | 2), k::O_LARGEFILE | 2);
+        assert_eq!(open_flags_out(k::O_LARGEFILE), PPC_O_LARGEFILE);
+        assert_eq!(open_flags(PPC_O_DIRECT), k::O_DIRECT);
+        assert_eq!(open_flags_out(k::O_DIRECT), PPC_O_DIRECT);
+        // The bits ppc spells the generic way: O_DIRECTORY, O_NOFOLLOW.
+        assert_eq!(open_flags(0o40000 | 0o100000), k::O_DIRECTORY | k::O_NOFOLLOW);
+        assert_eq!(open_flags_out(k::O_DIRECTORY | k::O_NOFOLLOW), 0o40000 | 0o100000);
     }
 }

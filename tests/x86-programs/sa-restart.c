@@ -6,7 +6,12 @@
  *   - without it, wait4 says EINTR;
  *   - poll and nanosleep say EINTR even with SA_RESTART.
  * gex answered EINTR for every one of them (a shell's waitpid saw it).
- * The output is the same natively. */
+ * The output is the same natively.
+ *
+ * The alarm is a fixed 100 ms ahead, so on a loaded machine it can fire
+ * before the call waits; the handler notes whether the call had begun
+ * (`in_call`), and a case whose alarm came early is made again (five times
+ * at most). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
@@ -21,8 +26,25 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t got;
-static void on_alarm(int s) { (void)s; got++; }
+static volatile sig_atomic_t got, in_call, early;
+static void on_alarm(int s) {
+    (void)s;
+    got++;
+    if (!in_call) early = 1;
+}
+
+/* Before a case's attempt: no handler yet, the call not begun. */
+static void attempt(void) {
+    got = 0;
+    in_call = 0;
+    early = 0;
+}
+
+/* Whether to make the case again: its alarm came before its call. */
+static int again(int *tries) {
+    in_call = 0;
+    return early && ++*tries < 5;
+}
 
 static void handler(int restart) {
     struct sigaction sa;
@@ -51,45 +73,56 @@ static void report(const char *what, int ok, long r, int e) {
 }
 
 static void case_wait4(int restart) {
-    got = 0;
     handler(restart);
-    pid_t c = fork();
-    if (c == 0) {
-        ms(400);
-        _exit(7);
-    }
-    alarm_soon();
-    int st = 0;
-    pid_t r = waitpid(c, &st, 0);
-    int e = errno;
+    pid_t c, r;
+    int st, e, tries = 0;
+    do {
+        attempt();
+        c = fork();
+        if (c == 0) {
+            ms(400);
+            _exit(7);
+        }
+        alarm_soon();
+        st = 0;
+        in_call = 1;
+        r = waitpid(c, &st, 0);
+        e = errno;
+        if (r != c) waitpid(c, 0, 0);
+    } while (again(&tries));
     /* The child's pid differs between runs: 1 for it. */
     if (restart) {
         report("wait4, SA_RESTART", r == c && WIFEXITED(st) && WEXITSTATUS(st) == 7 && got == 1, r == c ? 1 : r, e);
     } else {
         report("wait4, no SA_RESTART", r == -1 && e == EINTR && got == 1, r, e);
-        waitpid(c, 0, 0);
     }
 }
 
 static void case_read(void) {
-    got = 0;
     handler(1);
-    int p[2];
-    if (pipe(p)) return;
-    pid_t c = fork();
-    if (c == 0) {
-        ms(400);
-        if (write(p[1], "x", 1) != 1) _exit(1);
-        _exit(0);
-    }
-    close(p[1]);
-    alarm_soon();
-    char ch = 0;
-    long r = read(p[0], &ch, 1);
-    int e = errno;
+    long r;
+    int e, tries = 0;
+    char ch;
+    do {
+        attempt();
+        int p[2];
+        if (pipe(p)) return;
+        pid_t c = fork();
+        if (c == 0) {
+            ms(400);
+            if (write(p[1], "x", 1) != 1) _exit(1);
+            _exit(0);
+        }
+        close(p[1]);
+        alarm_soon();
+        ch = 0;
+        in_call = 1;
+        r = read(p[0], &ch, 1);
+        e = errno;
+        close(p[0]);
+        waitpid(c, 0, 0);
+    } while (again(&tries));
     report("read, SA_RESTART", r == 1 && ch == 'x' && got == 1, r, e);
-    close(p[0]);
-    waitpid(c, 0, 0);
 }
 
 static int word;
@@ -107,42 +140,57 @@ static void *waker(void *arg) {
 }
 
 static void case_futex(void) {
-    got = 0;
     handler(1);
-    word = 0;
-    pthread_t t;
-    pthread_create(&t, 0, waker, 0);
-    alarm_soon();
-    /* One call: woken by the waker (0) once the handler has run, or by a
-     * restart that finds the word already changed (EAGAIN). EINTR is the
-     * bug. */
-    long r = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, 0, 0, 0);
-    int e = errno;
+    long r;
+    int e, tries = 0;
+    do {
+        attempt();
+        word = 0;
+        pthread_t t;
+        pthread_create(&t, 0, waker, 0);
+        alarm_soon();
+        /* One call: woken by the waker (0) once the handler has run, or by
+         * a restart that finds the word already changed (EAGAIN). EINTR is
+         * the bug. */
+        in_call = 1;
+        r = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, 0, 0, 0);
+        e = errno;
+        pthread_join(t, 0);
+    } while (again(&tries));
     report("futex wait, SA_RESTART", (r == 0 || (r == -1 && e == EAGAIN)) && got == 1, r, e);
-    pthread_join(t, 0);
 }
 
 static void case_poll(void) {
-    got = 0;
     handler(1);
-    int p[2];
-    if (pipe(p)) return;
-    alarm_soon();
-    struct pollfd f = {.fd = p[0], .events = POLLIN};
-    long r = poll(&f, 1, 2000);
-    int e = errno;
+    long r;
+    int e, tries = 0;
+    do {
+        attempt();
+        int p[2];
+        if (pipe(p)) return;
+        alarm_soon();
+        struct pollfd f = {.fd = p[0], .events = POLLIN};
+        in_call = 1;
+        r = poll(&f, 1, 2000);
+        e = errno;
+        close(p[0]);
+        close(p[1]);
+    } while (again(&tries));
     report("poll, SA_RESTART", r == -1 && e == EINTR && got == 1, r, e);
-    close(p[0]);
-    close(p[1]);
 }
 
 static void case_nanosleep(void) {
-    got = 0;
     handler(1);
-    alarm_soon();
-    struct timespec d = {2, 0};
-    long r = nanosleep(&d, &d);
-    int e = errno;
+    long r;
+    int e, tries = 0;
+    do {
+        attempt();
+        alarm_soon();
+        struct timespec d = {2, 0};
+        in_call = 1;
+        r = nanosleep(&d, &d);
+        e = errno;
+    } while (again(&tries));
     report("nanosleep, SA_RESTART", r == -1 && e == EINTR && got == 1, r, e);
 }
 

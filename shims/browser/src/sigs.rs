@@ -26,7 +26,12 @@ pub(crate) struct Home {
     pub sig: Arc<ProcSig>,
     procs: Arc<ProcTable>,
     pub pid: i32,
-    uid: u32,
+    /// Its user and group ids (`Kernel::creds`, the same ones): a set
+    /// under the lock or without it is every thread's next read.
+    creds: Arc<gex_kernel::syscalls::Creds>,
+    /// Its threads' signal states (`Kernel::thread_signals`), for a
+    /// `tgkill` to one.
+    threads: Arc<gex_kernel::signal::ThreadSigs>,
     clock: ClockFn,
     /// Its futexes and its memory map's published view, for `futex`
     /// without the kernel (docs/kernel-locking.md §5.2 step 4).
@@ -47,7 +52,6 @@ pub(crate) struct Home {
     /// For the path calls: the threads' own fs_structs, the group, the
     /// terminals and `O_TMPFILE`'s serial (`Kernel::path_io`).
     thread_fs: Arc<gex_kernel::syscalls::ThreadFs>,
-    gid: u32,
     ptys: Option<gex_kernel::pty::Remote>,
     tmpfiles: Arc<std::sync::atomic::AtomicU64>,
     /// The process's first fs_struct (its directory and umask).
@@ -56,9 +60,9 @@ pub(crate) struct Home {
     /// for `prlimit64` (L17).
     pipes: Option<gex_kernel::pipe::Remote>,
     rlimits: Arc<gex_kernel::syscalls::Rlimits>,
-    /// For the socket calls (L18): the network, the resolver and the ports,
-    /// the global kernel's sockets, and the socket name tables.
-    net: Option<Arc<dyn gex_kernel::net::NetStack>>,
+    /// For the socket calls (L18): the resolver and the ports, the global
+    /// kernel's sockets, and the socket name tables (the network is the
+    /// page's, `crate::page_net`).
     resolver: Arc<gex_kernel::net::Resolver>,
     ports: Arc<gex_kernel::net::Ports>,
     unix_remote: Option<gex_kernel::unix::Remote>,
@@ -90,7 +94,8 @@ fn home_of(k: &Kernel) -> Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
         pid: k.pid,
-        uid: k.uid,
+        creds: Arc::clone(&k.creds),
+        threads: Arc::clone(&k.thread_signals),
         clock: k.clock,
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
@@ -101,13 +106,11 @@ fn home_of(k: &Kernel) -> Home {
         pins: Arc::clone(&k.pins),
         place: k.place.clone(),
         thread_fs: Arc::clone(&k.thread_fs),
-        gid: k.gid,
         ptys: k.ptys,
         tmpfiles: Arc::clone(&k.tmpfiles),
         proc_fs: Arc::clone(&k.proc_fs),
         pipes: k.pipes,
         rlimits: Arc::clone(&k.rlimits),
-        net: k.net.clone(),
         resolver: Arc::clone(&k.resolver),
         ports: Arc::clone(&k.ports),
         unix_remote: k.unix_remote,
@@ -129,6 +132,26 @@ impl Home {
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Its user and group ids, which lock themselves.
+    pub(crate) fn creds(&self) -> &gex_kernel::syscalls::Creds {
+        &self.creds
+    }
+
+    /// Its terminal, which locks itself.
+    pub(crate) fn tty(&self) -> &gex_kernel::tty::TtyRef {
+        &self.tty
+    }
+
+    /// The process table, which locks itself.
+    pub(crate) fn procs(&self) -> &ProcTable {
+        &self.procs
+    }
+
+    /// The socket name table, which locks itself.
+    pub(crate) fn socket_names(&self) -> &gex_kernel::unix::SocketNames {
+        &self.socket_names
     }
 
     /// Up to `out.len()` bytes of `path` from `offset`, through the
@@ -233,14 +256,14 @@ fn gather(home: &Home) {
         gex_kernel::proc::signal_seq()
     };
     if SEQ_SEEN.with(|c| c.replace(seq)) != seq {
-        home.sig.collect(&home.procs, home.pid, home.uid);
+        home.sig.collect(&home.procs, home.pid, home.creds.uid());
         // Another process's `tgkill` to this Worker's thread: its own, so
         // taken here (the kernel's `collect_signals` takes the rest, and
         // drops those for threads gone).
         MINE.with(|m| {
             if let Some((tid, t)) = m.borrow().as_ref() {
                 for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
-                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.uid });
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.uid() });
                 }
             }
         });
@@ -294,7 +317,7 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         // Linux sends it as the writer itself sending it (SI_USER).
         view.raise_from(
             signal::sig::SIGPIPE,
-            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.uid },
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.uid() },
         );
     }
     if suspended.is_some() {
@@ -356,8 +379,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             map: map(),
             compat,
             pid: home.pid,
-            uid: home.uid,
-            gid: home.gid,
+            creds: &home.creds,
             procs: &home.procs,
             ptys: home.ptys,
             tmpfiles: &home.tmpfiles,
@@ -368,13 +390,14 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         procs: &home.procs,
         tty: &home.tty,
         pid: home.pid,
-        uid: home.uid,
+        creds: &home.creds,
+        threads: &home.threads,
         wasm32: crate::WASM32.load(Ordering::Acquire),
         futex,
         started: crate::clock_started(),
         rlimits: &home.rlimits,
         net: syscalls::NetIo {
-            net: home.net.as_ref(),
+            net: crate::page_net(),
             resolver: &home.resolver,
             ports: &home.ports,
             unix_remote: home.unix_remote,

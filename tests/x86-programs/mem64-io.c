@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -32,8 +33,9 @@ int main(void) {
     unsigned want = sum((unsigned char *)a, LEN);
 
     /* A file: write from a, read back into b. */
-    const char *path = "/tmp/mem64-io.bin";
-    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    /* A name of its own: concurrent runs under gexc share /tmp. */
+    char path[] = "/tmp/mem64-io-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) { puts("open failed"); return 1; }
     if (write(fd, a, LEN) != LEN) { puts("file write short"); return 1; }
     memset(b, 0, LEN);

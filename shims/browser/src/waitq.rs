@@ -115,7 +115,7 @@ fn queues_of(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: u
     let mut qs = vec![proc_queue()];
     let mut soonest = match waiting {
         Waiting::Sleep(at) => Some(*at),
-        Waiting::Futex { deadline, .. } | Waiting::Net(deadline) | Waiting::Pi { deadline, .. } => *deadline,
+        Waiting::Futex { deadline, .. } | Waiting::Net(deadline) | Waiting::Pi { deadline, .. } | Waiting::SigWait(deadline) => *deadline,
         _ => None,
     };
     let mut handle = |h: &Arc<dyn gex_kernel::vfs::FileHandle>, qs: &mut Vec<u32>| {
@@ -232,6 +232,7 @@ fn same_wait(a: &Waiting, b: &Waiting) -> bool {
         (Waiting::Net(x), Waiting::Net(y)) => x == y,
         (Waiting::Pi { addr: a, gen: g, .. }, Waiting::Pi { addr: b, gen: k, .. }) => a == b && g == k,
         (Waiting::Child, Waiting::Child) | (Waiting::Signal, Waiting::Signal) => true,
+        (Waiting::SigWait(x), Waiting::SigWait(y)) => x == y,
         _ => false,
     }
 }

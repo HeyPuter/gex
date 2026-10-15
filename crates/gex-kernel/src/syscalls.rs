@@ -324,6 +324,20 @@ pub enum BlockOp {
     /// [`Kernel::finish_blocking`] does before the call returns `EINTR` --
     /// the only thing it ever returns.
     SigSuspend { restore_mask: u64 },
+    /// `rt_sigtimedwait` with none of `set` pending: wait until one of them
+    /// is, for at most `timeout`. The host answers `Ok(0)` when one is
+    /// pending (the call is then made again, which takes it with its
+    /// `siginfo_t`), `EAGAIN` when the time is up, `EINTR` when a signal
+    /// outside the set is delivered. The thread's and the process's pending
+    /// sets travel with it, so asking takes no kernel lock; a signal another
+    /// process sends reaches the process's set when the waiter's host
+    /// collects it, as it does to ask whether a signal ends any wait.
+    SigWait {
+        set: u64,
+        timeout: Option<std::time::Duration>,
+        thread: Arc<crate::signal::ThreadSig>,
+        process: Arc<crate::signal::ProcSig>,
+    },
     /// A `read` on a stream with nothing in it yet: a terminal nobody has
     /// typed at, a socket with nothing arrived.
     ///
@@ -441,6 +455,8 @@ impl BlockOp {
         match self {
             BlockOp::FutexWait { deadline: None, .. } => Restart::SaRestart,
             BlockOp::FutexWait { .. } | BlockOp::Sleep(_) | BlockOp::SigSuspend { .. } | BlockOp::Poll { .. } => Restart::Never,
+            // signal(7): never restarted, whatever SA_RESTART says.
+            BlockOp::SigWait { .. } => Restart::Never,
             BlockOp::FutexLockPi { .. } => Restart::Always,
             // `connect` is not in signal(7)'s list: an interrupted connect
             // goes on in the background and says `EINTR`.
@@ -504,8 +520,9 @@ pub struct Kernel {
     /// The argument and environment vectors, for `/proc/self/cmdline`.
     pub argv: Vec<String>,
     pub envp: Vec<String>,
-    pub uid: u32,
-    pub gid: u32,
+    /// Its user and group ids, which its threads share and a fork copies
+    /// ([`Creds`]).
+    pub creds: Arc<Creds>,
     /// Trace every syscall to stderr (PLAN §11's strace mode).
     pub trace: bool,
     /// Signal dispositions, masks and pending set.
@@ -569,6 +586,9 @@ pub struct Kernel {
     pub retry_transfer: Option<(u64, [u64; 6])>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
+    /// An `rt_sigtimedwait` that waited (`BlockOp::SigWait`): its arguments,
+    /// to take the signal with once one of its set is pending.
+    pub retry_sigwait: Option<[u64; 6]>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
     /// enters with `int 0x80`, and its numbering and structures are the i386
     /// ones (see `crate::i386`). Set at exec from the image's class,
@@ -645,7 +665,9 @@ pub struct Kernel {
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
-    pub thread_signals: std::collections::HashMap<i32, Arc<crate::signal::ThreadSig>>,
+    /// Behind its own lock, shared with the host's lock-free calls, which
+    /// signal a thread through it (`tgkill`).
+    pub thread_signals: Arc<crate::signal::ThreadSigs>,
     /// The thread whose part `signals` holds now.
     pub sig_tid: i32,
     /// Every other thread's half-finished blocking call (`PendingCall`),
@@ -889,8 +911,48 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
+/// A call's answer as the word its result register holds: the value, or
+/// the negated errno.
+fn result_word(r: SysResult) -> u64 {
+    match r {
+        Ok(v) => v,
+        Err(e) => (e.0 as i64).wrapping_neg() as u64,
+    }
+}
+
+/// `times`: four `clock_t` -- user, system, and the same for reaped
+/// children -- counted in the hundredths of a second that `USER_HZ` means
+/// on Linux, and a return value on the same scale; `cpu_ns` the processor
+/// time used. i386's are 32-bit.
+fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, buf: u64) -> SysResult {
+    let ticks = (cpu_ns / 10_000_000) as u64;
+    if buf != 0 && compat {
+        m.zero(buf, 16)?;
+        m.write_u32(buf, ticks as u32)?;
+    } else if buf != 0 {
+        m.zero(buf, 32)?;
+        m.write_u64(buf, ticks)?;
+    }
+    Ok(if compat { ticks as u32 as u64 } else { ticks })
+}
+
+/// `time`: the wall clock's seconds, also stored at `tloc` unless it is
+/// null -- as a 32-bit `time_t` for i386, whose 64-bit store wrote four
+/// bytes past the caller's variable.
+fn time_answer(m: &mut GuestMem<'_>, compat: bool, clock: ClockFn, tloc: u64) -> SysResult {
+    let (secs, _) = guest_wall(clock());
+    if tloc != 0 {
+        if compat {
+            m.write_u32(tloc, secs as u32)?;
+        } else {
+            m.write_u64(tloc, secs)?;
+        }
+    }
+    Ok(if compat { secs as u32 as u64 } else { secs })
+}
+
 /// Answer one of the calls that only read the clock -- `clock_gettime`,
-/// `gettimeofday`, `getrusage`, `sched_yield` -- straight from the context at
+/// `gettimeofday`, `getrusage`, `times`, `time`, `sched_yield` -- straight from the context at
 /// `ctx_addr`, without a [`Kernel`], and say whether it was one.
 ///
 /// A host takes its kernel lock for every syscall, and Wine asks the time
@@ -938,6 +1000,10 @@ pub fn clock_call(
         // (buffer, 32-bit timeval)
         Tod(u64, bool),
         Rusage(u64),
+        // (buffer): `times`, in the ABI's `clock_t`.
+        Times(u64),
+        // (where to store it, or 0): `time`, x86-64's and i386's.
+        Time(u64),
         Yield,
     }
     let call = if compat {
@@ -949,6 +1015,8 @@ pub fn clock_call(
             x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
             x::GETTIMEOFDAY => Call::Tod(a0, true),
             x::GETRUSAGE => Call::Rusage(a1),
+            x::TIMES => Call::Times(a0),
+            x::TIME => Call::Time(a0),
             x::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
@@ -960,6 +1028,8 @@ pub fn clock_call(
             229 => Call::Res(a1, false),
             96 => Call::Tod(a0, false),
             98 => Call::Rusage(a1),
+            100 => Call::Times(a0),
+            201 => Call::Time(a0),
             24 => Call::Yield,
             _ => return false,
         }
@@ -969,6 +1039,7 @@ pub fn clock_call(
             nr::CLOCK_GETRES => Call::Res(a1, false),
             nr::GETTIMEOFDAY => Call::Tod(a0, false),
             nr::GETRUSAGE => Call::Rusage(a1),
+            nr::TIMES => Call::Times(a0),
             nr::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
@@ -1020,6 +1091,22 @@ pub fn clock_call(
         // A pure yield: the caller's Worker is its own OS thread, and the
         // browser schedules those without being asked.
         Call::Yield => true,
+        Call::Times(buf) => {
+            let r = times_answer(m, compat, cpu(), buf);
+            if gex_abi::X86 {
+                let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+            }
+            let _ = set_result(m, ctx_addr, result_word(r));
+            return true;
+        }
+        Call::Time(tloc) => {
+            let r = time_answer(m, compat, clock, tloc);
+            if gex_abi::X86 {
+                let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+            }
+            let _ = set_result(m, ctx_addr, result_word(r));
+            return true;
+        }
     };
     if gex_abi::X86 {
         let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
@@ -1053,6 +1140,268 @@ pub struct FdIo<'a> {
 }
 
 impl FdIo<'_> {
+    /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
+    ///
+    /// One descriptor, readable and writable, over a single `EventFd`. The
+    /// `EFD_NONBLOCK`/`EFD_CLOEXEC` flags are `O_NONBLOCK`/`O_CLOEXEC` by
+    /// another name, so they go straight into the open flags and the
+    /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
+    pub fn eventfd2(&self, initval: u64, flags: u64) -> SysResult {
+        use crate::eventfd::{flags as efd, EventFd};
+        let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[eventfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDWR,
+            true,
+            true,
+        );
+        self.fds.insert(file, cloexec)
+    }
+    /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
+    pub fn timerfd_create(&self, clock: ClockFn, clockid: u64, flags: u64) -> SysResult {
+        let mut timer = crate::timerfd::TimerFd::new(clock);
+        if is_monotonic_clock(clockid) {
+            timer = timer.monotonic(monotonic_from);
+        }
+        let handle = Arc::new(timer);
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[timerfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        self.fds.insert(file, cloexec)
+    }
+    /// `timerfd_settime`: arm or disarm the timer from an `itimerspec`.
+    ///
+    /// The struct is two `timespec`s -- `it_interval` then `it_value`, sixteen
+    /// bytes each. `it_value` of zero disarms; the `TFD_TIMER_ABSTIME` flag
+    /// makes it an absolute time on the clock. The old setting is written back
+    /// through `old` when it is non-null, the same shape the kernel returns.
+    pub fn timerfd_settime(
+        &self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        flags: u64,
+        new: u64,
+        old: u64,
+    ) -> SysResult {
+        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
+            let secs = m.read_u64(at)?;
+            let nanos = m.read_u64(at + 8)?;
+            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+        };
+        let interval = read_ns(m, new)?;
+        let value = read_ns(m, new + 16)?;
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, prev_int) = handle
+            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
+            .ok_or(Errno::EINVAL)?;
+        if old != 0 {
+            m.write_u64(old, prev_int / 1_000_000_000)?;
+            m.write_u64(old + 8, prev_int % 1_000_000_000)?;
+            m.write_u64(old + 16, rem / 1_000_000_000)?;
+            m.write_u64(old + 24, rem % 1_000_000_000)?;
+        }
+        Ok(0)
+    }
+    /// `timerfd_gettime`: write the time to the next expiry and the interval.
+    pub fn timerfd_gettime(&self, m: &mut GuestMem<'_>, fd: i32, curr: u64) -> SysResult {
+        if curr == 0 {
+            return Ok(0);
+        }
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, interval) = handle.timerfd_get().ok_or(Errno::EINVAL)?;
+        m.write_u64(curr, interval / 1_000_000_000)?;
+        m.write_u64(curr + 8, interval % 1_000_000_000)?;
+        m.write_u64(curr + 16, rem / 1_000_000_000)?;
+        m.write_u64(curr + 24, rem % 1_000_000_000)?;
+        Ok(0)
+    }
+    pub fn memfd_create(&self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
+        const MFD_CLOEXEC: u64 = 1;
+        let raw = m.read_cstr(name, 249)?;
+        let name = String::from_utf8_lossy(&raw).into_owned();
+        let memfd = Arc::new(unix::MemFd::new(&name));
+        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
+    }
+    /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
+    ///
+    /// Xwayland calls this through `posix_fallocate` after sealing its shared
+    /// memory, to be certain the pages are there before it hands the
+    /// descriptor to a compositor. The other modes -- punching holes,
+    /// collapsing ranges -- are refused rather than silently treated as
+    /// allocation, which would leave a caller believing it had freed space.
+    pub fn fallocate(&self, fd: i32, mode: u64, offset: u64, len: u64) -> SysResult {
+        if mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if let Ok(memfd) = self.memfd_of(fd) {
+            return memfd.reserve(end);
+        }
+        // An ordinary file grows by being written to its new length.
+        let file = self.fds.get(fd)?;
+        let size = file.handle.metadata()?.size;
+        if end > size {
+            file.handle.truncate(end)?;
+        }
+        Ok(0)
+    }
+    /// `epoll_create1`.
+    pub fn epoll_create(&self, flags: u64) -> SysResult {
+        const EPOLL_CLOEXEC: u64 = 0o2000000;
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::new());
+        let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
+        self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)
+    }
+    /// Copy up to `count` bytes from one descriptor to another through a kernel
+    /// buffer -- the shared core of `sendfile` and `copy_file_range`. When
+    /// `in_off`/`out_off` is `Some` it is an absolute offset used without
+    /// touching that descriptor's own position (the offset-pointer forms);
+    /// `None` uses and advances the descriptor's position. Returns the bytes
+    /// transferred. A single call moves at most one buffer, as Linux does --
+    /// callers loop for more. If the output takes fewer bytes than were read
+    /// from a positional-less input, the input is rewound so the tail is not
+    /// silently dropped.
+    pub fn transfer_fds(
+        &self,
+        in_fd: i32,
+        in_off: Option<u64>,
+        out_fd: i32,
+        out_off: Option<u64>,
+        count: u64,
+    ) -> SysResult {
+        let cap = count.min(1 << 24) as usize;
+        if cap == 0 {
+            return Ok(0);
+        }
+        let in_file = self.fds.get(in_fd)?;
+        let out_file = self.fds.get(out_fd)?;
+        let mut buf = vec![0u8; cap];
+        let n = match in_off {
+            Some(o) => in_file.pread(o, &mut buf)?,
+            None => in_file.read(&mut buf)?,
+        } as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < n {
+            let w = match out_off {
+                Some(o) => out_file.pwrite(o + written as u64, &buf[written..n])?,
+                None => out_file.write(&buf[written..n])?,
+            } as usize;
+            if w == 0 {
+                break;
+            }
+            written += w;
+        }
+        // A positional-less input already advanced by the full `n`; hand back
+        // the tail the output could not take (best effort: a stream cannot seek).
+        if in_off.is_none() && written < n {
+            let _ = in_file.seek(-((n - written) as i64), 1 /* SEEK_CUR */);
+        }
+        Ok(written as u64)
+    }
+    /// `sendfile(out_fd, in_fd, offset_ptr, count)`: copy in the kernel. With a
+    /// non-null `offset_ptr` the read starts there and the pointer is advanced
+    /// by the count sent, leaving the input's own position untouched -- so a
+    /// server can serve the same file to many clients without seeking.
+    pub fn sendfile(
+        &self,
+        m: &mut GuestMem<'_>,
+        out_fd: i32,
+        in_fd: i32,
+        off_ptr: u64,
+        count: u64,
+    ) -> SysResult {
+        let in_off = if off_ptr != 0 {
+            Some(m.read_u64(off_ptr)?)
+        } else {
+            None
+        };
+        let sent = self.transfer_fds(in_fd, in_off, out_fd, None, count)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_ptr, o + sent)?;
+        }
+        Ok(sent)
+    }
+    /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
+    /// Both offset pointers are optional; each non-null one is used for the
+    /// transfer and then advanced by the bytes copied. `flags` is reserved and
+    /// must be zero.
+    pub fn copy_file_range(
+        &self,
+        m: &mut GuestMem<'_>,
+        fd_in: i32,
+        off_in: u64,
+        fd_out: i32,
+        off_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> SysResult {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let in_off = if off_in != 0 {
+            Some(m.read_u64(off_in)?)
+        } else {
+            None
+        };
+        let out_off = if off_out != 0 {
+            Some(m.read_u64(off_out)?)
+        } else {
+            None
+        };
+        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_in, o + copied)?;
+        }
+        if let Some(o) = out_off {
+            m.write_u64(off_out, o + copied)?;
+        }
+        Ok(copied)
+    }
+    /// A transfer whose input is an empty blocking stream waits for it to be
+    /// readable (`AcceptWait`) and is then made again.
+    pub fn transfer_park(&self, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let (fd, off) = match n {
+            nr::SENDFILE => (a[1] as i32, a[2]),
+            _ => (a[0] as i32, a[1]),
+        };
+        let file = self.fds.get(fd).ok()?;
+        if off != 0 || !file.would_block() || file.handle.poll_readable() {
+            return None;
+        }
+        Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
+    }
+
+    /// sendfile, copy_file_range and splice, by number.
+    pub fn transfer_syscall(&self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
+        match n {
+            nr::SENDFILE => self.sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            // A blocking `recvfrom`/`recv` that waited for a datagram or
+            // bytes (the classifier below).
+            nr::RECVFROM => recvfrom(self, m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
+            nr::COPY_FILE_RANGE => self.copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
+            _ => self.splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
+        }
+    }
+    /// `splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`: as
+    /// copy_file_range, with pipes allowed on either side (a pipe's offset
+    /// pointer must be null, which the transfer does not need to check: a
+    /// pipe has no `pread`). The SPLICE_F_* flags are hints.
+    pub fn splice(&self, m: &mut GuestMem<'_>, fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: u64) -> SysResult {
+        self.copy_file_range(m, fd_in, off_in, fd_out, off_out, len, 0)
+    }
+
     /// `pipe2`.
     pub fn pipe2(&self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
         // A pipe in the global kernel when there is one, because the whole
@@ -2238,8 +2587,8 @@ pub struct PathIo<'a> {
     pub map: MapIo<'a>,
     pub compat: bool,
     pub pid: i32,
-    pub uid: u32,
-    pub gid: u32,
+    /// The process's ids, read at each call: the owner a stat reports.
+    pub creds: &'a Creds,
     pub procs: &'a ProcTable,
     pub ptys: Option<crate::pty::Remote>,
     /// `O_TMPFILE`'s names, numbered per process.
@@ -2339,7 +2688,7 @@ impl PathIo<'_> {
 
     fn call_once(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         Some(match n {
-            nr::OPENAT => self.openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
+            nr::OPENAT => self.openat(m, a[0] as i32, a[1], oflags::from_guest(a[2], self.compat), a[3] as u32),
             nr::OPENAT2 => self.openat2(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETDENTS64 => self.getdents(m, a[0] as i32, a[1], a[2]),
             nr::FSTAT => self.fstat(m, a[0] as i32, a[1]),
@@ -2573,7 +2922,7 @@ impl PathIo<'_> {
         if size < 24 {
             return Err(Errno::EINVAL);
         }
-        let flags = m.read_u64(how)?;
+        let flags = oflags::from_guest(m.read_u64(how)?, self.compat);
         let mode = m.read_u64(how + 8)? as u32;
         let resolve = m.read_u64(how + 16)?;
         if resolve != 0 {
@@ -2630,8 +2979,8 @@ impl PathIo<'_> {
         put32(&mut out, 0, STATX_BASIC_STATS);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
-        put32(&mut out, 20, self.uid);
-        put32(&mut out, 24, self.gid);
+        put32(&mut out, 20, self.creds.uid());
+        put32(&mut out, 24, self.creds.gid());
         out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
@@ -2665,7 +3014,7 @@ impl PathIo<'_> {
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        Stat { uid: self.uid, gid: self.gid, ..Kernel::stat_from(md) }
+        Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
     }
 
     pub fn fstatat(
@@ -2695,7 +3044,7 @@ impl PathIo<'_> {
         let p = self.at_path(m, dirfd, path)?;
         // A root guest (`--uid 0`) may read and write anything; execute
         // still needs an execute bit, which the host checks.
-        let mode = if self.uid == 0 { mode & 1 } else { mode & 7 };
+        let mode = if self.creds.uid() == 0 { mode & 1 } else { mode & 7 };
         self.ns.access(&p, mode).map(|_| 0)
     }
 
@@ -4082,7 +4431,11 @@ pub struct Free<'a> {
     /// for `ioctl`.
     pub tty: &'a crate::tty::TtyRef,
     pub pid: i32,
-    pub uid: u32,
+    /// The process's ids: the sender a signal names, the owner the
+    /// credential calls answer and change.
+    pub creds: &'a Creds,
+    /// The process's threads' signal states, for a `tgkill` to one.
+    pub threads: &'a crate::signal::ThreadSigs,
     /// A wasm32 program, whose own code runs a handler's frame.
     pub wasm32: bool,
     /// The process's futexes, for `futex`.
@@ -4108,6 +4461,10 @@ pub enum FreeOutcome {
     Blocking(BlockOp, Option<u64>),
     /// The machine has been halted: the process ends with this status.
     Exit(i32),
+    /// A wasm32 program's `rt_sigreturn` put back a call its handler
+    /// interrupted, to be made again now from the restored context, as a
+    /// syscall of its own (`restart_call`).
+    Again,
 }
 
 /// `ppoll`, `pselect6`, `epoll_pwait` or `epoll_pwait2` (canonical).
@@ -4163,6 +4520,454 @@ pub fn is_fd_misc(n: u64) -> bool {
         n,
         nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
     )
+}
+
+/// The calls that need nothing of the process but its descriptor table
+/// (`fsync`, `fdatasync`: a check that the descriptor is open), the process
+/// table (`getppid`), the calling thread's own context (`arch_prctl`) or
+/// nothing at all: `uname`, `prctl`, `sync`, the robust list and `rseq`,
+/// the scheduling policy calls, `sched_getaffinity`, `getcpu`,
+/// `membarrier`, the supplementary groups, and the calls that are
+/// accepted and do nothing here (L22). Canonical, for this process's ABI
+/// (`compat`): `arch_prctl` is x86's, and the do-nothing number is made
+/// only by a translation from x86-64 or i386.
+pub fn is_quiet(n: u64, compat: bool) -> bool {
+    matches!(
+        n,
+        nr::UNAME
+            | nr::PRCTL
+            | nr::SYNC
+            | nr::FSYNC
+            | nr::FDATASYNC
+            | nr::SET_ROBUST_LIST
+            | nr::GET_ROBUST_LIST
+            | nr::RSEQ
+            | nr::SCHED_GETAFFINITY
+            | nr::SCHED_GETSCHEDULER
+            | nr::SCHED_GETPARAM
+            | nr::SCHED_SETPARAM
+            | nr::SCHED_SETSCHEDULER
+            | nr::SCHED_GET_PRIORITY_MAX
+            | nr::SCHED_GET_PRIORITY_MIN
+            | nr::GETCPU
+            | nr::MEMBARRIER
+            | nr::GETGROUPS
+            | nr::SETGROUPS
+            | nr::GETPPID
+    ) || (n == nr::ARCH_PRCTL && gex_abi::X86)
+        || (n == nr::NOOP_OK && (gex_abi::X86 || gex_abi::PPC || compat))
+}
+
+/// The calls that make a descriptor's object or work one, needing the
+/// descriptor table and nothing else of a kernel (and the clock for a
+/// timer): `eventfd2`, `epoll_create1`, `memfd_create`, the timerfd calls,
+/// `fallocate`, and the transfers `sendfile`, `splice` and
+/// `copy_file_range` (L22b). Canonical.
+pub fn is_fd_object(n: u64) -> bool {
+    matches!(
+        n,
+        nr::EVENTFD2
+            | nr::EPOLL_CREATE1
+            | nr::MEMFD_CREATE
+            | nr::TIMERFD_CREATE
+            | nr::TIMERFD_SETTIME
+            | nr::TIMERFD_GETTIME
+            | nr::FALLOCATE
+            | nr::SENDFILE
+            | nr::SPLICE
+            | nr::COPY_FILE_RANGE
+    )
+}
+
+/// A call [`is_fd_object`] admits, made, for the kernel's arms and
+/// [`free_call`] alike. A transfer that must wait is the caller's to park
+/// first ([`FdIo::transfer_park`]).
+pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    match n {
+        nr::EVENTFD2 => io.eventfd2(a[0], a[1]),
+        nr::EPOLL_CREATE1 => io.epoll_create(a[0]),
+        nr::MEMFD_CREATE => io.memfd_create(m, a[0], a[1]),
+        nr::TIMERFD_CREATE => io.timerfd_create(clock, a[0], a[1]),
+        nr::TIMERFD_SETTIME => io.timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
+        nr::TIMERFD_GETTIME => io.timerfd_gettime(m, a[0] as i32, a[1]),
+        nr::FALLOCATE => io.fallocate(a[0] as i32, a[1], a[2], a[3]),
+        nr::SENDFILE | nr::SPLICE | nr::COPY_FILE_RANGE => io.transfer_syscall(m, n, &a),
+        _ => unreachable!("is_fd_object admitted a call fd_object_call does not make"),
+    }
+}
+
+/// A process's user and group ids. Its threads share one (a `setuid` on
+/// any is every thread's, as Linux's process-wide set), a fork copies it,
+/// and an `exec` keeps it. Read at each use (the owner a stat reports, the
+/// sender a signal names, `getuid`), so a change is seen by every thread's
+/// next call, with or without a kernel lock. Each set call changes one
+/// word, so two atomics are the whole of it (docs/kernel-locking.md §3.12
+/// A, L22c).
+#[derive(Debug)]
+pub struct Creds {
+    uid: std::sync::atomic::AtomicU32,
+    gid: std::sync::atomic::AtomicU32,
+}
+
+impl Creds {
+    pub fn new(uid: u32, gid: u32) -> Arc<Creds> {
+        Arc::new(Creds { uid: uid.into(), gid: gid.into() })
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Become `uid` (a host's identity, or the guest's `setuid`).
+    pub fn set_uid(&self, uid: u32) {
+        self.uid.store(uid, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn set_gid(&self, gid: u32) {
+        self.gid.store(gid, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The credential, session and process group calls: `get[e]uid`,
+/// `get[e]gid`, the `set*id` family, `getres[ug]id`, `setsid`, `getsid`,
+/// `getpgid` (and i386's and x86-64's `getpgrp`, translated to it) and
+/// `setpgid` (L22c). They need the process's [`Creds`] and the process
+/// table, which locks itself. Canonical.
+pub fn is_cred(n: u64) -> bool {
+    matches!(
+        n,
+        nr::GETUID
+            | nr::GETEUID
+            | nr::GETGID
+            | nr::GETEGID
+            | nr::SETUID
+            | nr::SETGID
+            | nr::SETREUID
+            | nr::SETREGID
+            | nr::SETRESUID
+            | nr::SETRESGID
+            | nr::GETRESUID
+            | nr::GETRESGID
+            | nr::SETSID
+            | nr::GETSID
+            | nr::GETPGID
+            | nr::SETPGID
+    )
+}
+
+/// A call [`is_cred`] admits, made, for the kernel's arms and
+/// [`free_call`] alike, as process `pid`.
+///
+/// There is no privilege model here: the guest is the whole system, so a
+/// request to become another user is recorded and granted. Refusing would
+/// be the less honest answer, since nothing gex does is protected by the
+/// uid in the first place. Real, effective and saved ids are one value, so
+/// the `setre*`/`setres*` forms set the effective one and the `getres*`
+/// forms report it three times; all ones means "leave alone".
+pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    let set = |want: u64, apply: &dyn Fn(u32)| {
+        if want as u32 != u32::MAX {
+            apply(want as u32);
+        }
+        Ok(0)
+    };
+    let getres = |m: &mut GuestMem<'_>, id: u32| {
+        for slot in [a[0], a[1], a[2]] {
+            if slot != 0 {
+                m.write_u32(slot, id)?;
+            }
+        }
+        Ok(0)
+    };
+    match n {
+        nr::GETUID | nr::GETEUID => Ok(creds.uid() as u64),
+        nr::GETGID | nr::GETEGID => Ok(creds.gid() as u64),
+        nr::SETUID => set(a[0], &|v| creds.set_uid(v)),
+        nr::SETGID => set(a[0], &|v| creds.set_gid(v)),
+        nr::SETREUID | nr::SETRESUID => set(a[1], &|v| creds.set_uid(v)),
+        nr::SETREGID | nr::SETRESGID => set(a[1], &|v| creds.set_gid(v)),
+        nr::GETRESUID => getres(m, creds.uid()),
+        nr::GETRESGID => getres(m, creds.gid()),
+        nr::SETSID => procs.setsid(pid).map(|s| s as u64),
+        nr::GETSID => procs.sid(pid, a[0] as i32).map(|s| s as u64),
+        nr::GETPGID => procs.pgid(pid, a[0] as i32).map(|g| g as u64),
+        nr::SETPGID => procs.setpgid(pid, a[0] as i32, a[1] as i32).map(|_| 0),
+        _ => unreachable!("is_cred admitted a call cred_call does not make"),
+    }
+}
+
+/// The signal calls (L22d): those that send one, `kill` to a process, a
+/// group or every process and `tkill` and `tgkill` to a thread; and the
+/// calling thread's own `rt_sigtimedwait`, `rt_sigsuspend` and
+/// `rt_sigreturn`. They need the process table, which locks itself, the
+/// process's threads' signal states ([`ThreadSigs`](crate::signal::ThreadSigs),
+/// behind their own lock), and the caller's. Canonical.
+pub fn is_signal_call(n: u64) -> bool {
+    matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN)
+}
+
+/// `rt_sigtimedwait`'s answer now: a signal of `set` already pending is
+/// taken, with its `siginfo_t`; none is `EAGAIN`. A call with none pending
+/// and time to wait parks first ([`sigwait_park`]) and comes here once one
+/// is. For the kernel's arm and [`free_call`] alike.
+pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u64; 6]) -> SysResult {
+    let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
+    // The timeout is read and checked before anything is taken, as Linux
+    // does (the time64 layout: i386's and ppc's arrive widened).
+    if a[2] != 0 {
+        sigwait_timeout(m, a[2])?;
+    }
+    let Some((signal, source)) = signals.claim_in(set) else { return Err(Errno::EAGAIN) };
+    // A `siginfo_t`: si_signo, si_errno, si_code, then the sender for one a
+    // process sent (the union is 8-aligned in the 64-bit layout).
+    if a[1] != 0 {
+        m.zero(a[1], 128)?;
+        m.write_u32(a[1], signal)?;
+        match source {
+            Some(src) => {
+                let fields = a[1] + if compat || gex_abi::PPC { 12 } else { 16 };
+                m.write_u32(a[1] + 8, src.code as u32)?;
+                m.write_u32(fields, src.pid as u32)?;
+                m.write_u32(fields + 4, src.uid)?;
+            }
+            None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
+        }
+    }
+    Ok(signal as u64)
+}
+
+/// `rt_sigtimedwait`'s timeout at `at`: `EFAULT` unreadable, `EINVAL` not a
+/// time.
+fn sigwait_timeout(m: &GuestMem<'_>, at: u64) -> Result<std::time::Duration, Errno> {
+    let secs = m.read_u64(at)? as i64;
+    let nanos = m.read_u64(at + 8)?;
+    if secs < 0 || nanos >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(std::time::Duration::new(secs as u64, nanos as u32))
+}
+
+/// Whether `rt_sigtimedwait` waits: none of its set pending and time to wait
+/// (no timeout, or one that is not zero). `None` answers now
+/// ([`sigtimedwait`]: the signal, `EAGAIN`, or the error a bad argument
+/// is). For the kernel's blocking path and [`free_call`] alike.
+pub fn sigwait_park(signals: &Signals, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
+    let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0]).ok()? };
+    let timeout = if a[2] == 0 { None } else { Some(sigwait_timeout(m, a[2]).ok()?) };
+    // An empty set waits too: for the time, or for a signal to interrupt it.
+    if signals.pending_raw() & set != 0 || timeout == Some(std::time::Duration::ZERO) {
+        return None;
+    }
+    Some(BlockOp::SigWait {
+        set,
+        timeout,
+        thread: Arc::clone(signals.thread()),
+        process: Arc::clone(signals.process()),
+    })
+}
+
+/// `rt_sigsuspend`'s start: the mask the caller asks for, in place, and the
+/// one to put back afterwards. For the kernel's blocking path and
+/// [`free_call`] alike.
+///
+/// The swap and the wait have to look atomic to the guest -- that is the
+/// entire reason the call exists instead of a `sigprocmask` followed by a
+/// `pause` -- so the mask changes here, and is put back when the wait is
+/// over (`finish_blocking`, or the host's own finish).
+pub fn sigsuspend_begin(signals: &Signals, m: &GuestMem<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let want = m.read_bits64(a[0])?;
+    let restore = signals.blocked();
+    // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or anywhere else.
+    const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+    signals.set_blocked(want & !UNBLOCKABLE);
+    Ok(restore)
+}
+
+/// What [`kill_call`] sends from: the calling thread's signal state, its
+/// process's other threads', the process table, and who is sending.
+pub struct KillTo<'a> {
+    pub signals: &'a Signals,
+    pub threads: &'a crate::signal::ThreadSigs,
+    pub procs: &'a ProcTable,
+    pub pid: i32,
+    /// The calling thread.
+    pub tid: i32,
+    pub creds: &'a Creds,
+}
+
+/// A send [`is_signal_call`] admits (`kill`, `tkill`, `tgkill`), made, for
+/// the kernel's arms and [`free_call`] alike. A host that has threads
+/// waiting elsewhere wakes them after (a signal for one is raised on its
+/// own pending word, which it sees when it looks).
+pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    if n == nr::KILL {
+        // `kill` addresses a process, which may be any process on the
+        // system. It goes through the table, which leaves the signal
+        // pending for the target to collect at its next syscall.
+        to.procs.kill(to.pid, a[0] as i32, a[1] as u32)?;
+        // If the caller was one of the targets -- it signalled itself, or
+        // its own group, or everything -- it must see the signal before
+        // this syscall returns, because `raise` is expected to have
+        // delivered by then. Who the targets were is the table's question
+        // to answer, not a rule to restate here: getting it wrong the other
+        // way made `kill(-pgid)` signal a caller that was in a different
+        // group entirely. Whether or not anything is still in the inbox:
+        // another thread's collect may have taken it and not yet raised it,
+        // and collecting waits for that one (`ProcSig::collect`).
+        to.signals.process().collect(to.procs, to.pid, to.creds.uid());
+        return Ok(0);
+    }
+    // `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
+    // signal goes to that thread. Mono's GC stops the world with
+    // `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
+    // left the target running and the GC waiting.
+    let (tgid, tid, signo) = if n == nr::TKILL { (to.pid, a[0] as i32, a[1] as u32) } else { (a[0] as i32, a[1] as i32, a[2] as u32) };
+    if signo > crate::signal::sig::MAX || tid <= 0 || (n == nr::TGKILL && tgid <= 0) {
+        return Err(Errno::EINVAL);
+    }
+    let target = if tid == to.tid { None } else { to.threads.get(tid) };
+    // An id names one task in the whole system (`ProcTable::new_tid`). One
+    // not of this process is another's thread: that process takes the
+    // signal, as `kill` gives it; `tgkill` must name its process.
+    if target.is_none() && tid != to.tid {
+        let owner = to.procs.task_owner(tid).ok_or(Errno::ESRCH)?;
+        if owner == to.pid || (n == nr::TGKILL && owner != tgid) {
+            return Err(Errno::ESRCH);
+        }
+        // That thread alone, collected by its process (`collect_signals`).
+        // A probe (`signo` 0) asks after the process only.
+        if signo == 0 {
+            return to.procs.kill(to.pid, owner, 0).map(|_| 0);
+        }
+        return to.procs.tkill(to.pid, owner, tid, signo).map(|_| 0);
+    }
+    if tgid != to.pid {
+        return Err(Errno::ESRCH);
+    }
+    if signo > 0 {
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.uid() };
+        match target {
+            Some(t) => t.raise_from(signo, source),
+            None => to.signals.raise_from(signo, source),
+        }
+    }
+    Ok(0)
+}
+
+/// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
+/// both answer them here. `ctx_addr` is the calling thread's context.
+pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
+    match n {
+        nr::UNAME => uname(m, io.compat, a[0]),
+        // Names, death signals and dumpability: all things a process may
+        // set about itself that change nothing observable here.
+        nr::PRCTL => Ok(0),
+        // Nothing here is written back to a device, so there is nothing
+        // to flush -- but an init script's last act is usually to call it.
+        nr::SYNC => Ok(0),
+        // `fdatasync` like `fsync`: everything is already durable (the VFS
+        // is in memory), so validating the fd and returning success is the
+        // honest answer. Missing it made sqlite's journal sync return
+        // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
+        // and refuses to write any file-backed database.
+        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32).map(|_| 0),
+        nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
+        // Restartable sequences are an optimisation the guest can live
+        // without, and both libcs treat ENOSYS as "not available".
+        nr::RSEQ => Err(Errno::ENOSYS),
+        // One processor, and it is the one the caller is on. dpkg asks
+        // to size its worker pool.
+        nr::SCHED_GETAFFINITY => {
+            let (len, mask) = ((a[1] as usize).min(1024), a[2]);
+            if mask != 0 && len >= 8 {
+                m.zero(mask, len)?;
+                m.write_u64(mask, 1)?;
+            }
+            Ok(8)
+        }
+        // Scheduling policy: every guest thread runs SCHED_OTHER at
+        // priority 0, which is what these report. Setting a normal policy
+        // is accepted; a real-time one is refused as for an unprivileged
+        // process. Mono treats a failed priority query as fatal.
+        nr::SCHED_GETSCHEDULER => Ok(0),
+        nr::SCHED_GETPARAM => {
+            m.write_u32(a[1], 0)?;
+            Ok(0)
+        }
+        nr::SCHED_SETPARAM => Ok(0),
+        nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
+            1 | 2 => Err(Errno::EPERM),
+            0 | 3 | 5 => Ok(0),
+            _ => Err(Errno::EINVAL),
+        },
+        nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
+        nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
+        // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
+        nr::GETCPU => {
+            if a[0] != 0 {
+                m.write_u32(a[0], 0)?;
+            }
+            if a[1] != 0 {
+                m.write_u32(a[1], 0)?;
+            }
+            Ok(0)
+        }
+        nr::MEMBARRIER => Ok(0),
+        // No supplementary groups. `getgroups(0, _)` asks for the count.
+        nr::GETGROUPS | nr::SETGROUPS => Ok(0),
+        nr::GETPPID => Ok(procs.ppid(io.pid) as u64),
+        nr::ARCH_PRCTL => arch_prctl(m, ctx_addr, a[0], a[1]),
+        nr::NOOP_OK => Ok(0),
+        _ => unreachable!("is_quiet admitted a call quiet_call does not make"),
+    }
+}
+
+/// `uname`: the kernel gex says it is.
+fn uname(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+    let fields = [
+        "Linux",
+        "gex",
+        "6.1.0-gex",
+        "#1 SMP gex",
+        // An i386 process on the x86 build; a wasm32 program on the
+        // AArch64 build is part of an aarch64 system (its dpkg and
+        // config.guess should agree with the arm64 programs beside it).
+        if compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
+        "(none)",
+    ];
+    let mut out = vec![0u8; 65 * 6];
+    for (i, f) in fields.iter().enumerate() {
+        let b = f.as_bytes();
+        out[i * 65..i * 65 + b.len()].copy_from_slice(b);
+    }
+    m.write(buf, &out)?;
+    Ok(0)
+}
+
+/// `arch_prctl`: the calling thread's segment bases, in its context.
+fn arch_prctl(m: &mut GuestMem<'_>, ctx_addr: u64, code: u64, addr: u64) -> SysResult {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+    match code {
+        ARCH_SET_FS => m.write_u64(ctx_addr + ctx::FS_BASE as u64, addr)?,
+        ARCH_SET_GS => m.write_u64(ctx_addr + ctx::GS_BASE as u64, addr)?,
+        ARCH_GET_FS => {
+            let v = m.read_u64(ctx_addr + ctx::FS_BASE as u64)?;
+            m.write_u64(addr, v)?;
+        }
+        ARCH_GET_GS => {
+            let v = m.read_u64(ctx_addr + ctx::GS_BASE as u64)?;
+            m.write_u64(addr, v)?;
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
 }
 
 fn is_mapping(n: u64) -> bool {
@@ -4268,7 +5073,12 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SHUTDOWN => nr::SHUTDOWN,
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG_TIME64 => nr::RECVMMSG,
-            _ => return None,
+            // The quiet calls, as the translation numbers them (several
+            // numbers become the do-nothing one).
+            r => match crate::i386::canonical_number(r) {
+                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) => c,
+                _ => return None,
+            },
         }
     } else if gex_abi::X86 {
         use crate::x86::raw as x;
@@ -4361,7 +5171,10 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SHUTDOWN => nr::SHUTDOWN,
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
-            _ => return None,
+            r => match crate::x86::canonical_number(r) {
+                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) => c,
+                _ => return None,
+            },
         }
     } else {
         match raw {
@@ -4375,6 +5188,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
+            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) => raw,
             _ => return None,
         }
     };
@@ -4428,7 +5242,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -4466,7 +5280,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -4506,7 +5320,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
-        f.signals.process().collect(f.procs, f.pid, f.uid);
+        f.signals.process().collect(f.procs, f.pid, f.creds.uid());
         r
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
@@ -4528,6 +5342,56 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     } else if is_path(n) {
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
+    } else if is_quiet(n, compat) {
+        quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
+    } else if is_cred(n) {
+        cred_call(f.creds, f.procs, f.pid, m, n, a)
+    } else if is_signal_call(n) {
+        match n {
+            // Returning from a handler restores a whole context, so it
+            // does not go through "write the result and continue".
+            nr::RT_SIGRETURN => {
+                let legacy = compat && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
+                return match signal::sigreturn(f.signals, m, ctx_addr, compat, legacy) {
+                    // The restored context is in ctx: a wasm32 program goes
+                    // on there, or makes the call its handler interrupted.
+                    Ok(_) if f.wasm32 => {
+                        if restart_taken(m, ctx_addr) {
+                            FreeOutcome::Again
+                        } else {
+                            FreeOutcome::Done(Delivery::None)
+                        }
+                    }
+                    Ok(pc) => FreeOutcome::Done(Delivery::Resume(pc)),
+                    Err(_) => FreeOutcome::Done(Delivery::Terminate { signal: signal::sig::SIGSEGV, core: true }),
+                };
+            }
+            nr::RT_SIGSUSPEND => match sigsuspend_begin(f.signals, m, a) {
+                // Until a signal it can see arrives, its old mask owed
+                // back (`BlockOp::SigSuspend`).
+                Ok(restore_mask) => return FreeOutcome::Blocking(BlockOp::SigSuspend { restore_mask }, Some(restore_mask)),
+                Err(_) => Err(Errno::EFAULT),
+            },
+            nr::RT_SIGTIMEDWAIT => match sigwait_park(f.signals, m, a) {
+                // The host waits; its `Ok(0)` makes the call again, which
+                // takes the signal ([`BlockOp::SigWait`]).
+                Some(op) => return FreeOutcome::Blocking(op, None),
+                None => sigtimedwait(f.signals, m, compat, a),
+            },
+            _ => {
+                let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
+                kill_call(&to, n, a)
+            }
+        }
+    } else if is_fd_object(n) {
+        // As the full call: a transfer from an empty blocking stream parks
+        // until it is readable and is made again then.
+        if matches!(n, nr::SENDFILE | nr::SPLICE | nr::COPY_FILE_RANGE) {
+            if let Some(op) = f.io.transfer_park(n, a) {
+                return FreeOutcome::Blocking(op, None);
+            }
+        }
+        fd_object_call(&f.io, f.futex.clock, m, n, a)
     } else if is_fd_misc(n) {
         match n {
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -4538,7 +5402,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
             nr::SYSINFO => sysinfo(m, compat, a[0]),
-            _ => prlimit(f.rlimits, f.io.fds, f.uid, m, a[1], a[2], a[3]),
+            _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
         }
     } else if is_socket_call(n) {
         // As the full call: a blocking `connect`, `accept` or `recvfrom`
@@ -4605,7 +5469,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     };
     if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
         // Linux sends it as the writer itself sending it (SI_USER).
-        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.uid });
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.uid() });
     }
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
@@ -5149,25 +6013,24 @@ fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, 
     Ok(total)
 }
 
-/// What a process and thread are called, as a host last saw them under its
-/// lock: the answers [`ident_call`] gives without it.
+/// What the calling process and thread are called, as its host knows them
+/// (the pid since its load or fork, the tid since the thread started): the
+/// answers [`ident_call`] gives.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Idents {
     pub pid: u32,
     pub ppid: u32,
     pub tid: u32,
-    pub uid: u32,
-    pub gid: u32,
 }
 
-/// `getpid`, `getppid`, `gettid` and the 32-bit `get[e]uid`/`get[e]gid`
-/// answered from `ids` with no lock (docs/kernel-locking.md §3.1), as
-/// [`clock_call`] answers the clocks: a host that keeps `ids` current calls
-/// this before taking its lock, and the full syscall runs whenever it returns
-/// false. `ids.tid == 0` means the host has none yet, and `ids.ppid == 0`
-/// leaves `getppid` to the full call. The 16-bit i386 forms
-/// are left to the full call, which owns their overflow rule.
-pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Idents) -> bool {
+/// `getpid`, `getppid`, `gettid` answered from `ids`, and the 32-bit
+/// `get[e]uid`/`get[e]gid` from the process's `creds`, with no lock
+/// (docs/kernel-locking.md §3.1), as [`clock_call`] answers the clocks: a
+/// host that knows the calling thread's ids calls this before anything
+/// else, and the full syscall runs whenever it returns false. `ids.tid ==
+/// 0` means the host has none yet, and `ids.ppid == 0` leaves `getppid` to
+/// the full call. The 16-bit i386 forms are left to the full call.
+pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Idents, creds: &Creds) -> bool {
     if gex_abi::PPC || ids.tid == 0 {
         return false;
     }
@@ -5182,8 +6045,8 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => ids.uid,
-            x::GETGID | x::GETEGID => ids.gid,
+            x::GETUID | x::GETEUID => creds.uid(),
+            x::GETGID | x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else if gex_abi::X86 {
@@ -5192,8 +6055,8 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             x::GETPID => ids.pid,
             x::GETPPID if ids.ppid != 0 => ids.ppid,
             x::GETTID => ids.tid,
-            x::GETUID | x::GETEUID => ids.uid,
-            x::GETGID | x::GETEGID => ids.gid,
+            x::GETUID | x::GETEUID => creds.uid(),
+            x::GETGID | x::GETEGID => creds.gid(),
             _ => return false,
         }
     } else {
@@ -5201,8 +6064,8 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
             nr::GETPID => ids.pid,
             nr::GETPPID if ids.ppid != 0 => ids.ppid,
             nr::GETTID => ids.tid,
-            nr::GETUID | nr::GETEUID => ids.uid,
-            nr::GETGID | nr::GETEGID => ids.gid,
+            nr::GETUID | nr::GETEUID => creds.uid(),
+            nr::GETGID | nr::GETEGID => creds.gid(),
             _ => return false,
         }
     };
@@ -5226,14 +6089,6 @@ pub fn system_clock() -> (u64, u32) {
     {
         (0, 0)
     }
-}
-
-/// Apply a `set*id` request, where the all-ones value means "leave alone".
-fn set_id(slot: &mut u32, want: u64) -> SysResult {
-    if want as u32 != u32::MAX {
-        *slot = want as u32;
-    }
-    Ok(0)
 }
 
 /// The path a syscall names, for the trace.
@@ -5691,6 +6546,7 @@ pub struct PendingCall {
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
+    pub retry_sigwait: Option<[u64; 6]>,
     /// The parked call's restart class and its syscall's return pc
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
@@ -5759,6 +6615,7 @@ impl Kernel {
             retry_recvmsg: self.retry_recvmsg.take(),
             retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
+            retry_sigwait: self.retry_sigwait.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
         };
@@ -5771,14 +6628,14 @@ impl Kernel {
         self.retry_recvmsg = call.retry_recvmsg;
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
+        self.retry_sigwait = call.retry_sigwait;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
-            .entry(tid)
-            .or_insert_with(|| Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
-        self.signals.switch_to(Arc::clone(next));
+            .get_or_insert_with(tid, || Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
+        self.signals.switch_to(next);
         self.sig_tid = tid;
     }
 
@@ -5792,15 +6649,12 @@ impl Kernel {
         }
         if tid == self.sig_tid {
             let cur = Arc::clone(self.signals.thread());
-            self.thread_signals.entry(tid).or_insert_with(|| Arc::clone(&cur));
+            self.thread_signals.get_or_insert_with(tid, || Arc::clone(&cur));
             return cur;
         }
         let blocked = self.signals.blocked();
-        Arc::clone(
-            self.thread_signals
-                .entry(tid)
-                .or_insert_with(|| Arc::new(signal::ThreadSig::new_thread(blocked))),
-        )
+        self.thread_signals
+            .get_or_insert_with(tid, || Arc::new(signal::ThreadSig::new_thread(blocked)))
     }
 
     /// The signal state after `execve` ([`Signals::exec`]): the other
@@ -5825,7 +6679,7 @@ impl Kernel {
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
         // The other threads are gone, and their ids with them.
-        for &t in self.thread_signals.keys() {
+        for t in self.thread_signals.tids() {
             if t != tid && t != self.pid {
                 self.procs.end_tid(t);
             }
@@ -5849,7 +6703,7 @@ impl Kernel {
         if tid == self.sig_tid {
             return self.signals.would_deliver();
         }
-        match self.thread_signals.get(&tid) {
+        match self.thread_signals.get(tid) {
             Some(t) => t.ready(self.signals.process()),
             None => self.signals.would_deliver(),
         }
@@ -5888,8 +6742,7 @@ impl Kernel {
             exe_path,
             argv: Vec::new(),
             envp: Vec::new(),
-            uid: 1000,
-            gid: 1000,
+            creds: Creds::new(1000, 1000),
             signals: Signals::new(),
             futexes: Arc::new(FutexTable::new()),
             trace: false,
@@ -5907,6 +6760,7 @@ impl Kernel {
             retry_recvmsg: None,
             retry_transfer: None,
             restore_sigmask: None,
+            retry_sigwait: None,
             started: 0,
             pins: Default::default(),
             place: None,
@@ -5914,7 +6768,7 @@ impl Kernel {
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
             syscall_nr: 0,
-            thread_signals: std::collections::HashMap::new(),
+            thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: false,
@@ -6189,8 +7043,9 @@ impl Kernel {
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
-            uid: self.uid,
-            gid: self.gid,
+            // The child's own ids from here on: a set in either is not the
+            // other's.
+            creds: Creds::new(self.creds.uid(), self.creds.gid()),
             trace: self.trace,
             // A fork resets pending signals but keeps the dispositions.
             signals: self.signals.fork(),
@@ -6212,6 +7067,7 @@ impl Kernel {
             retry_recvmsg: None,
             retry_transfer: None,
             restore_sigmask: None,
+            retry_sigwait: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             pins: Default::default(),
@@ -6222,7 +7078,7 @@ impl Kernel {
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
             syscall_nr: 0,
-            thread_signals: std::collections::HashMap::new(),
+            thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: self.compat,
@@ -6651,7 +7507,7 @@ impl Kernel {
             self.thread_exit(m);
             // Its signal state goes with it; the next thread to enter loads
             // its own.
-            self.thread_signals.remove(&self.tid);
+            self.thread_signals.remove(self.tid);
             self.procs.end_tid(self.tid);
             self.thread_calls.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
@@ -6749,7 +7605,7 @@ impl Kernel {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
-                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.uid },
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
                 );
             }
         }
@@ -6858,8 +7714,7 @@ impl Kernel {
             map: self.map_io(),
             compat: self.compat,
             pid: self.pid,
-            uid: self.uid,
-            gid: self.gid,
+            creds: &self.creds,
             procs: &self.procs,
             ptys: self.ptys,
             tmpfiles: &self.tmpfiles,
@@ -6903,14 +7758,17 @@ impl Kernel {
             // seconds and then reported success: musl saw `ENOSYS` and spun,
             // 1.6 million syscalls' worth, until the child ended by itself.
             nr::RT_SIGSUSPEND => {
-                let want = m.read_bits64(a[0]).ok()?;
-                let restore_mask = self.signals.blocked();
-                // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
-                // anywhere else.
-                const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
-                self.signals.set_blocked(want & !UNBLOCKABLE);
+                let restore_mask = sigsuspend_begin(&self.signals, m, a).ok()?;
                 self.restore_sigmask = Some(restore_mask);
                 Some(BlockOp::SigSuspend { restore_mask })
+            }
+            // `rt_sigtimedwait` with nothing of its set pending waits for one
+            // (it had answered `EAGAIN` at once, whatever the timeout); the
+            // signal is taken in `finish_blocking`.
+            nr::RT_SIGTIMEDWAIT => {
+                let op = sigwait_park(&self.signals, m, a)?;
+                self.retry_sigwait = Some(a);
+                Some(op)
             }
             nr::CONNECT => {
                 let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
@@ -6944,16 +7802,9 @@ impl Kernel {
             // grep x`: GNU grep splices its stdin pipe) waits for it to be
             // readable and then does the real transfer (`retry_transfer`).
             nr::SPLICE | nr::SENDFILE | nr::COPY_FILE_RANGE => {
-                let (fd, off) = match n {
-                    nr::SENDFILE => (a[1] as i32, a[2]),
-                    _ => (a[0] as i32, a[1]),
-                };
-                let file = self.fds.get(fd).ok()?;
-                if off != 0 || !file.would_block() || file.handle.poll_readable() {
-                    return None;
-                }
+                let op = self.fd_io().transfer_park(n, a)?;
                 self.retry_transfer = Some((n, a));
-                Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
+                Some(op)
             }
             // `recvfrom` (and `recv`) on an empty blocking socket waits for
             // it to be readable, then reads under the lock, as `recvmsg`
@@ -7031,7 +7882,11 @@ impl Kernel {
             _ => r,
         };
         let r = match self.retry_transfer.take() {
-            Some((n, a)) if r.is_ok() => self.transfer_syscall(m, n, &a),
+            Some((n, a)) if r.is_ok() => self.fd_io().transfer_syscall(m, n, &a),
+            _ => r,
+        };
+        let r = match self.retry_sigwait.take() {
+            Some(a) if r.is_ok() => sigtimedwait(&self.signals, m, self.compat, a),
             _ => r,
         };
         // A wait a signal ended that Linux would restart (signal(7)): the
@@ -7065,7 +7920,7 @@ impl Kernel {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,
                 // Linux sends it as the writer itself sending it (SI_USER).
-                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.uid },
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.uid() },
             );
         }
         let ret = encode(r);
@@ -7100,6 +7955,9 @@ impl Kernel {
     fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
         let r: SysResult = match n {
             nr::EXIT | nr::EXIT_GROUP => return Err((a[0] & 0xff) as i32),
+            // The calls that need nothing of the process ([`quiet_call`],
+            // the free path's code).
+            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, m, self.ctx_addr, n, a),
 
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
@@ -7107,8 +7965,6 @@ impl Kernel {
             nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
             nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
             nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(a[0]),
-            nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC || self.compat => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -7117,7 +7973,6 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::SENDFILE | nr::COPY_FILE_RANGE | nr::SPLICE => self.transfer_syscall(m, n, &a),
             nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
                 .fds
@@ -7126,10 +7981,9 @@ impl Kernel {
             nr::DUP => self.sys_dup(a[0] as i32),
             nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
-            nr::EVENTFD2 => self.sys_eventfd2(a[0], a[1]),
-            nr::TIMERFD_CREATE => self.sys_timerfd_create(a[0], a[1]),
-            nr::TIMERFD_SETTIME => self.sys_timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::TIMERFD_GETTIME => self.sys_timerfd_gettime(m, a[0] as i32, a[1]),
+            // The calls that make or work a descriptor's object
+            // ([`fd_object_call`], the free path's code).
+            n if is_fd_object(n) => fd_object_call(&self.fd_io(), self.clock, m, n, a),
             // F_GETLK and F_OFD_GETLK: nobody holds a lock (see
             // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
             // first field in every `struct flock` layout (i386's flock and
@@ -7137,12 +7991,6 @@ impl Kernel {
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(a[0] as i32, a[1]),
-            // `fdatasync` like `fsync`: everything is already durable (the VFS
-            // is in memory), so validating the fd and returning success is the
-            // honest answer. Missing it made sqlite's journal sync return
-            // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
-            // and refuses to write any file-backed database.
-            nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
             // Only a thread's own working directory (CLONE_FS) is unshared;
             // a private descriptor table or namespace is not supported.
             nr::UNSHARE => {
@@ -7173,46 +8021,12 @@ impl Kernel {
             }
 
             // -- process and time --------------------------------------------
-            nr::UNAME => self.sys_uname(m, a[0]),
             nr::GETPID => Ok(self.pid as u64),
-            nr::GETPPID => Ok(self.procs.ppid(self.pid) as u64),
             nr::GETTID => Ok(self.tid as u64),
-            nr::GETUID | nr::GETEUID => Ok(self.uid as u64),
-            nr::GETGID | nr::GETEGID => Ok(self.gid as u64),
-
-            // -- sessions and process groups ---------------------------------
-            nr::SETSID => self.procs.setsid(self.pid).map(|s| s as u64),
-            nr::GETSID => self.procs.sid(self.pid, a[0] as i32).map(|s| s as u64),
-            nr::GETPGID => self.procs.pgid(self.pid, a[0] as i32).map(|g| g as u64),
-            nr::SETPGID => self
-                .procs
-                .setpgid(self.pid, a[0] as i32, a[1] as i32)
-                .map(|_| 0),
-
-            // -- credentials -------------------------------------------------
-            // There is no privilege model here: the guest is the whole system,
-            // so a request to become another user is recorded and granted.
-            // Refusing would be the less honest answer, since nothing gex does
-            // is protected by the uid in the first place.
-            nr::SETUID => set_id(&mut self.uid, a[0]),
-            nr::SETGID => set_id(&mut self.gid, a[0]),
-            nr::SETREUID => set_id(&mut self.uid, a[1]),
-            nr::SETREGID => set_id(&mut self.gid, a[1]),
-            nr::SETRESUID => set_id(&mut self.uid, a[1]),
-            nr::SETRESGID => set_id(&mut self.gid, a[1]),
-            nr::GETRESUID => self.sys_getres(m, a, self.uid),
-            nr::GETRESGID => self.sys_getres(m, a, self.gid),
-            // No supplementary groups. `getgroups(0, _)` asks for the count.
-            nr::GETGROUPS => Ok(0),
-            nr::SETGROUPS => Ok(0),
-            // Names, death signals and dumpability: all things a process may
-            // set about itself that change nothing observable here.
-            nr::PRCTL => Ok(0),
+            // -- credentials, sessions and process groups (L22c) ------------
+            n if is_cred(n) => cred_call(&self.creds, &self.procs, self.pid, m, n, a),
 
             // -- mounts ------------------------------------------------------
-            // Nothing here is written back to a device, so there is nothing
-            // to flush -- but an init script's last act is usually to call it.
-            nr::SYNC => Ok(0),
             nr::MOUNT => self.sys_mount(m, a),
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
@@ -7225,14 +8039,10 @@ impl Kernel {
                 let cwd = self.vfs.cwd.clone();
                 self.net_io().call(&self.fd_io(), m, n, a, &cwd)
             }
-            nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
-            nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
-            nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
-            nr::MEMBARRIER => self.sys_membarrier(a[0]),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -7243,9 +8053,6 @@ impl Kernel {
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
-            // One processor, and it is the one the caller is on. dpkg asks
-            // to size its worker pool.
-            nr::SCHED_GETAFFINITY => self.sys_getaffinity(m, a[1], a[2]),
             // Interval timers raise their signal when due (`check_timers`,
             // and a page Worker's own `sigs::gather`).
             nr::SETITIMER => self.sys_itimer(m, a[0], a[1], a[2], true),
@@ -7254,28 +8061,12 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
-            // Scheduling policy: every guest thread runs SCHED_OTHER at
-            // priority 0, which is what these report. Setting a normal policy
-            // is accepted; a real-time one is refused as for an unprivileged
-            // process. Mono treats a failed priority query as fatal.
-            nr::SCHED_GETSCHEDULER => Ok(0),
-            nr::SCHED_GETPARAM => self.sys_sched_getparam(m, a[1]),
-            nr::SCHED_SETPARAM => Ok(0),
-            nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
-                1 | 2 => Err(Errno::EPERM),
-                0 | 3 | 5 => Ok(0),
-                _ => Err(Errno::EINVAL),
-            },
-            nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
-            nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
             // Scheduling niceness: we run every guest thread at the default
             // priority, so report nice 0 and accept any set as a no-op. The
             // raw getpriority ABI returns `20 - nice` (kept non-negative so a
             // real nice value is never mistaken for an -errno), i.e. 20 here.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
-            // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
-            nr::GETCPU => self.sys_getcpu(m, a[0], a[1]),
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
@@ -7283,36 +8074,21 @@ impl Kernel {
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
-            nr::RT_SIGTIMEDWAIT => self.sys_rt_sigtimedwait(m, a),
+            nr::RT_SIGTIMEDWAIT => sigtimedwait(&self.signals, m, self.compat, a),
+            // Reached only when the new mask could not be read (the
+            // blocking path takes the rest).
+            nr::RT_SIGSUSPEND => Err(Errno::EFAULT),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // `tkill` and `tgkill` address a thread: see `sys_tgkill`.
-            nr::TKILL | nr::TGKILL => self.sys_tgkill(n, a),
-            // `kill` addresses a process, which may be any process on the
-            // system. It goes through the table, which leaves the signal
-            // pending for the target to collect at its next syscall.
-            nr::KILL => {
-                let target = a[0] as i32;
-                let signo = a[1] as u32;
-                if self.trace {
-                    eprintln!("[gex:{}] kill -> pid {target} signal {signo}", self.pid);
+            // `kill`, `tkill` and `tgkill` (L22d), as the free path makes
+            // them.
+            nr::KILL | nr::TKILL | nr::TGKILL => {
+                if self.trace && n == nr::KILL {
+                    eprintln!("[gex:{}] kill -> pid {} signal {}", self.pid, a[0] as i32, a[1] as u32);
                 }
-                match self.procs.kill(self.pid, target, signo) {
-                    Ok(_) => {
-                        // If the caller was one of the targets -- it signalled
-                        // itself, or its own group, or everything -- it must
-                        // see the signal before this syscall returns, because
-                        // `raise` is expected to have delivered by then. Who
-                        // the targets were is the table's question to answer,
-                        // not a rule to restate here: getting it wrong the
-                        // other way made `kill(-pgid)` signal a caller that
-                        // was in a different group entirely.
-                        self.take_sent_signals();
-                        Ok(0)
-                    }
-                    Err(e) => Err(e),
-                }
+                let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
+                kill_call(&to, n, a)
             }
             nr::RT_SIGRETURN => {
                 // Handled by the caller, which must redirect execution to the
@@ -7320,11 +8096,7 @@ impl Kernel {
                 Ok(0)
             }
 
-            nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
             nr::FUTEX => self.sys_futex(m, a),
-            // Restartable sequences are an optimisation the guest can live
-            // without, and both libcs treat ENOSYS as "not available".
-            nr::RSEQ => Err(Errno::ENOSYS),
 
             _ => {
                 if !self.unimplemented.contains(&n) {
@@ -7360,18 +8132,6 @@ impl Kernel {
         sigpending(&self.signals, m, set)
     }
 
-    /// `getcpu`: which CPU/NUMA node the caller runs on. We present a single
-    /// scheduling domain, so both are 0. The third arg (tcache) is ignored on
-    /// modern kernels; null pointers are skipped.
-    fn sys_getcpu(&self, m: &mut GuestMem<'_>, cpu: u64, node: u64) -> SysResult {
-        if cpu != 0 {
-            m.write_u32(cpu, 0)?;
-        }
-        if node != 0 {
-            m.write_u32(node, 0)?;
-        }
-        Ok(0)
-    }
 
     fn sys_rt_sigprocmask(
         &mut self,
@@ -7422,10 +8182,10 @@ impl Kernel {
         if self.procs.has_signals(self.pid) {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
-                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.uid };
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.uid() };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
-                } else if let Some(t) = self.thread_signals.get(&tid) {
+                } else if let Some(t) = self.thread_signals.get(tid) {
                     t.raise_from(signo, source);
                     other = true;
                 }
@@ -7438,7 +8198,7 @@ impl Kernel {
                 crate::wait::notify(self.procs.queue(self.pid));
             }
         }
-        let inbox = self.signals.process().collect(&self.procs, self.pid, self.uid);
+        let inbox = self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
         if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
         }
@@ -7561,136 +8321,10 @@ impl Kernel {
         io_pwrite(&self.fds, m, fd, buf, len, off)
     }
 
-    /// Copy up to `count` bytes from one descriptor to another through a kernel
-    /// buffer -- the shared core of `sendfile` and `copy_file_range`. When
-    /// `in_off`/`out_off` is `Some` it is an absolute offset used without
-    /// touching that descriptor's own position (the offset-pointer forms);
-    /// `None` uses and advances the descriptor's position. Returns the bytes
-    /// transferred. A single call moves at most one buffer, as Linux does --
-    /// callers loop for more. If the output takes fewer bytes than were read
-    /// from a positional-less input, the input is rewound so the tail is not
-    /// silently dropped.
-    fn transfer_fds(
-        &mut self,
-        in_fd: i32,
-        in_off: Option<u64>,
-        out_fd: i32,
-        out_off: Option<u64>,
-        count: u64,
-    ) -> SysResult {
-        let cap = count.min(1 << 24) as usize;
-        if cap == 0 {
-            return Ok(0);
-        }
-        let in_file = self.fds.get(in_fd)?;
-        let out_file = self.fds.get(out_fd)?;
-        let mut buf = vec![0u8; cap];
-        let n = match in_off {
-            Some(o) => in_file.pread(o, &mut buf)?,
-            None => in_file.read(&mut buf)?,
-        } as usize;
-        if n == 0 {
-            return Ok(0);
-        }
-        let mut written = 0usize;
-        while written < n {
-            let w = match out_off {
-                Some(o) => out_file.pwrite(o + written as u64, &buf[written..n])?,
-                None => out_file.write(&buf[written..n])?,
-            } as usize;
-            if w == 0 {
-                break;
-            }
-            written += w;
-        }
-        // A positional-less input already advanced by the full `n`; hand back
-        // the tail the output could not take (best effort: a stream cannot seek).
-        if in_off.is_none() && written < n {
-            let _ = in_file.seek(-((n - written) as i64), 1 /* SEEK_CUR */);
-        }
-        Ok(written as u64)
-    }
 
-    /// `sendfile(out_fd, in_fd, offset_ptr, count)`: copy in the kernel. With a
-    /// non-null `offset_ptr` the read starts there and the pointer is advanced
-    /// by the count sent, leaving the input's own position untouched -- so a
-    /// server can serve the same file to many clients without seeking.
-    fn sys_sendfile(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        out_fd: i32,
-        in_fd: i32,
-        off_ptr: u64,
-        count: u64,
-    ) -> SysResult {
-        let in_off = if off_ptr != 0 {
-            Some(m.read_u64(off_ptr)?)
-        } else {
-            None
-        };
-        let sent = self.transfer_fds(in_fd, in_off, out_fd, None, count)?;
-        if let Some(o) = in_off {
-            m.write_u64(off_ptr, o + sent)?;
-        }
-        Ok(sent)
-    }
 
-    /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
-    /// Both offset pointers are optional; each non-null one is used for the
-    /// transfer and then advanced by the bytes copied. `flags` is reserved and
-    /// must be zero.
-    fn sys_copy_file_range(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd_in: i32,
-        off_in: u64,
-        fd_out: i32,
-        off_out: u64,
-        len: u64,
-        flags: u32,
-    ) -> SysResult {
-        if flags != 0 {
-            return Err(Errno::EINVAL);
-        }
-        let in_off = if off_in != 0 {
-            Some(m.read_u64(off_in)?)
-        } else {
-            None
-        };
-        let out_off = if off_out != 0 {
-            Some(m.read_u64(off_out)?)
-        } else {
-            None
-        };
-        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
-        if let Some(o) = in_off {
-            m.write_u64(off_in, o + copied)?;
-        }
-        if let Some(o) = out_off {
-            m.write_u64(off_out, o + copied)?;
-        }
-        Ok(copied)
-    }
 
-    /// sendfile, copy_file_range and splice, by number.
-    fn transfer_syscall(&mut self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
-        match n {
-            nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
-            // A blocking `recvfrom`/`recv` that waited for a datagram or
-            // bytes (the classifier below).
-            nr::RECVFROM => recvfrom(&self.fd_io(), m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
-            nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
-            _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
-        }
-    }
 
-    /// `splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`: as
-    /// copy_file_range, with pipes allowed on either side (a pipe's offset
-    /// pointer must be null, which the transfer does not need to check: a
-    /// pipe has no `pread`). The SPLICE_F_* flags are hints.
-    fn sys_splice(&mut self, m: &mut GuestMem<'_>, fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: u64) -> SysResult {
-        self.sys_copy_file_range(m, fd_in, off_in, fd_out, off_out, len, 0)
-    }
 
     fn read_iovecs(
         m: &GuestMem<'_>,
@@ -7735,91 +8369,9 @@ impl Kernel {
     }
 
 
-    /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
-    ///
-    /// One descriptor, readable and writable, over a single `EventFd`. The
-    /// `EFD_NONBLOCK`/`EFD_CLOEXEC` flags are `O_NONBLOCK`/`O_CLOEXEC` by
-    /// another name, so they go straight into the open flags and the
-    /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
-    fn sys_eventfd2(&mut self, initval: u64, flags: u64) -> SysResult {
-        use crate::eventfd::{flags as efd, EventFd};
-        let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let file = OpenFile::new(
-            handle,
-            "anon_inode:[eventfd]".to_string(),
-            (flags & oflags::O_NONBLOCK) | oflags::O_RDWR,
-            true,
-            true,
-        );
-        self.fds.insert(file, cloexec)
-    }
 
-    /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
-    fn sys_timerfd_create(&mut self, clockid: u64, flags: u64) -> SysResult {
-        let mut timer = crate::timerfd::TimerFd::new(self.clock);
-        if is_monotonic_clock(clockid) {
-            timer = timer.monotonic(monotonic_from);
-        }
-        let handle = Arc::new(timer);
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let file = OpenFile::new(
-            handle,
-            "anon_inode:[timerfd]".to_string(),
-            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
-            true,
-            false,
-        );
-        self.fds.insert(file, cloexec)
-    }
 
-    /// `timerfd_settime`: arm or disarm the timer from an `itimerspec`.
-    ///
-    /// The struct is two `timespec`s -- `it_interval` then `it_value`, sixteen
-    /// bytes each. `it_value` of zero disarms; the `TFD_TIMER_ABSTIME` flag
-    /// makes it an absolute time on the clock. The old setting is written back
-    /// through `old` when it is non-null, the same shape the kernel returns.
-    fn sys_timerfd_settime(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        flags: u64,
-        new: u64,
-        old: u64,
-    ) -> SysResult {
-        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
-            let secs = m.read_u64(at)?;
-            let nanos = m.read_u64(at + 8)?;
-            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
-        };
-        let interval = read_ns(m, new)?;
-        let value = read_ns(m, new + 16)?;
-        let handle = self.fds.get(fd)?.handle.clone();
-        let (rem, prev_int) = handle
-            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
-            .ok_or(Errno::EINVAL)?;
-        if old != 0 {
-            m.write_u64(old, prev_int / 1_000_000_000)?;
-            m.write_u64(old + 8, prev_int % 1_000_000_000)?;
-            m.write_u64(old + 16, rem / 1_000_000_000)?;
-            m.write_u64(old + 24, rem % 1_000_000_000)?;
-        }
-        Ok(0)
-    }
 
-    /// `timerfd_gettime`: write the time to the next expiry and the interval.
-    fn sys_timerfd_gettime(&mut self, m: &mut GuestMem<'_>, fd: i32, curr: u64) -> SysResult {
-        if curr == 0 {
-            return Ok(0);
-        }
-        let handle = self.fds.get(fd)?.handle.clone();
-        let (rem, interval) = handle.timerfd_get().ok_or(Errno::EINVAL)?;
-        m.write_u64(curr, interval / 1_000_000_000)?;
-        m.write_u64(curr + 8, interval % 1_000_000_000)?;
-        m.write_u64(curr + 16, rem / 1_000_000_000)?;
-        m.write_u64(curr + 24, rem % 1_000_000_000)?;
-        Ok(0)
-    }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
         self.fd_io().pipe2(m, fds, flags)
@@ -7932,7 +8484,15 @@ impl FdIo<'_> {
             const F_UNLCK: u16 = 2;
             return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
         }
-        self.fcntl(fd, cmd, arg)
+        // The status flags in the guest's own spelling (an AArch64
+        // program's `O_DIRECT` is not x86's).
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        match cmd {
+            F_SETFL => self.fcntl(fd, cmd, oflags::from_guest(arg, self.compat)),
+            F_GETFL => self.fcntl(fd, cmd, arg).map(|f| oflags::to_guest(f, self.compat)),
+            _ => self.fcntl(fd, cmd, arg),
+        }
     }
 
     pub fn fcntl(&self, fd: i32, cmd: u64, arg: u64) -> SysResult {
@@ -7969,7 +8529,7 @@ impl FdIo<'_> {
                 const STATUS: u64 = oflags::ACCMODE
                     | oflags::O_APPEND
                     | oflags::O_NONBLOCK
-                    | 0o40000 // O_DIRECT
+                    | oflags::O_DIRECT
                     | 0o4010000; // O_SYNC | O_NOATIME
                 // The access mode comes from what the description can do,
                 // not from the stored flags: inherited stdio, socketpair
@@ -7994,7 +8554,7 @@ impl FdIo<'_> {
                 const SETTABLE: u64 = oflags::O_APPEND
                     | oflags::O_NONBLOCK
                     | 0o20000 // O_ASYNC
-                    | 0o40000 // O_DIRECT
+                    | oflags::O_DIRECT
                     | 0o1000000; // O_NOATIME
                 let f = self.fds.get(fd)?;
                 f.set_flags(f.flags() & !SETTABLE | arg & SETTABLE);
@@ -8588,68 +9148,6 @@ impl Kernel {
         }
     }
 
-    /// `sched_getaffinity`. One processor, and it is the one the caller is
-    /// already on. dpkg asks in order to size its worker pool.
-    fn sys_getaffinity(&mut self, m: &mut GuestMem<'_>, len: u64, mask: u64) -> SysResult {
-        let len = (len as usize).min(1024);
-        if mask != 0 && len >= 8 {
-            m.zero(mask, len)?;
-            m.write_u64(mask, 1)?;
-        }
-        Ok(8)
-    }
-
-    /// `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
-    /// signal goes to that thread. Mono's GC stops the world with
-    /// `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
-    /// left the target running and the GC waiting.
-    fn sys_tgkill(&mut self, n: u64, a: [u64; 6]) -> SysResult {
-        let (tgid, tid, signo) = if n == nr::TKILL {
-            (self.pid, a[0] as i32, a[1] as u32)
-        } else {
-            (a[0] as i32, a[1] as i32, a[2] as u32)
-        };
-        if signo > crate::signal::sig::MAX || tid <= 0 || (n == nr::TGKILL && tgid <= 0) {
-            return Err(Errno::EINVAL);
-        }
-        // An id names one task in the whole system (`ProcTable::new_tid`).
-        // One not of this process is another's thread: that process takes
-        // the signal, as `kill` gives it; `tgkill` must name its process.
-        if !self.thread_signals.contains_key(&tid) && tid != self.tid {
-            let owner = self.procs.task_owner(tid).ok_or(Errno::ESRCH)?;
-            if owner == self.pid || (n == nr::TGKILL && owner != tgid) {
-                return Err(Errno::ESRCH);
-            }
-            // That thread alone, collected by its process
-            // (`collect_signals`). A probe (`signo` 0) asks after the
-            // process only.
-            if signo == 0 {
-                return self.procs.kill(self.pid, owner, 0).map(|_| 0);
-            }
-            return self.procs.tkill(self.pid, owner, tid, signo).map(|_| 0);
-        }
-        if tgid != self.pid {
-            return Err(Errno::ESRCH);
-        }
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
-        if tid == self.tid {
-            if signo > 0 {
-                self.signals.raise_from(signo, source);
-            }
-        } else {
-            let Some(t) = self.thread_signals.get(&tid) else { return Err(Errno::ESRCH) };
-            if signo > 0 {
-                t.raise_from(signo, source);
-            }
-        }
-        Ok(0)
-    }
-
-    /// `sched_getparam(pid, *param)`: priority 0, the only one there is.
-    fn sys_sched_getparam(&mut self, m: &mut GuestMem<'_>, param: u64) -> SysResult {
-        m.write_u32(param, 0)?;
-        Ok(0)
-    }
 
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
@@ -8666,18 +9164,7 @@ impl Kernel {
         if !self.procs.has_signals(self.pid) {
             return;
         }
-        self.signals.process().collect(&self.procs, self.pid, self.uid);
-    }
-
-    /// `getresuid` and `getresgid`: real, effective and saved, all the same
-    /// value here because nothing ever differs between them.
-    fn sys_getres(&mut self, m: &mut GuestMem<'_>, a: [u64; 6], id: u32) -> SysResult {
-        for slot in [a[0], a[1], a[2]] {
-            if slot != 0 {
-                m.write_u32(slot, id)?;
-            }
-        }
-        Ok(0)
+        self.signals.process().collect(&self.procs, self.pid, self.creds.uid());
     }
 
     /// `mount`, for the filesystems gex has.
@@ -8740,36 +9227,6 @@ impl Kernel {
             Ok(0)
         } else {
             Err(Errno::EINVAL)
-        }
-    }
-
-    /// `rt_sigtimedwait`, for a signal already pending. The blocking case is
-    /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
-    /// every caller seen so far (draining blocked signals, not sleeping).
-    fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
-        match self.signals.take_pending_in(set) {
-            Some(signal) => {
-                // A `siginfo_t`: si_signo, si_errno, si_code, then the sender
-                // for one a process sent (the union is 8-aligned in the 64-bit
-                // layout).
-                let source = self.signals.take_source(signal);
-                if a[1] != 0 {
-                    m.zero(a[1], 128)?;
-                    m.write_u32(a[1], signal)?;
-                    match source {
-                        Some(src) => {
-                            let fields = a[1] + if self.compat || gex_abi::PPC { 12 } else { 16 };
-                            m.write_u32(a[1] + 8, src.code as u32)?;
-                            m.write_u32(fields, src.pid as u32)?;
-                            m.write_u32(fields + 4, src.uid)?;
-                        }
-                        None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
-                    }
-                }
-                Ok(signal as u64)
-            }
-            None => Err(Errno::EAGAIN),
         }
     }
 
@@ -8849,26 +9306,7 @@ impl Kernel {
         self.fd_io().close_range(first, last, flags)
     }
 
-    /// `membarrier`: force a memory barrier across the process's threads.
-    ///
-    /// A no-op that succeeds. Every gex thread runs against one shared linear
-    /// memory and the runtime already emits the atomic accesses the guest asks
-    /// for, so there is no per-thread view to reconcile -- which is the whole
-    /// job of this call. The `MEMBARRIER_CMD_QUERY` (cmd 0) case returns the
-    /// bitmask of supported commands, and reporting none is honest and is what
-    /// a caller that falls back to a heavier barrier expects.
-    fn sys_membarrier(&mut self, cmd: u64) -> SysResult {
-        let _ = cmd;
-        Ok(0)
-    }
 
-    /// `epoll_create1`.
-    fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
-        const EPOLL_CLOEXEC: u64 = 0o2000000;
-        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::new());
-        let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
-        self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)
-    }
 
     /// The epoll set an open file is, if it is one.
 
@@ -8888,34 +9326,7 @@ impl Kernel {
         self.fd_io().epoll_ctl(m, epfd, op, fd, event)
     }
 
-    /// The anonymous shared file behind a descriptor, if it is one.
-    fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
-        self.fd_io().memfd_of(fd)
-    }
 
-    /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
-    ///
-    /// Xwayland calls this through `posix_fallocate` after sealing its shared
-    /// memory, to be certain the pages are there before it hands the
-    /// descriptor to a compositor. The other modes -- punching holes,
-    /// collapsing ranges -- are refused rather than silently treated as
-    /// allocation, which would leave a caller believing it had freed space.
-    fn sys_fallocate(&mut self, fd: i32, mode: u64, offset: u64, len: u64) -> SysResult {
-        if mode != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
-        if let Ok(memfd) = self.memfd_of(fd) {
-            return memfd.reserve(end);
-        }
-        // An ordinary file grows by being written to its new length.
-        let file = self.fds.get(fd)?;
-        let size = file.handle.metadata()?.size;
-        if end > size {
-            file.handle.truncate(end)?;
-        }
-        Ok(0)
-    }
 
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
@@ -8923,15 +9334,6 @@ impl Kernel {
         self.fd_io().flock(fd, op)
     }
 
-    fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
-        const MFD_CLOEXEC: u64 = 1;
-        let raw = m.read_cstr(name, 249)?;
-        let name = String::from_utf8_lossy(&raw).into_owned();
-        let memfd = Arc::new(unix::MemFd::new(&name));
-        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
-        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
-        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
-    }
 
 
 
@@ -8998,11 +9400,7 @@ impl Kernel {
     }
 
     fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
-        let (secs, _) = guest_wall((self.clock)());
-        if tloc != 0 {
-            m.write_u64(tloc, secs)?;
-        }
-        Ok(secs)
+        time_answer(m, self.compat, self.clock, tloc)
     }
 
     /// `alarm(s)`: `setitimer(ITIMER_REAL, {0, s})`, returning the seconds the
@@ -9012,49 +9410,7 @@ impl Kernel {
         Ok(alarm(&self.signals, self.now_nanos(), secs))
     }
 
-    /// x86-64 `arch_prctl`: the FS and GS segment bases, which is how that
-    /// ABI sets its thread pointer.
-    fn sys_arch_prctl(&mut self, m: &mut GuestMem<'_>, code: u64, addr: u64) -> SysResult {
-        const ARCH_SET_GS: u64 = 0x1001;
-        const ARCH_SET_FS: u64 = 0x1002;
-        const ARCH_GET_FS: u64 = 0x1003;
-        const ARCH_GET_GS: u64 = 0x1004;
-        match code {
-            ARCH_SET_FS => m.write_u64(self.ctx_addr + ctx::FS_BASE as u64, addr)?,
-            ARCH_SET_GS => m.write_u64(self.ctx_addr + ctx::GS_BASE as u64, addr)?,
-            ARCH_GET_FS => {
-                let v = m.read_u64(self.ctx_addr + ctx::FS_BASE as u64)?;
-                m.write_u64(addr, v)?;
-            }
-            ARCH_GET_GS => {
-                let v = m.read_u64(self.ctx_addr + ctx::GS_BASE as u64)?;
-                m.write_u64(addr, v)?;
-            }
-            _ => return Err(Errno::EINVAL),
-        }
-        Ok(0)
-    }
 
-    fn sys_uname(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        let fields = [
-            "Linux",
-            "gex",
-            "6.1.0-gex",
-            "#1 SMP gex",
-            // An i386 process on the x86 build; a wasm32 program on the
-            // AArch64 build is part of an aarch64 system (its dpkg and
-            // config.guess should agree with the arm64 programs beside it).
-            if self.compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
-            "(none)",
-        ];
-        let mut out = vec![0u8; 65 * 6];
-        for (i, f) in fields.iter().enumerate() {
-            let b = f.as_bytes();
-            out[i * 65..i * 65 + b.len()].copy_from_slice(b);
-        }
-        m.write(buf, &out)?;
-        Ok(0)
-    }
 
     fn sys_clock_gettime(&mut self, m: &mut GuestMem<'_>, clk: u64, buf: u64) -> SysResult {
         // The two processor clocks count from when the process started, not
@@ -9123,16 +9479,8 @@ impl Kernel {
     /// children -- counted in the hundredths of a second that `USER_HZ` means
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        let ticks = (self.cpu_nanos() / 10_000_000) as u64;
-        if buf != 0 && self.compat {
-            // i386: four 32-bit clock_t
-            m.zero(buf, 16)?;
-            m.write_u32(buf, ticks as u32)?;
-        } else if buf != 0 {
-            m.zero(buf, 32)?;
-            m.write_u64(buf, ticks)?;
-        }
-        Ok(if self.compat { ticks as u32 as u64 } else { ticks })
+        let cpu = self.cpu_nanos();
+        times_answer(m, self.compat, cpu, buf)
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
@@ -9161,7 +9509,7 @@ impl Kernel {
     }
 
     fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
-        prlimit(&self.rlimits, &self.fds, self.uid, m, resource, new, old)
+        prlimit(&self.rlimits, &self.fds, self.creds.uid(), m, resource, new, old)
     }
 }
 
@@ -9574,7 +9922,7 @@ mod tests {
         }
         let (mut mem, mut k) = setup();
         let at = k.ctx_addr;
-        let ids = Idents { pid: k.pid as u32, ppid: 0, tid: k.tid as u32, uid: k.uid, gid: k.gid };
+        let ids = Idents { pid: k.pid as u32, ppid: 0, tid: k.tid as u32 };
         for n in [nr::GETPID, nr::GETTID, nr::GETUID, nr::GETEUID, nr::GETGID, nr::GETEGID] {
             let mut m = GuestMem::new(&mut mem);
             set_args(&mut m, at, n, &[]);
@@ -9582,16 +9930,16 @@ mod tests {
             let want = ret(&m, at);
             m.write_u64(at + ctx::x(0) as u64, 0x5555).unwrap();
             set_args(&mut m, at, n, &[]);
-            assert!(ident_call(&mut m, at, false, &ids), "call {n}");
+            assert!(ident_call(&mut m, at, false, &ids, &k.creds), "call {n}");
             assert_eq!(ret(&m, at), want, "call {n}");
         }
         let mut m = GuestMem::new(&mut mem);
         set_args(&mut m, at, nr::GETPPID, &[]);
-        assert!(!ident_call(&mut m, at, false, &ids), "no parent given");
+        assert!(!ident_call(&mut m, at, false, &ids, &k.creds), "no parent given");
         set_args(&mut m, at, nr::GETPID, &[]);
-        assert!(!ident_call(&mut m, at, false, &Idents { tid: 0, ..ids }), "no thread yet");
+        assert!(!ident_call(&mut m, at, false, &Idents { tid: 0, ..ids }, &k.creds), "no thread yet");
         set_args(&mut m, at, nr::CLOCK_GETTIME, &[0, 0x3000]);
-        assert!(!ident_call(&mut m, at, false, &ids), "not an id call");
+        assert!(!ident_call(&mut m, at, false, &ids, &k.creds), "not an id call");
     }
 
     /// `clock_call`, the lock-free answer, writes what the full call writes,
@@ -9621,6 +9969,9 @@ mod tests {
             (nr::CLOCK_GETTIME, [3, buf]),
             (nr::GETTIMEOFDAY, [buf, 0]),
             (nr::GETRUSAGE, [0, buf]),
+            (nr::TIMES, [buf, 0]),
+            (nr::TIMES, [0, 0]),
+            (if gex_abi::X86 { nr::TIME } else { nr::TIMES }, [buf, 0]),
             (nr::SCHED_YIELD, [0, 0]),
         ] {
             let mut m = GuestMem::new(&mut mem);
@@ -10103,7 +10454,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10202,6 +10553,550 @@ mod tests {
     }
 
     #[test]
+    fn free_quiet_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        let buf_at = 0x30000u64;
+        let mut cases: Vec<(u64, [u64; 3])> = vec![
+            (nr::UNAME, [buf_at, 0, 0]),
+            (nr::PRCTL, [15, buf_at, 0]),
+            (nr::SYNC, [0, 0, 0]),
+            (nr::FSYNC, [1, 0, 0]),
+            (nr::FSYNC, [999, 0, 0]),
+            (nr::FDATASYNC, [2, 0, 0]),
+            (nr::SET_ROBUST_LIST, [buf_at, 24, 0]),
+            (nr::GET_ROBUST_LIST, [0, buf_at, buf_at + 8]),
+            (nr::RSEQ, [buf_at, 32, 0]),
+            (nr::SCHED_GETAFFINITY, [0, 128, buf_at]),
+            (nr::SCHED_GETAFFINITY, [0, 4, buf_at]),
+            (nr::SCHED_GETSCHEDULER, [0, 0, 0]),
+            (nr::SCHED_GETPARAM, [0, buf_at, 0]),
+            (nr::SCHED_SETPARAM, [0, buf_at, 0]),
+            (nr::SCHED_SETSCHEDULER, [0, 1, buf_at]),
+            (nr::SCHED_SETSCHEDULER, [0, 3, buf_at]),
+            (nr::SCHED_SETSCHEDULER, [0, 9, buf_at]),
+            (nr::SCHED_GET_PRIORITY_MAX, [1, 0, 0]),
+            (nr::SCHED_GET_PRIORITY_MIN, [0, 0, 0]),
+            (nr::GETCPU, [buf_at, buf_at + 4, 0]),
+            (nr::MEMBARRIER, [0, 0, 0]),
+            (nr::GETGROUPS, [0, 0, 0]),
+            (nr::SETGROUPS, [0, 0, 0]),
+            (nr::GETPPID, [0, 0, 0]),
+        ];
+        if gex_abi::X86 {
+            // arch_prctl: set the fs base, read it back.
+            cases.push((nr::ARCH_PRCTL, [0x1002, 0x1234_5000, 0]));
+            cases.push((nr::ARCH_PRCTL, [0x1003, buf_at, 0]));
+            cases.push((nr::ARCH_PRCTL, [0x9999, buf_at, 0]));
+        }
+        for (n, args) in cases {
+            m.zero(buf_at, 256).unwrap();
+            m.write_u64(buf_at + 200, 0x5a5a).unwrap();
+            set_args(&mut m, at, n, &args);
+            k.syscall(&mut m, 0);
+            let (want, want_ret) = (m.read(buf_at, 256).unwrap().to_vec(), ret(&m, at));
+            let fs = m.read_u64(at + ctx::FS_BASE as u64).unwrap();
+            m.zero(buf_at, 256).unwrap();
+            m.write_u64(buf_at + 200, 0x5a5a).unwrap();
+            set_args(&mut m, at, n, &args);
+            assert!(done(free(&k, &mut m, at)), "call {n} in the class");
+            assert_eq!(m.read(buf_at, 256).unwrap(), &want[..], "call {n} {args:?}");
+            assert_eq!(ret(&m, at), want_ret, "call {n} {args:?}");
+            assert_eq!(m.read_u64(at + ctx::FS_BASE as u64).unwrap(), fs, "call {n}");
+        }
+        // Not quiet: declined, for the kernel.
+        set_args(&mut m, at, nr::WAIT4, &[0, 0, 0]);
+        assert!(free_class(&m, at, false).is_none());
+    }
+
+    /// The credential calls (L22c) answer and change the ids as the
+    /// kernel's arms do, the change is what the rest of the process reads
+    /// (a stat's owner), and a fork's ids are its own.
+    #[test]
+    fn free_cred_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        let buf_at = 0x30000u64;
+        let keep = u32::MAX as u64;
+        let cases: Vec<(u64, [u64; 3])> = vec![
+            (nr::GETUID, [0, 0, 0]),
+            (nr::GETEUID, [0, 0, 0]),
+            (nr::GETGID, [0, 0, 0]),
+            (nr::GETEGID, [0, 0, 0]),
+            (nr::SETUID, [0, 0, 0]),
+            (nr::SETUID, [keep, 0, 0]),
+            (nr::SETGID, [5, 0, 0]),
+            (nr::SETREUID, [keep, 7, 0]),
+            (nr::SETREGID, [keep, 8, 0]),
+            (nr::SETRESUID, [keep, 9, keep]),
+            (nr::SETRESUID, [keep, keep, keep]),
+            (nr::SETRESGID, [keep, 10, keep]),
+            (nr::GETRESUID, [buf_at, buf_at + 4, buf_at + 8]),
+            (nr::GETRESGID, [buf_at, 0, buf_at + 8]),
+            (nr::GETRESUID, [1, 0, 0]),
+            (nr::GETSID, [0, 0, 0]),
+            (nr::GETPGID, [0, 0, 0]),
+            (nr::GETPGID, [99999, 0, 0]),
+            (nr::SETPGID, [0, 0, 0]),
+            (nr::SETPGID, [99999, 0, 0]),
+        ];
+        for (n, args) in cases {
+            let run = |m: &mut GuestMem<'_>, k: &mut Kernel, kernel: bool| {
+                k.creds.set_uid(1000);
+                k.creds.set_gid(1000);
+                m.zero(buf_at, 64).unwrap();
+                set_args(m, at, n, &args);
+                if kernel {
+                    k.syscall(m, 0);
+                } else {
+                    assert!(done(free(k, m, at)), "call {n} in the class");
+                }
+                (ret(m, at), m.read(buf_at, 64).unwrap().to_vec(), k.creds.uid(), k.creds.gid())
+            };
+            let want = run(&mut m, &mut k, true);
+            assert_eq!(run(&mut m, &mut k, false), want, "call {n} {args:?}");
+        }
+        // setsid: the same answer both ways (EPERM here, for a process
+        // that already leads its group), and the session the kernel's
+        // getsid reports unchanged.
+        set_args(&mut m, at, nr::GETSID, &[0]);
+        k.syscall(&mut m, 0);
+        let sid = ret(&m, at);
+        set_args(&mut m, at, nr::SETSID, &[]);
+        assert!(done(free(&k, &mut m, at)));
+        let made = ret(&m, at);
+        set_args(&mut m, at, nr::SETSID, &[]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), made);
+        set_args(&mut m, at, nr::GETSID, &[0]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), if made < 0 { sid } else { made });
+        // A uid set without the kernel is the owner the kernel's stat reports.
+        set_args(&mut m, at, nr::SETUID, &[4321]);
+        assert!(done(free(&k, &mut m, at)));
+        set_args(&mut m, at, nr::FSTAT, &[1, buf_at]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 0);
+        let uid_at = if gex_abi::X86 { 28 } else { 24 };
+        assert_eq!(m.read_u32(buf_at + uid_at).unwrap(), 4321);
+        // A fork's ids are its own from then on.
+        let child = k.fork_kernel();
+        assert_eq!(child.creds.uid(), 4321);
+        child.creds.set_uid(5);
+        assert_eq!(k.creds.uid(), 4321);
+    }
+
+    /// `kill`, `tkill` and `tgkill` (L22d) answer as the kernel's arms do,
+    /// and one for another thread of the process is raised on that
+    /// thread's own state, found through the shared table.
+    #[test]
+    fn free_kill_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        let (pid, tid) = (k.pid as u64, k.tid as u64);
+        let cases: Vec<(u64, [u64; 3])> = vec![
+            (nr::KILL, [pid, 0, 0]),
+            (nr::KILL, [99999, 0, 0]),
+            (nr::TKILL, [tid, 0, 0]),
+            (nr::TKILL, [0, 0, 0]),
+            (nr::TKILL, [tid, 99, 0]),
+            (nr::TGKILL, [pid, tid, 0]),
+            (nr::TGKILL, [pid + 999, tid, 0]),
+            (nr::TGKILL, [pid, 99999, 0]),
+            (nr::TGKILL, [0, tid, 0]),
+        ];
+        for (n, args) in cases {
+            set_args(&mut m, at, n, &args);
+            k.syscall(&mut m, 0);
+            let want = ret(&m, at);
+            set_args(&mut m, at, n, &args);
+            assert!(done(free(&k, &mut m, at)), "call {n} in the class");
+            assert_eq!(ret(&m, at), want, "call {n} {args:?}");
+        }
+        // Another thread's: on its own pending word, with the sender named,
+        // and none on the caller's.
+        const SIGUSR2: u64 = 12;
+        let other = Arc::new(signal::ThreadSig::new_thread(0));
+        k.thread_signals.insert(4242, Arc::clone(&other));
+        set_args(&mut m, at, nr::TGKILL, &[pid, 4242, SIGUSR2]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 0);
+        assert_eq!(other.pending(), 1 << (SIGUSR2 - 1));
+        assert_eq!(k.signals.thread().pending() & (1 << (SIGUSR2 - 1)), 0);
+
+        // rt_sigtimedwait: nothing pending with a zero timeout is EAGAIN
+        // both ways; a blocked signal the process sent itself is taken,
+        // with its sender, the same both ways.
+        let set_at = 0x31000u64;
+        let info_at = 0x31100u64;
+        let zero_at = 0x31200u64;
+        m.write_u64(set_at, 1 << (SIGUSR2 - 1)).unwrap();
+        m.zero(zero_at, 16).unwrap();
+        k.signals.set_blocked(1 << (SIGUSR2 - 1));
+        let mut answers = Vec::new();
+        for kernel in [true, false] {
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, zero_at, 8]);
+            if kernel {
+                k.syscall(&mut m, 0);
+            } else {
+                assert!(done(free(&k, &mut m, at)));
+            }
+            assert_eq!(ret(&m, at), -(Errno::EAGAIN.0 as i64));
+            set_args(&mut m, at, nr::KILL, &[pid, SIGUSR2]);
+            k.syscall(&mut m, 0);
+            m.zero(info_at, 128).unwrap();
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+            if kernel {
+                k.syscall(&mut m, 0);
+            } else {
+                assert!(done(free(&k, &mut m, at)));
+            }
+            answers.push((ret(&m, at), m.read(info_at, 32).unwrap().to_vec()));
+        }
+        assert_eq!(answers[0].0, SIGUSR2 as i64);
+        assert_eq!(answers[0], answers[1]);
+
+        // rt_sigsuspend: the asked-for mask in place (SIGKILL never
+        // blocked), a park on SigSuspend, the old mask owed back.
+        k.signals.set_blocked(0x5);
+        m.write_u64(set_at, !0).unwrap();
+        set_args(&mut m, at, nr::RT_SIGSUSPEND, &[set_at, 8]);
+        match free(&k, &mut m, at) {
+            Some(FreeOutcome::Blocking(BlockOp::SigSuspend { restore_mask: 0x5 }, Some(0x5))) => {}
+            _ => panic!("rt_sigsuspend did not park"),
+        }
+        assert_eq!(k.signals.blocked(), !0 & !((1 << 8) | (1 << 18)));
+        k.signals.set_blocked(0);
+        set_args(&mut m, at, nr::RT_SIGSUSPEND, &[0x7fff_ffff_0000, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), -(Errno::EFAULT.0 as i64));
+    }
+
+    /// `rt_sigtimedwait` with none of its set pending waits (it had answered
+    /// `EAGAIN` at once, whatever the timeout): it parks on `SigWait`, with
+    /// and without the lock, and the kernel's finish takes the signal that
+    /// ended the wait, or passes on the host's `EAGAIN` (time up) and
+    /// `EINTR`. A bad timeout is `EINVAL` before anything is taken.
+    #[test]
+    fn sigtimedwait_waits_for_its_set() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        const SIGUSR1: u64 = 10;
+        let bit = 1u64 << (SIGUSR1 - 1);
+        let (set_at, info_at, ts_at, bad_at) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64);
+        m.write_u64(set_at, bit).unwrap();
+        m.write_u64(ts_at, 2).unwrap();
+        m.write_u64(ts_at + 8, 500).unwrap();
+        m.write_u64(bad_at, 0).unwrap();
+        m.write_u64(bad_at + 8, 1_000_000_000).unwrap();
+        k.signals.set_blocked(bit);
+        let pid = k.pid as u64;
+
+        // Without the lock: a park on its set, with the timeout.
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        let call = free_class(&m, at, false).expect("in the class");
+        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+        match free_call(&f, &mut m, at, call) {
+            FreeOutcome::Blocking(BlockOp::SigWait { set, timeout, .. }, None) => {
+                assert_eq!(set, bit);
+                assert_eq!(timeout, Some(std::time::Duration::new(2, 500)));
+            }
+            _ => panic!("rt_sigtimedwait did not park"),
+        }
+
+        // With it: the same park; the signal raised meanwhile is what the
+        // host saw, and the finish takes it with its siginfo_t.
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+        let op = match k.syscall(&mut m, 0) {
+            SyscallOutcome::Blocking(op) => op,
+            _ => panic!("rt_sigtimedwait did not park under the lock"),
+        };
+        let BlockOp::SigWait { set, timeout: None, thread, process } = op else { panic!("not SigWait: {op:?}") };
+        assert_eq!((thread.pending() | process.shared()) & set, 0);
+        k.signals.raise(SIGUSR1 as u32);
+        assert_ne!((thread.pending() | process.shared()) & set, 0, "the waiter sees it without the kernel");
+        m.zero(info_at, 128).unwrap();
+        k.finish_blocking(&mut m, Ok(0));
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        assert_eq!(m.read_u32(info_at).unwrap(), SIGUSR1 as u32);
+        assert_eq!(k.signals.pending_raw() & bit, 0, "taken");
+
+        // Time up and interrupted: the host's answer is the call's.
+        for (host, want) in [(Errno::EAGAIN, Errno::EAGAIN), (Errno::EINTR, Errno::EINTR)] {
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::SigWait { .. })));
+            k.finish_blocking(&mut m, Err(host));
+            assert_eq!(ret(&m, at), -(want.0 as i64));
+        }
+
+        // A tgkill to the waiting thread itself: taken with its sender
+        // (SI_TKILL), not SI_KERNEL (its sender was looked for on the
+        // process's set once the thread's pending bit was cleared).
+        set_args(&mut m, at, nr::TGKILL, &[pid, k.tid as u64, SIGUSR1]);
+        k.syscall(&mut m, 0);
+        m.zero(info_at, 128).unwrap();
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        assert_eq!(m.read_u32(info_at + 8).unwrap() as i32, signal::SI_TKILL);
+        assert_eq!(m.read_u32(info_at + if gex_abi::PPC { 12 } else { 16 }).unwrap(), k.pid as u32);
+
+        // Pending already: answered at once, no park. A bad timeout: EINVAL.
+        set_args(&mut m, at, nr::KILL, &[pid, SIGUSR1]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue | SyscallOutcome::Resume(_)));
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, bad_at, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
+    }
+
+    #[test]
+    fn free_i386_quiet_calls_answer_as_the_kernel_does() {
+        if !gex_abi::X86 {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            free_call(&f, m, at, call)
+        }
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 3]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            for (i, v) in a.iter().enumerate() {
+                m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+            }
+        };
+        let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+        use crate::i386::raw;
+        let buf_at = 0x30000u64;
+        for (n, args) in [
+            (raw::UNAME, [buf_at, 0, 0]),
+            (raw::GETCPU, [buf_at, buf_at + 4, 0]),
+            (raw::SCHED_GETAFFINITY, [0, 64, buf_at]),
+            (raw::FSYNC, [1, 0, 0]),
+            (raw::FSYNC, [0xffff_ffff, 0, 0]),
+            (raw::GETGROUPS, [0, 0, 0]),
+            (raw::PERSONALITY, [0, 0, 0]),
+            (raw::GETPPID, [0, 0, 0]),
+        ] {
+            m.zero(buf_at, 512).unwrap();
+            set32(&mut m, n, args);
+            k.syscall(&mut m, 0);
+            let (want, want_ret) = (m.read(buf_at, 512).unwrap().to_vec(), r32(&m));
+            m.zero(buf_at, 512).unwrap();
+            set32(&mut m, n, args);
+            assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)), "raw {n}");
+            assert_eq!(m.read(buf_at, 512).unwrap(), &want[..], "raw {n}");
+            assert_eq!(r32(&m), want_ret, "raw {n}");
+        }
+        // A timerfd armed and re-armed through the 32-bit itimerspec, its
+        // old value narrowed back, either way.
+        for lock_free in [true, false] {
+            let mut go = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            set32(&mut m, raw::TIMERFD_CREATE, [1, 0, 0]);
+            go(&mut m, &mut k);
+            let tfd = r32(&m) as u64;
+            m.zero(0x31000, 64).unwrap();
+            m.write_u32(0x31008, 100).unwrap(); // it_value.tv_sec
+            m.write_u32(0x31000, 7).unwrap(); // it_interval.tv_sec
+            set32(&mut m, raw::TIMERFD_SETTIME, [tfd, 0, 0x31000]);
+            m.write_u64(at + crate::i386::ARG_SLOTS[3] as u64, 0).unwrap();
+            go(&mut m, &mut k);
+            assert_eq!(r32(&m), 0, "lock_free {lock_free}");
+            set32(&mut m, raw::TIMERFD_SETTIME, [tfd, 0, 0x31000]);
+            m.write_u64(at + crate::i386::ARG_SLOTS[3] as u64, 0x31100).unwrap();
+            m.write_u64(0x31110, !0).unwrap();
+            go(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(m.read_u32(0x31100).unwrap(), 7, "old interval, 32-bit");
+            let left = m.read_u32(0x31108).unwrap();
+            assert!(left == 99 || left == 100, "{left}");
+            assert_eq!(m.read_u64(0x31110).unwrap(), !0, "nothing past the 16 bytes");
+            set32(&mut m, raw::CLOSE, [tfd, 0, 0]);
+            k.syscall(&mut m, 0);
+        }
+        // uname's machine is i686 for an i386 process.
+        set32(&mut m, raw::UNAME, [buf_at, 0, 0]);
+        let _ = free(&k, &mut m, at);
+        assert_eq!(&m.read(buf_at + 4 * 65, 4).unwrap(), b"i686");
+        // set_thread_area: the entry number chosen and the base in %gs, as
+        // the full call's translation does.
+        m.write_u32(buf_at + 0x100, u32::MAX).unwrap();
+        m.write_u32(buf_at + 0x104, 0x0abc_d000).unwrap();
+        set32(&mut m, raw::SET_THREAD_AREA, [buf_at + 0x100, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(r32(&m), 0);
+        assert_eq!(m.read_u32(buf_at + 0x100).unwrap(), 6);
+        assert_eq!(m.read_u64(at + ctx::GS_BASE as u64).unwrap(), 0x0abc_d000);
+        // time(&t): a 32-bit time_t stored, nothing past it (the clocks'
+        // own path answers it).
+        m.write_u64(buf_at, !0).unwrap();
+        set32(&mut m, raw::TIME, [buf_at, 0, 0]);
+        assert!(clock_call(&mut m, at, true, k.clock, k.started));
+        assert_eq!(m.read_u32(buf_at + 4).unwrap(), u32::MAX, "only four bytes stored");
+        assert_eq!(m.read_u32(buf_at).unwrap() as i32, r32(&m));
+    }
+
+    #[test]
+    fn free_fd_object_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        for lock_free in [true, false] {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(done(free(k, m, at)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            let full = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, args: &[u64]| {
+                set_args(m, at, n, args);
+                k.syscall(m, 0);
+                ret(m, at) as u64
+            };
+            // eventfd2: a counter, written and read back.
+            set_args(&mut m, at, nr::EVENTFD2, &[3, 0]);
+            call(&mut m, &mut k);
+            let efd = ret(&m, at) as u64;
+            assert!(efd < 100, "lock_free {lock_free}");
+            assert_eq!(k.fds.get(efd as i32).unwrap().path, "anon_inode:[eventfd]");
+            assert_eq!(full(&mut m, &mut k, nr::READ, &[efd, 0x20000, 8]), 8);
+            assert_eq!(m.read_u64(0x20000).unwrap(), 3);
+            // epoll_create1 with CLOEXEC.
+            set_args(&mut m, at, nr::EPOLL_CREATE1, &[0o2000000]);
+            call(&mut m, &mut k);
+            let ep = ret(&m, at) as u64;
+            assert_eq!(k.fds.get(ep as i32).unwrap().path, "anon_inode:[eventpoll]");
+            // memfd_create, then fallocate to a size the descriptor reports.
+            m.write(0x20100, b"buf\0").unwrap();
+            set_args(&mut m, at, nr::MEMFD_CREATE, &[0x20100, 1]);
+            call(&mut m, &mut k);
+            let mfd = ret(&m, at) as u64;
+            assert_eq!(k.fds.get(mfd as i32).unwrap().path, "/memfd:buf");
+            set_args(&mut m, at, nr::FALLOCATE, &[mfd, 0, 0, 8192]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            assert_eq!(k.fds.get(mfd as i32).unwrap().handle.metadata().unwrap().size, 8192);
+            set_args(&mut m, at, nr::FALLOCATE, &[mfd, 1, 0, 8192]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EOPNOTSUPP.0 as i64));
+            // A timerfd armed for ten seconds says about ten seconds left.
+            set_args(&mut m, at, nr::TIMERFD_CREATE, &[1, 0]);
+            call(&mut m, &mut k);
+            let tfd = ret(&m, at) as u64;
+            m.zero(0x20200, 64).unwrap();
+            m.write_u64(0x20210, 10).unwrap();
+            set_args(&mut m, at, nr::TIMERFD_SETTIME, &[tfd, 0, 0x20200, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::TIMERFD_GETTIME, &[tfd, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            let left = m.read_u64(0x20310).unwrap();
+            assert!(left == 9 || left == 10, "{left}");
+            // The transfers: a file into a pipe, then a pipe into a file.
+            m.write(0x20400, b"/src\0").unwrap();
+            let src = full(&mut m, &mut k, nr::OPENAT, &[(-100i64) as u64, 0x20400, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_TRUNC) as u64, 0o644]);
+            m.write(0x20500, b"transferred").unwrap();
+            assert_eq!(full(&mut m, &mut k, nr::WRITE, &[src, 0x20500, 11]), 11);
+            set_args(&mut m, at, nr::PIPE2, &[0x20600, 0]);
+            k.syscall(&mut m, 0);
+            let (r, w) = (m.read_u32(0x20600).unwrap() as u64, m.read_u32(0x20604).unwrap() as u64);
+            m.write_u64(0x20700, 0).unwrap();
+            set_args(&mut m, at, nr::SENDFILE, &[w, src, 0x20700, 64]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            assert_eq!(m.read_u64(0x20700).unwrap(), 11, "the offset advanced");
+            m.write(0x20800, b"/dst\0").unwrap();
+            let dst = full(&mut m, &mut k, nr::OPENAT, &[(-100i64) as u64, 0x20800, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_TRUNC) as u64, 0o644]);
+            set_args(&mut m, at, nr::SPLICE, &[r, 0, dst, 0, 64, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            m.write_u64(0x20900, 0).unwrap();
+            m.write_u64(0x20908, 11).unwrap();
+            set_args(&mut m, at, nr::COPY_FILE_RANGE, &[src, 0x20900, dst, 0x20908, 64, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            assert_eq!(full(&mut m, &mut k, nr::PREAD64, &[dst, 0x20a00, 64, 0]), 22);
+            assert_eq!(m.read(0x20a00, 22).unwrap(), b"transferredtransferred");
+            // An empty blocking pipe: the transfer waits, both ways.
+            set_args(&mut m, at, nr::SPLICE, &[r, 0, dst, 0, 64, 0]);
+            if lock_free {
+                assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::AcceptWait { .. }, None))));
+            } else {
+                assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::AcceptWait { .. })));
+                k.retry_transfer = None;
+            }
+            for f in [efd, ep, mfd, tfd, src, r, w, dst] {
+                set_args(&mut m, at, nr::CLOSE, &[f]);
+                k.syscall(&mut m, 0);
+            }
+        }
+    }
+
+    #[test]
     fn free_fd_misc_calls_answer_as_the_kernel_does() {
         if gex_abi::PPC {
             return;
@@ -10212,7 +11107,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10304,7 +11199,7 @@ mod tests {
             set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_NOFILE as u64, 0, 0x22100]);
             if lock_free { let _ = k.syscall(&mut m, 0); } else { assert!(done(free(&k, &mut m, at))); }
             assert_eq!(m.read_u64(0x22100).unwrap(), soft);
-            k.uid = 1000;
+            k.creds.set_uid(1000);
             m.write_u64(0x22000, 10).unwrap();
             m.write_u64(0x22008, 20).unwrap();
             set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_CORE as u64, 0x22000, 0]);
@@ -10319,7 +11214,7 @@ mod tests {
             set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_CORE as u64, 0x22000, 0]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
-            k.uid = 0;
+            k.creds.set_uid(0);
             k.rlimits.set(default_rlimits());
         }
     }
@@ -10335,7 +11230,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10377,7 +11272,7 @@ mod tests {
 
         // A blocked signal raised is pending, read lock-free.
         k.signals.set_blocked(1 << (SIGUSR1 - 1));
-        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.uid });
+        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.creds.uid() });
         set_args(&mut m, at, nr::RT_SIGPENDING, &[0x22000, 8]);
         assert!(done(free(&k, &mut m, at)));
         assert_eq!(m.read_bits64(0x22000).unwrap() & (1 << (SIGUSR1 - 1)), 1 << (SIGUSR1 - 1));
@@ -10433,7 +11328,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10441,7 +11336,7 @@ mod tests {
         // Not in the class: declined before anything is done.
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::SETSID, &[]);
+        set_args(&mut m, at, nr::WAIT4, &[0, 0, 0]);
         assert!(free(&k, &mut m, at).is_none());
 
         // An empty pipe parks both ways, on the same stream.
@@ -10611,7 +11506,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10672,7 +11567,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -11084,7 +11979,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -11161,7 +12056,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -11259,7 +12154,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11341,7 +12236,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11407,7 +12302,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -11509,7 +12404,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -11546,7 +12441,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11591,6 +12486,60 @@ mod tests {
         assert_eq!(g[g.len() - 2], -(Errno::ENOENT.0 as i64));
     }
 
+    /// Open flags are read in the guest's own spelling. An AArch64 program's
+    /// `O_LARGEFILE` is x86's `O_NOFOLLOW`, and glibc passes it on every
+    /// open: taken as x86's, opening anything through a symlink was
+    /// `ELOOP`. And `fcntl(F_GETFL)` answers in that spelling too.
+    #[test]
+    fn open_flags_are_the_guests_spelling() {
+        if gex_abi::PPC {
+            return;
+        }
+        let g = |f: u64| oflags::to_guest(f, false);
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                match free_class(m, at, false) {
+                    Some(call) if lock_free => {
+                        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                        assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                    }
+                    _ => {
+                        k.syscall(m, 0);
+                    }
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            for (a, t) in [(0x20000u64, &b"/d\0"[..]), (0x20200, b"/d/f\0"), (0x20300, b"/d/l\0")] {
+                m.write(a, t).unwrap();
+            }
+            sys_locked(&mut m, &mut k, at, nr::MKDIRAT, &[cwd, 0x20000, 0o755]);
+            let f = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20200, g(oflags::O_RDWR | oflags::O_CREAT | oflags::O_LARGEFILE), 0o644]);
+            assert!(f >= 3, "create: {f}");
+            sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20200, cwd, 0x20300]);
+            let via = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20300, g(oflags::O_RDONLY | oflags::O_LARGEFILE), 0]);
+            assert!(via >= 3, "open through the link with O_LARGEFILE (lock_free {lock_free}): {via}");
+            let nofollow = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20300, g(oflags::O_RDONLY | oflags::O_NOFOLLOW), 0]);
+            assert_eq!(nofollow, -(Errno::ELOOP.0 as i64), "O_NOFOLLOW on the link");
+            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, g(oflags::O_RDONLY | oflags::O_DIRECTORY), 0]);
+            assert!(dir >= 3, "O_DIRECTORY: {dir}");
+            // O_DIRECT set and read back, in the guest's spelling.
+            const F_GETFL: u64 = 3;
+            const F_SETFL: u64 = 4;
+            assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[f as u64, F_SETFL, g(oflags::O_DIRECT | oflags::O_NONBLOCK)]), 0);
+            let fl = sys(&mut m, &mut k, nr::FCNTL, &[f as u64, F_GETFL]) as u64;
+            assert_eq!(fl & g(oflags::O_DIRECT | oflags::O_NONBLOCK), g(oflags::O_DIRECT | oflags::O_NONBLOCK), "F_GETFL {fl:#o}");
+            assert_eq!(fl & oflags::ACCMODE, oflags::O_RDWR);
+            assert_eq!(fl & g(oflags::O_DIRECTORY | oflags::O_NOFOLLOW), 0, "F_GETFL {fl:#o}");
+        }
+    }
+
     /// The path writers through the lock-free path ([`PathIo`], L14c)
     /// answer as the full call does. A directory renamed takes what is under
     /// it, a descriptor on a directory below follows it there (Linux
@@ -11614,7 +12563,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11725,7 +12674,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11801,7 +12750,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11908,7 +12857,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11989,7 +12938,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12028,7 +12977,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;

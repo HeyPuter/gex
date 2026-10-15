@@ -1,7 +1,9 @@
-/* getpriority/setpriority/getcpu: we run at the default niceness in a single
- * scheduling domain. getpriority and setpriority are deterministic and so are
- * checked against QEMU directly; getcpu's CPU number is whatever host core the
- * process lands on (QEMU reports the real one), so only its success is checked. */
+/* getpriority/setpriority/getcpu. Every answer is relative to the niceness
+ * the process starts at, because that is the runner's own: QEMU passes the
+ * host's through (a suite run under `nice -n 10` starts at 10), and gex is a
+ * fresh system at 0. Raising it by 5 (clamped at 19) is allowed to anyone.
+ * getcpu's CPU number is whatever host core the process lands on (QEMU
+ * reports the real one), so only its success is checked. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <sched.h>
@@ -13,10 +15,13 @@
 int main(void) {
     errno = 0;
     int p = getpriority(PRIO_PROCESS, 0);
-    printf("getpriority=%d errno=%d\n", p, errno);
+    printf("getpriority in-range=%d errno=%d\n", p >= -20 && p <= 19, errno);
 
-    int r = setpriority(PRIO_PROCESS, 0, 5);
-    printf("setpriority ret=%d\n", r);
+    int want = p + 5 > 19 ? 19 : p + 5;
+    int r = setpriority(PRIO_PROCESS, 0, want);
+    printf("setpriority(+5) ret=%d\n", r);
+    /* Not read back: gex accepts a niceness and does not keep it (the
+     * scheduler is the host's). */
 
     unsigned cpu = 99, node = 99;
     long g = syscall(SYS_getcpu, &cpu, &node, 0);
