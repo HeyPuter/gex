@@ -702,6 +702,9 @@ async function handle(msg) {
         if (count === 1) console.error(`[wlstub] wrote ${W}x${H} scene to ${dumpPath}`);
       },
       pollInput() { return 0; },
+      // No input here, ever (`wl_input_pending`, which the shim asks of every
+      // compositor since the pump learned to wait for a client's input).
+      inputPending() { return false; },
     });
   }
 
