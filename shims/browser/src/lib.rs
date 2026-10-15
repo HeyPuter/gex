@@ -10851,6 +10851,13 @@ pub(crate) fn stale_now() {
     TURN_NOW.with(|c| c.set(0));
 }
 
+/// No [`NowScope`] is open any more: a trap left the frames that held them
+/// (`trap`), and their `Drop` never runs.
+fn end_now_scopes() {
+    NOW_SCOPED.with(|s| s.set(false));
+    stale_now();
+}
+
 /// A pass whose clock questions share one reading ([`turn_now`]). Nested
 /// scopes start their own reading; the outer one reads again after.
 pub(crate) struct NowScope(bool);
@@ -12243,6 +12250,11 @@ fn trap() -> ! {
     // reported itself as being inside syscall 221, and that sent the hunt for
     // the demo site's crash into `do_exec` twice.
     IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Nor in a pass of the clock (`NowScope`), whose `Drop` this skips as
+    // well: left set, every later clock question on this Worker got the
+    // reading the trapping syscall took, and a timed `poll` or `epoll_wait`
+    // whose stack went back to the page never reached its deadline.
+    end_now_scopes();
     warch::unreachable()
 }
 
