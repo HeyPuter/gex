@@ -99,18 +99,13 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # sock-threads: a unix listener, its clients, socketpairs and internet
 # sockets from several threads at once (L18: the socket calls without the
 # kernel lock).
-# fork-maps-threads (native tiers only for now): forks while other threads
-# map, protect and unmap memory and files (L19: a fork's image, code names
-# and the translator's file reads come from the published map, not the
-# kernel lock). Not in the page tier: in the memory64 page a forked child
-# of a threaded parent can fault walking musl's thread list, whose
-# descriptors sit on thread stacks above 4 GiB that its memory was not grown
-# to cover (fails the same on 31a21cad).
 # exec-dethread: an exec from a second thread while the first joins, spins,
 # reads or waits on a futex; the old program must not run over the new one
 # (the page's de_thread). Page only, as spawn-threads.
-# fork-maps-threads: forks while other threads map and unmap; the child's
-# image and memory cover every mapping, thread stacks above 4 GiB too.
+# fork-maps-threads: forks while other threads map, protect and unmap memory
+# and files (L19: a fork's image, code names and the translator's file reads
+# come from the published map, not the kernel lock); the child's image and
+# memory cover every mapping, thread stacks above 4 GiB too.
 # fork-thread-ctx: a process forked or exec'd from a thread other than the
 # first starts threads; none may share the main thread's context.
 # fork-twice-thread: a shell forked from a second thread launches two
