@@ -488,6 +488,28 @@ in the scheduler pick after each wake of the global WAKE word: about
      `pread64` 20 in pid 2). Legs: the i386 builds of
      `close-while-reading`, `kernel-contend` and `ioctl-threads`, page
      tier and SP; `free_i386_positioned_calls_answer_as_the_kernel_does`.
+   - The descriptor table's own calls (L10): `close`, `close_range`,
+     `dup`, `dup2`, `dup3`, `fcntl` (i386's `fcntl64` too) and `flock`
+     are in the free class, as `FdIo` methods the kernel's calls use too.
+     The table publishes itself and the `flock` table locks itself. What
+     the kernel lock had been making safe was the "last descriptor" test
+     (`Arc::strong_count == 1` after the close). Without the lock it is
+     wrong both ways: two threads closing the last two copies at once each
+     still hold one, and a replaced copy of the table holds one until its
+     readers move on. So the lock and an `O_TMPFILE`'s name now go when
+     the description itself does (`OpenFile`'s `Drop`, Linux's last
+     `fput`). A `close` of such a description waits for the table's
+     replaced copies (`FdTable::settle`, `Published::settle`), so the lock
+     is gone when the call returns. For that, `Published` now retires a
+     replaced value under its writers' mutex, and counts the values being
+     dropped. A memfd is found from its handle (`FileHandle::as_memfd`),
+     not a per-kernel map. Legs: `fdtable-threads` (the dup family, flags
+     and close racing on one table while a writer feeds a pipe through
+     copies; flock released by the last close and not before) in the page
+     tier, x86-64 and i386, and SP;
+     `free_fd_table_calls_answer_as_the_kernel_does`, its i386 twin,
+     `a_tmpfile_name_goes_with_its_last_descriptor`, and gex-atomic's
+     `settle_drops_every_value_replaced_before_it`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:

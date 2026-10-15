@@ -610,8 +610,6 @@ pub struct Kernel {
     pub resolver: Arc<net::Resolver>,
     /// The TCP ports guests listen on. Shared across `fork` like the resolver.
     pub ports: Arc<net::Ports>,
-    /// And for anonymous shared files, which have seals.
-    pub memfds: std::collections::HashMap<usize, Arc<unix::MemFd>>,
     /// Which unix socket answers to which path. Shared system-wide, because
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
@@ -1031,6 +1029,9 @@ pub struct FdIo<'a> {
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
     pub pid: i32,
+    /// `flock`'s locks (`Kernel::file_locks`, shared with the process's
+    /// forks), released when a description goes.
+    pub file_locks: &'a Arc<unix::FileLocks>,
 }
 
 impl FdIo<'_> {
@@ -1739,6 +1740,13 @@ impl FdIo<'_> {
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3]),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
+            nr::CLOSE => self.close(a[0] as i32),
+            nr::CLOSE_RANGE => self.close_range(a[0], a[1], a[2]),
+            nr::DUP => self.dup(a[0] as i32),
+            nr::DUP2 => self.dup2(a[0] as i32, a[1] as i32),
+            nr::DUP3 => self.dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::FCNTL => self.fcntl_call(m, a[0] as i32, a[1], a[2]),
+            nr::FLOCK => self.flock(a[0] as i32, a[1]),
             _ => return None,
         })
     }
@@ -1865,6 +1873,13 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
             x::IOCTL => nr::IOCTL,
+            x::CLOSE => nr::CLOSE,
+            x::CLOSE_RANGE => nr::CLOSE_RANGE,
+            x::DUP => nr::DUP,
+            x::DUP2 => nr::DUP2,
+            x::DUP3 => nr::DUP3,
+            x::FCNTL | x::FCNTL64 => nr::FCNTL,
+            x::FLOCK => nr::FLOCK,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1888,13 +1903,21 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
             x::IOCTL => nr::IOCTL,
+            x::CLOSE => nr::CLOSE,
+            x::CLOSE_RANGE => nr::CLOSE_RANGE,
+            x::DUP => nr::DUP,
+            x::DUP2 => nr::DUP2,
+            x::DUP3 => nr::DUP3,
+            x::FCNTL => nr::FCNTL,
+            x::FLOCK => nr::FLOCK,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
             | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
-            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL => raw,
+            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL | nr::CLOSE
+            | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK => raw,
             _ => return None,
         }
     };
@@ -1916,8 +1939,10 @@ pub struct FreeCall {
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
 /// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
 /// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
-/// `sendmsg`, `recvmsg` and `ioctl`; the 32-bit ABI's `pread64`,
-/// `pwrite64` and `_llseek` too, translated as the full call translates them.
+/// `sendmsg`, `recvmsg`, `ioctl`, and the descriptor table's own calls
+/// (`close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `flock`); the
+/// 32-bit ABI's `pread64`, `pwrite64`, `_llseek` and `fcntl64` too,
+/// translated as the full call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1939,7 +1964,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP) && !is_poll(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1969,7 +1994,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
     let mut post = crate::i386::Post::None;
-    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK)) {
+    if is_poll(n)
+        || (compat
+            && matches!(
+                n,
+                nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK | nr::DUP2 | nr::DUP3 | nr::FCNTL
+            ))
+    {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
             post = p;
@@ -3375,7 +3406,6 @@ impl Kernel {
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             ports: Arc::new(net::Ports::new()),
-            memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             host_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
@@ -3633,7 +3663,6 @@ impl Kernel {
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             ports: Arc::clone(&self.ports),
-            memfds: self.memfds.clone(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
@@ -4212,7 +4241,7 @@ impl Kernel {
 
     /// The descriptor half of this kernel ([`FdIo`]).
     pub fn fd_io(&self) -> FdIo<'_> {
-        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid }
+        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks }
     }
 
     /// The blocking half of a syscall, if it has one.
@@ -4471,11 +4500,7 @@ impl Kernel {
             // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
             // first field in every `struct flock` layout (i386's flock and
             // flock64, x86-64's, wasm32's).
-            nr::FCNTL if a[1] == 5 || a[1] == 36 => self.fds.get(a[0] as i32).and_then(|_| {
-                const F_UNLCK: u16 = 2;
-                m.write(a[2], &F_UNLCK.to_le_bytes()).map(|_| 0)
-            }),
-            nr::FCNTL => self.sys_fcntl(a[0] as i32, a[1], a[2]),
+            nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self
                 .fds
@@ -5505,7 +5530,7 @@ impl Kernel {
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
         let file = match tmpfile_path {
-            Some(tp) => OpenFile::tmpfile(handle, tp, flags, readable, writable),
+            Some(tp) => OpenFile::tmpfile(handle, tp, self.vfs.view().get(), flags, readable, writable),
             None => OpenFile::new(handle, p, flags, readable, writable),
         };
         self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
@@ -5545,16 +5570,11 @@ impl Kernel {
     }
 
     fn sys_dup(&mut self, fd: i32) -> SysResult {
-        let file = self.fds.get(fd)?;
-        self.fds.insert(file, false)
+        self.fd_io().dup(fd)
     }
 
     fn sys_dup3(&mut self, old: i32, new: i32, flags: u64) -> SysResult {
-        if old == new {
-            return Err(Errno::EINVAL);
-        }
-        let file = self.fds.get(old)?;
-        self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
+        self.fd_io().dup3(old, new, flags)
     }
 
     /// `linkat`: a second name for a file that already exists.
@@ -5900,6 +5920,85 @@ impl Kernel {
     }
 
     fn sys_fcntl(&mut self, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        self.fd_io().fcntl(fd, cmd, arg)
+    }
+
+}
+
+/// The descriptor table's own calls: `close`, `close_range`, the `dup`
+/// family, `fcntl` and `flock`. No kernel lock (docs/kernel-locking.md,
+/// L10): the table publishes itself, `flock`'s locks and a memfd's seals
+/// lock themselves, and an `O_TMPFILE`'s name is dropped through the
+/// process's published namespace.
+impl FdIo<'_> {
+    pub fn dup(&self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        self.fds.insert(file, false)
+    }
+
+    pub fn dup3(&self, old: i32, new: i32, flags: u64) -> SysResult {
+        if old == new {
+            return Err(Errno::EINVAL);
+        }
+        let file = self.fds.get(old)?;
+        self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// `dup2`: `dup3` without flags, except that `dup2(fd, fd)` is a no-op
+    /// that still validates the descriptor, where `dup3` would refuse.
+    pub fn dup2(&self, old: i32, new: i32) -> SysResult {
+        if old == new {
+            self.fds.get(old)?;
+            return Ok(new as u64);
+        }
+        self.dup3(old, new, 0)
+    }
+
+    /// Close a descriptor. The description's `flock` lock and an
+    /// `O_TMPFILE`'s name go with the description itself (`OpenFile`'s
+    /// `Drop`): when its last descriptor closes here, or in another process
+    /// it was passed to, and no call still in flight holds it. `dup` and
+    /// `fork` share one description, so closing a copy releases nothing.
+    pub fn close(&self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        self.fds.close(fd)?;
+        let settle = file.undoes_on_last_close();
+        drop(file);
+        if settle {
+            self.fds.settle();
+        }
+        Ok(0)
+    }
+
+    /// `close_range`: shut every open descriptor in a span at once.
+    pub fn close_range(&self, first: u64, last: u64, flags: u64) -> SysResult {
+        // `CLOSE_RANGE_CLOEXEC` marks the span close-on-exec instead of closing
+        // it now; `CLOSE_RANGE_UNSHARE` asks for a private descriptor table
+        // first, which is a no-op here because a process already has its own.
+        const CLOSE_RANGE_CLOEXEC: u64 = 4;
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        self.fds
+            .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
+        self.fds.settle();
+        Ok(0)
+    }
+
+    /// `fcntl` as the call is made: F_GETLK and F_OFD_GETLK answer through
+    /// memory, nobody holding a lock (see [`FdIo::fcntl`]), so the answer is
+    /// l_type = F_UNLCK, which is the first field in every `struct flock`
+    /// layout (i386's flock and flock64, x86-64's, wasm32's).
+    pub fn fcntl_call(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        if cmd == 5 || cmd == 36 {
+            self.fds.get(fd)?;
+            const F_UNLCK: u16 = 2;
+            return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
+        }
+        self.fcntl(fd, cmd, arg)
+    }
+
+    pub fn fcntl(&self, fd: i32, cmd: u64, arg: u64) -> SysResult {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;
@@ -5980,6 +6079,21 @@ impl Kernel {
         }
     }
 
+    /// The anonymous shared file behind a descriptor: `EINVAL` for any other.
+    pub fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_memfd().ok_or(Errno::EINVAL)
+    }
+
+    /// `flock`. The open file description owns the lock, and its address is
+    /// a stable name for it while it is open.
+    pub fn flock(&self, fd: i32, op: u64) -> SysResult {
+        let file = self.fds.get(fd)?;
+        let r = self.file_locks.flock(&file.path, file.lock_key(), op);
+        if r.is_ok() {
+            file.note_locks(self.file_locks);
+        }
+        r
+    }
 }
 
 impl FdIo<'_> {
@@ -7473,42 +7587,14 @@ impl Kernel {
         Ok(())
     }
 
-    /// `close`, which also drops any advisory lock the description held.
-    ///
-    /// Only when this was the last descriptor onto it: `dup` and `fork` share
-    /// one description and one lock, so closing a copy releases nothing. And
-    /// the lock is keyed by the description's address, which is handed
-    /// straight back to the next open -- a stale one would belong to an
-    /// unrelated file.
+    /// `close` ([`FdIo::close`]).
     fn sys_close(&mut self, fd: i32) -> SysResult {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file) as *const () as usize;
-        self.fds.close(fd)?;
-        // One reference in the table is gone; `file` is the other. Anything
-        // above that is another descriptor.
-        if Arc::strong_count(&file) == 1 {
-            self.file_locks.release(key);
-            // Last descriptor to an O_TMPFILE: drop its name. If a `linkat` gave
-            // it another (the atomic-write idiom), that name keeps the inode.
-            if let Some(tp) = &file.unlink_on_close {
-                let _ = self.vfs.unlink(tp);
-            }
-        }
-        Ok(0)
+        self.fd_io().close(fd)
     }
 
     /// `close_range`: shut every open descriptor in a span at once.
     fn sys_close_range(&mut self, first: u64, last: u64, flags: u64) -> SysResult {
-        // `CLOSE_RANGE_CLOEXEC` marks the span close-on-exec instead of closing
-        // it now; `CLOSE_RANGE_UNSHARE` asks for a private descriptor table
-        // first, which is a no-op here because a process already has its own.
-        const CLOSE_RANGE_CLOEXEC: u64 = 4;
-        if first > last {
-            return Err(Errno::EINVAL);
-        }
-        self.fds
-            .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
-        Ok(0)
+        self.fd_io().close_range(first, last, flags)
     }
 
     /// `membarrier`: force a memory barrier across the process's threads.
@@ -7602,9 +7688,7 @@ impl Kernel {
 
     /// The anonymous shared file behind a descriptor, if it is one.
     fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.memfds.get(&key).cloned().ok_or(Errno::EINVAL)
+        self.fd_io().memfd_of(fd)
     }
 
     /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
@@ -7634,9 +7718,7 @@ impl Kernel {
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
     fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file) as *const () as usize;
-        self.file_locks.flock(&file.path, key, op)
+        self.fd_io().flock(fd, op)
     }
 
     fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
@@ -7644,12 +7726,9 @@ impl Kernel {
         let raw = m.read_cstr(name, 249)?;
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
-        let handle: Arc<dyn crate::vfs::FileHandle> = memfd.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
         let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
-        let fd = self.fds.insert(file, flags & MFD_CLOEXEC != 0)?;
-        self.memfds.insert(key, memfd);
-        Ok(fd)
+        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
 
     fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
@@ -8084,14 +8163,9 @@ impl Kernel {
 
     // -- process and time ----------------------------------------------------
 
-    /// `dup2`: `dup3` without flags, except that `dup2(fd, fd)` is a no-op
-    /// that still validates the descriptor, where `dup3` would refuse.
+    /// `dup2` ([`FdIo::dup2`]).
     fn sys_dup2(&mut self, old: i32, new: i32) -> SysResult {
-        if old == new {
-            self.fds.get(old)?;
-            return Ok(new as u64);
-        }
-        self.sys_dup3(old, new, 0)
+        self.fd_io().dup2(old, new)
     }
 
     fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
@@ -9378,7 +9452,7 @@ mod tests {
         // Not in the class: declined before anything is done.
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::CLOSE, &[rfd]);
+        set_args(&mut m, at, nr::FSTAT, &[rfd, 0x22000]);
         assert!(free(&k, &mut m, at).is_none());
 
         // An empty pipe parks both ways, on the same stream.
@@ -10209,7 +10283,7 @@ mod tests {
         let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
         use crate::i386::raw;
         for lock_free in [true, false] {
-            let mut call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
                 if lock_free {
                     assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
                 } else {
@@ -10242,6 +10316,200 @@ mod tests {
             assert_eq!(r32(&m), -(Errno::EBADF.0 as i32));
             assert_eq!(m.read_u64(0x22000).unwrap(), 77);
         }
+    }
+
+    #[test]
+    fn free_fd_table_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::unix::lock_op;
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        let open = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+            set_args(m, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            k.syscall(m, 0);
+            ret(m, at) as u64
+        };
+        let fd = open(&mut m, &mut k);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_GETFD: u64 = 1;
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        const F_GETLK: u64 = 5;
+        const F_ADD_SEALS: u64 = 1033;
+        const F_GET_SEALS: u64 = 1034;
+        let ebadf = -(Errno::EBADF.0 as i64);
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let mut got = Vec::new();
+            let d1 = sys(&mut m, &mut k, nr::DUP, &[fd]);
+            got.push(d1);
+            got.push(sys(&mut m, &mut k, nr::DUP3, &[fd, 21, oflags::O_CLOEXEC]));
+            got.push(sys(&mut m, &mut k, nr::DUP3, &[fd, fd, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[21, F_GETFD]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_DUPFD_CLOEXEC, 30]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[30, F_GETFD]));
+            m.write_u64(0x25000, !0).unwrap();
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GETLK, 0x25000]));
+            got.push(m.read(0x25000, 2).unwrap()[0] as i64);
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, oflags::O_NONBLOCK]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[d1 as u64, F_GETFL]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GET_SEALS]));
+            // A second description of the file contends for its lock until
+            // the first's last descriptor closes; a copy's close is not that.
+            let own = open(&mut m, &mut k);
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[own, lock_op::EX]));
+            let other = open(&mut m, &mut k);
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[d1 as u64]));
+            let copy = sys(&mut m, &mut k, nr::DUP, &[own]);
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[copy as u64]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[21]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[30]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[30]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[own]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::UN]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[40, 50, 0]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[5, 4, 0]));
+            // `other` closed by its range.
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[other, other, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[other, F_GETFD]));
+            // A memfd's seals, found from its descriptor.
+            m.write(0x26000, b"mem\0").unwrap();
+            let mfd = sys_locked(&mut m, &mut k, at, nr::MEMFD_CREATE, &[0x26000, 0]);
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[mfd, F_ADD_SEALS, 2]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[mfd, F_GET_SEALS]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[mfd]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert_eq!(g[1], 21);
+        assert_eq!(g[2], -(Errno::EINVAL.0 as i64));
+        assert_eq!((g[3], g[4], g[5]), (1, 30, 1));
+        assert_eq!((g[6], g[7]), (0, 2), "F_GETLK: F_UNLCK");
+        assert_eq!(g[9] as u64 & oflags::O_NONBLOCK, oflags::O_NONBLOCK, "a copy shares the flags");
+        assert_eq!(g[11], -(Errno::EINVAL.0 as i64), "no seals on a file");
+        assert_eq!((g[12], g[13]), (0, -(Errno::EWOULDBLOCK.0 as i64)));
+        assert_eq!(g[16], -(Errno::EWOULDBLOCK.0 as i64), "a copy's close keeps the lock");
+        assert_eq!((g[17], g[18], g[19], g[20]), (0, 0, ebadf, 0));
+        assert_eq!(g[21], 0, "the last close released it");
+        assert_eq!((g[22], g[23], g[24]), (0, 0, -(Errno::EINVAL.0 as i64)));
+        assert_eq!((g[25], g[26]), (0, ebadf), "closed by its range");
+        assert_eq!((g[27], g[28], g[29]), (0, 2, 0));
+    }
+
+    #[test]
+    fn a_tmpfile_name_goes_with_its_last_descriptor() {
+        // Closed through the lock-free path, which has no kernel: the name
+        // goes with the description (`OpenFile`'s `Drop`).
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_TMPFILE | oflags::O_RDWR, 0o600]);
+        assert!((fd as i64) >= 0, "O_TMPFILE: {}", fd as i64);
+        let name = k.fds.get(fd as i32).unwrap().path.clone();
+        let copy = sys_locked(&mut m, &mut k, at, nr::DUP, &[fd]);
+        let close = |m: &mut GuestMem<'_>, k: &Kernel, fd: u64| {
+            set_args(m, at, nr::CLOSE, &[fd]);
+            let call = free_class(m, at, false).expect("close is in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
+            ret(m, at)
+        };
+        assert_eq!(close(&mut m, &k, fd), 0);
+        assert!(k.vfs.metadata(&name).is_ok(), "a copy is still open");
+        assert_eq!(close(&mut m, &k, copy), 0);
+        assert!(k.vfs.metadata(&name).is_err(), "{name} outlived its last descriptor");
+    }
+
+    /// A call made through the kernel, its result.
+    fn sys_locked(m: &mut GuestMem<'_>, k: &mut Kernel, at: u64, n: u64, a: &[u64]) -> u64 {
+        set_args(m, at, n, a);
+        k.syscall(m, 0);
+        ret(m, at) as u64
+    }
+
+    #[test]
+    fn free_i386_fd_table_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        use crate::i386::raw;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: [u64; 3]| {
+                m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+                }
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32
+            };
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, raw::DUP2, [fd, 20, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP2, [fd, fd, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP3, [fd, 21, oflags::O_CLOEXEC]));
+            got.push(sys(&mut m, &mut k, raw::FCNTL64, [21, 1, 0]));
+            // F_GETLK64 (12) is the 32-bit ABI's F_GETLK.
+            m.write_u64(0x25000, !0).unwrap();
+            got.push(sys(&mut m, &mut k, raw::FCNTL64, [fd, 12, 0x25000]));
+            got.push(m.read(0x25000, 2).unwrap()[0] as i32);
+            got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 2, 0]));
+            got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 8, 0]));
+            got.push(sys(&mut m, &mut k, raw::CLOSE, [20, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::CLOSE, [20, 0, 0]));
+            // close_range's bounds are unsigned: ~0 is "to the end".
+            got.push(sys(&mut m, &mut k, raw::CLOSE_RANGE, [21, 0xffff_ffff, 0]));
+            got.push(sys(&mut m, &mut k, raw::FCNTL, [21, 1, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP, [0xffff_ffff, 0, 0]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let ebadf = -(Errno::EBADF.0 as i32);
+        assert_eq!(seen[0], vec![20, fd as i32, 21, 1, 0, 2, 0, 0, 0, ebadf, 0, ebadf, ebadf]);
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub(crate) struct Home {
     vfs: Arc<gex_kernel::vfs::VfsView>,
     /// Its terminal, for `ioctl`.
     tty: Arc<gex_kernel::tty::TtyRef>,
+    /// `flock`'s locks, released by the last `close` of a description.
+    file_locks: Arc<gex_kernel::unix::FileLocks>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -69,6 +71,7 @@ fn home_of(k: &Kernel) -> Home {
         map: Arc::clone(k.mem.view()),
         vfs: Arc::clone(k.vfs.view()),
         tty: Arc::clone(&k.tty),
+        file_locks: Arc::clone(&k.file_locks),
     }
 }
 
@@ -227,7 +230,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         clock: home.clock,
     };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
         signals: &view,
         procs: &home.procs,
         tty: &home.tty,

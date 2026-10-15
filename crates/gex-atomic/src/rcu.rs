@@ -29,6 +29,9 @@ pub struct Published<T> {
     /// Old values a reader held on to past the writer's wait, with the
     /// epoch they were replaced at; dropped by a later write.
     retired: Mutex<Vec<(u64, Box<T>)>>,
+    /// Old values taken off `retired` and being dropped, outside its lock
+    /// (a value's drop may be long): what a `settle` waits for too.
+    dropping: AtomicU64,
 }
 
 // SAFETY: a `Published<T>` hands out `&T` to any thread and drops `T`s on
@@ -54,6 +57,7 @@ impl<T> Published<T> {
             epoch: AtomicU64::new(1),
             slots: (0..slots.max(1)).map(|_| AtomicU64::new(0)).collect(),
             retired: Mutex::new(Vec::new()),
+            dropping: AtomicU64::new(0),
         }
     }
 
@@ -86,22 +90,27 @@ impl<T> Published<T> {
     /// a reader holds on to it unusually long, in which case a later write
     /// drops it.
     pub fn write<R>(&self, f: impl FnOnce(&T) -> (Option<T>, R)) -> R {
-        let (old, r) = {
+        let (replaced, r) = {
             let _g = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: `writer` is held, so `cur` is not replaced or freed
             // while `f` looks at it.
             let (new, r) = f(unsafe { &*self.cur.load(SeqCst) });
             match new {
-                Some(v) => (Some(self.cur.swap(Box::into_raw(Box::new(v)), SeqCst)), r),
-                None => (None, r),
+                Some(v) => {
+                    let old = self.cur.swap(Box::into_raw(Box::new(v)), SeqCst);
+                    // Retired before the next writer runs, so a value
+                    // replaced is always somewhere a `settle` looks.
+                    let e = self.epoch.fetch_add(1, SeqCst);
+                    // SAFETY: `old` came from `Box::into_raw` and is no
+                    // longer published; it is owned here.
+                    let old = unsafe { Box::from_raw(old) };
+                    self.retired.lock().unwrap_or_else(|e| e.into_inner()).push((e, old));
+                    (true, r)
+                }
+                None => (false, r),
             }
         };
-        if let Some(old) = old {
-            let e = self.epoch.fetch_add(1, SeqCst);
-            // SAFETY: `old` came from `Box::into_raw` and is no longer
-            // published; it is owned here.
-            let old = unsafe { Box::from_raw(old) };
-            self.retired.lock().unwrap_or_else(|e| e.into_inner()).push((e, old));
+        if replaced {
             // Readers hold a pin for a few loads; a bounded wait for them.
             for _ in 0..1_000_000 {
                 if self.reclaim() {
@@ -113,6 +122,22 @@ impl<T> Published<T> {
         r
     }
 
+    /// Wait until every value replaced before this call is dropped: each
+    /// reader that could see one has moved on (`synchronize_rcu`). Readers
+    /// look for a few loads, so this is short; it is for a caller that must
+    /// know an old value's contents are gone.
+    pub fn settle(&self) {
+        let now = self.epoch.load(SeqCst);
+        loop {
+            self.reclaim();
+            let done = self.retired.lock().unwrap_or_else(|e| e.into_inner()).iter().all(|r| r.0 >= now);
+            if done && self.dropping.load(SeqCst) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     /// Drop what no reader can see; true when nothing is left waiting.
     fn reclaim(&self) -> bool {
         let oldest = self
@@ -122,7 +147,7 @@ impl<T> Published<T> {
             .filter(|&e| e != 0)
             .min()
             .unwrap_or(u64::MAX);
-        let gone: Vec<Box<T>> = {
+        let (gone, empty) = {
             let mut r = self.retired.lock().unwrap_or_else(|e| e.into_inner());
             let mut gone = Vec::new();
             let mut i = 0;
@@ -133,15 +158,18 @@ impl<T> Published<T> {
                     i += 1;
                 }
             }
-            if r.is_empty() {
-                drop(r);
-                drop(gone);
-                return true;
+            // Counted while still under the lock, so a `settle` that finds
+            // the list empty also finds these.
+            if !gone.is_empty() {
+                self.dropping.fetch_add(1, SeqCst);
             }
-            gone
+            (gone, r.is_empty())
         };
-        drop(gone);
-        false
+        if !gone.is_empty() {
+            drop(gone);
+            self.dropping.fetch_sub(1, SeqCst);
+        }
+        empty
     }
 
     /// The value, for its only owner.
@@ -178,6 +206,42 @@ mod tests {
         assert!(w.upgrade().is_none(), "the replaced value outlived the write");
         assert_eq!(p.read(1, |v| **v), 2);
         assert_eq!(p.read(0, |v| **v), 2);
+    }
+
+    #[test]
+    fn settle_drops_every_value_replaced_before_it() {
+        // Readers busy on their slots and other writers replacing it
+        // throughout: once a write and a settle are done, nothing the
+        // write replaced is left, however long its own wait was.
+        let p = Arc::new(Published::new(Arc::new(0u64), 8));
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy: Vec<_> = (1..7)
+            .map(|slot| {
+                let (p, stop) = (p.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(SeqCst) {
+                        if slot % 2 == 0 {
+                            p.write(|v| (Some(Arc::new(v.wrapping_add(1))), ()));
+                        } else {
+                            p.read(slot, |v| std::hint::black_box(**v));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..2_000 {
+            let mine = Arc::new(u64::MAX);
+            let w = Arc::downgrade(&mine);
+            p.write(|_| (Some(mine), ()));
+            p.write(|v| (Some(Arc::new(**v)), ()));
+            p.settle();
+            // Replaced by the second write at the latest: gone.
+            assert_eq!(w.strong_count(), 0, "a replaced value outlived settle");
+        }
+        stop.store(true, SeqCst);
+        for b in busy {
+            b.join().unwrap();
+        }
     }
 
     /// A value whose drop marks it dead, so a reader still holding it after
