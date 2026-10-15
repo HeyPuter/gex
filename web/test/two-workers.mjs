@@ -49,7 +49,7 @@ const seed = new Uint8Array(await readFile(SEED));
  * needs the shim's exports, and they only exist on the side that owns the
  * memory.
  */
-function spawnGuest(elfBytes, argv) {
+function spawnGuest(elfBytes, argv, bind) {
   return new Promise((resolve) => {
     const w = new Worker(
       `
@@ -100,7 +100,11 @@ function spawnGuest(elfBytes, argv) {
             });
           }
         });
-        parentPort.postMessage({ kind: 'ready' });
+        // A path to serve is bound before the guest runs: once run starts,
+        // the guest can reach its stat before this Worker's event loop
+        // turns to handle a bind asked for afterwards.
+        const bound = m.bind ? e.gex_host_bind(...stage(m.bind)) : undefined;
+        parentPort.postMessage({ kind: 'ready', bound });
         const status = await gex.run(entry);
         parentPort.postMessage({ kind: 'exit', status, text: out });
       });
@@ -122,21 +126,23 @@ function spawnGuest(elfBytes, argv) {
     w.on('message', (m) => {
       if (m.kind === 'out') guest.out = m.text;
       else if (m.kind === 'exit') guest.exited = m;
-      else if (m.kind === 'ready') resolve(guest);
+      else if (m.kind === 'ready') {
+        guest.bound = m.bound;
+        resolve(guest);
+      }
       else {
         const i = pending.findIndex((p) => p.want === m.kind);
         if (i >= 0) pending.splice(i, 1)[0].r(m);
       }
     });
-    w.postMessage({ kind: 'run', shim, seed, elf: elfBytes, argv });
+    w.postMessage({ kind: 'run', shim, seed, elf: elfBytes, argv, bind });
   });
 }
 
 const server = await spawnGuest(new Uint8Array(await readFile(serverElf)), [serverElf]);
-const client = await spawnGuest(new Uint8Array(await readFile(clientElf)), [clientElf]);
-
 // The client's Worker serves the path its guest will connect to.
-const bound = await client.ask({ kind: 'bind', path: PATH }, 'bound');
+const client = await spawnGuest(new Uint8Array(await readFile(clientElf)), [clientElf], PATH);
+const bound = { id: client.bound };
 if (bound.id < 0) {
   console.log('FAIL two-workers: could not bind the relay path in the client Worker');
   process.exit(1);
