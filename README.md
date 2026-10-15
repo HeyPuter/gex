@@ -694,3 +694,13 @@ deliberate trade recorded here so nobody has to rediscover it.
   and keyed by address. Invalidating a page that *was* already translated —
   the `IC IVAU` hook in PLAN §6.2 — is not implemented, so a guest JIT that
   reuses an address for different code would run the old translation.
+* **On the native runtime, a lookup can miss a directory renamed from
+  outside gex.** A path lookup that keeps racing directory renames falls
+  back to the filesystem's rename lock, so a rename made by the guest
+  cannot make the lookup miss (docs/kernel-locking.md, L14d). A host
+  directory mounted into the guest (hostfs: `/tmp` without `--sysroot`,
+  and the sysroot itself) only sees renames made through gex. A
+  directory renamed by the host, or by another host process, while a
+  guest lookup runs through it can still make that lookup return
+  `ENOENT`, as if the lookup had run just after the rename. The browser's
+  filesystems are gex's own and have no such gap.
