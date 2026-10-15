@@ -35,3 +35,15 @@ XKBCOMMON_SHA256 := 65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863
 MESON_VERSION    := 1.5.2
 MESON_URL        := https://files.pythonhosted.org/packages/py3/m/meson/meson-1.5.2-py3-none-any.whl
 MESON_SHA256     := 77706e2368a00d789c097632ccf4fc39251fba56d03e1e1b262559a3c7a08f5b
+
+# TLS (schannel's and crypt32's GnuTLS): GnuTLS with its included libtasn1
+# and libunistring over nettle with mini-gmp (no GMP), and Mozilla's CA
+# bundle as curl.se publishes it (sha256 as in its .sha256 file).
+NETTLE_VERSION   := 3.10.1
+NETTLE_URL       := https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
+NETTLE_SHA256    := b0fcdd7fc0cdea6e80dcf1dd85ba794af0d5b4a57e26397eee3bc193272d9132
+GNUTLS_VERSION   := 3.8.9
+GNUTLS_URL       := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.tar.xz
+GNUTLS_SHA256    := 69e113d802d1670c4d5ac1b99040b1f2d5c7c05daec5003813c049b5184820ed
+CACERT_URL       := https://curl.se/ca/cacert-2026-08-13.pem
+CACERT_SHA256    := f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9

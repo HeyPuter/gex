@@ -41,11 +41,12 @@ tools)
 wasm)
   src=$(realpath "$2") tools=$(realpath "$3") build=$(realpath -m "$4") deps=$(realpath "$5")
   : "${GEX_WASM_SYSROOT:?}"
-  o="$OPTS --without-gnutls --without-ffmpeg --without-fontconfig"
+  o="$OPTS --with-gnutls --without-ffmpeg --without-fontconfig"
   export PKG_CONFIG_LIBDIR=$deps/install/lib/pkgconfig
   configure "$build" "$src $o $deps $GEX_WASM_SYSROOT" "$src/configure" --host=wasm32-unknown-linux-musl --with-wine-tools="$tools" $o \
     CC="$here/../wcc" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$deps/host/wayland-scanner" \
-    ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 ac_cv_lib_soname_EGL=libEGL.so.1
+    ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 ac_cv_lib_soname_EGL=libEGL.so.1 \
+    ac_cv_lib_soname_gnutls=libgnutls.so.30
   # wrc and wmc read locale.nls from the tools tree, which __tooldeps__ does
   # not make: the source's.
   mkdir -p "$tools/nls" && ln -sf "$src/nls/locale.nls" "$tools/nls/locale.nls"

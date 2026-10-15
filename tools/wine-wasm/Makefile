@@ -46,6 +46,7 @@ export W3_JOBS GEX_WINE_PREFIX GEX_CRT_SRC W3_DL_SEED
 export FREETYPE_VERSION FREETYPE_URL FREETYPE_SHA256 WAYLAND_VERSION WAYLAND_URL WAYLAND_SHA256
 export LIBXML2_VERSION LIBXML2_URL LIBXML2_SHA256 XKBCOMMON_VERSION XKBCOMMON_URL XKBCOMMON_SHA256
 export MESON_VERSION MESON_URL MESON_SHA256
+export NETTLE_VERSION NETTLE_URL NETTLE_SHA256 GNUTLS_VERSION GNUTLS_URL GNUTLS_SHA256 CACERT_URL CACERT_SHA256
 
 h = $(shell cat $(1) | sha1sum | cut -c1-$(or $(2),10))
 short = $(shell printf %.12s $(1))
@@ -79,7 +80,12 @@ BUILD := $(C)/build-$(WINE_BID)-$(DEPS_KEY)
 
 # The dist: everything above plus these scripts (stage, link, rebase).
 TOOLS_KEY := $(call h,$(filter-out %/local.mk %/w3.pins %/run.sh %/w3/units.sh,$(wildcard $(W3)/*.py $(W3)/*.sh $(W3)/*.txt $(W3)/*.reg $(W3)/wcc $(W3)/w3/*.sh)),8)
-DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)
+# W3_TLS=0: the loader without GnuTLS (crypt32's and schannel's dlopen of it
+# then fails, as on a host without it), 1.8 MB less wasm, for a site that
+# never speaks https (Paint). The Wine build is the same either way.
+W3_TLS ?= 1
+export W3_TLS
+DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(W3_TLS)),-notls)
 DIST := $(C)/dist-$(DIST_KEY)
 BARE := $(C)/pfx-bare-$(DIST_KEY)
 INSTALLED := $(C)/pfx-installed-$(DIST_KEY)
