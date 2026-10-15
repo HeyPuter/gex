@@ -18,7 +18,11 @@ here=$(cd "$(dirname "$0")" && pwd); T=$(cd "$here/.." && pwd)
 B=$(realpath "$1") F=$(realpath "$2") D=$(realpath -m "$3") P=$(realpath -m "$4")
 x86=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 CORE="ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll vcruntime140.dll msvcp140.dll concrt140.dll win32u.dll user32.dll gdi32.dll"
-PROGRAMS=${W3_PROGRAMS:-explorer.exe winewayland.drv opengl32.dll wineboot.exe services.exe winedevice.exe plugplay.exe rundll32.exe svchost.exe rpcss.exe conhost.exe}
+# With TLS (W3_TLS, the Makefile's): crypt32, rsaenh and bcrypt as wasm32 too. As
+# i386 the first certificate chain verification of a process took 10-30 s
+# natively, past a server's wait for the request; as wasm32 under 1 s.
+tlsmods=""; [ "${W3_TLS:-1}" != 0 ] && tlsmods=" crypt32.dll rsaenh.dll bcrypt.dll"
+PROGRAMS=${W3_PROGRAMS:-explorer.exe winewayland.drv opengl32.dll wineboot.exe services.exe winedevice.exe plugplay.exe rundll32.exe svchost.exe rpcss.exe conhost.exe$tlsmods}
 # Every module built (wine-build.sh's make is -k): one that failed stops
 # the stage here, by name.
 for m in $CORE $PROGRAMS; do
