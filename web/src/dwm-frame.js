@@ -406,8 +406,10 @@ export function drawDwmFrame(ctx, atlas, f) {
   const hasHelp = shown.some((b) => b.kind === 'help');
   const any = shown.some((b) => b.kind !== 'close');
   const A = f.active ? 'ACTIVE' : 'INACTIVE';
-  for (const b of shown) {
-    const state = b.state === 2 ? 2 : b.state === 3 ? 3 : b.state === 4 ? 4 : 1;
+  const draw = (b, state, alpha) => {
+    if (alpha <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
     let bg;
     if (f.tool) bg = `SMALLBUTTON${A}CLOSE`;
     else if (b.kind === 'close') bg = any ? `BUTTON${A}CLOSE` : `BUTTON${A}CLOSEALONE`;
@@ -438,6 +440,42 @@ export function drawDwmFrame(ctx, atlas, f) {
       const y = b.y + ct + Math.round((b.h - ct - cb - gh) / 2);
       ctx.drawImage(img, ...gl.src, x, y, gw, gh);
     }
+    ctx.restore();
+  };
+  const norm = (s) => (s === 2 || s === 3 || s === 4 ? s : 1);
+  for (const b of shown) {
+    // Normal and hot cross-fade (CButton, ComputeFadeValues over 0.16 s):
+    // the new state comes in twice as fast as the old one goes.
+    if (b.fade && b.fade.t < 1 && norm(b.fade.from) !== norm(b.state)) {
+      draw(b, norm(b.fade.from), op255(1 - b.fade.t));
+      draw(b, norm(b.state), op255(Math.min(1, 2 * b.fade.t)));
+    } else {
+      draw(b, norm(b.state), 1);
+    }
+  }
+}
+
+/** The caption buttons' cross-fades between normal and hot: `update(buttons,
+ *  now)` (drawDwmFrame's buttons, ms) gives each its `fade` and says
+ *  whether one is still running (draw again on the next frame). */
+export class DwmButtonFades {
+  #last = new Map(); // kind -> { state, from, start }
+  update(buttons, now) {
+    let busy = false;
+    for (const b of buttons) {
+      let e = this.#last.get(b.kind);
+      if (!e) { e = { state: b.state, from: b.state, start: -Infinity }; this.#last.set(b.kind, e); }
+      const fades = (s) => s === 1 || s === 2;
+      if (b.state !== e.state) {
+        e.from = fades(e.state) && fades(b.state) ? e.state : b.state;
+        e.state = b.state;
+        e.start = now;
+      }
+      const t = Math.min(1, (now - e.start) / 160);
+      b.fade = { from: e.from, t };
+      if (t < 1 && e.from !== b.state) busy = true;
+    }
+    return busy;
   }
 }
 

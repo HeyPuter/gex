@@ -24,7 +24,7 @@
 
 import { glassFeColorMatrix } from './glass-colorization.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
+import { DwmButtonFades, drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 
 const UI = 1;
 /** The blur's standard deviation, in pixels: DWM's look at 96 dpi. */
@@ -118,6 +118,8 @@ export function domGlass(win, mount, scene = null) {
   let overlay = null;
   let hovered = null;
   let sig = '';
+  const fades = new DwmButtonFades();
+  let fading = false;
 
   const place = () => {
     const x = parseFloat(c.style.left) || 0;
@@ -203,8 +205,13 @@ export function domGlass(win, mount, scene = null) {
       overlay.height = Math.max(1, fh + S.t + S.b);
       sig = '';
     }
+    const busy = fr ? fades.update(fr.buttons, performance.now()) : false;
+    if (busy && !fading) {
+      fading = true;
+      requestAnimationFrame(() => { fading = false; place(); });
+    }
     const now = JSON.stringify([win.glass, win.title, hovered && [hovered.x, hovered.y], !!aeroAtlas(), x, y, W, H,
-      !framed && win.focused]);
+      !framed && win.focused, fr?.buttons.map((b) => b.fade?.t)]);
     if (now === sig) return;
     sig = now;
     const ctx = overlay.getContext('2d');

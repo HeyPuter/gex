@@ -98,12 +98,13 @@ function rec(i, { surface, x, y, w, h, addr, id, glass, format = 0, title = '', 
   recs.set(new Int32Array(tb.buffer), r + R_TITLE);
 }
 rec(0, { surface: 1, x: 0, y: 0, w: 800, h: 600, addr: bg, id: 1 });
-// Windows 7's caption buttons: close 43 wide, maximize and minimize 26, all
-// 20 high at the top edge, 6 px in from the right.
+// Windows 7's caption buttons as uDWM sizes them for a 21-pixel caption:
+// close 49 wide, maximize 27, minimize 29, all 20 high, a pixel below the
+// top edge, 6 px in from the right.
 const frame = params.get('frame') === '0' ? null : [1 | 2,
-  W - 6 - 43, 0, 43, 20, 1,
-  W - 6 - 43 - 26, 0, 26, 20, 1,
-  W - 6 - 43 - 52, 0, 26, 20, 1];
+  W - 6 - 49, 1, 49, 20, 1,
+  W - 6 - 49 - 27, 1, 27, 20, 1,
+  W - 6 - 49 - 27 - 29, 1, 29, 20, 1];
 rec(1, { surface: 2, x: 200, y: 150, w: W, h: H, addr: win, id: 2, format: 1, title: 'Computer', frame,
   glass: glassOn ? [[0, 0, W, 30], [0, 30, 8, H - 38], [W - 8, 30, 8, H - 38], [0, H - 8, W, 8]] : null });
 const proxy = new WlProxy(channel, null, () => TOKEN);
