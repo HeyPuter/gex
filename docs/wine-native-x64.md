@@ -447,3 +447,99 @@ layer are untouched.
 - **Branches.** Wine on `w64/main` (wt/wine-w64, from mw/wasm32-w3
   b57ea7f7d69). gex on `w64/main` (wt/w64). Work files are in
   `scratch/W64` and `hot/W64`.
+
+## 7. Resume (W64 parked 2026-10-15, after W64.5's first handover)
+
+**Where it stands.** W64.0-W64.4 are in (the table in §5). W64.5's first
+round is gex 273f48a2 with Wine w64/main 05d6ec1a806 (gate 1015n; the
+gate's wt/gate-wine-w64 moves to 05d6ec1a806 in the same round, since
+the Wine side imports `gex.door_call_lp64`).
+- The page runs x64 programs, MP with the door and SP: hello_args,
+  crtmem, apc, tls, cxx, exitproc, seh and seh-traps, 8 of 8 in each
+  build, about 10.5 min a build on gooner.
+- Natively with the door (`DOOR=1`), every console case passes but mtx,
+  which takes longer than nt-x64.sh's default 300 s, door or not.
+- Proposed gate job (the coordinator is adding it to CORE_W64, with
+  `DOOR=1` in job_wine64):
+  `job_wine64_page() { w64dist || return 1; for f in mp sp; do PAGE=$f DOOR=1 CASES="hello_args crtmem apc tls cxx exitproc seh seh-traps" TMO=900 sc 40m 512 tests/wine64/nt-x64.sh $W64_DIST $W64_PREFIX 2>&1 | tail -3; done; }`
+  It needs phase 0's x86 shared shim and seed in web/public/gex.
+- The section fix (Wine af2068f56c1 on w64/section-alias in
+  wt/wine-secalias, on mw wasm32-w3-next 42f51eb0cc4) is gated with
+  843764b2 in 1015m. The coordinator pushes it to wasm32-w3-next once
+  that round is green. W64's own Wine (w64/main) does not have it yet:
+  cherry-pick it there after the push.
+
+**Open: sync livelocks in the page.** sync's SRW lock plus condition
+variable case stalls in the page (MP). It passes natively, in 3.5 min
+with the boot.
+- Reproducers, built with x86_64-w64-mingw32-gcc, are in
+  scratch/W64/page1: pc.c (the producer/consumer alone, progress
+  printed), cv.c (one condition variable sleep, woken after 2 s) and
+  cas.c. Run them with `DIST=scratch/W64/ddist DOOR=1
+  scratch/W64/page1/run.sh /t/X.exe` (MP) or `run-sp.sh` (SP).
+- **Not** two threads on one Worker. Every thread gets its own Worker
+  (`[host] pid 54:55`, `54:56`, `54:57`). The trace's `switch to thread 1
+  ... blocked=true` lines are thread 1, a Wine-internal thread, finishing
+  its nanosleeps (about 22 a second).
+- Contended 64-bit `lock cmpxchg` and `InterlockedIncrement64` are
+  correct in the page (cas.c).
+- What is wrong: the process makes about 26 million futex calls in 100 s
+  (`GEX_HEARTBEAT=10000000`'s census). One thread repeats FUTEX_WAIT_PRIVATE
+  (op 0x80) on 0x129004c, which is the loader's low static data (PIC:
+  add the process's memory base to find the symbol), with val 0x7dfeede0
+  (pointer-like) while the word is 0. So the kernel answers EAGAIN at once,
+  and the caller loops.
+- cv.c stalls the same way before its first printf. Natively the same
+  binary's futex calls look normal (`gexc run --strace`): WAKE ops on
+  Wine's alert words, val 0.
+- Next: find which lock is at 0x129004c and who passes that value. Check
+  whether a system call made from inside the fault hook in the page (the
+  hook now runs at the run loop's next entry, `hook` in `#runLoop`) sees
+  its arguments in a different context from the one natively. Also check
+  musl's variadic `syscall()` under wasm64: Wine's futex_wait passes int
+  arguments, and musl reads long slots.
+- The trace patch is scratch/W64/w64dbg-futex-trace.diff
+  (count_syscall, shims/browser/src/lib.rs).
+
+**Open: highdata in the page.** 2560 MiB of data fails: Wine logs
+`mmap() error Out of memory, range 0x7fff0000-0x87ff0000` for 128 MiB
+allocations, and "allocate_virtual_memory out of memory, size
+08000000". Natively the same 4 GiB lowering limit passes. The
+coordinator notes a W64 page process is memory64 (LIMIT64 16 GiB), so
+this is not W3's 2 GiB growth. Find the limit that actually fails
+before leaving the test failing: the page memory's initial or maximum
+size for this process, where the high arena is placed, Chrome's
+RLIMIT_DATA, or node's flags in run-node.mjs.
+
+**Next goal: Dicey Dungeons in the page**, to its title menu, with
+screenshots (natively it reaches the menu: tests/games/dicey-w64.wl,
+docs/games.md). In PAGE mode nt-x64.sh still skips the display and GL
+cases (WL and GL): they need the page's compositor and GL. That
+needs a GPU, so it runs on edger through bench.sh (BENCH_HOST=edger,
+BENCH_TIMEOUT), never worldmachine while the user's builds are there.
+The game files are private.
+
+**Also queued.** W's TLS pins for w64-deps.sh: gex w/w3-tls afe68fd5
+(w3.pins, w3/deps.sh). They are nettle 3.10.1 with mini-gmp, GnuTLS
+3.8.9, and the curl CA bundle at DIST/etc/ssl/certs. Wine's configure
+gets `ac_cv_lib_soname_gnutls=libgnutls.so.30`, the loader gets
+secur32, and dlreg needs the 70 names, minus the `gnutls_handle` false
+match. Later: the opengl32 id fast path, and a W3 build tree that does
+not depend on the worktree it was configured from.
+
+**Worktrees, branches and files.**
+- gex: wt/w64, w64/main.
+- Wine: wt/wine-w64, w64/main 05d6ec1a806; wt/wine-secalias,
+  w64/section-alias af2068f56c1.
+- musl: wt/musl-w64 w64/wasm64, unchanged.
+- All of them are clean.
+- Dev tree: scratch/W64/dev64g, configured from wt/wine-w64 with
+  OpenGL. Its deps and wasm64 sysroot were in hot/W64 and are now kept
+  in scratch/W64/kept/{deps64,sr64}. Point `W64_DEPS` and
+  `GEX_WASM64_SYSROOT` there, or rebuild them with w64-deps.sh and
+  build-sysroot64.sh. My helper scripts are in scratch/W64/kept/bin.
+- Overlays: scratch/W64/ddist, the full dist hard-linked, with the
+  door-enabled loader. Page work is in scratch/W64/page1. Screenshots
+  are in scratch/W64/shots (private).
+- Delete the overlays and dev trees by name when they are no longer
+  needed: ddist, gldist, ndist, dev64g, page1, kept.
