@@ -478,6 +478,16 @@ in the scheduler pick after each wake of the global WAKE word: about
      filled and drained, close-on-exec flipped and terminal requests from
      three more threads) in the page tier;
      `free_ioctl_answers_as_the_kernel_does`.
+   - The 32-bit positioned calls (L9): i386 `pread64`, `pwrite64`,
+     `lseek` and `_llseek` are in the free class too. The 64-bit ones
+     already were; the 32-bit ones took the lock only because their
+     arguments come split in register pairs. `i386::translate` joins them
+     as the locked path does, and its `Post` writes `_llseek`'s result to
+     the caller's `loff_t` and answers 0. In the Noita page (i386) they
+     were the second-busiest takers at startup (`lseek` 76 a second,
+     `pread64` 20 in pid 2). Legs: the i386 builds of
+     `close-while-reading`, `kernel-contend` and `ioctl-threads`, page
+     tier and SP; `free_i386_positioned_calls_answer_as_the_kernel_does`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:

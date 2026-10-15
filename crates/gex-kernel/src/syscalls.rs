@@ -1846,6 +1846,9 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::WRITE => nr::WRITE,
             x::READV => nr::READV,
             x::WRITEV => nr::WRITEV,
+            x::PREAD64 => nr::PREAD64,
+            x::PWRITE64 => nr::PWRITE64,
+            x::LSEEK | x::LLSEEK => nr::LSEEK,
             x::RT_SIGPROCMASK => nr::RT_SIGPROCMASK,
             x::POLL | x::PPOLL | x::PPOLL_TIME64 => nr::PPOLL,
             x::NEWSELECT | x::PSELECT6 | x::PSELECT6_TIME64 => nr::PSELECT6,
@@ -1908,8 +1911,8 @@ pub struct FreeCall {
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
 /// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
 /// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
-/// `sendmsg`, `recvmsg` and `ioctl`. The 32-bit ABI's
-/// positioned calls and `_llseek` are not in it.
+/// `sendmsg`, `recvmsg` and `ioctl`; the 32-bit ABI's `pread64`,
+/// `pwrite64` and `_llseek` too, translated as the full call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1960,9 +1963,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `epoll_wait` as their `p` forms, and a 32-bit ABI's times and
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
-    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP)) {
+    let mut post = crate::i386::Post::None;
+    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK)) {
         let t = if compat {
-            crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr).0
+            let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
+            post = p;
+            t
         } else if gex_abi::X86 {
             crate::x86::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, f.signals.blocked())
         } else {
@@ -2057,7 +2063,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // Linux sends it as the writer itself sending it (SI_USER).
         f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.uid });
     }
-    let _ = set_result(m, ctx_addr, encode(r));
+    // `_llseek` answers through memory (`i386::Post`).
+    let ret = match r {
+        Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, v))),
+        r => encode(r),
+    };
+    let _ = set_result(m, ctx_addr, ret);
     let d = if f.signals.has_pending() {
         signal::dispatch(f.signals, m, ctx_addr, compat).unwrap_or(Delivery::None)
     } else {
@@ -10154,6 +10165,76 @@ mod tests {
         assert!(view.of(&b).is_some());
         assert_eq!(held.len(), 2, "a reader's copy is whole");
         assert_eq!(maps.len(), 1);
+    }
+
+    /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class
+    /// (docs/kernel-locking.md §5.2, L9) answer as the full call does: the
+    /// 64-bit offset from two registers, `_llseek`'s result through memory.
+    #[test]
+    fn free_i386_positioned_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        set_args(&mut m, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        k.syscall(&mut m, 0);
+        let fd = ret(&m, at) as u64;
+        m.write(0x21000, b"hello world").unwrap();
+        set_args(&mut m, at, nr::WRITE, &[fd, 0x21000, 11]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), 11);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            for (i, v) in a.iter().enumerate() {
+                m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+            }
+        };
+        let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+        use crate::i386::raw;
+        for lock_free in [true, false] {
+            let mut call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            // _llseek(fd, 0, 6, &result, SEEK_SET): 0, and 6 at result.
+            m.write_u64(0x22000, !0).unwrap();
+            set32(&mut m, raw::LLSEEK, [fd, 0, 6, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0, "lock_free {lock_free}");
+            assert_eq!(m.read_u64(0x22000).unwrap(), 6);
+            // pread64(fd, buf, 5, lo 6, hi 0): "world", the offset kept.
+            set32(&mut m, raw::PREAD64, [fd, 0x23000, 5, 6, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 5);
+            assert_eq!(m.read(0x23000, 5).unwrap(), b"world");
+            // pwrite64 at 0, then the offset still 6 (_llseek SEEK_CUR 0).
+            m.write(0x24000, b"J").unwrap();
+            set32(&mut m, raw::PWRITE64, [fd, 0x24000, 1, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 1);
+            set32(&mut m, raw::LLSEEK, [fd, 0, 0, 0x22000, 1]);
+            call(&mut m, &mut k);
+            assert_eq!(m.read_u64(0x22000).unwrap(), 6);
+            // A bad descriptor: EBADF, with nothing written.
+            m.write_u64(0x22000, 77).unwrap();
+            set32(&mut m, raw::LLSEEK, [99, 0, 0, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), -(Errno::EBADF.0 as i32));
+            assert_eq!(m.read_u64(0x22000).unwrap(), 77);
+        }
     }
 
     #[test]
