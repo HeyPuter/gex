@@ -80,7 +80,11 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # proc-threads: /proc/self read while other threads map, unmap, open and
 # close; cmdline in a forked child and after execve; a child's stat (L14a:
 # /proc reads the process's published state, no refresh under the lock).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads"}
+# fs-threads: a chdir in one pthread seen by its siblings; unshare(CLONE_FS)
+# gives a thread its own directory, shared with the threads it makes; *at
+# calls through a directory descriptor racing renames in it (L14b: the path
+# calls without the kernel lock).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

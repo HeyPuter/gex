@@ -13,7 +13,7 @@ use gex_kernel::proc::ProcTable;
 use gex_kernel::signal::{self, Delivery, ProcSig, Signals, ThreadSig};
 use gex_kernel::futex::FutexTable;
 use gex_kernel::mem::MapView;
-use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx, MapIo};
+use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx, MapIo, PathIo};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -44,6 +44,12 @@ pub(crate) struct Home {
     mm: gex_kernel::mem::Mm,
     pins: Arc<std::collections::HashMap<String, u64>>,
     place: Option<Arc<dyn gex_kernel::syscalls::ObjectPlace>>,
+    /// For the path calls: the threads' own fs_structs, the group, the
+    /// terminals and `O_TMPFILE`'s serial (`Kernel::path_io`).
+    thread_fs: Arc<gex_kernel::syscalls::ThreadFs>,
+    gid: u32,
+    ptys: Option<gex_kernel::pty::Remote>,
+    tmpfiles: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -80,6 +86,10 @@ fn home_of(k: &Kernel) -> Home {
         mm: k.mem.shared(),
         pins: Arc::clone(&k.pins),
         place: k.place.clone(),
+        thread_fs: Arc::clone(&k.thread_fs),
+        gid: k.gid,
+        ptys: k.ptys,
+        tmpfiles: Arc::clone(&k.tmpfiles),
     }
 }
 
@@ -294,9 +304,26 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         tid: crate::my_tid() as u32,
         clock: home.clock,
     };
+    // The working directory of this thread's fs_struct: its own, or the
+    // process's in the namespace it resolves through.
+    let own = home.thread_fs.of(ctx_addr).map(|fs| fs.get());
+    let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
         io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
-        map: MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc },
+        map: map(),
+        path: PathIo {
+            ns: &ns,
+            view: &home.vfs,
+            cwd: own.as_deref().unwrap_or(&ns.cwd),
+            map: map(),
+            compat,
+            pid: home.pid,
+            uid: home.uid,
+            gid: home.gid,
+            procs: &home.procs,
+            ptys: home.ptys,
+            tmpfiles: &home.tmpfiles,
+        },
         signals: &view,
         procs: &home.procs,
         tty: &home.tty,

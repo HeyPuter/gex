@@ -455,6 +455,7 @@ impl BlockOp {
 /// `clone` flags gex understands.
 pub mod clone_flags {
     pub const VM: u64 = 0x0000_0100;
+    pub const FS: u64 = 0x0000_0200;
     pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
     pub const SETTLS: u64 = 0x0008_0000;
@@ -666,12 +667,14 @@ pub struct Kernel {
     /// The canonical number of the syscall being handled (for the host's
     /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
     pub syscall_nr: u64,
-    /// The working directories of threads that left the process's
-    /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
-    /// the length of each of that thread's system calls.
-    pub thread_cwd: std::collections::HashMap<u64, String>,
+    /// The fs_structs other than the process's first one (whose directory
+    /// is `vfs`'s): a thread's after `unshare(CLONE_FS)` or a `clone`
+    /// without `CLONE_FS`, shared with the threads it creates with it.
+    /// Entered into `vfs` for each of such a thread's calls; read by its
+    /// calls made without the kernel lock.
+    pub thread_fs: Arc<ThreadFs>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
-    pub next_tmpfile: u64,
+    pub tmpfiles: Arc<std::sync::atomic::AtomicU64>,
     /// The file-creation mask. Recorded rather than applied: nothing here
     /// enforces permissions, but `umask(022)` is expected to hand back what
     /// it replaced, and a build system that does not get one back concludes
@@ -1753,6 +1756,482 @@ pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, 
         Ok(0)
 }
 
+/// A working directory shared by the threads that share an fs_struct.
+pub struct FsCwd(std::sync::Mutex<String>);
+
+impl FsCwd {
+    pub fn new(cwd: String) -> FsCwd {
+        FsCwd(std::sync::Mutex::new(cwd))
+    }
+    pub fn get(&self) -> String {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn set(&self, cwd: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = cwd;
+    }
+}
+
+/// The threads of a process whose fs_struct is not the process's first one,
+/// by context address (`Kernel::thread_fs`). Threads made with `CLONE_FS`
+/// (every pthread) share their creator's; `unshare(CLONE_FS)` and a
+/// `clone` without it make one of the thread's own.
+#[derive(Default)]
+pub struct ThreadFs {
+    /// Whether any thread has one: most processes never do.
+    any: std::sync::atomic::AtomicBool,
+    by_ctx: std::sync::Mutex<std::collections::HashMap<u64, Arc<FsCwd>>>,
+}
+
+impl ThreadFs {
+    /// The fs_struct of the thread whose context is at `ctx`, if not the
+    /// process's first.
+    pub fn of(&self, ctx: u64) -> Option<Arc<FsCwd>> {
+        if !self.any.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.by_ctx.lock().unwrap_or_else(|e| e.into_inner()).get(&ctx).cloned()
+    }
+
+    fn set(&self, ctx: u64, fs: Option<Arc<FsCwd>>) {
+        let mut m = self.by_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        match fs {
+            Some(fs) => {
+                m.insert(ctx, fs);
+                self.any.store(true, std::sync::atomic::Ordering::Release);
+            }
+            None => {
+                m.remove(&ctx);
+            }
+        }
+    }
+}
+
+/// The path lookups and opens (docs/kernel-locking.md, L14b): what they
+/// read is the namespace (the kernel's own, or its published view), the
+/// working directory of the calling thread's fs_struct, the descriptor
+/// table and the mapping log (an object's pin or placement, armed by its
+/// open). The kernel's calls use the same code (`Kernel::path_io`).
+pub struct PathIo<'a> {
+    pub ns: &'a crate::vfs::Namespace,
+    /// The published namespace, which an `O_TMPFILE`'s name is removed
+    /// through when its description goes.
+    pub view: &'a Arc<crate::vfs::VfsView>,
+    /// The working directory relative paths resolve against: the calling
+    /// thread's fs_struct's (`ThreadFs`), else the process's.
+    pub cwd: &'a str,
+    /// The descriptor table, the map and its placement.
+    pub map: MapIo<'a>,
+    pub compat: bool,
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub procs: &'a ProcTable,
+    pub ptys: Option<crate::pty::Remote>,
+    /// `O_TMPFILE`'s names, numbered per process.
+    pub tmpfiles: &'a std::sync::atomic::AtomicU64,
+}
+
+impl PathIo<'_> {
+    /// The path call `n` (canonical; [`is_path`]), or `None` for another.
+    pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        Some(match n {
+            nr::OPENAT => self.openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
+            nr::OPENAT2 => self.openat2(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::GETDENTS64 => self.getdents(m, a[0] as i32, a[1], a[2]),
+            nr::FSTAT => self.fstat(m, a[0] as i32, a[1]),
+            nr::NEWFSTATAT => self.fstatat(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::STATX => self.statx(m, a[0] as i32, a[1], a[2], a[4]),
+            nr::FACCESSAT | nr::FACCESSAT2 => self.faccessat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::GETCWD => self.getcwd(m, a[0], a[1]),
+            _ => return None,
+        })
+    }
+
+    /// Open a pseudoterminal end if `p` names one, else `None` so the ordinary
+    /// open runs. The pair lives in the global kernel (`self.ptys`); with none
+    /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
+    pub fn open_pty(&self, p: &str, flags: u64) -> Option<SysResult> {
+        let r = self.ptys?;
+        // `/dev/tty` is the caller's *controlling terminal*. Inside a terminal
+        // emulator that is a pty in the global kernel, not the page's own
+        // terminal -- a shell opens this for job control and compares its
+        // foreground group with its own, and the page's terminal never matches:
+        // dash then spins raising SIGTTIN at itself, which shows as a window
+        // that echoes what is typed and runs none of it. Only when this
+        // session has claimed one; otherwise the name falls through to the
+        // console handle, which is right for the page's own shell.
+        if p == "/dev/tty" {
+            let sid = self.procs.sid(self.pid, 0).unwrap_or(0);
+            let id = (r.for_sid)(sid);
+            if id >= 0 {
+                let handle = Arc::new(crate::pty::RemotePty { id, master: false, remote: r });
+                // A descriptor of its own on that end, so the counting stays
+                // right, but no claim: this session already owns it.
+                (r.open_end)(id, 0);
+                let file = OpenFile::new(handle, format!("pty:[{id}:s]"), flags, true, true);
+                return Some(self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0));
+            }
+            return None;
+        }
+        let (id, master) = if p == "/dev/ptmx" {
+            let packed = (r.open_master)();
+            if packed < 0 {
+                return Some(Err(Errno::ENOSPC));
+            }
+            (packed >> 16, true)
+        } else if let Some(n) = p.strip_prefix("/dev/pts/") {
+            let ptn: i32 = n.parse().ok()?;
+            let id = (r.open_slave)(ptn);
+            if id == -1 {
+                return None; // no such pts -- let the VFS answer ENOENT
+            }
+            if id < 0 {
+                return Some(Err(Errno(-id))); // locked, or otherwise refused
+            }
+            (id, false)
+        } else {
+            return None;
+        };
+        let handle = Arc::new(crate::pty::RemotePty { id, master, remote: r });
+        // Opening a terminal is how a session claims it.
+        //
+        // A session leader with no controlling terminal that opens one without
+        // O_NOCTTY acquires it, and its process group becomes the terminal's
+        // foreground group -- Linux does this in the open, not in `TIOCSCTTY`,
+        // and a terminal emulator's child relies on it: xterm's child calls
+        // `setsid` and opens the slave, and never issues the ioctl. Without
+        // this the shell it execs is in a *background* group, so the kernel
+        // answers every read from the terminal with SIGTTIN: a window that
+        // echoes what is typed (the line discipline does that) and runs none
+        // of it.
+        if !master && flags & oflags::O_NOCTTY == 0 {
+            let leader = self.procs.sid(self.pid, 0) == Ok(self.pid);
+            if leader {
+                use crate::vfs::FileHandle;
+                handle.claim_session(self.pid);
+            }
+        }
+        let path = format!("pty:[{id}:{}]", if master { 'm' } else { 's' });
+        let file = OpenFile::new(handle, path, flags, true, true);
+        Some(self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0))
+    }
+
+    pub fn openat(
+        &self,
+        m: &GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+        mode: u32,
+    ) -> SysResult {
+        let p = self.at_path(m, dirfd, path)?;
+        // Unix98 pseudoterminals. `/dev/ptmx` makes a fresh pair and hands back
+        // the master; `/dev/pts/N` takes the matching slave. Both live in the
+        // global kernel, so the master (xterm) and the slave (its shell) can be
+        // different Workers. Intercepted before the VFS, which has no such nodes.
+        if let Some(res) = self.open_pty(&p, flags) {
+            return res;
+        }
+        // `O_TMPFILE` names a directory and asks for an unnamed file inside
+        // it: made, opened, and unlinked at once, so the handle is the only
+        // way to it. `O_PATH` opens the name, not the file, so it does not
+        // follow a dangling symlink to `ENOENT` -- which is how tar sets the
+        // mode on a symlink whose target does not exist yet.
+        let mut tmpfile_path: Option<String> = None;
+        let handle = if flags & oflags::O_PATH != 0 {
+            let md = if flags & oflags::O_NOFOLLOW != 0 {
+                self.ns.metadata_nofollow(&p)?
+            } else {
+                self.ns.metadata(&p)?
+            };
+            Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
+        } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
+            let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
+            let h = self.ns.open(
+                &tmp,
+                oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
+                if mode == 0 { 0o600 } else { mode },
+            )?;
+            // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
+            // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
+            // into place; the name is removed when the descriptor closes (see
+            // `OpenFile::unlink_on_close`). Recording `tmp` as the fd's path --
+            // not the directory `p` -- is what makes `/proc/self/fd/N` point at
+            // the file rather than at a directory (linking which is EPERM).
+            tmpfile_path = Some(tmp);
+            h
+        } else {
+            // Arm a pin if this is an object of the closure. Before the open
+            // rather than after, because `open` moves `p` into the call and
+            // the path is what identifies the object.
+            if let Some(base) = self.map.pin_for(&p) {
+                self.map.mem.lock().log.armed_pin = Some((p.clone(), base));
+            }
+            // O_CREAT of "name/" that is not there: a slash names a
+            // directory, which open does not create (EISDIR, as Linux).
+            if flags & oflags::O_CREAT != 0 && Kernel::path_tail(m, path)?.0 && self.ns.metadata(&p).is_err() {
+                return Err(Errno::EISDIR);
+            }
+            // O_NOFOLLOW on a symlink: ELOOP.
+            if flags & oflags::O_NOFOLLOW != 0
+                && self.ns.metadata_nofollow(&p).is_ok_and(|md| md.file_type == FileType::Symlink)
+            {
+                return Err(Errno::ELOOP);
+            }
+            // A directory opens for reading only: each filesystem's `open`
+            // says `EISDIR`, without a lookup of its own here.
+            let h = self.ns.open(&p, flags, mode)?;
+            // And arm a placement, for an object nobody pinned. Only for a
+            // shared object: the executable's own base is fixed by the
+            // loader rather than reserved, and arming on every open would
+            // hand the next unrelated reservation somebody else's address.
+            //
+            // After the open rather than before, so a path that does not
+            // exist -- `ld.so` probes several directories for every library
+            // it loads -- leaves nothing armed.
+            if self.map.place.is_some() && is_shared_object(&p) {
+                self.map.mem.lock().log.armed_place = Some(p.clone());
+            }
+            h
+        };
+        let acc = flags & oflags::ACCMODE;
+        let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
+        let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
+        let file = match tmpfile_path {
+            Some(tp) => OpenFile::tmpfile(handle, tp, self.view.get(), flags, readable, writable),
+            None => OpenFile::new(handle, p, flags, readable, writable),
+        };
+        self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// `openat2(dirfd, path, how, size)`: `openat` with an extensible
+    /// `open_how` struct { u64 flags; u64 mode; u64 resolve } instead of a bare
+    /// flags word.
+    ///
+    /// `resolve` is the reason a program reaches for this syscall specifically:
+    /// RESOLVE_BENEATH / RESOLVE_IN_ROOT / RESOLVE_NO_SYMLINKS pin path lookup
+    /// inside a subtree, which is how a sandbox keeps a lookup from escaping.
+    /// This VFS cannot enforce that per-open, and the one thing worse than not
+    /// offering containment is offering it falsely -- so any non-zero `resolve`
+    /// gets EINVAL rather than an open that silently ignored the constraint.
+    /// `resolve == 0` is ordinary resolution and routes to the `openat` path.
+    pub fn openat2(
+        &self,
+        m: &GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        how: u64,
+        size: u64,
+    ) -> SysResult {
+        // The struct is versioned by length; Linux rejects one shorter than the
+        // first defined version (three u64s = 24 bytes).
+        if size < 24 {
+            return Err(Errno::EINVAL);
+        }
+        let flags = m.read_u64(how)?;
+        let mode = m.read_u64(how + 8)? as u32;
+        let resolve = m.read_u64(how + 16)?;
+        if resolve != 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.openat(m, dirfd, path, flags, mode)
+    }
+
+    pub fn getdents(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+        let file = self.map.fds.get(fd)?;
+        let bytes = file.read_dirents(len as usize)?;
+        m.write(buf, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// `statx`, how glibc stats a file on a modern kernel.
+    ///
+    /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
+    /// returned the right answer but `ls` then branched into padding, so serve
+    /// the path glibc actually wants.
+    pub fn statx(
+        &self,
+        m: &mut GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+        buf: u64,
+    ) -> SysResult {
+        let raw = m.read_cstr(path, 4096)?;
+        let md = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            self.map.fds.get(dirfd)?.metadata()?
+        } else {
+            let p = self.at_path(m, dirfd, path)?;
+            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                self.ns.metadata_nofollow(&p)?
+            } else {
+                self.ns.metadata(&p)?
+            }
+        };
+        let st = Kernel::stat_from(&md);
+
+        // `struct statx` is 256 bytes and mostly reserved.
+        let mut out = [0u8; 256];
+        let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
+            o[at..at + 4].copy_from_slice(&v.to_ge_bytes())
+        };
+        let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
+            o[at..at + 8].copy_from_slice(&v.to_ge_bytes())
+        };
+        // What is filled in. The caller asks for a mask and the kernel says
+        // which parts it actually answered; claiming everything but the
+        // birth time is what a Linux filesystem without one reports.
+        const STATX_BASIC_STATS: u32 = 0x07ff;
+        put32(&mut out, 0, STATX_BASIC_STATS);
+        put32(&mut out, 4, st.blksize as u32);
+        put32(&mut out, 16, st.nlink as u32);
+        put32(&mut out, 20, self.uid);
+        put32(&mut out, 24, self.gid);
+        out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
+        put64(&mut out, 32, st.ino);
+        put64(&mut out, 40, st.size as u64);
+        put64(&mut out, 48, st.blocks as u64);
+        // atime, btime, ctime, mtime: 16 bytes each from offset 64, seconds
+        // then nanoseconds; btime is reported as mtime.
+        for (at, (t, ns)) in [64usize, 80, 96, 112].into_iter().zip([
+            (st.atime, st.atime_ns),
+            (st.mtime, st.mtime_ns),
+            (st.ctime, st.ctime_ns),
+            (st.mtime, st.mtime_ns),
+        ]) {
+            put64(&mut out, at, t as u64);
+            put32(&mut out, at + 8, ns);
+        }
+        put32(&mut out, 128, (st.rdev >> 8) as u32);
+        put32(&mut out, 132, (st.rdev & 0xff) as u32);
+        m.write(buf, &out)?;
+        Ok(0)
+    }
+
+    pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
+        let md = self.map.fds.get(fd)?.metadata()?;
+        m.write(buf, &Kernel::stat_from(&md).encode_for(self.compat))?;
+        Ok(0)
+    }
+
+    pub fn fstatat(
+        &self,
+        m: &mut GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        buf: u64,
+        flags: u64,
+    ) -> SysResult {
+        let raw = m.read_cstr(path, 4096)?;
+        if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            return self.fstat(m, dirfd, buf);
+        }
+        let p = self.at_path(m, dirfd, path)?;
+        let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            self.ns.metadata_nofollow(&p)
+        } else {
+            self.ns.metadata(&p)
+        };
+        let md = md?;
+        m.write(buf, &Kernel::stat_from(&md).encode_for(self.compat))?;
+        Ok(0)
+    }
+
+    pub fn faccessat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        let p = self.at_path(m, dirfd, path)?;
+        // A root guest (`--uid 0`) may read and write anything; execute
+        // still needs an execute bit, which the host checks.
+        let mode = if self.uid == 0 { mode & 1 } else { mode & 7 };
+        self.ns.access(&p, mode).map(|_| 0)
+    }
+
+    pub fn readlinkat(
+        &self,
+        m: &mut GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        buf: u64,
+        size: u64,
+    ) -> SysResult {
+        let p = self.at_path(m, dirfd, path)?;
+        let target = self.ns.read_link(&p)?;
+        let bytes = target.as_bytes();
+        let n = bytes.len().min(size as usize);
+        m.write(buf, &bytes[..n])?;
+        Ok(n as u64)
+    }
+
+    pub fn getcwd(&self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> SysResult {
+        let mut bytes = self.cwd.to_string().into_bytes();
+        bytes.push(0);
+        if bytes.len() as u64 > size {
+            return Err(Errno::ERANGE);
+        }
+        m.write(buf, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
+        let raw = m.read_cstr(path, 4096)?;
+        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        self.at_path_str(dirfd, &p)
+    }
+
+    pub fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
+        let p = p.to_string();
+        // An empty path names nothing (the AT_EMPTY_PATH forms check for it
+        // before they get here), as on Linux.
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let abs = if p.starts_with('/') || dirfd == AT_FDCWD {
+            crate::vfs::normalize(&p, self.cwd)
+        } else {
+            self.at_dir_path(dirfd, &p)?
+        };
+        // A trailing slash names a directory: "file/" is ENOTDIR (the
+        // normalised path has lost the slash, so look now).
+        if p.len() > 1 && p.ends_with('/') {
+            let followed = self.ns.metadata(&abs);
+            if let Ok(md) = followed.as_ref() {
+                if md.file_type != crate::vfs::FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                // "link/" names the directory the link points to, even for
+                // lstat and the other calls that do not follow a last link
+                let mut cur = abs;
+                for _ in 0..40 {
+                    match self.ns.read_link(&cur) {
+                        Ok(t) if t.starts_with('/') => cur = crate::vfs::normalize(&t, "/"),
+                        Ok(t) => cur = crate::vfs::normalize(&t, &crate::vfs::parent_of(&cur)),
+                        Err(_) => break,
+                    }
+                }
+                return Ok(cur);
+            }
+            // a dangling or looping link with a slash names nothing: the
+            // error following it gives (ENOENT, ELOOP)
+            if self.ns.metadata_nofollow(&abs).is_ok() {
+                return Err(followed.err().unwrap_or(Errno::ENOENT));
+            }
+        }
+        Ok(abs)
+    }
+
+    pub fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
+        // Relative to an open directory: its recorded path is the base. A
+        // descriptor that is not a directory is ENOTDIR.
+        let f = self.map.fds.get(dirfd)?;
+        if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
+            return Err(Errno::ENOTDIR);
+        }
+        let base = f.path.clone();
+        Ok(crate::vfs::normalize(p, &base))
+    }
+}
+
 /// The memory map and what a mapping call needs beside it, none of it behind
 /// the kernel lock (docs/kernel-locking.md §3.5, L12b): `mmap`, `munmap`,
 /// `mprotect`, `brk`, `mremap`, `madvise` and `msync`, the same code for the
@@ -2149,6 +2628,8 @@ pub struct Free<'a> {
     pub io: FdIo<'a>,
     /// The memory map, for the mapping calls.
     pub map: MapIo<'a>,
+    /// The namespace and the thread's working directory, for the path calls.
+    pub path: PathIo<'a>,
     /// The calling thread's signal state.
     pub signals: &'a Signals,
     pub procs: &'a ProcTable,
@@ -2186,6 +2667,23 @@ fn is_poll(n: u64) -> bool {
 }
 
 /// The mapping calls ([`MapIo`]), canonical.
+/// The path lookups and opens [`PathIo`] answers.
+fn is_path(n: u64) -> bool {
+    matches!(
+        n,
+        nr::OPENAT
+            | nr::OPENAT2
+            | nr::GETDENTS64
+            | nr::FSTAT
+            | nr::NEWFSTATAT
+            | nr::STATX
+            | nr::FACCESSAT
+            | nr::FACCESSAT2
+            | nr::READLINKAT
+            | nr::GETCWD
+    )
+}
+
 fn is_mapping(n: u64) -> bool {
     matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
 }
@@ -2231,6 +2729,16 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::MREMAP => nr::MREMAP,
             x::MADVISE => nr::MADVISE,
             x::MSYNC => nr::MSYNC,
+            x::OPEN | x::CREAT | x::OPENAT => nr::OPENAT,
+            x::OPENAT2 => nr::OPENAT2,
+            x::STAT | x::STAT64 | x::LSTAT | x::LSTAT64 | x::FSTATAT64 => nr::NEWFSTATAT,
+            x::FSTAT | x::FSTAT64 => nr::FSTAT,
+            x::STATX => nr::STATX,
+            x::ACCESS | x::FACCESSAT => nr::FACCESSAT,
+            x::FACCESSAT2 => nr::FACCESSAT2,
+            x::READLINK | x::READLINKAT => nr::READLINKAT,
+            x::GETCWD => nr::GETCWD,
+            x::GETDENTS64 => nr::GETDENTS64,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -2268,6 +2776,16 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::MREMAP => nr::MREMAP,
             x::MADVISE => nr::MADVISE,
             x::MSYNC => nr::MSYNC,
+            x::OPEN | x::CREAT | x::OPENAT => nr::OPENAT,
+            x::OPENAT2 => nr::OPENAT2,
+            x::STAT | x::LSTAT | x::NEWFSTATAT => nr::NEWFSTATAT,
+            x::FSTAT => nr::FSTAT,
+            x::STATX => nr::STATX,
+            x::ACCESS | x::FACCESSAT => nr::FACCESSAT,
+            x::FACCESSAT2 => nr::FACCESSAT2,
+            x::READLINK | x::READLINKAT => nr::READLINKAT,
+            x::GETCWD => nr::GETCWD,
+            x::GETDENTS64 => nr::GETDENTS64,
             _ => return None,
         }
     } else {
@@ -2277,6 +2795,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL | nr::CLOSE
             | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK | nr::BRK | nr::MMAP | nr::MUNMAP
             | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC => raw,
+            n if is_path(n) => raw,
             _ => return None,
         }
     };
@@ -2327,7 +2846,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -2363,6 +2882,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 n,
                 nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK | nr::DUP2 | nr::DUP3 | nr::FCNTL
             ) || is_mapping(n)))
+        // The path calls' older forms (`open`, `stat`, `access`, ...) as the
+        // `*at` ones, a 32-bit ABI's descriptor sign-extended.
+        || (is_path(n) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -2406,6 +2928,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         r
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
+        r
+    } else if is_path(n) {
+        let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
@@ -3758,8 +4283,8 @@ impl Kernel {
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
-            thread_cwd: std::collections::HashMap::new(),
-            next_tmpfile: 0,
+            thread_fs: Arc::new(ThreadFs::default()),
+            tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             umask: 0o022,
             rlimits: default_rlimits(),
             net: None,
@@ -4008,8 +4533,8 @@ impl Kernel {
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
-            thread_cwd: std::collections::HashMap::new(),
-            next_tmpfile: self.next_tmpfile,
+            thread_fs: Arc::new(ThreadFs::default()),
+            tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(self.tmpfiles.load(std::sync::atomic::Ordering::Relaxed))),
             umask: self.umask,
             rlimits: self.rlimits,
             net: self.net.clone(),
@@ -4091,6 +4616,14 @@ impl Kernel {
             m.write_u32(child_tid, tid as u32)?;
         }
         self.live_threads += 1;
+        // Its fs_struct: its creator's with `CLONE_FS` (every pthread), a
+        // copy of it without.
+        let fs = if flags & clone_flags::FS != 0 {
+            self.thread_fs.of(parent)
+        } else {
+            Some(Arc::new(FsCwd::new(self.vfs.cwd.clone())))
+        };
+        self.thread_fs.set(child, fs);
         // The new thread's signal state: its creator's mask, nothing pending.
         self.thread_signals.insert(tid, Arc::new(crate::signal::ThreadSig::new_thread(self.signals.blocked())));
         Ok(SpawnRequest {
@@ -4108,6 +4641,7 @@ impl Kernel {
     /// it. `pthread_join` blocks on exactly this futex.
     fn thread_exit(&mut self, m: &mut GuestMem<'_>) {
         self.live_threads = self.live_threads.saturating_sub(1);
+        self.thread_fs.set(self.ctx_addr, None);
         let addr = self.clear_child_tid;
         if addr != 0 {
             let _ = m.write_u32(addr, 0);
@@ -4134,17 +4668,18 @@ impl Kernel {
     fn syscall_cwd(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         // A thread with a working directory of its own (`unshare(CLONE_FS)`)
         // has it in `vfs` while its call runs.
-        if self.thread_cwd.is_empty() {
-            return self.syscall_inner(m, pc);
-        }
         let me = self.ctx_addr;
-        let Some(mut cwd) = self.thread_cwd.remove(&me) else {
+        let Some(fs) = self.thread_fs.of(me) else {
             return self.syscall_inner(m, pc);
         };
-        self.vfs.swap_cwd(&mut cwd);
+        self.vfs.enter_cwd(fs.get());
         let out = self.syscall_inner(m, pc);
-        self.vfs.swap_cwd(&mut cwd);
-        self.thread_cwd.insert(me, cwd);
+        let cwd = self.vfs.leave_cwd();
+        // Into the thread's fs_struct as it is now (an `unshare` in the call
+        // gave it a new one).
+        if let Some(fs) = self.thread_fs.of(me) {
+            fs.set(cwd);
+        }
         out
     }
 
@@ -4596,6 +5131,25 @@ impl Kernel {
         FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks }
     }
 
+    /// The path calls' part of this kernel ([`PathIo`]): the namespace
+    /// itself, whose working directory is the calling thread's while its
+    /// call runs (`syscall_cwd`).
+    pub fn path_io(&self) -> PathIo<'_> {
+        PathIo {
+            ns: &self.vfs,
+            view: self.vfs.view(),
+            cwd: &self.vfs.cwd,
+            map: self.map_io(),
+            compat: self.compat,
+            pid: self.pid,
+            uid: self.uid,
+            gid: self.gid,
+            procs: &self.procs,
+            ptys: self.ptys,
+            tmpfiles: &self.tmpfiles,
+        }
+    }
+
     /// The mapping calls' part of this kernel ([`MapIo`]).
     pub fn map_io(&self) -> MapIo<'_> {
         MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc }
@@ -4846,8 +5400,6 @@ impl Kernel {
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
             nr::SENDFILE | nr::COPY_FILE_RANGE | nr::SPLICE => self.transfer_syscall(m, n, &a),
-            nr::OPENAT => self.sys_openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
-            nr::OPENAT2 => self.sys_openat2(m, a[0] as i32, a[1], a[2], a[3]),
             nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
                 .fds
@@ -4860,10 +5412,6 @@ impl Kernel {
             nr::TIMERFD_CREATE => self.sys_timerfd_create(a[0], a[1]),
             nr::TIMERFD_SETTIME => self.sys_timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
             nr::TIMERFD_GETTIME => self.sys_timerfd_gettime(m, a[0] as i32, a[1]),
-            nr::GETDENTS64 => self.sys_getdents(m, a[0] as i32, a[1], a[2]),
-            nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
-            nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::STATX => self.sys_statx(m, a[0] as i32, a[1], a[2], a[4]),
             // F_GETLK and F_OFD_GETLK: nobody holds a lock (see
             // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
             // first field in every `struct flock` layout (i386's flock and
@@ -4880,9 +5428,6 @@ impl Kernel {
             // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
             // and refuses to write any file-backed database.
             nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1], a[2] as u32),
-            nr::READLINKAT => self.sys_readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             // Only a thread's own working directory (CLONE_FS) is unshared;
@@ -4892,8 +5437,8 @@ impl Kernel {
                     Err(Errno::EINVAL)
                 } else {
                     if a[0] & 0x200 != 0 {
-                        let cwd = self.vfs.cwd.clone();
-                        self.thread_cwd.entry(self.ctx_addr).or_insert(cwd);
+                        // A copy of the directory it had, its own from now.
+                        self.thread_fs.set(self.ctx_addr, Some(Arc::new(FsCwd::new(self.vfs.cwd.clone()))));
                     }
                     Ok(0)
                 }
@@ -4947,6 +5492,11 @@ impl Kernel {
             // -- memory ------------------------------------------------------
             nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
                 let Some(r) = self.map_io().call(m, n, a) else { unreachable!() };
+                r
+            }
+            // The path lookups and opens (L14b), the free path's code.
+            n if is_path(n) => {
+                let Some(r) = self.path_io().call(m, n, a) else { unreachable!() };
                 r
             }
 
@@ -5430,51 +5980,12 @@ impl Kernel {
 
     /// Resolve a `*at`-style `(dirfd, path)` pair to an absolute guest path.
     fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
-        let raw = m.read_cstr(path, 4096)?;
-        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
-        self.at_path_str(dirfd, &p)
+        self.path_io().at_path(m, dirfd, path)
     }
 
     /// [`Self::at_path`] for a path already read.
     fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        let p = p.to_string();
-        // An empty path names nothing (the AT_EMPTY_PATH forms check for it
-        // before they get here), as on Linux.
-        if p.is_empty() {
-            return Err(Errno::ENOENT);
-        }
-        let abs = if p.starts_with('/') || dirfd == AT_FDCWD {
-            self.vfs.absolute(&p)
-        } else {
-            self.at_dir_path(dirfd, &p)?
-        };
-        // A trailing slash names a directory: "file/" is ENOTDIR (the
-        // normalised path has lost the slash, so look now).
-        if p.len() > 1 && p.ends_with('/') {
-            let followed = self.vfs.metadata(&abs);
-            if let Ok(md) = followed.as_ref() {
-                if md.file_type != crate::vfs::FileType::Directory {
-                    return Err(Errno::ENOTDIR);
-                }
-                // "link/" names the directory the link points to, even for
-                // lstat and the other calls that do not follow a last link
-                let mut cur = abs;
-                for _ in 0..40 {
-                    match self.vfs.read_link(&cur) {
-                        Ok(t) if t.starts_with('/') => cur = crate::vfs::normalize(&t, "/"),
-                        Ok(t) => cur = crate::vfs::normalize(&t, &crate::vfs::parent_of(&cur)),
-                        Err(_) => break,
-                    }
-                }
-                return Ok(cur);
-            }
-            // a dangling or looping link with a slash names nothing: the
-            // error following it gives (ENOENT, ELOOP)
-            if self.vfs.metadata_nofollow(&abs).is_ok() {
-                return Err(followed.err().unwrap_or(Errno::ENOENT));
-            }
-        }
-        Ok(abs)
+        self.path_io().at_path_str(dirfd, p)
     }
 
     /// How the path at `ptr` ends, which normalising loses: with a slash
@@ -5504,14 +6015,7 @@ impl Kernel {
 
     /// `p` relative to the directory open at `dirfd`.
     fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        // Relative to an open directory: its recorded path is the base. A
-        // descriptor that is not a directory is ENOTDIR.
-        let f = self.fds.get(dirfd)?;
-        if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
-            return Err(Errno::ENOTDIR);
-        }
-        let base = f.path.clone();
-        Ok(crate::vfs::normalize(p, &base))
+        self.path_io().at_dir_path(dirfd, p)
     }
 
     // -- I/O -----------------------------------------------------------------
@@ -5701,197 +6205,8 @@ impl Kernel {
         io_readv(&self.fds, m, fd, iov, count, self.compat)
     }
 
-    /// Open a pseudoterminal end if `p` names one, else `None` so the ordinary
-    /// open runs. The pair lives in the global kernel (`self.ptys`); with none
-    /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
-    fn open_pty(&mut self, p: &str, flags: u64) -> Option<SysResult> {
-        let r = self.ptys?;
-        // `/dev/tty` is the caller's *controlling terminal*. Inside a terminal
-        // emulator that is a pty in the global kernel, not the page's own
-        // terminal -- a shell opens this for job control and compares its
-        // foreground group with its own, and the page's terminal never matches:
-        // dash then spins raising SIGTTIN at itself, which shows as a window
-        // that echoes what is typed and runs none of it. Only when this
-        // session has claimed one; otherwise the name falls through to the
-        // console handle, which is right for the page's own shell.
-        if p == "/dev/tty" {
-            let sid = self.procs.sid(self.pid, 0).unwrap_or(0);
-            let id = (r.for_sid)(sid);
-            if id >= 0 {
-                let handle = Arc::new(crate::pty::RemotePty { id, master: false, remote: r });
-                // A descriptor of its own on that end, so the counting stays
-                // right, but no claim: this session already owns it.
-                (r.open_end)(id, 0);
-                let file = OpenFile::new(handle, format!("pty:[{id}:s]"), flags, true, true);
-                return Some(self.fds.insert(file, flags & oflags::O_CLOEXEC != 0));
-            }
-            return None;
-        }
-        let (id, master) = if p == "/dev/ptmx" {
-            let packed = (r.open_master)();
-            if packed < 0 {
-                return Some(Err(Errno::ENOSPC));
-            }
-            (packed >> 16, true)
-        } else if let Some(n) = p.strip_prefix("/dev/pts/") {
-            let ptn: i32 = n.parse().ok()?;
-            let id = (r.open_slave)(ptn);
-            if id == -1 {
-                return None; // no such pts -- let the VFS answer ENOENT
-            }
-            if id < 0 {
-                return Some(Err(Errno(-id))); // locked, or otherwise refused
-            }
-            (id, false)
-        } else {
-            return None;
-        };
-        let handle = Arc::new(crate::pty::RemotePty { id, master, remote: r });
-        // Opening a terminal is how a session claims it.
-        //
-        // A session leader with no controlling terminal that opens one without
-        // O_NOCTTY acquires it, and its process group becomes the terminal's
-        // foreground group -- Linux does this in the open, not in `TIOCSCTTY`,
-        // and a terminal emulator's child relies on it: xterm's child calls
-        // `setsid` and opens the slave, and never issues the ioctl. Without
-        // this the shell it execs is in a *background* group, so the kernel
-        // answers every read from the terminal with SIGTTIN: a window that
-        // echoes what is typed (the line discipline does that) and runs none
-        // of it.
-        if !master && flags & oflags::O_NOCTTY == 0 {
-            let leader = self.procs.sid(self.pid, 0) == Ok(self.pid);
-            if leader {
-                use crate::vfs::FileHandle;
-                handle.claim_session(self.pid);
-            }
-        }
-        let path = format!("pty:[{id}:{}]", if master { 'm' } else { 's' });
-        let file = OpenFile::new(handle, path, flags, true, true);
-        Some(self.fds.insert(file, flags & oflags::O_CLOEXEC != 0))
-    }
 
-    fn sys_openat(
-        &mut self,
-        m: &GuestMem<'_>,
-        dirfd: i32,
-        path: u64,
-        flags: u64,
-        mode: u32,
-    ) -> SysResult {
-        let p = self.at_path(m, dirfd, path)?;
-        // Unix98 pseudoterminals. `/dev/ptmx` makes a fresh pair and hands back
-        // the master; `/dev/pts/N` takes the matching slave. Both live in the
-        // global kernel, so the master (xterm) and the slave (its shell) can be
-        // different Workers. Intercepted before the VFS, which has no such nodes.
-        if let Some(res) = self.open_pty(&p, flags) {
-            return res;
-        }
-        // `O_TMPFILE` names a directory and asks for an unnamed file inside
-        // it: made, opened, and unlinked at once, so the handle is the only
-        // way to it. `O_PATH` opens the name, not the file, so it does not
-        // follow a dangling symlink to `ENOENT` -- which is how tar sets the
-        // mode on a symlink whose target does not exist yet.
-        let mut tmpfile_path: Option<String> = None;
-        let handle = if flags & oflags::O_PATH != 0 {
-            let md = if flags & oflags::O_NOFOLLOW != 0 {
-                self.vfs.metadata_nofollow(&p)?
-            } else {
-                self.vfs.metadata(&p)?
-            };
-            Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
-        } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
-            let n = self.next_tmpfile;
-            self.next_tmpfile += 1;
-            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-            let h = self.vfs.open(
-                &tmp,
-                oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
-                if mode == 0 { 0o600 } else { mode },
-            )?;
-            // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
-            // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
-            // into place; the name is removed when the descriptor closes (see
-            // `OpenFile::unlink_on_close`). Recording `tmp` as the fd's path --
-            // not the directory `p` -- is what makes `/proc/self/fd/N` point at
-            // the file rather than at a directory (linking which is EPERM).
-            tmpfile_path = Some(tmp);
-            h
-        } else {
-            // Arm a pin if this is an object of the closure. Before the open
-            // rather than after, because `open` moves `p` into the call and
-            // the path is what identifies the object.
-            if let Some(base) = self.pin_for(&p) {
-                self.mem.lock().log.armed_pin = Some((p.clone(), base));
-            }
-            // O_CREAT of "name/" that is not there: a slash names a
-            // directory, which open does not create (EISDIR, as Linux).
-            if flags & oflags::O_CREAT != 0 && Self::path_tail(m, path)?.0 && self.vfs.metadata(&p).is_err() {
-                return Err(Errno::EISDIR);
-            }
-            // O_NOFOLLOW on a symlink: ELOOP.
-            if flags & oflags::O_NOFOLLOW != 0
-                && self.vfs.metadata_nofollow(&p).is_ok_and(|md| md.file_type == FileType::Symlink)
-            {
-                return Err(Errno::ELOOP);
-            }
-            // A directory opens for reading only: each filesystem's `open`
-            // says `EISDIR`, without a lookup of its own here.
-            let h = self.vfs.open(&p, flags, mode)?;
-            // And arm a placement, for an object nobody pinned. Only for a
-            // shared object: the executable's own base is fixed by the
-            // loader rather than reserved, and arming on every open would
-            // hand the next unrelated reservation somebody else's address.
-            //
-            // After the open rather than before, so a path that does not
-            // exist -- `ld.so` probes several directories for every library
-            // it loads -- leaves nothing armed.
-            if self.place.is_some() && is_shared_object(&p) {
-                self.mem.lock().log.armed_place = Some(p.clone());
-            }
-            h
-        };
-        let acc = flags & oflags::ACCMODE;
-        let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
-        let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
-        let file = match tmpfile_path {
-            Some(tp) => OpenFile::tmpfile(handle, tp, self.vfs.view().get(), flags, readable, writable),
-            None => OpenFile::new(handle, p, flags, readable, writable),
-        };
-        self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
-    }
 
-    /// `openat2(dirfd, path, how, size)`: `openat` with an extensible
-    /// `open_how` struct { u64 flags; u64 mode; u64 resolve } instead of a bare
-    /// flags word.
-    ///
-    /// `resolve` is the reason a program reaches for this syscall specifically:
-    /// RESOLVE_BENEATH / RESOLVE_IN_ROOT / RESOLVE_NO_SYMLINKS pin path lookup
-    /// inside a subtree, which is how a sandbox keeps a lookup from escaping.
-    /// This VFS cannot enforce that per-open, and the one thing worse than not
-    /// offering containment is offering it falsely -- so any non-zero `resolve`
-    /// gets EINVAL rather than an open that silently ignored the constraint.
-    /// `resolve == 0` is ordinary resolution and routes to the `openat` path.
-    fn sys_openat2(
-        &mut self,
-        m: &GuestMem<'_>,
-        dirfd: i32,
-        path: u64,
-        how: u64,
-        size: u64,
-    ) -> SysResult {
-        // The struct is versioned by length; Linux rejects one shorter than the
-        // first defined version (three u64s = 24 bytes).
-        if size < 24 {
-            return Err(Errno::EINVAL);
-        }
-        let flags = m.read_u64(how)?;
-        let mode = m.read_u64(how + 8)? as u32;
-        let resolve = m.read_u64(how + 16)?;
-        if resolve != 0 {
-            return Err(Errno::EINVAL);
-        }
-        self.sys_openat(m, dirfd, path, flags, mode)
-    }
 
     fn sys_dup(&mut self, fd: i32) -> SysResult {
         self.fd_io().dup(fd)
@@ -6115,12 +6430,6 @@ impl Kernel {
         Ok(0)
     }
 
-    fn sys_getdents(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        let file = self.fds.get(fd)?;
-        let bytes = file.read_dirents(len as usize)?;
-        m.write(buf, &bytes)?;
-        Ok(bytes.len() as u64)
-    }
 
     fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
@@ -6150,98 +6459,8 @@ impl Kernel {
         }
     }
 
-    /// `statx`, how glibc stats a file on a modern kernel.
-    ///
-    /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
-    /// returned the right answer but `ls` then branched into padding, so serve
-    /// the path glibc actually wants.
-    fn sys_statx(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        dirfd: i32,
-        path: u64,
-        flags: u64,
-        buf: u64,
-    ) -> SysResult {
-        let raw = m.read_cstr(path, 4096)?;
-        let md = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            self.fds.get(dirfd)?.metadata()?
-        } else {
-            let p = self.at_path(m, dirfd, path)?;
-            if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                self.vfs.metadata_nofollow(&p)?
-            } else {
-                self.vfs.metadata(&p)?
-            }
-        };
-        let st = Self::stat_from(&md);
 
-        // `struct statx` is 256 bytes and mostly reserved.
-        let mut out = [0u8; 256];
-        let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
-            o[at..at + 4].copy_from_slice(&v.to_ge_bytes())
-        };
-        let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_ge_bytes())
-        };
-        // What is filled in. The caller asks for a mask and the kernel says
-        // which parts it actually answered; claiming everything but the
-        // birth time is what a Linux filesystem without one reports.
-        const STATX_BASIC_STATS: u32 = 0x07ff;
-        put32(&mut out, 0, STATX_BASIC_STATS);
-        put32(&mut out, 4, st.blksize as u32);
-        put32(&mut out, 16, st.nlink as u32);
-        put32(&mut out, 20, self.uid);
-        put32(&mut out, 24, self.gid);
-        out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
-        put64(&mut out, 32, st.ino);
-        put64(&mut out, 40, st.size as u64);
-        put64(&mut out, 48, st.blocks as u64);
-        // atime, btime, ctime, mtime: 16 bytes each from offset 64, seconds
-        // then nanoseconds; btime is reported as mtime.
-        for (at, (t, ns)) in [64usize, 80, 96, 112].into_iter().zip([
-            (st.atime, st.atime_ns),
-            (st.mtime, st.mtime_ns),
-            (st.ctime, st.ctime_ns),
-            (st.mtime, st.mtime_ns),
-        ]) {
-            put64(&mut out, at, t as u64);
-            put32(&mut out, at + 8, ns);
-        }
-        put32(&mut out, 128, (st.rdev >> 8) as u32);
-        put32(&mut out, 132, (st.rdev & 0xff) as u32);
-        m.write(buf, &out)?;
-        Ok(0)
-    }
 
-    fn sys_fstat(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
-        let md = self.fds.get(fd)?.metadata()?;
-        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
-        Ok(0)
-    }
-
-    fn sys_fstatat(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        dirfd: i32,
-        path: u64,
-        buf: u64,
-        flags: u64,
-    ) -> SysResult {
-        let raw = m.read_cstr(path, 4096)?;
-        if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            return self.sys_fstat(m, dirfd, buf);
-        }
-        let p = self.at_path(m, dirfd, path)?;
-        let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            self.vfs.metadata_nofollow(&p)
-        } else {
-            self.vfs.metadata(&p)
-        };
-        let md = md?;
-        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
-        Ok(0)
-    }
 
     fn sys_fcntl(&mut self, fd: i32, cmd: u64, arg: u64) -> SysResult {
         self.fd_io().fcntl(fd, cmd, arg)
@@ -6900,39 +7119,8 @@ impl Kernel {
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }
 
-    fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
-        let p = self.at_path(m, dirfd, path)?;
-        // A root guest (`--uid 0`) may read and write anything; execute
-        // still needs an execute bit, which the host checks.
-        let mode = if self.uid == 0 { mode & 1 } else { mode & 7 };
-        self.vfs.access(&p, mode).map(|_| 0)
-    }
 
-    fn sys_readlinkat(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        dirfd: i32,
-        path: u64,
-        buf: u64,
-        size: u64,
-    ) -> SysResult {
-        let p = self.at_path(m, dirfd, path)?;
-        let target = self.vfs.read_link(&p)?;
-        let bytes = target.as_bytes();
-        let n = bytes.len().min(size as usize);
-        m.write(buf, &bytes[..n])?;
-        Ok(n as u64)
-    }
 
-    fn sys_getcwd(&mut self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> SysResult {
-        let mut bytes = self.vfs.cwd.clone().into_bytes();
-        bytes.push(0);
-        if bytes.len() as u64 > size {
-            return Err(Errno::ERANGE);
-        }
-        m.write(buf, &bytes)?;
-        Ok(bytes.len() as u64)
-    }
 
     fn sys_chdir(&mut self, m: &GuestMem<'_>, path: u64) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
@@ -9256,7 +9444,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9264,7 +9452,7 @@ mod tests {
         // Not in the class: declined before anything is done.
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::FSTAT, &[rfd, 0x22000]);
+        set_args(&mut m, at, nr::FCHDIR, &[rfd]);
         assert!(free(&k, &mut m, at).is_none());
 
         // An empty pipe parks both ways, on the same stream.
@@ -9434,7 +9622,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9495,7 +9683,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9907,7 +10095,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -9984,7 +10172,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -10083,7 +10271,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -10149,7 +10337,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -10251,7 +10439,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -10266,6 +10454,138 @@ mod tests {
         set_args(m, at, n, a);
         k.syscall(m, 0);
         ret(m, at) as u64
+    }
+
+    /// The path lookups and opens through the lock-free path ([`PathIo`])
+    /// answer as the full call does: two kernels, the same calls, one
+    /// through each path. Relative to the directory and to a descriptor,
+    /// through a symlink, a stat of each kind, a listing, a missing name.
+    #[test]
+    fn free_path_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            for (a, t) in [(0x20000u64, &b"/d\0"[..]), (0x20100, b"f\0"), (0x20200, b"/d/f\0"), (0x20300, b"/d/l\0"), (0x20400, b"/d/none\0"), (0x20500, b"l\0")] {
+                m.write(a, t).unwrap();
+            }
+            sys_locked(&mut m, &mut k, at, nr::MKDIRAT, &[cwd, 0x20000, 0o755]);
+            sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20200, cwd, 0x20300]);
+            let mut got = Vec::new();
+            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
+            got.push(dir);
+            let f = sys(&mut m, &mut k, nr::OPENAT, &[dir as u64, 0x20100, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_CLOEXEC) as u64, 0o640]);
+            got.push(f);
+            m.write(0x21000, b"twelve bytes").unwrap();
+            got.push(sys(&mut m, &mut k, nr::WRITE, &[f as u64, 0x21000, 12]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, 0]));
+            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, AT_SYMLINK_NOFOLLOW]));
+            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.push(sys(&mut m, &mut k, nr::FSTAT, &[f as u64, 0x22000]));
+            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.push(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20300, 0, 0x7ff, 0x23000]));
+            got.extend(m.read(0x23000, 256).unwrap().iter().map(|&b| b as i64));
+            got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20200, 4]));
+            got.push(sys(&mut m, &mut k, nr::FACCESSAT, &[cwd, 0x20400, 0]));
+            got.push(sys(&mut m, &mut k, nr::READLINKAT, &[dir as u64, 0x20500, 0x24000, 64]));
+            got.extend(m.read(0x24000, 8).unwrap().iter().map(|&b| b as i64));
+            got.push(sys(&mut m, &mut k, nr::GETCWD, &[0x25000, 64]));
+            got.push(sys(&mut m, &mut k, nr::GETDENTS64, &[dir as u64, 0x26000, 4096]));
+            got.push(sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20400, 0, 0]));
+            got.push(k.fds.cloexec(f as i32).unwrap() as i64);
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 12, "{:?}", &g[..3]);
+        assert_eq!(*g.last().unwrap(), 1, "O_CLOEXEC");
+        assert_eq!(g[g.len() - 2], -(Errno::ENOENT.0 as i64));
+    }
+
+    /// The 32-bit ABI's path calls through the lock-free path, in their
+    /// older forms too (`open`, `creat`, `stat64`, `lstat64`, `fstat64`,
+    /// `access`, `readlink`): translated as the full call translates them,
+    /// `AT_FDCWD` sign-extended.
+    #[test]
+    fn free_i386_path_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::i386::raw;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            k.compat = true;
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: [u64; 6]| {
+                m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+                }
+                if lock_free {
+                    let call = free_class(m, at, true).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32 as i64
+            };
+            let cwd32 = 0xffff_ff9cu64;
+            for (a, t) in [(0x20000u64, &b"/f\0"[..]), (0x20100, b"/l\0"), (0x20200, b"/none\0"), (0x20300, b"/g\0")] {
+                m.write(a, t).unwrap();
+            }
+            let mut got = Vec::new();
+            let f = sys(&mut m, &mut k, raw::OPEN, [0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o600, 0, 0, 0]);
+            got.push(f);
+            got.push(sys(&mut m, &mut k, raw::CREAT, [0x20300, 0o600, 0, 0, 0, 0]));
+            m.write(0x21000, b"abc").unwrap();
+            got.push(sys(&mut m, &mut k, raw::WRITE, [f as u64, 0x21000, 3, 0, 0, 0]));
+            sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20000, (-100i64) as u64, 0x20100]);
+            for (n, a) in [
+                (raw::STAT64, [0x20100u64, 0x22000, 0, 0, 0, 0]),
+                (raw::LSTAT64, [0x20100, 0x22000, 0, 0, 0, 0]),
+                (raw::FSTAT64, [f as u64, 0x22000, 0, 0, 0, 0]),
+                (raw::FSTATAT64, [cwd32, 0x20000, 0x22000, 0, 0, 0]),
+            ] {
+                got.push(sys(&mut m, &mut k, n, a));
+                got.extend(m.read(0x22000, 96).unwrap().iter().map(|&b| b as i64));
+            }
+            got.push(sys(&mut m, &mut k, raw::ACCESS, [0x20000, 4, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::ACCESS, [0x20200, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::FACCESSAT, [cwd32, 0x20000, 4, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::READLINK, [0x20100, 0x24000, 64, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::READLINKAT, [cwd32, 0x20100, 0x24000, 64, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::GETCWD, [0x25000, 64, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::OPENAT, [cwd32, 0x20200, 0, 0, 0, 0]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 3, "{:?}", &g[..3]);
+        assert_eq!(*g.last().unwrap(), -(Errno::ENOENT.0 as i64));
     }
 
     /// The mapping calls through the lock-free path ([`MapIo`]) answer as
@@ -10290,7 +10610,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -10371,7 +10691,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -10410,7 +10730,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;

@@ -14947,19 +14947,17 @@ pub extern "C" fn gex_loader_done_ms() -> u64 {
 /// When this process began, for the measurement above.
 static PROCESS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The path of the most recent `openat`, for the crash report.
-static LAST_OPEN: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The path of the most recent `openat`, for the crash report: its own
+/// lock, since `openat` takes no other (L14b).
+static LAST_OPEN: gex_kernel::sync::Mutex<String> = gex_kernel::sync::Mutex::new(String::new());
 
 /// How many bytes of it there are, written into the shim's own buffer.
 #[no_mangle]
 pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
-    // Under KLOCK: shares `LAST_OPEN` with the openat writer above.
-    with_host(|_| {
-        let s = LAST_OPEN.0.borrow();
-        let n = s.len().min(max as usize);
-        shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
-        n as u32
-    })
+    let s = LAST_OPEN.lock();
+    let n = s.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
+    n as u32
 }
 
 fn note_process_syscall(base: u64, pc: i64) {
@@ -14980,14 +14978,11 @@ fn note_process_syscall(base: u64, pc: i64) {
     // away.
     if n == nr::OPENAT {
         if let Ok(b) = gm.read_cstr(g(1), 256) {
-            // Under KLOCK: `note_process_syscall` runs before `gex_syscall`'s
-            // own `with_host`, so this fires unlocked on EVERY openat of EVERY
-            // Worker. `LAST_OPEN` is one process-global `RefCell<String>`; two
-            // threads openat-ing at once both `borrow_mut` and realloc it -- a
-            // wild store (the residual browser stack smash, since the browser's
-            // true parallelism hits concurrent syscalls far more than node).
+            // Its own lock: every Worker's openat writes it, and two at once
+            // through a bare cell was a wild store (the browser's stack
+            // smash).
             let path = String::from_utf8_lossy(&b).into_owned();
-            with_host(|_| *LAST_OPEN.0.borrow_mut() = path);
+            *LAST_OPEN.lock() = path;
         }
     }
     if n != nr::CLONE && n != nr::EXECVE {

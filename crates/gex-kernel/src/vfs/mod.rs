@@ -506,6 +506,10 @@ fn within(abs: &str, at: &str) -> bool {
 pub struct Vfs {
     ns: Namespace,
     view: NsCell,
+    /// The process's working directory while a thread with an fs_struct
+    /// of its own has its directory in `ns` for its call ([`Vfs::enter_cwd`]):
+    /// what a publication shows.
+    held: Option<String>,
 }
 
 /// A [`Vfs`]'s namespace as other threads read it: replaced whole on every
@@ -532,7 +536,8 @@ struct NsCell(Arc<VfsView>);
 
 impl Clone for Vfs {
     fn clone(&self) -> Vfs {
-        Vfs { ns: self.ns.clone(), view: NsCell(Arc::new(VfsView::new(&self.ns))) }
+        // A fork's copy: the calling thread's directory is the child's.
+        Vfs { ns: self.ns.clone(), view: NsCell(Arc::new(VfsView::new(&self.ns))), held: None }
     }
 }
 
@@ -547,7 +552,7 @@ impl Vfs {
     pub fn new() -> Vfs {
         let ns = Namespace::new();
         let view = NsCell(Arc::new(VfsView::new(&ns)));
-        Vfs { ns, view }
+        Vfs { ns, view, held: None }
     }
 
     /// The published namespace, the same view for this table's whole life.
@@ -558,7 +563,11 @@ impl Vfs {
     /// Every build, the single-threaded page's too, which reads its
     /// namespace the same way: a mount or a `chdir` is rare.
     fn publish(&self) {
-        let ns = Arc::new(self.ns.clone());
+        let mut ns = self.ns.clone();
+        if let Some(cwd) = &self.held {
+            ns.cwd.clone_from(cwd);
+        }
+        let ns = Arc::new(ns);
         self.view.0.cur.write(|_| (Some(ns), ()));
     }
 
@@ -581,11 +590,19 @@ impl Vfs {
         self.publish();
         Ok(())
     }
-    /// Trade the working directory for `cwd`, unpublished: a thread with
-    /// its own (`unshare(CLONE_FS)`) has it here while its call runs, and
-    /// the view keeps the process's.
-    pub fn swap_cwd(&mut self, cwd: &mut String) {
-        std::mem::swap(&mut self.ns.cwd, cwd);
+    /// Resolve against `cwd`, a thread's own fs_struct's directory, until
+    /// [`Vfs::leave_cwd`]: the process's stays what is published, a `chdir`
+    /// in between changing only the thread's.
+    pub fn enter_cwd(&mut self, cwd: String) {
+        self.held = Some(std::mem::replace(&mut self.ns.cwd, cwd));
+    }
+
+    /// Back to the process's directory; the thread's, as the call left it.
+    pub fn leave_cwd(&mut self) -> String {
+        match self.held.take() {
+            Some(p) => std::mem::replace(&mut self.ns.cwd, p),
+            None => self.ns.cwd.clone(),
+        }
     }
 }
 

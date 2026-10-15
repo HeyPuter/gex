@@ -641,6 +641,35 @@ in the scheduler pick after each wake of the global WAKE word: about
      old command line in `/proc/self/cmdline`; the image is now compared by
      argv. Leg: `proc-threads` (x86-64, i386, aarch64; page tier and SP)
      and `proc_reads_the_process_live`.
+   - The path lookups and opens without the kernel lock (L14b): `openat`,
+     `openat2`, `getdents64`, `fstat`, `newfstatat`, `statx`,
+     `faccessat(2)`, `readlinkat` and `getcwd` (and their i386, x86-64 and
+     aarch64 older forms, translated to these) run on the free path through
+     `PathIo`: the published namespace, the descriptor table, the map (for
+     the user buffers) and the calling thread's working directory. The
+     working directory belongs to the fs_struct, not to the thread: every
+     thread made with `CLONE_FS` (every pthread) shares its creator's
+     (`ThreadFs`, an `FsCwd` per context, the same `Arc` for the threads
+     that share it); `clone` without `CLONE_FS` copies it and
+     `unshare(CLONE_FS)` makes the caller's own. A `chdir` in one pthread
+     is seen by its siblings, as on Linux. The namespace's publication keeps
+     the process's directory while a call runs in a thread's own
+     (`Vfs::enter_cwd`/`leave_cwd`). The tmpfile counter is an atomic and
+     the page's record of the last open (`LAST_OPEN`) its own lock, so
+     `note_process_syscall` no longer takes KLock on every `openat`. Still
+     under the kernel lock: the path writers (`mkdir`, `unlink`, `rename`,
+     `symlink`, `link`, `chmod`, `utimensat`, `chdir`), next (L14c). Known
+     gaps, both older than L14b: the page's tmpfs renames a directory
+     without its descendants (a flat map of paths), and a directory
+     descriptor resolves through the path it was opened at, not the
+     directory, so a rename of the directory itself leaves it stale; an
+     exec by a thread with its own fs_struct starts in the process's
+     directory. Legs: `free_path_calls_answer_as_the_kernel_does`,
+     `free_i386_path_calls_answer_as_the_kernel_does`; `fs-threads`
+     (x86-64, i386, aarch64; page tier and SP): a pthread's `chdir` seen by
+     its siblings and main, `unshare(CLONE_FS)` shared with the threads made
+     after it and not by the rest, and `openat`/`fstatat` through a
+     directory descriptor while another thread renames files in it.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
