@@ -76,6 +76,14 @@ pub(crate) fn provided(addr: u64) -> bool {
 /// A new process (a forked child): start over from what its kernel has
 /// mapped. Returns whether something was queued.
 fn rescan_if_new() -> bool {
+    // A vfork child running in place is not a new process here: it runs in
+    // its parent's memory, with its parent's bindings, until its exec.
+    // Taken for one (`my_pid` is the child's), the parent's bindings were
+    // cleared and rebuilt twice per spawn, once for the child and once more
+    // when the parent went on.
+    if crate::vfork::active() {
+        return false;
+    }
     let pid = crate::my_pid();
     let was = PID.swap(pid, Ordering::AcqRel);
     if was == pid {

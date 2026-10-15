@@ -271,6 +271,8 @@ extern "C" {
     fn k_take_kill_signals(pid: i32, taken: u64) -> u64;
     fn k_kill_sender(pid: i32, signo: u32) -> i32;
     fn k_has_signals(pid: i32) -> i32;
+    fn k_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32;
+    fn k_take_thread_signal(pid: i32, tid: i32) -> i64;
     fn k_ppid(pid: i32) -> i32;
     fn k_pgid(caller: i32, of: i32) -> i32;
     fn k_sid(caller: i32, of: i32) -> i32;
@@ -457,6 +459,7 @@ extern "C" {
     fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
     fn k_sock_dup(id: i32) -> i32;
     fn k_boot_secs(want: u32) -> u32;
+    fn k_guest_clock(scale_milli: u32, wall_shift: i32) -> u64;
     fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn k_sock_read_fds(
@@ -662,6 +665,13 @@ extern "C" fn r_take_kill_signals(pid: i32, taken: u64) -> u64 {
 extern "C" fn r_kill_sender(pid: i32, signo: u32) -> i32 {
     unsafe { k_kill_sender(pid, signo) }
 }
+extern "C" fn r_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32 {
+    signal_note("tid", caller, pid, signo);
+    unsafe { k_tkill(caller, pid, tid, signo) }
+}
+extern "C" fn r_take_thread_signal(pid: i32, tid: i32) -> i64 {
+    unsafe { k_take_thread_signal(pid, tid) }
+}
 extern "C" fn r_has_signals(pid: i32) -> i32 {
     unsafe { k_has_signals(pid) }
 }
@@ -736,6 +746,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             take_kill_signals: r_take_kill_signals,
             kill_sender: r_kill_sender,
             has_signals: r_has_signals,
+            tkill: r_tkill,
+            take_thread_signal: r_take_thread_signal,
             ppid: r_ppid,
             pgid: r_pgid,
             sid: r_sid,
@@ -1294,6 +1306,11 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     }
     // And one boot instant for every process's monotonic clocks.
     gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
+    // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
+    let gc = unsafe { k_guest_clock(0, 0) };
+    if gc != 0 {
+        gex_kernel::set_guest_clock((gc >> 32) as f64 / 1000.0, gc as u32 as i32 as i64);
+    }
     Some(gex_kernel::unix::Remote {
         queue: rs_queue,
         bind: rs_bind,
@@ -1558,6 +1575,12 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
+    // Audio: OSS's /dev/dsp and /dev/mixer, a null output, as natively
+    // (shims/native). W3's wineoss.drv is a pure Unix library linked into
+    // the loader; without the device its test_connect says Unavailable,
+    // mmdevapi picks no driver and a program finds no audio device
+    // (waveOutGetNumDevs 0; tests/w3/audio.sh).
+    devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
     // for every process so a name one creates another opens (Chromium's
@@ -1568,7 +1591,14 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
-    let wayland = crate::wl::have_wl().then(|| {
+    //
+    // And not for a vfork child running in its parent's Worker (vfork.rs):
+    // `set_compositor` is the memory's, which is the parent's, so the
+    // child's device replaced the parent's for good, and the parent's own
+    // clients were never pumped again (winlogon, after spawning explorer in
+    // place, hung on its first Wayland round trip). The child only execs;
+    // its program gets a compositor in the Worker the exec starts.
+    let wayland = (crate::wl::have_wl() && vfork::pid_here().is_none()).then(|| {
         let device = crate::wl::WaylandDevice::new();
         kernel.host_names.bind_host(
             crate::wl::DEFAULT_SOCKET,
@@ -9205,7 +9235,16 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// not the image survives -- pid, parent, non-cloexec descriptors, cwd -- which
 /// is what makes fork-then-exec work. Returns the entry point, or zero if the
 /// program could not be loaded (the caller already has an errno).
+thread_local! {
+    /// The exec about to run is on a memory no program has run in yet (a
+    /// posix_spawn child's, `vfork::gex_adopted_exec`): the image's and the
+    /// stack's spans read as zero already, so `do_exec` does not scan them.
+    /// Taken by the next `do_exec`.
+    pub(crate) static EXEC_FRESH: Cell<bool> = const { Cell::new(false) };
+}
+
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    let fresh = EXEC_FRESH.with(|c| c.replace(false));
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -9360,7 +9399,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if b > data.len() {
             return 0;
         }
-        gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+        if !fresh {
+            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+        }
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
         let mut prot = 0;
         if seg.readable {
@@ -9448,7 +9489,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // below it as the previous image had, so a program reading an uninitialised
     // local read the last program's data instead of zero.
     let stack_lo = (gex_abi::STACK_TOP - gex_abi::STACK_SIZE) as usize;
-    gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
+    // (A fresh memory's is zero: scanning its 8 MiB to find that out was
+    // half a millisecond of every posix_spawn child's exec.)
+    if !fresh {
+        gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
+    }
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     h.kernel.mem.lock().insert(
@@ -12285,6 +12330,13 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // As in `gex_illegal`: the browser traps out of a resumable fault too.
     let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
+    // Native Wine's return pad (its int3 filler), translated by an earlier
+    // stray return, reached past the call-outs waiting: as the miss path.
+    if cgen::native_return_stray(pc as u64, my_ctx()) {
+        set_resume(pc as u64);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     if raw == gex_abi::imports::BRK_TRACE {
         let line = with_host(|h| {
             let gm = GuestMem::new(guest_bytes());
@@ -13171,6 +13223,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if !no_leave && cgen::may_leave() {
             return gex_emit::module::DISPATCH_MISS_LEAVE;
         }
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
+    // Native Wine's return pad, reached past the call-outs waiting: they
+    // leave (`cgen::native_return_stray`), and it is not translated.
+    if cgen::native_return_stray(pc, my_ctx()) {
+        miss_way(pc, 3);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();

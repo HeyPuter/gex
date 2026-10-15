@@ -262,6 +262,9 @@ const CALLOUT_UNWOUND = 64n << 10n;
  *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
 const NATIVE_UNWOUND = 512n;
+/** Where a native caller's `run_until` goes after a stray return to its
+ *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
+const STRAY_PC = NATIVE_RETURN_PAD + 1n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -1083,6 +1086,8 @@ export class Gex {
   static providerSkip = '';
   /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
   static fjitLibs = '';
+  /** `base:key:identity:path;...` (cgen.rs `gex_cgen_identities`). */
+  static identities = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -1982,19 +1987,9 @@ export class Gex {
     this.#closureModules = [];
   }
 
-  /**
-   * Join a process that is already loaded, as one of its threads. Same memory,
-   * shim and guest as `load`, but no program is placed and no kernel built --
-   * both already exist in the adopted memory.
-   *
-   * Instantiating a second time is safe only because the shared build is linked
-   * with `--shared-memory`: wasm-ld emits passive data segments and an
-   * atomic-guarded `__wasm_init_memory`, so the first instance initialises the
-   * data and later ones leave it alone. A plain memory would wipe the kernel.
-   */
-  async attach(shimWasm, guestWasm, { devices = true } = {}) {
-    const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
-    _at('start');
+  /** The kernel, shim and guest instances on this Worker's memory: what
+   *  `attach` starts with, and what `preattach` does ahead of a process. */
+  async #instantiate(shimWasm, guestWasm, _at = () => {}) {
     await this.#startKernel();
     _at('kernel started');
     // A compiled `Module` if the host has one, bytes otherwise: passing a
@@ -2015,25 +2010,6 @@ export class Gex {
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes.
     this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
-    // The devices this process has -- process-wide flags in shared memory, so
-    // only a *process* sets them. A thread answering for itself would turn a
-    // GPU or network off underneath the threads using it. Before the kernel is
-    // built, which is when the device nodes are made and the vtest socket bound.
-    if (devices) {
-      this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
-      this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
-      if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
-      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
-      this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
-      // The unit cache and ELF export providers, as `load` gives a process its
-      // own: a forked child's table starts empty while its GOT holds what
-      // its parent's providers made code (cgen/elfprov.rs).
-      if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
-      if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
-      this.#libprovConfig();
-    // Narrate one page's directory writes, in every process. See #136.
-    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
-    }
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -2057,6 +2033,69 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     _at('guest instantiated');
+  }
+
+  /**
+   * `attach`'s instances, made while this Worker waits in the host's pool for
+   * a process to run on a memory of its own (an exec'd posix_spawn child,
+   * `#adoptExec`): the kernel's, the shim's and the guest's, on this Gex's
+   * fresh memory. Nothing of a process is in them yet -- its pid, descriptors,
+   * environment and devices are its kernel's, built at adopt -- so the Worker
+   * can still be given any process; one that brings its own memory (a thread,
+   * a forked child) leaves this Gex unused.
+   */
+  async preattach(shimWasm, guestWasm) {
+    await this.#instantiate(shimWasm, guestWasm);
+    this.#preattached = true;
+  }
+
+  /** Whether `preattach` has run and no `attach` has used it yet. */
+  get preattached() {
+    return this.#preattached;
+  }
+  #preattached = false;
+
+  /** The process's environment, for a Gex made before its process was known
+   *  (`preattach`). */
+  setEnv(env) {
+    this.#env = env;
+  }
+
+  /**
+   * Join a process that is already loaded, as one of its threads. Same memory,
+   * shim and guest as `load`, but no program is placed and no kernel built --
+   * both already exist in the adopted memory.
+   *
+   * Instantiating a second time is safe only because the shared build is linked
+   * with `--shared-memory`: wasm-ld emits passive data segments and an
+   * atomic-guarded `__wasm_init_memory`, so the first instance initialises the
+   * data and later ones leave it alone. A plain memory would wipe the kernel.
+   */
+  async attach(shimWasm, guestWasm, { devices = true } = {}) {
+    const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
+    _at('start');
+    if (this.#preattached) this.#preattached = false;
+    else await this.#instantiate(shimWasm, guestWasm, _at);
+    // The devices this process has -- process-wide flags in shared memory, so
+    // only a *process* sets them. A thread answering for itself would turn a
+    // GPU or network off underneath the threads using it. Before the kernel is
+    // built, which is when the device nodes are made and the vtest socket bound.
+    if (devices) {
+      this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
+      this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+      // The unit cache and ELF export providers, as `load` gives a process its
+      // own: a forked child's table starts empty while its GOT holds what
+      // its parent's providers made code (cgen/elfprov.rs).
+      if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+      this.#libprovConfig();
+    // Narrate one page's directory writes, in every process. See #136.
+    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
+    }
+    const e = this.#shim.exports;
     // A thread joins its process's numbering; a forked child decides once its
     // kernel exists (`adoptProcess`).
     this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
@@ -2296,6 +2335,30 @@ export class Gex {
     // has none and keeps the linked stack.
     if (stackTop) inst.exports.__stack_pointer.value = stackTop | 0;
     this.#kernel = inst.exports;
+    // `?timescale=N&fixedtime=S`: the benchmark clocks (gex-kernel
+    // `set_guest_clock`, as pewasm's PEWASM_TIME_SCALE and FIXED_TIME). The
+    // first process sets them for all.
+    const scale = Number(globalThis.GEX_TIME_SCALE) || 0, fixed = Number(globalThis.GEX_FIXED_TIME) || 0;
+    if ((scale > 0 && scale !== 1) || fixed) {
+      const shift = fixed ? Math.floor(Number(this.#env.now() / 1000000000n)) - fixed : 0;
+      inst.exports.k_guest_clock?.(Math.round((scale || 1) * 1000), shift | 0);
+    }
+    this.#guestClock();
+  }
+
+  /** The benchmark clocks the kernel holds: monotonic speed, wall shift (s). */
+  #guestClock() {
+    if (this.#clockSet) return this.#clockSet;
+    const gc = BigInt.asUintN(64, BigInt(this.#kernel?.k_guest_clock?.(0, 0) ?? 0));
+    this.#clockSet = { scale: Number(gc >> 32n) / 1000 || 1, shift: BigInt(BigInt.asIntN(32, gc & 0xffffffffn)) };
+    return this.#clockSet;
+  }
+  #clockSet = null;
+
+  /** Monotonic ns since boot as the guest reads it. */
+  #guestMono(ns) {
+    const c = this.#guestClock(), m = ns - BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n;
+    return c.scale === 1 ? m : BigInt(Math.floor(Number(m) * c.scale));
   }
 
   /**
@@ -2433,7 +2496,7 @@ export class Gex {
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
     // Some of these return an i64, which JS has to answer with a BigInt.
-    const BIG = new Set(['k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_tty_winsize']);
+    const BIG = new Set(['k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_take_thread_signal', 'k_tty_winsize']);
     const out = { k_present: () => (k ? 1 : 0) };
     for (const n of NAMES) {
       // Some `gex_k` imports are answered here, not by the kernel (`k_present`
@@ -3175,6 +3238,19 @@ export class Gex {
     };
   }
 
+  /** A `CLONE_VM | CLONE_VFORK` clone this Worker copies instead of
+   *  running in place (`gex_vfork_ok` said why not): the child still runs,
+   *  as a forked one, so nothing fails, only a spawn costs a copy of the
+   *  memory. Said once per Worker, so a lost in-place path shows. */
+  #vforkCopiedSaid = false;
+  #vforkCopied(why) {
+    vforkTrace(`[vfork] not here: ${why}`);
+    if (this.#vforkCopiedSaid) return;
+    this.#vforkCopiedSaid = true;
+    const reason = { [-1]: 'a vfork child is already running here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'another thread staged the fork' }[why] ?? `code ${why}`;
+    console.error(`[gex] pid ${this.wlToken()}: a CLONE_VM|CLONE_VFORK child is copied, not run in place (${reason}); said once per Worker`);
+  }
+
   /** How many posix_spawn children ran in this Worker (`#vforkChild`). */
   #vforks = 0;
   get vforks() {
@@ -3511,6 +3587,18 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    // `?straytrap=1`: a guest return to native Wine's pad past open
+    // call-outs traps as "breakpoint" (cgen.rs `STRAY_TRAP`).
+    if (globalThis.GEX_STRAY_TRAP) e.gex_set_stray_trap?.(1);
+    // Images' keys and identities taken from the page, not hashed at each map
+    // (cgen.rs `gex_cgen_identities`).
+    if (Gex.identities && e.gex_cgen_identities) {
+      const b = new TextEncoder().encode(Gex.identities);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_cgen_identities(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (Gex.fjitLibs && e.gex_fjit_libs) {
       const b = new TextEncoder().encode(Gex.fjitLibs);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
@@ -3704,7 +3792,14 @@ export class Gex {
     }
     // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) collects: the
     // native wasm32 modules a session ran.
-    if (wasmdll) console.warn(`[gex-record] module ${this.#cgenStr(e.gex_cgen_pmod_file, prov)} ${pkey.slice(5)}`);
+    if (wasmdll) {
+      const file = this.#cgenStr(e.gex_cgen_pmod_file, prov);
+      console.warn(`[gex-record] module ${file} ${pkey.slice(5)}`);
+      // The same, structured: a native module (a Wine builtin), a process's
+      // program when it is an .exe (fetch-note.mjs).
+      const path = file.replace(/^wasm(dll|prog):/, '');
+      this.#env.noteStatus?.({ kind: 'module', path, program: wasmprog ? undefined : (/\.exe$/i.test(path) ? this.cmdline : undefined) });
+    }
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes, pkey)
       : prov >= 0
@@ -4535,7 +4630,7 @@ export class Gex {
         if (!single.on) {
           const ok = e.gex_vfork_ok?.() ?? 0;
           if (ok > 0) this.#vforkChild();
-          else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+          else if (ok !== -2) this.#vforkCopied(ok);
         }
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
@@ -4789,9 +4884,9 @@ export class Gex {
         const clk = arg(3), buf = nr === 78 ? arg(3) : arg(1);
         if (nr === 78 || clk === 0 || clk === 5 || clk === 8 || [1, 4, 6, 7, 9].includes(clk)) {
           if (!buf) { ret(nr === 78 ? 0 : -14); return; }
-          const ns = this.#env.now();
-          let secs = Number(ns / 1000000000n), nanos = Number(ns % 1000000000n);
-          if (nr !== 78 && [1, 4, 6, 7, 9].includes(clk)) secs -= this.#kernel?.k_boot_secs?.(0) ?? 0;
+          const now = this.#env.now();
+          const ns = nr !== 78 && [1, 4, 6, 7, 9].includes(clk) ? this.#guestMono(now) : now - this.#guestClock().shift * 1000000000n;
+          const secs = Number(ns / 1000000000n), nanos = Number(ns % 1000000000n);
           if (nr === 403) { dv.setBigUint64(buf, BigInt(secs), true); dv.setBigUint64(buf + 8, BigInt(nanos), true); }
           else { dv.setUint32(buf, secs >>> 0, true); dv.setUint32(buf + 4, nr === 78 ? Math.floor(nanos / 1000) : nanos, true); }
           ret(0);
@@ -4941,8 +5036,9 @@ export class Gex {
         // The time, as set_current_time would read it (gettimeofday,
         // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
         // of the door saved.
-        const ns = this.#env.now();
-        r = di.dispatch(pid, tid, ns / 100n + 116444736000000000n, (ns - di.bootNs) / 100n) >>> 0;
+        const ns = this.#env.now(), c = this.#guestClock();
+        const wall = ns - c.shift * 1000000000n, mono = c.scale === 1 ? ns - di.bootNs : this.#guestMono(ns);
+        r = di.dispatch(pid, tid, wall / 100n + 116444736000000000n, mono / 100n) >>> 0;
       }
       if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
@@ -5197,7 +5293,10 @@ export class Gex {
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
     console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
-    if (/\.exe$/i.test(path)) console.warn(`[gex-record] process ${path} :: ${this.cmdline}`);
+    const program = /\.exe$/i.test(path) ? this.cmdline : undefined;
+    if (program !== undefined) console.warn(`[gex-record] process ${path} :: ${program}`);
+    // The same, structured, for the page's start-up status (fetch-note.mjs).
+    this.#env.noteStatus?.({ kind: 'unit', key, path, hit: !!got, program });
     if (!got) {
       if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
       this.#cgenProviders(u);
@@ -5261,6 +5360,7 @@ export class Gex {
       for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
       return;
     }
+    for (const m of ms) this.#env.noteStatus?.({ kind: 'unit', key: m.key, path: m.path, hit: true, program: /\.exe$/i.test(m.path) ? this.cmdline : undefined });
     const us = new Uint32Array(ms.map((m) => m.u));
     const kb = new TextEncoder().encode(grp.key);
     const up = e.gex_alloc(Math.max(8, us.byteLength)) >>> 0;
@@ -5616,7 +5716,7 @@ export class Gex {
               ({ pc, ctx } = at);
               continue;
             }
-          } else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+          } else if (ok !== -2) this.#vforkCopied(ok);
         }
         this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before
@@ -6475,9 +6575,28 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
+          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+          // Native Wine's return pad, reached with nobody's watch or miss
+          // taking it (cgen.rs `native_return_stray`): the guest went on
+          // past this call-out to a native caller's return (an exception
+          // handled in the function that made it, which then returned on
+          // tier-1). It leaves, as every call-out down to that caller does,
+          // with the guest at STRAY_PC: the caller's `run_until` goes there,
+          // and its fallback puts back the registers the guest had at the
+          // pad (the bodies leaving between wrote stale ones) and ends the
+          // call (a body between two call-outs that leaves sends tier-1 to
+          // STRAY_PC inside the outer one, which leaves the same way). A
+          // call-out waiting for the pad itself with the stack where it
+          // wants it is simply done.
+          if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
+            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.unwound;
+            if (mine) e.gex_callout_stray(1);
+            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
+            return mine ? 1 : 0;
+          }
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
-          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
           if (sp > c.spWant + c.unwound) {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);

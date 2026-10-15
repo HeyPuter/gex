@@ -109,6 +109,17 @@ export async function start(opts = {}) {
  *                handle.ready() with `ready: 'manual'`
  * and then 'exited' or 'failed' (with `error`). `at` holds each phase's
  * start, and `elapsed` the time at the call, in ms since start().
+ *
+ * From 'boot' on, what the program has reached (a W3 build's units, as each
+ * process installs them: shims/browser/js/fetch-note.mjs `noteStatus`):
+ *   boot   {units: {done, total}, programs: {done, total}, program, image}:
+ *          the build's units installed so far (distinct images) of all it
+ *          ships, the .exe ones among them (each a process), the latest
+ *          program started and the latest image loaded (file names; a
+ *          native wasm32 module, a Wine builtin, counts there but is no
+ *          unit); a build without units has totals of 0
+ *   log    the latest events, oldest first, at most 50: {t (ms since
+ *          start()), kind ('phase', 'program', 'image', 'fetch'), text}
  */
 function progressMeter(state, onProgress) {
   const t0 = performance.now();
@@ -121,8 +132,14 @@ function progressMeter(state, onProgress) {
     elapsed: 0,
     error: null,
     fetch: null,
+    boot: { units: { done: 0, total: 0 }, programs: { done: 0, total: 0 }, program: null, image: null },
+    log: [],
   };
   state.progress = p;
+  const log = (kind, text) => {
+    p.log.push({ t: Math.round(performance.now() - t0), kind, text });
+    if (p.log.length > 50) p.log.splice(0, p.log.length - 50);
+  };
   let timer = null;
   let last = -1e9;
   const emit = () => {
@@ -132,7 +149,11 @@ function progressMeter(state, onProgress) {
     p.elapsed = Math.round(last - t0);
     if (!onProgress) return;
     try {
-      onProgress({ ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch } });
+      const b = p.boot;
+      onProgress({
+        ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch },
+        boot: { ...b, units: { ...b.units }, programs: { ...b.programs } }, log: p.log.map((l) => ({ ...l })),
+      });
     } catch (e) {
       console.warn(`[app] onProgress: ${e?.stack ?? e}`);
     }
@@ -154,6 +175,53 @@ function progressMeter(state, onProgress) {
       const ch = new BroadcastChannel('gex-fetch');
       const live = new Map(); // id -> { name, key }
       const files = new Map(); // key -> { name, done, total }
+      // The build's units, and which of them a process has installed.
+      const base = (path) => String(path ?? '').split(/[\\/]/).pop();
+      const shipped = new Map(Object.entries(unitNames));
+      const isExe = (name) => /\.exe$/i.test(name);
+      p.boot.units.total = shipped.size;
+      p.boot.programs.total = [...shipped.values()].filter(isExe).length;
+      const seen = new Set();
+      const modules = new Set();
+      // Each thread of a process installs its modules: a program is said once
+      // per command line.
+      const started = new Set();
+      const start = (name, st) => {
+        const k = `${st.path} ${st.program}`;
+        if (started.has(k)) return;
+        started.add(k);
+        p.boot.program = name;
+        log('program', `Started ${name}`);
+      };
+      const status = (st) => {
+        if (st?.kind === 'module') {
+          // A native module (a Wine builtin): a program when it is an .exe,
+          // else an image, said once; not one of the build's units.
+          const name = base(st.path);
+          if (st.program !== undefined) start(name, st);
+          else if (!modules.has(st.path)) {
+            p.boot.image = name;
+            log('image', `Loaded ${name}`);
+          }
+          modules.add(st.path);
+          this.tick();
+          return;
+        }
+        if (st?.kind !== 'unit') return;
+        const name = base(st.path);
+        const first = !seen.has(st.key);
+        seen.add(st.key);
+        if (first && shipped.has(st.key)) {
+          p.boot.units.done++;
+          if (isExe(name)) p.boot.programs.done++;
+        }
+        if (st.program !== undefined) start(name, st);
+        else if (first) {
+          p.boot.image = name;
+          log('image', st.hit ? `Loaded ${name}` : `Loaded ${name} (no unit: translated as it runs)`);
+        }
+        this.tick();
+      };
       const show = () => {
         let last = null;
         for (const f of live.values()) last = f;
@@ -163,6 +231,7 @@ function progressMeter(state, onProgress) {
         emit();
       };
       ch.onmessage = ({ data: m }) => {
+        if (m?.status) { status(m.status); return; }
         if (!m || typeof m.what !== 'string') return;
         // A unit's indirect-call side file: a probe the runtime makes, not
         // code the program waits for.
@@ -182,6 +251,7 @@ function progressMeter(state, onProgress) {
           total = l?.size ?? 0;
         }
         const f = files.get(key) ?? { kind, name, done: 0, total };
+        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching code for ${name || 'the program'}` : `Fetching ${name}`);
         files.set(key, f);
         if (m.phase === 'start') {
           live.set(m.id, { key });
@@ -204,8 +274,13 @@ function progressMeter(state, onProgress) {
     /** On to `name`, if it is further along than where it is. */
     phase(name) {
       if (!order.includes(name) || order.indexOf(name) <= order.indexOf(p.phase)) return;
+      const from = p.phase;
       p.phase = name;
       p.at[name] = Math.round(performance.now() - t0);
+      const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
+      if (from === 'download') log('phase', `Downloaded ${(p.download.done / 1e6).toFixed(1)} MB in ${secs(p.at[name])}`);
+      if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
+      if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
       emit();
     },
     /** The run is over: 'exited' or 'failed'. */
@@ -312,6 +387,12 @@ async function begin(opts, base, at, state, meter) {
   mark('fetching');
   const zstd = zstdLoader(at(b.zstd ?? 'vendor/zstddec-stream.mjs'));
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
+  // The lazy files' list, beside the bundle rather than after it.
+  const lazyList = b.lazy ? fetchJson(at(b.lazy), 'the lazy files\' list') : null;
+  lazyList?.catch(() => {});
+  // The background fill's list (eject-site.mjs --late): lazy files the page
+  // downloads once the boot's files are in, while the guest runs.
+  const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
   const fetcher = { pack, zstd, base, state, meter };
   // What is to come, for the progress: the bundle's files and the units'.
   // The two small lists are read before the bundle starts, so the totals
@@ -377,7 +458,7 @@ async function begin(opts, base, at, state, meter) {
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
   if (b.lazy) {
-    const m = await fetchJson(at(b.lazy), 'the lazy files\' list');
+    const m = await lazyList;
     // A path on this origin, not a URL: the kernel keeps a lazy file's
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
@@ -413,6 +494,50 @@ async function begin(opts, base, at, state, meter) {
   const preModules = await preloading;
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
+  // The fill: its buffer and counter made now, every Worker given them; its
+  // download started now, after the boot's, so it does not share their link.
+  let fill = null;
+  const fl = fillList ? await fillList : null;
+  if (fl && typeof SharedArrayBuffer === 'function') {
+    const buf = new SharedArrayBuffer(fl.size);
+    const counter = new Int32Array(new SharedArrayBuffer(4));
+    fill = { buf, at: counter, files: fl.files };
+    const t0 = performance.now();
+    // The late units (eject-site.mjs --late: `unit:KEY/FILE` entries), each
+    // compiled once its bytes are in and added to the modules every Worker
+    // started from then on is given (`preModules`, in the host's `extra`); a
+    // Worker started before takes the bytes from the fill itself
+    // (worker.mjs `loadFile`).
+    const late = fl.files.filter(([p]) => p.startsWith('unit:'));
+    let li = 0, lateN = 0;
+    const add = (entry) => {
+      if (!preModules) return;
+      // Before `closed`, which a Worker reads as the end of the list.
+      const c = preModules.findIndex(([k]) => k === 'closed');
+      preModules.splice(c < 0 ? preModules.length : c, 0, entry);
+      if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+    };
+    const takeLate = (n) => {
+      for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
+        const [name, off, size] = late[li];
+        const rel = name.slice('unit:'.length);
+        const bytes = new Uint8Array(buf, off, size).slice();
+        if (rel.endsWith('/c.wasm')) {
+          WebAssembly.compile(bytes).then((m) => add([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m]),
+            (e) => say(`[app] late unit ${rel}: ${e}\n`));
+        } else {
+          const s = new Uint8Array(new SharedArrayBuffer(size));
+          s.set(bytes);
+          add([`file:${rel}`, s]);
+        }
+      }
+    };
+    fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
+      into: buf,
+      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); takeLate(n); },
+    }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
+      .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
+  }
   state.phase = 'running';
   mark('running');
   if (keep) {
@@ -460,6 +585,8 @@ async function begin(opts, base, at, state, meter) {
     onSystem: (s) => { sys = s; },
     hostX: !!b.hostx && opts.hostx !== false,
     preModules,
+    fill,
+    identities: b.identities ?? null,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
@@ -573,6 +700,10 @@ function launchBuild(m, at) {
     const p = { ...(m.params ?? {}) };
     const lazy = p.lazy ?? null;
     delete p.lazy;
+    const fill = p.fill ?? null;
+    delete p.fill;
+    const identities = p.identities ?? null;
+    delete p.identities;
     return {
       tar: ['project/build/web/rootfs.tar'],
       exe: m.exe,
@@ -587,6 +718,8 @@ function launchBuild(m, at) {
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
+      fill,
+      identities,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
@@ -629,7 +762,12 @@ export function setGlobals(get, b = {}) {
   if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
+  // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
+  if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
+  // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
+  if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));
+  if (get('fixedtime')) globalThis.GEX_FIXED_TIME = Number(get('fixedtime'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a W3 program's start-up;
   // nt-page.js said why).
@@ -722,34 +860,39 @@ async function fetchShared(url, f, { shared = false } = {}) {
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f) {
+async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
   const res = await fetch(u.href);
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
-  const parts = [];
-  let at = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    at += value.length;
-    f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
-    f.meter?.bytes(value.length);
-  }
-  f.meter?.fileDone();
-  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
+  // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
-  const out = new Uint8Array(shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size));
+  const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
-  // Synchronous to the end: one decoder serves every fetch in flight.
-  for (const part of d.decodeStreaming(parts)) {
+  const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
     out.set(part, n);
     n += part.length;
+  };
+  const z = d.stream();
+  let at = 0;
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      z.push(value, emit);
+      progress?.(n);
+      at += value.length;
+      f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
+      f.meter?.bytes(value.length);
+    }
+  } finally {
+    z.end();
   }
+  f.meter?.fileDone();
+  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
   if (n !== size) throw new Error(`${url}: decoded ${n} of ${size} bytes`);
   return out;
 }

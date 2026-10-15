@@ -244,14 +244,20 @@ impl Image {
     /// Whether this is a native wasm32 program's container: an i386 image
     /// with [`WASM32_MAGIC`] 0x40 bytes below the entry.
     pub fn is_wasm32(&self) -> bool {
+        self.class32 && self.is_wasm_program()
+    }
+
+    /// Whether this is a native wasm program's container of either class:
+    /// [`WASM32_MAGIC`] 0x40 bytes below the entry (an ELF64 one holds an
+    /// LP64 program, W64's, lowered to wasm32 or not).
+    pub fn is_wasm_program(&self) -> bool {
         let at = self.entry.wrapping_sub(0x40);
-        self.class32
-            && self.segments.iter().any(|s| {
-                at >= s.vaddr && at + 8 <= s.vaddr + s.bytes.len() as u64 && {
-                    let o = (at - s.vaddr) as usize;
-                    &s.bytes[o..o + 8] == WASM32_MAGIC
-                }
-            })
+        self.segments.iter().any(|s| {
+            at >= s.vaddr && at + 8 <= s.vaddr + s.bytes.len() as u64 && {
+                let o = (at - s.vaddr) as usize;
+                &s.bytes[o..o + 8] == WASM32_MAGIC
+            }
+        })
     }
 
     /// The defined, non-TLS dynamic symbols in `[lo, hi)` (unbiased) by every

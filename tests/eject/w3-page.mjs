@@ -12,6 +12,8 @@
 //      "gl": gex/gex-wgpu-replay.*);
 //   2. served (cross-origin isolated) and opened at its launcher, a toplevel
 //      titled RE (default "Untitled - Paint") appears;
+//   2b. start()'s progress says which programs and images the start-up
+//      reached (`boot`, `log`: the runtime's structured notes);
 //   3. with "compositor" off, what draws it is the page's bare desktop
 //      (`describe().compositor === 'none'`), and the window has pixels;
 //   4. no service worker: the site ships no sw.js, none is registered, and
@@ -28,7 +30,9 @@
 //      one inside shrinks it (Win32's own SC_MOVE/SC_SIZE loops, the pointer
 //      held by the canvas), and a click on Paint leaves its owned dialog
 //      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
-//      raises a placed window.
+//      raises a placed window. A right click on the caption opens Wine's
+//      window menu (the guest has the right button) and the browser's
+//      context menu is cancelled.
 //   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
 //      the site's page instead, a hand-written one with its own container,
 //      size, arguments and onExit. The desktop is its box's size, inside the
@@ -68,6 +72,26 @@ const gexDir = existsSync(join(site, 'gex')) ? readdirSync(join(site, 'gex')) : 
 if (off.includes('compositor')) {
   const left = assets.filter((n) => /^(compositor|compositor-worker|gpu-device)-/.test(n));
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
+}
+// Every unit a Worker can see published is one every Worker of the process
+// can load: in the boot archive all Workers get at start (preload.json
+// `tar:N`) or in the background fill (`unit:KEY/c.wasm`, eject-site.mjs
+// --late), which every Worker also holds from its start; never in a list
+// only Workers started later are given (PF's E7b: units-late.tar, and a
+// Worker of winlogon trapped "published but cannot be loaded here").
+{
+  const preP = join(site, 'project/build/web/units/preload.json');
+  const pre = existsSync(preP) ? JSON.parse(readFileSync(preP, 'utf8')) : [];
+  const fillP = join(site, 'project/build/web/fill.json');
+  const fill = existsSync(fillP) ? JSON.parse(readFileSync(fillP, 'utf8')) : { files: [] };
+  const lateOnly = pre.filter(([k]) => /^late-/.test(k)).map(([k]) => k);
+  const boot = pre.filter(([k]) => /^tar:/.test(k)).reduce((a, [k]) => a + Number(k.slice(4)), 0);
+  const inFill = new Set(fill.files.filter(([n]) => /^unit:.*\/c\.wasm$/.test(n)).map(([n]) => n.slice(5, -7)));
+  const units = nt.units ?? [];
+  if (pre.some(([k]) => /^tar:/.test(k))) {
+    check(lateOnly.length === 0 && boot + inFill.size === units.length,
+      `every unit loadable by every Worker: ${boot} in the boot archive + ${inFill.size} in the fill = ${units.length} units${lateOnly.length ? `; given only to later Workers: ${lateOnly.join(', ')}` : ''}`);
+  }
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
 // The app library, and no test page: nt.html is gex's, never an ejected build's.
@@ -205,6 +229,16 @@ if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleR
   check(hit > 0 && hit >= 2 * miss, `the units are the runtime's: ${hit} image(s) hit a unit, ${miss} missed`);
 }
 
+// 2b. The start-up's status, structured (app.js progress `boot` and `log`,
+// from the runtime's own notes, not its console): at the window, processes
+// have installed the build's units, an .exe among them, and the log says so.
+{
+  const pr = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.progress ?? null)')) ?? 'null');
+  const b = pr?.boot;
+  const started = (pr?.log ?? []).filter((l) => l.kind === 'program').map((l) => l.text);
+  check(b && b.units.total > 0 && b.units.done > 0 && b.programs.done > 0 && started.length > 0,
+    `the start-up's status: ${b?.units.done ?? 0} of ${b?.units.total ?? 0} images and ${b?.programs.done ?? 0} of ${b?.programs.total ?? 0} programs reached, the latest ${b?.program ?? 'none'} (log: ${started.slice(-4).join('; ') || 'nothing started'})`);
+}
 // 3. Drawn by the page itself when the compositor is out.
 if (off.includes('compositor')) {
   check(d.compositor === 'none', `drawn without the scene compositor (describe().compositor ${d.compositor})`);
@@ -388,6 +422,24 @@ if (placedChecks) {
       await key('Enter', 'Enter', 13);
       await until(wins, (l) => l.length === 1);
     }
+    // The right button is the guest's: a right click on the caption opens
+    // Wine's window menu (WM_CONTEXTMENU on the caption, so the client saw
+    // BTN_RIGHT go down and up), and the browser's own context menu is
+    // cancelled (it opens on the press on Linux and took the release).
+    await ev(`(() => { globalThis.__ctxMenus = []; addEventListener('contextmenu', (e) => globalThis.__ctxMenus.push(e.defaultPrevented)); return 1; })()`);
+    m = await main();
+    const rx = m.x + Math.round(m.w / 2), ry = m.y + 10;
+    const right = (type, held) => browser.send('Input.dispatchMouseEvent',
+      { type, x: rx, y: ry, button: 'right', buttons: held ? 2 : 0, clickCount: 1 }, page);
+    await mouse('mouseMoved', rx, ry, false); await sleep(150);
+    await right('mousePressed', true); await sleep(100);
+    await right('mouseReleased', false);
+    ws = await until(wins, (l) => l.length >= 2);
+    const menus = (await ev('JSON.stringify(globalThis.__ctxMenus)')) ?? '[]';
+    check(JSON.parse(menus).length >= 1 && JSON.parse(menus).every(Boolean), `the browser's context menu is cancelled over the desktop (contextmenu events, defaultPrevented: ${menus})`);
+    check(ws.length >= 2, `a right click on the caption opens the window menu: the guest has the right button (${ws.length} placed window(s))`);
+    await key('Escape', 'Escape', 27);
+    await until(wins, (l) => l.length === 1);
   }
 }
 done();

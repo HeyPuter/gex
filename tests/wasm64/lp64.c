@@ -50,6 +50,10 @@ int main(void)
 	int n = poll(&pf, 1, 1000);
 	printf("poll %d revents %d\n", n, pf.revents & POLLIN);
 	printf("read %zd %s\n", read(p[0], buf, sizeof buf - 1), buf);
+	/* stat's owner is the process's own ids (x86-64's stat and fstat, not
+	 * statx): Wine refuses a prefix it does not own */
+	struct stat ps;
+	printf("pipe owned by getuid %d\n", fstat(p[0], &ps) == 0 && ps.st_uid == getuid() && ps.st_gid == getgid());
 	long big = 1L << 40;
 	printf("long arithmetic %ld\n", big / 3);
 	return 0;

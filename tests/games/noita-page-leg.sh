@@ -26,27 +26,22 @@
 #           port/seedpin's mod_config.xml in its save, xkb data, and the game at
 #           /g with mods/seedpin (NOITA_WORLD_SEED 1767225600), made by
 #           `noita-page-leg.sh --make-tar` from ~/gex-sandbox/Noita;
-#   units/  the function-tier units of every image of the run.
-# UNITS MUST BE REBUILT WHENEVER crates/gex-cgen CHANGES (the keys include
-# its sources): `GEX_CGEN_CACHE=units gexc cgen-image IMAGE --pe-base BASE`
-# with TREE's x86 gexc for each "unitless:" line of a run (page paths: /w3 is
-# the W3 dist, /g the game). A stale cache shows up as "unitless" lines.
-# The provider modules go in too, with the same gexc and GEX_CGEN_CACHE:
-# `gexc cgen-image --providers` (units/providers; no image's unit carries
-# them). The page names a missing one as "missing unit:", and the leg fails on
-# it at once, as on any image with code that has no unit at the base it landed
-# at (NOITA_UNITLESS_OK: a regex of images without code, default tzres and
-# normaliz). (So does the NT shim's trampoline unit, `--nt-trampolines32`,
-# which W3 runs do not place.)
-# The units are built with gex's own indirect-call profile of Noita,
-# tests/games/noita-icall (a counting run's, at the bases it ran at): after
-# a first build, `tests/games/noita-icall/place.py units LIST BUILDLOG`
-# (LIST the images and bases built, BUILDLOG that build's log, which names
-# each one's identity) moves it to these bases as units/icall/, and a second
-# build devirtualises the hot table calls. A new profile: build the units
-# with GEX_CGEN_ICALL_COUNT=1, run with NOITA_Q='&cgen=1&icallcount=1' and
-# NOITA_KEEP=icall, and split the run's dumps (tmp/noita-err.txt on the
-# bench box) with tests/games/noita-icall/split.py.
+#   units.list, images/, icall/: the images of the run with the bases they
+#           land at, and gex's own indirect-call profile of Noita at those
+#           bases (tests/games/noita-icall: after a first build,
+#           `tests/games/noita-icall/place.py`, which moves a counting run's
+#           profile to these bases; a new profile: build with
+#           GEX_CGEN_ICALL_COUNT=1, run with NOITA_Q='&cgen=1&icallcount=1' and
+#           NOITA_KEEP=icall, split the dumps with noita-icall/split.py).
+# The units themselves are built by tools/units-for.sh with TREE's x86 gexc,
+# into ukeys/ID for the gexc's unit-key inputs (`gexc cgen-image --inputs`):
+# when a gex change moves the keys (gex-cgen's or gex-ld's sources), the leg
+# builds the new set first (about an hour on gooner, noita.exe most of it; a
+# gate can start it right after its gexc build), logged in ukeys/ID.log and
+# said in the leg's output), and later runs reuse it. The page names an image
+# with code but no unit ("unitless:", "missing unit:"), and the leg fails on
+# it at once (NOITA_UNITLESS_OK: a regex of images without code, default
+# tzres and normaliz): an image missing from units.list, or a base moved.
 #
 # One bench.sh call per run, timed class (BENCH_TIMEOUT 20m). Takes about
 # 9 min to build on gooner, then the run.
@@ -110,6 +105,13 @@ if [ "${2:-}" != "--no-build" ]; then
     fi
   done
 fi
+# The units for TREE's gexc (tools/units-for.sh): built here when its
+# unit-key inputs have none yet. NOITA_GEXC: another x86 gexc of TREE's
+# sources (the gate's build).
+G=${NOITA_GEXC:-$W/target/x86/release/gexc}
+U=$(bash $W/tools/units-for.sh $A $G 2> $A/units-for.txt); urc=$?
+cat $A/units-for.txt
+[ $urc = 0 ] || { echo "FAIL noita page: no units for $G ($(tail -1 $A/units-for.txt))"; exit 1; }
 [ -f $A/base/web/public/gex/nt/noita.tar ] || { echo "FAIL noita page: no $A/base/web/public/gex/nt/noita.tar (--make-tar)"; exit 1; }
 # The run tree, at one path so the bench box's copy updates by difference.
 T=$A/tree; rm -rf $T; cp -al $A/base $T
@@ -138,12 +140,12 @@ shots="env NOITA_WORLD_BY_MIN=${NOITA_WORLD_BY_MIN:-12}"
 # NOITA_KEEP='web entry' records the profile's function starts, noita-icall/entries.py).
 [ -n "${NOITA_ENV:-}" ] && shots="$shots NOITA_ENV=$NOITA_ENV"
 [ -n "${NOITA_UNITLESS_OK:-}" ] && shots="$shots NOITA_UNITLESS_OK=$NOITA_UNITLESS_OK"
-BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} $B -s $T -s $A/units -- $shots bash $R/tree/tests/games/noita-page-leg.sh --remote $R/tree Noita/noita.exe $R/units ${LEG_SECS:-300} > $A/last.txt 2>&1
+BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} $B -s $T -s $U -- $shots bash $R/tree/tests/games/noita-page-leg.sh --remote $R/tree Noita/noita.exe ${U#$HOME/gex-sandbox/} ${LEG_SECS:-300} > $A/last.txt 2>&1
 [ -n "${NOITA_SHOTS:-}" ] && { rm -rf $A/shots; rsync -a $RH:$RR/$R/shots/ $A/shots/; ssh $RH "rm -rf $RR/$R/shots"; }
 # The page's stderr (Wine's and the console's kept lines), back into $A/noita-err.txt.
 rsync -a $RH:$RR/$R/tmp/noita-err.txt $A/noita-err.txt 2>/dev/null || rm -f $A/noita-err.txt
 res=$(grep -m1 '^== noita' $A/last.txt)
-if grep -q '^unitless: .*/noita\.exe ' $A/last.txt; then echo "FAIL noita page: noita.exe has no function-tier unit (rebuild $A/units for this gex-cgen); ${res:-no result}"; exit 1; fi
+if grep -q '^unitless: .*/noita\.exe ' $A/last.txt; then echo "FAIL noita page: noita.exe has no function-tier unit (not in $A/units.list?); ${res:-no result}"; exit 1; fi
 wfps=$(echo "$res" | sed -n 's/.*, world \([0-9.]*\) frames\/s.*/\1/p')
 if [ -z "$wfps" ]; then echo "FAIL noita page: ${res:-no result}; log $A/last.txt"; exit 1; fi
 if ! awk -v a="$wfps" -v b="$MIN" 'BEGIN { exit !(a + 0 >= b + 0) }'; then echo "FAIL noita page: world $wfps frames/s, want >= $MIN; ${res#== noita: }"; exit 1; fi

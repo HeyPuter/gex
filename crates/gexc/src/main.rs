@@ -171,6 +171,9 @@ usage:
                                    needs it built ahead (GEX_CGEN_GUARD=1)
   gexc cgen-image --providers      every export provider's module, into
                                    GEX_CGEN_CACHE (the browser cannot build them)
+  gexc cgen-image --inputs         a hash of everything a unit key takes besides
+                                   its image: a cache of units built by a gexc
+                                   that printed another one has no hits here
   gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
@@ -749,7 +752,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
     }
-    let wide = !program.compat();
+    // A native wasm program's container is not a 64-bit guest whose memory
+    // gex chooses: W64's LP64 program is lowered to wasm32 (its x86-64 code
+    // keeps below its code space), and its memory64 flavour is the module's
+    // own (docs/wine-native-x64.md §0.1).
+    let wide = !program.compat() && !program.exe.is_wasm_program();
     choose_mem(&mut ra, &bytes, wide)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
@@ -2512,6 +2519,12 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
+            // Print what every unit key takes besides its image
+            // (`image::inputs_id`): a changed id means every unit is rebuilt.
+            "--inputs" => {
+                println!("{}", gex_cgen::image::inputs_id());
+                return Ok(());
+            }
             other => path = Some(other.to_string()),
         }
         i += 1;

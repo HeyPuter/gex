@@ -71,7 +71,7 @@ pub mod ppc;
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
 pub use syscalls::{
-    clock_ns, share_monotonic_base, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
+    clock_ns, set_guest_clock, share_monotonic_base, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
     SyscallOutcome, ThreadState,
 };
 pub use proclive::{KernelProcSource, ProcCell};
