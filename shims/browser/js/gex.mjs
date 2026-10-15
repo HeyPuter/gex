@@ -760,7 +760,7 @@ class ProviderThrow extends Error {
  *  (GEX_VFORK_TRACE, `?vforktrace=1`): to the console, or appended to the
  *  file it names under Node (a Worker's console output is lost when the run
  *  ends first). */
-function vforkTrace(line) {
+export function vforkTrace(line) {
   const to = globalThis.GEX_VFORK_TRACE || globalThis.process?.env?.GEX_VFORK_TRACE;
   if (!to) return;
   if (typeof to === 'string' && to.includes('/') && globalThis.process?.getBuiltinModule) {

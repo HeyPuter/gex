@@ -30,12 +30,18 @@ async function channel() {
     };
   }
   const { parentPort } = await import('node:worker_threads');
+  let handler = null;
   return {
     post: (m, transfer) =>
       transfer && transfer.length
         ? parentPort.postMessage(m, transfer)
         : parentPort.postMessage(m),
-    on: (f) => parentPort.on('message', f),
+    // One listener, whose handler a given-back Worker's next process
+    // replaces, as `onmessage` is replaced in a browser.
+    on: (f) => {
+      if (!handler) parentPort.on('message', (m) => handler(m));
+      handler = f;
+    },
   };
 }
 
@@ -68,7 +74,7 @@ function forkTransfer(child) {
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { setFill, fillFile } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
-import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
+import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
@@ -91,10 +97,62 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
   console.debug = sync;
 }
 
+// What a process leaves in this realm besides `workerMain`'s state, which the
+// next process on this Worker must not see (`reset`): its timers, and the
+// globals its start message set. Not in the single-thread build, whose
+// Workers are fibers of one realm and are never given back.
+const timers = new Set();
+const realmGlobals = new Set(Object.getOwnPropertyNames(globalThis));
+if (!single.on) {
+  for (const [make, clear, once] of [['setTimeout', 'clearTimeout', true], ['setInterval', 'clearInterval', false]]) {
+    const mk = globalThis[make];
+    const cl = globalThis[clear];
+    if (typeof mk !== 'function' || typeof cl !== 'function') continue;
+    globalThis[make] = function (f, ...rest) {
+      let id;
+      const g = once && typeof f === 'function' ? function (...a) { timers.delete(id); return f.apply(this, a); } : f;
+      id = mk.call(globalThis, g, ...rest);
+      timers.add(id);
+      return id;
+    };
+    globalThis[clear] = function (id) {
+      timers.delete(id);
+      return cl.call(globalThis, id);
+    };
+  }
+}
+/** This realm as a new Worker has it, before the next process: every timer
+ *  the last one left stopped, every global it set gone. The console's
+ *  marking (`__gexMarkedConsole`) stays, since `console.error` keeps it. */
+function resetRealm() {
+  for (const id of timers) {
+    clearTimeout(id);
+    clearInterval(id);
+  }
+  timers.clear();
+  for (const k of Object.getOwnPropertyNames(globalThis)) {
+    if (realmGlobals.has(k) || k === '__gexMarkedConsole') continue;
+    try { delete globalThis[k]; } catch {}
+  }
+}
+
 // Everything below is one Worker's: its port, its process, its state. A
 // function rather than module scope so the single-thread build (single.mjs)
 // can run many of these in one realm, one per fiber; a real Worker runs one.
-async function workerMain(port) {
+//
+// And so a Worker can be given back (`reset`, host.mjs `#giveBack`): a
+// process that exited cleanly leaves this function's state behind, and the
+// next process starts on a new call of it, in a realm whose JS is compiled
+// and warm. `carry` is what outlives a process: the page's modules, given
+// while it waited in the pool. Messages the old call still posts are dropped.
+async function workerMain(rawPort, carry = null) {
+const life = { on: true };
+const port = {
+  post: (m, transfer) => {
+    if (life.on) rawPort.post(m, transfer);
+  },
+  on: rawPort.on,
+};
 
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
@@ -103,7 +161,9 @@ let workerGex = null;
 /// The page's modules, given while this Worker waited in the host's pool
 /// (`pooledModules`): its runtime starts with them, and the start message
 /// carries only those it lacks.
-const pooled = new Map();
+const pooled = carry?.pooled ?? new Map();
+/// Which process this is of the ones this Worker has run, from 1.
+const runs = (carry?.runs ?? 0) + 1;
 /// The bridges every process of a page sets up (GL, Wayland, network), as
 /// modules once loaded. Imported while this Worker waits in the host's pool
 /// (the end of this function), and used from here without an `await import`
@@ -143,6 +203,17 @@ let winsize = () => {};
 // rejected promise nobody holds, and a Worker that rejects on the way in looks
 // exactly like one that is busy.
 port.on((msg) => {
+  // Given back to the pool: this process's state stays here, unreachable,
+  // and the next one starts on a new call (see `workerMain`).
+  if (msg?.kind === 'reset') {
+    life.on = false;
+    resetRealm();
+    workerMain(rawPort, { pooled, runs }).catch((e) => {
+      console.error('gex: a given-back worker could not start again:', e?.stack ?? e);
+      rawPort.post({ kind: 'threw', message: String(e?.message ?? e) });
+    });
+    return;
+  }
   handle(msg).catch((e) => {
     const what = e?.stack ?? e?.message ?? String(e);
     if (typeof console !== 'undefined') console.error('gex: worker failed:', what);
@@ -812,6 +883,11 @@ async function handle(msg) {
     }
     gex.useNetwork(net);
   }
+  // A Worker given back after an earlier process (tests/browser-reuse.sh
+  // counts these).
+  if (runs > 1 && msg.kind !== 'thread') {
+    vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: given-back worker, its process ${runs}`);
+  }
   try {
     let entry;
     // A process enters on its first thread (where `run` starts); a thread has
@@ -1133,6 +1209,16 @@ async function handle(msg) {
     if (recyclable && !thread && !msg.child?.exec) {
       exitMsg.recycle = gex.recycleMemory?.() ?? undefined;
     }
+    // Whether this Worker can go back to the pool for another process
+    // (host.mjs `#giveBack`): only a process that exited by `exit` (a status
+    // under 128; a signal death is 128 and up), in this Worker alone (no
+    // thread, nothing else holding its memory), on no connection of this
+    // realm's own (Node's sockets, a Wisp WebSocket). The single-thread
+    // build's fibers are never given back.
+    exitMsg.workerRuns = runs;
+    exitMsg.giveBack = !single.on && !thread && !carries && !gone && recyclable
+      && (msg.kind === 'adopt' || msg.kind === 'run')
+      && status >= 0 && status < 128 && !msg.network && !msg.wispUrl;
     port.post(exitMsg);
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the
@@ -1227,7 +1313,7 @@ port.post({ kind: 'ready' });
 if (typeof self !== 'undefined') {
   for (const k of Object.keys(bridgeImports)) bridge(k).catch(() => {});
 }
-if (handed) handle(handed);
+if (handed && !carry) handle(handed);
 }
 
 // A real Worker runs itself; the single-thread build registers the function
