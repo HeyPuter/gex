@@ -52,6 +52,10 @@ pub(crate) struct Home {
     tmpfiles: Arc<std::sync::atomic::AtomicU64>,
     /// The process's first fs_struct (its directory and umask).
     proc_fs: Arc<gex_kernel::syscalls::FsCwd>,
+    /// The global kernel's pipes, for `pipe2`, and the resource limits,
+    /// for `prlimit64` (L17).
+    pipes: Option<gex_kernel::pipe::Remote>,
+    rlimits: Arc<gex_kernel::syscalls::Rlimits>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -93,6 +97,8 @@ fn home_of(k: &Kernel) -> Home {
         ptys: k.ptys,
         tmpfiles: Arc::clone(&k.tmpfiles),
         proc_fs: Arc::clone(&k.proc_fs),
+        pipes: k.pipes,
+        rlimits: Arc::clone(&k.rlimits),
     }
 }
 
@@ -320,7 +326,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     let fs = home.thread_fs.of(ctx_addr).unwrap_or_else(|| Arc::clone(&home.proc_fs));
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks, pipes: home.pipes },
         map: map(),
         path: PathIo {
             ns: &ns,
@@ -344,6 +350,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         wasm32: crate::WASM32.load(Ordering::Acquire),
         futex,
         started: crate::clock_started(),
+        rlimits: &home.rlimits,
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
 }

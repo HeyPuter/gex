@@ -683,9 +683,10 @@ pub struct Kernel {
     pub call_fs: Option<Arc<FsCwd>>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub tmpfiles: Arc<std::sync::atomic::AtomicU64>,
-    /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource.
-    /// RLIMIT_NOFILE's soft limit is the descriptor table's (`FdTable`).
-    pub rlimits: [[u64; 2]; RLIM_NLIMITS],
+    /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource,
+    /// behind their own lock ([`Rlimits`]). RLIMIT_NOFILE's soft limit is
+    /// the descriptor table's (`FdTable`).
+    pub rlimits: Arc<Rlimits>,
     /// The terminal: flags, size, foreground process group, and the line
     /// discipline behind them. See [`crate::tty`].
     ///
@@ -712,6 +713,33 @@ pub const RLIMIT_MEMLOCK: usize = 8;
 pub const RLIMIT_SIGPENDING: usize = 11;
 pub const RLIMIT_MSGQUEUE: usize = 12;
 pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// A process's resource limits, behind their own lock: `prlimit64` sets
+/// them without the kernel lock (docs/kernel-locking.md, L17).
+pub struct Rlimits(std::sync::Mutex<[[u64; 2]; RLIM_NLIMITS]>);
+
+impl Default for Rlimits {
+    fn default() -> Rlimits {
+        Rlimits(std::sync::Mutex::new(default_rlimits()))
+    }
+}
+
+impl Rlimits {
+    /// Soft and hard, per resource, now.
+    pub fn get(&self) -> [[u64; 2]; RLIM_NLIMITS] {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace them all (a process built from another's state).
+    pub fn set(&self, l: [[u64; 2]; RLIM_NLIMITS]) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = l;
+    }
+
+    /// A copy of its own, for a fork's child.
+    pub fn copy(&self) -> Rlimits {
+        Rlimits(std::sync::Mutex::new(self.get()))
+    }
+}
 
 pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
     let mut l = [[RLIM_INFINITY; 2]; RLIM_NLIMITS];
@@ -985,9 +1013,132 @@ pub struct FdIo<'a> {
     /// `flock`'s locks (`Kernel::file_locks`, shared with the process's
     /// forks), released when a description goes.
     pub file_locks: &'a Arc<unix::FileLocks>,
+    /// The global kernel's pipes, when there is one (`Kernel::pipes`).
+    pub pipes: Option<crate::pipe::Remote>,
 }
 
 impl FdIo<'_> {
+    /// `pipe2`.
+    pub fn pipe2(&self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
+        // A pipe in the global kernel when there is one, because the whole
+        // point of a pipe is that another process holds the other end -- and
+        // with a Worker per process that other end is in another memory,
+        // where an `Arc<Pipe>` means nothing.
+        if let Some(r) = self.pipes {
+            return self.shared_pipe2(m, r, fds, flags);
+        }
+        let pipe = Arc::new(Pipe::new());
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let read_end = OpenFile::new(
+            Arc::new(PipeEnd {
+                pipe: Arc::clone(&pipe),
+                write: false,
+            }),
+            "pipe:[0]".to_string(),
+            // The access mode belongs in the flags, not only in the two
+            // booleans: `fcntl(F_GETFL)` reports it, and glibc's `fdopen`
+            // refuses a descriptor whose mode does not match the one asked
+            // for. A write end reporting `O_RDONLY` is why apt could not
+            // open its dpkg pipe.
+            flags | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        let write_end = OpenFile::new(
+            Arc::new(PipeEnd {
+                pipe: Arc::clone(&pipe),
+                write: true,
+            }),
+            "pipe:[0]".to_string(),
+            flags | oflags::O_WRONLY,
+            false,
+            true,
+        );
+        // Both ends start with one reference each, which `Pipe::new` already
+        // accounted for.
+        let rfd = self.fds.insert(read_end, cloexec)?;
+        let wfd = self.fds.insert(write_end, cloexec)?;
+        m.write_u32(fds, rfd as u32)?;
+        m.write_u32(fds + 4, wfd as u32)?;
+        Ok(0)
+    }
+
+    /// `pipe2` with the buffer in the global kernel.
+    ///
+    /// The two descriptions are the same shape as the local ones -- the same
+    /// flags, the same access modes -- and differ only in what the handle is.
+    /// The path carries the id and the end, because that is what a `fork` has
+    /// to send across to rebuild the descriptor in the child: see
+    /// `gex_fork_fds` in the browser shim.
+    fn shared_pipe2(
+        &self,
+        m: &mut GuestMem<'_>,
+        r: crate::pipe::Remote,
+        fds: u64,
+        flags: u64,
+    ) -> SysResult {
+        let id = (r.new)(self.pid);
+        if id < 0 {
+            return Err(Errno::ENFILE);
+        }
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let read_end = OpenFile::new(
+            Arc::new(crate::pipe::RemotePipeEnd {
+                id,
+                write: false,
+                remote: r,
+            }),
+            format!("pipe:[{id}]"),
+            flags | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        let write_end = OpenFile::new(
+            Arc::new(crate::pipe::RemotePipeEnd {
+                id,
+                write: true,
+                remote: r,
+            }),
+            format!("pipe:[{id}]"),
+            flags | oflags::O_WRONLY,
+            false,
+            true,
+        );
+        let rfd = self.fds.insert(read_end, cloexec)?;
+        let wfd = self.fds.insert(write_end, cloexec)?;
+        m.write_u32(fds, rfd as u32)?;
+        m.write_u32(fds + 4, wfd as u32)?;
+        Ok(0)
+    }
+
+    /// `ftruncate`.
+    pub fn ftruncate(&self, fd: i32, len: u64) -> SysResult {
+        self.fds.get(fd).and_then(|f| f.handle.truncate(len).map(|_| 0))
+    }
+
+    /// `epoll_ctl`. A `struct epoll_event` on aarch64 is a 32-bit event mask,
+    /// four bytes of padding, and the caller's 64-bit token -- unlike x86-64,
+    /// where the structure is packed and the token starts at offset four.
+    pub fn epoll_ctl(&self, m: &GuestMem<'_>, epfd: i32, op: u64, fd: i32, event: u64) -> SysResult {
+        let set = self.epoll_of(epfd)?;
+        // `EPOLL_CTL_DEL` is allowed a null event pointer.
+        let (events, data) = if event == 0 {
+            (0, 0)
+        } else if gex_abi::X86 || self.compat {
+            (m.read_u32(event)?, m.read_u64(event + 4)?)
+        } else {
+            (m.read_u32(event)?, m.read_u64(event + 8)?)
+        };
+        // Watching something that is not open is an error, and a program that
+        // gets silence instead waits for a readiness that cannot arrive.
+        let source = if op != unix::epoll_op::DEL {
+            self.fds.get(fd)?.handle.wait_queue()
+        } else {
+            0
+        };
+        set.ctl_queue(op, fd, events, data, source)
+    }
+
     /// A `readv`'s vectors when there is more than one with room in it,
     /// for a parked read to fill in one go.
     fn readv_vectors(&self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Arc<[(u64, u64)]>> {
@@ -3319,6 +3470,8 @@ pub struct Free<'a> {
     /// first call is made): the processor-time clocks, for a sleep until a
     /// time on one.
     pub started: u128,
+    /// Its resource limits, for `prlimit64`.
+    pub rlimits: &'a Rlimits,
 }
 
 /// How a call [`free_call`] answers ended.
@@ -3375,6 +3528,18 @@ fn is_path(n: u64) -> bool {
 /// their own locks (`ProcSig`, `ThreadSig`), and `getrandom`: canonical.
 pub fn is_own_state(n: u64) -> bool {
     matches!(n, nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::SIGALTSTACK | nr::SETITIMER | nr::GETITIMER | nr::ALARM | nr::GETRANDOM)
+}
+
+/// The small descriptor and process calls that need no more than the
+/// descriptor table, the global kernel's pipes, the resource limits'
+/// own lock or nothing at all: `epoll_ctl`, `pipe2`, `ftruncate`,
+/// `statfs`/`fstatfs`, `getpriority`/`setpriority`, `sysinfo` and
+/// `prlimit64` (L17). Canonical.
+pub fn is_fd_misc(n: u64) -> bool {
+    matches!(
+        n,
+        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+    )
 }
 
 fn is_mapping(n: u64) -> bool {
@@ -3454,6 +3619,17 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETITIMER => nr::GETITIMER,
             x::ALARM => nr::ALARM,
             x::GETRANDOM => nr::GETRANDOM,
+            // `i386::translate` widens them (the old `statfs`/`fstatfs`
+            // with 32-bit counts are not made: musl does not).
+            x::EPOLL_CTL => nr::EPOLL_CTL,
+            x::PIPE | x::PIPE2 => nr::PIPE2,
+            x::FTRUNCATE | x::FTRUNCATE64 => nr::FTRUNCATE,
+            x::STATFS64 => nr::STATFS,
+            x::FSTATFS64 => nr::FSTATFS,
+            x::GETPRIORITY => nr::GETPRIORITY,
+            x::SETPRIORITY => nr::SETPRIORITY,
+            x::SYSINFO => nr::SYSINFO,
+            x::GETRLIMIT | x::UGETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -3522,6 +3698,15 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETITIMER => nr::GETITIMER,
             x::ALARM => nr::ALARM,
             x::GETRANDOM => nr::GETRANDOM,
+            x::EPOLL_CTL => nr::EPOLL_CTL,
+            x::PIPE | x::PIPE2 => nr::PIPE2,
+            x::FTRUNCATE => nr::FTRUNCATE,
+            x::STATFS => nr::STATFS,
+            x::FSTATFS => nr::FSTATFS,
+            x::GETPRIORITY => nr::GETPRIORITY,
+            x::SETPRIORITY => nr::SETPRIORITY,
+            x::SYSINFO => nr::SYSINFO,
+            x::GETRLIMIT | x::SETRLIMIT | x::PRLIMIT64 => nr::PRLIMIT64,
             _ => return None,
         }
     } else {
@@ -3534,6 +3719,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_path(n) => raw,
             // No `alarm` in this ABI.
             n if is_own_state(n) && n != nr::ALARM => raw,
+            n if is_fd_misc(n) => raw,
             _ => return None,
         }
     };
@@ -3587,7 +3773,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -3625,7 +3811,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -3687,6 +3873,18 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     } else if is_path(n) {
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
+    } else if is_fd_misc(n) {
+        match n {
+            nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
+            nr::PIPE2 => f.io.pipe2(m, a[0], a[1]),
+            nr::FTRUNCATE => f.io.ftruncate(a[0] as i32, a[1]),
+            nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
+            // As the kernel's arms: nice 0, and a change taken and ignored.
+            nr::GETPRIORITY => Ok(20),
+            nr::SETPRIORITY => Ok(0),
+            nr::SYSINFO => sysinfo(m, compat, a[0]),
+            _ => prlimit(f.rlimits, f.io.fds, f.uid, m, a[1], a[2], a[3]),
+        }
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
     } else if n == nr::RECVMSG {
@@ -5056,7 +5254,7 @@ impl Kernel {
             call_fs: None,
             tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             proc_fs: Arc::new(FsCwd::new("/".to_string())),
-            rlimits: default_rlimits(),
+            rlimits: Arc::new(Rlimits::default()),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             ports: Arc::new(net::Ports::new()),
@@ -5355,7 +5553,7 @@ impl Kernel {
             // The calling thread's fs_struct, copied: a fork's directory and
             // umask are its caller's.
             proc_fs: Arc::new(self.caller_fs().copy()),
-            rlimits: self.rlimits,
+            rlimits: Arc::new(self.rlimits.copy()),
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             ports: Arc::clone(&self.ports),
@@ -5950,7 +6148,7 @@ impl Kernel {
 
     /// The descriptor half of this kernel ([`FdIo`]).
     pub fn fd_io(&self) -> FdIo<'_> {
-        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks }
+        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks, pipes: self.pipes }
     }
 
     /// The path calls' part of this kernel ([`PathIo`]): the namespace
@@ -6243,10 +6441,7 @@ impl Kernel {
             // flock64, x86-64's, wasm32's).
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
-            nr::FTRUNCATE => self
-                .fds
-                .get(a[0] as i32)
-                .and_then(|f| f.handle.truncate(a[1]).map(|_| 0)),
+            nr::FTRUNCATE => self.fd_io().ftruncate(a[0] as i32, a[1]),
             // `fdatasync` like `fsync`: everything is already durable (the VFS
             // is in memory), so validating the fd and returning success is the
             // honest answer. Missing it made sqlite's journal sync return
@@ -6984,97 +7179,8 @@ impl Kernel {
     }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
-        // A pipe in the global kernel when there is one, because the whole
-        // point of a pipe is that another process holds the other end -- and
-        // with a Worker per process that other end is in another memory,
-        // where an `Arc<Pipe>` means nothing.
-        if let Some(r) = self.pipes {
-            return self.shared_pipe2(m, r, fds, flags);
-        }
-        let pipe = Arc::new(Pipe::new());
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let read_end = OpenFile::new(
-            Arc::new(PipeEnd {
-                pipe: Arc::clone(&pipe),
-                write: false,
-            }),
-            "pipe:[0]".to_string(),
-            // The access mode belongs in the flags, not only in the two
-            // booleans: `fcntl(F_GETFL)` reports it, and glibc's `fdopen`
-            // refuses a descriptor whose mode does not match the one asked
-            // for. A write end reporting `O_RDONLY` is why apt could not
-            // open its dpkg pipe.
-            flags | oflags::O_RDONLY,
-            true,
-            false,
-        );
-        let write_end = OpenFile::new(
-            Arc::new(PipeEnd {
-                pipe: Arc::clone(&pipe),
-                write: true,
-            }),
-            "pipe:[0]".to_string(),
-            flags | oflags::O_WRONLY,
-            false,
-            true,
-        );
-        // Both ends start with one reference each, which `Pipe::new` already
-        // accounted for.
-        let rfd = self.fds.insert(read_end, cloexec)?;
-        let wfd = self.fds.insert(write_end, cloexec)?;
-        m.write_u32(fds, rfd as u32)?;
-        m.write_u32(fds + 4, wfd as u32)?;
-        Ok(0)
+        self.fd_io().pipe2(m, fds, flags)
     }
-
-    /// `pipe2` with the buffer in the global kernel.
-    ///
-    /// The two descriptions are the same shape as the local ones -- the same
-    /// flags, the same access modes -- and differ only in what the handle is.
-    /// The path carries the id and the end, because that is what a `fork` has
-    /// to send across to rebuild the descriptor in the child: see
-    /// `gex_fork_fds` in the browser shim.
-    fn shared_pipe2(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        r: crate::pipe::Remote,
-        fds: u64,
-        flags: u64,
-    ) -> SysResult {
-        let id = (r.new)(self.pid);
-        if id < 0 {
-            return Err(Errno::ENFILE);
-        }
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let read_end = OpenFile::new(
-            Arc::new(crate::pipe::RemotePipeEnd {
-                id,
-                write: false,
-                remote: r,
-            }),
-            format!("pipe:[{id}]"),
-            flags | oflags::O_RDONLY,
-            true,
-            false,
-        );
-        let write_end = OpenFile::new(
-            Arc::new(crate::pipe::RemotePipeEnd {
-                id,
-                write: true,
-                remote: r,
-            }),
-            format!("pipe:[{id}]"),
-            flags | oflags::O_WRONLY,
-            false,
-            true,
-        );
-        let rfd = self.fds.insert(read_end, cloexec)?;
-        let wfd = self.fds.insert(write_end, cloexec)?;
-        m.write_u32(fds, rfd as u32)?;
-        m.write_u32(fds + 4, wfd as u32)?;
-        Ok(0)
-    }
-
 
     fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
@@ -7890,37 +7996,7 @@ impl Kernel {
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
     fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf == 0 {
-            return Err(Errno::EFAULT);
-        }
-        let mut out = [0u8; 120];
-        let put = |o: &mut [u8; 120], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
-        put(&mut out, 8, 4096); // f_bsize
-        put(&mut out, 16, 1 << 20); // f_blocks
-        put(&mut out, 24, 1 << 19); // f_bfree
-        put(&mut out, 32, 1 << 19); // f_bavail
-        put(&mut out, 40, 1 << 18); // f_files
-        put(&mut out, 48, 1 << 17); // f_ffree
-        put(&mut out, 72, 255); // f_namelen
-        put(&mut out, 80, 4096); // f_frsize
-        if self.compat {
-            // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
-            // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
-            let mut c = [0u8; 84];
-            let w32 = |o: &mut [u8; 84], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
-            w32(&mut c, 0, 0x0102_1994);
-            w32(&mut c, 4, 4096);
-            c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
-            w32(&mut c, 56, 255);
-            w32(&mut c, 60, 4096);
-            m.write(buf, &c)?;
-            return Ok(0);
-        }
-        m.write(buf, &out)?;
-        Ok(0)
+        statfs(m, self.compat, buf)
     }
 
     // -- memory --------------------------------------------------------------
@@ -8256,36 +8332,9 @@ impl Kernel {
         self.fd_io().epoll_of(fd)
     }
 
-    /// `epoll_ctl`. A `struct epoll_event` on aarch64 is a 32-bit event mask,
-    /// four bytes of padding, and the caller's 64-bit token -- unlike x86-64,
-    /// where the structure is packed and the token starts at offset four.
-    fn sys_epoll_ctl(
-        &mut self,
-        m: &GuestMem<'_>,
-        epfd: i32,
-        op: u64,
-        fd: i32,
-        event: u64,
-    ) -> SysResult {
-        let set = self.epoll_of(epfd)?;
-        // `EPOLL_CTL_DEL` is allowed a null event pointer.
-        let (events, data) = if event == 0 {
-            (0, 0)
-        } else if gex_abi::X86 || self.compat {
-            (m.read_u32(event)?, m.read_u64(event + 4)?)
-        } else {
-            (m.read_u32(event)?, m.read_u64(event + 8)?)
-        };
-        // Watching something that is not open is an error, and a program that
-        // gets silence instead waits for a readiness that cannot arrive.
-        let source = if op != unix::epoll_op::DEL {
-            self.fds.get(fd)?.handle.wait_queue()
-        } else {
-            0
-        };
-        set.ctl_queue(op, fd, events, data, source)
+    fn sys_epoll_ctl(&mut self, m: &GuestMem<'_>, epfd: i32, op: u64, fd: i32, event: u64) -> SysResult {
+        self.fd_io().epoll_ctl(m, epfd, op, fd, event)
     }
-
 
     /// The anonymous shared file behind a descriptor, if it is one.
     fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
@@ -8918,76 +8967,123 @@ impl Kernel {
     }
 
     fn sys_sysinfo(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf == 0 {
-            return Err(Errno::EFAULT);
-        }
-        // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
-        // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
-        // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
-        // one 4-byte longs (64 bytes), where 4 GiB does not fit and memory
-        // is counted in pages through mem_unit. glibc's qsort asks sysconf
-        // for the physical pages once a sort has 256 elements, and its
-        // caller's frame is exactly this struct's size: the wide layout in a
-        // 32-bit process overwrote the stack canary.
-        if self.compat {
-            m.zero(buf, 64)?;
-            m.write_u32(buf, 1000)?; // uptime
-            m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
-            m.write_u32(buf + 20, 1 << 19)?; // freeram
-            m.write(buf + 40, &1u16.to_ge_bytes())?; // procs
-            m.write_u32(buf + 52, 4096)?; // mem_unit
-        } else {
-            m.zero(buf, 112)?;
-            m.write_u64(buf, 1000)?; // uptime
-            m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
-            m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-            m.write(buf + 80, &1u16.to_ge_bytes())?; // procs
-            m.write_u32(buf + 104, 1)?; // mem_unit
-        }
-        Ok(0)
+        sysinfo(m, self.compat, buf)
     }
 
     fn sys_getrandom(&mut self, m: &mut GuestMem<'_>, buf: u64, len: u64) -> SysResult {
         getrandom(&self.vfs, m, buf, len)
     }
 
-    /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
-    /// processes set only their own). Limits are recorded and reported;
-    /// RLIMIT_NOFILE is enforced by the descriptor table, the rest are not.
     fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
-        let r = resource as usize;
-        if r >= RLIM_NLIMITS {
+        prlimit(&self.rlimits, &self.fds, self.uid, m, resource, new, old)
+    }
+}
+
+/// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
+/// magic, a 4 GiB volume half free).
+pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+    if buf == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut out = [0u8; 120];
+    let put = |o: &mut [u8; 120], at: usize, v: u64| {
+        o[at..at + 8].copy_from_slice(&v.to_le_bytes())
+    };
+    put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
+    put(&mut out, 8, 4096); // f_bsize
+    put(&mut out, 16, 1 << 20); // f_blocks
+    put(&mut out, 24, 1 << 19); // f_bfree
+    put(&mut out, 32, 1 << 19); // f_bavail
+    put(&mut out, 40, 1 << 18); // f_files
+    put(&mut out, 48, 1 << 17); // f_ffree
+    put(&mut out, 72, 255); // f_namelen
+    put(&mut out, 80, 4096); // f_frsize
+    if compat {
+        // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
+        // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
+        let mut c = [0u8; 84];
+        let w32 = |o: &mut [u8; 84], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        w32(&mut c, 0, 0x0102_1994);
+        w32(&mut c, 4, 4096);
+        c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
+        w32(&mut c, 56, 255);
+        w32(&mut c, 60, 4096);
+        m.write(buf, &c)?;
+        return Ok(0);
+    }
+    m.write(buf, &out)?;
+    Ok(0)
+}
+
+/// `sysinfo`: a constant machine (4 GiB, half free, one process).
+pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+    if buf == 0 {
+        return Err(Errno::EFAULT);
+    }
+    // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
+    // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
+    // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
+    // one 4-byte longs (64 bytes), where 4 GiB does not fit and memory
+    // is counted in pages through mem_unit. glibc's qsort asks sysconf
+    // for the physical pages once a sort has 256 elements, and its
+    // caller's frame is exactly this struct's size: the wide layout in a
+    // 32-bit process overwrote the stack canary.
+    if compat {
+        m.zero(buf, 64)?;
+        m.write_u32(buf, 1000)?; // uptime
+        m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
+        m.write_u32(buf + 20, 1 << 19)?; // freeram
+        m.write(buf + 40, &1u16.to_ge_bytes())?; // procs
+        m.write_u32(buf + 52, 4096)?; // mem_unit
+    } else {
+        m.zero(buf, 112)?;
+        m.write_u64(buf, 1000)?; // uptime
+        m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
+        m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
+        m.write(buf + 80, &1u16.to_ge_bytes())?; // procs
+        m.write_u32(buf + 104, 1)?; // mem_unit
+    }
+    Ok(0)
+}
+
+/// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
+/// processes set only their own). Limits are recorded and reported;
+/// RLIMIT_NOFILE is enforced by the descriptor table, the rest are not.
+/// Under the limits' own lock, read, checked and set at once.
+pub fn prlimit(rl: &Rlimits, fds: &FdTable, uid: u32, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
+    let r = resource as usize;
+    if r >= RLIM_NLIMITS {
+        return Err(Errno::EINVAL);
+    }
+    let mut limits = rl.0.lock().unwrap_or_else(|e| e.into_inner());
+    if r == RLIMIT_NOFILE {
+        limits[r][0] = fds.limit() as u64;
+    }
+    let cur = limits[r];
+    let want = if new != 0 { Some([m.read_u64(new)?, m.read_u64(new + 8)?]) } else { None };
+    if let Some([soft, hard]) = want {
+        if soft > hard {
             return Err(Errno::EINVAL);
         }
-        if r == RLIMIT_NOFILE {
-            self.rlimits[r][0] = self.fds.limit() as u64;
+        // raising the hard limit takes privilege; NOFILE cannot pass
+        // what the table holds
+        if (hard > cur[1] && uid != 0)
+            || (r == RLIMIT_NOFILE && hard > crate::file::NOFILE_HARD as u64)
+        {
+            return Err(Errno::EPERM);
         }
-        let cur = self.rlimits[r];
-        let want = if new != 0 { Some([m.read_u64(new)?, m.read_u64(new + 8)?]) } else { None };
-        if let Some([soft, hard]) = want {
-            if soft > hard {
-                return Err(Errno::EINVAL);
-            }
-            // raising the hard limit takes privilege; NOFILE cannot pass
-            // what the table holds
-            if (hard > cur[1] && self.uid != 0)
-                || (r == RLIMIT_NOFILE && hard > crate::file::NOFILE_HARD as u64)
-            {
-                return Err(Errno::EPERM);
-            }
-        }
-        if old != 0 {
-            m.write_u64(old, cur[0])?;
-            m.write_u64(old + 8, cur[1])?;
-        }
-        if let Some(lim) = want {
-            self.rlimits[r] = lim;
-            if r == RLIMIT_NOFILE {
-                self.fds.set_limit(lim[0] as usize);
-            }
-        }
-        Ok(0)
     }
+    if old != 0 {
+        m.write_u64(old, cur[0])?;
+        m.write_u64(old + 8, cur[1])?;
+    }
+    if let Some(lim) = want {
+        limits[r] = lim;
+        if r == RLIMIT_NOFILE {
+            fds.set_limit(lim[0] as usize);
+        }
+    }
+    Ok(0)
 }
 
 /// Whether canonical syscall `n` can change another thread's descriptor
@@ -9804,6 +9900,131 @@ mod tests {
     /// The calls on a process's and thread's own signal state, and
     /// `getrandom`, made lock-free (L15): what one path sets the other
     /// reads back.
+    /// The small descriptor and process calls (L17), lock-free and in the
+    /// kernel, give the same answers and change the same state.
+    #[test]
+    fn free_fd_misc_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        for lock_free in [true, false] {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(done(free(k, m, at)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            // A pipe made one way carries bytes the other way.
+            set_args(&mut m, at, nr::PIPE2, &[0x20000, oflags::O_CLOEXEC]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0, "lock_free {lock_free}");
+            let (r, w) = (m.read_u32(0x20000).unwrap() as u64, m.read_u32(0x20004).unwrap() as u64);
+            assert_eq!(k.fds.get(r as i32).unwrap().flags() & 3, oflags::O_RDONLY);
+            m.write(0x20100, b"pipe").unwrap();
+            set_args(&mut m, at, nr::WRITE, &[w, 0x20100, 4]);
+            k.syscall(&mut m, 0);
+            set_args(&mut m, at, nr::READ, &[r, 0x20200, 4]);
+            k.syscall(&mut m, 0);
+            assert_eq!(m.read(0x20200, 4).unwrap(), b"pipe");
+
+            // An epoll set watches what either side added: a second add is
+            // EEXIST, a watch of a closed descriptor EBADF.
+            set_args(&mut m, at, nr::EPOLL_CREATE1, &[0]);
+            k.syscall(&mut m, 0);
+            let ep = ret(&m, at) as u64;
+            m.write_u32(0x20300, 1).unwrap(); // EPOLLIN
+            m.write_u64(if gex_abi::X86 { 0x20304 } else { 0x20308 }, 0x77).unwrap();
+            set_args(&mut m, at, nr::EPOLL_CTL, &[ep, 1, r, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::EPOLL_CTL, &[ep, 1, r, 0x20300]);
+            if lock_free { let _ = k.syscall(&mut m, 0); } else { assert!(done(free(&k, &mut m, at))); }
+            assert_eq!(ret(&m, at), -(Errno::EEXIST.0 as i64));
+            set_args(&mut m, at, nr::EPOLL_CTL, &[ep, 1, 999, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
+
+            // ftruncate: the size the kernel then reports.
+            m.write(0x20400, b"/t\0").unwrap();
+            set_args(&mut m, at, nr::OPENAT, &[(-100i64) as u64, 0x20400, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            k.syscall(&mut m, 0);
+            let fd = ret(&m, at) as u64;
+            set_args(&mut m, at, nr::FTRUNCATE, &[fd, 1234]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            assert_eq!(k.fds.get(fd as i32).unwrap().handle.metadata().unwrap().size, 1234);
+            set_args(&mut m, at, nr::FTRUNCATE, &[999, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EBADF.0 as i64));
+            for f in [r, w, ep, fd] {
+                set_args(&mut m, at, nr::CLOSE, &[f]);
+                k.syscall(&mut m, 0);
+            }
+
+            // statfs, fstatfs and sysinfo: the same bytes either way.
+            m.zero(0x21000, 0x200).unwrap();
+            set_args(&mut m, at, nr::FSTATFS, &[0, 0x21000]);
+            call(&mut m, &mut k);
+            assert_eq!(m.read_u64(0x21000).unwrap(), 0x0102_1994);
+            m.write(0x21300, b"/\0").unwrap();
+            set_args(&mut m, at, nr::STATFS, &[0x21300, 0x21100]);
+            call(&mut m, &mut k);
+            assert_eq!(m.read(0x21000, 120).unwrap(), m.read(0x21100, 120).unwrap());
+            set_args(&mut m, at, nr::SYSINFO, &[0x21400]);
+            call(&mut m, &mut k);
+            assert_eq!(m.read_u64(0x21400 + 32).unwrap(), 4 << 30);
+            // getpriority's nice 0 (20 - nice, as the raw call answers it).
+            set_args(&mut m, at, nr::GETPRIORITY, &[0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 20);
+            set_args(&mut m, at, nr::SETPRIORITY, &[0, 0, 5]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+
+            // prlimit64: a soft NOFILE set one way is read back the other
+            // and is the descriptor table's; raising a hard limit unprivileged
+            // is EPERM, soft over hard EINVAL.
+            let soft = if lock_free { 300u64 } else { 400 };
+            m.write_u64(0x22000, soft).unwrap();
+            m.write_u64(0x22008, crate::file::NOFILE_HARD as u64).unwrap();
+            set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_NOFILE as u64, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            assert_eq!(k.fds.limit(), soft as usize);
+            set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_NOFILE as u64, 0, 0x22100]);
+            if lock_free { let _ = k.syscall(&mut m, 0); } else { assert!(done(free(&k, &mut m, at))); }
+            assert_eq!(m.read_u64(0x22100).unwrap(), soft);
+            k.uid = 1000;
+            m.write_u64(0x22000, 10).unwrap();
+            m.write_u64(0x22008, 20).unwrap();
+            set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_CORE as u64, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            m.write_u64(0x22008, 30).unwrap();
+            set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_CORE as u64, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EPERM.0 as i64));
+            m.write_u64(0x22000, 25).unwrap();
+            m.write_u64(0x22008, 20).unwrap();
+            set_args(&mut m, at, nr::PRLIMIT64, &[0, RLIMIT_CORE as u64, 0x22000, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
+            k.uid = 0;
+            k.rlimits.set(default_rlimits());
+        }
+    }
+
     #[test]
     fn free_own_state_calls_answer_as_the_kernel_does() {
         if gex_abi::PPC {
@@ -9815,7 +10036,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9913,7 +10134,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10091,7 +10312,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10152,7 +10373,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10564,7 +10785,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -10641,7 +10862,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -10720,6 +10941,87 @@ mod tests {
     /// i386's `_llseek`, `pread64` and `pwrite64` in the lock-free class
     /// (docs/kernel-locking.md §5.2, L9) answer as the full call does: the
     /// 64-bit offset from two registers, `_llseek`'s result through memory.
+    /// The small descriptor and process calls in their i386 forms (L17):
+    /// `pipe`, `ftruncate64`'s two-word length, `fstatfs64`'s size argument,
+    /// `ugetrlimit`'s 32-bit struct and the narrow `sysinfo`.
+    #[test]
+    fn free_i386_fd_misc_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        set_args(&mut m, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        k.syscall(&mut m, 0);
+        let fd = ret(&m, at) as u64;
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
+            free_call(&f, m, at, call)
+        }
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            for (i, v) in a.iter().enumerate() {
+                m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+            }
+        };
+        let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+        use crate::i386::raw;
+        for lock_free in [true, false] {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            // pipe(fds): two descriptors.
+            m.write_u64(0x21000, !0).unwrap();
+            set32(&mut m, raw::PIPE, [0x21000, 0, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0, "lock_free {lock_free}");
+            let (r, w) = (m.read_u32(0x21000).unwrap(), m.read_u32(0x21004).unwrap());
+            assert!(r != w && r < 100 && w < 100);
+            // ftruncate64(fd, lo, hi): the length from its two words (a high
+            // word would make a 4 GiB file in memory, so it is zero here).
+            set32(&mut m, raw::FTRUNCATE64, [fd, 0x12345, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(k.fds.get(fd as i32).unwrap().handle.metadata().unwrap().size, 0x12345);
+            // fstatfs64(fd, 84, buf): the 32-bit f_type first.
+            m.zero(0x22000, 84).unwrap();
+            set32(&mut m, raw::FSTATFS64, [fd, 84, 0x22000, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(m.read_u32(0x22000).unwrap(), 0x0102_1994);
+            // ugetrlimit(RLIMIT_STACK, &rlim32): 8 MiB soft, the hard limit
+            // (infinite) as the 32-bit all-ones.
+            m.write_u64(0x23000, 0).unwrap();
+            set32(&mut m, raw::UGETRLIMIT, [RLIMIT_STACK as u64, 0x23000, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(m.read_u32(0x23000).unwrap(), 8 << 20);
+            assert_eq!(m.read_u32(0x23004).unwrap(), u32::MAX);
+            // sysinfo: the 64-byte layout, memory in pages.
+            m.zero(0x24000, 128).unwrap();
+            m.write_u64(0x24040, 0x1122_3344).unwrap();
+            set32(&mut m, raw::SYSINFO, [0x24000, 0, 0, 0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(m.read_u32(0x24010).unwrap(), 1 << 20);
+            assert_eq!(m.read_u32(0x24034).unwrap(), 4096);
+            assert_eq!(m.read_u64(0x24040).unwrap(), 0x1122_3344, "past the 32-bit struct");
+            for f in [r as u64, w as u64] {
+                set32(&mut m, raw::CLOSE, [f, 0, 0, 0, 0]);
+                k.syscall(&mut m, 0);
+            }
+        }
+    }
+
     #[test]
     fn free_i386_positioned_calls_answer_as_the_kernel_does() {
         if gex_abi::PPC {
@@ -10740,7 +11042,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -10806,7 +11108,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -10908,7 +11210,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -10945,7 +11247,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11013,7 +11315,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11124,7 +11426,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11200,7 +11502,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11307,7 +11609,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11388,7 +11690,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -11427,7 +11729,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;

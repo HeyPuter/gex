@@ -8128,11 +8128,12 @@ pub extern "C" fn gex_set_child_state(ptr: u32, len: u32) {
 /// exec that starts in another Worker.
 fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let sig = k.signals.to_bytes(pending);
-    let mut v = Vec::with_capacity(8 + sig.len() + k.rlimits.len() * 16);
+    let limits = k.rlimits.get();
+    let mut v = Vec::with_capacity(8 + sig.len() + limits.len() * 16);
     v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     v.extend_from_slice(&sig);
     v.extend_from_slice(&k.proc_fs.umask().to_le_bytes());
-    for [soft, hard] in k.rlimits {
+    for [soft, hard] in limits {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
     }
@@ -8145,18 +8146,20 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     let Some(n) = b.get(..4).map(|w| u32::from_le_bytes(w.try_into().unwrap()) as usize) else { return };
     let Some(sig) = b.get(4..4 + n).and_then(gex_kernel::signal::Signals::from_bytes) else { return };
     let rest = &b[4 + n..];
-    if rest.len() != 4 + k.rlimits.len() * 16 {
+    let mut limits = k.rlimits.get();
+    if rest.len() != 4 + limits.len() * 16 {
         return;
     }
     k.signals = sig;
     k.thread_signals.clear();
     k.sig_tid = 0;
     k.proc_fs.set_umask(u32::from_le_bytes(rest[..4].try_into().unwrap()));
-    for (i, lim) in k.rlimits.iter_mut().enumerate() {
+    for (i, lim) in limits.iter_mut().enumerate() {
         let at = 4 + i * 16;
         lim[0] = u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
         lim[1] = u64::from_le_bytes(rest[at + 8..at + 16].try_into().unwrap());
     }
+    k.rlimits.set(limits);
 }
 
 #[no_mangle]

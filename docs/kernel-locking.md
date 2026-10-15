@@ -767,6 +767,21 @@ in the scheduler pick after each wake of the global WAKE word: about
      own alternate stacks, see a blocked raised signal pending and draw
      random bytes while an interval timer fires; then `getitimer`, the old
      value of a disarm, and `alarm`'s seconds left.
+   - The small descriptor and process calls without the kernel lock (L17):
+     `epoll_ctl`, `pipe2` (and `pipe`), `ftruncate` (i386's
+     `ftruncate64`), `statfs`/`fstatfs`, `getpriority`/`setpriority`,
+     `sysinfo` and `prlimit64` (with x86-64's `getrlimit`/`setrlimit` and
+     i386's `ugetrlimit`) run on the free path (`is_fd_misc`): the
+     descriptor table and the global kernel's pipes (`FdIo`), constant
+     answers, and the resource limits behind their own lock (`Rlimits`,
+     read, checked and set at once; RLIMIT_NOFILE's soft limit is the
+     descriptor table's, as before). Legs:
+     `free_fd_misc_calls_answer_as_the_kernel_does`,
+     `free_i386_fd_misc_calls_answer_as_the_kernel_does`; `fdmisc-threads`
+     (x86-64, i386; page tier, SP and gexc): pipes made and used, one epoll
+     set added to, waited on and deleted from by two threads, files
+     truncated and read back, and the descriptor limit set and read while
+     other threads open descriptors.
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
    - The compositor's pump (L8): no lock. What it asked of the kernel is
