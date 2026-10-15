@@ -30,6 +30,23 @@ pub(super) struct Prog {
     pub key: Option<(u64, u64)>,
     /// The file the bytes are from, for the system-wide key cache.
     pub path: String,
+    /// Built LP64 for wasm64 and lowered to wasm32 (W64,
+    /// docs/wine-native-x64.md): its base and stack-pointer globals are i64.
+    pub lowered: bool,
+}
+
+/// Whether `wasm` imports `env.__memory_base` as an i64: a module built for
+/// wasm64 and lowered to wasm32 (decided by the import's type only).
+pub(super) fn is_lowered(wasm: &[u8]) -> bool {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let Ok(wasmparser::Payload::ImportSection(r)) = payload else { continue };
+        return r.into_iter().flatten().any(|i| {
+            i.module == "env"
+                && i.name == "__memory_base"
+                && matches!(i.ty, wasmparser::TypeRef::Global(g) if g.content_type == wasmparser::ValType::I64)
+        });
+    }
+    false
 }
 
 pub(super) static PROGS: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
@@ -45,6 +62,9 @@ pub(crate) const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
 /// Header flag (offset 36): the program runs i386 code (Wine, W3).
 const FLAG_GUEST_I386: u32 = 1;
+/// Header flag: the program runs x86-64 code (64-bit native Wine, W64). It
+/// shares W3's address-space split and trampoline page.
+const FLAG_GUEST_X86_64: u32 = 2;
 
 /// Whether `program` is a native wasm32 one (its header, from the image's
 /// segments).
@@ -129,7 +149,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // trampoline page native Wine's gexrt sends the guest to. Once per fresh
     // image: a fork's child has its parent's.
     let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
-    if flags & FLAG_GUEST_I386 != 0 && relocate {
+    if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
         use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
         let page = gex_kernel::nt::boot::trampoline_page();
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
@@ -189,7 +209,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     super::dylink::static_published(number, info, &path, base, mem_base as u32);
     lock(&PROVIDERS).push(ProviderModule { file: format!("wasmprog:{path}"), regs, dirs, slots, memory_base: mem_base as u32 });
     let path = path.clone();
-    lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path });
+    let lowered = is_lowered(&wasm);
+    lock(&PROGS).push(Prog { number, wasm, relocate, key: None, path, lowered });
     CURRENT.store(entry, Ordering::Relaxed);
     Ok(number)
 }
@@ -349,6 +370,13 @@ fn note_key(id: &(&str, u64, i64, u64), len: u32, key: (u64, u64)) {
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasmprog(number: u32) -> i32 {
     lock(&PROGS).iter().any(|p| p.number == number) as i32
+}
+
+/// Whether provider module `number` is a wasm32 program lowered from wasm64
+/// ([`is_lowered`]).
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_lowered(number: u32) -> i32 {
+    lock(&PROGS).iter().any(|p| p.number == number && p.lowered) as i32
 }
 
 /// Whether this instantiation of program `number` applies its data

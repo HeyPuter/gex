@@ -2,7 +2,13 @@
 """Wrap a native wasm32 program (a PIE wasm module linked against gex's musl)
 in the ELF32 i386 container gexc runs (shims/native/src/wasmprog.rs).
 
-    wasm-elf.py IN.wasm OUT [--guest-i386] [--host-stub BLOB [--runner GEXC]]
+    wasm-elf.py IN.wasm OUT [--guest-i386] [--elf64 [--guest-x86-64]]
+                [--host-stub BLOB [--runner GEXC]]
+
+--elf64 (W64, docs/wine-native-x64.md §1.1): an ELF64 x86-64 container for a
+program built LP64 and lowered to wasm32 (tools/wine-wasm/wcc64): gex runs it
+with the x86-64 Linux ABI. --guest-x86-64: it runs x86-64 Windows code (the
+W64 loader). The segments and the header are the same.
 
 Segments:
   R    at BASE:          ELF header, program headers, then the wasm module
@@ -78,9 +84,13 @@ def main():
     # --guest-i386: the program runs i386 code (Wine's loader, W3): gex
     # translates i386 in its process and leaves Windows' addresses free.
     flags = 1 if '--guest-i386' in sys.argv[1:] else 0
+    elf64 = '--elf64' in sys.argv[1:]
+    if '--guest-x86-64' in sys.argv[1:]:
+        assert elf64, '--guest-x86-64 needs --elf64'
+        flags |= 2
     w = open(src, 'rb').read()
     mem_size, mem_align = dylink_mem(w)
-    ehsize, phsize, nph = 52, 32, (4 if stub else 5)
+    ehsize, phsize, nph = (64, 56, 4 if stub else 5) if elf64 else (52, 32, 4 if stub else 5)
     wasm_off = up(ehsize + phsize * nph, 16)
     r_end = wasm_off + len(w)
     text_off = up(r_end, PAGE)
@@ -104,23 +114,32 @@ def main():
         assert len(text) <= PAGE, 'host stub too big'
     text = text.ljust(PAGE, b'\xf4')
 
-    eh = b'\x7fELF' + bytes([1, 1, 1, 0]) + bytes(8)
-    eh += struct.pack('<HHIIIIIHHHHHH', 2, 3, 1, entry, ehsize, 0, 0, ehsize, phsize, nph, 40, 0, 0)
+    if elf64:
+        eh = b'\x7fELF' + bytes([2, 1, 1, 0]) + bytes(8)
+        eh += struct.pack('<HHIQQQIHHHHHH', 2, 62, 1, entry, ehsize, 0, 0, ehsize, phsize, nph, 64, 0, 0)
+    else:
+        eh = b'\x7fELF' + bytes([1, 1, 1, 0]) + bytes(8)
+        eh += struct.pack('<HHIIIIIHHHHHH', 2, 3, 1, entry, ehsize, 0, 0, ehsize, phsize, nph, 40, 0, 0)
+
+    def phdr(t, off, va, pa, filesz, memsz, fl, align):
+        if elf64:
+            return struct.pack('<IIQQQQQQ', t, fl, off, va, pa, filesz, memsz, align)
+        return struct.pack('<8I', t, off, va, pa, filesz, memsz, fl, align)
     ph = b''
     # PT_LOAD R: headers + wasm
-    ph += struct.pack('<8I', 1, 0, BASE, BASE, r_end, r_end, 4, PAGE)
+    ph += phdr(1, 0, BASE, BASE, r_end, r_end, 4, PAGE)
     # PT_LOAD R: gex header + entries. Not executable, so gex translates
     # nothing there; the first call to an entry misses and finds the
     # function table's binding.
-    ph += struct.pack('<8I', 1, text_off, text_va, text_va, PAGE, PAGE, 4, PAGE)
+    ph += phdr(1, text_off, text_va, text_va, PAGE, PAGE, 4, PAGE)
     # PT_LOAD R X: one page of hlt. gex refuses an image with nothing
     # executable; nothing jumps here.
-    ph += struct.pack('<8I', 1, text_off + PAGE, code_va, code_va, PAGE, PAGE, 5, PAGE)
+    ph += phdr(1, text_off + PAGE, code_va, code_va, PAGE, PAGE, 5, PAGE)
     # PT_LOAD RW: data (bss only)
-    ph += struct.pack('<8I', 1, text_off + 2 * PAGE, data_va, data_va, 0, data_sz, 6, PAGE)
+    ph += phdr(1, text_off + 2 * PAGE, data_va, data_va, 0, data_sz, 6, PAGE)
     if not stub:
         # PT_GNU_STACK RW
-        ph += struct.pack('<8I', 0x6474e551, 0, 0, 0, 0, 0, 6, 16)
+        ph += phdr(0x6474e551, 0, 0, 0, 0, 0, 6, 16)
     out = (eh + ph).ljust(wasm_off, b'\0') + w
     out = out.ljust(text_off, b'\0') + text + b'\xf4' * PAGE
     open(dst, 'wb').write(out)

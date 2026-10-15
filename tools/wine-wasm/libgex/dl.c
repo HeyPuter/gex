@@ -41,10 +41,20 @@ static const char *base(const char *p)
  * 7.6). Handles from it are GEX_DL_HANDLE and above; 0 with a message in
  * err when it cannot. A static program's loader has no link map and says
  * so. */
+/* a pointer as the address gex's imports take: 32-bit on wasm32 and on
+ * wasm64 lowered to wasm32 (every address below 4 GiB); 64-bit in a
+ * memory64 flavour (GEX_MEMORY64, docs/wine-native-x64.md §0.1) */
+#ifdef GEX_MEMORY64
+typedef unsigned long long gex_addr_t;
+#define GEX_ADDR(p) ((gex_addr_t)(unsigned long)(p))
+#else
+typedef unsigned gex_addr_t;
+#define GEX_ADDR(p) ((gex_addr_t)(unsigned long)(p))
+#endif
 __attribute__((__import_module__("gex"), __import_name__("dlopen")))
-unsigned __gex_dlopen(const char *path, char *err, unsigned errlen);
+unsigned __gex_dlopen(gex_addr_t path, gex_addr_t err, unsigned errlen);
 __attribute__((__import_module__("gex"), __import_name__("dlsym")))
-unsigned __gex_dlsym(unsigned handle, const char *name);
+unsigned __gex_dlsym(unsigned handle, gex_addr_t name);
 #define GEX_DL_HANDLE 0xfff00000u
 #define IS_GEX(p) ((unsigned long)(p) >= GEX_DL_HANDLE)
 
@@ -56,7 +66,7 @@ void *dlopen(const char *file, int mode)
 		if (!strcmp((*l)->name, b)) return (void *)*l;
 	char err[256];
 	err[0] = 0;
-	unsigned h = __gex_dlopen(file, err, sizeof err);
+	unsigned h = __gex_dlopen(GEX_ADDR(file), GEX_ADDR(err), sizeof err);
 	if (h) return (void *)(unsigned long)h;
 	__dl_seterr("%s", err[0] ? err : "not linked into this program");
 	return 0;
@@ -79,7 +89,7 @@ __attribute__((__visibility__("hidden")))
 void *__dlsym(void *restrict p, const char *restrict s, void *restrict ra)
 {
 	if (IS_GEX(p)) {
-		void *a = (void *)(unsigned long)__gex_dlsym((unsigned long)p, s);
+		void *a = (void *)(unsigned long)__gex_dlsym(GEX_ADDR(p), GEX_ADDR(s));
 		if (a) return a;
 	} else if (p && p != RTLD_DEFAULT && p != (void *)&self) {
 		void *a = find(p, s);
@@ -91,7 +101,7 @@ void *__dlsym(void *restrict p, const char *restrict s, void *restrict ra)
 		}
 		/* and the process's global scope (shared libraries, and the
 		 * program's own symbols when it is linked -rdynamic) */
-		void *a = (void *)(unsigned long)__gex_dlsym(0, s);
+		void *a = (void *)(unsigned long)__gex_dlsym(0, GEX_ADDR(s));
 		if (a) return a;
 	}
 	__dl_seterr("Symbol not found: %s", s);

@@ -126,6 +126,25 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
     Ok(g)
 }
 
+/// This store's i64 stack pointer for lowered LP64 modules (W64: built for
+/// wasm64, run in a 32-bit memory; `ftab::instantiate`), with a stack of its
+/// own beside [`stack`]'s, made on first use. A W64 thread's loader and
+/// Wine's PE module share it, as W3's share [`stack`].
+pub(crate) fn stack64(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result<wasmtime::Global> {
+    if let Some(g) = cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp64.clone()) {
+        return Ok(g);
+    }
+    let tid = cx.data().thread.tid;
+    let name = format!("[provider stack (lp64), thread {tid}]");
+    let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
+    let top = base + STACK - 16;
+    let g = wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, wasmtime::Mutability::Var), Val::I64(top as i64))?;
+    if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+        s.provider_sp64 = Some(g.clone());
+    }
+    Ok(g)
+}
+
 /// This store's exception tag for `gex.provider_throw` under a wasm64
 /// provider: `(i32)`, the throw's code. A throw is a wasm exception, so code
 /// the provider publishes at run time (Mono's wasm JIT, whose modules import
