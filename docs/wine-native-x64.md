@@ -160,6 +160,21 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
   `p < floor ? p : stub`, on i64. Entry thunks (`__gexe.<fn>`) read the
   Win64 registers. C's GexA64Icall (AAPCS64) is the same shape: one pass
   with an ABI table, rather than three copies, if C agrees.
+- **As built (W64.2, first part).** `tools/winebuild/wasm64.c` writes the
+  adapters from the ICALL pass's `gexw.sig64` custom section (each defined
+  function's signature with what the wasm types lose: pointer or integer,
+  a byval struct's size, a struct return's size), else from the wasm
+  signature. `libs/gexrt/wasm64.c` is gexrt64. Guest calls (exit stubs) go
+  through `gex.call_out`, as the Unix side's callbacks do: the return pad's
+  page has no dispatch entry under W64 until a call-out translates it.
+  `wcc64 -D_WIN32` compiles with the LLP64 plugin, `llp64.h`, Wine's own
+  libc headers (not the sysroot's LP64 ones) and the ICALL pass, all in
+  the sysroot's `lib` (build-sysroot64.sh); `-shared` and `-r` link
+  wasm64 and lower. A non-printf varargs export reads Win64's 8-byte slots
+  as they are, so only 8-byte variadic arguments are right until the
+  two-kind `va_list`. `tests/wasm64/dll` (the `dll` case of
+  tests/wine64/nt-x64.sh, with w64-dist.sh's W64_TOOLS and W64_SRC): 22
+  checks pass under the W64 loader.
 - **gexrt64** provides:
   - `__gexw_entry`: the C stack goes below the guest's RSP, past its home
     area;
@@ -212,7 +227,13 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
   JIT that writes first and protects after (`VirtualAlloc(PAGE_READWRITE)`
   then `VirtualProtect(PAGE_EXECUTE_READ)`: LuaJIT's mcode) is refused there.
   A `PAGE_EXECUTE*` reservation is placed low, so its later commit is fine;
-  a `PAGE_NOACCESS` one committed as executable is not, if it landed high. Data without an address is found by
+  a `PAGE_NOACCESS` one committed as executable is not, if it landed high.
+  The code space also has a bottom, 0x400000 (`w64_code_space_start`,
+  W64.2): native PE code takes a function pointer below 0x3f0000 for a
+  function-table index (the ICALL floor), and gex's trampoline page is
+  0x3f0000-0x400000. Executable views go at or above it (an image whose
+  base is below is relocated); data allocated below it and later made
+  executable is refused the same way, with a "below" log line. Data without an address is found by
   address (`map_free_area`): gex places a mapping without one below its
   code space only. `tests/wine64/highdata.c` allocates 2.5 GiB and checks
   all of it. Growing the directory to 4 GiB instead doubles it to 4 MiB,

@@ -4,7 +4,9 @@
 #
 #   tools/wine-wasm/w64-dist.sh WINE CACHE
 #
-# prints W64_DIST=... and W64_PREFIX=... (for tests/wine64/nt-x64.sh).
+# prints W64_DIST=..., W64_PREFIX=..., and W64_TOOLS=... and W64_SRC=...
+# (the native tools build and the Wine tree: the native PE side's case),
+# for tests/wine64/nt-x64.sh.
 # Each step is cached in CACHE by what it depends on, and skipped when done:
 #   tools-P     Wine's build tools, native (widl and winebuild know wasm64)
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
@@ -97,3 +99,5 @@ dist_make() {
 log "install ($K, $S)"; step dist64-$K-$S dist_make
 echo "W64_DIST=$C/dist64-$K-$S"
 echo "W64_PREFIX=$C/pfx64-$P/pfx"
+echo "W64_TOOLS=$T"
+echo "W64_SRC=$W"

@@ -14,6 +14,9 @@
 # PREFIX  a win64 prefix made from the same Wine (copied, never written)
 # gexc    an x86 gexc (default target/x86/release/gexc)
 # CASES="hello_args sync" limits the cases; TMO the per-case timeout (s).
+# W64_TOOLS (w64-dist.sh's: a native build of the fork's tools) and W64_SRC
+# (the Wine tree) add the native PE side's entry-adapter case, `dll`
+# (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -34,7 +37,7 @@ check() {
 	case " ${CASES:-$name} " in *" $name "*) ;; *) return ;; esac
 	local p=$w/pfx-$name out code src=$bin/$exe
 	case $exe in /*) src=$exe; exe=$(basename "$exe") ;; esac
-	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" "$p/drive_c/"
+	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
 	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
 		"$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
@@ -69,6 +72,18 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	esac
 else
 	fail=$((fail + 1)); echo "FAIL x64/highdata (W64): x86_64-w64-mingw32-gcc"
+fi
+# W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
+# called from x64 code through every kind of Win64 entry adapter, and
+# calling back (tests/wasm64/dll)
+if [ -n "${W64_TOOLS:-}" ] && [ -n "${W64_SRC:-}" ]; then
+	case " ${CASES:-dll} " in *" dll "*)
+		if "$root/tests/wasm64/dll/build.sh" "$w/dll" "$W64_SRC" "$W64_TOOLS" > "$w/dll.build" 2>&1; then
+			EXTRA="$w/dll/abi.dll" check dll 0 "(ok [^$nl]*$nl)+PASS" "$w/dll/abi_test.exe"
+		else
+			fail=$((fail + 1)); echo "FAIL x64/dll (W64): build"; tail -5 "$w/dll.build" | sed 's/^/  /'
+		fi ;;
+	esac
 fi
 [ -n "${WORK:-}" ] || rm -rf "$w"
 echo "$pass passed, $fail failed"

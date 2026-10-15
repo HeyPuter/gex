@@ -27,8 +27,21 @@
 // records the pair { function, thunk } in the data section `gexw_entries`.
 // gex binds each thunk at its function's table index as a guest address,
 // so a guest call or jump to that index runs the native function.
+//
+// On wasm64 (W64, docs/wine-native-x64.md §1.2: LLP64 lowered to wasm32) the
+// guest is x86-64 and there is one calling convention, Win64's: the exit
+// stubs lay the arguments out as 8-byte slots (__gexw_guest_call64 puts the
+// first four in RCX, RDX, R8, R9 and XMM0-3 alike, and every slot on the
+// stack past the home area), the entry thunks read them back by slot
+// (__gexw_arg, __gexw_argf64, ...), and a struct by value that is not 1, 2,
+// 4 or 8 bytes travels by reference, as Win64 passes it. The pass also
+// records each defined function's signature with what the wasm types lose
+// (a byval struct's size, a struct return's size, pointer or integer) in
+// the custom section gexw.sig64, which winebuild's wasm64 adapters read
+// (sig64() below).
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
@@ -61,7 +74,43 @@ std::string sigName(FunctionType *FT, const DataLayout &DL) {
   return s;
 }
 
+// The signature string of gexw.sig64: result, ':', parameters; v void,
+// i an integer of up to 32 bits, I a 64-bit integer, p a pointer, f float,
+// d double, X a 128-bit integer, bN a struct of N bytes by value, and a
+// leading sN for a struct of N bytes returned through the first parameter.
+std::string sig64(Function &F, const DataLayout &DL) {
+  FunctionType *FT = F.getFunctionType();
+  auto t = [&](Type *T) -> std::string {
+    if (T->isVoidTy()) return "v";
+    if (T->isPointerTy()) return "p";
+    if (T->isFloatTy()) return "f";
+    if (T->isDoubleTy()) return "d";
+    if (T->isIntegerTy() && T->getIntegerBitWidth() <= 32) return "i";
+    if (T->isIntegerTy(64)) return "I";
+    if (T->isIntegerTy(128)) return "X";
+    return "?";
+  };
+  std::string s, ps;
+  unsigned first = 0;
+  if (FT->getNumParams() && F.hasParamAttribute(0, Attribute::StructRet)) {
+    s = "s" + std::to_string(DL.getTypeAllocSize(F.getParamStructRetType(0)));
+    first = 1;
+  } else {
+    s = t(FT->getReturnType());
+  }
+  for (unsigned i = first; i < FT->getNumParams(); i++) {
+    if (Type *BT = F.getParamByValType(i)) ps += "b" + std::to_string(DL.getTypeAllocSize(BT));
+    else ps += t(FT->getParamType(i));
+  }
+  if (FT->isVarArg()) ps += ".";
+  return s + ":" + ps;
+}
+
+static bool smallStruct(uint64_t n) { return n == 1 || n == 2 || n == 4 || n == 8; }
+
 struct GexIcall : PassInfoMixin<GexIcall> {
+  bool W64 = false;
+
   Function *getTarget(Module &M, const char *name, FunctionType *FT) {
     return cast<Function>(M.getOrInsertFunction(name, FT).getCallee());
   }
@@ -87,6 +136,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     F->addFnAttr("gexw-no-icall");
     BasicBlock *BB = BasicBlock::Create(C, "entry", F);
     IRBuilder<> B(BB);
+    if (W64) {
+      exitStub64(M, CB, F, B);
+      return F;
+    }
 
     // Count the i386 stack words.
     unsigned words = 0;
@@ -138,6 +191,75 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       else report_fatal_error("gex icall: unsupported return type in " + Twine(name));
     }
     return F;
+  }
+
+  // The Win64 exit stub: every argument an 8-byte slot (see the top).
+  void exitStub64(Module &M, CallBase &CB, Function *F, IRBuilder<> &B) {
+    LLVMContext &C = M.getContext();
+    const DataLayout &DL = M.getDataLayout();
+    FunctionType *FT = F->getFunctionType();
+    Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+    Type *Ptr = PointerType::get(C, 0);
+    unsigned first = 0;
+    Value *SRet = nullptr;
+    uint64_t sretSize = 0;
+    if (FT->getNumParams() && CB.paramHasAttr(0, Attribute::StructRet)) {
+      SRet = F->getArg(0);
+      sretSize = DL.getTypeAllocSize(CB.getParamStructRetType(0));
+      first = 1;
+    }
+    unsigned n = FT->getNumParams() - first + (SRet && !smallStruct(sretSize) ? 1 : 0);
+    Value *Buf = B.CreateAlloca(I64, B.getInt32(n ? n : 1));
+    unsigned w = 0;
+    auto slot = [&](unsigned k) { return B.CreateGEP(I64, Buf, B.getInt32(k)); };
+    // a large struct return: the caller's buffer is the first argument
+    if (SRet && !smallStruct(sretSize)) B.CreateStore(B.CreatePtrToInt(SRet, I64), slot(w++));
+    for (unsigned i = first; i < FT->getNumParams(); i++) {
+      Argument *A = F->getArg(i);
+      Type *P = A->getType();
+      if (Type *BT = CB.getParamByValType(i)) {
+        uint64_t sz = DL.getTypeAllocSize(BT);
+        if (smallStruct(sz)) {
+          B.CreateStore(B.getInt64(0), slot(w));
+          B.CreateMemCpy(slot(w), Align(8), A, Align(1), sz);
+        } else {
+          B.CreateStore(B.CreatePtrToInt(A, I64), slot(w));  // by reference
+        }
+      } else if (P->isPointerTy()) {
+        B.CreateStore(B.CreatePtrToInt(A, I64), slot(w));
+      } else if (P->isDoubleTy()) {
+        B.CreateStore(B.CreateBitCast(A, I64), slot(w));
+      } else if (P->isFloatTy()) {
+        B.CreateStore(B.CreateZExt(B.CreateBitCast(A, I32), I64), slot(w));
+      } else if (P->isIntegerTy(128)) {
+        // Win64 passes a 16-byte value by reference
+        Value *T = B.CreateAlloca(P);
+        B.CreateStore(A, T);
+        B.CreateStore(B.CreatePtrToInt(T, I64), slot(w));
+      } else if (P->isIntegerTy()) {
+        B.CreateStore(B.CreateZExtOrTrunc(A, I64), slot(w));
+      } else {
+        report_fatal_error("gex icall: unsupported parameter type in " + F->getName());
+      }
+      w++;
+    }
+    Function *Get = getTarget(M, "gexw_get_icall_target", FunctionType::get(I64, false));
+    Value *T = B.CreateCall(Get);
+    Type *R = FT->getReturnType();
+    Function *Call = getTarget(M, "__gexw_guest_call64", FunctionType::get(I64, {I64, Ptr, I32, I32}, false));
+    Value *V = B.CreateCall(Call, {T, Buf, B.getInt32(w), B.getInt32(R->isFloatingPointTy() ? 1 : 0)});
+    if (SRet && smallStruct(sretSize)) {
+      // a 1, 2, 4 or 8-byte struct comes back in RAX
+      Value *Tmp = B.CreateAlloca(I64);
+      B.CreateStore(V, Tmp);
+      B.CreateMemCpy(SRet, Align(1), Tmp, Align(8), sretSize);
+    }
+    if (R->isVoidTy()) B.CreateRetVoid();
+    else if (R->isDoubleTy()) B.CreateRet(B.CreateBitCast(V, R));
+    else if (R->isFloatTy()) B.CreateRet(B.CreateBitCast(B.CreateTrunc(V, I32), R));
+    else if (R->isPointerTy()) B.CreateRet(B.CreateIntToPtr(V, R));
+    else if (R->isIntegerTy() && R->getIntegerBitWidth() <= 64) B.CreateRet(B.CreateZExtOrTrunc(V, R));
+    else report_fatal_error("gex icall: unsupported return type in " + F->getName());
   }
 
   // Is F's address taken by anything other than calls and metadata?
@@ -209,6 +331,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     Type *Ptr = PointerType::get(C, 0);
     FunctionType *FT = F.getFunctionType();
     if (FT->isVarArg()) return nullptr;
+    if (W64) return entryThunk64(M, F);
     FunctionType *BodyT = FunctionType::get(I32, {I32, I32, I32, I64}, false);
     std::string base = "__gexe." + F.getName().str();
     Function *Body = Function::Create(BodyT, GlobalValue::InternalLinkage, base + ".body", M);
@@ -315,6 +438,107 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return T;
   }
 
+  // The Win64 entry thunk of F: argument k (after a struct return's
+  // pointer, if any) is slot k (see the top). Null if a type has no Win64
+  // shape here.
+  Function *entryThunk64(Module &M, Function &F) {
+    LLVMContext &C = M.getContext();
+    const DataLayout &DL = M.getDataLayout();
+    Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *F32 = Type::getFloatTy(C),
+         *F64 = Type::getDoubleTy(C);
+    Type *Ptr = PointerType::get(C, 0);
+    FunctionType *FT = F.getFunctionType();
+    FunctionType *BodyT = FunctionType::get(I32, {I32, I32, I32, I64}, false);
+    std::string base = "__gexe." + F.getName().str();
+    Function *Body = Function::Create(BodyT, GlobalValue::InternalLinkage, base + ".body", M);
+    Body->addFnAttr("gexw-no-icall");
+    IRBuilder<> B(BasicBlock::Create(C, "entry", Body));
+    Value *Ctx = Body->getArg(0), *Ret = Body->getArg(3);
+    auto helper = [&](const char *n, Type *R, ArrayRef<Type *> P) {
+      return M.getOrInsertFunction(n, FunctionType::get(R, P, false));
+    };
+    auto arg = [&](unsigned k) { return B.CreateCall(helper("__gexw_arg", I64, {I32, I32}), {Ctx, B.getInt32(k)}); };
+    std::vector<Value *> args;
+    unsigned k = 0, first = 0;
+    Value *SRet = nullptr;
+    bool sretReg = false;
+    if (FT->getNumParams() && F.hasParamAttribute(0, Attribute::StructRet)) {
+      sretReg = smallStruct(DL.getTypeAllocSize(F.getParamStructRetType(0)));
+      if (sretReg) {
+        SRet = B.CreateAlloca(I64);
+        B.CreateStore(B.getInt64(0), SRet);
+      } else {
+        SRet = B.CreateIntToPtr(arg(k++), Ptr);
+      }
+      args.push_back(SRet);
+      first = 1;
+    }
+    for (unsigned i = first; i < FT->getNumParams(); i++, k++) {
+      Type *P = FT->getParamType(i);
+      if (Type *BT = F.getParamByValType(i)) {
+        if (smallStruct(DL.getTypeAllocSize(BT)))
+          args.push_back(B.CreateIntToPtr(B.CreateCall(helper("__gexw_argptr", I64, {I32, I32}), {Ctx, B.getInt32(k)}), Ptr));
+        else
+          args.push_back(B.CreateIntToPtr(arg(k), Ptr));
+      } else if (P->isPointerTy()) {
+        args.push_back(B.CreateIntToPtr(arg(k), P));
+      } else if (P->isDoubleTy()) {
+        args.push_back(B.CreateCall(helper("__gexw_argf64", F64, {I32, I32}), {Ctx, B.getInt32(k)}));
+      } else if (P->isFloatTy()) {
+        args.push_back(B.CreateCall(helper("__gexw_argf32", F32, {I32, I32}), {Ctx, B.getInt32(k)}));
+      } else if (P->isIntegerTy(128)) {
+        args.push_back(B.CreateLoad(P, B.CreateIntToPtr(arg(k), Ptr)));
+      } else if (P->isIntegerTy() && P->getIntegerBitWidth() <= 64) {
+        args.push_back(B.CreateTrunc(arg(k), P));
+      } else {
+        Body->eraseFromParent();
+        return nullptr;
+      }
+    }
+    Value *R = B.CreateCall(FT, &F, args);
+    Type *RT = FT->getReturnType();
+    Value *Out;
+    auto ret64 = [&](Value *V) {
+      return B.CreateCall(helper("__gexw_ret", I32, {I32, I64, I64}), {Ctx, Ret, V});
+    };
+    if (SRet && sretReg) Out = ret64(B.CreateLoad(I64, SRet));
+    else if (SRet) Out = ret64(B.CreatePtrToInt(SRet, I64));
+    else if (RT->isVoidTy()) Out = B.CreateCall(helper("__gexw_ret_void", I32, {I32, I64}), {Ctx, Ret});
+    else if (RT->isDoubleTy()) Out = B.CreateCall(helper("__gexw_ret_f64", I32, {I32, I64, F64}), {Ctx, Ret, R});
+    else if (RT->isFloatTy()) Out = B.CreateCall(helper("__gexw_ret_f32", I32, {I32, I64, F32}), {Ctx, Ret, R});
+    else if (RT->isPointerTy()) Out = ret64(B.CreatePtrToInt(R, I64));
+    else if (RT->isIntegerTy() && RT->getIntegerBitWidth() <= 64) Out = ret64(B.CreateZExt(R, I64));
+    else {
+      Body->eraseFromParent();
+      return nullptr;
+    }
+    B.CreateRet(Out);
+
+    Function *T = Function::Create(BodyT, GlobalValue::InternalLinkage, base, M);
+    T->addFnAttr("gexw-no-icall");
+    IRBuilder<> TB(BasicBlock::Create(C, "entry", T));
+    FunctionCallee Entry = helper("__gexw_entry", I32, {I32, I32, I32, I64, Ptr});
+    TB.CreateRet(TB.CreateCall(Entry, {T->getArg(0), T->getArg(1), T->getArg(2), T->getArg(3), Body}));
+    return T;
+  }
+
+  // gexw.sig64: every function this object defines for others, with its
+  // signature (sig64 above), as `name sig` lines.
+  static void emitSigs(Module &M) {
+    std::string text;
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.hasLocalLinkage() || F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
+      StringRef n = F.getName();
+      if (n.starts_with("__gexe.") || n.starts_with("llvm.")) continue;
+      bool plain = true;
+      for (char c : n) plain &= isalnum((unsigned char)c) || c == '_' || c == '$' || c == '.' || c == '@' || c == '?';
+      if (!plain) continue;
+      text += n.str() + " " + sig64(F, M.getDataLayout()) + "\\n";
+    }
+    if (!text.empty())
+      M.appendModuleInlineAsm(".section .custom_section.gexw.sig64,\"\",@\n.ascii \"" + text + "\"\n");
+  }
+
   // The pairs as a used, internal array in `section`.
   static void emitPairs(Module &M, const std::vector<std::pair<Function *, Function *>> &pairs,
                         const char *name, const char *section) {
@@ -327,7 +551,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     ArrayType *AT = ArrayType::get(PairT, elems.size());
     auto *G = new GlobalVariable(M, AT, true, GlobalValue::InternalLinkage, ConstantArray::get(AT, elems), name);
     G->setSection(section);
-    G->setAlignment(Align(4));
+    G->setAlignment(Align(M.getDataLayout().getPointerSize()));
     appendToUsed(M, {G});
   }
 
@@ -367,9 +591,13 @@ struct GexIcall : PassInfoMixin<GexIcall> {
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     LLVMContext &C = M.getContext();
+    W64 = Triple(M.getTargetTriple()).getArch() == Triple::wasm64;
     Type *I32 = Type::getInt32Ty(C);
+    // the pointer-sized integer a function pointer is compared as
+    Type *IP = W64 ? Type::getInt64Ty(C) : I32;
+    if (W64) emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
-    FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {I32}, false);
+    FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {IP}, false);
     unsigned done = 0, varargs = 0;
     std::vector<CallBase *> sites;
     for (Function &F : M) {
@@ -389,9 +617,9 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       Function *Stub = exitStub(M, *CB);
       IRBuilder<> B(CB);
       Value *Callee = CB->getCalledOperand();
-      Value *P = B.CreatePtrToInt(Callee, I32);
+      Value *P = B.CreatePtrToInt(Callee, IP);
       B.CreateCall(M.getOrInsertFunction("gexw_set_icall_target", SetT), {P});
-      Value *Native = B.CreateICmpULT(P, B.getInt32(ICALL_LIMIT));
+      Value *Native = B.CreateICmpULT(P, ConstantInt::get(IP, ICALL_LIMIT));
       CB->setCalledOperand(B.CreateSelect(Native, Callee, Stub));
       done++;
     }
