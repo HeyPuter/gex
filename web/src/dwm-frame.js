@@ -287,7 +287,7 @@ export function drawDwmFrame(ctx, atlas, f) {
 
   // 2. The highlight corners: the left one, and its mirror on the right.
   const corner = slice(atlas, 'LEFTHIGHLIGHTCORNER', st);
-  if (corner && !f.maximized) {
+  if (corner) {
     const [, , cw, ch] = corner.src;
     const px = 1, py = 1, qx = W - 1, qy = H - 1;
     ctx.save();
