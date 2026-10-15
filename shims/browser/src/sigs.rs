@@ -56,9 +56,9 @@ pub(crate) struct Home {
     /// for `prlimit64` (L17).
     pipes: Option<gex_kernel::pipe::Remote>,
     rlimits: Arc<gex_kernel::syscalls::Rlimits>,
-    /// For the socket calls (L18): the network, the resolver and the ports,
-    /// the global kernel's sockets, and the socket name tables.
-    net: Option<Arc<dyn gex_kernel::net::NetStack>>,
+    /// For the socket calls (L18): the resolver and the ports, the global
+    /// kernel's sockets, and the socket name tables (the network is the
+    /// page's, `crate::page_net`).
     resolver: Arc<gex_kernel::net::Resolver>,
     ports: Arc<gex_kernel::net::Ports>,
     unix_remote: Option<gex_kernel::unix::Remote>,
@@ -107,7 +107,6 @@ fn home_of(k: &Kernel) -> Home {
         proc_fs: Arc::clone(&k.proc_fs),
         pipes: k.pipes,
         rlimits: Arc::clone(&k.rlimits),
-        net: k.net.clone(),
         resolver: Arc::clone(&k.resolver),
         ports: Arc::clone(&k.ports),
         unix_remote: k.unix_remote,
@@ -129,6 +128,21 @@ impl Home {
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Its terminal, which locks itself.
+    pub(crate) fn tty(&self) -> &gex_kernel::tty::TtyRef {
+        &self.tty
+    }
+
+    /// The process table, which locks itself.
+    pub(crate) fn procs(&self) -> &ProcTable {
+        &self.procs
+    }
+
+    /// The socket name table, which locks itself.
+    pub(crate) fn socket_names(&self) -> &gex_kernel::unix::SocketNames {
+        &self.socket_names
     }
 
     /// Up to `out.len()` bytes of `path` from `offset`, through the
@@ -374,7 +388,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         started: crate::clock_started(),
         rlimits: &home.rlimits,
         net: syscalls::NetIo {
-            net: home.net.as_ref(),
+            net: crate::page_net(),
             resolver: &home.resolver,
             ports: &home.ports,
             unix_remote: home.unix_remote,

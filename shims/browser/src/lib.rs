@@ -110,7 +110,21 @@ extern "C" {
 }
 
 /// Whether the page gave the shim a network at all.
-static mut HAVE_NET: bool = false;
+static HAVE_NET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn have_net() -> bool {
+    HAVE_NET.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The page's network, when it has one: one stack for every process in this
+/// memory (`WispNet` holds nothing of its own). Read by each socket call
+/// (`sigs`'s `NetIo`) and by a kernel as it is built, so a network the page
+/// turns on later reaches every process at its next call, with no kernel to
+/// tell.
+pub(crate) fn page_net() -> Option<&'static Arc<dyn net::NetStack>> {
+    static WISP: std::sync::LazyLock<Arc<dyn net::NetStack>> = std::sync::LazyLock::new(|| Arc::new(WispNet));
+    have_net().then(|| &*WISP)
+}
 
 /// Say that the page has a Wisp connection behind the `net_*` imports.
 ///
@@ -119,15 +133,7 @@ static mut HAVE_NET: bool = false;
 /// every connection hangs.
 #[no_mangle]
 pub extern "C" fn gex_set_network(on: i32) {
-    unsafe { HAVE_NET = on != 0 };
-    // Only when there is a kernel to tell: a Worker between `attach` and
-    // `gex_adopt_child` has none, and a kernel built later reads the flag anyway.
-    if gex_has_host() != 0 {
-        with_host(|h| {
-            h.kernel.net =
-                unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
-        });
-    }
+    HAVE_NET.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
 /// One Wisp stream, as the kernel's [`net::Transport`].
@@ -4392,9 +4398,21 @@ fn with_px<R>(f: impl FnOnce(&Px<'_>) -> R) -> R {
 }
 
 /// Sockets the host holds one end of, so JS can carry a guest's stream
-/// somewhere the guest cannot reach -- another Worker, in particular.
-static HOST_SOCKETS: SingleThreaded<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
-    SingleThreaded(const { RefCell::new(Vec::new()) });
+/// somewhere the guest cannot reach -- another Worker, in particular. Their
+/// own lock: the browser's Xwayland<->compositor bridge calls send and recv
+/// from several Workers at once while others connect and accept.
+static HOST_SOCKETS: gex_kernel::sync::Mutex<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
+    gex_kernel::sync::Mutex::new(Vec::new());
+
+fn host_socket(handle: i32) -> Option<Arc<gex_kernel::unix::UnixSocket>> {
+    HOST_SOCKETS.lock().get(handle.max(0) as usize).cloned()
+}
+
+fn host_socket_add(sock: Arc<gex_kernel::unix::UnixSocket>) -> i32 {
+    let mut table = HOST_SOCKETS.lock();
+    table.push(sock);
+    (table.len() - 1) as i32
+}
 
 /// Connect the host to a unix socket the *guest* has bound: the mirror of
 /// `bind_host`, needed so a guest that *serves* a socket (an X server in one
@@ -4407,35 +4425,20 @@ pub extern "C" fn gex_host_connect(path: u32, path_len: u32) -> i32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return -1;
     };
-    with_host(|h| {
-        let sock = Arc::new(gex_kernel::unix::UnixSocket::new(true));
-        if h.kernel.socket_names.connect(&sock, name).is_err() {
-            return -1;
-        }
-        let mut table = HOST_SOCKETS.0.borrow_mut();
-        table.push(sock);
-        (table.len() - 1) as i32
-    })
+    let Some(home) = sigs::home() else { return -1 };
+    let sock = Arc::new(gex_kernel::unix::UnixSocket::new(true));
+    if home.socket_names().connect(&sock, name).is_err() {
+        return -1;
+    }
+    host_socket_add(sock)
 }
 
 /// Write to the guest through a handle from [`gex_host_connect`].
 #[no_mangle]
 pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
     let bytes = shim_slice(ptr, len);
-    // Clone the Arc under KLOCK: `HOST_SOCKETS` is a `SingleThreaded<Vec>` that
-    // `gex_host_connect` pushes to (a realloc) under KLOCK, and the browser's
-    // Xwayland<->compositor IPC calls send/recv from several Workers at once.
-    // An unlocked `borrow()` racing that push aliases freed backing storage --
-    // the browser-only residual after the closure-JIT races were fixed. The I/O
-    // itself stays outside the lock.
-    let sock = with_host(|_| {
-        HOST_SOCKETS
-            .0
-            .borrow()
-            .get(handle.max(0) as usize)
-            .cloned()
-    });
-    match sock {
+    // The socket cloned out of the table, the I/O outside its lock.
+    match host_socket(handle) {
         Some(s) => s.send(bytes).map(|n| n as i32).unwrap_or(-1),
         None => -1,
     }
@@ -4445,15 +4448,7 @@ pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
 /// which is not the same as end of stream -- the caller comes back.
 #[no_mangle]
 pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
-    // Clone under KLOCK -- see `gex_host_send`.
-    let sock = with_host(|_| {
-        HOST_SOCKETS
-            .0
-            .borrow()
-            .get(handle.max(0) as usize)
-            .cloned()
-    });
-    let Some(s) = sock else { return -1 };
+    let Some(s) = host_socket(handle) else { return -1 };
     let out = shim_slice_mut(ptr, max);
     s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
 }
@@ -4475,8 +4470,8 @@ impl gex_kernel::unix::HostListener for JsListener {
     }
 }
 
-static HOST_LISTENERS: SingleThreaded<Vec<Arc<JsListener>>> =
-    SingleThreaded(const { RefCell::new(Vec::new()) });
+/// The host's listeners, behind their own lock as [`HOST_SOCKETS`] is.
+static HOST_LISTENERS: gex_kernel::sync::Mutex<Vec<Arc<JsListener>>> = gex_kernel::sync::Mutex::new(Vec::new());
 
 /// Serve a unix socket at `path` from the host. Returns a listener id.
 ///
@@ -4487,49 +4482,28 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return -1;
     };
+    let Some(home) = sigs::home() else { return -1 };
     let listener = Arc::new(JsListener::default());
-    with_host(|h| {
-        h.kernel.socket_names.bind_host(
-            name,
-            Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>,
-        );
-        // Also in the filesystem: `connect` goes through the name table, but
-        // anything that checks the path exists first (Xlib, `test -S`; not
-        // Mesa) needs a node. Through the mount, since with a global kernel
-        // `h.root` is this process's own `TmpFs` with nothing mounted on it.
-        let _ = h.kernel.vfs.mksocket(name);
-        // Under the same KLOCK: `HOST_LISTENERS`/`HOST_SOCKETS` are pushed to
-        // from other Workers (`gex_host_accept`) while the browser's socket
-        // bridge runs on several threads. An unlocked push races the Vec.
-        let mut table = HOST_LISTENERS.0.borrow_mut();
-        table.push(listener);
-        (table.len() - 1) as i32
-    })
+    home.socket_names().bind_host(name, Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>);
+    // Also in the filesystem: `connect` goes through the name table, but
+    // anything that checks the path exists first (Xlib, `test -S`; not
+    // Mesa) needs a node. Through the mount, since with a global kernel the
+    // root is this process's own `TmpFs` with nothing mounted on it.
+    let _ = home.ns().mksocket(name);
+    let mut table = HOST_LISTENERS.lock();
+    table.push(listener);
+    (table.len() - 1) as i32
 }
 
 /// Take one waiting connection, as a handle for [`gex_host_send`] and
 /// [`gex_host_recv`]. -1 when nothing is waiting.
 #[no_mangle]
 pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
-    // Whole body under KLOCK: reads `HOST_LISTENERS` and pushes `HOST_SOCKETS`,
-    // both shared Vecs other Workers touch on the browser's socket bridge.
-    with_host(|_| {
-        let l = HOST_LISTENERS
-            .0
-            .borrow()
-            .get(listener.max(0) as usize)
-            .cloned();
-        let Some(l) = l else { return -1 };
-        let sock = l
-            .accepted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop();
-        let Some(sock) = sock else { return -1 };
-        let mut table = HOST_SOCKETS.0.borrow_mut();
-        table.push(sock);
-        (table.len() - 1) as i32
-    })
+    let l = HOST_LISTENERS.lock().get(listener.max(0) as usize).cloned();
+    let Some(l) = l else { return -1 };
+    let sock = l.accepted.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    let Some(sock) = sock else { return -1 };
+    host_socket_add(sock)
 }
 
 /// How many regions of guest memory this process actually owns. Anything that
@@ -4921,7 +4895,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.clock = browser_clock;
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
-    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    kernel.net = page_net().cloned();
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
@@ -6504,7 +6478,7 @@ fn wait_needs_page(r: &Run) -> bool {
         match h.metadata().map(|m| m.file_type) {
             Ok(FileType::Fifo) => true,
             // (`HAVE_NET` is what the kernel's `net` is made from.)
-            Ok(FileType::Socket) => !unsafe { HAVE_NET },
+            Ok(FileType::Socket) => !have_net(),
             // And whatever else says its waits are ended by another process:
             // a pseudoterminal, whose two ends live in the global kernel with a
             // terminal emulator in another Worker holding one of them. It was
@@ -6570,7 +6544,7 @@ fn wait_needs_page(r: &Run) -> bool {
         // was 34 seconds of a 115 second run, waking and re-parking every two
         // milliseconds because it dared not sleep longer.
         Waiting::Net(Some(_)) => true,
-        Waiting::Net(None) => unsafe { HAVE_NET },
+        Waiting::Net(None) => have_net(),
         _ => false,
     }
 }
@@ -6684,7 +6658,7 @@ pub extern "C" fn gex_set_stdin(ptr: u32, len: u32) {
 /// against whatever this process last set.
 #[no_mangle]
 pub extern "C" fn gex_tty_lflag() -> u32 {
-    with_host(|h| u32::from_le_bytes(h.kernel.tty.termios()[12..16].try_into().unwrap()))
+    sigs::home().map_or(0, |h| u32::from_le_bytes(h.tty().termios()[12..16].try_into().unwrap()))
 }
 
 /// Tell the guest how big the terminal is, and `SIGWINCH` the foreground group
@@ -6692,17 +6666,15 @@ pub extern "C" fn gex_tty_lflag() -> u32 {
 /// only when the size actually changed.
 #[no_mangle]
 pub extern "C" fn gex_set_winsize(rows: u32, cols: u32) {
-    with_host(|h| {
-        let (_, _, x, y) = h.kernel.tty.winsize();
-        if h.kernel.tty.set_winsize((rows as u16, cols as u16, x, y)) {
-            let fg = h.kernel.tty.fg();
-            let g = if fg > 0 { fg } else { h.kernel.pid };
-            let _ = h
-                .kernel
-                .procs
-                .kill_group(h.kernel.pid, g, gex_kernel::signal::sig::SIGWINCH);
-        }
-    });
+    // The terminal and the process table lock themselves.
+    let Some(h) = sigs::home() else { return };
+    let tty = h.tty();
+    let (_, _, x, y) = tty.winsize();
+    if tty.set_winsize((rows as u16, cols as u16, x, y)) {
+        let fg = tty.fg();
+        let g = if fg > 0 { fg } else { h.pid };
+        let _ = h.procs().kill_group(h.pid, g, gex_kernel::signal::sig::SIGWINCH);
+    }
 }
 
 /// Say that stdin is a terminal (what makes a shell print a prompt), and claim
@@ -8314,7 +8286,7 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 /// writes (gex.mjs `#doorPublish`, docs/wineserver-kernel.md).
 #[no_mangle]
 pub extern "C" fn gex_fd_pipe_id(fd: i32) -> i32 {
-    with_host(|h| h.kernel.fds.get(fd).ok().and_then(|f| pipe_id(&f.path)).unwrap_or(-1))
+    fds_free().and_then(|fds| fds.get(fd).ok()).and_then(|f| pipe_id(&f.path)).unwrap_or(-1)
 }
 
 fn pipe_id(path: &str) -> Option<i32> {
@@ -9125,7 +9097,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     kernel.clock = browser_clock;
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);
-    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    kernel.net = page_net().cloned();
     // The dispositions, mask, umask and limits the parent had (`do_fork`'s
     // `FORK_STATE`, staged here by the host with `gex_set_child_state`).
     {
