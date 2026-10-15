@@ -2,7 +2,7 @@
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
+import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -1098,6 +1098,7 @@ class Compositor {
       const [json, png] = await Promise.all([
         fetch('/gex/aero/dwm-parts.json').then((r) => (r.ok ? r.json() : null)),
         fetch('/gex/aero/dwm-atlas.png').then((r) => (r.ok ? r.blob() : null)),
+        self.fonts ? loadDwmFont(self.fonts) : false,
       ]);
       if (!json || !png) return;
       const img = await createImageBitmap(png, { premultiplyAlpha: 'premultiply', colorSpaceConversion: 'none' });

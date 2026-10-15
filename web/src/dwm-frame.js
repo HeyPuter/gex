@@ -114,6 +114,51 @@ export function nineGrid(ctx, img, src, m, x, y, w, h) {
   }
 }
 
+/** Caption text as uDWM has GDI draw it (CGlyphBitmapHolder::MakeBitmap): an
+ *  aliased one-bit mask at six times the horizontal resolution (the font
+ *  six times as wide), filtered down six to one, so edges are soft across
+ *  and hard up and down. `x`, `top`: the text's box; returns its width. */
+function gdiCaption(ctx, text, font, x, top, h, color) {
+  const scratch = (w, hh) => (typeof OffscreenCanvas === 'function'
+    ? new OffscreenCanvas(w, hh) : Object.assign(document.createElement('canvas'), { width: w, height: hh }));
+  ctx.save();
+  ctx.font = font;
+  const m = ctx.measureText(text);
+  ctx.restore();
+  const w = Math.ceil(m.width);
+  if (w <= 0 || h <= 0) return 0;
+  const W6 = w * 6 + 6;
+  const big = scratch(W6, h);
+  const b = big.getContext('2d', { willReadFrequently: true });
+  b.font = font;
+  b.textBaseline = 'alphabetic';
+  b.scale(6, 1);
+  b.fillStyle = '#000';
+  b.fillText(text, 0, Math.round(m.fontBoundingBoxAscent ?? h * 0.8));
+  const src = b.getImageData(0, 0, W6, h).data;
+  const out = new ImageData(w + 1, h);
+  const [r, g, bl] = color;
+  for (let y = 0; y < h; y++) {
+    for (let px = 0; px <= w; px++) {
+      let n = 0;
+      for (let k = 0; k < 6; k++) if (src[(y * W6 + px * 6 + k) * 4 + 3] >= 128) n++;
+      const o = (y * (w + 1) + px) * 4;
+      out.data[o] = r; out.data[o + 1] = g; out.data[o + 2] = bl;
+      out.data[o + 3] = Math.round((n * 255) / 6);
+    }
+  }
+  const small = scratch(w + 1, h);
+  small.getContext('2d').putImageData(out, 0, 0);
+  ctx.drawImage(small, x, top);
+  return w;
+}
+
+/** CSS colour '#rrggbb' to [r, g, b]. */
+const rgbOf = (c) => {
+  const v = /^#?([0-9a-f]{6})$/i.exec(c ?? '#000000')?.[1] ?? '000000';
+  return [0, 2, 4].map((i) => parseInt(v.slice(i, i + 2), 16));
+};
+
 const op255 = (v) => Math.min(255, Math.max(0, Math.round(v * 255))) / 255;
 
 /** The atlas (`{ img, parts }`, parts keyed "NAME:state") slice of a part,
@@ -174,6 +219,26 @@ export function drawDwmBlurBehind(ctx, atlas, f) {
   ctx.clip();
   envMap(ctx, atlas, f, typeof v === 'number' ? v / 100 : f.active ? 0.9 : 0.75);
   ctx.restore();
+}
+
+/** lfCaptionFont, Aero's: Segoe UI 9 pt, 12 px at 96 dpi. The page loads
+ *  the image's own segoeui.ttf as "DWM Segoe UI" when the site has it
+ *  (loadDwmFont). */
+export const DWM_CAPTION_FONT = '12px "DWM Segoe UI", "Segoe UI", system-ui, sans-serif';
+
+/** Load the Windows image's Segoe UI from `url` (the site's gex/aero/
+ *  segoeui.ttf) into `fonts` (document.fonts or a worker's self.fonts). */
+export async function loadDwmFont(fonts, url = '/gex/aero/segoeui.ttf') {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return false;
+    const face = new FontFace('DWM Segoe UI', await r.arrayBuffer());
+    await face.load();
+    fonts.add(face);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Shadow sizes, deflated: left, top, right, bottom. */
@@ -307,7 +372,7 @@ export function drawDwmFrame(ctx, atlas, f) {
   const tvw = Math.max(0, tr - tx), tvh = N.t;
   if (f.title && tvw > 0) {
     ctx.save();
-    ctx.font = f.font ?? '12px "Segoe UI", system-ui, sans-serif';
+    ctx.font = f.font ?? DWM_CAPTION_FONT;
     let text = f.title;
     const measure = (s) => Math.ceil(ctx.measureText(s).width);
     if (measure(text) > tvw) {
@@ -332,10 +397,7 @@ export function drawDwmFrame(ctx, atlas, f) {
     ctx.beginPath();
     ctx.rect(tx, 0, tvw, tvh);
     ctx.clip();
-    ctx.fillStyle = f.textColor ?? '#000';
-    ctx.textBaseline = 'alphabetic';
-    const ty = ((tvh - textH) >> 1) + (m.fontBoundingBoxAscent ?? 12);
-    ctx.fillText(text, tx, ty);
+    gdiCaption(ctx, text, ctx.font, tx, (tvh - textH) >> 1, textH, rgbOf(f.textColor));
     ctx.restore();
   }
 

@@ -24,7 +24,7 @@
 
 import { glassFeColorMatrix } from './glass-colorization.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
+import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, loadDwmFont, DWM_SHADOW } from './dwm-frame.js';
 
 const UI = 1;
 /** The blur's standard deviation, in pixels: DWM's look at 96 dpi. */
@@ -72,6 +72,7 @@ function aeroAtlas() {
     const [json, png] = await Promise.all([
       fetch('/gex/aero/dwm-parts.json').then((r) => (r.ok ? r.json() : null)),
       fetch('/gex/aero/dwm-atlas.png').then((r) => (r.ok ? r.blob() : null)),
+      loadDwmFont(document.fonts),
     ]);
     if (!json || !png) return false;
     const img = await createImageBitmap(png, { premultiplyAlpha: 'premultiply', colorSpaceConversion: 'none' });
