@@ -383,7 +383,11 @@ function w3Site() {
   if (strip || flag('--prune') || flag('--dedupe') || split) {
     const x = join(work, 'tarx');
     mkdirSync(x, { recursive: true });
-    execFileSync('tar', ['-xf', tar, '-C', x]);
+    // GNU tar sets a read-only directory's mode before extracting into it
+    // unless told to wait, and root may not write into it then where the
+    // filesystem checks (a Docker Desktop bind mount): bsdtar always waits.
+    const gnu = /GNU tar/.test(execFileSync('tar', ['--version']).toString());
+    execFileSync('tar', ['-xf', tar, '-C', x, ...(gnu ? ['--delay-directory-restore'] : [])]);
     // A read-only directory (a prefix's Start menu folders, which the shell
     // reads desktop.ini names from only when read only) is made writable
     // while files leave it, and packed with its own mode again.
