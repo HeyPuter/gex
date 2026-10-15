@@ -260,21 +260,50 @@ window is a surface with damage in the gex compositor (docs/nt-layer.md
 
 Revisit (a) only if exact Flip3D or animations become the goal.
 
-### 3.1 State (2026-10-14)
+### 3.1 State (2026-10-15)
+
+Glass and the frame are Windows 7 DWM's own arithmetic, read out of
+dwmcore.dll and uDWM.dll with their public symbols (the user's own ISO;
+nothing of theirs is in the repository but what the code computes).
 
 - **Protocol**: `crates/gex-wayland/protocols/gex-glass-v1.xml`: a
   surface's glass region and DWM's colorization (colour, balance, blur
   balance, afterglow colour and balance), taking effect at once. gex-wayland keeps it in `SurfaceInfo`
-  (`Glass`), and the surface record (74 words now) carries up to four
-  rectangles.
-- **Compositor** (`web/src/compositor-worker.js`, `Painter.glass`): before
-  a window with glass, the scene's pass ends, the box beneath the glass is
-  copied out and blurred (separable Gaussian, two passes each way, wider
-  the second time), and drawn back, tinted, under the window. The window's
-  alpha counts only inside its glass, as under DWM, so a GDI window (alpha
-  byte 0 throughout) is opaque but where it is glass. `web/test/glass.html`
-  shows it with hand-made records.
-- **Wine** (fork `gex-webgpu`): dwmapi reports composition on when the
+  (`Glass`), and the surface record (78 words now) carries up to four
+  rectangles, the frame's flags, client rectangle and caption buttons.
+- **The glass** (`web/src/dwm-glass.js`, `DwmGlass`; both compositors): what
+  dwmcore's `CBlurEffect` does on Direct3D 10 hardware. A Gaussian of sigma
+  3 (`m_flBlurSigma`) and radius 7, its 15 weights paired into 8 bilinear
+  taps (-7 with -6, ..., 5 with 6, 7 alone), normalized. A horizontal pass
+  into an 8-bit buffer a quarter of the screen wide (texel bx centred on
+  column 4 bx + 1), then a vertical one from it stretched back, and pixel
+  shader 2005's colorization: blurred * blur balance + Rec. 709 luma *
+  afterglow + colour, alpha 1. Sampling clamps at the screen's edges; the
+  passes run over the screen as drawn so far, as DWM's ran over its back
+  buffer. `web/test/dwm-glass.html` checks the GPU passes against a CPU
+  reference of the same algorithm (within one step of 255).
+- **Colorization** (`dwmGlassConstants`): uDWM's
+  `CGlassColorizationParameters::AdjustWindowColorization`. The registry's
+  colour and afterglow (their alpha unused) and balances, the frame's
+  COLORIZATIONOPACITY f (TOPFRAME: 100% active, 40% inactive) applied:
+  colour balance * f, blur balance 1 - (1 - b) * f, each rounded to a whole
+  percent. A window with no DWM frame (the taskbar) is active or inactive by
+  the keyboard's focus.
+- **The frame** (`web/src/dwm-frame.js`, `drawDwmFrame`): uDWM's
+  `CTopLevelWindow` mesh, under the window's client area. The environment
+  map (REFLECTIONMAP stretched over the virtual screen, shifted by an
+  eighth of the window's offset from the screen's centre), the highlight
+  corners and side highlights, the eight frame pieces (nine-grids out of
+  the atlas, each image its slice deflated a pixel each side, DWM's
+  nine-grid layout), the shadows outside the window, the caption's
+  TEXTGLOW and text (GDI's six-times-wide one-bit mask filtered down, in
+  the image's Segoe UI), and the buttons. The frame glass's top and bottom
+  bands are cut to the window's GDI round rect (radius 6). Glass with no
+  DWM frame (blur behind) carries the environment map too
+  (`drawDwmBlurBehind`). `tools/aero/extract-dwm-frame.py` extracts the
+  atlas and parts from the user's aero.msstyles; the page serves them, and
+  the image's segoeui.ttf, from `/gex/aero/`.
+- **Wine** (fork `soju-aero`): dwmapi reports composition on when the
   display driver draws glass, and `DwmExtendFrameIntoClientArea`,
   `DwmEnableBlurBehindWindow` and `DwmGetColorizationColor` work, through
   `NtUserSetWindowGlass` (a private `NtUserCallHwndParam`) to win32u, which
@@ -282,35 +311,25 @@ Revisit (a) only if exact Flip3D or animations become the goal.
   visible rect (frame bands, extended margins, blur-behind) whenever the
   window's rects change, and hands them to the new user-driver entry
   `pSetWindowGlass`. winewayland.drv implements it with `gex_glass_v1`.
-- **Frames**: `tools/aero/extract-dwm-frame.py` extracts DWM's frame atlas
-  and its parts (rectangles, nine-grid margins, states) from a Windows 7
-  aero.msstyles; the page serves them from the user's own copy at
-  `/gex/aero/` (Microsoft's artwork: gex ships only the tool).
-  `gex_glass_v1.set_frame` carries a frame's flags (frame, active,
-  maximized, tool) and the caption buttons' rectangles and states; the
-  compositor draws the frame pieces, the title in black on its glow, and
-  the buttons and glyphs. In Wine, win32u makes every captioned top-level
-  window's frame glass when the driver draws glass (the glass surrounds
-  the box inside borders and caption; a menu bar stays opaque) and passes
-  the buttons where its own hit testing has them, pressed state included.
-- **Colorization** (`web/src/glass-colorization.js`, both compositors):
-  Windows 7's glass is blurred backdrop times the blur balance, plus the
-  colour times its balance, plus the afterglow colour times the backdrop's
-  brightness (luma) times the afterglow balance; linear in the backdrop, so
-  a 3x3 matrix and an offset (a shader mode in the WebGPU compositor, an
-  SVG `feColorMatrix` after a blur in `backdrop-filter: url()` without
-  one). dwmapi reads all five registry values (default "sky": 0x6b74b8fc,
-  8, 49, 0x6b74b8fc, 43) and implements `DwmpGetColorizationParameters`.
+  Every captioned top-level window's frame is DWM's when the driver draws
+  glass; win32u sizes and places the caption buttons as uDWM does (from
+  NONCLIENTMETRICS' caption heights) and hit tests them, and passes their
+  states. dwmapi reads all five colorization values (default "sky":
+  0x6b74b8fc, 8, 49, 0x6b74b8fc, 43).
 - **The page with no compositor** (`bare-desktop.js`, the W3 page:
-  Wine's windows are canvases the browser composites): `web/src/dom-glass.js`
-  puts an element with a `backdrop-filter` (blur, then DWM's tint) under
-  each glass rectangle, stacked directly beneath the window's canvas, so the
-  browser blurs whatever is behind the window, and draws a frame left to
-  DWM from the same atlas on a canvas just above it. `DomWindow.paint`
+  Wine's windows are canvases the browser composites): `domGlassScene` in
+  `web/src/dom-glass.js` puts the windows' canvases together bottom to top
+  in a screen-sized WebGPU texture, runs `DwmGlass` at each window with
+  glass and fills its pane (a WebGPU canvas under the window) from the
+  result; each frame is a canvas between the pane and the window. Without
+  WebGPU, a CSS `backdrop-filter` approximates the glass
+  (`glass-colorization.js`'s matrix after a Gaussian). `DomWindow.paint`
   applies the alpha-in-glass rule. `web/test/glass.html?dom=1`.
-- **Not yet**: hover glow on caption buttons (win32u does not track
-  hover), the reflection streaks, thumbnails and Flip3D, and an end-to-end run:
-  W3 (winewayland in the page) is not reproducible from the repo yet.
+- **Not yet**: the window's icon in the caption (DWM draws the small icon;
+  the protocol does not carry it), the outward inflation of thin dialog
+  frames (`CalculateOutsideMargins`), the button cross-fade (0.16 s),
+  ColorizationGlassReflectionIntensity (50 assumed), Aero Peek, Flip3D
+  and thumbnails.
 
 ## 4. Reproducing (macOS, Apple silicon)
 
