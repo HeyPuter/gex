@@ -4,7 +4,12 @@
 //! [`crate::vfs`]; what stays here is the ABI vocabulary they share with the
 //! guest.
 
-/// Open-file flags the guest passes to `openat`.
+/// Open-file flags, in the kernel's own spelling: x86's, which i386 and
+/// wasm32 programs use on every build. The four bits Linux spells
+/// differently per architecture (`O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT`,
+/// `O_LARGEFILE`) arrive from an AArch64 program in the asm-generic spelling
+/// and are turned into this one at the guest's door ([`from_guest`]); a ppc
+/// program's go through `ppc::open_flags`.
 pub mod oflags {
     pub const O_RDONLY: u64 = 0o0;
     pub const O_WRONLY: u64 = 0o1;
@@ -26,7 +31,58 @@ pub mod oflags {
     /// symlink, and usable only for the `*at` calls and `fstat`.
     pub const O_PATH: u64 = 0o10000000;
     pub const O_NOFOLLOW: u64 = 0o400000;
+    pub const O_DIRECT: u64 = 0o40000;
+    /// i386's; x86-64 has none of its own (Linux forces it on there).
+    pub const O_LARGEFILE: u64 = 0o100000;
     pub const ACCMODE: u64 = 0o3;
+
+    /// The asm-generic spelling (AArch64's, and ppc's but for `O_DIRECT` and
+    /// `O_LARGEFILE`, which ppc swaps).
+    pub mod generic {
+        pub const O_DIRECTORY: u64 = 0o40000;
+        pub const O_NOFOLLOW: u64 = 0o100000;
+        pub const O_DIRECT: u64 = 0o200000;
+        pub const O_LARGEFILE: u64 = 0o400000;
+    }
+
+    /// Each pair (generic, kernel) of the bits that differ.
+    const DIFFER: [(u64, u64); 4] = [
+        (generic::O_DIRECTORY, O_DIRECTORY),
+        (generic::O_NOFOLLOW, O_NOFOLLOW),
+        (generic::O_DIRECT, O_DIRECT),
+        (generic::O_LARGEFILE, O_LARGEFILE),
+    ];
+
+    /// Generic spelling to the kernel's.
+    pub fn from_generic(f: u64) -> u64 {
+        DIFFER.iter().fold(f & !DIFFER.iter().fold(0, |m, d| m | d.0), |out, &(g, k)| {
+            if f & g != 0 { out | k } else { out }
+        })
+    }
+
+    /// The kernel's spelling to generic (`fcntl(F_GETFL)`).
+    pub fn to_generic(f: u64) -> u64 {
+        DIFFER.iter().fold(f & !DIFFER.iter().fold(0, |m, d| m | d.1), |out, &(g, k)| {
+            if f & k != 0 { out | g } else { out }
+        })
+    }
+
+    /// Whether this process spells its open flags the generic way: an
+    /// AArch64 program. Not an i386 or wasm32 one (`compat`, which use x86's
+    /// on every build), and not a ppc one, which its own layer translates.
+    pub fn generic_guest(compat: bool) -> bool {
+        !gex_abi::X86 && !gex_abi::PPC && !compat
+    }
+
+    /// Flags as this process passed them, in the kernel's spelling.
+    pub fn from_guest(f: u64, compat: bool) -> u64 {
+        if generic_guest(compat) { from_generic(f) } else { f }
+    }
+
+    /// Flags in the kernel's spelling, as this process reads them.
+    pub fn to_guest(f: u64, compat: bool) -> u64 {
+        if generic_guest(compat) { to_generic(f) } else { f }
+    }
 }
 
 /// `st_mode` type bits.
@@ -154,5 +210,28 @@ impl Stat {
             b[off + 8..off + 16].copy_from_slice(&(ns as u64).to_le_bytes());
         }
         b
+    }
+}
+
+#[cfg(test)]
+mod oflag_tests {
+    use super::oflags::*;
+
+    #[test]
+    fn generic_spelling_round_trips() {
+        let all = O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK;
+        for (g, k) in [
+            (generic::O_DIRECTORY, O_DIRECTORY),
+            (generic::O_NOFOLLOW, O_NOFOLLOW),
+            (generic::O_DIRECT, O_DIRECT),
+            (generic::O_LARGEFILE, O_LARGEFILE),
+        ] {
+            assert_eq!(from_generic(g | all), k | all, "{g:#o}");
+            assert_eq!(to_generic(k | all), g | all, "{k:#o}");
+        }
+        let every = generic::O_DIRECTORY | generic::O_NOFOLLOW | generic::O_DIRECT | generic::O_LARGEFILE;
+        assert_eq!(to_generic(from_generic(every | all)), every | all);
+        // An i386 or wasm32 program spells them x86's way on every build.
+        assert_eq!(from_guest(O_NOFOLLOW, true), O_NOFOLLOW);
     }
 }

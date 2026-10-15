@@ -2669,7 +2669,7 @@ impl PathIo<'_> {
 
     fn call_once(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         Some(match n {
-            nr::OPENAT => self.openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
+            nr::OPENAT => self.openat(m, a[0] as i32, a[1], oflags::from_guest(a[2], self.compat), a[3] as u32),
             nr::OPENAT2 => self.openat2(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETDENTS64 => self.getdents(m, a[0] as i32, a[1], a[2]),
             nr::FSTAT => self.fstat(m, a[0] as i32, a[1]),
@@ -2903,7 +2903,7 @@ impl PathIo<'_> {
         if size < 24 {
             return Err(Errno::EINVAL);
         }
-        let flags = m.read_u64(how)?;
+        let flags = oflags::from_guest(m.read_u64(how)?, self.compat);
         let mode = m.read_u64(how + 8)? as u32;
         let resolve = m.read_u64(how + 16)?;
         if resolve != 0 {
@@ -8396,7 +8396,15 @@ impl FdIo<'_> {
             const F_UNLCK: u16 = 2;
             return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
         }
-        self.fcntl(fd, cmd, arg)
+        // The status flags in the guest's own spelling (an AArch64
+        // program's `O_DIRECT` is not x86's).
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        match cmd {
+            F_SETFL => self.fcntl(fd, cmd, oflags::from_guest(arg, self.compat)),
+            F_GETFL => self.fcntl(fd, cmd, arg).map(|f| oflags::to_guest(f, self.compat)),
+            _ => self.fcntl(fd, cmd, arg),
+        }
     }
 
     pub fn fcntl(&self, fd: i32, cmd: u64, arg: u64) -> SysResult {
@@ -8433,7 +8441,7 @@ impl FdIo<'_> {
                 const STATUS: u64 = oflags::ACCMODE
                     | oflags::O_APPEND
                     | oflags::O_NONBLOCK
-                    | 0o40000 // O_DIRECT
+                    | oflags::O_DIRECT
                     | 0o4010000; // O_SYNC | O_NOATIME
                 // The access mode comes from what the description can do,
                 // not from the stored flags: inherited stdio, socketpair
@@ -8458,7 +8466,7 @@ impl FdIo<'_> {
                 const SETTABLE: u64 = oflags::O_APPEND
                     | oflags::O_NONBLOCK
                     | 0o20000 // O_ASYNC
-                    | 0o40000 // O_DIRECT
+                    | oflags::O_DIRECT
                     | 0o1000000; // O_NOATIME
                 let f = self.fds.get(fd)?;
                 f.set_flags(f.flags() & !SETTABLE | arg & SETTABLE);
@@ -12304,6 +12312,60 @@ mod tests {
         assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 12, "{:?}", &g[..3]);
         assert_eq!(*g.last().unwrap(), 1, "O_CLOEXEC");
         assert_eq!(g[g.len() - 2], -(Errno::ENOENT.0 as i64));
+    }
+
+    /// Open flags are read in the guest's own spelling. An AArch64 program's
+    /// `O_LARGEFILE` is x86's `O_NOFOLLOW`, and glibc passes it on every
+    /// open: taken as x86's, opening anything through a symlink was
+    /// `ELOOP`. And `fcntl(F_GETFL)` answers in that spelling too.
+    #[test]
+    fn open_flags_are_the_guests_spelling() {
+        if gex_abi::PPC {
+            return;
+        }
+        let g = |f: u64| oflags::to_guest(f, false);
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                match free_class(m, at, false) {
+                    Some(call) if lock_free => {
+                        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                        assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                    }
+                    _ => {
+                        k.syscall(m, 0);
+                    }
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            for (a, t) in [(0x20000u64, &b"/d\0"[..]), (0x20200, b"/d/f\0"), (0x20300, b"/d/l\0")] {
+                m.write(a, t).unwrap();
+            }
+            sys_locked(&mut m, &mut k, at, nr::MKDIRAT, &[cwd, 0x20000, 0o755]);
+            let f = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20200, g(oflags::O_RDWR | oflags::O_CREAT | oflags::O_LARGEFILE), 0o644]);
+            assert!(f >= 3, "create: {f}");
+            sys_locked(&mut m, &mut k, at, nr::SYMLINKAT, &[0x20200, cwd, 0x20300]);
+            let via = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20300, g(oflags::O_RDONLY | oflags::O_LARGEFILE), 0]);
+            assert!(via >= 3, "open through the link with O_LARGEFILE (lock_free {lock_free}): {via}");
+            let nofollow = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20300, g(oflags::O_RDONLY | oflags::O_NOFOLLOW), 0]);
+            assert_eq!(nofollow, -(Errno::ELOOP.0 as i64), "O_NOFOLLOW on the link");
+            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, 0x20000, g(oflags::O_RDONLY | oflags::O_DIRECTORY), 0]);
+            assert!(dir >= 3, "O_DIRECTORY: {dir}");
+            // O_DIRECT set and read back, in the guest's spelling.
+            const F_GETFL: u64 = 3;
+            const F_SETFL: u64 = 4;
+            assert_eq!(sys(&mut m, &mut k, nr::FCNTL, &[f as u64, F_SETFL, g(oflags::O_DIRECT | oflags::O_NONBLOCK)]), 0);
+            let fl = sys(&mut m, &mut k, nr::FCNTL, &[f as u64, F_GETFL]) as u64;
+            assert_eq!(fl & g(oflags::O_DIRECT | oflags::O_NONBLOCK), g(oflags::O_DIRECT | oflags::O_NONBLOCK), "F_GETFL {fl:#o}");
+            assert_eq!(fl & oflags::ACCMODE, oflags::O_RDWR);
+            assert_eq!(fl & g(oflags::O_DIRECTORY | oflags::O_NOFOLLOW), 0, "F_GETFL {fl:#o}");
+        }
     }
 
     /// The path writers through the lock-free path ([`PathIo`], L14c)

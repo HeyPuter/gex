@@ -43,6 +43,19 @@ int main(void){
     FILE *lf=fopen("/tmp/gexvfs/link","r"); char line[64]; fgets(line,sizeof line,lf); fclose(lf);
     printf("through-link=%s", line);
 
+    /* Open flags in this architecture's spelling. AArch64's O_LARGEFILE
+     * (which glibc's open and fopen pass on every call) is x86's O_NOFOLLOW;
+     * read as x86's, every open through a symlink was ELOOP. */
+    int lfd=open("/tmp/gexvfs/link",O_RDONLY|O_LARGEFILE);
+    printf("largefile-through-link=%d\n", lfd>=0); if(lfd>=0) close(lfd);
+    errno=0; lfd=open("/tmp/gexvfs/link",O_RDONLY|O_NOFOLLOW);
+    printf("nofollow-link=%d eloop=%d\n", lfd>=0, errno==ELOOP); if(lfd>=0) close(lfd);
+    lfd=open("/tmp/gexvfs",O_RDONLY|O_DIRECTORY);
+    printf("directory=%d\n", lfd>=0); if(lfd>=0) close(lfd);
+    lfd=open("/tmp/gexvfs/f0",O_RDONLY); fcntl(lfd,F_SETFL,O_NONBLOCK); int fl=fcntl(lfd,F_GETFL);
+    printf("getfl nonblock=%d directory=%d nofollow=%d\n", !!(fl&O_NONBLOCK), !!(fl&O_DIRECTORY), !!(fl&O_NOFOLLOW));
+    close(lfd);
+
     /* rename + unlink */
     rename("/tmp/gexvfs/f2","/tmp/gexvfs/renamed");
     printf("renamed-exists=%d old-gone=%d\n", access("/tmp/gexvfs/renamed",F_OK)==0, access("/tmp/gexvfs/f2",F_OK)!=0);
