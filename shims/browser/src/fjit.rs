@@ -250,10 +250,10 @@ fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
     if have != 0 {
         return have;
     }
-    crate::with_jit(|h| match h.jit.page_table.lookup(page) {
+    crate::with_jit_only(|j| match j.page_table.lookup(page) {
         Some(b) => b,
         None => {
-            let b = h.jit.page_table.base(page);
+            let b = j.page_table.base(page);
             fresh.push((page, b));
             b
         }

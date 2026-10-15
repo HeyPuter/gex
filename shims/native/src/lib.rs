@@ -8,7 +8,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
-use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcState, SyscallOutcome, ThreadState};
+use gex_kernel::vfs::ProcSource as _;
+use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcCell, SyscallOutcome, ThreadState};
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
@@ -239,7 +240,7 @@ struct HostState {
     memory: Option<gex_mem::GuestMemory>,
     /// Snapshot `/proc` reads from, refreshed before each syscall that could
     /// observe it.
-    proc_state: Arc<Mutex<ProcState>>,
+    proc_state: Arc<ProcCell>,
     /// Set when a host function decided the run must stop.
     exit: Option<Exit>,
     /// Set with `exit` when only this thread ends (`exit` with others left),
@@ -334,7 +335,7 @@ struct SpawnContext {
     opts: RunOptions,
     xlate: Options,
     kernel: Arc<Mutex<Kernel>>,
-    proc_state: Arc<Mutex<ProcState>>,
+    proc_state: Arc<ProcCell>,
     /// Where compiled runtime translations are kept, passed to every store.
     jit_cache: Option<(std::path::PathBuf, String)>,
     /// Shared across threads and inherited by children, so a profile of a
@@ -727,7 +728,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
 /// the address space and program, which is the same work as starting fresh.)
 struct Inherited {
     kernel: Kernel,
-    proc_state: Arc<Mutex<ProcState>>,
+    proc_state: Arc<ProcCell>,
     wayland: Option<wayland::Wayland>,
 }
 
@@ -1037,20 +1038,11 @@ fn run_program_with(
         None => (
             {
                 let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
-                k.pins = opts.pins.clone();
+                k.pins = std::sync::Arc::new(opts.pins.clone());
                 k
             },
-            // `..Default::default()` for the rest: listing every field means a
-            // new `ProcState` field breaks only this native site.
-            Arc::new(Mutex::new(ProcState {
-                pid: 1,
-                ppid: 0,
-                pgid: 1,
-                sid: 1,
-                exe: exe_path,
-                cwd: "/".into(),
-                ..Default::default()
-            })),
+            // Filled when the process is first published (`publish_proc`).
+            Arc::new(ProcCell::default()),
         ),
     };
     // Report the host's identity: with hostfs passthrough, a guest that
@@ -1118,7 +1110,7 @@ fn run_program_with(
     if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
         if let Some(bytes) = kernel.read_file(path) {
             let maps = gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base());
-            kernel.new_code.extend(maps);
+            kernel.mem.lock().log.new_code.extend(maps);
         }
     }
     let tid = kernel.pid;
@@ -1447,7 +1439,8 @@ fn run_program_with(
     if opts.report_pins {
         let landed = {
             let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
-            k.pin_landed.clone()
+            let landed = k.mem.lock().log.pin_landed.clone();
+            landed
         };
         let mut wrong = 0;
         for (path, want, got) in &landed {
@@ -2176,7 +2169,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // The child's kernel is a copy of the parent's: descriptors are `Arc`
     // handles, so parent and child share the open file descriptions exactly
     // as Linux does, while the VMA tree and the child list are its own.
-    let child_proc = Arc::new(Mutex::new(ProcState::default()));
+    let child_proc = Arc::new(ProcCell::default());
     let (mut child_kernel, regions, ctx_addr) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         // What the parent has mapped, less what it is known to hold only
@@ -2607,7 +2600,7 @@ fn exec_program(
     opts: &RunOptions,
     xlate: &Options,
     mut kernel: Kernel,
-    proc_state: Arc<Mutex<ProcState>>,
+    proc_state: Arc<ProcCell>,
     wayland: Option<wayland::Wayland>,
 ) -> Result<(Exit, Stats)> {
     if let Some(exit) = host_exec(&req, &kernel)? {
@@ -2812,7 +2805,7 @@ pub static BUSYBOX_APPLETS: std::sync::LazyLock<Vec<&'static str>> =
 fn mount_filesystems(
     kernel: &mut Kernel,
     opts: &RunOptions,
-    proc_state: Arc<Mutex<ProcState>>,
+    proc_state: Arc<ProcCell>,
 ) -> Result<()> {
     match &opts.sysroot {
         Some(root) => {
@@ -3605,7 +3598,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let mut sys_nr = !0u64;
             let stall_on = stall::on();
             if stall_on {
-                let pid = state.proc_state.lock().map(|p| p.pid).unwrap_or(0);
+                let pid = KernelProcSource(Arc::clone(&state.proc_state)).pid();
                 stall::enter(pid, state.thread.tid, nr);
             }
             watch_check(&gm, pc as u64, state.thread.tid);
@@ -3661,9 +3654,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
             }
             let outcome = state.with_kernel(|k| {
-                if !gex_kernel::skips_proc_snapshot(nr) {
-                    k.refresh_proc(&proc_state);
-                }
+                // Cheap when nothing changed; an exec changes the image.
+                k.publish_proc(&proc_state);
                 let o = k.syscall(&mut gm, pc as u64);
                 sys_nr = k.syscall_nr;
                 o
@@ -3739,14 +3731,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // would throw away the fresh translation.
             let retired: Vec<(u64, u64)> = caller
                 .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.retired_code));
+                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.retired_code));
             if !retired.is_empty() {
                 retire_translations(&mut caller, &retired)?;
             }
             recheck_units(&mut caller);
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.new_code));
+                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.new_code));
             profile::note_mapped(caller.data_mut(), &mapped);
             // A library a stateful provider replaces (stream U): bound before
             // the loader can call into it.
@@ -5817,11 +5809,11 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// addresses in `translated` (so discovery does not skip them). Old slots are
 /// abandoned, not reused: replay safety (newest wins) needs a base to belong
 /// to one page for the whole run.
-/// Ranges made executable again (`Kernel::recheck_code`): the units' pages
+/// Ranges made executable again (`MapLog::recheck_code`): the units' pages
 /// there are compared with what they were built from; no translation is
 /// forgotten (the write that could have changed them retired them already).
 fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
-    let recheck = caller.as_context_mut().data_mut().with_kernel(|k| std::mem::take(&mut k.recheck_code));
+    let recheck = caller.as_context_mut().data_mut().with_kernel(|k| std::mem::take(&mut k.mem.lock().log.recheck_code));
     if recheck.is_empty() {
         return;
     }

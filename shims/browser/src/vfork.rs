@@ -21,7 +21,7 @@
 //!      process: a `Host` built as a forked child's Worker builds one
 //!      (`child_host`: its pid, descriptors, working directory, signal
 //!      state, one thread), with the parent's memory map and translation
-//!      state (`JitRef::borrowed`). `with_host` serves this Worker that host
+//!      state (the process's one `JIT`). `with_host` serves this Worker that host
 //!      while the child runs; what is read without the kernel (the pid, the
 //!      exit flag, the descriptor table, the signal state) is this Worker's
 //!      too. The parent's process stays in place for its other Workers.
@@ -175,10 +175,8 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         gm.read(ctx_addr, ctx::SIZE).map(<[u8]>::to_vec).unwrap_or_default()
     };
-    let (compat, started, wasm32, mem, jit) = with_host(|h| {
-        let jit: *mut Jit = &mut *h.jit;
-        (h.kernel.compat, h.kernel.started, h.kernel.wasm32, h.kernel.mem.clone(), jit)
-    });
+    let (compat, started, wasm32, mem) =
+        with_host(|h| (h.kernel.compat, h.kernel.started, h.kernel.wasm32, h.kernel.mem.clone()));
     // What `adoptProcess` stages before `gex_adopt_child`, from what
     // `do_fork` staged.
     *CWD.0.borrow_mut() = FORK_CWD.0.borrow().clone();
@@ -193,12 +191,11 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     WHY.with(|c| c.set(0));
     let mut child = Box::new(super::child_host(pid, ctx_addr as i64, pc as i64, sp as i64, tls as i64, brk as i64));
     // The memory and its map are the parent's (the child may not change
-    // the map: `check`), and so is the code in it and what translated it.
+    // the map: `check`); so are the code in it and what translated it (`JIT`).
     child.kernel.mem = mem;
     child.kernel.wasm32 = wasm32;
     child.kernel.compat = compat;
     child.kernel.started = started;
-    child.jit = JitRef::borrowed(jit);
     CHILD.with(|c| c.set(&mut *child));
     std::mem::forget(child);
     CURRENT.with(|c| c.set(0));

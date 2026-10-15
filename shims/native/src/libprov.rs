@@ -555,7 +555,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         caller.data_mut().with_kernel(|k| {
             let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
             if end > start {
-                k.retired_code.push((start, end));
+                k.mem.lock().log.retired_code.push((start, end));
             }
         });
         gex_kernel::note_code_change();
@@ -763,7 +763,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
 /// Linux libraries already given their provider: (path, load bias).
 static ELF_INSTALLED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
-/// After a Linux syscall that mapped executable code (`Kernel::new_code`):
+/// After a Linux syscall that mapped executable code (`MapLog::new_code`):
 /// a shared object one of this process's stateful providers serves gets
 /// its exports bound to the provider, before anything can call them
 /// (docs/unity-dotnet.md: Unity's `libmonobdwgc-2.0.so`). The library's

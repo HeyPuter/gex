@@ -13,7 +13,7 @@ use gex_kernel::proc::ProcTable;
 use gex_kernel::signal::{self, Delivery, ProcSig, Signals, ThreadSig};
 use gex_kernel::futex::FutexTable;
 use gex_kernel::mem::MapView;
-use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx};
+use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx, MapIo};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -39,6 +39,11 @@ pub(crate) struct Home {
     tty: Arc<gex_kernel::tty::TtyRef>,
     /// `flock`'s locks, released by the last `close` of a description.
     file_locks: Arc<gex_kernel::unix::FileLocks>,
+    /// The memory map itself (`Mm::shared`), for the mapping calls, with
+    /// the placement they ask (`Kernel::pins`, `Kernel::place`).
+    mm: gex_kernel::mem::Mm,
+    pins: Arc<std::collections::HashMap<String, u64>>,
+    place: Option<Arc<dyn gex_kernel::syscalls::ObjectPlace>>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -72,7 +77,67 @@ fn home_of(k: &Kernel) -> Home {
         vfs: Arc::clone(k.vfs.view()),
         tty: Arc::clone(&k.tty),
         file_locks: Arc::clone(&k.file_locks),
+        mm: k.mem.shared(),
+        pins: Arc::clone(&k.pins),
+        place: k.place.clone(),
     }
+}
+
+impl Home {
+    /// The process's memory map, the kernel's own (`Mm::shared`).
+    pub(crate) fn mm(&self) -> &gex_kernel::mem::Mm {
+        &self.mm
+    }
+
+    /// Up to `out.len()` bytes of `path` from `offset`, through the
+    /// published namespace (no kernel lock); bytes filled.
+    pub(crate) fn read_file_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Option<usize> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut done = 0usize;
+        while done < out.len() {
+            let n = f.read_at(offset + done as u64, &mut out[done..]).ok()? as usize;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Some(done)
+    }
+
+    /// The whole of `path` (at most 512 MiB), as [`Home::read_file_at`].
+    pub(crate) fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = f.read_at(out.len() as u64, &mut buf).ok()? as usize;
+            if n == 0 {
+                return Some(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > 512 * 1024 * 1024 {
+                return None;
+            }
+        }
+    }
+
+    /// The executable mappings of files, as the log names new ones.
+    pub(crate) fn code_maps(&self) -> Vec<gex_kernel::CodeMap> {
+        use gex_kernel::mem::prot;
+        self.mm
+            .lock()
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
+            .collect()
+    }
+}
+
+/// This Worker's process, for the work after a syscall that runs without
+/// the kernel lock (the mapped-code drains, docs/kernel-locking.md L12c).
+pub(crate) fn proc_home() -> &'static Home {
+    home().expect("mapped code before its process was published")
 }
 
 thread_local! {
@@ -203,7 +268,7 @@ pub(crate) fn restarts(class: signal::Restart) -> bool {
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
 /// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
 /// and its signal included, without the kernel.
-pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool) -> FreeOutcome {
+pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool, pc: u64) -> FreeOutcome {
     let home = home().expect("a syscall before its process was published");
     let view = view(home).expect("a syscall from a Worker with no thread bound");
     let fds = crate::fds_free().expect("a syscall before its descriptor table was published");
@@ -231,6 +296,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     };
     let f = Free {
         io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
+        map: MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc },
         signals: &view,
         procs: &home.procs,
         tty: &home.tty,
