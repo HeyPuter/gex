@@ -3650,7 +3650,14 @@ export class Gex {
     }
     // What gex-eject's W3 recorder (tools/eject/record-w3.mjs) collects: the
     // native wasm32 modules a session ran.
-    if (wasmdll) console.warn(`[gex-record] module ${this.#cgenStr(e.gex_cgen_pmod_file, prov)} ${pkey.slice(5)}`);
+    if (wasmdll) {
+      const file = this.#cgenStr(e.gex_cgen_pmod_file, prov);
+      console.warn(`[gex-record] module ${file} ${pkey.slice(5)}`);
+      // The same, structured: a native module (a Wine builtin), a process's
+      // program when it is an .exe (fetch-note.mjs).
+      const path = file.replace(/^wasm(dll|prog):/, '');
+      this.#env.noteStatus?.({ kind: 'module', path, program: wasmprog ? undefined : (/\.exe$/i.test(path) ? this.cmdline : undefined) });
+    }
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov), pbytes, pkey)
       : prov >= 0
@@ -5127,7 +5134,7 @@ export class Gex {
     const program = /\.exe$/i.test(path) ? this.cmdline : undefined;
     if (program !== undefined) console.warn(`[gex-record] process ${path} :: ${program}`);
     // The same, structured, for the page's start-up status (fetch-note.mjs).
-    this.#env.noteUnit?.({ key, path, hit: !!got, program });
+    this.#env.noteStatus?.({ kind: 'unit', key, path, hit: !!got, program });
     if (!got) {
       if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
       this.#cgenProviders(u);
@@ -5191,7 +5198,7 @@ export class Gex {
       for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
       return;
     }
-    for (const m of ms) this.#env.noteUnit?.({ key: m.key, path: m.path, hit: true, program: /\.exe$/i.test(m.path) ? this.cmdline : undefined });
+    for (const m of ms) this.#env.noteStatus?.({ kind: 'unit', key: m.key, path: m.path, hit: true, program: /\.exe$/i.test(m.path) ? this.cmdline : undefined });
     const us = new Uint32Array(ms.map((m) => m.u));
     const kb = new TextEncoder().encode(grp.key);
     const up = e.gex_alloc(Math.max(8, us.byteLength)) >>> 0;

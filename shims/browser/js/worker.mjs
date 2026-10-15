@@ -408,9 +408,10 @@ async function handle(msg) {
     // directory under Node (GEX_CGEN_CACHE's layout), or `msg.cgen.url`, read
     // with a synchronous request -- allowed in a Worker, and what lets the
     // nested callback loop install one too. Null when there is none.
-    // An image's unit is in (or the image has none): the page's status.
-    noteUnit(status) {
-      noteStatus({ kind: 'unit', ...status });
+    // What the process reached (an image's unit, a native module): the
+    // page's start-up status (fetch-note.mjs).
+    noteStatus(status) {
+      noteStatus(status);
     }
     loadUnit(key) {
       // The entries now; the module's bytes only if this Worker compiles it

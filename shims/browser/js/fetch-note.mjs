@@ -27,8 +27,10 @@ export function noteFetch(what, bytes = 0) {
 
 /** Something the program reached, for the page's start-up status (app.js
  *  `onProgress`'s `boot` and `log`): `{ kind: 'unit', key, path, hit,
- *  program }` when an image's function-tier unit is installed in a process
- *  (`program`: the process's command line, when the image is its .exe). */
+ *  program }` when an image's function-tier unit is installed in a process,
+ *  `{ kind: 'module', path, program }` when a native wasm32 module (a Wine
+ *  builtin) is (`program`: the process's command line, when the image is
+ *  its .exe). */
 export function noteStatus(status) {
   if (!channel) return;
   try { channel.postMessage({ status, t: performance.now() + performance.timeOrigin }); } catch {}

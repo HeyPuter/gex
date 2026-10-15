@@ -115,8 +115,9 @@ export async function start(opts = {}) {
  *   boot   {units: {done, total}, programs: {done, total}, program, image}:
  *          the build's units installed so far (distinct images) of all it
  *          ships, the .exe ones among them (each a process), the latest
- *          program started and the latest image loaded (file names); a
- *          build without units has totals of 0
+ *          program started and the latest image loaded (file names; a
+ *          native wasm32 module, a Wine builtin, counts there but is no
+ *          unit); a build without units has totals of 0
  *   log    the latest events, oldest first, at most 50: {t (ms since
  *          start()), kind ('phase', 'program', 'image', 'fetch'), text}
  */
@@ -181,7 +182,31 @@ function progressMeter(state, onProgress) {
       p.boot.units.total = shipped.size;
       p.boot.programs.total = [...shipped.values()].filter(isExe).length;
       const seen = new Set();
+      const modules = new Set();
+      // Each thread of a process installs its modules: a program is said once
+      // per command line.
+      const started = new Set();
+      const start = (name, st) => {
+        const k = `${st.path} ${st.program}`;
+        if (started.has(k)) return;
+        started.add(k);
+        p.boot.program = name;
+        log('program', `Started ${name}`);
+      };
       const status = (st) => {
+        if (st?.kind === 'module') {
+          // A native module (a Wine builtin): a program when it is an .exe,
+          // else an image, said once; not one of the build's units.
+          const name = base(st.path);
+          if (st.program !== undefined) start(name, st);
+          else if (!modules.has(st.path)) {
+            p.boot.image = name;
+            log('image', `Loaded ${name}`);
+          }
+          modules.add(st.path);
+          this.tick();
+          return;
+        }
         if (st?.kind !== 'unit') return;
         const name = base(st.path);
         const first = !seen.has(st.key);
@@ -190,11 +215,8 @@ function progressMeter(state, onProgress) {
           p.boot.units.done++;
           if (isExe(name)) p.boot.programs.done++;
         }
-        if (st.program !== undefined) {
-          // A process, at its .exe: said every time (two of one program are two processes).
-          p.boot.program = name;
-          log('program', `Started ${name}`);
-        } else if (first) {
+        if (st.program !== undefined) start(name, st);
+        else if (first) {
           p.boot.image = name;
           log('image', st.hit ? `Loaded ${name}` : `Loaded ${name} (no unit: translated as it runs)`);
         }
