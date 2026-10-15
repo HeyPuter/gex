@@ -3788,7 +3788,9 @@ export class Gex {
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
     const pcopy = () => new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, plen).slice();
     let pbytes = null, pkey = null;
-    if (wasmprog && e.gex_cgen_pmod_wasm_key) {
+    // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
+    // and hashes in one mspaint boot.
+    if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
       if (!this.#sharedModules.has(pkey)) pbytes = pcopy();
