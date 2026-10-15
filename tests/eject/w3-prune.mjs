@@ -100,6 +100,10 @@ await browser.send('Runtime.enable', {}, page);
 // the trap that matters happens there. FLAT auto-attach brings it here.
 const pruned = [];
 const traps = [];
+// A crash the window counts miss: Wine starting its debugger (winedbg
+// --auto: an unhandled exception), a "Program Error" or debugger window, or
+// Paint's process ending (its main thread's exit line: a pid with no colon).
+const crashes = [];
 // Declared before the handlers: one can fire while auto-attach is still
 // being set up, and a step name read in its temporal dead zone would throw
 // inside the handler, losing the line.
@@ -109,6 +113,8 @@ let step = 'load';
   browser.on('Runtime.consoleAPICalled', (p) => {
     const line = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
     if (line.includes('[pruned]')) pruned.push({ at: step, line });
+    if (/\[gex-record\] process \S*winedbg\.exe/.test(line)) crashes.push({ at: step, line: line.slice(0, 200) });
+    if (/^\[gex\] pid \d+: lived [^{]*\{\S+ C:\\windows\\system32\\mspaint\.exe\}/i.test(line)) crashes.push({ at: step, line: line.slice(0, 200) });
     if (consoleFile) appendFileSync(consoleFile, `${Date.now() - t0} ${line}\n`);
   });
   browser.on('Runtime.exceptionThrown', (p) => {
@@ -197,6 +203,10 @@ const run = async (name, fn) => {
   const hit = seen() - before;
   steps.push({ name, hit });
   if (hit) console.log(`FAIL step ${name}: ${hit} pruned function(s) ran`);
+  const t = JSON.parse((await ev('(async () => JSON.stringify((await globalThis.__gexCompositor?.describe?.())?.titles ?? []))()')) ?? '[]');
+  for (const x of t.filter((x) => /Program Error|Wine Debugger/.test(x))) {
+    if (!crashes.some((c) => c.line === `window "${x}"`)) crashes.push({ at: name, line: `window "${x}"` });
+  }
   await shot(name);
 };
 
@@ -283,6 +293,8 @@ check(!!d?.titles?.some((t) => /Paint/.test(t)), `a Paint window is still there 
 
 // ---------------------------------------------------------------------------
 // The verdict: any pruned function that ran is a soundness bug.
+check(crashes.length === 0, `no program crashed over ${steps.length} step(s) (winedbg, a Program Error window, Paint's process ending)`);
+for (const c of crashes) console.log(`  crash at ${c.at}: ${c.line}`);
 const all = [...pruned, ...traps];
 check(all.length === 0, `no pruned function ran over ${steps.length} step(s)`);
 if (all.length) {
