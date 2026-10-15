@@ -267,12 +267,21 @@ class DomWindow {
         out[o + 1] = mem[i + 1];
         out[o + 2] = mem[i];
         const xx = x + col;
+        let a;
         if (c && (xx < c.x || xx >= c.x + c.w || yy < c.y || yy >= c.y + c.h)) {
-          out[o + 3] = 0;
+          a = 0;
         } else if (glass) {
-          out[o + 3] = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
+          a = spans.some((r) => xx >= r.x && xx < r.x + r.w) ? mem[i + 3] : 255;
         } else {
-          out[o + 3] = s.format === 1 ? 255 : mem[i + 3];
+          a = s.format === 1 ? 255 : mem[i + 3];
+        }
+        out[o + 3] = a;
+        // The pixels are premultiplied (wl_shm's ARGB8888; and DWM blends a
+        // window's pixels so): ImageData wants them straight.
+        if (a < 255 && a > 0) {
+          out[o] = Math.min(255, Math.round((out[o] * 255) / a));
+          out[o + 1] = Math.min(255, Math.round((out[o + 1] * 255) / a));
+          out[o + 2] = Math.min(255, Math.round((out[o + 2] * 255) / a));
         }
       }
     }

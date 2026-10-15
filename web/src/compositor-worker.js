@@ -139,6 +139,9 @@ struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
     }
     if (!inGlass) { c.a = 1.0; }
   }
+  // wl_shm's pixels are premultiplied (and DWM blends a window's so); the
+  // pipeline's blend is for straight alpha.
+  if (u.swizzle == 1u && c.a > 0.0 && c.a < 1.0) { c = vec4f(min(c.rgb / c.a, vec3f(1.0)), c.a); }
   return c;
 }`;
 
