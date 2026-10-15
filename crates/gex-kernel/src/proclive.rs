@@ -4,7 +4,7 @@
 //!
 //! What `/proc/self` shows is live everywhere it can be: the memory map
 //! through its own lock (`Mm::shared`), the descriptor table through its
-//! published copy, the working directory through the published namespace
+//! published copy, the working directory through the process's fs_struct
 //! and the process relations through the process table. What only changes
 //! at a process's start and at `execve` -- its image's name, command line
 //! and environment -- is published then ([`Kernel::publish_proc`]). So an
@@ -26,6 +26,8 @@ struct Live {
     mm: Mm,
     fds: Arc<FdTable>,
     vfs: Arc<VfsView>,
+    /// The process's fs_struct: its working directory.
+    fs: Arc<crate::syscalls::FsCwd>,
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
@@ -91,7 +93,14 @@ impl ProcSource for KernelProcSource {
         self.0.get().map(|l| l.exe.clone()).unwrap_or_default()
     }
     fn cwd(&self) -> String {
-        self.0.get().map_or_else(|| "/".to_string(), |l| l.vfs.get().cwd.clone())
+        self.0.get().map_or_else(
+            || "/".to_string(),
+            |l| match l.fs.get() {
+                // Removed, as Linux shows one.
+                c if c == crate::syscalls::GONE_CWD => "/ (deleted)".to_string(),
+                c => c,
+            },
+        )
     }
     fn fds(&self) -> Vec<(i32, String)> {
         // A pty end under the name a program can open and `stat`, which is
@@ -157,6 +166,7 @@ impl Kernel {
                 && Arc::ptr_eq(&o.procs, &self.procs)
                 && Arc::ptr_eq(&o.fds, &self.fds)
                 && Arc::ptr_eq(&o.vfs, self.vfs.view())
+                && Arc::ptr_eq(&o.fs, &self.proc_fs)
                 && o.mm.same(&self.mem)
                 && o.ptys.is_some() == self.ptys.is_some()
                 && o.argv == self.argv
@@ -172,6 +182,7 @@ impl Kernel {
             mm: self.mem.shared(),
             fds: Arc::clone(&self.fds),
             vfs: Arc::clone(self.vfs.view()),
+            fs: Arc::clone(&self.proc_fs),
             exe: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -213,7 +224,7 @@ mod tests {
         let h = k.vfs.open("/d/f", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR, 0o644).unwrap();
         let fd = k.fds.insert(crate::file::OpenFile::new(h, "/d/f".into(), 0, true, true), false).unwrap() as i32;
         assert!(src.fds().contains(&(fd, "/d/f".to_string())));
-        k.vfs.set_cwd("/d").unwrap();
+        k.set_cwd("/d").unwrap();
         assert_eq!(src.cwd(), "/d");
         // An exec: the new image once published.
         k.argv = vec!["a".into(), "two".into()];

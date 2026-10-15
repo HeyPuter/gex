@@ -45,12 +45,13 @@ pub(crate) struct Home {
     pins: Arc<std::collections::HashMap<String, u64>>,
     place: Option<Arc<dyn gex_kernel::syscalls::ObjectPlace>>,
     /// For the path calls: the threads' own fs_structs, the group, the
-    /// terminals, `O_TMPFILE`'s serial and the umask (`Kernel::path_io`).
+    /// terminals and `O_TMPFILE`'s serial (`Kernel::path_io`).
     thread_fs: Arc<gex_kernel::syscalls::ThreadFs>,
     gid: u32,
     ptys: Option<gex_kernel::pty::Remote>,
     tmpfiles: Arc<std::sync::atomic::AtomicU64>,
-    umask: Arc<std::sync::atomic::AtomicU32>,
+    /// The process's first fs_struct (its directory and umask).
+    proc_fs: Arc<gex_kernel::syscalls::FsCwd>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -91,7 +92,7 @@ fn home_of(k: &Kernel) -> Home {
         gid: k.gid,
         ptys: k.ptys,
         tmpfiles: Arc::clone(&k.tmpfiles),
-        umask: Arc::clone(&k.umask),
+        proc_fs: Arc::clone(&k.proc_fs),
     }
 }
 
@@ -306,9 +307,8 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         tid: crate::my_tid() as u32,
         clock: home.clock,
     };
-    // The working directory of this thread's fs_struct: its own, or the
-    // process's in the namespace it resolves through.
-    let own = home.thread_fs.of(ctx_addr).map(|fs| fs.get());
+    // This thread's fs_struct: its own, or the process's.
+    let fs = home.thread_fs.of(ctx_addr).unwrap_or_else(|| Arc::clone(&home.proc_fs));
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
         io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
@@ -316,7 +316,6 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         path: PathIo {
             ns: &ns,
             view: &home.vfs,
-            cwd: own.as_deref().unwrap_or(&ns.cwd),
             map: map(),
             compat,
             pid: home.pid,
@@ -325,7 +324,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             procs: &home.procs,
             ptys: home.ptys,
             tmpfiles: &home.tmpfiles,
-            umask: &home.umask,
+            fs,
             clock: home.clock,
         },
         signals: &view,

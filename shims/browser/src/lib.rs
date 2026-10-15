@@ -301,6 +301,8 @@ extern "C" {
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
     fn k_fs_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_hold_renames(handle: i32, owner: i32, on: u32) -> i32;
+    fn k_fs_rename_epoch() -> i32;
     fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
@@ -795,6 +797,12 @@ extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::
 }
 extern "C" fn rf_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_fs_moved(handle, at, cap) }
+}
+extern "C" fn rf_rename_epoch() -> i32 {
+    unsafe { k_fs_rename_epoch() }
+}
+extern "C" fn rf_hold_renames(handle: i32, owner: i32, on: u32) -> i32 {
+    unsafe { k_fs_hold_renames(handle, owner, on) }
 }
 extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
@@ -1323,6 +1331,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             rmdir: rf_rmdir,
             rename: rf_rename,
             moved: rf_moved,
+            hold_renames: rf_hold_renames,
+            rename_epoch: rf_rename_epoch,
             chmod: rf_chmod,
             fchmod: rf_fchmod,
             symlink: rf_symlink,
@@ -4881,7 +4891,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
-            let _ = kernel.vfs.set_cwd(&cwd);
+            let _ = kernel.set_cwd(&cwd);
         }
     }
     kernel.uid = unsafe { IDENTITY.0 };
@@ -8129,7 +8139,7 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + sig.len() + k.rlimits.len() * 16);
     v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     v.extend_from_slice(&sig);
-    v.extend_from_slice(&k.umask.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    v.extend_from_slice(&k.proc_fs.umask().to_le_bytes());
     for [soft, hard] in k.rlimits {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
@@ -8149,7 +8159,7 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     k.signals = sig;
     k.thread_signals.clear();
     k.sig_tid = 0;
-    k.umask.store(u32::from_le_bytes(rest[..4].try_into().unwrap()), std::sync::atomic::Ordering::Relaxed);
+    k.proc_fs.set_umask(u32::from_le_bytes(rest[..4].try_into().unwrap()));
     for (i, lim) in k.rlimits.iter_mut().enumerate() {
         let at = 4 + i * 16;
         lim[0] = u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());
@@ -9078,7 +9088,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
-            let _ = kernel.vfs.set_cwd(&cwd);
+            let _ = kernel.set_cwd(&cwd);
         }
     }
     // The parent's program and arguments (`gex_set_child_exe`).

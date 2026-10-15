@@ -49,8 +49,10 @@ pub struct Remote {
     pub unlink: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    /// `rename`; `noreplace` (1) is `RENAME_NOREPLACE`, checked with the
-    /// move under the filesystem's lock.
+    /// `rename`; `noreplace` bit 0 is `RENAME_NOREPLACE`, checked with the
+    /// move under the filesystem's lock, and the bits above it the
+    /// directory renames the calling thread holds off
+    /// ([`super::own_holds`]), which its own rename does not wait for.
     pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32, noreplace: u32) -> i32,
     /// [`FileHandle::moved`]: the path the handle's directory was opened at,
     /// the path it has now and the epoch in decimal, NUL-separated, at
@@ -58,6 +60,10 @@ pub struct Remote {
     /// a handle that does not follow its directory, `-ENOENT` once it is
     /// removed, `-ERANGE` when `cap` will not hold them.
     pub moved: extern "C" fn(handle: i32, at: crate::PAddr, cap: u32) -> i32,
+    /// [`FileHandle::rename_epoch`] of the one filesystem there, truncated.
+    pub rename_epoch: extern "C" fn() -> i32,
+    /// [`FileHandle::hold_renames`]: 1 when the filesystem has the lock.
+    pub hold_renames: extern "C" fn(handle: i32, owner: i32, on: u32) -> i32,
     pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     /// `fchmod` on an open handle.
     pub fchmod: extern "C" fn(handle: i32, mode: u32) -> i32,
@@ -323,7 +329,7 @@ impl FileSystem for RemoteFs {
     fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         let (fa, fn_) = at(from.as_bytes());
         let (ta, tn) = at(to.as_bytes());
-        ok((self.remote.rename)(fa, fn_, ta, tn, noreplace as u32)).map(|_| ())
+        ok((self.remote.rename)(fa, fn_, ta, tn, noreplace as u32 | super::own_holds() << 1)).map(|_| ())
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
@@ -445,6 +451,14 @@ impl FileHandle for RemoteHandle {
 
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         Some(ok((self.remote.fchmod)(self.id, mode)).map(|_| ()))
+    }
+
+    fn rename_epoch(&self) -> Option<u64> {
+        Some((self.remote.rename_epoch)() as u32 as u64)
+    }
+
+    fn hold_renames(&self, owner: i32, on: bool) -> bool {
+        (self.remote.hold_renames)(self.id, owner, on as u32) == 1
     }
 
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {

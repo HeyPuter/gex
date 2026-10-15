@@ -9,7 +9,9 @@
  * own directory back and forth. Every open of a file finds one of its two
  * names or neither and what it opens is the file; a directory renamed takes
  * its file along; and a descriptor follows its own directory, so an open
- * through it never misses. */
+ * through it never misses. The working directory is held the same way
+ * (L14d): renamed, getcwd says where it went, and relative opens racing
+ * renames of it never miss either. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -114,6 +116,8 @@ static void *bystander(void *arg) {
 
 /* --- *at calls racing renames -------------------------------------- */
 
+static int check(int fd, const char *want);
+
 static int dfd, efd;
 static volatile int stop;
 
@@ -146,6 +150,35 @@ static void *own_renamer(void *arg) {
     for (int i = 0; !stop; i++) {
         if (rename(i & 1 ? b : a, i & 1 ? a : b)) fail("rename the descriptor's directory");
         if (i % 16 == 0) sched_yield();
+    }
+    return NULL;
+}
+
+/* The working directory, renamed back and forth under the root. */
+static void *cwd_renamer(void *arg) {
+    (void)arg;
+    char a[96], b[96];
+    snprintf(a, sizeof a, "%s/w1", root);
+    snprintf(b, sizeof b, "%s/w2", root);
+    for (int i = 0; i < ROUNDS * 4; i++) {
+        if (rename(i & 1 ? b : a, i & 1 ? a : b)) fail("rename the working directory");
+        if (i % 16 == 0) sched_yield();
+    }
+    stop = 1;
+    return NULL;
+}
+
+/* Relative to the working directory being renamed: always there. */
+static void *cwd_opener(void *arg) {
+    (void)arg;
+    while (!stop) {
+        int fd = open("here", O_RDONLY);
+        if (fd < 0) fail("a relative open while the working directory is renamed");
+        else if (!check(fd, "here")) fail("opened something else relative to a renamed cwd");
+        struct stat st;
+        if (stat("here", &st) || st.st_size != 4) fail("a relative stat while the working directory is renamed");
+        char cwd[256];
+        if (!getcwd(cwd, sizeof cwd) || !(ends_with(cwd, "/w1") || ends_with(cwd, "/w2"))) fail("getcwd while the working directory is renamed");
     }
     return NULL;
 }
@@ -281,7 +314,29 @@ int main(int argc, char **argv) {
     /* Wherever the renames left them, the descriptors still name them. */
     if (fchdir(efd)) fail("fchdir to a renamed directory");
     if (access("own", R_OK)) fail("a relative lookup after fchdir to a renamed directory");
+
+    /* The working directory renamed: getcwd follows it, as on Linux. */
+    snprintf(p, sizeof p, "%s/w1", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/w1/here", root); put(p, "here");
+    if (chdir(root) || chdir("w1")) fail("chdir w1");
+    char w2[96];
+    snprintf(p, sizeof p, "%s/w1", root);
+    snprintf(w2, sizeof w2, "%s/w2", root);
+    if (rename(p, w2)) fail("rename the working directory");
+    if (!getcwd(cwd, sizeof cwd) || !ends_with(cwd, "/w2")) fail("getcwd after a rename of the working directory");
+    if (access("here", R_OK)) fail("a relative lookup after a rename of the working directory");
+    if (rename(w2, p)) fail("rename it back");
+    stop = 0;
+    pthread_t cr, co[3];
+    for (int i = 0; i < 3; i++) pthread_create(&co[i], NULL, cwd_opener, NULL);
+    pthread_create(&cr, NULL, cwd_renamer, NULL);
+    pthread_join(cr, NULL);
+    for (int i = 0; i < 3; i++) pthread_join(co[i], NULL);
+    /* Where the renames left it: w1 (an even count). */
+    if (!getcwd(cwd, sizeof cwd) || !ends_with(cwd, "/w1")) fail("getcwd after the renames");
     if (chdir(root)) return 1;
+    snprintf(p, sizeof p, "%s/w1/here", root); unlink(p);
+    snprintf(p, sizeof p, "%s/w1", root); rmdir(p);
 
     snprintf(p, sizeof p, "%s/d/f", root); unlink(p);
     snprintf(p, sizeof p, "%s/d/g", root); unlink(p);

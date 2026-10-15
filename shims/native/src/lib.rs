@@ -2470,7 +2470,7 @@ fn host_exec(req: &ExecRequest, kernel: &Kernel) -> Result<Option<Exit>> {
     let path = if req.path.starts_with('/') {
         req.path.clone()
     } else {
-        format!("{}/{}", kernel.vfs.cwd.trim_end_matches('/'), req.path)
+        format!("{}/{}", kernel.caller_cwd().trim_end_matches('/'), req.path)
     };
     let listed = |p: &str| {
         list.split(':').filter(|e| !e.is_empty()).any(|e| {
@@ -2506,7 +2506,7 @@ fn host_exec(req: &ExecRequest, kernel: &Kernel) -> Result<Option<Exit>> {
             cmd.env(k, v);
         }
     }
-    cmd.current_dir(&kernel.vfs.cwd);
+    cmd.current_dir(kernel.caller_cwd());
     // For a launcher that limits how many gexcs run at once (gexcc-exec): a
     // gexc started below this one must not wait for a slot this one holds.
     cmd.env("GEXC_HOSTED", "1");
@@ -2642,7 +2642,7 @@ fn exec_program(
     kernel.exe_path = if req.path.starts_with('/') {
         req.path.clone()
     } else {
-        format!("{}/{}", kernel.vfs.cwd.trim_end_matches('/'), req.path)
+        format!("{}/{}", kernel.caller_cwd().trim_end_matches('/'), req.path)
     };
     let opts = RunOptions {
         args: req.argv,
@@ -2865,7 +2865,7 @@ fn mount_filesystems(
         None if opts.sysroot.is_some() => "/".to_string(),
         None => cwd,
     };
-    let _ = kernel.vfs.set_cwd(&start);
+    let _ = kernel.set_cwd(&start);
     Ok(())
 }
 

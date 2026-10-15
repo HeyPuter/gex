@@ -277,7 +277,7 @@ pub(crate) fn stage_exec(h: &mut Host, path: &str, argv: &[String], envp: &[Stri
     }
     stage_fork_fds(h, pid);
     let fds = std::mem::take(&mut *FORK_FDS.0.borrow_mut()).into_bytes();
-    let cwd = h.kernel.vfs.cwd.clone().into_bytes();
+    let cwd = h.kernel.caller_cwd().into_bytes();
     let state = state_bytes(&h.kernel, true);
     EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
     h.kernel.fds.close_all();

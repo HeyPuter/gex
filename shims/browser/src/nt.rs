@@ -460,7 +460,7 @@ mod imp {
         let exe_path = k.exe_path.clone();
         // The page's working directory if it named one, else the program's
         // own, which is where a Windows program usually expects to start.
-        let cwd = match k.vfs.cwd.as_str() {
+        let cwd = match k.cwd().as_str() {
             "/" | "" => exe_path.rsplit_once('/').map(|(d, _)| if d.is_empty() { "/" } else { d }).unwrap_or("/").to_string(),
             c => c.to_string(),
         };

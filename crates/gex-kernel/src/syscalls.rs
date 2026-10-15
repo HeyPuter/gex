@@ -667,25 +667,22 @@ pub struct Kernel {
     /// The canonical number of the syscall being handled (for the host's
     /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
     pub syscall_nr: u64,
-    /// The fs_structs other than the process's first one (whose directory
-    /// is `vfs`'s): a thread's after `unshare(CLONE_FS)` or a `clone`
-    /// without `CLONE_FS`, shared with the threads it creates with it.
-    /// Entered into `vfs` for each of such a thread's calls; read by its
-    /// calls made without the kernel lock.
+    /// The process's first fs_struct: its working directory and umask,
+    /// every thread's that has not made one of its own.
+    pub proc_fs: Arc<FsCwd>,
+    /// The fs_structs other than the process's first one: a thread's after
+    /// `unshare(CLONE_FS)` or a `clone` without `CLONE_FS`, shared with the
+    /// threads it creates with it. A thread's directory is entered into
+    /// `vfs` for each of its calls made under the kernel lock
+    /// (`syscall_cwd`); its calls made without the lock read it here.
     pub thread_fs: Arc<ThreadFs>,
-    /// The directory of the fs_struct of the thread whose `fork` or
-    /// `execve` the host is carrying out, when that thread has its own:
-    /// what the child or the new image starts in ([`Kernel::caller_cwd`],
-    /// [`Kernel::exec_signals`]). Kept from the call itself: by the time the
-    /// host acts, another thread's call may have run.
-    pub call_cwd: Option<String>,
+    /// The fs_struct of the thread whose `fork` or `execve` the host is
+    /// carrying out: what the child or the new image starts in
+    /// ([`Kernel::caller_fs`], [`Kernel::exec_signals`]). Kept from the call
+    /// itself: by the time the host acts, another thread's call may have run.
+    pub call_fs: Option<Arc<FsCwd>>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub tmpfiles: Arc<std::sync::atomic::AtomicU64>,
-    /// The file-creation mask. Recorded rather than applied: nothing here
-    /// enforces permissions, but `umask(022)` is expected to hand back what
-    /// it replaced, and a build system that does not get one back concludes
-    /// the mask was zero and re-runs itself.
-    pub umask: Arc<std::sync::atomic::AtomicU32>,
     /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource.
     /// RLIMIT_NOFILE's soft limit is the descriptor table's (`FdTable`).
     pub rlimits: [[u64; 2]; RLIM_NLIMITS],
@@ -1762,18 +1759,112 @@ pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, 
         Ok(0)
 }
 
-/// A working directory shared by the threads that share an fs_struct.
-pub struct FsCwd(std::sync::Mutex<String>);
+/// What a working directory that has been removed resolves as: no name
+/// under it exists (`ENOENT`, as Linux answers in a removed directory), and
+/// `getcwd` says `ENOENT` for it.
+pub const GONE_CWD: &str = "/\u{0}gone";
+
+/// An fs_struct: the working directory and the umask, shared by the threads
+/// that share one (every pthread: `CLONE_FS`). The process's first is
+/// `Kernel::proc_fs`; `unshare(CLONE_FS)` and a `clone` without it make
+/// others (`ThreadFs`).
+///
+/// The directory is held by identity, as Linux holds a dentry: the open
+/// directory, which follows a rename of itself or of a directory above it
+/// ([`crate::vfs::FileHandle::moved`]). Its path is kept with the
+/// filesystem's rename count it was found at, so while no directory there
+/// has been renamed (one lock-free load) the path stands.
+pub struct FsCwd {
+    at: std::sync::Mutex<CwdAt>,
+    umask: std::sync::atomic::AtomicU32,
+}
+
+#[derive(Clone)]
+struct CwdAt {
+    /// The path now, and the path the directory was opened at.
+    path: String,
+    opened: String,
+    dir: Option<Arc<dyn crate::vfs::FileHandle>>,
+    /// The filesystem's rename count `path` was found at, and the
+    /// directory's own move count then ([`crate::vfs::Moved::epoch`]).
+    epoch: Option<u64>,
+    moves: Option<u64>,
+}
 
 impl FsCwd {
+    /// At `cwd`, held by name only (until a `chdir` opens it).
     pub fn new(cwd: String) -> FsCwd {
-        FsCwd(std::sync::Mutex::new(cwd))
+        FsCwd {
+            at: std::sync::Mutex::new(CwdAt { opened: cwd.clone(), path: cwd, dir: None, epoch: None, moves: None }),
+            umask: std::sync::atomic::AtomicU32::new(0o022),
+        }
     }
+
+    /// A copy, its own from now (`clone` without `CLONE_FS`, `unshare`).
+    pub fn copy(&self) -> FsCwd {
+        FsCwd {
+            at: std::sync::Mutex::new(self.lock().clone()),
+            umask: std::sync::atomic::AtomicU32::new(self.umask()),
+        }
+    }
+
+    /// Take `other`'s directory and umask (`execve` from a thread with an
+    /// fs_struct of its own).
+    pub fn copy_from(&self, other: &FsCwd) {
+        let at = other.lock().clone();
+        *self.lock() = at;
+        self.set_umask(other.umask());
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CwdAt> {
+        self.at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The directory's path now ([`GONE_CWD`] once it is removed).
     pub fn get(&self) -> String {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.get_seen().0
     }
-    fn set(&self, cwd: String) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = cwd;
+
+    /// The directory's path now, and how many times the directory had
+    /// moved when that was found ([`crate::vfs::Moved::epoch`]; `None` for
+    /// one not held by identity): a lookup relative to it that missed while
+    /// that changed raced a rename (`PathIo::call`).
+    pub fn get_seen(&self) -> (String, Option<u64>) {
+        let mut at = self.lock();
+        let Some(dir) = at.dir.clone() else { return (at.path.clone(), None) };
+        let epoch = dir.rename_epoch();
+        if epoch.is_some() && epoch == at.epoch {
+            return (at.path.clone(), at.moves);
+        }
+        (at.path, at.moves) = match dir.moved() {
+            Some(Ok(m)) => (m.path_from(&at.opened).unwrap_or_else(|| at.path.clone()), Some(m.epoch)),
+            Some(Err(_)) => (GONE_CWD.to_string(), None),
+            None => (at.path.clone(), None),
+        };
+        at.epoch = epoch;
+        (at.path.clone(), at.moves)
+    }
+
+    /// The directory, when held by identity.
+    fn dir(&self) -> Option<Arc<dyn crate::vfs::FileHandle>> {
+        self.lock().dir.clone()
+    }
+
+    /// Now at `path`, held through `dir` when the filesystem gave one that
+    /// follows its directory.
+    pub fn set(&self, path: String, dir: Option<Arc<dyn crate::vfs::FileHandle>>) {
+        // Its path checked on first use: a rename between the open and now
+        // is seen then.
+        let dir = dir.filter(|d| d.moved().is_some());
+        *self.lock() = CwdAt { opened: path.clone(), path, dir, epoch: None, moves: None };
+    }
+
+    pub fn umask(&self) -> u32 {
+        self.umask.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_umask(&self, mask: u32) -> u32 {
+        self.umask.swap(mask & 0o777, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1827,9 +1918,6 @@ pub struct PathIo<'a> {
     /// The published namespace, which an `O_TMPFILE`'s name is removed
     /// through when its description goes.
     pub view: &'a Arc<crate::vfs::VfsView>,
-    /// The working directory relative paths resolve against: the calling
-    /// thread's fs_struct's (`ThreadFs`), else the process's.
-    pub cwd: &'a str,
     /// The descriptor table, the map and its placement.
     pub map: MapIo<'a>,
     pub compat: bool,
@@ -1840,8 +1928,9 @@ pub struct PathIo<'a> {
     pub ptys: Option<crate::pty::Remote>,
     /// `O_TMPFILE`'s names, numbered per process.
     pub tmpfiles: &'a std::sync::atomic::AtomicU64,
-    /// What `mkdir` leaves out of the mode it is asked for.
-    pub umask: &'a std::sync::atomic::AtomicU32,
+    /// The calling thread's fs_struct: `chdir`'s, `umask`'s, and what
+    /// `mkdir` leaves out of the mode it is asked for.
+    pub fs: Arc<FsCwd>,
     /// For `utimensat`'s "now".
     pub clock: ClockFn,
 }
@@ -1849,37 +1938,87 @@ pub struct PathIo<'a> {
 thread_local! {
     /// The directory descriptors this thread's path call resolved through,
     /// and their filesystems' rename epochs then ([`PathIo::call`]).
-    static DIRS_SEEN: std::cell::RefCell<Vec<(i32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DIRS_SEEN: std::cell::RefCell<Vec<Seen>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A directory a path call resolved through, and how many times it had
+/// moved then: a descriptor's, or the working directory.
+#[derive(Clone, Copy)]
+enum Seen {
+    Fd(i32, u64),
+    Cwd(u64),
 }
 
 impl PathIo<'_> {
     /// The path call `n` (canonical; [`is_path`]), or `None` for another.
     ///
-    /// A descriptor's directory is found where it is now and the call then
-    /// resolves through that path, two steps: a directory renamed between
-    /// them leaves the call looking where the directory was. So a call
-    /// through a directory descriptor that finds nothing (`ENOENT`,
-    /// `ENOTDIR`) while a directory was renamed on that filesystem is made
-    /// again, as Linux's lookup by the directory itself would not have
-    /// missed (Linux's own path walk retries on its rename seqlock the same
-    /// way). A miss has done nothing to undo. Bounded: a directory renamed
-    /// without pause by another thread can still make a call miss.
+    /// A descriptor's directory, or the working directory, is found where
+    /// it is now and the call then resolves through that path, two steps:
+    /// a directory renamed between them leaves the call looking where the
+    /// directory was. So a call through a directory descriptor or relative
+    /// to the working directory that finds nothing (`ENOENT`, `ENOTDIR`)
+    /// while that directory moved is made again, as Linux's lookup by the directory itself would not have
+    /// missed. A miss has done nothing to undo. After a few such tries the
+    /// call is made with the directories' filesystems' renames held off
+    /// (`FileHandle::hold_renames`, the filesystem's own lock, not the
+    /// kernel's), so it cannot miss for a rename: Linux's walk, after its
+    /// optimistic tries on the rename seqlock, falls back to `rename_lock`
+    /// the same way.
     pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
-        for _ in 0..64 {
+        let mut seen = Vec::new();
+        for _ in 0..8 {
             DIRS_SEEN.with(|d| d.borrow_mut().clear());
             let r = self.call_once(m, n, a)?;
             if !matches!(r, Err(Errno::ENOENT) | Err(Errno::ENOTDIR)) {
                 return Some(r);
             }
-            let seen = DIRS_SEEN.with(|d| std::mem::take(&mut *d.borrow_mut()));
-            let raced = seen.iter().any(|&(fd, epoch)| {
-                self.map.fds.get(fd).ok().and_then(|f| f.dir_at().ok().flatten()).is_some_and(|(_, now)| now != epoch)
+            seen = DIRS_SEEN.with(|d| std::mem::take(&mut *d.borrow_mut()));
+            let raced = seen.iter().any(|&s| match s {
+                Seen::Fd(fd, epoch) => {
+                    self.map.fds.get(fd).ok().and_then(|f| f.dir_at().ok().flatten()).is_some_and(|(_, now)| now != epoch)
+                }
+                Seen::Cwd(epoch) => self.cwd_moves() != Some(epoch),
             });
             if !raced {
                 return Some(r);
             }
         }
-        self.call_once(m, n, a)
+        // Still racing: once more with the directories' filesystems'
+        // renames held off, so the directory found is where the call looks.
+        // Released however the call ends.
+        struct Held(Vec<Arc<dyn crate::vfs::FileHandle>>, i32);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.hold_renames(self.1, false);
+                    crate::vfs::note_own_hold(false);
+                }
+            }
+        }
+        let mut held = Held(Vec::new(), self.pid);
+        for s in seen {
+            let h = match s {
+                Seen::Fd(fd, _) => self.map.fds.get(fd).ok().map(|f| Arc::clone(&f.handle)),
+                Seen::Cwd(_) => self.fs.dir(),
+            };
+            if let Some(h) = h {
+                if h.hold_renames(self.pid, true) {
+                    crate::vfs::note_own_hold(true);
+                    held.0.push(h);
+                }
+            }
+        }
+        let r = self.call_once(m, n, a);
+        drop(held);
+        r
+    }
+
+    /// How many times the working directory has moved, now.
+    fn cwd_moves(&self) -> Option<u64> {
+        match self.fs.dir()?.moved()? {
+            Ok(m) => Some(m.epoch),
+            Err(_) => None,
+        }
     }
 
     fn call_once(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
@@ -1894,6 +2033,11 @@ impl PathIo<'_> {
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::CHDIR => self.sys_chdir(m, a[0]),
+            nr::FCHDIR => self.sys_fchdir(a[0] as i32),
+            // There is one process's view of the world and nothing consults
+            // a umask, but a program that sets one wants the old value back.
+            nr::UMASK => Ok(self.fs.set_umask(a[0] as u32) as u64),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::RENAMEAT2 => self.sys_renameat2(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
@@ -2247,13 +2391,59 @@ impl PathIo<'_> {
     }
 
     pub fn getcwd(&self, m: &mut GuestMem<'_>, buf: u64, size: u64) -> SysResult {
-        let mut bytes = self.cwd.to_string().into_bytes();
+        // Removed: Linux's `getcwd` says so.
+        let cwd = self.fs.get();
+        if cwd == GONE_CWD {
+            return Err(Errno::ENOENT);
+        }
+        let mut bytes = cwd.into_bytes();
         bytes.push(0);
         if bytes.len() as u64 > size {
             return Err(Errno::ERANGE);
         }
         m.write(buf, &bytes)?;
         Ok(bytes.len() as u64)
+    }
+
+    /// `chdir`: the calling thread's fs_struct's directory, held by
+    /// identity (the open directory), so it follows a rename as Linux's
+    /// does.
+    pub fn sys_chdir(&self, m: &GuestMem<'_>, path: u64) -> SysResult {
+        let raw = m.read_cstr(path, 4096)?;
+        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let abs = self.at_path_str(AT_FDCWD, &p)?;
+        self.enter(abs, None)
+    }
+
+    /// `fchdir`: the working directory named by a descriptor, where the
+    /// directory is now. coreutils' `mkdir -p` needs this: gnulib's
+    /// `savewd` returns between components with `fchdir`.
+    pub fn sys_fchdir(&self, fd: i32) -> SysResult {
+        let file = self.map.fds.get(fd)?;
+        let path = file.dir_path()?.unwrap_or_else(|| file.path.clone());
+        // A pipe or a socket has a name that is not a path. `ENOTDIR` is
+        // what Linux says about a descriptor that is not a directory.
+        if !path.starts_with('/') {
+            return Err(Errno::ENOTDIR);
+        }
+        let held = file.handle.moved().is_some().then(|| Arc::clone(&file.handle));
+        self.enter(path, held)
+    }
+
+    /// Make `abs` the fs_struct's directory: it must be one. Held through
+    /// `dir`, or a handle opened on it here.
+    fn enter(&self, abs: String, dir: Option<Arc<dyn crate::vfs::FileHandle>>) -> SysResult {
+        // Followed through its links: the directory, by the name it has.
+        let md = self.ns.metadata(&abs)?;
+        if md.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let dir = dir.or_else(|| self.ns.open(&abs, oflags::O_RDONLY | oflags::O_DIRECTORY, 0).ok());
+        self.fs.set(abs, dir);
+        Ok(0)
     }
 
     /// How the path at `ptr` ends, which normalising loses: with a slash
@@ -2332,7 +2522,7 @@ impl PathIo<'_> {
         if Self::path_tail(m, path)?.1 != 0 {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
         }
-        self.ns.mkdir(&p, mode & !self.umask.load(std::sync::atomic::Ordering::Relaxed)).map(|_| 0)
+        self.ns.mkdir(&p, mode & !self.fs.umask()).map(|_| 0)
     }
 
     pub fn sys_unlinkat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
@@ -2528,8 +2718,15 @@ impl PathIo<'_> {
         if p.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let abs = if p.starts_with('/') || dirfd == AT_FDCWD {
-            crate::vfs::normalize(&p, self.cwd)
+        let abs = if p.starts_with('/') {
+            crate::vfs::normalize(&p, "/")
+        } else if dirfd == AT_FDCWD {
+            // Relative to the working directory, where it is now.
+            let (cwd, moves) = self.fs.get_seen();
+            if let Some(moves) = moves {
+                DIRS_SEEN.with(|d| d.borrow_mut().push(Seen::Cwd(moves)));
+            }
+            crate::vfs::normalize(&p, &cwd)
         } else {
             self.at_dir_path(dirfd, &p)?
         };
@@ -2568,7 +2765,7 @@ impl PathIo<'_> {
         // descriptor that is not a directory is ENOTDIR.
         let f = self.map.fds.get(dirfd)?;
         if let Some((base, epoch)) = f.dir_at()? {
-            DIRS_SEEN.with(|d| d.borrow_mut().push((dirfd, epoch)));
+            DIRS_SEEN.with(|d| d.borrow_mut().push(Seen::Fd(dirfd, epoch)));
             return Ok(crate::vfs::normalize(p, &base));
         }
         if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
@@ -3038,6 +3235,9 @@ fn is_path(n: u64) -> bool {
             | nr::FCHMODAT
             | nr::FCHOWN
             | nr::FCHOWNAT
+            | nr::CHDIR
+            | nr::FCHDIR
+            | nr::UMASK
     )
 }
 
@@ -3103,6 +3303,9 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::LINK | x::LINKAT => nr::LINKAT,
             x::SYMLINK | x::SYMLINKAT => nr::SYMLINKAT,
             x::UTIMENSAT | x::UTIMENSAT_TIME64 => nr::UTIMENSAT,
+            x::CHDIR => nr::CHDIR,
+            x::FCHDIR => nr::FCHDIR,
+            x::UMASK => nr::UMASK,
             x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::LCHOWN16 | x::FCHOWNAT => nr::FCHOWNAT,
@@ -3161,6 +3364,9 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::LINK | x::LINKAT => nr::LINKAT,
             x::SYMLINK | x::SYMLINKAT => nr::SYMLINKAT,
             x::UTIMENSAT => nr::UTIMENSAT,
+            x::CHDIR => nr::CHDIR,
+            x::FCHDIR => nr::FCHDIR,
+            x::UMASK => nr::UMASK,
             x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::FCHOWNAT => nr::FCHOWNAT,
@@ -4572,10 +4778,16 @@ impl Kernel {
     /// `execve`. A thread that had its own (`unshare(CLONE_FS)`) makes its
     /// directory the process's; the other threads' go with them.
     pub fn exec_signals(&mut self, tid: i32) {
-        if let Some(cwd) = self.call_cwd.take() {
-            self.vfs.put_cwd(cwd);
+        if let Some(fs) = self.call_fs.take() {
+            if !Arc::ptr_eq(&fs, &self.proc_fs) {
+                self.proc_fs.copy_from(&fs);
+            }
         }
         self.thread_fs.clear();
+        let cwd = self.proc_fs.get();
+        if cwd != self.vfs.cwd {
+            self.vfs.put_cwd(cwd);
+        }
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
         self.thread_signals.clear();
@@ -4671,9 +4883,9 @@ impl Kernel {
             wasm32: false,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
-            call_cwd: None,
+            call_fs: None,
             tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            umask: Arc::new(std::sync::atomic::AtomicU32::new(0o022)),
+            proc_fs: Arc::new(FsCwd::new("/".to_string())),
             rlimits: default_rlimits(),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
@@ -4868,18 +5080,46 @@ impl Kernel {
     /// other. The VMA tree is copied because the child gets its own address
     /// space, and the child list starts empty because a grandchild is not the
     /// parent's to reap.
+    /// The fs_struct of the thread whose context is at `ctx`: its own, or
+    /// the process's.
+    pub fn fs_of(&self, ctx: u64) -> Arc<FsCwd> {
+        self.thread_fs.of(ctx).unwrap_or_else(|| Arc::clone(&self.proc_fs))
+    }
+
+    /// The fs_struct of the thread making the call: in a call, the calling
+    /// thread's; after one (the host carrying out its `fork` or `execve`),
+    /// the one that call was made with.
+    pub fn caller_fs(&self) -> Arc<FsCwd> {
+        if self.vfs.in_thread_cwd() {
+            return self.fs_of(self.ctx_addr);
+        }
+        self.call_fs.clone().unwrap_or_else(|| Arc::clone(&self.proc_fs))
+    }
+
     /// The working directory of the calling thread's fs_struct: what a
     /// `fork` (which copies the caller's) starts in.
     pub fn caller_cwd(&self) -> String {
-        match &self.call_cwd {
-            Some(cwd) if !self.vfs.in_thread_cwd() => cwd.clone(),
-            _ => self.vfs.cwd.clone(),
-        }
+        self.caller_fs().get()
+    }
+
+    /// The process's working directory, where it is now.
+    pub fn cwd(&self) -> String {
+        self.proc_fs.get()
+    }
+
+    /// Make `path` the process's working directory (a host starting a
+    /// process there), held by identity as `chdir` holds it.
+    pub fn set_cwd(&mut self, path: &str) -> Result<(), Errno> {
+        self.vfs.set_cwd(path)?;
+        let abs = self.vfs.cwd.clone();
+        let dir = self.vfs.open(&abs, oflags::O_RDONLY | oflags::O_DIRECTORY, 0).ok();
+        self.proc_fs.set(abs, dir);
+        Ok(())
     }
 
     pub fn fork_kernel(&self) -> Kernel {
         let mut child = self.fork_kernel_inner();
-        let cwd = self.caller_cwd();
+        let cwd = child.proc_fs.get();
         if cwd != child.vfs.cwd {
             child.vfs.put_cwd(cwd);
         }
@@ -4940,9 +5180,11 @@ impl Kernel {
             wasm32: self.wasm32,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
-            call_cwd: None,
+            call_fs: None,
             tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(self.tmpfiles.load(std::sync::atomic::Ordering::Relaxed))),
-            umask: Arc::new(std::sync::atomic::AtomicU32::new(self.umask.load(std::sync::atomic::Ordering::Relaxed))),
+            // The calling thread's fs_struct, copied: a fork's directory and
+            // umask are its caller's.
+            proc_fs: Arc::new(self.caller_fs().copy()),
             rlimits: self.rlimits,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
@@ -5028,7 +5270,7 @@ impl Kernel {
         let fs = if flags & clone_flags::FS != 0 {
             self.thread_fs.of(parent)
         } else {
-            Some(Arc::new(FsCwd::new(self.vfs.cwd.clone())))
+            Some(Arc::new(self.fs_of(parent).copy()))
         };
         self.thread_fs.set(child, fs);
         // The new thread's signal state: its creator's mask, nothing pending.
@@ -5073,28 +5315,22 @@ impl Kernel {
     }
 
     fn syscall_cwd(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
-        // A thread with a working directory of its own (`unshare(CLONE_FS)`)
-        // has it in `vfs` while its call runs.
+        // The calling thread's working directory is in `vfs` while its call
+        // runs: what its relative paths resolve against. The fs_struct
+        // holds it (a `chdir` changes it there, `PathIo`).
         let me = self.ctx_addr;
-        let hands_on = |out: &SyscallOutcome| matches!(out, SyscallOutcome::SpawnProcess { .. } | SyscallOutcome::Exec { .. });
-        let Some(fs) = self.thread_fs.of(me) else {
-            let out = self.syscall_inner(m, pc);
-            if hands_on(&out) {
-                // An `unshare` in the call may have given it one.
-                self.call_cwd = self.thread_fs.of(me).map(|fs| fs.get());
-            }
-            return out;
-        };
-        self.vfs.enter_cwd(fs.get());
+        self.vfs.enter_cwd(self.fs_of(me).get());
         let out = self.syscall_inner(m, pc);
-        let cwd = self.vfs.leave_cwd();
-        if hands_on(&out) {
-            self.call_cwd = Some(cwd.clone());
+        self.vfs.leave_cwd();
+        if matches!(out, SyscallOutcome::SpawnProcess { .. } | SyscallOutcome::Exec { .. }) {
+            // An `unshare` in the call may have given it its own.
+            self.call_fs = Some(self.fs_of(me));
         }
-        // Into the thread's fs_struct as it is now (an `unshare` in the call
-        // gave it a new one).
-        if let Some(fs) = self.thread_fs.of(me) {
-            fs.set(cwd);
+        // The namespace's own directory follows the process's, for what is
+        // resolved outside a call.
+        let cwd = self.proc_fs.get();
+        if cwd != self.vfs.cwd {
+            self.vfs.put_cwd(cwd);
         }
         out
     }
@@ -5554,7 +5790,8 @@ impl Kernel {
         PathIo {
             ns: &self.vfs,
             view: self.vfs.view(),
-            cwd: &self.vfs.cwd,
+            // In a call, the calling thread's (entered into the namespace
+            // for it); outside one, the process's.
             map: self.map_io(),
             compat: self.compat,
             pid: self.pid,
@@ -5563,7 +5800,7 @@ impl Kernel {
             procs: &self.procs,
             ptys: self.ptys,
             tmpfiles: &self.tmpfiles,
-            umask: &self.umask,
+            fs: self.fs_of(self.ctx_addr),
             clock: self.clock,
         }
     }
@@ -5846,8 +6083,6 @@ impl Kernel {
             // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
             // and refuses to write any file-backed database.
             nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::CHDIR => self.sys_chdir(m, a[0]),
-            nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             // Only a thread's own working directory (CLONE_FS) is unshared;
             // a private descriptor table or namespace is not supported.
             nr::UNSHARE => {
@@ -5856,7 +6091,7 @@ impl Kernel {
                 } else {
                     if a[0] & 0x200 != 0 {
                         // A copy of the directory it had, its own from now.
-                        self.thread_fs.set(self.ctx_addr, Some(Arc::new(FsCwd::new(self.vfs.cwd.clone()))));
+                        self.thread_fs.set(self.ctx_addr, Some(Arc::new(self.fs_of(self.ctx_addr).copy())));
                     }
                     Ok(0)
                 }
@@ -5865,7 +6100,6 @@ impl Kernel {
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
-            nr::UMASK => Ok(self.umask.swap(a[0] as u32 & 0o777, std::sync::atomic::Ordering::Relaxed) as u64),
 
             // -- memory ------------------------------------------------------
             nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
@@ -7442,32 +7676,6 @@ impl Kernel {
 
 
 
-    fn sys_chdir(&mut self, m: &GuestMem<'_>, path: u64) -> SysResult {
-        let raw = m.read_cstr(path, 4096)?;
-        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
-        if p.is_empty() {
-            return Err(Errno::ENOENT);
-        }
-        self.vfs.set_cwd(&p).map(|_| 0)
-    }
-
-    /// `fchdir`: the working directory named by a descriptor.
-    ///
-    /// The descriptor already knows the absolute path it was opened as, and
-    /// `set_cwd` re-checks it is a directory (the error a descriptor on a
-    /// regular file must produce). coreutils' `mkdir -p` needs this: gnulib's
-    /// `savewd` returns between components with `fchdir`.
-    fn sys_fchdir(&mut self, fd: i32) -> SysResult {
-        let file = self.fds.get(fd)?;
-        // Where the directory is now, if it has moved since it was opened.
-        let path = file.dir_path()?.unwrap_or_else(|| file.path.clone());
-        // A pipe or a socket has a name that is not a path. `ENOTDIR` is
-        // what Linux says about a descriptor that is not a directory.
-        if !path.starts_with('/') {
-            return Err(Errno::ENOTDIR);
-        }
-        self.vfs.set_cwd(&path).map(|_| 0)
-    }
 
 
 
@@ -9579,7 +9787,7 @@ mod tests {
         // Not in the class: declined before anything is done.
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::FCHDIR, &[rfd]);
+        set_args(&mut m, at, nr::SETSID, &[]);
         assert!(free(&k, &mut m, at).is_none());
 
         // An empty pipe parks both ways, on the same stream.
@@ -10760,6 +10968,77 @@ mod tests {
             ]
         );
         assert!(tail[5] > tail[1], "an open through the moved directory: {}", tail[5]);
+    }
+
+    /// `chdir`, `fchdir` and `umask` through the lock-free path answer as
+    /// the full call does, and a working directory is held by identity: it
+    /// follows a rename of itself or of a directory above it, and once
+    /// removed `getcwd` and relative lookups say `ENOENT`, as on Linux.
+    #[test]
+    fn a_working_directory_follows_its_renames() {
+        if gex_abi::PPC {
+            return;
+        }
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            let names: [&[u8]; 8] = [b"/a\0", b"/a/b\0", b"/a/b/s\0", b"/c\0", b"f\0", b"/c/b/f\0", b"/c/b\0", b"s\0"];
+            let ptr = |i: usize| 0x20000u64 + 0x100 * i as u64;
+            for (i, t) in names.iter().enumerate() {
+                m.write(ptr(i), t).unwrap();
+            }
+            let (a, ab, abs_, c, f, cbf, cb, s) = (ptr(0), ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7));
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, a, 0o755]));
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, ab, 0o755]));
+            got.push(sys(&mut m, &mut k, nr::UMASK, &[0o077]));
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, abs_, 0o777]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, abs_, 0x22000, 0]));
+            got.push(m.read_u32(0x22000 + if gex_abi::X86 { 24 } else { 16 }).unwrap() as i64 & 0o777);
+            got.push(sys(&mut m, &mut k, nr::CHDIR, &[ab]));
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT, &[cwd, a, cwd, c]));
+            got.push(sys(&mut m, &mut k, nr::GETCWD, &[0x25000, 64]));
+            got.extend(m.read(0x25000, 6).unwrap().iter().map(|&b| b as i64));
+            let file = sys(&mut m, &mut k, nr::OPENAT, &[cwd, f, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            got.push((file >= 3) as i64);
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, cbf, 0x22000, 0]));
+            // fchdir to the root and back through a descriptor on /c/b.
+            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, cb, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
+            m.write(0x26000, b"/\0").unwrap();
+            got.push(sys(&mut m, &mut k, nr::CHDIR, &[0x26000]));
+            got.push(sys(&mut m, &mut k, nr::FCHDIR, &[dir as u64]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, f, 0x22000, 0]));
+            // Removed under it.
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, cbf, 0]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, s, AT_REMOVEDIR]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, cb, AT_REMOVEDIR]));
+            got.push(sys(&mut m, &mut k, nr::GETCWD, &[0x25000, 64]));
+            got.push(sys(&mut m, &mut k, nr::OPENAT, &[cwd, f, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]));
+            got.push(sys(&mut m, &mut k, nr::UMASK, &[0o022]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let e = |x: Errno| -(x.0 as i64);
+        let mut want = vec![0, 0, 0o022, 0, 0, 0o700, 0, 0, 5];
+        want.extend(b"/c/b\0\0".iter().map(|&b| b as i64));
+        want.extend([1, 0, 0, 0, 0, 0, 0, 0, e(Errno::ENOENT), e(Errno::ENOENT), 0o077]);
+        assert_eq!(seen[0], want);
     }
 
     /// The 32-bit ABI's path calls through the lock-free path, in their

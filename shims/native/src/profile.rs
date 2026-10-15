@@ -612,7 +612,7 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
         const AT_FDCWD: u64 = (-100i64) as u64;
         let dir = state.with_kernel(|k| {
             if dirfd == AT_FDCWD {
-                Some(k.vfs.cwd.clone())
+                Some(k.cwd())
             } else {
                 k.fds.get(dirfd as i32).ok().map(|f| f.path.clone())
             }

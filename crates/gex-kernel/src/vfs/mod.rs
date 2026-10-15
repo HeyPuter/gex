@@ -156,7 +156,6 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn remote_id(&self) -> Option<i32> {
         None
     }
-    /// List a directory. Only directories implement this.
     /// Where a directory opened here is now, for a descriptor that relative
     /// paths resolve through (`openat(dirfd, ...)`, `fchdir`), or `ENOENT`
     /// once it is removed. Linux resolves such a descriptor by the
@@ -166,6 +165,23 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn moved(&self) -> Option<Result<Moved, Errno>> {
         None
     }
+    /// How many directories this handle's filesystem has renamed or removed, read
+    /// without a lock: while it stays the same, a directory's path found
+    /// by [`FileHandle::moved`] still stands (a working directory keeps its
+    /// path this way, `FsCwd`). `None` for a filesystem that does not count.
+    fn rename_epoch(&self) -> Option<u64> {
+        None
+    }
+    /// Hold off the renames of directories on this handle's filesystem
+    /// (`on`), or let them go again, for process `owner`: its rename lock,
+    /// taken shared. What a lookup through a directory descriptor that kept
+    /// racing renames falls back to, as Linux's walk falls back to
+    /// `rename_lock` (`PathIo::call`). Whether the filesystem has one.
+    fn hold_renames(&self, owner: i32, on: bool) -> bool {
+        let _ = (owner, on);
+        false
+    }
+    /// List a directory. Only directories implement this.
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
     }
@@ -394,6 +410,113 @@ impl FileHandle for PathHandle {
     }
 }
 
+static OWNER_ALIVE: std::sync::OnceLock<fn(i32) -> bool> = std::sync::OnceLock::new();
+
+/// How a filesystem shared by several processes tells whether the process
+/// holding its directory renames off is still there
+/// ([`FileHandle::hold_renames`]): one that ended without letting go holds
+/// nothing. The first call wins; without one every holder is.
+pub fn set_owner_alive(alive: fn(i32) -> bool) {
+    let _ = OWNER_ALIVE.set(alive);
+}
+
+thread_local! {
+    /// The holds this thread has taken: a rename it makes itself does not
+    /// wait for them. Counted by the caller of `hold_renames` (`PathIo`),
+    /// on its own thread: the global kernel's thread-locals are not one per
+    /// thread of the process calling it, so a remote rename carries the
+    /// count with it.
+    static OWN_HOLDS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// The holds the calling thread has taken ([`FileHandle::hold_renames`]).
+pub fn own_holds() -> u32 {
+    OWN_HOLDS.with(|h| h.get())
+}
+
+/// The calling thread took a hold (`on`) or let one go.
+pub fn note_own_hold(on: bool) {
+    OWN_HOLDS.with(|h| h.set(if on { h.get() + 1 } else { h.get().saturating_sub(1) }));
+}
+
+/// A filesystem's rename lock (Linux's `rename_lock`, per filesystem): the
+/// count of its directories renamed or removed, read without a lock
+/// ([`FileHandle::rename_epoch`]), and the lookups holding directory renames
+/// off, by process ([`FileHandle::hold_renames`]). A directory rename runs
+/// in [`RenameGate::rename`], which waits while another thread holds, and a
+/// hold waits for a rename under way.
+#[derive(Debug, Default)]
+pub struct RenameGate {
+    renamed: std::sync::atomic::AtomicU64,
+    holds: std::sync::Mutex<std::collections::BTreeMap<i32, u32>>,
+}
+
+impl RenameGate {
+    pub fn epoch(&self) -> u64 {
+        self.renamed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A directory renamed or removed.
+    pub fn bump(&self) {
+        self.renamed.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<i32, u32>> {
+        self.holds.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`FileHandle::hold_renames`].
+    pub fn hold(&self, owner: i32, on: bool) {
+        let mut holds = self.lock();
+        if on {
+            *holds.entry(owner).or_insert(0) += 1;
+        } else if let Some(n) = holds.get_mut(&owner) {
+            *n -= 1;
+            if *n == 0 {
+                holds.remove(&owner);
+            }
+        }
+    }
+
+    /// Run `f`, a directory rename (`dir`) or another, once no thread but
+    /// the caller, which holds `own`, holds directory renames off: a
+    /// lookup's few calls, made after it raced renames many times over. A
+    /// rename that moved a directory counts ([`RenameGate::epoch`]).
+    pub fn rename<T>(&self, own: u32, dir: bool, f: impl FnOnce() -> Result<T, Errno>) -> Result<T, Errno> {
+        if !dir {
+            return f();
+        }
+        let holds = loop {
+            let mut holds = self.lock();
+            if !Self::held_by_others(&mut holds, own) {
+                break holds;
+            }
+            drop(holds);
+            std::thread::yield_now();
+            core::hint::spin_loop();
+        };
+        let r = f();
+        if r.is_ok() {
+            self.bump();
+        }
+        drop(holds);
+        r
+    }
+
+    /// Whether a thread other than this one holds, a holder that has ended
+    /// forgotten.
+    fn held_by_others(holds: &mut std::collections::BTreeMap<i32, u32>, own: u32) -> bool {
+        if holds.is_empty() {
+            return false;
+        }
+        if let Some(alive) = OWNER_ALIVE.get() {
+            holds.retain(|pid, _| alive(*pid));
+        }
+        let all: u32 = holds.values().sum();
+        all > own
+    }
+}
+
 /// Where an open directory is ([`FileHandle::moved`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Moved {
@@ -405,6 +528,28 @@ pub struct Moved {
     /// above it: a lookup through the path that missed while this changed
     /// raced a rename, and is made again (`PathIo::call`).
     pub epoch: u64,
+}
+
+impl Moved {
+    /// The absolute path the directory has now, given the absolute path it
+    /// was opened at: the mount's part of that path does not change. `None`
+    /// when the directory was opened through a symlink among the
+    /// directories of its path (the path does not end in `was`).
+    pub fn path_from(&self, opened: &str) -> Option<String> {
+        if self.was == self.now {
+            return Some(opened.to_string());
+        }
+        let mount = if self.was.is_empty() {
+            opened
+        } else {
+            opened.strip_suffix(self.was.as_str())?.strip_suffix('/')?
+        };
+        Some(match (mount, self.now.as_str()) {
+            ("", "") => "/".to_string(),
+            (m, "") => m.to_string(),
+            (m, now) => format!("{m}/{now}"),
+        })
+    }
 }
 
 /// A mounted filesystem.

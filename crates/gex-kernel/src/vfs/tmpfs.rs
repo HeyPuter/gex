@@ -342,9 +342,24 @@ impl Inner {
     }
 }
 
+/// The tree, and its rename lock ([`super::RenameGate`]), taken before the
+/// tree's.
+#[derive(Debug)]
+struct Shared {
+    m: Mutex<Inner>,
+    gate: super::RenameGate,
+}
+
+impl std::ops::Deref for Shared {
+    type Target = Mutex<Inner>;
+    fn deref(&self) -> &Mutex<Inner> {
+        &self.m
+    }
+}
+
 /// An in-memory filesystem.
 pub struct TmpFs {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Shared>,
 }
 
 impl TmpFs {
@@ -368,6 +383,97 @@ impl TmpFs {
         }
     }
 
+    /// How many directories have been renamed here
+    /// ([`FileHandle::rename_epoch`]).
+    pub fn renames(&self) -> u64 {
+        self.inner.gate.epoch()
+    }
+
+    /// [`FileSystem::rename2`] by a caller holding `own` of the directory
+    /// renames held off ([`super::own_holds`]; the global kernel's caller
+    /// says, `k_fs_rename`). A directory moves under the rename lock, which
+    /// waits while another thread's lookup holds directory renames off.
+    /// What `from` is is checked again under the tree's lock: `EAGAIN` from
+    /// `rename_locked` is "it changed meanwhile".
+    pub fn rename2_as(&self, from: &str, to: &str, noreplace: bool, own: u32) -> Result<(), Errno> {
+        loop {
+            let dir = matches!(self.inner.lock().unwrap().nodes.get(from), Some(Node::Dir));
+            match self.inner.gate.rename(own, dir, || self.rename_locked(from, to, noreplace, dir)) {
+                Err(Errno::EAGAIN) => continue,
+                r => return r,
+            }
+        }
+    }
+
+    fn rename_locked(&self, from: &str, to: &str, noreplace: bool, dir: bool) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(node) = inner.nodes.get(from) else {
+            return Err(Errno::ENOENT);
+        };
+        let is_dir = matches!(node, Node::Dir);
+        if is_dir != dir {
+            return Err(Errno::EAGAIN);
+        }
+        let parent = to.rfind('/').map_or("", |i| &to[..i]);
+        if !matches!(inner.nodes.get(parent), Some(Node::Dir)) {
+            return Err(if inner.nodes.contains_key(parent) { Errno::ENOTDIR } else { Errno::ENOENT });
+        }
+        if from == to {
+            return if noreplace { Err(Errno::EEXIST) } else { Ok(()) };
+        }
+        if is_dir && to.starts_with(from) && (from.is_empty() || to.as_bytes().get(from.len()) == Some(&b'/')) {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(dst) = inner.nodes.get(to) {
+            if noreplace {
+                return Err(Errno::EEXIST);
+            }
+            match (is_dir, matches!(dst, Node::Dir)) {
+                (false, true) => return Err(Errno::EISDIR),
+                (true, false) => return Err(Errno::ENOTDIR),
+                (true, true) if inner.has_children(to) => return Err(Errno::ENOTEMPTY),
+                _ => {}
+            }
+            // Two names for one file: Linux leaves both.
+            if !is_dir && inner.inos.get(from).is_some() && inner.inos.get(from) == inner.inos.get(to) {
+                return Ok(());
+            }
+            inner.forget(to);
+        }
+        let node = inner.nodes.remove(from).unwrap();
+        let ino = inner.inos.remove(from).unwrap_or(1);
+        // The mode travels with the name. `dpkg` unpacks a program to
+        // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
+        // mode behind here means every binary a package installs arrives
+        // without its execute bit, and the failure surfaces later as a shell
+        // saying the program does not exist.
+        if let Some(m) = inner.modes.remove(from) {
+            inner.modes.insert(to.to_string(), m);
+        }
+        if let Some(t) = inner.mtimes.remove(from) {
+            inner.mtimes.insert(to.to_string(), t);
+        }
+        inner.nodes.insert(to.to_string(), node);
+        inner.inos.insert(to.to_string(), ino);
+        if is_dir {
+            inner.move_under(from, to);
+            // It and every directory under it are somewhere else now.
+            let lo = format!("{to}/");
+            let hi = format!("{to}0");
+            let mut moved: Vec<u64> = inner
+                .nodes
+                .range::<String, _>(lo..hi)
+                .filter(|(_, n)| matches!(n, Node::Dir))
+                .filter_map(|(k, _)| inner.inos.get(k).copied())
+                .collect();
+            moved.push(ino);
+            for i in moved {
+                *inner.moves.entry(i).or_insert(0) += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn new() -> TmpFs {
         let mut inner = Inner {
             next_ino: 2,
@@ -376,7 +482,7 @@ impl TmpFs {
         inner.nodes.insert(String::new(), Node::Dir);
         inner.set_ino(String::new(), 1);
         TmpFs {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(Shared { m: Mutex::new(inner), gate: Default::default() }),
         }
     }
 
@@ -537,7 +643,7 @@ impl Default for TmpFs {
 /// A handle onto one tmpfs node.
 #[derive(Debug)]
 struct TmpHandle {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Shared>,
     path: String,
     /// The contents, when this handle is onto a file. Held directly, so the
     /// descriptor keeps working after the name is unlinked or renamed.
@@ -773,6 +879,15 @@ impl FileHandle for TmpHandle {
         Some(inner.chmod(&path, mode))
     }
 
+    fn rename_epoch(&self) -> Option<u64> {
+        Some(self.inner.gate.epoch())
+    }
+
+    fn hold_renames(&self, owner: i32, on: bool) -> bool {
+        self.inner.gate.hold(owner, on);
+        true
+    }
+
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {
         let ino = self.dir?;
         let inner = self.inner.lock().unwrap();
@@ -962,6 +1077,9 @@ impl FileSystem for TmpFs {
         inner.nodes.remove(path);
         inner.drop_ino(path);
         inner.modes.remove(path);
+        // A directory gone is a directory whose path changed, for whoever
+        // holds it ([`FileHandle::rename_epoch`]).
+        self.inner.gate.bump();
         Ok(())
     }
 
@@ -977,69 +1095,7 @@ impl FileSystem for TmpFs {
     /// file over a directory (`EISDIR`); a destination whose directory is
     /// not there (`ENOENT`).
     fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(node) = inner.nodes.get(from) else {
-            return Err(Errno::ENOENT);
-        };
-        let is_dir = matches!(node, Node::Dir);
-        let parent = to.rfind('/').map_or("", |i| &to[..i]);
-        if !matches!(inner.nodes.get(parent), Some(Node::Dir)) {
-            return Err(if inner.nodes.contains_key(parent) { Errno::ENOTDIR } else { Errno::ENOENT });
-        }
-        if from == to {
-            return if noreplace { Err(Errno::EEXIST) } else { Ok(()) };
-        }
-        if is_dir && to.starts_with(from) && (from.is_empty() || to.as_bytes().get(from.len()) == Some(&b'/')) {
-            return Err(Errno::EINVAL);
-        }
-        if let Some(dst) = inner.nodes.get(to) {
-            if noreplace {
-                return Err(Errno::EEXIST);
-            }
-            match (is_dir, matches!(dst, Node::Dir)) {
-                (false, true) => return Err(Errno::EISDIR),
-                (true, false) => return Err(Errno::ENOTDIR),
-                (true, true) if inner.has_children(to) => return Err(Errno::ENOTEMPTY),
-                _ => {}
-            }
-            // Two names for one file: Linux leaves both.
-            if !is_dir && inner.inos.get(from).is_some() && inner.inos.get(from) == inner.inos.get(to) {
-                return Ok(());
-            }
-            inner.forget(to);
-        }
-        let node = inner.nodes.remove(from).unwrap();
-        let ino = inner.inos.remove(from).unwrap_or(1);
-        // The mode travels with the name. `dpkg` unpacks a program to
-        // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
-        // mode behind here means every binary a package installs arrives
-        // without its execute bit, and the failure surfaces later as a shell
-        // saying the program does not exist.
-        if let Some(m) = inner.modes.remove(from) {
-            inner.modes.insert(to.to_string(), m);
-        }
-        if let Some(t) = inner.mtimes.remove(from) {
-            inner.mtimes.insert(to.to_string(), t);
-        }
-        inner.nodes.insert(to.to_string(), node);
-        inner.inos.insert(to.to_string(), ino);
-        if is_dir {
-            inner.move_under(from, to);
-            // It and every directory under it are somewhere else now.
-            let lo = format!("{to}/");
-            let hi = format!("{to}0");
-            let mut moved: Vec<u64> = inner
-                .nodes
-                .range::<String, _>(lo..hi)
-                .filter(|(_, n)| matches!(n, Node::Dir))
-                .filter_map(|(k, _)| inner.inos.get(k).copied())
-                .collect();
-            moved.push(ino);
-            for i in moved {
-                *inner.moves.entry(i).or_insert(0) += 1;
-            }
-        }
-        Ok(())
+        self.rename2_as(from, to, noreplace, super::own_holds())
     }
 
     /// A second name for the same node. The node is behind an `Arc`, so both
@@ -1173,6 +1229,38 @@ mod tests {
         // A file's handle has its node, not a directory to follow.
         fs.add_file("g", vec![]);
         assert_eq!(fs.open("g", 0, 0).unwrap().moved(), None);
+    }
+
+    /// A lookup's hold keeps directories where they are until it lets go;
+    /// files still move, and the holder's own thread is not held off.
+    #[test]
+    fn a_hold_keeps_directory_renames_off() {
+        let fs = Arc::new(TmpFs::new());
+        fs.mkdir("a", 0o755).unwrap();
+        fs.add_file("f", vec![]);
+        let h = fs.open("a", 0, 0).unwrap();
+        assert!(h.hold_renames(7, true));
+        crate::vfs::note_own_hold(true);
+        fs.rename("f", "g").unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = {
+            let (fs, done) = (Arc::clone(&fs), Arc::clone(&done));
+            std::thread::spawn(move || {
+                fs.rename("a", "b").unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!done.load(Ordering::SeqCst), "a directory moved under a hold");
+        assert_eq!(h.moved().unwrap().unwrap().now, "a");
+        // The holder's own renames go through.
+        fs.mkdir("c", 0o755).unwrap();
+        fs.rename("c", "d").unwrap();
+        h.hold_renames(7, false);
+        crate::vfs::note_own_hold(false);
+        t.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(h.moved().unwrap().unwrap().now, "b");
     }
 
     #[test]

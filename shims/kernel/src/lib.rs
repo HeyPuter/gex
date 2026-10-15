@@ -2445,6 +2445,8 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     static ROOT: OnceLock<std::sync::Arc<gex_kernel::vfs::TmpFs>> = OnceLock::new();
     ROOT.get_or_init(|| {
         gex_kernel::vfs::tmpfs::set_lazy_fetch(fetch_lazy);
+        // A process that ended holding directory renames off holds nothing.
+        gex_kernel::vfs::set_owner_alive(|pid| procs().alive(pid));
         let fs = gex_kernel::vfs::TmpFs::new();
         // Directories a guest expects before anything is bundled: `open(O_CREAT)`
         // under a missing directory is `ENOENT`, not a directory being made.
@@ -2764,7 +2766,23 @@ pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, noreplace: u32) -> i32 {
-    as_unit(rootfs().rename2(&path_of(from, from_len), &path_of(to, to_len), noreplace != 0))
+    // Bit 0 is RENAME_NOREPLACE; above it, the holds the caller has taken
+    // (`remote::Remote::rename2`).
+    as_unit(rootfs().rename2_as(&path_of(from, from_len), &path_of(to, to_len), noreplace & 1 != 0, noreplace >> 1))
+}
+
+/// Directories renamed in the root so far (`remote::Remote::rename_epoch`):
+/// one atomic load, no lock.
+#[no_mangle]
+pub extern "C" fn k_fs_rename_epoch() -> i32 {
+    rootfs().renames() as i32
+}
+
+/// Directory renames held off for a lookup (`remote::Remote::hold_renames`).
+#[no_mangle]
+pub extern "C" fn k_fs_hold_renames(handle: i32, owner: i32, on: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    h.hold_renames(owner, on != 0) as i32
 }
 
 /// Where an open directory is now (`remote::Remote::moved`).

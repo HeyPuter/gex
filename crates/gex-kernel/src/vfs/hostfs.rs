@@ -19,6 +19,10 @@ pub struct HostFs {
     read_only: bool,
     /// `root` as the host resolves it, once asked (`HostDir::moved`).
     canon: std::sync::OnceLock<Option<PathBuf>>,
+    /// The rename lock of the renames made through this mount. The host's
+    /// own, and another process's, are not seen by it: a lookup racing
+    /// one of those can still miss.
+    gate: Arc<super::RenameGate>,
 }
 
 impl HostFs {
@@ -27,6 +31,7 @@ impl HostFs {
             root: root.into(),
             read_only: false,
             canon: Default::default(),
+            gate: Default::default(),
         }
     }
 
@@ -35,6 +40,7 @@ impl HostFs {
             root: root.into(),
             read_only: true,
             canon: Default::default(),
+            gate: Default::default(),
         }
     }
 
@@ -181,6 +187,7 @@ struct HostDir {
     /// directory is now is what the host says of the open descriptor
     /// ([`FileHandle::moved`]).
     held: Option<(File, String, PathBuf)>,
+    gate: Arc<super::RenameGate>,
 }
 
 impl FileHandle for HostDir {
@@ -204,7 +211,17 @@ impl FileHandle for HostDir {
         }
         // Moved out of the mount: the path it was opened at is all there is.
         let rel = Path::new(now).strip_prefix(root).ok()?;
-        Some(Ok(super::Moved { was: was.clone(), now: rel.to_str()?.to_string(), epoch: 0 }))
+        // Any directory renamed here counts as this one moving: the host
+        // keeps no count per directory.
+        Some(Ok(super::Moved { was: was.clone(), now: rel.to_str()?.to_string(), epoch: self.gate.epoch() }))
+    }
+
+    // No `rename_epoch`: the host renames directories too, so where the
+    // directory is is asked each time.
+
+    fn hold_renames(&self, owner: i32, on: bool) -> bool {
+        self.gate.hold(owner, on);
+        true
     }
 }
 
@@ -245,6 +262,7 @@ impl FileSystem for HostFs {
                     entries,
                     md: convert(md),
                     held,
+                    gate: Arc::clone(&self.gate),
                 }));
             }
         }
@@ -364,14 +382,18 @@ impl FileSystem for HostFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::remove_dir(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
+        std::fs::remove_dir(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        self.gate.bump();
+        Ok(())
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::rename(self.host_path(from)?, self.host_path(to)?).map_err(|e| Errno::from_io(&e))
+        let (from, to) = (self.host_path(from)?, self.host_path(to)?);
+        let dir = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_dir());
+        self.gate.rename(super::own_holds(), dir, || std::fs::rename(&from, &to).map_err(|e| Errno::from_io(&e)))
     }
 
     /// `chmod`, same floor as creation: the host must keep owner rw on what it

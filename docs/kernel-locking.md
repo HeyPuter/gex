@@ -684,17 +684,14 @@ in the scheduler pick after each wake of the global WAKE word: about
        it. Finding the directory and then the name is two steps, so a call
        through a descriptor that misses while its directory moved (a
        per-directory move count) is made again, as Linux's walk retries on
-       its rename seqlock; bounded, 64 times. `fchmod` follows a renamed
-       file the same way.
+       its rename seqlock (L14d: then falls back to the rename lock, below).
+       `fchmod` follows a renamed file the same way.
      - `execve` keeps the calling thread's fs_struct and a `fork` copies
        it. A thread with a directory of its own (`unshare(CLONE_FS)`) execs
        into that directory, not the process's; the directory is taken from
-       the call itself (`Kernel::call_cwd`), since by the time the host acts
-       another thread's call may have run.
-     Still under the kernel lock: `chdir` and `fchdir` (the process's
-     directory is the namespace's, published by the lock's holder) and
-     `umask`'s swap. A working directory itself is still kept by name, so
-     a process's directory renamed away under it is not followed. Legs:
+       the call itself (`Kernel::call_fs`, L14d), since by the time the
+       host acts another thread's call may have run.
+     Legs:
      `free_path_writers_answer_as_the_kernel_does`, the writers' older
      forms in `free_i386_path_calls_answer_as_the_kernel_does`,
      `a_renamed_directory_takes_its_subtree`,
@@ -703,6 +700,36 @@ in the scheduler pick after each wake of the global WAKE word: about
      a file in it back and forth, and renames a descriptor's own directory
      back and forth while threads open through it; a child execs from a
      thread with its own fs_struct.
+   - `chdir`, `fchdir` and `umask` without the kernel lock, and the
+     working directory by identity (L14d). They are `PathIo`'s: each
+     changes the calling thread's fs_struct (`FsCwd`: the directory, held
+     open, and the umask), which the process's (`Kernel::proc_fs`) and
+     each thread's own (`ThreadFs`) are. The namespace's directory now
+     only follows the process's, for what is resolved outside a call. The
+     working directory is held through its open directory, as Linux holds
+     a dentry: renamed, `getcwd`, `/proc/self/cwd` and relative lookups
+     follow it; removed, `getcwd` says `ENOENT` and `/proc/self/cwd` reads
+     `/ (deleted)`. Its path is found again only when the filesystem's
+     count of directory renames and removals has changed
+     (`FileHandle::rename_epoch`, read without a lock). A relative lookup
+     that misses while the working directory moved is made again, as one
+     through a descriptor is. After eight such tries the call is made once
+     more with the filesystems' directory renames held off
+     (`FileHandle::hold_renames`): the filesystem's own rename lock
+     (`vfs::RenameGate`, per tmpfs and hostfs mount; the global kernel's
+     for the remote filesystem through `k_fs_hold_renames`), taken
+     shared, not the kernel's. A miss for a rename is then impossible,
+     not just unlikely: Linux's walk falls back to `rename_lock` the same
+     way after its optimistic tries. A directory rename waits while
+     another thread holds; the holder's own renames do not, and a holder
+     whose process has ended holds nothing (`vfs::set_owner_alive`).
+     hostfs counts only the renames made through it: the host's own, and
+     other host processes', are outside that lock. Legs:
+     `a_working_directory_follows_its_renames`,
+     `a_hold_keeps_directory_renames_off`; `fs-threads` now also renames
+     the working directory and checks `getcwd` and a relative lookup, and
+     races renames of the working directory back and forth with threads
+     opening, stating and `getcwd`ing relative to it.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
