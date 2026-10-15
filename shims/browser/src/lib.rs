@@ -2880,6 +2880,11 @@ struct Thread {
     /// Where it stands: its own Worker's, which changes it without the
     /// kernel lock (docs/kernel-locking.md §3.7).
     run: Arc<Mutex<Run>>,
+    /// Set when another thread's `execve` took the process from under this
+    /// one (Linux's de_thread): the thread has gone with the old program,
+    /// while the process goes on. Its Worker reads it, without the kernel
+    /// lock, through [`thread_gone`].
+    gone: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A thread's place in its run: what it waits for and what its parked call
@@ -2916,6 +2921,7 @@ impl Thread {
         Thread {
             kstate,
             run: Arc::new(Mutex::new(Run { pc, waiting, blocked_on: None, owed: Owed::default() })),
+            gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -7158,6 +7164,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     Some(stop) => stop,
     None => with_host(|h| {
         let stop = (|h: &mut Host| -> i32 {
+        // Another thread's `execve` took the process from this one: the
+        // thread table is the new program's, and this thread is not in it.
+        if thread_gone() {
+            set_resume_none();
+            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+            }
+            return 3;
+        }
         // Whether the kernel this call is about to run against is still
         // intact; whose process this is, for the calls that name it (set
         // here so it cannot be missed); and whether a pinned library landed
@@ -8787,6 +8802,7 @@ pub(crate) fn bind_mine(h: &mut Host, i: usize) {
         MY_CTX.with(|c| c.set(ctx_addr));
         MY_TID.with(|c| c.set(tid));
         MY_RUN.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.run)));
+        MY_GONE.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.gone)));
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -8806,6 +8822,22 @@ thread_local! {
     /// And its run state ([`Run`]), which this Worker changes without the
     /// kernel lock.
     static MY_RUN: RefCell<Option<Arc<Mutex<Run>>>> = const { RefCell::new(None) };
+    /// And its [`Thread::gone`].
+    static MY_GONE: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Whether this Worker's thread went with its old program when another
+/// thread of the process called `execve`. Its index into the thread table
+/// (`cur()`) means nothing any more: the table is the new program's.
+pub(crate) fn thread_gone() -> bool {
+    MY_GONE.with(|c| c.borrow().as_ref().is_some_and(|g| g.load(std::sync::atomic::Ordering::Acquire)))
+}
+
+/// [`thread_gone`], for the host: a process Worker whose thread is gone must
+/// not end the process, which runs on in another Worker.
+#[no_mangle]
+pub extern "C" fn gex_thread_gone() -> i32 {
+    thread_gone() as i32
 }
 
 /// [`MY_CTX`].
@@ -9637,9 +9669,24 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     write_u64(data, c + ctx::MON_SIZE, 0);
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
+    // Every other thread goes with the old program (Linux's de_thread): its
+    // Worker, parked or running, sees `gone` and ends, without the process.
+    let me = cur();
+    let others = h.threads.len() > 1;
+    for (i, t) in h.threads.iter().enumerate() {
+        if i != me {
+            t.gone.store(true, std::sync::atomic::Ordering::Release);
+            let mut r = t.run();
+            r.waiting = Waiting::Exited;
+            r.blocked_on = None;
+        }
+    }
     h.threads = vec![Thread::new(ThreadState::new(ctx_addr, h.kernel.pid), entry, Waiting::Runnable)];
     publish_runs(h);
     set_current(h, 0);
+    if others {
+        waitq::wake_process();
+    }
     if let (Some(p), None) = (&program, &restored) {
         if hook != 0 {
             snap_arm(&mut h.kernel, key, &p.exe, p.interp_base());
@@ -12818,6 +12865,14 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // A loop that has left an exception dispatched nested (nt::exc_escape).
     if nt::exc_escape(ctx, pc as u64) {
         set_resume_none();
+        trap();
+    }
+    // A thread another thread's `execve` took the process from, still
+    // running the old program's code (a loop that makes no syscall): it goes
+    // here, as on Linux it would at once.
+    if thread_gone() {
+        set_resume_none();
+        set_resume_ctx_none();
         trap();
     }
     // Rearm: translated code counts a word down to zero and calls here; leaving
@@ -16006,8 +16061,12 @@ static EXITED: std::sync::atomic::AtomicBool =
 
 /// Whether this Worker's process has exited: its vfork child's, while one
 /// runs here (vfork.rs), whose exit is not the parent's.
+///
+/// A Worker whose thread another thread's `execve` took away answers yes as
+/// well: the process it ran is over for it, and every way out of the guest
+/// that asks this ends the Worker without ending the process.
 pub(crate) fn exited() -> bool {
-    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed))
+    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed) || thread_gone())
 }
 
 /// Record the exit [`exited`] answers.

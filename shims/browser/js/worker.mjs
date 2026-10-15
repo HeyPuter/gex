@@ -118,7 +118,7 @@ const bridgeImports = {
 const bridges = {};
 const bridge = (k) => bridges[k] ?? bridgeImports[k]().then((m) => (bridges[k] = m));
 /// This Worker's runtime made ahead of its process (`preattach`, host.mjs):
-/// a promise of `{ gex, shared, stack }`, or null. Used by an exec'd
+/// a promise of `{ gex, shared, stack, mem64 }`, or null. Used by an exec'd
 /// posix_spawn child, which runs on a fresh memory; anything else leaves it.
 let preattached = null;
 /// Whether this process's memory can go to the next fork child when it exits
@@ -268,6 +268,12 @@ async function handle(msg) {
   if (msg?.kind === 'preattach') {
     const shared = !!msg.shared;
     const stack = msg.kernelStack;
+    // The memory's index type is the process's, and the host says which: a
+    // wasm64 shim imports an i64 memory. Decided here, before the memory is
+    // made, since no start message has said it yet (it was left i32, and
+    // every m64 Worker's runtime failed to instantiate).
+    const mem64 = !!msg.mem64;
+    if (mem64) globalThis.GEX_MEM64 = 1;
     preattached = (async () => {
       const gex = new Gex(new Env(), {
         kernel: { ...msg.kernel, stackTop: stack },
@@ -275,7 +281,7 @@ async function handle(msg) {
         modules: pooled,
       });
       await gex.preattach(msg.shim, msg.guest);
-      return { gex, shared, stack };
+      return { gex, shared, stack, mem64 };
     })().catch((err) => {
       console.error(`[gex] a pooled Worker could not prepare a runtime: ${err?.message ?? err}`);
       return null;
@@ -589,7 +595,17 @@ async function handle(msg) {
   const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
     && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
   preattached = null;
-  const gex = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+  // A runtime made in the pool that does not fit the process it was made
+  // for is a host bug, not a choice: said, and the process gets a new one.
+  const fits = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+    && pre.mem64 === !!msg.mem64;
+  if (pre && !fits) {
+    console.error(`[gex] pid ${msg.child?.pid}: the pooled runtime does not fit its process `
+      + `(shared ${pre.shared}/${!!msg.shared}, stack ${pre.stack}/${msg.kernelStack}, mem64 ${pre.mem64}/${!!msg.mem64}); a new one is made`);
+  }
+  // Back to the process's own type, should the pool's have been the other.
+  if (pre && pre.mem64 && !msg.mem64) delete globalThis.GEX_MEM64;
+  const gex = fits
     ? pre.gex
     : new Gex(new WorkerEnv(), {
       kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
@@ -797,10 +813,15 @@ async function handle(msg) {
     // A process enters on its first thread (where `run` starts); a thread has
     // registers of its own.
     let ctx;
+    // A thread the process lost before this Worker could adopt it.
+    let gone = false;
+    // A thread's: how many `execve`s its process had made when it came up.
+    let execGen = 0;
     if (msg.kind === 'thread') {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
-      ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      ({ entry, ctx, gone } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
       narrate(`[worker] pid ${msg.child?.pid}: adopt arrived`);
@@ -959,7 +980,17 @@ async function handle(msg) {
     // an abandoned process stack.
     globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
     const runStarted = performance.now();
-    const status = await gex.run(entry, ctx);
+    const status = gone ? 0 : await gex.run(entry, ctx);
+    // This Worker's thread went with the old program when another thread
+    // called `execve`: the process runs on in that thread's Worker, so this
+    // one ends as a thread does, never as the process.
+    //
+    // And the other way round: a thread Worker whose thread made that
+    // `execve` (or one since) carries the process now, and ends it as its
+    // process Worker would have.
+    const carries = msg.kind === 'thread' && !gone && !ex.gex_thread_gone?.()
+      && (ex.gex_exec_gen?.() ?? 0) !== execGen;
+    const thread = (msg.kind === 'thread' && !carries) || !!ex.gex_thread_gone?.();
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
       // Who sent the last signal anywhere (the global kernel's record): a
@@ -988,20 +1019,22 @@ async function handle(msg) {
     // joining it. A thread's own exit already woke its joiner's futex; a thread
     // that faults is handled by the Worker's error path and never reaches here.
     // `?fjit=`: what the function JIT did, and how often its lock was held.
-    if (msg.kind !== 'thread') ex.gex_fjit_report?.();
-    if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
+    if (!thread) ex.gex_fjit_report?.();
+    if (!thread) ex.gex_process_gone?.(134);
     // `?xcache=`: what this process added to the store, kept for the next load
     // (docs/gexcc.md §8). After the exit is published, so a parent's wait does
     // not wait for it.
     const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
     const xcacheMin = msg.xcacheMin ?? msg.opts?.xcacheMin ?? msg.child?.opts?.xcacheMin;
-    if (msg.kind !== 'thread' && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
+    if (!thread && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
     const exitMsg = {
       kind: 'exit',
       status,
+      threadGone: thread && msg.kind !== 'thread' ? true : undefined,
+      carries: carries || undefined,
       guestMillis,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
@@ -1093,7 +1126,7 @@ async function handle(msg) {
     // This process's memory, zeroed, for the host to give the next fork child
     // (`Gex#recycleMemory`): its pages are touched, which a fresh memory's are
     // not. After the kernel has the process gone, so no parent waits on it.
-    if (recyclable && msg.kind !== 'thread' && !msg.child?.exec) {
+    if (recyclable && !thread && !msg.child?.exec) {
       exitMsg.recycle = gex.recycleMemory?.() ?? undefined;
     }
     port.post(exitMsg);
