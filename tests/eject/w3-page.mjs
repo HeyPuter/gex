@@ -73,6 +73,26 @@ if (off.includes('compositor')) {
   const left = assets.filter((n) => /^(compositor|compositor-worker|gpu-device)-/.test(n));
   check(left.length === 0, `"compositor" off: no scene compositor in the site${left.length ? ` (found ${left.join(', ')})` : ''}`);
 }
+// Every unit a Worker can see published is one every Worker of the process
+// can load: in the boot archive all Workers get at start (preload.json
+// `tar:N`) or in the background fill (`unit:KEY/c.wasm`, eject-site.mjs
+// --late), which every Worker also holds from its start; never in a list
+// only Workers started later are given (PF's E7b: units-late.tar, and a
+// Worker of winlogon trapped "published but cannot be loaded here").
+{
+  const preP = join(site, 'project/build/web/units/preload.json');
+  const pre = existsSync(preP) ? JSON.parse(readFileSync(preP, 'utf8')) : [];
+  const fillP = join(site, 'project/build/web/fill.json');
+  const fill = existsSync(fillP) ? JSON.parse(readFileSync(fillP, 'utf8')) : { files: [] };
+  const lateOnly = pre.filter(([k]) => /^late-/.test(k)).map(([k]) => k);
+  const boot = pre.filter(([k]) => /^tar:/.test(k)).reduce((a, [k]) => a + Number(k.slice(4)), 0);
+  const inFill = new Set(fill.files.filter(([n]) => /^unit:.*\/c\.wasm$/.test(n)).map(([n]) => n.slice(5, -7)));
+  const units = nt.units ?? [];
+  if (pre.some(([k]) => /^tar:/.test(k))) {
+    check(lateOnly.length === 0 && boot + inFill.size === units.length,
+      `every unit loadable by every Worker: ${boot} in the boot archive + ${inFill.size} in the fill = ${units.length} units${lateOnly.length ? `; given only to later Workers: ${lateOnly.join(', ')}` : ''}`);
+  }
+}
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
 // The app library, and no test page: nt.html is gex's, never an ejected build's.
 check(existsSync(join(site, 'app.mjs')), 'the site has the app library (app.mjs)');

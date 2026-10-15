@@ -434,7 +434,7 @@ pub fn site(env: &[String], tar: &crate::reach::Tar, prefix: &str) -> Site {
 /// bit 4, `gex_cgen_set_mode`) is the page's to set, not this gexc's. The
 /// composition is `image::unit_inputs`'s, which [`rekey`] checks against a
 /// recorded key for every image.
-fn key_with(image: &gex_ld::Image, unguarded: bool) -> String {
+pub(crate) fn key_with(image: &gex_ld::Image, unguarded: bool) -> String {
     let mut h = gex_key::sha256::Sha256::new();
     h.update(gex_cgen::image::abi_fingerprint().as_bytes());
     let mut inputs = format!("{}:{}", gex_cgen::image::UNIT_INPUTS, gex_key::sha256::hex(&h.finish()));

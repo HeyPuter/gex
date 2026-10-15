@@ -170,6 +170,16 @@ pub(crate) fn set_identities(spec: &str) {
     *lock(&KNOWN) = Some(m);
 }
 
+/// The page's identities (`base:key:identity:path;...`, a W3 site's
+/// `identities`, written by its build from the units it made), before the
+/// program starts: as GEX_NT_IDENTITIES for an NT page.
+#[no_mangle]
+pub extern "C" fn gex_cgen_identities(ptr: u32, len: u32) {
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
+    set_identities(spec.trim());
+}
+
 fn known(base: u64, path: &str) -> Option<(String, String)> {
     lock(&KNOWN).as_ref()?.get(&(base, path.to_string())).cloned()
 }

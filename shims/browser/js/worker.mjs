@@ -66,6 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
+import { setFill, fillFile } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
@@ -516,6 +517,10 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
+      // A late unit's (eject-site.mjs --late), in the fill: a Worker started
+      // before the page had compiled it waits for its bytes there.
+      const late = fillFile(`unit:${rel}`);
+      if (late) return late;
       if (preClosed) return null;
       try {
         if (c.root) {
@@ -569,10 +574,14 @@ async function handle(msg) {
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
+  if (msg.identities) Gex.identities = msg.identities;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
+  // Lazy files the page is filling in the background (app.js `fill`): their
+  // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
+  if (msg.fill) setFill(msg.fill);
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   // The runtime made in the pool, when this process runs on a fresh memory

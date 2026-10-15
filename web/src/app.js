@@ -387,6 +387,12 @@ async function begin(opts, base, at, state, meter) {
   mark('fetching');
   const zstd = zstdLoader(at(b.zstd ?? 'vendor/zstddec-stream.mjs'));
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
+  // The lazy files' list, beside the bundle rather than after it.
+  const lazyList = b.lazy ? fetchJson(at(b.lazy), 'the lazy files\' list') : null;
+  lazyList?.catch(() => {});
+  // The background fill's list (eject-site.mjs --late): lazy files the page
+  // downloads once the boot's files are in, while the guest runs.
+  const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
   const fetcher = { pack, zstd, base, state, meter };
   // What is to come, for the progress: the bundle's files and the units'.
   // The two small lists are read before the bundle starts, so the totals
@@ -452,7 +458,7 @@ async function begin(opts, base, at, state, meter) {
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
   if (b.lazy) {
-    const m = await fetchJson(at(b.lazy), 'the lazy files\' list');
+    const m = await lazyList;
     // A path on this origin, not a URL: the kernel keeps a lazy file's
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
@@ -488,6 +494,50 @@ async function begin(opts, base, at, state, meter) {
   const preModules = await preloading;
   await runtime;
   if (preModules) mark(`compiled ${preModules.filter(([k]) => k.startsWith('cgen:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
+  // The fill: its buffer and counter made now, every Worker given them; its
+  // download started now, after the boot's, so it does not share their link.
+  let fill = null;
+  const fl = fillList ? await fillList : null;
+  if (fl && typeof SharedArrayBuffer === 'function') {
+    const buf = new SharedArrayBuffer(fl.size);
+    const counter = new Int32Array(new SharedArrayBuffer(4));
+    fill = { buf, at: counter, files: fl.files };
+    const t0 = performance.now();
+    // The late units (eject-site.mjs --late: `unit:KEY/FILE` entries), each
+    // compiled once its bytes are in and added to the modules every Worker
+    // started from then on is given (`preModules`, in the host's `extra`); a
+    // Worker started before takes the bytes from the fill itself
+    // (worker.mjs `loadFile`).
+    const late = fl.files.filter(([p]) => p.startsWith('unit:'));
+    let li = 0, lateN = 0;
+    const add = (entry) => {
+      if (!preModules) return;
+      // Before `closed`, which a Worker reads as the end of the list.
+      const c = preModules.findIndex(([k]) => k === 'closed');
+      preModules.splice(c < 0 ? preModules.length : c, 0, entry);
+      if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+    };
+    const takeLate = (n) => {
+      for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
+        const [name, off, size] = late[li];
+        const rel = name.slice('unit:'.length);
+        const bytes = new Uint8Array(buf, off, size).slice();
+        if (rel.endsWith('/c.wasm')) {
+          WebAssembly.compile(bytes).then((m) => add([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m]),
+            (e) => say(`[app] late unit ${rel}: ${e}\n`));
+        } else {
+          const s = new Uint8Array(new SharedArrayBuffer(size));
+          s.set(bytes);
+          add([`file:${rel}`, s]);
+        }
+      }
+    };
+    fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
+      into: buf,
+      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); takeLate(n); },
+    }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
+      .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
+  }
   state.phase = 'running';
   mark('running');
   if (keep) {
@@ -535,6 +585,8 @@ async function begin(opts, base, at, state, meter) {
     onSystem: (s) => { sys = s; },
     hostX: !!b.hostx && opts.hostx !== false,
     preModules,
+    fill,
+    identities: b.identities ?? null,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
@@ -648,6 +700,10 @@ function launchBuild(m, at) {
     const p = { ...(m.params ?? {}) };
     const lazy = p.lazy ?? null;
     delete p.lazy;
+    const fill = p.fill ?? null;
+    delete p.fill;
+    const identities = p.identities ?? null;
+    delete p.identities;
     return {
       tar: ['project/build/web/rootfs.tar'],
       exe: m.exe,
@@ -662,6 +718,8 @@ function launchBuild(m, at) {
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
+      fill,
+      identities,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
@@ -802,34 +860,39 @@ async function fetchShared(url, f, { shared = false } = {}) {
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f) {
+async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
   const res = await fetch(u.href);
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
-  const parts = [];
-  let at = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    at += value.length;
-    f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
-    f.meter?.bytes(value.length);
-  }
-  f.meter?.fileDone();
-  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
+  // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
-  const out = new Uint8Array(shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size));
+  const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
   let n = 0;
-  // Synchronous to the end: one decoder serves every fetch in flight.
-  for (const part of d.decodeStreaming(parts)) {
+  const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
     out.set(part, n);
     n += part.length;
+  };
+  const z = d.stream();
+  let at = 0;
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      z.push(value, emit);
+      progress?.(n);
+      at += value.length;
+      f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
+      f.meter?.bytes(value.length);
+    }
+  } finally {
+    z.end();
   }
+  f.meter?.fileDone();
+  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
   if (n !== size) throw new Error(`${url}: decoded ${n} of ${size} bytes`);
   return out;
 }

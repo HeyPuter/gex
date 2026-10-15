@@ -595,6 +595,12 @@ async function runProgramHere(
     // Every N safepoints, print the guest pc -- the only instrument for
     // locating what is slow in a page.
     heartbeat = globalThis.GEX_HEARTBEAT ?? 0,
+    // Lazy files the page fills in the background (app.js `fill`), handed to
+    // every Worker (lazy-fetch.mjs `setFill`).
+    fill = null,
+    // Units' keys and identities (`base:key:identity:path;...`), so a Worker
+    // takes them instead of hashing each image it maps (cgen.rs `known`).
+    identities = null,
     // KiB of mapped text per object to statically recompile once hot; 0 leaves
     // the guest to arrive one dispatch miss at a time. A parameter because the
     // page and `run-node.mjs` used to disagree, so a host-specific fault could
@@ -879,6 +885,8 @@ async function runProgramHere(
       // In `extra` so every Worker gets it, not only pid 1: the interesting
       // process is the X server and the client it forks, not the demo's shell.
       heartbeat: heartbeat || undefined,
+      fill: fill || undefined,
+      identities: identities || undefined,
       // How many traps a forked child takes before it stops waiting to be an
       // `execve` and installs its parent's modules.
       adoptAfter: typeof globalThis.GEX_ADOPT_AFTER === "number"

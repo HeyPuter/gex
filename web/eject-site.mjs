@@ -34,7 +34,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late'].includes(av[i - 1]));
 // A W3 page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -372,6 +372,13 @@ function w3Site() {
   // stored once by content under project/build/web/lazy/ and read from the
   // host, in 1 MiB ranges, when a guest first reads it.
   const split = w3.bundle?.split ? new Set(w3.bundle.read ?? []) : null;
+  // --late FILE: see the fill below.
+  const late = opt('--late', null) ? readFileSync(opt('--late', null), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')) : [];
+  if (split) for (const p of late) split.delete(p);
+  // A unit's guest path as --late names it, and the late files' units (in
+  // the fill, not units.tar).
+  const lateGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
+  const lateKeys = new Set();
   let lazyFiles = 0, lazyBytes = 0;
   if (strip || flag('--prune') || flag('--dedupe') || split) {
     const x = join(work, 'tarx');
@@ -419,6 +426,40 @@ function w3Site() {
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
       w3.params = { ...(w3.params ?? {}), lazy: '/project/build/web/lazy.json' };
+      // --late FILE (guest paths, one a line, in the order wanted): files of
+      // the run's read set that left the bundle above for the background fill,
+      // fill.bin (packed): each lazy file's bytes once, in that order, which
+      // the page downloads after the bundle while the guest runs (app.js
+      // `fill`); fill.json says where each starts.
+      // Each late image's unit follows its bytes there (`unit:KEY/FILE`):
+      // the page compiles it from the fill, and a Worker started before
+      // that reads it there (app.js, worker.mjs `loadFile`).
+      if (late.length) {
+        const byPath = new Map(lazy.map((f) => [f[0], f]));
+        const seen = new Map();
+        const entries = [];
+        const parts = [];
+        let off = 0;
+        const put = (name, bytes) => { entries.push([name, off, bytes.length]); parts.push(bytes); off += bytes.length; };
+        for (const p of late) {
+          const f = byPath.get(p);
+          if (f && !seen.has(f[2])) {
+            seen.set(f[2], true);
+            put(`/project/build/web/lazy/${f[2]}`, readFileSync(join(store, f[2])));
+          }
+          for (const u of (w3.units ?? []).filter((u) => lateGuest(u.path) === p.toLowerCase())) {
+            if (lateKeys.has(u.key) || !existsSync(join(web, 'units', u.key, 'c.wasm')) || existsSync(join(web, 'units', u.key, 'cold'))) continue;
+            lateKeys.add(u.key);
+            for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(web, 'units', u.key, n)));
+          }
+        }
+        const fb = join(work, 'fill.bin');
+        writeFileSync(fb, Buffer.concat(parts));
+        place(fb, 'project/build/web/fill.bin');
+        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: '/project/build/web/fill.bin', size: off, files: entries }));
+        w3.params.fill = '/project/build/web/fill.json';
+        console.log(`eject-site: the fill: ${seen.size} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
+      }
     }
     tar = join(work, 'rootfs.tar');
     const dirs = [];
@@ -453,14 +494,17 @@ function w3Site() {
   const preload = [];
   const coldUnits = w3.units.filter((u) => existsSync(join(web, 'units', u.key, 'cold'))).length;
   if (!coldUnits) {
+    // --late: the late files' units travel in the fill (above), not here.
+    const bootUnits = w3.units.filter((u) => !lateKeys.has(u.key));
     const list = join(work, 'units-list');
-    const names = w3.units.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]);
+    const names = bootUnits.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]);
     writeFileSync(list, `${names.join('\n')}\n`);
     const ut = join(work, 'units.tar');
     execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '-cf', ut, '-T', list]);
     place(ut, 'project/build/web/units.tar');
+    if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${w3.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
-    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${w3.units.length}`, '/project/build/web/units.tar']]));
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${bootUnits.length}`, '/project/build/web/units.tar']]));
   }
   for (const u of coldUnits ? w3.units : []) {
     const d = join(web, 'units', u.key);
