@@ -1355,6 +1355,25 @@ impl MemoryMap {
     }
 
     /// Render the map the way `/proc/self/maps` does.
+    /// `/proc/self/status`'s memory sizes, in bytes: everything mapped
+    /// (VmSize), what can be touched (VmRSS: gex never pages out, so every
+    /// accessible page counts as resident), and the part of that no file
+    /// can rebuild (RssAnon). Wine's GetProcessMemoryInfo reads them.
+    pub fn vm_counters(&self) -> (u64, u64, u64) {
+        let (mut size, mut rss, mut anon) = (0, 0, 0);
+        for v in &self.vmas {
+            let n = v.end - v.start;
+            size += n;
+            if v.prot != 0 {
+                rss += n;
+                if v.origin.is_none() {
+                    anon += n;
+                }
+            }
+        }
+        (size, rss, anon)
+    }
+
     pub fn proc_maps(&self) -> String {
         let mut s = String::new();
         for v in &self.vmas {
@@ -1380,6 +1399,28 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// /proc/self/status's sizes: a reservation counts toward VmSize only,
+    /// accessible memory toward VmRSS and RssAnon.
+    #[test]
+    fn vm_counters_split_reserved_from_resident() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x2000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let (s0, r0, a0) = m.vm_counters();
+        m.mmap(0, 0x10_0000, 0, 0, "reserved").unwrap();
+        m.mmap(0, 0x4000, prot::READ | prot::WRITE, 0, "data").unwrap();
+        let (s, r, a) = m.vm_counters();
+        assert_eq!(s - s0, 0x10_4000);
+        assert_eq!(r - r0, 0x4000);
+        assert_eq!(a - a0, 0x4000);
+    }
 
     /// glibc's heap pattern must not leak the arena a claim at a time.
     ///

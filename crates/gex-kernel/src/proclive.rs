@@ -135,8 +135,13 @@ impl ProcSource for KernelProcSource {
     fn status(&self) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);
+        // (no peak is kept: the peaks are the current sizes)
+        let (size, rss, anon) = l.mm.lock().vm_counters();
+        let (size, rss, anon) = (size >> 10, rss >> 10, anon >> 10);
         format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t1\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
+             VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
+             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t1\n",
             l.exe.rsplit('/').next().unwrap_or("gex"),
             l.pid,
             l.pid,

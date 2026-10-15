@@ -19,6 +19,13 @@
 # (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
+# The display case (W64.4), when the loader has winewayland.drv's Unix side
+# (link-w64.sh with W64_DEPS) and the driver's PE side is there (native:
+# NATIVE= with W64_NATIVE_DLLS' winewayland.drv): window.exe under gexc's
+# Wayland compositor, its frames checked for the four quadrants and the
+# white square (frame.py).
+# GL=1 runs a case with the host's GL (gexc run --gl): the GL cases (W64.4),
+# when the loader has opengl32.so and gex-gl's EGL.
 # NATIVE=DIR runs them with every file in DIR in place of (or beside) DIST's
 # PE DLLs: W64.2's skeletons over one module, winepe.wasm (w64-dist.sh's
 # W64_NATIVE, pelink.py).
@@ -51,7 +58,7 @@ if [ -n "${NTDLL:-}${NATIVE:-}" ]; then
 		for f in "$NATIVE"/*; do
 			rm -f "$o/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$o/lib/wine/x86_64-windows/"
 		done
-		tag="W64 native $(cd "$NATIVE" && ls -- *.dll *.exe 2>/dev/null | sed 's/\.[^.]*$//' | tr '\n' ' ' | sed 's/ $//')"
+		tag="W64 native $(cd "$NATIVE" && ls -- *.dll *.drv *.exe 2>/dev/null | sed 's/\.[^.]*$//' | tr '\n' ' ' | sed 's/ $//')"
 	fi
 	dist=$o; wine=$dist/lib/wine/x86_64-unix/wine
 fi
@@ -65,11 +72,29 @@ check() {
 	local p=$w/pfx-$name out code src=$bin/$exe
 	case $exe in /*) src=$exe; exe=$(basename "$exe") ;; esac
 	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
-	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run \
+	local wl=()
+	if [ -n "${WL:-}" ]; then
+		# the Wayland driver, gexc's compositor, its frames as PPMs; display
+		# modes emulated (Wayland sets none), as W3's game prefix has them
+		printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="wayland"\n' >> "$p/user.reg"
+		printf '\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' >> "$p/user.reg"
+		# the prefix is made without a display (w64-dist.sh: native
+		# wineboot, no Wayland libraries): the driver's file, as wineboot
+		# would install it
+		[ -e "$p/drive_c/windows/system32/winewayland.drv" ] ||
+			cp "$dist/lib/wine/x86_64-windows/winewayland.drv" "$p/drive_c/windows/system32/"
+		rm -f "$w/$name"-*.ppm
+		wl=(--wayland "$w/wl-$name" --wayland-size "${WL_SIZE:-640x480}" --wayland-out "$w/$name")
+	fi
+	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
+	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${gl[@]}" "${wl[@]}" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
 		"$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
 	code=${out##*exit=}
 	out=${out%$'\n'exit=*}; out=${out%exit=*}; out=${out//$'\r'/}
+	local fr=""
+	# (WL=- : the display without a frame check)
+	[ -z "${WL:-}" ] || [ "$WL" = - ] || fr=$(python3 "$here/frame.py" "$w/$name" "${WL_MIN:-1000}" $WL 2>&1) || code="$code, $fr"
 	if [ "$code" = "$want_code" ] && [[ "$out" =~ ^${want_out}$ ]]; then
 		pass=$((pass + 1)); echo "ok   x64/$name ($tag)"
 	else
@@ -77,7 +102,7 @@ check() {
 		echo "  stdout: $(printf %q "$out" | cut -c1-400)"
 		grep -v '^\[host\]' "$w/$name.err" | tail -8 | sed 's/^/  stderr: /'
 	fi
-	rm -rf "$p"
+	rm -rf "$p" "$w/wl-$name"; rm -f "$w/$name"-*.ppm
 }
 check hello_args 42 "hello from a Windows program with 3 args${nl}arg 1: a${nl}arg 2: b c" hello_args.exe a "b c"
 check sync 0 "$allok" sync.exe
@@ -93,6 +118,31 @@ check seh-traps 0 "$allok" seh.exe traps
 # (tests/nt/msvc/build-x64.sh)
 check msvc_cxxeh 0 "$allok" msvc_cxxeh.exe
 check fiber 0 "$allok" fiber.exe
+# W64.4: a window painted with GDI, shown by the Wayland driver (for 3 s)
+if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/winewayland.drv" ]; then
+	WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255" check window 0 "shown${nl}bye" window.exe 3
+	# Wine's x64 notepad, up for 5 s and closed by WM_CLOSE (notepadrun.c):
+	# its caption, edit field, and the text of title, menu bar and status
+	# bar (black: about 740 pixels, 335 of them the menus')
+	WL="50,150,250:5000 255,255,255:50000 0,0,0:600" check notepad 0 "title [^$nl]*Notepad${nl}closed 0" notepadrun.exe 5
+	# tests/nt's GUI programs on the display (they check themselves);
+	# display.exe fails 2 checks: a named section mapped twice in one
+	# process does not share its pages (wasm memory has no aliases; the
+	# kernel hands a second MAP_SHARED the first's address, and MAP_FIXED
+	# views cannot have it). x86/display fails under W3 too (known-fail,
+	# w3_boot). Its 800x600 must fit the output: emulated modes go up to
+	# the output's size.
+	for t in user_win gdi input; do WL=- check $t 0 "$allok" $t.exe; done
+	WL=- WL_SIZE=1024x768 check display 0 "$allok" display.exe
+	# W64.4: OpenGL, when the loader has opengl32.so and gex-gl's EGL
+	# (link-w64.sh): the host's GL (gexc run --gl). glwindow draws the four
+	# quadrants and the white square with GL for 3 s, its frames checked.
+	if grep -q libEGL.so.1 "$wine"; then
+		for t in glcompat glfast; do GL=1 WL=- check $t 0 "$allok" $t.exe; done
+		GL=1 WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255:100" \
+			check glwindow 0 "shown${nl}frames [0-9]+${nl}bye" glwindow.exe 3
+	fi
+fi
 # W64.1b: data above 2 GiB, code below it (highdata.c)
 if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	check highdata 0 "$allok" "$w/highdata.exe"
