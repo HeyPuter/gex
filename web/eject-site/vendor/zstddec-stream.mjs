@@ -62,6 +62,49 @@ var ZSTDDecoder = class {
 		instance.exports.free(uncompressedPtr);
 		return dec;
 	}
+	/** gex: a push decoder, for decoding while a download arrives. `push(chunk, emit)`
+	 *  decodes what `chunk` completes, calling `emit` with each decoded part (a view of the decoder's
+	 *  buffer, good until the next call);
+	 *  `end()` frees it and throws if the stream is incomplete. */
+	stream() {
+		if (!instance) throw new Error("ZSTDDecoder: Await .init() before decoding.");
+		const buffOutSize = instance.exports.ZSTD_DStreamOutSize();
+		const buffOut = instance.exports.malloc(buffOutSize);
+		const dctxPtr = instance.exports.ZSTD_createDCtx();
+		const inputPtr = instance.exports.malloc(12);
+		const outputPtr = instance.exports.malloc(12);
+		let lastRet = 0, cap = 0, compressedPtr = 0;
+		return {
+			push(array, emit) {
+				if (array.byteLength > cap) {
+					if (compressedPtr) instance.exports.free(compressedPtr);
+					cap = array.byteLength;
+					compressedPtr = instance.exports.malloc(cap);
+				}
+				heap.set(array, compressedPtr);
+				heapView.setInt32(inputPtr, compressedPtr, true);
+				heapView.setInt32(inputPtr + 4, array.byteLength, true);
+				heapView.setInt32(inputPtr + 8, 0, true);
+				while (heapView.getUint32(inputPtr + 8, true) < heapView.getUint32(inputPtr + 4, true)) {
+					heapView.setInt32(outputPtr, buffOut, true);
+					heapView.setInt32(outputPtr + 4, buffOutSize, true);
+					heapView.setInt32(outputPtr + 8, 0, true);
+					lastRet = instance.exports.ZSTD_decompressStream(dctxPtr, outputPtr, inputPtr);
+					if (lastRet > 0xffffff00) throw new Error(`ZSTD_decompressStream: error ${lastRet}`);
+					const outputPos = heapView.getUint32(outputPtr + 8, true);
+					if (outputPos) emit(heap.subarray(buffOut, buffOut + outputPos));
+				}
+			},
+			end() {
+				if (compressedPtr) instance.exports.free(compressedPtr);
+				instance.exports.ZSTD_freeDCtx(dctxPtr);
+				instance.exports.free(buffOut);
+				instance.exports.free(inputPtr);
+				instance.exports.free(outputPtr);
+				if (lastRet !== 0) throw new Error("Incomplete stream, more data expected.");
+			}
+		};
+	}
 	*decodeStreaming(arrays) {
 		if (!instance) throw new Error("ZSTDDecoder: Await .init() before decoding.");
 		const buffInSize = instance.exports.ZSTD_DStreamInSize();

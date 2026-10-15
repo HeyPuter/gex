@@ -387,6 +387,9 @@ async function begin(opts, base, at, state, meter) {
   mark('fetching');
   const zstd = zstdLoader(at(b.zstd ?? 'vendor/zstddec-stream.mjs'));
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
+  // The lazy files' list, beside the bundle rather than after it.
+  const lazyList = b.lazy ? fetchJson(at(b.lazy), 'the lazy files\' list') : null;
+  lazyList?.catch(() => {});
   const fetcher = { pack, zstd, base, state, meter };
   // What is to come, for the progress: the bundle's files and the units'.
   // The two small lists are read before the bundle starts, so the totals
@@ -452,7 +455,7 @@ async function begin(opts, base, at, state, meter) {
   const lazyNames = new Map(); // a lazy file's URL path -> { name, size }
   const lazyMtimes = {};
   if (b.lazy) {
-    const m = await fetchJson(at(b.lazy), 'the lazy files\' list');
+    const m = await lazyList;
     // A path on this origin, not a URL: the kernel keeps a lazy file's
     // source as a path (k_fs_add_lazy), and fetches it from the page's origin.
     const lazyBase = new URL(at(m.base)).pathname;
@@ -806,28 +809,32 @@ async function fetchPacked(url, { size, zsize, build }, shared, f) {
   u.pathname += '.zst';
   const res = await fetch(u.href);
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
-  const parts = [];
-  let at = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    at += value.length;
-    f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
-    f.meter?.bytes(value.length);
-  }
-  f.meter?.fileDone();
-  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
+  // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
   const out = new Uint8Array(shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size));
   let n = 0;
-  // Synchronous to the end: one decoder serves every fetch in flight.
-  for (const part of d.decodeStreaming(parts)) {
+  const emit = (part) => {
     if (n + part.length > size) throw new Error(`${url}: longer than its ${size} bytes`);
     out.set(part, n);
     n += part.length;
+  };
+  const z = d.stream();
+  let at = 0;
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      z.push(value, emit);
+      at += value.length;
+      f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
+      f.meter?.bytes(value.length);
+    }
+  } finally {
+    z.end();
   }
+  f.meter?.fileDone();
+  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
   if (n !== size) throw new Error(`${url}: decoded ${n} of ${size} bytes`);
   return out;
 }
