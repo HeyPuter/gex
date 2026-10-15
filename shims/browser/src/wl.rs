@@ -231,6 +231,10 @@ static COMPOSITOR: std::sync::Mutex<Option<WaylandDevice>> = std::sync::Mutex::n
 /// for a scheduler turn that takes no lock (`waitq::idle_turn`): if so, the
 /// turn pumps (`pump_if_wanted`). A compositor busy elsewhere is a yes.
 pub fn pump_wanted() -> bool {
+    // Not while a vfork child runs in this Worker: see `pump_if_wanted`.
+    if crate::vfork::active() {
+        return false;
+    }
     let device = match COMPOSITOR.try_lock() {
         Ok(d) => d.clone(),
         Err(_) => return true,
@@ -273,6 +277,12 @@ fn proc_cx() -> Option<Arc<ProcCx>> {
 /// The compositor's work, when it has any: pumped by the Worker that asks,
 /// without the kernel lock. Pumps are serialised by the device's sessions.
 pub fn pump_if_wanted() {
+    // A vfork child running in place (vfork.rs) passes the scheduler on the
+    // parent's memory, where this compositor is the parent's: pumped there,
+    // its first publish would name the parent's windows with the child's pid
+    // (`gex_wl_token` is `my_pid`, the child's until `gex_vfork_end`), and
+    // the program the child execs would join that block. The child only
+    // execs; the parent pumps when it goes on.
     if !pump_wanted() {
         return;
     }
