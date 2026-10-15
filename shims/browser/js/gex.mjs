@@ -1083,6 +1083,8 @@ export class Gex {
   static providerSkip = '';
   /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
   static fjitLibs = '';
+  /** `base:key:identity:path;...` (cgen.rs `gex_cgen_identities`). */
+  static identities = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -3535,6 +3537,15 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    // Images' keys and identities taken from the page, not hashed at each map
+    // (cgen.rs `gex_cgen_identities`).
+    if (Gex.identities && e.gex_cgen_identities) {
+      const b = new TextEncoder().encode(Gex.identities);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_cgen_identities(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (Gex.fjitLibs && e.gex_fjit_libs) {
       const b = new TextEncoder().encode(Gex.fjitLibs);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;

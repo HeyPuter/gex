@@ -546,6 +546,7 @@ async function handle(msg) {
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
+  if (msg.identities) Gex.identities = msg.identities;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;

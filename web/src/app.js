@@ -557,6 +557,7 @@ async function begin(opts, base, at, state, meter) {
     hostX: !!b.hostx && opts.hostx !== false,
     preModules,
     fill,
+    identities: b.identities ?? null,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
@@ -672,6 +673,8 @@ function launchBuild(m, at) {
     delete p.lazy;
     const fill = p.fill ?? null;
     delete p.fill;
+    const identities = p.identities ?? null;
+    delete p.identities;
     return {
       tar: ['project/build/web/rootfs.tar'],
       exe: m.exe,
@@ -687,6 +690,7 @@ function launchBuild(m, at) {
       preload: 'project/build/web/units/preload.json',
       lazy,
       fill,
+      identities,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
