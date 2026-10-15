@@ -24,6 +24,8 @@
 # NATIVE= with W64_NATIVE_DLLS' winewayland.drv): window.exe under gexc's
 # Wayland compositor, its frames checked for the four quadrants and the
 # white square (frame.py).
+# GL=1 runs a case with the host's GL (gexc run --gl): the GL cases (W64.4),
+# when the loader has opengl32.so and gex-gl's EGL.
 # NATIVE=DIR runs them with every file in DIR in place of (or beside) DIST's
 # PE DLLs: W64.2's skeletons over one module, winepe.wasm (w64-dist.sh's
 # W64_NATIVE, pelink.py).
@@ -84,7 +86,8 @@ check() {
 		rm -f "$w/$name"-*.ppm
 		wl=(--wayland "$w/wl-$name" --wayland-size "${WL_SIZE:-640x480}" --wayland-out "$w/$name")
 	fi
-	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${wl[@]}" \
+	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
+	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${gl[@]}" "${wl[@]}" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
 		"$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
 	code=${out##*exit=}
@@ -131,6 +134,14 @@ if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/wineway
 	# the output's size.
 	for t in user_win gdi input; do WL=- check $t 0 "$allok" $t.exe; done
 	WL=- WL_SIZE=1024x768 check display 0 "$allok" display.exe
+	# W64.4: OpenGL, when the loader has opengl32.so and gex-gl's EGL
+	# (link-w64.sh): the host's GL (gexc run --gl). glwindow draws the four
+	# quadrants and the white square with GL for 3 s, its frames checked.
+	if grep -q libEGL.so.1 "$wine"; then
+		for t in glcompat glfast; do GL=1 WL=- check $t 0 "$allok" $t.exe; done
+		GL=1 WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255:100" \
+			check glwindow 0 "shown${nl}frames [0-9]+${nl}bye" glwindow.exe 3
+	fi
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c)
 if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then

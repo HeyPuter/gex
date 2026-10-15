@@ -5,7 +5,9 @@
 #   FreeType (win32u), libwayland-client/-egl, libxml2, libxkbcommon and
 #   libxkbregistry (winewayland.drv), and ffi64/, the libffi stand-in for
 #   libwayland's one ffi_call (64-bit pointers: a call table by argument
-#   pattern, ffi64/gen.py). No EGL and no OSS yet.
+#   pattern, ffi64/gen.py), and gex-gl's EGL headers and pkg-config file
+#   (opengl32.so; the library, guest/gl/gexgl.c, is compiled by
+#   link-w64.sh, since it changes with gex). No OSS yet.
 #
 #   tools/wine-wasm/w64-deps.sh OUT DL
 #
@@ -98,5 +100,12 @@ PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain setup xkb-build libxkbcomm
   -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale > "$out/xkb-setup.log" 2>&1
 ninja -C xkb-build -j"$J" libxkbcommon.a libxkbregistry.a > "$out/xkb-make.log" 2>&1
 PYTHONPATH=$out/meson python3 -m mesonbuild.mesonmain install -C xkb-build --no-rebuild --tags devel,runtime > "$out/xkb-install.log" 2>&1
+
+# gex-gl's EGL: Khronos's headers (the host's) and a pkg-config file with no
+# library (configure is given the soname; link-w64.sh links gexgl.c).
+mkdir -p "$I/egl/include"
+cp -r /usr/include/EGL /usr/include/KHR "$I/egl/include/"
+printf 'Name: egl\nDescription: gex-gl EGL (wasm64 LP64, linked by link-w64.sh: guest/gl/gexgl.c)\nVersion: 1.5\nCflags: -I%s\nLibs:\n' \
+  "$I/egl/include" > "$I/lib/pkgconfig/egl.pc"
 rm -rf "$S"
 echo "w64-deps: $I"

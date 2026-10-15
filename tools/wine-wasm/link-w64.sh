@@ -10,7 +10,8 @@
 # Also the Unix libraries crypt32, ws2_32, msv1_0, dnsapi and nsiproxy (as
 # W3's w3/link-loader.sh), registered with dlreg.py, and, when the tree was
 # configured with them (W64.4, w64-deps.sh's libraries: W64_DEPS), win32u
-# (+ FreeType) and winewayland.drv (+ libwayland, xkbcommon).
+# (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
+# (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64).
 # WINE_BUILD is a wasm64 build tree of the Wine fork (configure
 # --host=wasm64-unknown-linux-musl CC=tools/wine-wasm/wcc64
 # CXX=tools/wine-wasm/wcc64++); the objects are made there first.
@@ -85,7 +86,7 @@ fi
 if grep -q '^dlls/winewayland.drv/winewayland.so:' Makefile; then
 	# winewayland.so, the display driver; its protocol sources are generated
 	# in the tree first.
-	defs="-D__wine_unix_call_funcs=winewayland__wine_unix_call_funcs -Dget_region_data=winewayland_get_region_data"
+	defs="-D__wine_unix_call_funcs=winewayland__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=winewayland__wine_unix_call_wow64_funcs -Dget_region_data=winewayland_get_region_data"
 	mkdir -p gexw64/winewayland
 	gen=$(unixobjs winewayland.drv winewayland | sed -n 's/-protocol\.o$/-protocol.c/p')
 	# shellcheck disable=SC2086
@@ -100,7 +101,28 @@ if grep -q '^dlls/winewayland.drv/winewayland.so:' Makefile; then
 		fi
 	done
 	reg="$reg winewayland.so:data:__wine_unix_call_funcs=winewayland__wine_unix_call_funcs"
-	libs="$libs $W64_DEPS/lib/libwayland-client.a $W64_DEPS/lib/libxkbcommon.a $W64_DEPS/lib/libxkbregistry.a $W64_DEPS/lib/libxml2.a"
+	libs="$libs $W64_DEPS/lib/libwayland-egl.a $W64_DEPS/lib/libwayland-client.a $W64_DEPS/lib/libxkbcommon.a $W64_DEPS/lib/libxkbregistry.a $W64_DEPS/lib/libxml2.a"
+fi
+if grep -q '^dlls/opengl32/opengl32.so:' Makefile && grep -q 'SONAME_LIBEGL' include/config.h; then
+	# opengl32.so; win32u's EGL is gex-gl's (guest/gl/gexgl.c, LP64), found
+	# by dlopen("libEGL.so.1"), as W3's link-loader.sh links it. gex-gl
+	# finds libwayland-client the same way (RTLD_NOLOAD).
+	mkdir -p gexw64/opengl32
+	for c in $(unixobjs opengl32 opengl32); do
+		b=$(basename "$c" .o)
+		compile "dlls/opengl32/$b.c" "$c" "gexw64/opengl32/$b.o" "-D__wine_unix_call_funcs=opengl32__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=opengl32__wine_unix_call_wow64_funcs"
+	done
+	reg="$reg opengl32.so:data:__wine_unix_call_funcs=opengl32__wine_unix_call_funcs"
+	gl=$HERE/../../guest/gl
+	if ! [ gexw64/gexgl.o -nt "$gl/gexgl.c" ] || [ -n "$(find "$gl" -maxdepth 1 -newer gexw64/gexgl.o \( -name '*.h' -o -name '*.inc' \))" ]; then
+		nice -n 10 "$HERE/wcc64" -O2 -c -o gexw64/gexgl.o "$gl/gexgl.c" >&2 || { echo "link-w64: gexgl.c failed" >&2; touch "$fail"; }
+	fi
+	objs="$objs gexw64/gexgl.o"
+	for f in $(llvm-nm --defined-only --extern-only gexw64/gexgl.o | awk '$2 == "T" { print $3 }'); do reg="$reg libEGL.so.1:func:$f"; done
+	for f in wl_display_flush wl_proxy_destroy wl_proxy_get_display wl_proxy_get_id wl_proxy_marshal wl_proxy_marshal_constructor; do
+		reg="$reg libwayland-client.so.0:func:$f"
+	done
+	reg="$reg libwayland-client.so.0:data:wl_callback_interface"
 fi
 wait
 [ ! -e "$fail" ] || { echo "link-w64: compile failed; not linking" >&2; exit 1; }

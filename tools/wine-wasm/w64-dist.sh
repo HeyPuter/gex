@@ -13,10 +13,11 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
 #               a native x86_64 Unix side, used only to make the prefix)
 #   pfx64-P     a win64 prefix (wineboot -i, native, no display)
-#   deps64-S    the Unix side's display libraries, LP64 wasm64 (w64-deps.sh:
-#               FreeType, libwayland, libxml2, xkbcommon; W64.4)
+#   deps64-D    the Unix side's display libraries, LP64 wasm64 (w64-deps.sh:
+#               FreeType, libwayland, libxml2, xkbcommon, EGL headers; W64.4)
 #   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
-#               win32u (+ FreeType) and winewayland.drv in the loader
+#               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
+#               EGL, guest/gl/gexgl.c; W64.4) in the loader
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over W3_BUILD)
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               share/wine
@@ -27,8 +28,9 @@
 #               linked as one module behind their skeletons
 #               (stage-native64.sh)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
-# pfx64), S the sysroot, gex's link tools and the libraries' pins and
-# build, N those, the PE linker and the DLL list.
+# pfx64), D the sysroot, the compiler and the libraries' pins and build,
+# S those, gex's link tools and gex-gl's guest library, N those, the PE
+# linker and the DLL list.
 # Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16); the
 # libraries' tarballs are kept in CACHE/dl, taken from W3_DL_SEED and
 # W3's downloads (W3_CACHE, default ~/.cache/gex-w3) when there.
@@ -68,8 +70,12 @@ fi
 # (dlls/*/unix, server, loader): keyed by the rest of the tree, so a
 # Unix-side change rebuilds only the wasm64 tree and the server.
 P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader/)' | sha256sum | cut -c1-12)
-S=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/link-w64.sh "$here"/wcc64 "$here"/flags64.sh "$here"/dlreg.py \
-	"$here"/w64-deps.sh "$here"/w3.pins "$here"/ffi64/*; } | sha256sum | cut -c1-10)
+# The display libraries are keyed by what builds them; the wasm64 tree by
+# those, the link and gex-gl's guest library (linked into the loader).
+DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$here"/w64-deps.sh "$here"/w3.pins \
+	"$here"/ffi64/*; } | sha256sum | cut -c1-10)
+S=$( { echo "$DH"; cat "$here"/link-w64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
+	"$here"/../../guest/gl/*.inc; } | sha256sum | cut -c1-10)
 without="--without-x --without-freetype --without-gstreamer --without-pulse --without-alsa --without-cups
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus
   --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-sdl --without-oss
@@ -109,16 +115,17 @@ log "win64 prefix ($P)"; step pfx64-$P pfx_make
 deps64_build() {
 	W3_DL_SEED="${W3_DL_SEED:-} ${W3_CACHE:-$HOME/.cache/gex-w3}/dl" JOBS=$J nice -n 10 "$here/w64-deps.sh" "$PWD" "$C/dl"
 }
-log "display libraries ($S)"; step deps64-$S deps64_build
-DEPS=$C/deps64-$S
+log "display libraries ($DH)"; step deps64-$DH deps64_build
+DEPS=$C/deps64-$DH
 
 b64_build() {
-	# FreeType and Wayland from deps64 (the sonames: dlreg's names)
-	local o=${without//--without-wayland/}; o=${o//--without-freetype/}
+	# FreeType, Wayland and gex-gl's EGL from deps64 (the sonames: dlreg's names)
+	local o=${without//--without-wayland/}; o=${o//--without-freetype/}; o=${o//--without-opengl/}
 	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
 		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
 		CC="$here/wcc64" CXX="$here/wcc64++" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
-		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6
+		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
+		ac_cv_lib_soname_EGL=libEGL.so.1
 	mkdir -p out
 	W64_DEPS=$DEPS/install JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
 }
