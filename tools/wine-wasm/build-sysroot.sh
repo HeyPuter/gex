@@ -84,7 +84,7 @@ for f in "$CRT"/*.c; do
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wno-everything -c "$f" -o "$b.o" &
   objs="$objs $b.o"
   [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done
@@ -100,7 +100,7 @@ if [ -n "${GEX_BINARYEN:-}" ]; then
   ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
 elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
   t=binaryen-version_$BINARYEN_VERSION
-  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$OUT"
+  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-$(uname -m)-linux.tar.gz" | tar xz -C "$OUT"
   rm -rf "$OUT/sysroot/binaryen"
   mv "$OUT/$t" "$OUT/sysroot/binaryen"
 fi
