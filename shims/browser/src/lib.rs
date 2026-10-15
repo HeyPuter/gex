@@ -9194,7 +9194,16 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// not the image survives -- pid, parent, non-cloexec descriptors, cwd -- which
 /// is what makes fork-then-exec work. Returns the entry point, or zero if the
 /// program could not be loaded (the caller already has an errno).
+thread_local! {
+    /// The exec about to run is on a memory no program has run in yet (a
+    /// posix_spawn child's, `vfork::gex_adopted_exec`): the image's and the
+    /// stack's spans read as zero already, so `do_exec` does not scan them.
+    /// Taken by the next `do_exec`.
+    pub(crate) static EXEC_FRESH: Cell<bool> = const { Cell::new(false) };
+}
+
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    let fresh = EXEC_FRESH.with(|c| c.replace(false));
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -9349,7 +9358,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if b > data.len() {
             return 0;
         }
-        gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+        if !fresh {
+            gex_kernel::zero_dirty_bytes(&mut data[a..b]);
+        }
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
         let mut prot = 0;
         if seg.readable {
@@ -9437,7 +9448,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // below it as the previous image had, so a program reading an uninitialised
     // local read the last program's data instead of zero.
     let stack_lo = (gex_abi::STACK_TOP - gex_abi::STACK_SIZE) as usize;
-    gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
+    // (A fresh memory's is zero: scanning its 8 MiB to find that out was
+    // half a millisecond of every posix_spawn child's exec.)
+    if !fresh {
+        gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
+    }
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     h.kernel.mem.lock().insert(
