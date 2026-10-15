@@ -13,19 +13,25 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
 #               a native x86_64 Unix side, used only to make the prefix)
 #   pfx64-P     a win64 prefix (wineboot -i, native, no display)
-#   b64-K-S     the wasm64 build tree of the Unix side (wcc64)
+#   deps64-S    the Unix side's display libraries, LP64 wasm64 (w64-deps.sh:
+#               FreeType, libwayland, libxml2, xkbcommon; W64.4)
+#   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
+#               win32u (+ FreeType) and winewayland.drv in the loader
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over W3_BUILD)
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               share/wine
 #   ntdll64-K-S the native PE ntdll (W64.2), made in b64-K-S
 #   pen64-K-N   the native PE core (W64.2): W64_NATIVE_DLLS (default ntdll,
-#               kernelbase, kernel32, msvcrt, ucrtbase) made in b64-K-S and
+#               kernelbase, kernel32, msvcrt, ucrtbase, and winewayland.drv,
+#               the display driver's PE side, W64.4) made in b64-K-S and
 #               linked as one module behind their skeletons
 #               (stage-native64.sh)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
-# pfx64), S the sysroot and gex's link tools, N those, the PE linker and
-# the DLL list.
-# Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16).
+# pfx64), S the sysroot, gex's link tools and the libraries' pins and
+# build, N those, the PE linker and the DLL list.
+# Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16); the
+# libraries' tarballs are kept in CACHE/dl, taken from W3_DL_SEED and
+# W3's downloads (W3_CACHE, default ~/.cache/gex-w3) when there.
 # The server is compiled with a configured W3 build tree's commands:
 # W3_BUILD and GEX_WASM_SYSROOT, or, unset, tools/wine-wasm's own (`make
 # paths`, under W3_CACHE), made first when missing (`make build`: the W3
@@ -62,7 +68,8 @@ fi
 # (dlls/*/unix, server, loader): keyed by the rest of the tree, so a
 # Unix-side change rebuilds only the wasm64 tree and the server.
 P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader/)' | sha256sum | cut -c1-12)
-S=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/link-w64.sh "$here"/wcc64 "$here"/flags64.sh "$here"/dlreg.py; } | sha256sum | cut -c1-10)
+S=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/link-w64.sh "$here"/wcc64 "$here"/flags64.sh "$here"/dlreg.py \
+	"$here"/w64-deps.sh "$here"/w3.pins "$here"/ffi64/*; } | sha256sum | cut -c1-10)
 without="--without-x --without-freetype --without-gstreamer --without-pulse --without-alsa --without-cups
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus
   --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-sdl --without-oss
@@ -99,11 +106,21 @@ pfx_make() {
 }
 log "win64 prefix ($P)"; step pfx64-$P pfx_make
 
+deps64_build() {
+	W3_DL_SEED="${W3_DL_SEED:-} ${W3_CACHE:-$HOME/.cache/gex-w3}/dl" JOBS=$J nice -n 10 "$here/w64-deps.sh" "$PWD" "$C/dl"
+}
+log "display libraries ($S)"; step deps64-$S deps64_build
+DEPS=$C/deps64-$S
+
 b64_build() {
-	"$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" --disable-tests --without-mingw \
-		--enable-archs= --without-unwind $without CC="$here/wcc64" CXX="$here/wcc64++"
+	# FreeType and Wayland from deps64 (the sonames: dlreg's names)
+	local o=${without//--without-wayland/}; o=${o//--without-freetype/}
+	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
+		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
+		CC="$here/wcc64" CXX="$here/wcc64++" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
+		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6
 	mkdir -p out
-	JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
+	W64_DEPS=$DEPS/install JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
@@ -119,6 +136,9 @@ dist_make() {
 	cp -p "$C/srv-$K"/lib/wine/i386-unix/wineserver* lib/wine/x86_64-unix/
 	cp -a "$N/lib/wine/x86_64-windows" lib/wine/
 	cp -a "$N/share/wine" share/
+	# Wine's own fonts (the x86_64 build, without FreeType, installs none;
+	# win32u's FreeType reads them, as W3's w3/stage.sh stages them)
+	mkdir -p share/wine/fonts && cp -f "$W"/fonts/*.ttf share/wine/fonts/
 	ln -sfn ../../share "$d/lib/wine/share"
 }
 log "install ($K, $S)"; step dist64-$K-$S dist_make
@@ -131,16 +151,16 @@ ntdll_native() {
 }
 log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native
 
-D=${W64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
+D=${W64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}
 NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
 pe_native() {
 	# W64.2's native PE core: each DLL's relocatable object and export list
 	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
 	local b=$C/b64-$K-$S t
 	t="libs/gexrt/libgexrt.a"
-	for dll in $D; do t="$t dlls/${dll%.*}/wasm64-windows/$dll"; done
+	for dll in $D; do t="$t dlls/${dll%.dll}/wasm64-windows/$dll"; done
 	# shellcheck disable=SC2086
-	( cd "$b" && nice -n 10 make -j"$J" $t )
+	( cd "$b" && nice -n 10 make -j"$J" $t ) || return 1
 	# shellcheck disable=SC2086
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }

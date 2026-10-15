@@ -212,6 +212,9 @@ def main():
             DELAY[mod] = [modname(i.lstrip('-')) for i in makefile_var(mk, 'DELAYIMPORTS')]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
+    if W64 and only - {d[0] for d in dlls}:
+        # (W64 names its set, stage-native64.sh: each one is wanted)
+        sys.exit('no objects for ' + ' '.join(sorted(only - {d[0] for d in dlls})) + ' (make their wasm64-windows DLLs first)')
     # every DLL the build has an export list for, native or not: what an
     # import the linked DLLs leave undefined is found in (guest imports)
     others = {}
