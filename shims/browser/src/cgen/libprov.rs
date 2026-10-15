@@ -203,6 +203,11 @@ static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// data and code page its parent made (a child must not start a provider
 /// over: an open `z_stream` points into its heap). Returns a unit to serve.
 pub(crate) fn rescan_if_new() -> Option<usize> {
+    // Not for a vfork child running in place (see `elfprov::rescan_if_new`):
+    // its memory, providers' data and heap are its parent's, still in use.
+    if crate::vfork::active() {
+        return None;
+    }
     let pid = crate::my_pid();
     let was = PID.swap(pid, Ordering::AcqRel);
     if was == pid || (lock(&DLLS).is_empty() && !AUTO.load(Ordering::Relaxed)) {

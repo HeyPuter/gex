@@ -3236,6 +3236,19 @@ export class Gex {
     };
   }
 
+  /** A `CLONE_VM | CLONE_VFORK` clone this Worker copies instead of
+   *  running in place (`gex_vfork_ok` said why not): the child still runs,
+   *  as a forked one, so nothing fails, only a spawn costs a copy of the
+   *  memory. Said once per Worker, so a lost in-place path shows. */
+  #vforkCopiedSaid = false;
+  #vforkCopied(why) {
+    vforkTrace(`[vfork] not here: ${why}`);
+    if (this.#vforkCopiedSaid) return;
+    this.#vforkCopiedSaid = true;
+    const reason = { [-1]: 'a vfork child is already running here', [-4]: "inside a provider's call", [-5]: 'a Windows process', [-6]: 'no global kernel', [-7]: 'another thread staged the fork' }[why] ?? `code ${why}`;
+    console.error(`[gex] pid ${this.wlToken()}: a CLONE_VM|CLONE_VFORK child is copied, not run in place (${reason}); said once per Worker`);
+  }
+
   /** How many posix_spawn children ran in this Worker (`#vforkChild`). */
   #vforks = 0;
   get vforks() {
@@ -4606,7 +4619,7 @@ export class Gex {
         if (!single.on) {
           const ok = e.gex_vfork_ok?.() ?? 0;
           if (ok > 0) this.#vforkChild();
-          else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+          else if (ok !== -2) this.#vforkCopied(ok);
         }
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
         this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
@@ -5692,7 +5705,7 @@ export class Gex {
               ({ pc, ctx } = at);
               continue;
             }
-          } else if (ok !== -2) vforkTrace(`[vfork] not here: ${ok}`);
+          } else if (ok !== -2) this.#vforkCopied(ok);
         }
         this.#where = 'drainFork';
         // A `fork` leaves a child here for the host to start. Drained before

@@ -1561,7 +1561,14 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
-    let wayland = crate::wl::have_wl().then(|| {
+    //
+    // And not for a vfork child running in its parent's Worker (vfork.rs):
+    // `set_compositor` is the memory's, which is the parent's, so the
+    // child's device replaced the parent's for good, and the parent's own
+    // clients were never pumped again (winlogon, after spawning explorer in
+    // place, hung on its first Wayland round trip). The child only execs;
+    // its program gets a compositor in the Worker the exec starts.
+    let wayland = (crate::wl::have_wl() && vfork::pid_here().is_none()).then(|| {
         let device = crate::wl::WaylandDevice::new();
         kernel.host_names.bind_host(
             crate::wl::DEFAULT_SOCKET,
