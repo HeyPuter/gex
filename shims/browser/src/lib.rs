@@ -10446,22 +10446,22 @@ fn chunk_sums(b: &[u8]) -> Vec<u64> {
 /// The first registry module whose bytes changed since they were pushed:
 /// its index, address, the changed chunk's offset and its bytes now. Each
 /// module is reported once.
-pub(crate) fn verify_registry(h: &mut Host) -> Option<String> {
-    for i in 0..h.jit.registry.len() {
-        let now = chunk_sums(&h.jit.registry[i]);
-        if let Some(c) = now.iter().zip(&h.jit.registry_sums[i]).position(|(a, b)| a != b) {
-            let m = &h.jit.registry[i];
+pub(crate) fn verify_registry(j: &mut Jit) -> Option<String> {
+    for i in 0..j.registry.len() {
+        let now = chunk_sums(&j.registry[i]);
+        if let Some(c) = now.iter().zip(&j.registry_sums[i]).position(|(a, b)| a != b) {
+            let m = &j.registry[i];
             let at = c * 256;
             let bytes: Vec<String> = m[at..(at + 256).min(m.len())].iter().map(|b| format!("{b:02x}")).collect();
             let s = format!(
                 "module {i} at {:#x}+{:#x} (of {} modules): chunk at +{at:#x} (address {:#x}) changed; now {}",
                 m.as_ptr() as usize,
                 m.len(),
-                h.jit.registry.len(),
+                j.registry.len(),
                 m.as_ptr() as usize + at,
                 bytes.join(" ")
             );
-            h.jit.registry_sums[i] = now;
+            j.registry_sums[i] = now;
             return Some(s);
         }
     }
@@ -15567,7 +15567,7 @@ pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
 /// survive `execve`. See [`gex_shared_dump`] for why the child needs it.
 #[no_mangle]
 pub extern "C" fn gex_shared_count() -> u32 {
-    with_host(|h| h.jit.shared.len() as u32)
+    with_jit_only(|j| j.shared.len() as u32)
 }
 
 /// Write the identity map to `out`: a `u64` page, a `u64` key and a `u32`
@@ -15583,13 +15583,13 @@ pub extern "C" fn gex_shared_count() -> u32 {
 /// receiver actually mapped.
 #[no_mangle]
 pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
-    with_host(|h| {
-        let n = h.jit.shared.len();
+    with_jit_only(|j| {
+        let n = j.shared.len();
         if (n * 20) as u32 > cap {
             return -1;
         }
         let dst = shim_slice_mut(out, (n * 20) as u32);
-        for (i, ((page, key), base)) in h.jit.shared.iter().enumerate() {
+        for (i, ((page, key), base)) in j.shared.iter().enumerate() {
             dst[i * 20..i * 20 + 8].copy_from_slice(&page.to_le_bytes());
             dst[i * 20 + 8..i * 20 + 16].copy_from_slice(&key.to_le_bytes());
             dst[i * 20 + 16..i * 20 + 20].copy_from_slice(&base.to_le_bytes());
@@ -15607,14 +15607,14 @@ pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
 pub extern "C" fn gex_shared_seed(ptr: u32, count: u32) -> u32 {
     phase(4);
     let src = shim_slice(ptr, count.saturating_mul(20));
-    with_host(|h| {
+    with_jit_only(|j| {
         let mut n = 0u32;
         for r in src.chunks_exact(20) {
             let page = u64::from_le_bytes(r[0..8].try_into().unwrap());
             let key = u64::from_le_bytes(r[8..16].try_into().unwrap());
             let base = u32::from_le_bytes(r[16..20].try_into().unwrap());
             if let std::collections::hash_map::Entry::Vacant(v) =
-                h.jit.shared.entry((page, key))
+                j.shared.entry((page, key))
             {
                 v.insert(base);
                 n += 1;
@@ -16438,8 +16438,8 @@ pub extern "C" fn gex_set_heartbeat(every: i64) {
 /// code to translate.
 #[no_mangle]
 pub extern "C" fn gex_jit_by_object(out: u32, max: u32) -> u32 {
-    let text = with_host(|h| {
-        let mut v: Vec<(&String, &(u64, u64, u64))> = h.jit.by_object.iter().collect();
+    let text = with_jit_only(|j| {
+        let mut v: Vec<(&String, &(u64, u64, u64))> = j.by_object.iter().collect();
         v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
         v.iter()
             .take(8)
@@ -16511,12 +16511,12 @@ pub extern "C" fn gex_lift_why(i: u32) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_jit_blocks() -> i64 {
-    with_host(|h| h.jit.blocks as i64)
+    with_jit_only(|j| j.blocks as i64)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_jit_compiles() -> i64 {
-    with_host(|h| h.jit.compiles as i64)
+    with_jit_only(|j| j.compiles as i64)
 }
 
 /// Blocks lifted on a page a closure library already claims.
@@ -16526,7 +16526,7 @@ pub extern "C" fn gex_jit_compiles() -> i64 {
 /// block static recompilation already produced.
 #[no_mangle]
 pub extern "C" fn gex_lift_in_closure() -> i64 {
-    with_host(|h| h.jit.lift_in_closure as i64)
+    with_jit_only(|j| j.lift_in_closure as i64)
 }
 
 /// How the shared-slot lookup went, packed so one call answers.
@@ -16535,19 +16535,19 @@ pub extern "C" fn gex_lift_in_closure() -> i64 {
 /// program that misses a hundred thousand times.
 #[no_mangle]
 pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
-    with_host(|h| {
+    with_jit_only(|j| {
         (match which {
-            0 => h.jit.reuse_have,
-            1 => h.jit.reuse_hit,
-            2 => h.jit.reuse_miss,
-            4 => h.jit.reuse_served,
-            5 => h.jit.store_ok,
-            6 => h.jit.store_full,
+            0 => j.reuse_have,
+            1 => j.reuse_hit,
+            2 => j.reuse_miss,
+            4 => j.reuse_served,
+            5 => j.store_ok,
+            6 => j.store_full,
             7 => SERVE_NONE.with(|c| c.borrow().0),
             8 => SERVE_NONE.with(|c| c.borrow().1),
             9 => NOIDENT_WHY.with(|c| c.borrow().0),
             10 => NOIDENT_WHY.with(|c| c.borrow().1),
-            _ => h.jit.reuse_noident,
+            _ => j.reuse_noident,
         }) as i64
     })
 }
@@ -16555,7 +16555,7 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
 /// Milliseconds the shim itself spent translating.
 #[no_mangle]
 pub extern "C" fn gex_jit_millis() -> i64 {
-    with_host(|h| (h.jit.nanos / 1_000_000) as i64)
+    with_jit_only(|j| (j.nanos / 1_000_000) as i64)
 }
 
 /// `GEX_EXC_TRACE`-style narration of NtRaiseException's nesting decision

@@ -713,7 +713,7 @@ mod imp {
             }
         }
         if VERIFY_REGISTRY.load(Ordering::Relaxed) {
-            if let Some(what) = with_host(crate::verify_registry) {
+            if let Some(what) = crate::with_jit_only(crate::verify_registry) {
                 warn_line(&format!("gex-nt: a translation was overwritten after it was kept: {what}\n"));
             }
         }
