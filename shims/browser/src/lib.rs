@@ -7235,59 +7235,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
-        // A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
-        // caught fatal signal) prints nothing of its own if the message path is
-        // gone, so name who did it: the stack from the raiser holds `abort`'s
-        // saved return address (its caller), and x30 the nearest frame -- enough
-        // to say which library and function a silent abort came from.
+        // A signal sent: the process's waits look again, and an abort is
+        // named (`kill_sent`).
         {
             use gex_kernel::syscalls::nr as knr;
             // The kernel's own (canonical) number: `nr` is the raw one, which
             // for an x86 or i386 process is in that ABI's numbering.
             let canon = h.kernel.syscall_nr;
-            let is_kill = matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL);
-            let sig = if canon == knr::TGKILL { a2 } else { a1 };
-            // A signal for a thread of this process is raised here, on that
-            // thread's own pending word, which its safepoints read (`sigs`);
-            // the thread may be parked in another Worker.
-            if is_kill {
-                waitq::wake_process();
-            }
-            if is_kill && sig == 6 {
-                let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
-                let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
-                let mut bt = String::new();
-                // The frame-pointer chain: at each aarch64 frame `[x29]` is the
-                // caller's x29 and `[x29+8]` its return address -- a clean call
-                // stack, unlike raw stack words which are half stale data.
-                let mut fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
-                for _ in 0..40 {
-                    if fp == 0 || fp & 7 != 0 {
-                        break;
-                    }
-                    let ret = gm.read_u64(fp + 8).unwrap_or(0);
-                    let o = object_off_at(ret);
-                    if !o.is_empty() {
-                        bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
-                    }
-                    let next = gm.read_u64(fp).unwrap_or(0);
-                    if next <= fp {
-                        break;
-                    }
-                    fp = next;
-                }
-                for i in 0..80u64 {
-                    let w = gm.read_u64(sp + i * 8).unwrap_or(0);
-                    let o = object_off_at(w);
-                    if o.contains(".so") || o.starts_with('/') {
-                        bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
-                    }
-                }
-                warn_line(&format!(
-                    "gex: SIGABRT raised by pid {} x30={x30:#x} {}, stack refs:{bt}\n",
-                    h.kernel.pid,
-                    object_name_at(&Px::of(h), x30),
-                ));
+            if matches!(canon, knr::KILL | knr::TKILL | knr::TGKILL) {
+                let sig = if canon == knr::TGKILL { a2 } else { a1 };
+                kill_sent(&gm, kstate.ctx_addr, h.kernel.pid, sig, &Px::of(h));
             }
         }
         // Relay every futex this syscall woke to the shared per-address counter,
@@ -7898,6 +7855,59 @@ fn clock_syscall(ctx: i32) -> bool {
         ));
     }
     true
+}
+
+/// After a `kill`, `tkill` or `tgkill` of signal `sig` from the thread whose
+/// context is at `ctx_addr`, with the kernel lock or without it (L22d).
+///
+/// A signal for a thread of this process is raised on that thread's own
+/// pending word, which its safepoints read (`sigs`); the thread may be
+/// parked in another Worker, so the process's waits look again.
+///
+/// A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
+/// caught fatal signal) prints nothing of its own if the message path is
+/// gone, so name who did it: the stack from the raiser holds `abort`'s
+/// saved return address (its caller), and x30 the nearest frame -- enough
+/// to say which library and function a silent abort came from.
+fn kill_sent(gm: &GuestMem<'_>, ctx_addr: u64, pid: i32, sig: u64, p: &Px<'_>) {
+    waitq::wake_process();
+    if sig != 6 {
+        return;
+    }
+    let sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+    let x30 = gm.read_u64(ctx_addr + ctx::x(30) as u64).unwrap_or(0);
+    let mut bt = String::new();
+    // The frame-pointer chain: at each aarch64 frame `[x29]` is the
+    // caller's x29 and `[x29+8]` its return address -- a clean call
+    // stack, unlike raw stack words which are half stale data.
+    let mut fp = gm.read_u64(ctx_addr + ctx::x(29) as u64).unwrap_or(0);
+    for _ in 0..40 {
+        if fp == 0 || fp & 7 != 0 {
+            break;
+        }
+        let ret = gm.read_u64(fp + 8).unwrap_or(0);
+        let o = object_off_at(ret);
+        if !o.is_empty() {
+            bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
+        }
+        let next = gm.read_u64(fp).unwrap_or(0);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    for i in 0..80u64 {
+        let w = gm.read_u64(sp + i * 8).unwrap_or(0);
+        let o = object_off_at(w);
+        if o.contains(".so") || o.starts_with('/') {
+            bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
+        }
+    }
+    warn_line(&format!(
+        "gex: SIGABRT raised by pid {} x30={x30:#x} {}, stack refs:{bt}\n",
+        pid,
+        object_name_at(p, x30),
+    ));
 }
 
 /// The getpid family for this Worker's thread (`ident_call`): its pid as
@@ -11446,6 +11456,11 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         // again (as the locked call's end does).
         waitq::publish_timer();
     }
+    if matches!(n, nr::KILL | nr::TKILL | nr::TGKILL) {
+        // As the locked call's end: the waits look again, an abort is named.
+        let sig = if n == nr::TGKILL { a2 } else { a1 };
+        with_px(|p| kill_sent(&gm, ctx_addr, my_pid(), sig, p));
+    }
     if let FreeOutcome::Done(_) = &outcome {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
@@ -11467,6 +11482,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
         FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
+        // A wasm32 program's sigreturn put back a call its handler
+        // interrupted: that call, made now as a syscall of its own (without
+        // the lock if it is a class call, as any other).
+        FreeOutcome::Again => return free_syscall(ctx, pc, mapped),
     })
 }
 
@@ -11512,7 +11531,18 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // A blocking `connect` (L18), as the kernel's park: until the
         // connection is up, refused or gone (`wait_ready`'s `Net`).
         gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
-        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep or a socket"),
+        // `rt_sigsuspend` (L22d), as the kernel's park: until a signal it
+        // can see arrives (another process's notifies this process's wait
+        // queue, a thread's of its own `waitq::wake_process`, a timer's is
+        // the wait's deadline), or at once if one already can be.
+        gex_kernel::BlockOp::SigSuspend { .. } => {
+            if sigs::ready() || unsafe { k_present() } == 0 {
+                Waiting::Runnable
+            } else {
+                Waiting::Signal
+            }
+        }
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket or a signal"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     let reissue = matches!(op, gex_kernel::BlockOp::AcceptWait { .. });

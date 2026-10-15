@@ -29,6 +29,9 @@ pub(crate) struct Home {
     /// Its user and group ids (`Kernel::creds`, the same ones): a set
     /// under the lock or without it is every thread's next read.
     creds: Arc<gex_kernel::syscalls::Creds>,
+    /// Its threads' signal states (`Kernel::thread_signals`), for a
+    /// `tgkill` to one.
+    threads: Arc<gex_kernel::signal::ThreadSigs>,
     clock: ClockFn,
     /// Its futexes and its memory map's published view, for `futex`
     /// without the kernel (docs/kernel-locking.md §5.2 step 4).
@@ -92,6 +95,7 @@ fn home_of(k: &Kernel) -> Home {
         procs: Arc::clone(&k.procs),
         pid: k.pid,
         creds: Arc::clone(&k.creds),
+        threads: Arc::clone(&k.thread_signals),
         clock: k.clock,
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
@@ -387,6 +391,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         tty: &home.tty,
         pid: home.pid,
         creds: &home.creds,
+        threads: &home.threads,
         wasm32: crate::WASM32.load(Ordering::Acquire),
         futex,
         started: crate::clock_started(),

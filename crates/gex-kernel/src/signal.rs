@@ -166,6 +166,10 @@ pub struct ProcSig {
     /// The earliest armed timer's deadline, clamped to `u64`; [`NO_TIMER`]
     /// when none is armed. Written under `timers`.
     timer_next: AtomicU64,
+    /// Held across a [`ProcSig::collect`]'s take of the inbox and its
+    /// raise, so a collect that finds the inbox empty because another is
+    /// under way waits for that one's signals to be pending (L22d).
+    collecting: Mutex<()>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -184,6 +188,7 @@ impl ProcSig {
             shared: AtomicU64::new(0),
             shared_sources: Mutex::new([None; NSIG]),
             timers: Mutex::new([None; 3]),
+            collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
         }
     }
@@ -313,7 +318,14 @@ impl ProcSig {
     /// -- so it leaves the signal on a shared per-process word and the target
     /// picks it up here. This is what makes `timeout`, job control and every
     /// supervisor work.
+    ///
+    /// One step to any other collector of this process: a `kill` to its own
+    /// process that finds its signal already taken by another thread's
+    /// collect waits here until that collect has raised it, so the signal
+    /// is pending when the `kill` returns (a `sigtimedwait` after it found
+    /// nothing, one time in a few hundred, in the page).
     pub fn collect(&self, procs: &crate::proc::ProcTable, pid: i32, uid: u32) -> u64 {
+        let _one = self.collecting.lock();
         let inbox = procs.take_signals(pid);
         if inbox == 0 {
             return 0;
@@ -365,6 +377,46 @@ pub struct Own {
     /// and `sigreturn` restores it -- without it the woken signal stays blocked
     /// and pending forever (`timeout` spun 2.2 million times).
     pub suspend_restore: Option<u64>,
+}
+
+/// Every thread's own signal state in a process, by tid, behind its own
+/// lock (L22d): what a `tgkill` to a thread of the same process raises on,
+/// whether its sender holds the kernel or not. Shared (`Arc`) between the
+/// process's kernel and its host's lock-free calls; a fork's is new. A leaf
+/// lock: nothing is called with it held.
+#[derive(Default)]
+pub struct ThreadSigs(Mutex<std::collections::HashMap<i32, Arc<ThreadSig>>>);
+
+impl ThreadSigs {
+    pub fn get(&self, tid: i32) -> Option<Arc<ThreadSig>> {
+        self.0.lock().get(&tid).cloned()
+    }
+
+    pub fn contains(&self, tid: i32) -> bool {
+        self.0.lock().contains_key(&tid)
+    }
+
+    pub fn insert(&self, tid: i32, t: Arc<ThreadSig>) {
+        self.0.lock().insert(tid, t);
+    }
+
+    /// `tid`'s, made by `make` if it has none yet.
+    pub fn get_or_insert_with(&self, tid: i32, make: impl FnOnce() -> Arc<ThreadSig>) -> Arc<ThreadSig> {
+        Arc::clone(self.0.lock().entry(tid).or_insert_with(make))
+    }
+
+    pub fn remove(&self, tid: i32) {
+        self.0.lock().remove(&tid);
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().clear();
+    }
+
+    /// The tids it holds, as it holds them now.
+    pub fn tids(&self) -> Vec<i32> {
+        self.0.lock().keys().copied().collect()
+    }
 }
 
 /// One thread's signal state, shared (`Arc`) between the thread and whoever

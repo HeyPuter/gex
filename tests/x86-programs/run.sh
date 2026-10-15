@@ -113,6 +113,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # sender of a signal they send themselves all show the new ids, and another
 # asks getpgid and getsid (L22c: the credential and session calls without
 # the kernel lock; the ids every thread reads are the process's, now).
+# kill-threads: a token passed round four threads by tgkill, a read
+# interrupted by one, sigsuspend woken by one twenty times, the process's
+# own kill taken by sigtimedwait, and a child ended by kill (L22d: the
+# signal calls without the kernel lock).
 # fork-maps-threads (native tiers only for now): forks while other threads
 # map, protect and unmap memory and files (L19: a fork's image, code names
 # and the translator's file reads come from the published map, not the
@@ -120,7 +124,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # of a threaded parent can fault walking musl's thread list, whose
 # descriptors sit on thread stacks above 4 GiB that its memory was not grown
 # to cover (fails the same on 31a21cad).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads quiet-threads fdobj-threads cred-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads quiet-threads fdobj-threads cred-threads kill-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

@@ -646,7 +646,9 @@ pub struct Kernel {
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
-    pub thread_signals: std::collections::HashMap<i32, Arc<crate::signal::ThreadSig>>,
+    /// Behind its own lock, shared with the host's lock-free calls, which
+    /// signal a thread through it (`tgkill`).
+    pub thread_signals: Arc<crate::signal::ThreadSigs>,
     /// The thread whose part `signals` holds now.
     pub sig_tid: i32,
     /// Every other thread's half-finished blocking call (`PendingCall`),
@@ -4413,6 +4415,8 @@ pub struct Free<'a> {
     /// The process's ids: the sender a signal names, the owner the
     /// credential calls answer and change.
     pub creds: &'a Creds,
+    /// The process's threads' signal states, for a `tgkill` to one.
+    pub threads: &'a crate::signal::ThreadSigs,
     /// A wasm32 program, whose own code runs a handler's frame.
     pub wasm32: bool,
     /// The process's futexes, for `futex`.
@@ -4438,6 +4442,10 @@ pub enum FreeOutcome {
     Blocking(BlockOp, Option<u64>),
     /// The machine has been halted: the process ends with this status.
     Exit(i32),
+    /// A wasm32 program's `rt_sigreturn` put back a call its handler
+    /// interrupted, to be made again now from the restored context, as a
+    /// syscall of its own (`restart_call`).
+    Again,
 }
 
 /// `ppoll`, `pselect6`, `epoll_pwait` or `epoll_pwait2` (canonical).
@@ -4673,6 +4681,129 @@ pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_
     }
 }
 
+/// The signal calls (L22d): those that send one, `kill` to a process, a
+/// group or every process and `tkill` and `tgkill` to a thread; and the
+/// calling thread's own `rt_sigtimedwait`, `rt_sigsuspend` and
+/// `rt_sigreturn`. They need the process table, which locks itself, the
+/// process's threads' signal states ([`ThreadSigs`](crate::signal::ThreadSigs),
+/// behind their own lock), and the caller's. Canonical.
+pub fn is_signal_call(n: u64) -> bool {
+    matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN)
+}
+
+/// `rt_sigtimedwait`, as it is answered here: a signal of `set` already
+/// pending is taken, with its `siginfo_t`; none is `EAGAIN` at once,
+/// whatever the timeout. For the kernel's arm and [`free_call`] alike.
+pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u64; 6]) -> SysResult {
+    let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
+    let Some(signal) = signals.take_pending_in(set) else { return Err(Errno::EAGAIN) };
+    // A `siginfo_t`: si_signo, si_errno, si_code, then the sender for one a
+    // process sent (the union is 8-aligned in the 64-bit layout).
+    let source = signals.take_source(signal);
+    if a[1] != 0 {
+        m.zero(a[1], 128)?;
+        m.write_u32(a[1], signal)?;
+        match source {
+            Some(src) => {
+                let fields = a[1] + if compat || gex_abi::PPC { 12 } else { 16 };
+                m.write_u32(a[1] + 8, src.code as u32)?;
+                m.write_u32(fields, src.pid as u32)?;
+                m.write_u32(fields + 4, src.uid)?;
+            }
+            None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
+        }
+    }
+    Ok(signal as u64)
+}
+
+/// `rt_sigsuspend`'s start: the mask the caller asks for, in place, and the
+/// one to put back afterwards. For the kernel's blocking path and
+/// [`free_call`] alike.
+///
+/// The swap and the wait have to look atomic to the guest -- that is the
+/// entire reason the call exists instead of a `sigprocmask` followed by a
+/// `pause` -- so the mask changes here, and is put back when the wait is
+/// over (`finish_blocking`, or the host's own finish).
+pub fn sigsuspend_begin(signals: &Signals, m: &GuestMem<'_>, a: [u64; 6]) -> Result<u64, Errno> {
+    let want = m.read_bits64(a[0])?;
+    let restore = signals.blocked();
+    // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or anywhere else.
+    const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+    signals.set_blocked(want & !UNBLOCKABLE);
+    Ok(restore)
+}
+
+/// What [`kill_call`] sends from: the calling thread's signal state, its
+/// process's other threads', the process table, and who is sending.
+pub struct KillTo<'a> {
+    pub signals: &'a Signals,
+    pub threads: &'a crate::signal::ThreadSigs,
+    pub procs: &'a ProcTable,
+    pub pid: i32,
+    /// The calling thread.
+    pub tid: i32,
+    pub creds: &'a Creds,
+}
+
+/// A send [`is_signal_call`] admits (`kill`, `tkill`, `tgkill`), made, for
+/// the kernel's arms and [`free_call`] alike. A host that has threads
+/// waiting elsewhere wakes them after (a signal for one is raised on its
+/// own pending word, which it sees when it looks).
+pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    if n == nr::KILL {
+        // `kill` addresses a process, which may be any process on the
+        // system. It goes through the table, which leaves the signal
+        // pending for the target to collect at its next syscall.
+        to.procs.kill(to.pid, a[0] as i32, a[1] as u32)?;
+        // If the caller was one of the targets -- it signalled itself, or
+        // its own group, or everything -- it must see the signal before
+        // this syscall returns, because `raise` is expected to have
+        // delivered by then. Who the targets were is the table's question
+        // to answer, not a rule to restate here: getting it wrong the other
+        // way made `kill(-pgid)` signal a caller that was in a different
+        // group entirely. Whether or not anything is still in the inbox:
+        // another thread's collect may have taken it and not yet raised it,
+        // and collecting waits for that one (`ProcSig::collect`).
+        to.signals.process().collect(to.procs, to.pid, to.creds.uid());
+        return Ok(0);
+    }
+    // `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
+    // signal goes to that thread. Mono's GC stops the world with
+    // `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
+    // left the target running and the GC waiting.
+    let (tgid, tid, signo) = if n == nr::TKILL { (to.pid, a[0] as i32, a[1] as u32) } else { (a[0] as i32, a[1] as i32, a[2] as u32) };
+    if signo > crate::signal::sig::MAX || tid <= 0 || (n == nr::TGKILL && tgid <= 0) {
+        return Err(Errno::EINVAL);
+    }
+    let target = if tid == to.tid { None } else { to.threads.get(tid) };
+    // An id names one task in the whole system (`ProcTable::new_tid`). One
+    // not of this process is another's thread: that process takes the
+    // signal, as `kill` gives it; `tgkill` must name its process.
+    if target.is_none() && tid != to.tid {
+        let owner = to.procs.task_owner(tid).ok_or(Errno::ESRCH)?;
+        if owner == to.pid || (n == nr::TGKILL && owner != tgid) {
+            return Err(Errno::ESRCH);
+        }
+        // That thread alone, collected by its process (`collect_signals`).
+        // A probe (`signo` 0) asks after the process only.
+        if signo == 0 {
+            return to.procs.kill(to.pid, owner, 0).map(|_| 0);
+        }
+        return to.procs.tkill(to.pid, owner, tid, signo).map(|_| 0);
+    }
+    if tgid != to.pid {
+        return Err(Errno::ESRCH);
+    }
+    if signo > 0 {
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.uid() };
+        match target {
+            Some(t) => t.raise_from(signo, source),
+            None => to.signals.raise_from(signo, source),
+        }
+    }
+    Ok(0)
+}
+
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
 /// both answer them here. `ctx_addr` is the calling thread's context.
 pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
@@ -4891,7 +5022,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             // The quiet calls, as the translation numbers them (several
             // numbers become the do-nothing one).
             r => match crate::i386::canonical_number(r) {
-                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) => c,
+                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) => c,
                 _ => return None,
             },
         }
@@ -4987,7 +5118,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
             r => match crate::x86::canonical_number(r) {
-                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) => c,
+                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) => c,
                 _ => return None,
             },
         }
@@ -5003,7 +5134,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
-            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) => raw,
+            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) => raw,
             _ => return None,
         }
     };
@@ -5057,7 +5188,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -5095,7 +5226,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -5161,6 +5292,38 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
     } else if is_cred(n) {
         cred_call(f.creds, f.procs, f.pid, m, n, a)
+    } else if is_signal_call(n) {
+        match n {
+            // Returning from a handler restores a whole context, so it
+            // does not go through "write the result and continue".
+            nr::RT_SIGRETURN => {
+                let legacy = compat && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
+                return match signal::sigreturn(f.signals, m, ctx_addr, compat, legacy) {
+                    // The restored context is in ctx: a wasm32 program goes
+                    // on there, or makes the call its handler interrupted.
+                    Ok(_) if f.wasm32 => {
+                        if restart_taken(m, ctx_addr) {
+                            FreeOutcome::Again
+                        } else {
+                            FreeOutcome::Done(Delivery::None)
+                        }
+                    }
+                    Ok(pc) => FreeOutcome::Done(Delivery::Resume(pc)),
+                    Err(_) => FreeOutcome::Done(Delivery::Terminate { signal: signal::sig::SIGSEGV, core: true }),
+                };
+            }
+            nr::RT_SIGSUSPEND => match sigsuspend_begin(f.signals, m, a) {
+                // Until a signal it can see arrives, its old mask owed
+                // back (`BlockOp::SigSuspend`).
+                Ok(restore_mask) => return FreeOutcome::Blocking(BlockOp::SigSuspend { restore_mask }, Some(restore_mask)),
+                Err(_) => Err(Errno::EFAULT),
+            },
+            nr::RT_SIGTIMEDWAIT => sigtimedwait(f.signals, m, compat, a),
+            _ => {
+                let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
+                kill_call(&to, n, a)
+            }
+        }
     } else if is_fd_object(n) {
         // As the full call: a transfer from an empty blocking stream parks
         // until it is readable and is made again then.
@@ -6409,9 +6572,8 @@ impl Kernel {
         let blocked = self.signals.blocked();
         let next = self
             .thread_signals
-            .entry(tid)
-            .or_insert_with(|| Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
-        self.signals.switch_to(Arc::clone(next));
+            .get_or_insert_with(tid, || Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
+        self.signals.switch_to(next);
         self.sig_tid = tid;
     }
 
@@ -6425,15 +6587,12 @@ impl Kernel {
         }
         if tid == self.sig_tid {
             let cur = Arc::clone(self.signals.thread());
-            self.thread_signals.entry(tid).or_insert_with(|| Arc::clone(&cur));
+            self.thread_signals.get_or_insert_with(tid, || Arc::clone(&cur));
             return cur;
         }
         let blocked = self.signals.blocked();
-        Arc::clone(
-            self.thread_signals
-                .entry(tid)
-                .or_insert_with(|| Arc::new(signal::ThreadSig::new_thread(blocked))),
-        )
+        self.thread_signals
+            .get_or_insert_with(tid, || Arc::new(signal::ThreadSig::new_thread(blocked)))
     }
 
     /// The signal state after `execve` ([`Signals::exec`]): the other
@@ -6458,7 +6617,7 @@ impl Kernel {
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
         // The other threads are gone, and their ids with them.
-        for &t in self.thread_signals.keys() {
+        for t in self.thread_signals.tids() {
             if t != tid && t != self.pid {
                 self.procs.end_tid(t);
             }
@@ -6482,7 +6641,7 @@ impl Kernel {
         if tid == self.sig_tid {
             return self.signals.would_deliver();
         }
-        match self.thread_signals.get(&tid) {
+        match self.thread_signals.get(tid) {
             Some(t) => t.ready(self.signals.process()),
             None => self.signals.would_deliver(),
         }
@@ -6546,7 +6705,7 @@ impl Kernel {
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
             syscall_nr: 0,
-            thread_signals: std::collections::HashMap::new(),
+            thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: false,
@@ -6843,7 +7002,7 @@ impl Kernel {
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
             syscall_nr: 0,
-            thread_signals: std::collections::HashMap::new(),
+            thread_signals: Arc::new(crate::signal::ThreadSigs::default()),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             compat: self.compat,
@@ -7272,7 +7431,7 @@ impl Kernel {
             self.thread_exit(m);
             // Its signal state goes with it; the next thread to enter loads
             // its own.
-            self.thread_signals.remove(&self.tid);
+            self.thread_signals.remove(self.tid);
             self.procs.end_tid(self.tid);
             self.thread_calls.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
@@ -7523,12 +7682,7 @@ impl Kernel {
             // seconds and then reported success: musl saw `ENOSYS` and spun,
             // 1.6 million syscalls' worth, until the child ended by itself.
             nr::RT_SIGSUSPEND => {
-                let want = m.read_bits64(a[0]).ok()?;
-                let restore_mask = self.signals.blocked();
-                // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
-                // anywhere else.
-                const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
-                self.signals.set_blocked(want & !UNBLOCKABLE);
+                let restore_mask = sigsuspend_begin(&self.signals, m, a).ok()?;
                 self.restore_sigmask = Some(restore_mask);
                 Some(BlockOp::SigSuspend { restore_mask })
             }
@@ -7832,36 +7986,21 @@ impl Kernel {
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
-            nr::RT_SIGTIMEDWAIT => self.sys_rt_sigtimedwait(m, a),
+            nr::RT_SIGTIMEDWAIT => sigtimedwait(&self.signals, m, self.compat, a),
+            // Reached only when the new mask could not be read (the
+            // blocking path takes the rest).
+            nr::RT_SIGSUSPEND => Err(Errno::EFAULT),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // `tkill` and `tgkill` address a thread: see `sys_tgkill`.
-            nr::TKILL | nr::TGKILL => self.sys_tgkill(n, a),
-            // `kill` addresses a process, which may be any process on the
-            // system. It goes through the table, which leaves the signal
-            // pending for the target to collect at its next syscall.
-            nr::KILL => {
-                let target = a[0] as i32;
-                let signo = a[1] as u32;
-                if self.trace {
-                    eprintln!("[gex:{}] kill -> pid {target} signal {signo}", self.pid);
+            // `kill`, `tkill` and `tgkill` (L22d), as the free path makes
+            // them.
+            nr::KILL | nr::TKILL | nr::TGKILL => {
+                if self.trace && n == nr::KILL {
+                    eprintln!("[gex:{}] kill -> pid {} signal {}", self.pid, a[0] as i32, a[1] as u32);
                 }
-                match self.procs.kill(self.pid, target, signo) {
-                    Ok(_) => {
-                        // If the caller was one of the targets -- it signalled
-                        // itself, or its own group, or everything -- it must
-                        // see the signal before this syscall returns, because
-                        // `raise` is expected to have delivered by then. Who
-                        // the targets were is the table's question to answer,
-                        // not a rule to restate here: getting it wrong the
-                        // other way made `kill(-pgid)` signal a caller that
-                        // was in a different group entirely.
-                        self.take_sent_signals();
-                        Ok(0)
-                    }
-                    Err(e) => Err(e),
-                }
+                let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
+                kill_call(&to, n, a)
             }
             nr::RT_SIGRETURN => {
                 // Handled by the caller, which must redirect execution to the
@@ -7958,7 +8097,7 @@ impl Kernel {
                 let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.uid() };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
-                } else if let Some(t) = self.thread_signals.get(&tid) {
+                } else if let Some(t) = self.thread_signals.get(tid) {
                     t.raise_from(signo, source);
                     other = true;
                 }
@@ -8914,53 +9053,6 @@ impl Kernel {
     }
 
 
-    /// `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
-    /// signal goes to that thread. Mono's GC stops the world with
-    /// `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
-    /// left the target running and the GC waiting.
-    fn sys_tgkill(&mut self, n: u64, a: [u64; 6]) -> SysResult {
-        let (tgid, tid, signo) = if n == nr::TKILL {
-            (self.pid, a[0] as i32, a[1] as u32)
-        } else {
-            (a[0] as i32, a[1] as i32, a[2] as u32)
-        };
-        if signo > crate::signal::sig::MAX || tid <= 0 || (n == nr::TGKILL && tgid <= 0) {
-            return Err(Errno::EINVAL);
-        }
-        // An id names one task in the whole system (`ProcTable::new_tid`).
-        // One not of this process is another's thread: that process takes
-        // the signal, as `kill` gives it; `tgkill` must name its process.
-        if !self.thread_signals.contains_key(&tid) && tid != self.tid {
-            let owner = self.procs.task_owner(tid).ok_or(Errno::ESRCH)?;
-            if owner == self.pid || (n == nr::TGKILL && owner != tgid) {
-                return Err(Errno::ESRCH);
-            }
-            // That thread alone, collected by its process
-            // (`collect_signals`). A probe (`signo` 0) asks after the
-            // process only.
-            if signo == 0 {
-                return self.procs.kill(self.pid, owner, 0).map(|_| 0);
-            }
-            return self.procs.tkill(self.pid, owner, tid, signo).map(|_| 0);
-        }
-        if tgid != self.pid {
-            return Err(Errno::ESRCH);
-        }
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.creds.uid() };
-        if tid == self.tid {
-            if signo > 0 {
-                self.signals.raise_from(signo, source);
-            }
-        } else {
-            let Some(t) = self.thread_signals.get(&tid) else { return Err(Errno::ESRCH) };
-            if signo > 0 {
-                t.raise_from(signo, source);
-            }
-        }
-        Ok(0)
-    }
-
-
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
     fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
@@ -9045,33 +9137,6 @@ impl Kernel {
     /// `rt_sigtimedwait`, for a signal already pending. The blocking case is
     /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
     /// every caller seen so far (draining blocked signals, not sleeping).
-    fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
-        match self.signals.take_pending_in(set) {
-            Some(signal) => {
-                // A `siginfo_t`: si_signo, si_errno, si_code, then the sender
-                // for one a process sent (the union is 8-aligned in the 64-bit
-                // layout).
-                let source = self.signals.take_source(signal);
-                if a[1] != 0 {
-                    m.zero(a[1], 128)?;
-                    m.write_u32(a[1], signal)?;
-                    match source {
-                        Some(src) => {
-                            let fields = a[1] + if self.compat || gex_abi::PPC { 12 } else { 16 };
-                            m.write_u32(a[1] + 8, src.code as u32)?;
-                            m.write_u32(fields, src.pid as u32)?;
-                            m.write_u32(fields + 4, src.uid)?;
-                        }
-                        None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
-                    }
-                }
-                Ok(signal as u64)
-            }
-            None => Err(Errno::EAGAIN),
-        }
-    }
-
     // -- sockets ---------------------------------------------------------------
 
 
@@ -10296,7 +10361,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10405,7 +10470,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10476,7 +10541,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10550,6 +10615,101 @@ mod tests {
         assert_eq!(k.creds.uid(), 4321);
     }
 
+    /// `kill`, `tkill` and `tgkill` (L22d) answer as the kernel's arms do,
+    /// and one for another thread of the process is raised on that
+    /// thread's own state, found through the shared table.
+    #[test]
+    fn free_kill_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        let (pid, tid) = (k.pid as u64, k.tid as u64);
+        let cases: Vec<(u64, [u64; 3])> = vec![
+            (nr::KILL, [pid, 0, 0]),
+            (nr::KILL, [99999, 0, 0]),
+            (nr::TKILL, [tid, 0, 0]),
+            (nr::TKILL, [0, 0, 0]),
+            (nr::TKILL, [tid, 99, 0]),
+            (nr::TGKILL, [pid, tid, 0]),
+            (nr::TGKILL, [pid + 999, tid, 0]),
+            (nr::TGKILL, [pid, 99999, 0]),
+            (nr::TGKILL, [0, tid, 0]),
+        ];
+        for (n, args) in cases {
+            set_args(&mut m, at, n, &args);
+            k.syscall(&mut m, 0);
+            let want = ret(&m, at);
+            set_args(&mut m, at, n, &args);
+            assert!(done(free(&k, &mut m, at)), "call {n} in the class");
+            assert_eq!(ret(&m, at), want, "call {n} {args:?}");
+        }
+        // Another thread's: on its own pending word, with the sender named,
+        // and none on the caller's.
+        const SIGUSR2: u64 = 12;
+        let other = Arc::new(signal::ThreadSig::new_thread(0));
+        k.thread_signals.insert(4242, Arc::clone(&other));
+        set_args(&mut m, at, nr::TGKILL, &[pid, 4242, SIGUSR2]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 0);
+        assert_eq!(other.pending(), 1 << (SIGUSR2 - 1));
+        assert_eq!(k.signals.thread().pending() & (1 << (SIGUSR2 - 1)), 0);
+
+        // rt_sigtimedwait: nothing pending is EAGAIN both ways; a blocked
+        // signal the process sent itself is taken, with its sender, the
+        // same both ways.
+        let set_at = 0x31000u64;
+        let info_at = 0x31100u64;
+        m.write_u64(set_at, 1 << (SIGUSR2 - 1)).unwrap();
+        k.signals.set_blocked(1 << (SIGUSR2 - 1));
+        let mut answers = Vec::new();
+        for kernel in [true, false] {
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+            if kernel {
+                k.syscall(&mut m, 0);
+            } else {
+                assert!(done(free(&k, &mut m, at)));
+            }
+            assert_eq!(ret(&m, at), -(Errno::EAGAIN.0 as i64));
+            set_args(&mut m, at, nr::KILL, &[pid, SIGUSR2]);
+            k.syscall(&mut m, 0);
+            m.zero(info_at, 128).unwrap();
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+            if kernel {
+                k.syscall(&mut m, 0);
+            } else {
+                assert!(done(free(&k, &mut m, at)));
+            }
+            answers.push((ret(&m, at), m.read(info_at, 32).unwrap().to_vec()));
+        }
+        assert_eq!(answers[0].0, SIGUSR2 as i64);
+        assert_eq!(answers[0], answers[1]);
+
+        // rt_sigsuspend: the asked-for mask in place (SIGKILL never
+        // blocked), a park on SigSuspend, the old mask owed back.
+        k.signals.set_blocked(0x5);
+        m.write_u64(set_at, !0).unwrap();
+        set_args(&mut m, at, nr::RT_SIGSUSPEND, &[set_at, 8]);
+        match free(&k, &mut m, at) {
+            Some(FreeOutcome::Blocking(BlockOp::SigSuspend { restore_mask: 0x5 }, Some(0x5))) => {}
+            _ => panic!("rt_sigsuspend did not park"),
+        }
+        assert_eq!(k.signals.blocked(), !0 & !((1 << 8) | (1 << 18)));
+        k.signals.set_blocked(0);
+        set_args(&mut m, at, nr::RT_SIGSUSPEND, &[0x7fff_ffff_0000, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), -(Errno::EFAULT.0 as i64));
+    }
+
     #[test]
     fn free_i386_quiet_calls_answer_as_the_kernel_does() {
         if !gex_abi::X86 {
@@ -10562,7 +10722,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 3]| {
@@ -10659,7 +10819,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10767,7 +10927,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10890,7 +11050,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10988,7 +11148,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -11166,7 +11326,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -11227,7 +11387,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -11639,7 +11799,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -11716,7 +11876,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -11814,7 +11974,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11896,7 +12056,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -11962,7 +12122,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -12064,7 +12224,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -12101,7 +12261,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12169,7 +12329,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12280,7 +12440,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12356,7 +12516,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12463,7 +12623,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12544,7 +12704,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12583,7 +12743,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;
