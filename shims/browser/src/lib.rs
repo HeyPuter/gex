@@ -14317,11 +14317,36 @@ fn fault_pc(pc: i64) -> i64 {
 /// the old library's blocks (Half-Life: SDL's libudev landing where an
 /// earlier library had been, entered in the middle of an instruction).
 fn retire_unmapped_code_in(h: &mut Host) {
-    let (retired, recheck) = {
-        let mut mm = h.kernel.mem.lock();
-        (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.recheck_code))
-    };
-    retire_noted(&h.kernel.mem, &retired, &recheck);
+    let mm = &h.kernel.mem;
+    with_jit_only(|_| {
+        let (retired, recheck, _) = take_logged(mm, false);
+        retire_noted(mm, &retired, &recheck);
+    });
+}
+
+/// The code the map's log says was retired, rechecked and (with `mapped`)
+/// mapped since it was last looked at, taken out of it.
+///
+/// Only under the JIT lock, held until what is taken is retired: the
+/// entries leave the log there, so a thread whose own mapping call reuses
+/// a retired address, and drains the log before it returns, either finds
+/// them still there and retires them itself, or waits for whoever took
+/// them to have retired them. A call that makes code executable (`mmap`,
+/// `mprotect`, the NT layer's) always drains, so no thread runs new code
+/// at an address whose old translations are still in place, whichever
+/// path, locked or not, unmapped it (docs/kernel-locking.md §4.3, L12b).
+pub(crate) fn take_logged(
+    mm: &gex_kernel::mem::Mm,
+    mapped: bool,
+) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<gex_kernel::CodeMap>) {
+    assert!(jit_holds(), "gex: the map's log drained without the JIT lock");
+    let mut g = mm.lock();
+    let log = &mut g.log;
+    (
+        std::mem::take(&mut log.retired_code),
+        std::mem::take(&mut log.recheck_code),
+        if mapped { std::mem::take(&mut log.new_code) } else { Vec::new() },
+    )
 }
 
 /// What a mapping call made without the kernel lock (`free_syscall`) noted
@@ -14332,17 +14357,11 @@ fn retire_unmapped_code_in(h: &mut Host) {
 fn map_drain() -> Vec<gex_kernel::CodeMap> {
     let Some(home) = sigs::home() else { return Vec::new() };
     let mm = home.mm();
-    let (retired, recheck, mapped) = {
-        let mut g = mm.lock();
-        let log = &mut g.log;
-        (
-            std::mem::take(&mut log.retired_code),
-            std::mem::take(&mut log.recheck_code),
-            std::mem::take(&mut log.new_code),
-        )
-    };
-    retire_noted(mm, &retired, &recheck);
-    mapped
+    with_jit_only(|_| {
+        let (retired, recheck, mapped) = take_logged(mm, true);
+        retire_noted(mm, &retired, &recheck);
+        mapped
+    })
 }
 
 /// Retire `retired` (code unmapped or made writable) and compare `recheck`

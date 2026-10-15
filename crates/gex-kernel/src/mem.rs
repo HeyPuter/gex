@@ -64,6 +64,18 @@ pub struct Vma {
 }
 
 impl Vma {
+    /// Whether `next`, which starts where this ends, is the same mapping
+    /// continued: the same protection and name, and its file offsets (if
+    /// any) carrying on from this one's.
+    fn joins(&self, next: &Vma) -> bool {
+        let continues = |a: &Option<(String, u64)>, b: &Option<(String, u64)>| match (a, b) {
+            (None, None) => true,
+            (Some((x, o)), Some((y, p))) => x == y && o + (self.end - self.start) == *p,
+            _ => false,
+        };
+        self.prot == next.prot && self.name == next.name && continues(&self.origin, &next.origin) && continues(&self.code, &next.code)
+    }
+
     /// A piece of this mapping, with the origin offset moved to match.
     fn slice(&self, start: u64, end: u64, prot: u32) -> Vma {
         Vma {
@@ -1293,7 +1305,21 @@ impl MemoryMap {
             }
         }
         out.sort_by_key(|v| v.start);
-        self.vmas = out;
+        // Neighbours the change made alike again are one mapping again, as
+        // Linux merges them: a range made read-only and back is whole, so a
+        // later `mremap` of it, which must name one mapping, finds one.
+        // Only at the boundaries this call touched.
+        let mut merged: Vec<Vma> = Vec::with_capacity(out.len());
+        for v in out {
+            if let Some(last) = merged.last_mut() {
+                if last.end == v.start && (addr..=end).contains(&v.start) && last.joins(&v) {
+                    last.end = v.end;
+                    continue;
+                }
+            }
+            merged.push(v);
+        }
+        self.vmas = merged;
         if touched {
             Ok(())
         } else {
@@ -1744,6 +1770,24 @@ mod tests {
         assert!(m.check_access(a + 0x1000, 0x1000, prot::EXEC));
         assert!(!m.check_access(a, 0x1000, prot::EXEC));
         assert!(!m.check_access(a + 0x2000, 0x1000, prot::EXEC));
+    }
+
+    /// A range made read-only and writable again is one mapping again, as
+    /// Linux merges it, so `mremap` of the whole of it works; neighbours
+    /// that differ stay apart.
+    #[test]
+    fn protect_back_merges_and_mremap_takes_the_whole() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let rw = prot::READ | prot::WRITE;
+        let a = m.mmap(0, 0x4000, rw, flags::ANONYMOUS, "x").unwrap();
+        m.protect(a + 0x1000, 0x1000, prot::READ).unwrap();
+        assert_eq!(m.vmas().len(), 3);
+        m.protect(a + 0x1000, 0x1000, rw).unwrap();
+        assert_eq!(m.vmas().iter().filter(|v| v.start >= a && v.end <= a + 0x4000).count(), 1);
+        assert!(m.mremap(a, 0x4000, 0x8000, true).is_ok());
+        let b = m.mmap(0, 0x2000, rw, flags::ANONYMOUS, "y").unwrap();
+        m.protect(b, 0x1000, prot::READ).unwrap();
+        assert_eq!(m.vmas().iter().filter(|v| v.start >= b && v.end <= b + 0x2000).count(), 2);
     }
 
     #[test]

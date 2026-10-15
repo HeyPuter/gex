@@ -44,7 +44,10 @@ static void *anon(void *arg) {
         if (mprotect(p + 0x1000, 0x1000, PROT_READ)) fail("mprotect");
         if (p[0x1000] != (unsigned char)(id + 1)) fail("bytes kept");
         if (mprotect(p + 0x1000, 0x1000, PROT_READ | PROT_WRITE)) fail("mprotect back");
-        if (munmap(p, len)) fail("munmap");
+        /* One mapping again (Linux merges the pieces), so it moves whole. */
+        unsigned char *g = mremap(p, len, len + 0x1000, MREMAP_MAYMOVE);
+        if (g == MAP_FAILED) { fail("mremap after mprotect"); munmap(p, len); continue; }
+        if (munmap(g, len + 0x1000)) fail("munmap");
         /* Moved while the others map into what it leaves. */
         p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) { fail("mmap"); continue; }

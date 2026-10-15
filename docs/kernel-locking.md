@@ -593,14 +593,26 @@ in the scheduler pick after each wake of the global WAKE word: about
      translates or runs the old code between the two and a freed address
      is not mapped again with new code before its translations are gone.
      `mremap` copies with the mm lock held, so another thread's mapping
-     cannot land in the range it vacates before its bytes are out. Still
-     under the kernel lock: the consumers of the mapped code
+     cannot land in the range it vacates before its bytes are out.
+     The log is drained only under the JIT lock, held until what was taken
+     is retired (`take_logged`), and every call that makes code executable
+     drains it before it returns: the free path's, the locked path's
+     (`retire_unmapped_code_in`) and the NT layer's (its calls still run
+     under the kernel lock, their drain a section after the call). So
+     whichever path unmapped code, a thread that maps new code at that
+     address either retires the old translations itself or waits for whoever
+     took them to finish; none runs the old code there. `mprotect` merges
+     the neighbours it makes alike again, as Linux does, so a range made
+     read-only and writable again is one mapping for `mremap`. Still under
+     the kernel lock: the consumers of the mapped code
      (`recompile_objects`, `elfprov::maps`, which take it themselves after
-     the call, L12c), and the NT layer's own mapping calls, whose retire is
-     a separate kernel-lock section after the call. Legs:
+     the call, L12c), and the NT layer's mapping calls themselves. Legs:
      `free_mapping_calls_answer_as_the_kernel_does`,
-     `free_i386_mapping_calls_answer_as_the_kernel_does`; `mmap-threads`
-     (x86-64, i386, aarch64) in the page tier.
+     `free_i386_mapping_calls_answer_as_the_kernel_does`,
+     `protect_back_merges_and_mremap_takes_the_whole`; `mmap-threads`
+     (x86-64, i386, aarch64) in the page tier; W3 `vmreuse` (NT
+     VirtualAlloc/VirtualProtect/VirtualFree with code at reused
+     addresses, from four threads).
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
