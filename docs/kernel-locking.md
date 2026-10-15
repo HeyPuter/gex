@@ -309,6 +309,158 @@ About 85 sites, and the hottest path after syscalls. The plan:
   run is the debugging oracle for each step: thread sanitizer and stress
   tests run there.
 
+### 3.12 What still takes the lock, and what replaces it (survey, 2026-10-15)
+
+On 31a21cad (after L18) there are 113 lock sites in shims/browser/src:
+105 `with_host`, 4 `with_host_free`, 2 `with_host_free_in`, and 2
+`KLock::take`. The two `KLock::take` calls are `with_host` itself and NT's
+`lock_kernel`. `with_jit` has no callers left. Each group below lists its
+call sites, the state they actually touch, and what replaces the lock.
+
+- **A. The locked syscall path.**
+  - Sites: 2, both in `gex_syscall`: its `None` arm, and the trace's
+    caller name.
+  - Calls still taken this way, as canonical numbers:
+    - lifecycle: clone, clone3, execve, exit, exit_group, wait4, reboot;
+    - signals: kill, tkill, tgkill, rt_sigtimedwait, rt_sigsuspend,
+      rt_sigreturn;
+    - credentials and sessions: set*uid/gid, setgroups, getgroups,
+      getres*, setsid, setpgid, getpgid, getsid, and getppid when IDS
+      holds none;
+    - descriptor objects: eventfd2, epoll_create1, timerfd_*,
+      memfd_create, dup2, fallocate, sendfile, splice, copy_file_range,
+      fsync, fdatasync, sync;
+    - thread-own and constant: set_tid_address, set/get_robust_list, rseq,
+      prctl, arch_prctl, uname, sched_*, getcpu, membarrier, times, time;
+    - namespace: mount, umount2, unshare.
+  - Work the locked section does around every call: the
+    `enter_thread`/`leave_thread` swap, publishing IDS, the pin report,
+    refreshing the proc snapshot, and delivering signals at syscall end.
+  - Replacements:
+    - thread-own and constant calls: nothing; they use the thread's own
+      state.
+    - descriptor objects: `FdIo`.
+    - credentials: a per-process `Published<Creds>`, read by `PathIo`'s
+      `stat_owned`, by the kill permission checks and by IDS. pgid and sid
+      go to `ProcTable`.
+    - kill, tkill, tgkill, rt_sigtimedwait and rt_sigsuspend: `ProcSig`,
+      `ThreadSig` and `ProcTable`.
+    - rt_sigreturn: the thread's own state, through `sigs::sigreturn`.
+    - mount, umount2 and unshare: the namespace's writer.
+    - IDS: set at thread start, at fork and at exec, instead of at every
+      locked call.
+    - lifecycle: groups F and G below.
+  - Tests:
+    - setuid on one thread is seen by another thread's `stat` and by its
+      kill permission checks.
+- **B. Translation and file reads.**
+  - Sites: 21.
+    - fjit.rs ×5;
+    - dylink.rs ×3;
+    - wasmdll.rs ×2;
+    - wasmprog.rs ×3;
+    - cgen.rs ×4;
+    - `gex_get_file` and `gex_pin_report`;
+    - sigs.rs ×2. These two are the SP build's borrow, but they still go
+      through `Host`.
+  - State: the vfs, the mm (which already has its own lock), envp, the
+    trace flag, and `retired_code`.
+  - Replacement: reads through the published `Home` (`proc_home`, `Px`).
+    This is identity: no new lock.
+- **C. Introspection and diagnostics.**
+  - Sites: 31.
+    - Everything that names an address: `object_off_at`, `object_off_str`,
+      `object_file_off`, `executable_object_at`, `livelock_note`, fjit's
+      two names, `gex_breakpoint`'s lines, `gex_dispatch_miss`'s wild,
+      no-meta and eject reports, `gex_illegal`, and NT `fault`'s map line.
+    - `gex_vma_*`, `gex_cmdline`, `gex_dump_state`, `gex_jit_by_object`,
+      `gex_shared_*`, the `gex_jit_*` counters, `gex_reuse_stat`, and
+      `gex_dense_owner`.
+  - State: the vmas, the namespace, argv, and `Host.jit` (`JitHere`'s
+    counters, `shared` and `registry_dense`).
+  - Replacements:
+    - names: the mm through `Home`;
+    - counters: atomics;
+    - `shared` and `registry_dense`: into the JIT box (`with_jit_only`);
+    - `gex_dump_state`: reads snapshots.
+- **D. The thread table** (`Host.threads`).
+  - Sites: 7 (`gex_ctx_exited`, the wake, idle and safepoint censuses,
+    `report_deadlock`, and NT's thread exit and spawn), plus vfork's in F.
+  - Replacement: §3.7's fixed slot table. A CAS claims a slot, run state is
+    atomic, and each slot's `ThreadCtx` is behind its own mutex. The
+    censuses read atomics: a racy view is fine for a diagnostic.
+- **E. Process end.**
+  - Sites: 18.
+    - `set_exit` and `exit_process` from `gex_breakpoint` ×5,
+      `gex_illegal`, `gex_sysreg_write`, `low_access`, `gex_dispatch_miss`
+      ×2, `report_deadlock`, NT `end_process` and its x87 fault, and
+      dylink's and wasmprog's 127;
+    - `exit_here`, `gex_abandon`, `gex_process_gone` ×2, `gex_exit_code`.
+  - State: `Host.exit`, the descriptor table's teardown, and the
+    `ProcTable` publication.
+  - Replacement: exit as a once.
+    - A CAS on an atomic exit status decides the winner. The winner sets
+      `halt_code`, and every free-path call checks `halt_code` at entry and
+      at its park's end.
+    - Teardown happens once no thread holds a descriptor reference: it
+      drops the table's published snapshot as an RCU writer, and the
+      descriptions close when the last reader's `Arc` goes. A thread parked
+      in a read, an accept or a futex wait is woken by the halt and leaves
+      without touching the table again.
+    - `ProcTable` publishes the status last, so a parent's `wait4` sees the
+      descriptors already closed.
+  - Tests:
+    - `exit_group` from one thread while others are parked in a blocking
+      read, an accept and a futex wait.
+- **F. Adoption and vfork.**
+  - Sites: 9 (`gex_adopt_*`, `adopt_fds_text`, `gex_vfork_begin` ×2,
+    `gex_vfork_end`, `gex_adopted_exec`).
+  - Replacement: nothing.
+    - A process has a single owner until it is published, so its fields
+      are written directly.
+    - A vfork child already has its own host.
+- **G. Host devices and settings.**
+  - Sites: 11.
+    - `gex_set_network`;
+    - `gex_host_connect`, `send`, `recv`, `bind` and `accept`;
+    - `gex_tty_lflag` and `gex_set_winsize`;
+    - `gex_fd_pipe_id`;
+    - `gex_set_compat` ×2.
+  - Replacements:
+    - the network: a published slot, so `Home` follows a late
+      `gex_set_network`;
+    - host sockets: the socket names' own lock;
+    - the terminal: its own lock;
+    - the descriptor: `FdIo`;
+    - compat and start time: process constants, set before the first
+      guest instruction.
+- **H. NT.**
+  - Sites: 4 in nt.rs (the code retire, `end_process`, and `fault` ×2),
+    plus `lock_kernel`, which hands the whole `Kernel` to 16 callers in
+    gex-kernel's nt (file ×6, section ×2, thread ×2, vm ×2, object, opengl,
+    sysinfo, gdi/font). Those callers use the vfs, the mm and the
+    retire log.
+  - Replacement: `KernelCell` becomes accessors for those. This is code
+    removal only, with no new NT-layer behaviour.
+
+Order, one subsystem per commit, each with its concurrency test and none
+with a fallback that takes the lock. The commits are handed over two or
+three at a time.
+
+| Step | Groups |
+|---|---|
+| L19 | B, and C's names |
+| L20 | `JitHere` into the JIT box and atomics |
+| L21 | G |
+| L22 | A's calls, in its groups |
+| L23 | D |
+| L24 | E |
+| L25 | lifecycle (clone, exec, wait, exit) and F |
+| L26 | H |
+
+After L26 the `HOST` static and `KLock` are deleted. The native
+`Mutex<Kernel>` (§3.11) goes last.
+
 ## 4. Mechanisms specific to the page
 
 ### 4.0 One lock type, three builds
