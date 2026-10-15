@@ -26,7 +26,9 @@ pub(crate) struct Home {
     pub sig: Arc<ProcSig>,
     procs: Arc<ProcTable>,
     pub pid: i32,
-    uid: u32,
+    /// Its user and group ids (`Kernel::creds`, the same ones): a set
+    /// under the lock or without it is every thread's next read.
+    creds: Arc<gex_kernel::syscalls::Creds>,
     clock: ClockFn,
     /// Its futexes and its memory map's published view, for `futex`
     /// without the kernel (docs/kernel-locking.md §5.2 step 4).
@@ -47,7 +49,6 @@ pub(crate) struct Home {
     /// For the path calls: the threads' own fs_structs, the group, the
     /// terminals and `O_TMPFILE`'s serial (`Kernel::path_io`).
     thread_fs: Arc<gex_kernel::syscalls::ThreadFs>,
-    gid: u32,
     ptys: Option<gex_kernel::pty::Remote>,
     tmpfiles: Arc<std::sync::atomic::AtomicU64>,
     /// The process's first fs_struct (its directory and umask).
@@ -90,7 +91,7 @@ fn home_of(k: &Kernel) -> Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
         pid: k.pid,
-        uid: k.uid,
+        creds: Arc::clone(&k.creds),
         clock: k.clock,
         futexes: Arc::clone(&k.futexes),
         map: Arc::clone(k.mem.view()),
@@ -101,7 +102,6 @@ fn home_of(k: &Kernel) -> Home {
         pins: Arc::clone(&k.pins),
         place: k.place.clone(),
         thread_fs: Arc::clone(&k.thread_fs),
-        gid: k.gid,
         ptys: k.ptys,
         tmpfiles: Arc::clone(&k.tmpfiles),
         proc_fs: Arc::clone(&k.proc_fs),
@@ -128,6 +128,11 @@ impl Home {
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Its user and group ids, which lock themselves.
+    pub(crate) fn creds(&self) -> &gex_kernel::syscalls::Creds {
+        &self.creds
     }
 
     /// Its terminal, which locks itself.
@@ -247,14 +252,14 @@ fn gather(home: &Home) {
         gex_kernel::proc::signal_seq()
     };
     if SEQ_SEEN.with(|c| c.replace(seq)) != seq {
-        home.sig.collect(&home.procs, home.pid, home.uid);
+        home.sig.collect(&home.procs, home.pid, home.creds.uid());
         // Another process's `tgkill` to this Worker's thread: its own, so
         // taken here (the kernel's `collect_signals` takes the rest, and
         // drops those for threads gone).
         MINE.with(|m| {
             if let Some((tid, t)) = m.borrow().as_ref() {
                 for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
-                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.uid });
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.uid() });
                 }
             }
         });
@@ -308,7 +313,7 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         // Linux sends it as the writer itself sending it (SI_USER).
         view.raise_from(
             signal::sig::SIGPIPE,
-            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.uid },
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.uid() },
         );
     }
     if suspended.is_some() {
@@ -370,8 +375,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             map: map(),
             compat,
             pid: home.pid,
-            uid: home.uid,
-            gid: home.gid,
+            creds: &home.creds,
             procs: &home.procs,
             ptys: home.ptys,
             tmpfiles: &home.tmpfiles,
@@ -382,7 +386,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         procs: &home.procs,
         tty: &home.tty,
         pid: home.pid,
-        uid: home.uid,
+        creds: &home.creds,
         wasm32: crate::WASM32.load(Ordering::Acquire),
         futex,
         started: crate::clock_started(),

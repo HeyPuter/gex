@@ -340,15 +340,19 @@ call sites, the state they actually touch, and what replaces the lock.
     - thread-own and constant calls: nothing; they use the thread's own
       state.
     - descriptor objects: `FdIo`.
-    - credentials: a per-process `Published<Creds>`, read by `PathIo`'s
-      `stat_owned`, by the kill permission checks and by IDS. pgid and sid
-      go to `ProcTable`.
+    - credentials: a per-process `Creds`, shared by its threads, copied
+      by a fork and read at each use: by `PathIo`'s `stat_owned`, by a
+      signal's sender uid and by `ident_call`. Each set call changes one
+      id, so it is two atomics rather than a `Published` snapshot. There
+      is no kill permission check to read it (no privilege model). pgid
+      and sid are already `ProcTable`'s (L22c).
     - kill, tkill, tgkill, rt_sigtimedwait and rt_sigsuspend: `ProcSig`,
       `ThreadSig` and `ProcTable`.
     - rt_sigreturn: the thread's own state, through `sigs::sigreturn`.
     - mount, umount2 and unshare: the namespace's writer.
-    - IDS: set at thread start, at fork and at exec, instead of at every
-      locked call.
+    - IDS: gone. `ident_call` reads the pid set at load and fork, the
+      tid bound at thread start (`bind_mine`) and the `Creds`, instead of
+      a copy refreshed at every locked call (L22c).
     - lifecycle: groups F and G below.
   - Tests:
     - setuid on one thread is seen by another thread's `stat` and by its
@@ -452,7 +456,7 @@ three at a time.
 | L19 | B, and C's names |
 | L20 | `JitHere` into the JIT box and atomics |
 | L21 | G |
-| L22 | A's calls, in its groups |
+| L22 | A's calls, in its groups: L22a the thread-own and constant calls, times and time; L22b the descriptor objects; L22c credentials and sessions; L22d signals; L22e mounts and the rest |
 | L23 | D |
 | L24 | E |
 | L25 | lifecycle (clone, exec, wait, exit) and F |

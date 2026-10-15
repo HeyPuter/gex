@@ -4902,8 +4902,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             let _ = kernel.set_cwd(&cwd);
         }
     }
-    kernel.uid = unsafe { IDENTITY.0 };
-    kernel.gid = unsafe { IDENTITY.1 };
+    kernel.creds.set_uid(unsafe { IDENTITY.0 });
+    kernel.creds.set_gid(unsafe { IDENTITY.1 });
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
     install_console(&mut kernel);
@@ -7128,18 +7128,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // where process 1 never exits to call `gex_pin_report`).
         check_host_magic_in(h, "a syscall");
         set_my_pid(h.kernel.pid);
-        // What `ident_call` answers from until this thread's next full call.
-        // No parent: asking for it is a call into the system-wide kernel, and
-        // a reparent would go unseen; `getppid` takes the full path.
-        IDS.with(|c| {
-            c.set(gex_kernel::syscalls::Idents {
-                pid: h.kernel.pid as u32,
-                ppid: 0,
-                tid: h.threads[cur()].kstate.tid as u32,
-                uid: h.kernel.uid,
-                gid: h.kernel.gid,
-            })
-        });
         report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -7856,12 +7844,6 @@ fn clock_constants(compat: bool, started: u128) {
     CLOCK_ABI.store(if compat { 1 } else { 2 }, Release);
 }
 
-thread_local! {
-    /// This thread's ids as its last full syscall saw them (`ident_call`).
-    static IDS: Cell<gex_kernel::syscalls::Idents> = const {
-        Cell::new(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 })
-    };
-}
 
 /// The clocks, with no kernel lock (docs/kernel-locking.md §5.2 step 1):
 /// `clock_gettime`, `clock_getres`, `gettimeofday`, `getrusage` and
@@ -7877,8 +7859,7 @@ thread_local! {
 /// check); and a provider collection's stop (cgen/libprov.rs), which parks
 /// the thread on its way back to guest code, as after any syscall.
 ///
-/// The getpid family is answered here too, from this thread's ids as its
-/// last full syscall left them (`ident_call`, step 6a).
+/// The getpid family is answered here too (`ident_syscall`, step 6a).
 fn clock_syscall(ctx: i32) -> bool {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let abi = CLOCK_ABI.load(Acquire);
@@ -7891,7 +7872,7 @@ fn clock_syscall(ctx: i32) -> bool {
     let started = CLOCK_STARTED.load(Acquire) as u128;
     let at = ctx as u32 as u64;
     if !gex_kernel::syscalls::clock_call(&mut gm, at, abi == 1, browser_clock, started)
-        && !IDS.with(|c| gex_kernel::syscalls::ident_call(&mut gm, at, abi == 1, &c.get()))
+        && !ident_syscall(&mut gm, at, abi == 1)
     {
         return false;
     }
@@ -7904,7 +7885,7 @@ fn clock_syscall(ctx: i32) -> bool {
     // A provider's collection running: park here, as the full path does on
     // its way back to guest code.
     if cgen::libprov::stop_active() {
-        let tid = IDS.with(|c| c.get().tid);
+        let tid = my_tid();
         if tid != 0 {
             cgen::libprov::park_if_stopping(tid as u32, false);
         }
@@ -7917,6 +7898,26 @@ fn clock_syscall(ctx: i32) -> bool {
         ));
     }
     true
+}
+
+/// The getpid family for this Worker's thread (`ident_call`): its pid as
+/// its process's load or fork set it (`MY_PID`), its tid as its thread's
+/// start bound it (`bind_mine`), and the process's ids as they are now
+/// (`Creds`). No parent: asking for it is a call into the process table,
+/// and a reparent must be seen; `getppid` is a quiet call. A vfork child
+/// runs on its parent's thread, whose tid is not its own: its calls take
+/// the full path.
+fn ident_syscall(gm: &mut GuestMem<'_>, at: u64, compat: bool) -> bool {
+    if vfork::pid_here().is_some() {
+        return false;
+    }
+    let Some(home) = sigs::home() else { return false };
+    let ids = gex_kernel::syscalls::Idents {
+        pid: MY_PID.load(std::sync::atomic::Ordering::Relaxed) as u32,
+        ppid: 0,
+        tid: my_tid() as u32,
+    };
+    ids.pid != 0 && gex_kernel::syscalls::ident_call(gm, at, compat, &ids, home.creds())
 }
 
 /// This process's descriptor table, which needs no kernel lock
@@ -9035,8 +9036,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     let mut kernel = Kernel::new(ctx_addr, brk as u64, String::new());
     // Who this process is: `Kernel::new` defaults to uid 1000, so a child that
     // did not copy `IDENTITY` here is not root and every forked `dpkg` refuses.
-    kernel.uid = unsafe { IDENTITY.0 };
-    kernel.gid = unsafe { IDENTITY.1 };
+    kernel.creds.set_uid(unsafe { IDENTITY.0 });
+    kernel.creds.set_gid(unsafe { IDENTITY.1 });
     kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     if nt::windows_space() != 0 {
         w3_address_space(&mut kernel.mem.lock(), nt::windows_space());

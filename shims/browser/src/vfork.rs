@@ -215,9 +215,6 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
         }
         publish_vfork_child(h);
     });
-    // The getpid family's answers are the parent's until the child's first
-    // full call: none until then.
-    IDS.with(|c| c.set(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 }));
     set_resume_none();
     set_resume_ctx_none();
     pc as i64
@@ -352,7 +349,6 @@ pub extern "C" fn gex_vfork_end() -> i64 {
         let _ = gm.write(ctx_addr, &ctx);
     }
     CURRENT.with(|c| c.set(cur));
-    IDS.with(|c| c.set(gex_kernel::syscalls::Idents { pid: 0, ppid: 0, tid: 0, uid: 0, gid: 0 }));
     with_host(|h| bind_mine(h, cur));
     // The caller goes on at the returned pc itself. Left in `RESUME`, that
     // pc was still there for the thread's next call that trapped without

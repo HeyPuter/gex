@@ -1050,8 +1050,7 @@ fn run_program_with(
     let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
     let mut kernel = Kernel {
         trace: opts.trace,
-        uid,
-        gid,
+        creds: gex_kernel::syscalls::Creds::new(uid, gid),
         argv: opts.args.clone(),
         envp: opts.env.clone(),
         ..kernel
