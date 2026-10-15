@@ -423,6 +423,9 @@ mod tests {
     }
 
     #[test]
+    // The order is checked only where `RANKED` is on: a release build without
+    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
     #[should_panic(expected = "lock order")]
     fn a_ranked_lock_under_a_higher_one_panics() {
         let jit = Mutex::ranked((), rank::JIT);
@@ -432,6 +435,9 @@ mod tests {
     }
 
     #[test]
+    // The order is checked only where `RANKED` is on: a release build without
+    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
     #[should_panic(expected = "lock order")]
     fn a_ranked_lock_taken_again_panics_rather_than_hangs() {
         let mm = Mutex::ranked((), rank::MM);

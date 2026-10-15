@@ -39,7 +39,8 @@ static int mapped(void *p, size_t len) {
     static __thread char buf[1 << 17];
     if (slurp("/proc/self/maps", buf, sizeof buf) <= 0) return -1;
     char want[48];
-    snprintf(want, sizeof want, "%lx-%lx ", (unsigned long)p, (unsigned long)p + len);
+    /* As Linux prints them: at least eight digits. */
+    snprintf(want, sizeof want, "%08lx-%08lx ", (unsigned long)p, (unsigned long)p + len);
     for (char *l = buf; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : 0)
         if (!strncmp(l, want, strlen(want))) return 1;
     return 0;
