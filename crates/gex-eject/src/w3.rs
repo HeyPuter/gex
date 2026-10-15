@@ -226,6 +226,41 @@ fn template(off: &[String]) -> String {
     ]))
 }
 
+/// The site's `identities` (`base:key:identity:path;...`): for each unit, its
+/// image as the site ships it (web/rootfs.tar, trimmed or not) at the base
+/// the unit was built for (found from the unit's addresses). A line is
+/// written only when the key this gexc computes for that image is the unit's
+/// own, so the page never takes a key its own hashing would not give.
+fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&str) -> String) -> Result<String> {
+    let what = crate::project::PROJECT_FILE;
+    let bytes = std::fs::read(web.join("rootfs.tar"))?;
+    let tar = crate::reach::Tar::parse(&bytes)?;
+    let mut lines = Vec::new();
+    let mut skipped = 0;
+    for u in units {
+        let key = json::str_field(u, "key", what)?;
+        let path = json::str_field(u, "path", what)?;
+        let site = site_key(&key);
+        let found = (|| -> Option<String> {
+            let data = tar.read(&path)?;
+            let pe = gex_ld::pe::parse(data).ok()?;
+            let wasm = std::fs::read(dir.join("units").join(&key).join("c.wasm")).ok()?;
+            let unit = gex_split::Unit::parse(&wasm).ok()?;
+            let addrs: std::collections::HashSet<u64> = unit.addresses().into_iter().collect();
+            let base = crate::reach::find_base(&pe, &addrs)?;
+            let image = gex_xlate::func::pe_input(&pe, base).ok()?.0;
+            [true, false].into_iter().find(|&g| crate::rsrc::key_with(&image, g) == site)?;
+            Some(format!("{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
+        })();
+        match found {
+            Some(l) => lines.push(l),
+            None => skipped += 1,
+        }
+    }
+    eprintln!("gexc eject build: identities for {} units ({skipped} left to the page to hash)", lines.len());
+    Ok(lines.join(";"))
+}
+
 /// `"resources": "trim"` (crate::rsrc): writes `web/rootfs.tar`, the bundle
 /// with every distinct PE trimmed, and `build/resources.json`. Returns the
 /// units' new keys, old to new. An image whose unit's key this gexc does not
@@ -677,6 +712,14 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     };
     // Split units: the page fetches their cold clusters (gex.mjs `gex.cold`).
     let mut params = params;
+    // Each unit's image key and identity as the page computes them for the
+    // image it ships (cgen.rs `known`), which the page takes instead of
+    // hashing every byte of each image it maps.
+    let identities = unit_identities(dir, &web, units, &site_key)?;
+    if !identities.is_empty() {
+        params.retain(|(k, _)| k != "identities");
+        params.push(("identities".to_string(), s(&identities)));
+    }
     if cold_units > 0 {
         params.push(("cold".to_string(), s("1")));
     }
