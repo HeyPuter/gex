@@ -1118,6 +1118,268 @@ pub struct FdIo<'a> {
 }
 
 impl FdIo<'_> {
+    /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
+    ///
+    /// One descriptor, readable and writable, over a single `EventFd`. The
+    /// `EFD_NONBLOCK`/`EFD_CLOEXEC` flags are `O_NONBLOCK`/`O_CLOEXEC` by
+    /// another name, so they go straight into the open flags and the
+    /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
+    pub fn eventfd2(&self, initval: u64, flags: u64) -> SysResult {
+        use crate::eventfd::{flags as efd, EventFd};
+        let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[eventfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDWR,
+            true,
+            true,
+        );
+        self.fds.insert(file, cloexec)
+    }
+    /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
+    pub fn timerfd_create(&self, clock: ClockFn, clockid: u64, flags: u64) -> SysResult {
+        let mut timer = crate::timerfd::TimerFd::new(clock);
+        if is_monotonic_clock(clockid) {
+            timer = timer.monotonic(monotonic_from);
+        }
+        let handle = Arc::new(timer);
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[timerfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        self.fds.insert(file, cloexec)
+    }
+    /// `timerfd_settime`: arm or disarm the timer from an `itimerspec`.
+    ///
+    /// The struct is two `timespec`s -- `it_interval` then `it_value`, sixteen
+    /// bytes each. `it_value` of zero disarms; the `TFD_TIMER_ABSTIME` flag
+    /// makes it an absolute time on the clock. The old setting is written back
+    /// through `old` when it is non-null, the same shape the kernel returns.
+    pub fn timerfd_settime(
+        &self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        flags: u64,
+        new: u64,
+        old: u64,
+    ) -> SysResult {
+        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
+            let secs = m.read_u64(at)?;
+            let nanos = m.read_u64(at + 8)?;
+            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+        };
+        let interval = read_ns(m, new)?;
+        let value = read_ns(m, new + 16)?;
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, prev_int) = handle
+            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
+            .ok_or(Errno::EINVAL)?;
+        if old != 0 {
+            m.write_u64(old, prev_int / 1_000_000_000)?;
+            m.write_u64(old + 8, prev_int % 1_000_000_000)?;
+            m.write_u64(old + 16, rem / 1_000_000_000)?;
+            m.write_u64(old + 24, rem % 1_000_000_000)?;
+        }
+        Ok(0)
+    }
+    /// `timerfd_gettime`: write the time to the next expiry and the interval.
+    pub fn timerfd_gettime(&self, m: &mut GuestMem<'_>, fd: i32, curr: u64) -> SysResult {
+        if curr == 0 {
+            return Ok(0);
+        }
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, interval) = handle.timerfd_get().ok_or(Errno::EINVAL)?;
+        m.write_u64(curr, interval / 1_000_000_000)?;
+        m.write_u64(curr + 8, interval % 1_000_000_000)?;
+        m.write_u64(curr + 16, rem / 1_000_000_000)?;
+        m.write_u64(curr + 24, rem % 1_000_000_000)?;
+        Ok(0)
+    }
+    pub fn memfd_create(&self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
+        const MFD_CLOEXEC: u64 = 1;
+        let raw = m.read_cstr(name, 249)?;
+        let name = String::from_utf8_lossy(&raw).into_owned();
+        let memfd = Arc::new(unix::MemFd::new(&name));
+        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
+    }
+    /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
+    ///
+    /// Xwayland calls this through `posix_fallocate` after sealing its shared
+    /// memory, to be certain the pages are there before it hands the
+    /// descriptor to a compositor. The other modes -- punching holes,
+    /// collapsing ranges -- are refused rather than silently treated as
+    /// allocation, which would leave a caller believing it had freed space.
+    pub fn fallocate(&self, fd: i32, mode: u64, offset: u64, len: u64) -> SysResult {
+        if mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if let Ok(memfd) = self.memfd_of(fd) {
+            return memfd.reserve(end);
+        }
+        // An ordinary file grows by being written to its new length.
+        let file = self.fds.get(fd)?;
+        let size = file.handle.metadata()?.size;
+        if end > size {
+            file.handle.truncate(end)?;
+        }
+        Ok(0)
+    }
+    /// `epoll_create1`.
+    pub fn epoll_create(&self, flags: u64) -> SysResult {
+        const EPOLL_CLOEXEC: u64 = 0o2000000;
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::new());
+        let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
+        self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)
+    }
+    /// Copy up to `count` bytes from one descriptor to another through a kernel
+    /// buffer -- the shared core of `sendfile` and `copy_file_range`. When
+    /// `in_off`/`out_off` is `Some` it is an absolute offset used without
+    /// touching that descriptor's own position (the offset-pointer forms);
+    /// `None` uses and advances the descriptor's position. Returns the bytes
+    /// transferred. A single call moves at most one buffer, as Linux does --
+    /// callers loop for more. If the output takes fewer bytes than were read
+    /// from a positional-less input, the input is rewound so the tail is not
+    /// silently dropped.
+    pub fn transfer_fds(
+        &self,
+        in_fd: i32,
+        in_off: Option<u64>,
+        out_fd: i32,
+        out_off: Option<u64>,
+        count: u64,
+    ) -> SysResult {
+        let cap = count.min(1 << 24) as usize;
+        if cap == 0 {
+            return Ok(0);
+        }
+        let in_file = self.fds.get(in_fd)?;
+        let out_file = self.fds.get(out_fd)?;
+        let mut buf = vec![0u8; cap];
+        let n = match in_off {
+            Some(o) => in_file.pread(o, &mut buf)?,
+            None => in_file.read(&mut buf)?,
+        } as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < n {
+            let w = match out_off {
+                Some(o) => out_file.pwrite(o + written as u64, &buf[written..n])?,
+                None => out_file.write(&buf[written..n])?,
+            } as usize;
+            if w == 0 {
+                break;
+            }
+            written += w;
+        }
+        // A positional-less input already advanced by the full `n`; hand back
+        // the tail the output could not take (best effort: a stream cannot seek).
+        if in_off.is_none() && written < n {
+            let _ = in_file.seek(-((n - written) as i64), 1 /* SEEK_CUR */);
+        }
+        Ok(written as u64)
+    }
+    /// `sendfile(out_fd, in_fd, offset_ptr, count)`: copy in the kernel. With a
+    /// non-null `offset_ptr` the read starts there and the pointer is advanced
+    /// by the count sent, leaving the input's own position untouched -- so a
+    /// server can serve the same file to many clients without seeking.
+    pub fn sendfile(
+        &self,
+        m: &mut GuestMem<'_>,
+        out_fd: i32,
+        in_fd: i32,
+        off_ptr: u64,
+        count: u64,
+    ) -> SysResult {
+        let in_off = if off_ptr != 0 {
+            Some(m.read_u64(off_ptr)?)
+        } else {
+            None
+        };
+        let sent = self.transfer_fds(in_fd, in_off, out_fd, None, count)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_ptr, o + sent)?;
+        }
+        Ok(sent)
+    }
+    /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
+    /// Both offset pointers are optional; each non-null one is used for the
+    /// transfer and then advanced by the bytes copied. `flags` is reserved and
+    /// must be zero.
+    pub fn copy_file_range(
+        &self,
+        m: &mut GuestMem<'_>,
+        fd_in: i32,
+        off_in: u64,
+        fd_out: i32,
+        off_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> SysResult {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let in_off = if off_in != 0 {
+            Some(m.read_u64(off_in)?)
+        } else {
+            None
+        };
+        let out_off = if off_out != 0 {
+            Some(m.read_u64(off_out)?)
+        } else {
+            None
+        };
+        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_in, o + copied)?;
+        }
+        if let Some(o) = out_off {
+            m.write_u64(off_out, o + copied)?;
+        }
+        Ok(copied)
+    }
+    /// A transfer whose input is an empty blocking stream waits for it to be
+    /// readable (`AcceptWait`) and is then made again.
+    pub fn transfer_park(&self, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        let (fd, off) = match n {
+            nr::SENDFILE => (a[1] as i32, a[2]),
+            _ => (a[0] as i32, a[1]),
+        };
+        let file = self.fds.get(fd).ok()?;
+        if off != 0 || !file.would_block() || file.handle.poll_readable() {
+            return None;
+        }
+        Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
+    }
+
+    /// sendfile, copy_file_range and splice, by number.
+    pub fn transfer_syscall(&self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
+        match n {
+            nr::SENDFILE => self.sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            // A blocking `recvfrom`/`recv` that waited for a datagram or
+            // bytes (the classifier below).
+            nr::RECVFROM => recvfrom(self, m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
+            nr::COPY_FILE_RANGE => self.copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
+            _ => self.splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
+        }
+    }
+    /// `splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`: as
+    /// copy_file_range, with pipes allowed on either side (a pipe's offset
+    /// pointer must be null, which the transfer does not need to check: a
+    /// pipe has no `pread`). The SPLICE_F_* flags are hints.
+    pub fn splice(&self, m: &mut GuestMem<'_>, fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: u64) -> SysResult {
+        self.copy_file_range(m, fd_in, off_in, fd_out, off_out, len, 0)
+    }
+
     /// `pipe2`.
     pub fn pipe2(&self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
         // A pipe in the global kernel when there is one, because the whole
@@ -4266,6 +4528,44 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
         || (n == nr::NOOP_OK && (gex_abi::X86 || gex_abi::PPC || compat))
 }
 
+/// The calls that make a descriptor's object or work one, needing the
+/// descriptor table and nothing else of a kernel (and the clock for a
+/// timer): `eventfd2`, `epoll_create1`, `memfd_create`, the timerfd calls,
+/// `fallocate`, and the transfers `sendfile`, `splice` and
+/// `copy_file_range` (L22b). Canonical.
+pub fn is_fd_object(n: u64) -> bool {
+    matches!(
+        n,
+        nr::EVENTFD2
+            | nr::EPOLL_CREATE1
+            | nr::MEMFD_CREATE
+            | nr::TIMERFD_CREATE
+            | nr::TIMERFD_SETTIME
+            | nr::TIMERFD_GETTIME
+            | nr::FALLOCATE
+            | nr::SENDFILE
+            | nr::SPLICE
+            | nr::COPY_FILE_RANGE
+    )
+}
+
+/// A call [`is_fd_object`] admits, made, for the kernel's arms and
+/// [`free_call`] alike. A transfer that must wait is the caller's to park
+/// first ([`FdIo::transfer_park`]).
+pub fn fd_object_call(io: &FdIo<'_>, clock: ClockFn, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    match n {
+        nr::EVENTFD2 => io.eventfd2(a[0], a[1]),
+        nr::EPOLL_CREATE1 => io.epoll_create(a[0]),
+        nr::MEMFD_CREATE => io.memfd_create(m, a[0], a[1]),
+        nr::TIMERFD_CREATE => io.timerfd_create(clock, a[0], a[1]),
+        nr::TIMERFD_SETTIME => io.timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
+        nr::TIMERFD_GETTIME => io.timerfd_gettime(m, a[0] as i32, a[1]),
+        nr::FALLOCATE => io.fallocate(a[0] as i32, a[1], a[2], a[3]),
+        nr::SENDFILE | nr::SPLICE | nr::COPY_FILE_RANGE => io.transfer_syscall(m, n, &a),
+        _ => unreachable!("is_fd_object admitted a call fd_object_call does not make"),
+    }
+}
+
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
 /// both answer them here. `ctx_addr` is the calling thread's context.
 pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
@@ -4484,7 +4784,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             // The quiet calls, as the translation numbers them (several
             // numbers become the do-nothing one).
             r => match crate::i386::canonical_number(r) {
-                c if is_quiet(c, true) => c,
+                c if is_quiet(c, true) || is_fd_object(c) => c,
                 _ => return None,
             },
         }
@@ -4580,7 +4880,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
             r => match crate::x86::canonical_number(r) {
-                c if is_quiet(c, false) => c,
+                c if is_quiet(c, false) || is_fd_object(c) => c,
                 _ => return None,
             },
         }
@@ -4596,7 +4896,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
-            n if is_quiet(n, false) => raw,
+            n if is_quiet(n, false) || is_fd_object(n) => raw,
             _ => return None,
         }
     };
@@ -4650,7 +4950,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -4688,7 +4988,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -4752,6 +5052,15 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         r
     } else if is_quiet(n, compat) {
         quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
+    } else if is_fd_object(n) {
+        // As the full call: a transfer from an empty blocking stream parks
+        // until it is readable and is made again then.
+        if matches!(n, nr::SENDFILE | nr::SPLICE | nr::COPY_FILE_RANGE) {
+            if let Some(op) = f.io.transfer_park(n, a) {
+                return FreeOutcome::Blocking(op, None);
+            }
+        }
+        fd_object_call(&f.io, f.futex.clock, m, n, a)
     } else if is_fd_misc(n) {
         match n {
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -7156,16 +7465,9 @@ impl Kernel {
             // grep x`: GNU grep splices its stdin pipe) waits for it to be
             // readable and then does the real transfer (`retry_transfer`).
             nr::SPLICE | nr::SENDFILE | nr::COPY_FILE_RANGE => {
-                let (fd, off) = match n {
-                    nr::SENDFILE => (a[1] as i32, a[2]),
-                    _ => (a[0] as i32, a[1]),
-                };
-                let file = self.fds.get(fd).ok()?;
-                if off != 0 || !file.would_block() || file.handle.poll_readable() {
-                    return None;
-                }
+                let op = self.fd_io().transfer_park(n, a)?;
                 self.retry_transfer = Some((n, a));
-                Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
+                Some(op)
             }
             // `recvfrom` (and `recv`) on an empty blocking socket waits for
             // it to be readable, then reads under the lock, as `recvmsg`
@@ -7243,7 +7545,7 @@ impl Kernel {
             _ => r,
         };
         let r = match self.retry_transfer.take() {
-            Some((n, a)) if r.is_ok() => self.transfer_syscall(m, n, &a),
+            Some((n, a)) if r.is_ok() => self.fd_io().transfer_syscall(m, n, &a),
             _ => r,
         };
         // A wait a signal ended that Linux would restart (signal(7)): the
@@ -7330,7 +7632,6 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::SENDFILE | nr::COPY_FILE_RANGE | nr::SPLICE => self.transfer_syscall(m, n, &a),
             nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
                 .fds
@@ -7339,10 +7640,9 @@ impl Kernel {
             nr::DUP => self.sys_dup(a[0] as i32),
             nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
-            nr::EVENTFD2 => self.sys_eventfd2(a[0], a[1]),
-            nr::TIMERFD_CREATE => self.sys_timerfd_create(a[0], a[1]),
-            nr::TIMERFD_SETTIME => self.sys_timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::TIMERFD_GETTIME => self.sys_timerfd_gettime(m, a[0] as i32, a[1]),
+            // The calls that make or work a descriptor's object
+            // ([`fd_object_call`], the free path's code).
+            n if is_fd_object(n) => fd_object_call(&self.fd_io(), self.clock, m, n, a),
             // F_GETLK and F_OFD_GETLK: nobody holds a lock (see
             // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
             // first field in every `struct flock` layout (i386's flock and
@@ -7421,10 +7721,7 @@ impl Kernel {
                 let cwd = self.vfs.cwd.clone();
                 self.net_io().call(&self.fd_io(), m, n, a, &cwd)
             }
-            nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
-            nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
-            nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
@@ -7721,136 +8018,10 @@ impl Kernel {
         io_pwrite(&self.fds, m, fd, buf, len, off)
     }
 
-    /// Copy up to `count` bytes from one descriptor to another through a kernel
-    /// buffer -- the shared core of `sendfile` and `copy_file_range`. When
-    /// `in_off`/`out_off` is `Some` it is an absolute offset used without
-    /// touching that descriptor's own position (the offset-pointer forms);
-    /// `None` uses and advances the descriptor's position. Returns the bytes
-    /// transferred. A single call moves at most one buffer, as Linux does --
-    /// callers loop for more. If the output takes fewer bytes than were read
-    /// from a positional-less input, the input is rewound so the tail is not
-    /// silently dropped.
-    fn transfer_fds(
-        &mut self,
-        in_fd: i32,
-        in_off: Option<u64>,
-        out_fd: i32,
-        out_off: Option<u64>,
-        count: u64,
-    ) -> SysResult {
-        let cap = count.min(1 << 24) as usize;
-        if cap == 0 {
-            return Ok(0);
-        }
-        let in_file = self.fds.get(in_fd)?;
-        let out_file = self.fds.get(out_fd)?;
-        let mut buf = vec![0u8; cap];
-        let n = match in_off {
-            Some(o) => in_file.pread(o, &mut buf)?,
-            None => in_file.read(&mut buf)?,
-        } as usize;
-        if n == 0 {
-            return Ok(0);
-        }
-        let mut written = 0usize;
-        while written < n {
-            let w = match out_off {
-                Some(o) => out_file.pwrite(o + written as u64, &buf[written..n])?,
-                None => out_file.write(&buf[written..n])?,
-            } as usize;
-            if w == 0 {
-                break;
-            }
-            written += w;
-        }
-        // A positional-less input already advanced by the full `n`; hand back
-        // the tail the output could not take (best effort: a stream cannot seek).
-        if in_off.is_none() && written < n {
-            let _ = in_file.seek(-((n - written) as i64), 1 /* SEEK_CUR */);
-        }
-        Ok(written as u64)
-    }
 
-    /// `sendfile(out_fd, in_fd, offset_ptr, count)`: copy in the kernel. With a
-    /// non-null `offset_ptr` the read starts there and the pointer is advanced
-    /// by the count sent, leaving the input's own position untouched -- so a
-    /// server can serve the same file to many clients without seeking.
-    fn sys_sendfile(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        out_fd: i32,
-        in_fd: i32,
-        off_ptr: u64,
-        count: u64,
-    ) -> SysResult {
-        let in_off = if off_ptr != 0 {
-            Some(m.read_u64(off_ptr)?)
-        } else {
-            None
-        };
-        let sent = self.transfer_fds(in_fd, in_off, out_fd, None, count)?;
-        if let Some(o) = in_off {
-            m.write_u64(off_ptr, o + sent)?;
-        }
-        Ok(sent)
-    }
 
-    /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
-    /// Both offset pointers are optional; each non-null one is used for the
-    /// transfer and then advanced by the bytes copied. `flags` is reserved and
-    /// must be zero.
-    fn sys_copy_file_range(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd_in: i32,
-        off_in: u64,
-        fd_out: i32,
-        off_out: u64,
-        len: u64,
-        flags: u32,
-    ) -> SysResult {
-        if flags != 0 {
-            return Err(Errno::EINVAL);
-        }
-        let in_off = if off_in != 0 {
-            Some(m.read_u64(off_in)?)
-        } else {
-            None
-        };
-        let out_off = if off_out != 0 {
-            Some(m.read_u64(off_out)?)
-        } else {
-            None
-        };
-        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
-        if let Some(o) = in_off {
-            m.write_u64(off_in, o + copied)?;
-        }
-        if let Some(o) = out_off {
-            m.write_u64(off_out, o + copied)?;
-        }
-        Ok(copied)
-    }
 
-    /// sendfile, copy_file_range and splice, by number.
-    fn transfer_syscall(&mut self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
-        match n {
-            nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
-            // A blocking `recvfrom`/`recv` that waited for a datagram or
-            // bytes (the classifier below).
-            nr::RECVFROM => recvfrom(&self.fd_io(), m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
-            nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
-            _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
-        }
-    }
 
-    /// `splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`: as
-    /// copy_file_range, with pipes allowed on either side (a pipe's offset
-    /// pointer must be null, which the transfer does not need to check: a
-    /// pipe has no `pread`). The SPLICE_F_* flags are hints.
-    fn sys_splice(&mut self, m: &mut GuestMem<'_>, fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: u64) -> SysResult {
-        self.sys_copy_file_range(m, fd_in, off_in, fd_out, off_out, len, 0)
-    }
 
     fn read_iovecs(
         m: &GuestMem<'_>,
@@ -7895,91 +8066,9 @@ impl Kernel {
     }
 
 
-    /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
-    ///
-    /// One descriptor, readable and writable, over a single `EventFd`. The
-    /// `EFD_NONBLOCK`/`EFD_CLOEXEC` flags are `O_NONBLOCK`/`O_CLOEXEC` by
-    /// another name, so they go straight into the open flags and the
-    /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
-    fn sys_eventfd2(&mut self, initval: u64, flags: u64) -> SysResult {
-        use crate::eventfd::{flags as efd, EventFd};
-        let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let file = OpenFile::new(
-            handle,
-            "anon_inode:[eventfd]".to_string(),
-            (flags & oflags::O_NONBLOCK) | oflags::O_RDWR,
-            true,
-            true,
-        );
-        self.fds.insert(file, cloexec)
-    }
 
-    /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
-    fn sys_timerfd_create(&mut self, clockid: u64, flags: u64) -> SysResult {
-        let mut timer = crate::timerfd::TimerFd::new(self.clock);
-        if is_monotonic_clock(clockid) {
-            timer = timer.monotonic(monotonic_from);
-        }
-        let handle = Arc::new(timer);
-        let cloexec = flags & oflags::O_CLOEXEC != 0;
-        let file = OpenFile::new(
-            handle,
-            "anon_inode:[timerfd]".to_string(),
-            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
-            true,
-            false,
-        );
-        self.fds.insert(file, cloexec)
-    }
 
-    /// `timerfd_settime`: arm or disarm the timer from an `itimerspec`.
-    ///
-    /// The struct is two `timespec`s -- `it_interval` then `it_value`, sixteen
-    /// bytes each. `it_value` of zero disarms; the `TFD_TIMER_ABSTIME` flag
-    /// makes it an absolute time on the clock. The old setting is written back
-    /// through `old` when it is non-null, the same shape the kernel returns.
-    fn sys_timerfd_settime(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        fd: i32,
-        flags: u64,
-        new: u64,
-        old: u64,
-    ) -> SysResult {
-        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
-            let secs = m.read_u64(at)?;
-            let nanos = m.read_u64(at + 8)?;
-            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
-        };
-        let interval = read_ns(m, new)?;
-        let value = read_ns(m, new + 16)?;
-        let handle = self.fds.get(fd)?.handle.clone();
-        let (rem, prev_int) = handle
-            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
-            .ok_or(Errno::EINVAL)?;
-        if old != 0 {
-            m.write_u64(old, prev_int / 1_000_000_000)?;
-            m.write_u64(old + 8, prev_int % 1_000_000_000)?;
-            m.write_u64(old + 16, rem / 1_000_000_000)?;
-            m.write_u64(old + 24, rem % 1_000_000_000)?;
-        }
-        Ok(0)
-    }
 
-    /// `timerfd_gettime`: write the time to the next expiry and the interval.
-    fn sys_timerfd_gettime(&mut self, m: &mut GuestMem<'_>, fd: i32, curr: u64) -> SysResult {
-        if curr == 0 {
-            return Ok(0);
-        }
-        let handle = self.fds.get(fd)?.handle.clone();
-        let (rem, interval) = handle.timerfd_get().ok_or(Errno::EINVAL)?;
-        m.write_u64(curr, interval / 1_000_000_000)?;
-        m.write_u64(curr + 8, interval % 1_000_000_000)?;
-        m.write_u64(curr + 16, rem / 1_000_000_000)?;
-        m.write_u64(curr + 24, rem % 1_000_000_000)?;
-        Ok(0)
-    }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
         self.fd_io().pipe2(m, fds, flags)
@@ -8995,13 +9084,6 @@ impl Kernel {
     }
 
 
-    /// `epoll_create1`.
-    fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
-        const EPOLL_CLOEXEC: u64 = 0o2000000;
-        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::EpollSet::new());
-        let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
-        self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)
-    }
 
     /// The epoll set an open file is, if it is one.
 
@@ -9021,34 +9103,7 @@ impl Kernel {
         self.fd_io().epoll_ctl(m, epfd, op, fd, event)
     }
 
-    /// The anonymous shared file behind a descriptor, if it is one.
-    fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
-        self.fd_io().memfd_of(fd)
-    }
 
-    /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
-    ///
-    /// Xwayland calls this through `posix_fallocate` after sealing its shared
-    /// memory, to be certain the pages are there before it hands the
-    /// descriptor to a compositor. The other modes -- punching holes,
-    /// collapsing ranges -- are refused rather than silently treated as
-    /// allocation, which would leave a caller believing it had freed space.
-    fn sys_fallocate(&mut self, fd: i32, mode: u64, offset: u64, len: u64) -> SysResult {
-        if mode != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
-        if let Ok(memfd) = self.memfd_of(fd) {
-            return memfd.reserve(end);
-        }
-        // An ordinary file grows by being written to its new length.
-        let file = self.fds.get(fd)?;
-        let size = file.handle.metadata()?.size;
-        if end > size {
-            file.handle.truncate(end)?;
-        }
-        Ok(0)
-    }
 
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
@@ -9056,15 +9111,6 @@ impl Kernel {
         self.fd_io().flock(fd, op)
     }
 
-    fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
-        const MFD_CLOEXEC: u64 = 1;
-        let raw = m.read_cstr(name, 249)?;
-        let name = String::from_utf8_lossy(&raw).into_owned();
-        let memfd = Arc::new(unix::MemFd::new(&name));
-        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
-        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
-        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
-    }
 
 
 
@@ -10395,6 +10441,38 @@ mod tests {
             assert_eq!(m.read(buf_at, 512).unwrap(), &want[..], "raw {n}");
             assert_eq!(r32(&m), want_ret, "raw {n}");
         }
+        // A timerfd armed and re-armed through the 32-bit itimerspec, its
+        // old value narrowed back, either way.
+        for lock_free in [true, false] {
+            let mut go = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            set32(&mut m, raw::TIMERFD_CREATE, [1, 0, 0]);
+            go(&mut m, &mut k);
+            let tfd = r32(&m) as u64;
+            m.zero(0x31000, 64).unwrap();
+            m.write_u32(0x31008, 100).unwrap(); // it_value.tv_sec
+            m.write_u32(0x31000, 7).unwrap(); // it_interval.tv_sec
+            set32(&mut m, raw::TIMERFD_SETTIME, [tfd, 0, 0x31000]);
+            m.write_u64(at + crate::i386::ARG_SLOTS[3] as u64, 0).unwrap();
+            go(&mut m, &mut k);
+            assert_eq!(r32(&m), 0, "lock_free {lock_free}");
+            set32(&mut m, raw::TIMERFD_SETTIME, [tfd, 0, 0x31000]);
+            m.write_u64(at + crate::i386::ARG_SLOTS[3] as u64, 0x31100).unwrap();
+            m.write_u64(0x31110, !0).unwrap();
+            go(&mut m, &mut k);
+            assert_eq!(r32(&m), 0);
+            assert_eq!(m.read_u32(0x31100).unwrap(), 7, "old interval, 32-bit");
+            let left = m.read_u32(0x31108).unwrap();
+            assert!(left == 99 || left == 100, "{left}");
+            assert_eq!(m.read_u64(0x31110).unwrap(), !0, "nothing past the 16 bytes");
+            set32(&mut m, raw::CLOSE, [tfd, 0, 0]);
+            k.syscall(&mut m, 0);
+        }
         // uname's machine is i686 for an i386 process.
         set32(&mut m, raw::UNAME, [buf_at, 0, 0]);
         let _ = free(&k, &mut m, at);
@@ -10415,6 +10493,114 @@ mod tests {
         assert!(clock_call(&mut m, at, true, k.clock, k.started));
         assert_eq!(m.read_u32(buf_at + 4).unwrap(), u32::MAX, "only four bytes stored");
         assert_eq!(m.read_u32(buf_at).unwrap() as i32, r32(&m));
+    }
+
+    #[test]
+    fn free_fd_object_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        for lock_free in [true, false] {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+                if lock_free {
+                    assert!(done(free(k, m, at)));
+                } else {
+                    k.syscall(m, 0);
+                }
+            };
+            let full = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, args: &[u64]| {
+                set_args(m, at, n, args);
+                k.syscall(m, 0);
+                ret(m, at) as u64
+            };
+            // eventfd2: a counter, written and read back.
+            set_args(&mut m, at, nr::EVENTFD2, &[3, 0]);
+            call(&mut m, &mut k);
+            let efd = ret(&m, at) as u64;
+            assert!(efd < 100, "lock_free {lock_free}");
+            assert_eq!(k.fds.get(efd as i32).unwrap().path, "anon_inode:[eventfd]");
+            assert_eq!(full(&mut m, &mut k, nr::READ, &[efd, 0x20000, 8]), 8);
+            assert_eq!(m.read_u64(0x20000).unwrap(), 3);
+            // epoll_create1 with CLOEXEC.
+            set_args(&mut m, at, nr::EPOLL_CREATE1, &[0o2000000]);
+            call(&mut m, &mut k);
+            let ep = ret(&m, at) as u64;
+            assert_eq!(k.fds.get(ep as i32).unwrap().path, "anon_inode:[eventpoll]");
+            // memfd_create, then fallocate to a size the descriptor reports.
+            m.write(0x20100, b"buf\0").unwrap();
+            set_args(&mut m, at, nr::MEMFD_CREATE, &[0x20100, 1]);
+            call(&mut m, &mut k);
+            let mfd = ret(&m, at) as u64;
+            assert_eq!(k.fds.get(mfd as i32).unwrap().path, "/memfd:buf");
+            set_args(&mut m, at, nr::FALLOCATE, &[mfd, 0, 0, 8192]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            assert_eq!(k.fds.get(mfd as i32).unwrap().handle.metadata().unwrap().size, 8192);
+            set_args(&mut m, at, nr::FALLOCATE, &[mfd, 1, 0, 8192]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -(Errno::EOPNOTSUPP.0 as i64));
+            // A timerfd armed for ten seconds says about ten seconds left.
+            set_args(&mut m, at, nr::TIMERFD_CREATE, &[1, 0]);
+            call(&mut m, &mut k);
+            let tfd = ret(&m, at) as u64;
+            m.zero(0x20200, 64).unwrap();
+            m.write_u64(0x20210, 10).unwrap();
+            set_args(&mut m, at, nr::TIMERFD_SETTIME, &[tfd, 0, 0x20200, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::TIMERFD_GETTIME, &[tfd, 0x20300]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 0);
+            let left = m.read_u64(0x20310).unwrap();
+            assert!(left == 9 || left == 10, "{left}");
+            // The transfers: a file into a pipe, then a pipe into a file.
+            m.write(0x20400, b"/src\0").unwrap();
+            let src = full(&mut m, &mut k, nr::OPENAT, &[(-100i64) as u64, 0x20400, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_TRUNC) as u64, 0o644]);
+            m.write(0x20500, b"transferred").unwrap();
+            assert_eq!(full(&mut m, &mut k, nr::WRITE, &[src, 0x20500, 11]), 11);
+            set_args(&mut m, at, nr::PIPE2, &[0x20600, 0]);
+            k.syscall(&mut m, 0);
+            let (r, w) = (m.read_u32(0x20600).unwrap() as u64, m.read_u32(0x20604).unwrap() as u64);
+            m.write_u64(0x20700, 0).unwrap();
+            set_args(&mut m, at, nr::SENDFILE, &[w, src, 0x20700, 64]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            assert_eq!(m.read_u64(0x20700).unwrap(), 11, "the offset advanced");
+            m.write(0x20800, b"/dst\0").unwrap();
+            let dst = full(&mut m, &mut k, nr::OPENAT, &[(-100i64) as u64, 0x20800, (oflags::O_RDWR | oflags::O_CREAT | oflags::O_TRUNC) as u64, 0o644]);
+            set_args(&mut m, at, nr::SPLICE, &[r, 0, dst, 0, 64, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            m.write_u64(0x20900, 0).unwrap();
+            m.write_u64(0x20908, 11).unwrap();
+            set_args(&mut m, at, nr::COPY_FILE_RANGE, &[src, 0x20900, dst, 0x20908, 64, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 11);
+            assert_eq!(full(&mut m, &mut k, nr::PREAD64, &[dst, 0x20a00, 64, 0]), 22);
+            assert_eq!(m.read(0x20a00, 22).unwrap(), b"transferredtransferred");
+            // An empty blocking pipe: the transfer waits, both ways.
+            set_args(&mut m, at, nr::SPLICE, &[r, 0, dst, 0, 64, 0]);
+            if lock_free {
+                assert!(matches!(free(&k, &mut m, at), Some(FreeOutcome::Blocking(BlockOp::AcceptWait { .. }, None))));
+            } else {
+                assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::AcceptWait { .. })));
+                k.retry_transfer = None;
+            }
+            for f in [efd, ep, mfd, tfd, src, r, w, dst] {
+                set_args(&mut m, at, nr::CLOSE, &[f]);
+                k.syscall(&mut m, 0);
+            }
+        }
     }
 
     #[test]
