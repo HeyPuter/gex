@@ -422,6 +422,25 @@ const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
+/** The spans of a map blob (`vma_blob` in the shim: u32 count, then per
+ *  region u64 start, u64 end, u32 prot, a name and a code identity). */
+function vmaRegions(blob) {
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const out = [];
+  let p = 4;
+  for (let i = dv.getUint32(0, true); i > 0 && p + 24 <= blob.length; i--) {
+    const start = Number(dv.getBigUint64(p, true));
+    const end = Number(dv.getBigUint64(p + 8, true));
+    const prot = dv.getUint32(p + 16, true);
+    p += 20;
+    p += 4 + dv.getUint32(p, true);
+    const code = dv.getUint32(p, true);
+    p += 4 + code + 8;
+    out.push({ start, end, prot });
+  }
+  return out;
+}
+
 /**
  * A cheap content hash for whether two copies of a region agree. FNV-1a over
  * words, not bytes: only ever answers same-or-different.
@@ -2242,14 +2261,17 @@ export class Gex {
       return zeros;
     });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
-    const scratch = e.gex_alloc(24) >>> 0;
-    const dv = new DataView(this.#memory.buffer);
-    const n = e.gex_vma_count();
-    for (let i = 0; i < n; i++) {
-      if (e.gex_vma_at(i, scratch) !== 0) continue;
-      const start = Number(dv.getBigUint64(scratch, true));
-      const end = Number(dv.getBigUint64(scratch + 8, true));
-      const prot = Number(dv.getBigUint64(scratch + 16, true));
+    // The map read once, as the blob the child rebuilds its map from
+    // (`#vmaBlob`), and the regions copied are that blob's: read a region at
+    // a time (`gex_vma_count`, then `gex_vma_at`), other threads mapping and
+    // unmapping meanwhile shifted the indexes, and the image missed regions
+    // and named others twice. A missed thread stack above 4 GiB left the
+    // child's memory short of it, and musl's fork in the child faulted
+    // walking the thread list there (fork-maps-threads).
+    const blob = this.#vmaBlob();
+    this.#forkVmaBlob = blob;
+    const regions = blob ? vmaRegions(blob) : this.#vmaRegionsEach();
+    for (const { start, end, prot } of regions) {
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
       if (end > start) {
@@ -2258,7 +2280,6 @@ export class Gex {
         r.zeros = runs(start, end);
       }
     }
-    e.gex_free?.(scratch, 24);
     if (runsCap) e.gex_free?.(runsAt, runsCap * 8);
     if (staging) this.#stageImage(out);
     // A checksum per region, so the child can say whether what it runs on is
@@ -2271,6 +2292,9 @@ export class Gex {
       // `gex_vma_reloadable`: read-only library text is identical to its file.
       let again = 0;
       if (e.gex_vma_reloadable) {
+        const n = e.gex_vma_count();
+        const scratch = e.gex_alloc(24) >>> 0;
+        const dv = new DataView(this.#memory.buffer);
         for (let i = 0; i < n; i++) {
           if (e.gex_vma_at(i, scratch) !== 0) continue;
           if (!e.gex_vma_reloadable(i)) continue;
@@ -2278,6 +2302,7 @@ export class Gex {
           const b = Number(dv.getBigUint64(scratch + 8, true));
           if (b > a) again += b - a;
         }
+        e.gex_free?.(scratch, 24);
       }
       console.error(
         `[gex] fork image: ${out.length} regions, ${(bytes / 1048576).toFixed(1)} MiB, `
@@ -2285,6 +2310,29 @@ export class Gex {
         + `${Math.round(performance.now() - t0)}ms to copy`,
       );
     }
+    return out;
+  }
+
+  /// The map `#processImage` read for the fork being built: the child gets
+  /// these bytes, so its map is the one its image was copied by.
+  #forkVmaBlob = null;
+
+  /** The map a region at a time, for a shim with no blob. */
+  #vmaRegionsEach() {
+    const e = this.#shim.exports;
+    const scratch = e.gex_alloc(24) >>> 0;
+    const out = [];
+    const n = e.gex_vma_count();
+    for (let i = 0; i < n; i++) {
+      if (e.gex_vma_at(i, scratch) !== 0) continue;
+      const dv = new DataView(this.#memory.buffer);
+      out.push({
+        start: Number(dv.getBigUint64(scratch, true)),
+        end: Number(dv.getBigUint64(scratch + 8, true)),
+        prot: Number(dv.getBigUint64(scratch + 16, true)),
+      });
+    }
+    e.gex_free?.(scratch, 24);
     return out;
   }
 
@@ -2297,14 +2345,18 @@ export class Gex {
   #vmaBlob() {
     const e = this.#shim.exports;
     if (!e.gex_vma_blob_len || !e.gex_vma_blob_read) return null;
-    const len = e.gex_vma_blob_len() >>> 0;
-    if (!len) return null;
-    const buf = e.gex_alloc(len) >>> 0;
+    // One read of the map, into room to spare: other threads map and unmap
+    // between a length asked and a read, and a blob read against a stale
+    // length was refused (the image then fell back to reading the map a
+    // region at a time). Asked again with more room while it does not fit.
+    let cap = (e.gex_vma_blob_len() >>> 0) * 2 + 4096;
     let blob = null;
-    if (e.gex_vma_blob_read(buf, len) === len) {
-      blob = new Uint8Array(this.#memory.buffer, buf, len).slice();
+    for (let tries = 0; tries < 8 && !blob; tries++, cap *= 2) {
+      const buf = e.gex_alloc(cap) >>> 0;
+      const got = e.gex_vma_blob_read(buf, cap) >>> 0;
+      if (got) blob = new Uint8Array(this.#memory.buffer, buf, got).slice();
+      e.gex_free?.(buf, cap);
     }
-    e.gex_free?.(buf, len);
     return blob;
   }
 
@@ -3303,7 +3355,7 @@ export class Gex {
       imageStage: this.#imageStage,
       // The map, separately from the bytes: names and code identities the child
       // needs to recognise a page as belonging to an already-translated library.
-      vmaBlob: this.#vmaBlob(),
+      vmaBlob: this.#forkVmaBlob,
       // Every slot this process has claimed -- not the highest any module needed.
       // The directory is written when a page is *claimed*, not when its module
       // installs, so the max over inherited modules misses a page claimed after
