@@ -9120,6 +9120,13 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
 /// posix_spawn's child in its parent's (`vfork`). Its working directory,
 /// program and signal state are what was staged (`gex_set_cwd`,
 /// `gex_set_child_exe`, `gex_set_child_state`).
+/// The context slots up to and including the one at `ctx`: where a process
+/// running on `ctx` numbers its next clone's.
+fn ctx_slots_below(ctx: u64) -> u32 {
+    let stride = (ctx::SIZE as u64 + 63) & !63;
+    (ctx.saturating_sub(gex_abi::ctx_addr(0)) / stride) as u32 + 1
+}
+
 fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> Host {
     let ctx_addr = ctx_addr as u64;
     {
@@ -9173,6 +9180,12 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
+    // Contexts above the main thread's: its context is the one the parent
+    // forked from, slot N when the forking thread was not the first, and clones
+    // numbered from 1 reached N and drove two threads through one context (the
+    // Win7 shell's COM factory child of explorer: its fifth thread ran on the
+    // main thread's registers).
+    kernel.next_ctx_slot = kernel.next_ctx_slot.max(ctx_slots_below(ctx_addr));
     // The process's start, unless this is a vfork child's kernel: the
     // memory's other Workers are its parent's threads (vfork.rs).
     if vfork::pid_here().is_none() {
@@ -9469,7 +9482,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
     h.kernel.live_threads = 1;
-    h.kernel.next_ctx_slot = 1;
+    // Clones above the context this program goes on, which is the exec'ing
+    // thread's: not slot 0 after an exec from a second thread.
+    let here = if ctx_addr_get() != 0 { ctx_addr_get() } else { h.kernel.ctx_addr };
+    h.kernel.next_ctx_slot = ctx_slots_below(here).max(1);
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
