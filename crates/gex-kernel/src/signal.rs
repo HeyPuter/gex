@@ -435,6 +435,10 @@ pub struct ThreadSig {
     /// kernel raised itself.
     sources: Mutex<[Option<Source>; NSIG]>,
     own: Mutex<Own>,
+    /// Where the thread's exit writes zero and futex-wakes (what
+    /// `pthread_join` waits on): `CLONE_CHILD_CLEARTID`'s word, or
+    /// `set_tid_address`'s. Zero for none.
+    clear_child_tid: AtomicU64,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -455,7 +459,20 @@ impl ThreadSig {
             blocked: AtomicU64::new(blocked),
             sources: Mutex::new([None; NSIG]),
             own: Mutex::new(Own::default()),
+            clear_child_tid: AtomicU64::new(0),
         }
+    }
+
+    /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).
+    pub fn clear_child_tid(&self) -> u64 {
+        self.clear_child_tid.load(Ordering::Acquire)
+    }
+
+    /// `set_tid_address`, or `CLONE_CHILD_CLEARTID` at its start: the word
+    /// the thread's exit clears. Only the thread itself, or its creator
+    /// before it runs, sets it.
+    pub fn set_clear_child_tid(&self, addr: u64) {
+        self.clear_child_tid.store(addr, Ordering::Release);
     }
 
     /// Mark a signal pending for this thread, sent by `source` (`None`: the
@@ -585,6 +602,8 @@ impl Signals {
         own.alt_stack = SigAltStack::default();
         own.in_handler = false;
         own.suspend_restore = None;
+        // The word was in the old image: Linux forgets it (`mm_release`).
+        self.cur.set_clear_child_tid(0);
     }
 
     pub fn action(&self, signal: u32) -> SigAction {
