@@ -40,6 +40,12 @@ struct WinePe {
     /// variables).
     pending: Vec<(u64, Vec<u8>)>,
     wasm: Vec<u8>,
+    /// The file `wasm` is from, and its content key, made on first asking
+    /// (`gex_cgen_pmod_wasm_key`): from the system-wide cache, so a process
+    /// neither hashes the 9 MB nor has JS copy them out when the page
+    /// already has the module.
+    file: String,
+    key: Option<(u64, u64)>,
     installed: bool,
     /// The DLLs whose skeleton has been mapped. A later mapping of one (an
     /// image view: wineboot's install maps DLLs so) binds its exports but
@@ -132,7 +138,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
         let data_exports = exported_offsets(&wasm)?;
         let number = lock(&PROVIDERS).len() as u32;
-        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, installed: false, mapped: Default::default() });
+        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, file, key: None, installed: false, mapped: Default::default() });
     }
     let wp = g.as_mut().expect("Wine's PE module");
     let slot = |n: &str| wp.slots.get(n).copied();
@@ -308,6 +314,13 @@ pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
         return n;
     }
     lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
+}
+
+/// Wine's PE module's content key when it is provider module `number`.
+pub(super) fn wasm_key(number: u32) -> Option<(u64, u64)> {
+    let mut g = lock(&WINE_PE);
+    let w = g.as_mut().filter(|w| w.number == number)?;
+    Some(*w.key.get_or_insert_with(|| super::wasmprog::file_key(&w.file, &w.wasm)))
 }
 
 /// The publishing Worker instantiated Wine's PE module (its data is
