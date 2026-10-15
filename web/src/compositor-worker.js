@@ -1,7 +1,7 @@
 // Demo build: runtime .wasm as .wasm.zst (zfetch.js); a no-op elsewhere.
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
-import { glassColorMatrix } from './glass-colorization.js';
+import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -98,11 +98,11 @@ struct U {
   texRect: vec4f,   // sub-rectangle of the texture to sample (0..1)
   color: vec4f,
   output: vec2f,    // output size in pixels
-  mode: u32,        // 0 = texture, 1 = solid colour, 2 = blur (color.xy: step in texels), 4 = colorization
+  mode: u32,        // 0 = texture, 1 = solid colour, 3 = texture times colour
   swizzle: u32,     // 1 = the texture holds BGRA bytes (wl_shm)
   opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha), 2 = but in glass
   glassCount: u32,
-  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels); mode 4: the matrix's rows
+  glass: array<vec4f, 4>, // with opaque 2: where the texture's alpha counts (output pixels)
   client: vec4f,    // w > 0: a frame DWM draws goes over the texture outside this (output pixels)
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -119,35 +119,10 @@ struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
   o.uv = u.texRect.xy + corner * u.texRect.zw;
   return o;
 }
-// Glass's blur: one direction of a separable Gaussian, 13 taps (sigma 4 at
-// step 1), the step given in texels so a pass can spread wider.
-fn blur(uv: vec2f) -> vec4f {
-  let texel = u.color.xy / vec2f(textureDimensions(tex));
-  let w = array<f32, 7>(0.1585, 0.1465, 0.1157, 0.0781, 0.0451, 0.0222, 0.0094);
-  // Kept inside the rectangle drawn from (texRect): the scratch texture
-  // holds older frames' pixels beyond it.
-  let half = 0.5 / vec2f(textureDimensions(tex));
-  let lo = u.texRect.xy + half;
-  let hi = u.texRect.xy + u.texRect.zw - half;
-  var c = textureSampleLevel(tex, samp, uv, 0.0) * w[0];
-  for (var i = 1; i < 7; i++) {
-    let d = texel * f32(i);
-    c += (textureSampleLevel(tex, samp, clamp(uv + d, lo, hi), 0.0)
-        + textureSampleLevel(tex, samp, clamp(uv - d, lo, hi), 0.0)) * w[i];
-  }
-  return c;
-}
 @fragment fn fs(v: V) -> @location(0) vec4f {
   var c = textureSample(tex, samp, v.uv);
   if (u.mode == 1u) { return u.color; }
-  if (u.mode == 2u) { return vec4f(blur(v.uv).rgb, 1.0); }
   if (u.mode == 3u) { return c * u.color; }
-  // Windows 7's colorization of the blurred backdrop (glass-colorization.js):
-  // a 3x3 matrix (glass[0..2].xyz, rows) and an offset (color.rgb).
-  if (u.mode == 4u) {
-    let m = mat3x3f(u.glass[0].xyz, u.glass[1].xyz, u.glass[2].xyz);
-    return vec4f(clamp(c.rgb * m + u.color.rgb, vec3f(0.0), vec3f(1.0)), 1.0);
-  }
   if (u.swizzle == 1u) { c = c.bgra; }
   if (u.client.z > 0.0 && (any(v.pos.xy < u.client.xy) || any(v.pos.xy >= u.client.xy + u.client.zw))) {
     return vec4f(0.0);
@@ -218,14 +193,6 @@ class Painter {
       fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: blend, alpha: blend } }] },
       primitive: { topology: 'triangle-strip' },
     });
-    // Glass's blur passes write, not blend: their targets start undefined.
-    this.pipelineCopy = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
-      vertex: { module, entryPoint: 'vs' },
-      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
-      primitive: { topology: 'triangle-strip' },
-    });
-    this.glassTex = [null, null];
     // Clamped, whatever the texture: the guest's GL frames are textures Mesa
     // made, and sampling must not depend on their state. Nearest where a
     // texture is drawn at its own size (a window, 1:1 with the device's
@@ -274,6 +241,7 @@ class Painter {
     this.w = w;
     this.h = h;
     this.n = 0;
+    this.dwm?.frame();
     this.encoder = this.device.createCommandEncoder();
     this.pass = this.encoder.beginRenderPass({
       colorAttachments: [{ view: this.scene.createView(), loadOp: 'clear', storeOp: 'store',
@@ -341,66 +309,22 @@ class Painter {
     }
   }
 
-  /** Windows 7's glass under a window: what is drawn so far, blurred and
-   *  coloured (`colour`, glassColorMatrix's), in `rects` (output pixels). The
-   *  scene's pass ends, the box around the rectangles is copied out and
-   *  blurred in two passes each way, and the pass resumes on the scene to
-   *  draw the result. */
-  glass(rects, colour) {
-    if (!rects.length || this.n + 8 + rects.length * 2 >= MAX_DRAWS) return;
-    const pad = 24;
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (const r of rects) {
-      x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y);
-      x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h);
-    }
-    x0 = Math.max(0, Math.floor(x0) - pad); y0 = Math.max(0, Math.floor(y0) - pad);
-    x1 = Math.min(this.w, Math.ceil(x1) + pad); y1 = Math.min(this.h, Math.ceil(y1) + pad);
-    const bw = x1 - x0, bh = y1 - y0;
-    if (bw <= 0 || bh <= 0) return;
-    // Two scratch textures at least the box's size, kept between frames.
-    for (let i = 0; i < 2; i++) {
-      const t = this.glassTex[i];
-      if (!t || t.width < bw || t.height < bh) {
-        t?.destroy();
-        this.glassTex[i] = this.device.createTexture({
-          size: [Math.max(bw, t?.width ?? 0), Math.max(bh, t?.height ?? 0)],
-          format: this.format,
-          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-      }
-    }
-    const [a, b] = this.glassTex;
+  /** Windows 7's glass under a window, as DWM draws it (dwm-glass.js): what
+   *  is drawn so far, blurred and coloured (`c`, dwmGlassConstants'), in
+   *  `rects` (output pixels). The scene's pass ends for DWM's two passes and
+   *  resumes on the scene. */
+  glass(rects, c) {
+    if (!rects.length) return;
+    this.dwm ??= new DwmGlass(this.device, this.format);
     this.pass.end();
-    this.encoder.copyTextureToTexture({ texture: this.scene, origin: [x0, y0] }, { texture: a }, [bw, bh]);
-    const uv = [0, 0, bw / a.width, bh / a.height];
-    const saved = [this.w, this.h];
-    // a -> b horizontally, b -> a vertically; twice, the second spread wider.
-    for (const [src, dst, dx, dy] of [[a, b, 1, 0], [b, a, 0, 1], [a, b, 2.5, 0], [b, a, 0, 2.5]]) {
-      this.w = dst.width;
-      this.h = dst.height;
-      this.pass = this.encoder.beginRenderPass({
-        colorAttachments: [{ view: dst.createView(), loadOp: 'load', storeOp: 'store' }],
-      });
-      this.pass.setPipeline(this.pipelineCopy);
-      this.#draw(0, 0, bw, bh, src, 2, [dx, dy, 0, 0], 0, 0, uv);
-      this.pass.end();
-    }
-    [this.w, this.h] = saved;
+    this.dwm.encode(this.encoder, this.scene, this.w, this.h, rects, c);
     this.pass = this.encoder.beginRenderPass({
       colorAttachments: [{ view: this.scene.createView(), loadOp: 'load', storeOp: 'store' }],
     });
     this.pass.setPipeline(this.pipeline);
-    for (const r of rects) {
-      const u = [(r.x - x0) / a.width, (r.y - y0) / a.height, r.w / a.width, r.h / a.height];
-      const { m, offset } = colour;
-      // `c.rgb * m` in WGSL dots c with each of m's columns, and
-      // mat3x3f(a, b, c) takes columns: so the columns given are m's rows
-      // (as x, y, w for #draw's x, y, z).
-      const rows = [0, 1, 2].map((i) => ({ x: m[3 * i], y: m[3 * i + 1], w: m[3 * i + 2], h: 0 }));
-      this.#draw(r.x, r.y, r.w, r.h, a, 4, [...offset, 1], 0, 0, u, rows);
-    }
   }
+
+
 
   textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1], glass = null, client = null } = {}) {
     if (!tex) return;
@@ -1131,6 +1055,18 @@ class Compositor {
     p.textured(b.x + Math.floor((b.w - size) / 2), b.y + Math.floor((b.h - size) / 2), size, size, x.tex);
   }
 
+  /** DWM's COLORIZATIONOPACITY for `win`'s frame (0..1): the theme's
+   *  TOPFRAME, active or inactive (uDWM's GetNCAreaHelper reads it per frame
+   *  state; Aero's are 100 and 40). */
+  #colorizationOpacity(win) {
+    const g = win.info.glass;
+    const framed = (g.frame & 1) !== 0;
+    const active = framed ? (g.frame & 2) !== 0 : this.#focus === win.key;
+    const q = this.#aeroAtlas()?.parts.get(`TOPFRAME:${active ? 1 : 2}`);
+    const v = q?.properties?.COLORIZATIONOPACITY;
+    return (typeof v === 'number' ? v : active ? 100 : 40) / 100;
+  }
+
   /** A window's glass (`gex_glass_v1`): its rectangles in output pixels,
    *  clipped to the window, and DWM's colorization as a tint. */
   #drawGlass(win) {
@@ -1142,7 +1078,7 @@ class Compositor {
       const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
       if (w > 0 && h > 0) rects.push({ x: f.x + x, y: f.y + y, w, h });
     }
-    this.#painter.glass(rects, glassColorMatrix(g));
+    this.#painter.glass(rects, dwmGlassConstants(g, this.#colorizationOpacity(win)));
     return rects;
   }
 
