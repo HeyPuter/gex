@@ -327,11 +327,9 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     gather(home);
     // Whether a futex word is mapped: the map's published view where other
     // Workers may be changing the map; the map itself in the single-threaded
-    // build, which keeps no view and has nobody inside the kernel now.
+    // build, which keeps no view.
     #[cfg(not(feature = "shared-memory"))]
-    let by_kernel = |addr: u64, len: u64| {
-        crate::with_host(|h| h.kernel.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end))
-    };
+    let by_kernel = |addr: u64, len: u64| home.mm.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
     let ns = home.vfs.get();
     let futex = FutexCx {
         table: &home.futexes,
@@ -399,8 +397,7 @@ pub(crate) fn sigreturn(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, gex
 
 /// Whether `pc` is in an executable mapping of this process: the map's
 /// published view where other Workers may be changing the map; the map
-/// itself in the single-threaded build, which keeps no view and has nobody
-/// inside the kernel now.
+/// itself in the single-threaded build, which keeps no view.
 pub(crate) fn executable(pc: u64) -> bool {
     #[cfg(feature = "shared-memory")]
     {
@@ -408,7 +405,7 @@ pub(crate) fn executable(pc: u64) -> bool {
     }
     #[cfg(not(feature = "shared-memory"))]
     {
-        crate::with_host(|h| h.kernel.mem.lock().vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
+        home().is_some_and(|h| h.mm.lock().vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
     }
 }
 

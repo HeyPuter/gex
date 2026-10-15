@@ -183,7 +183,7 @@ fn take_throw(caller: &mut Caller<'_, HostState>) -> Result<Option<i32>> {
 /// kind of stateful provider yet).
 pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
-    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, k, size, name)).map_err(|e| anyhow!(e))
+    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, &k.mem, size, name)).map_err(|e| anyhow!(e))
 }
 
 /// Guest pages in a Linux process (a native wasm32 program, `wasmprog`):
@@ -219,7 +219,7 @@ fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
 /// provider's data and heap, which must not move the program's later DLLs.
 pub(crate) fn alloc_top(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
-    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, k, size, name)).map_err(|e| anyhow!(e))
+    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, &k.mem, size, name)).map_err(|e| anyhow!(e))
 }
 
 /// Install `p`'s functions for an image whose exports are `exports` at

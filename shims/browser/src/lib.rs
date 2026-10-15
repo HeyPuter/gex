@@ -4537,7 +4537,7 @@ pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
 /// which parts are real. Paired with [`gex_vma_at`]: count first, then ask.
 #[no_mangle]
 pub extern "C" fn gex_vma_count() -> i32 {
-    with_host(|h| h.kernel.mem.lock().vmas().len() as i32)
+    named_mm().map_or(0, |mm| mm.lock().vmas().len() as i32)
 }
 
 /// The whole memory map as bytes, for a child to rebuild from. Each region's
@@ -4550,8 +4550,9 @@ pub extern "C" fn gex_vma_count() -> i32 {
 ///
 /// A zero `code_len` means no code identity. `origin` is deliberately absent:
 /// it is a claim about *this* process's mappings, not something to inherit.
-fn vma_blob(h: &Host) -> Vec<u8> {
-    let mm = h.kernel.mem.lock();
+fn vma_blob() -> Vec<u8> {
+    let Some(mm) = named_mm() else { return 0u32.to_le_bytes().to_vec() };
+    let mm = mm.lock();
     let vmas = mm.vmas();
     let mut out = Vec::with_capacity(64 * vmas.len());
     out.extend_from_slice(&(vmas.len() as u32).to_le_bytes());
@@ -4578,19 +4579,17 @@ fn vma_blob(h: &Host) -> Vec<u8> {
 
 #[no_mangle]
 pub extern "C" fn gex_vma_blob_len() -> u32 {
-    with_host(|h| vma_blob(h).len() as u32)
+    vma_blob().len() as u32
 }
 
 #[no_mangle]
 pub extern "C" fn gex_vma_blob_read(out: u32, cap: u32) -> u32 {
-    with_host(|h| {
-        let blob = vma_blob(h);
-        if blob.len() as u32 > cap {
-            return 0;
-        }
-        shim_slice_mut(out, blob.len() as u32).copy_from_slice(&blob);
-        blob.len() as u32
-    })
+    let blob = vma_blob();
+    if blob.len() as u32 > cap {
+        return 0;
+    }
+    shim_slice_mut(out, blob.len() as u32).copy_from_slice(&blob);
+    blob.len() as u32
 }
 
 /// Rebuild the child's map from what [`vma_blob`] wrote.
@@ -4653,16 +4652,16 @@ static ADOPTED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// than a return value, since a wasm function hands back only one.
 #[no_mangle]
 pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
-    with_host(|h| {
-        let Some((start, end, prot)) = h.kernel.mem.lock().vmas().get(i.max(0) as usize).map(|v| (v.start, v.end, v.prot as u64)) else {
-            return -1;
-        };
-        let dst = shim_slice_mut(out, 24);
-        dst[0..8].copy_from_slice(&start.to_le_bytes());
-        dst[8..16].copy_from_slice(&end.to_le_bytes());
-        dst[16..24].copy_from_slice(&prot.to_le_bytes());
-        0
-    })
+    let Some(mm) = named_mm() else { return -1 };
+    let found = mm.lock().vmas().get(i.max(0) as usize).map(|v| (v.start, v.end, v.prot as u64));
+    let Some((start, end, prot)) = found else {
+        return -1;
+    };
+    let dst = shim_slice_mut(out, 24);
+    dst[0..8].copy_from_slice(&start.to_le_bytes());
+    dst[8..16].copy_from_slice(&end.to_le_bytes());
+    dst[16..24].copy_from_slice(&prot.to_le_bytes());
+    0
 }
 
 /// The runs of 4 KiB pages in `[start, end)` that are not all zero, for a
@@ -5162,7 +5161,7 @@ fn report_new_pins_in(h: &Host) {
 /// runs code at the wrong address, so a mismatch is written loudly.
 #[no_mangle]
 pub extern "C" fn gex_pin_report() {
-    let landed = with_host(|h| h.kernel.mem.lock().log.pin_landed.clone());
+    let landed = sigs::home().map(|h| h.mm().lock().log.pin_landed.clone()).unwrap_or_default();
     for (path, want, got) in landed {
         let how = if want == got { "ok" } else { "MISPLACED" };
         trace_line(&format!("[gex] pin {how}: {path} wanted {want:#x}, landed {got:#x}\n"));
@@ -5544,15 +5543,7 @@ pub extern "C" fn gex_get_file(path: u32, path_len: u32) -> u32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return 0;
     };
-    let bytes = with_host(|h| {
-        let f = h.kernel.vfs.open(name, 0, 0).ok()?;
-        let len = f.metadata().ok()?.size as usize;
-        let mut buf = vec![0u8; len];
-        let n = f.read_at(0, &mut buf).ok()? as usize;
-        buf.truncate(n);
-        Some(buf)
-    })
-    .unwrap_or_default();
+    let bytes = sigs::home().and_then(|h| h.read_file(name)).unwrap_or_default();
     let len = bytes.len() as u32;
     *EXTRACTED.0.borrow_mut() = bytes;
     len
@@ -7089,7 +7080,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         } else {
             gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
         };
-        let caller = with_host(|h| object_off_at(h, ret));
+        let caller = object_off_at(ret);
         // An unknown call shows its raw number: "unknown" alone cannot be looked up.
         let raw_nr = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
         let name = match gex_kernel::syscalls::syscall_name(n) {
@@ -7315,7 +7306,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         break;
                     }
                     let ret = gm.read_u64(fp + 8).unwrap_or(0);
-                    let o = object_off_at(h, ret);
+                    let o = object_off_at(ret);
                     if !o.is_empty() {
                         bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
                     }
@@ -7327,7 +7318,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 }
                 for i in 0..80u64 {
                     let w = gm.read_u64(sp + i * 8).unwrap_or(0);
-                    let o = object_off_at(h, w);
+                    let o = object_off_at(w);
                     if o.contains(".so") || o.starts_with('/') {
                         bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
                     }
@@ -12255,16 +12246,15 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     }
     // Which process and what is mapped there: with a Worker per process the
     // console interleaves them all.
-    let vma = with_host(|h| {
-        h.kernel
-            .mem
-            .lock()
-            .vmas()
-            .iter()
-            .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
-            .map(|v| format!("{:#x}-{:#x} {}", v.start, v.end, v.name))
-            .unwrap_or_else(|| "unmapped".into())
-    });
+    let vma = named_mm()
+        .and_then(|mm| {
+            mm.lock()
+                .vmas()
+                .iter()
+                .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
+                .map(|v| format!("{:#x}-{:#x} {}", v.start, v.end, v.name))
+        })
+        .unwrap_or_else(|| "unmapped".into());
     trace_line(&format!(
         "gex: pid {}: illegal instruction {:#010x} at pc={:#x} ({vma})\n",
         my_pid(),
@@ -13128,7 +13118,7 @@ fn livelock_note(pc: u64) {
          the miss path: {way}; {}; dense index {}; function table: knows {}, index {:?}, unit serves {}, behind {}; \
          translated {translated}, translations of it {remiss}; aot {}\n",
         my_pid(),
-        with_host(|h| object_off_at(h, pc)),
+        object_off_at(pc),
         pages.join("; "),
         dense::lookup(pc),
         cgen::knows(pc),
@@ -13393,7 +13383,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 .map(|i| {
                     let a = sp.wrapping_sub(0x60).wrapping_add(i * 8);
                     let v = gm.read_u64(a).unwrap_or(0);
-                    format!("{a:#x}={v:#x}{}", Some(object_off_at(h, v)).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default())
+                    format!("{a:#x}={v:#x}{}", Some(object_off_at(v)).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default())
                 })
                 .collect();
             let regs: Vec<String> = (0..16u8).map(|r| format!("r{r}={:#x}", gm.read_u64(c + ctx::x(r) as u64).unwrap_or(0))).collect();
@@ -13402,8 +13392,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
                 h.kernel.pid,
                 cur(),
-                object_off_at(h, last),
-                object_off_at(h, src),
+                object_off_at(last),
+                object_off_at(src),
                 stack.join(", "),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
             ));
@@ -13494,7 +13484,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "gex-eject: code at {pc:#x} ({}) was not translated when this project was built: \
                  the recorded session never reached it. Record a session that reaches it and \
                  re-eject, or build with the JIT fallback\n",
-                object_off_at(h, pc)
+                object_off_at(pc)
             );
             warn_line(&stop);
             // And on the guest's stderr: under Node a Worker's console output
@@ -13525,7 +13515,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     cands.push(v);
                 }
             }
-            let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(h, *v))).collect();
+            let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(*v))).collect();
             // In lines of 16: a page's console logger may cut long lines.
             warn_line(&format!("gex-eject: {} return addresses on the stack from esp {sp:#x} (web entry candidates):\n", list.len()));
             for chunk in list.chunks(16) {
@@ -13541,7 +13531,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     break;
                 }
                 let (Ok(next), Ok(ra)) = (gm.read_u32(ebp), gm.read_u32(ebp + 4)) else { break };
-                chain.push(format!("{:#x} ({})", ra, object_off_at(h, ra as u64)));
+                chain.push(format!("{:#x} ({})", ra, object_off_at(ra as u64)));
                 if (next as u64) <= ebp {
                     break;
                 }
@@ -14976,14 +14966,13 @@ pub extern "C" fn gex_set_intrinsic_mask(mask: u32) {
 /// Reported before the mechanism is built, so the mechanism is justified.
 #[no_mangle]
 pub extern "C" fn gex_vma_reloadable(i: u32) -> i32 {
-    with_host(|h| {
-        let mm = h.kernel.mem.lock();
-        let Some(v) = mm.vmas().get(i as usize) else {
-            return 0;
-        };
-        let writable = v.prot & gex_kernel::mem::prot::WRITE != 0;
-        (!writable && v.origin.is_some()) as i32
-    })
+    let Some(mm) = named_mm() else { return 0 };
+    let mm = mm.lock();
+    let Some(v) = mm.vmas().get(i as usize) else {
+        return 0;
+    };
+    let writable = v.prot & gex_kernel::mem::prot::WRITE != 0;
+    (!writable && v.origin.is_some()) as i32
 }
 
 fn note_intrinsics(addr: u64) {
@@ -15214,34 +15203,32 @@ fn note_blocks(
     e.2 = e.2.max(a);
 }
 
+/// This process's memory map, from its published `Home` (no kernel lock):
+/// what the address-naming reports read. `None` before the process is
+/// published.
+fn named_mm() -> Option<&'static gex_kernel::mem::Mm> {
+    sigs::home().map(|h| h.mm())
+}
+
 /// The object file at `a` (by file name) and `a`'s offset into its mapping.
 pub(crate) fn object_file_off(a: u64) -> (String, u64) {
-    with_host(|h| {
-        h.kernel
-            .mem
-            .lock()
-            .vmas()
-            .iter()
-            .find(|v| a >= v.start && a < v.end)
-            .map(|v| (v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default(), a - v.start))
-            .unwrap_or_default()
-    })
+    let Some(mm) = named_mm() else { return Default::default() };
+    mm.lock()
+        .vmas()
+        .iter()
+        .find(|v| a >= v.start && a < v.end)
+        .map(|v| (v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default(), a - v.start))
+        .unwrap_or_default()
 }
 
-/// [`object_off_at`], taking the host itself.
-pub(crate) fn object_off_str(a: u64) -> String {
-    with_host(|h| object_off_at(h, a))
-}
-
-/// The short name of whatever object holds this address, for a counter. Takes
-/// the host it already has, since the caller is inside `with_host` and a second
-/// `RefCell` borrow would panic.
-/// Like `object_name_at` but with the `+offset` into the object, so a return
-/// address on a crash stack can be run through objdump to name the function.
-pub(crate) fn object_off_at(h: &Host, a: u64) -> String {
-    h.kernel
-        .mem
-        .lock()
+/// The short name of whatever object holds this address, with the
+/// `+offset` into the object, so a return address on a crash stack can be
+/// run through objdump to name the function. Reads the published map, so
+/// it may be called with or without the kernel, but not with the map's own
+/// lock held.
+pub(crate) fn object_off_at(a: u64) -> String {
+    let Some(mm) = named_mm() else { return String::new() };
+    mm.lock()
         .vmas()
         .iter()
         .find(|v| a >= v.start && a < v.end)
@@ -15278,11 +15265,9 @@ fn object_name_at(p: &Px<'_>, a: u64) -> String {
 
 /// Which object's executable mapping a guest address falls in, if any.
 fn executable_object_at(a: u64) -> Option<String> {
-    with_host(|h| {
-        let mm = h.kernel.mem.lock();
-        let v = mm.vmas().iter().find(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)?;
-        v.origin.as_ref().map(|(p, _)| p.clone())
-    })
+    let mm = named_mm()?.lock();
+    let v = mm.vmas().iter().find(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)?;
+    v.origin.as_ref().map(|(p, _)| p.clone())
 }
 
 /// The library functions one object offers or calls, and whether any answer

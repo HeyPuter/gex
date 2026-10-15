@@ -107,7 +107,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             Some((dir, _)) => format!("{dir}/{module_name}"),
             None => module_name.clone(),
         };
-        let wasm = crate::with_host(|h| gex_kernel::nt::file::read_guest_file(&h.kernel, &file)).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+        let wasm = gex_kernel::nt::file::read_guest_file(&crate::sigs::proc_home().ns(), &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
         let data = provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?;
@@ -521,7 +521,7 @@ pub extern "C" fn gex_code_changed(addr: u32, len: u32) {
     let (addr, len) = (addr as u64, len as u64);
     let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
     if end > start {
-        crate::with_host(|h| h.kernel.mem.lock().log.retired_code.push((start, end)));
+        crate::sigs::proc_home().mm().lock().log.retired_code.push((start, end));
     }
     gex_kernel::note_code_change();
 }

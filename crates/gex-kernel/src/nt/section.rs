@@ -589,7 +589,7 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
             LoadOrder::Disabled => return Err(Status(st::DLL_NOT_FOUND)),
             LoadOrder::Builtin(builtin) => {
                 let k = c.kernel();
-                match super::file::read_guest_file(&k, &builtin) {
+                match super::file::read_guest_file(&k.vfs, &builtin) {
                     Ok(b) if pe::is_pe(&b) => {
                         if c.p.cfg.trace {
                             crate::nt_log!("[nt:{:x}]   {path} -> builtin {builtin} (WINEDLLOVERRIDES)", c.t.tid);

@@ -125,7 +125,7 @@ fn scan_const(root: u64, funcs: &[u64], wasm: &[u8]) {
         let list: Vec<String> = funcs.iter().take(24).map(|a| format!("{a:x}")).collect();
         crate::warn_line(&format!(
             "[fjitscan] {want:#x} x{hits} in the module of root {root:#x} ({}), {} functions: {}\n",
-            crate::object_off_str(root),
+            crate::object_off_at(root),
             funcs.len(),
             list.join(",")
         ));
@@ -302,16 +302,16 @@ fn loads(elf: &[u8]) -> Vec<(u64, u64, u64)> {
 /// and SDL's X11 connect failed the same way (hb26, hb45). The fallback runs
 /// it instead; the function's real entry still gets translated.
 fn mid_function(addr: u64) -> bool {
-    let Some((path, off, start)) = crate::with_host(|h| {
-        h.kernel.mem.lock().vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)))
-    }) else {
+    let home = crate::sigs::proc_home();
+    let found = home.mm().lock().vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)));
+    let Some((path, off, start)) = found else {
         return false;
     };
     let cached = lock(&FDES).get_or_insert_with(Default::default).get(&path).cloned();
     let obj = match cached {
         Some(o) => o,
         None => {
-            let bytes = crate::with_host(|h| h.kernel.read_file(&path)).unwrap_or_default();
+            let bytes = home.read_file(&path).unwrap_or_default();
             // Not the PLT's: one FDE covers all of `.plt`, whose stubs are
             // each an entry (hp9 left them to the fallback, and died).
             let plt: Vec<(u64, u64)> = gex_xlate::ehframe::sections(&bytes)
@@ -377,15 +377,16 @@ static SEEDED: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 /// 7.1 s with them (one function per module: 49.7 MiB and 14.1 s against
 /// 3.2 MiB and 1.7 s); HK's menu had 20 MiB of libasound wasm (hp13).
 fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
-    let maps: Vec<(u64, String, u64)> = crate::with_host(|h| {
+    let home = crate::sigs::proc_home();
+    let maps: Vec<(u64, String, u64)> = {
         use gex_kernel::mem::prot;
-        h.kernel.mem.lock().vmas().iter().filter(|v| v.prot & prot::EXEC != 0).filter_map(|v| v.code.clone().map(|(p, o)| (v.start, p, o))).collect()
-    });
+        home.mm().lock().vmas().iter().filter(|v| v.prot & prot::EXEC != 0).filter_map(|v| v.code.clone().map(|(p, o)| (v.start, p, o))).collect()
+    };
     for (start, path, off) in maps {
         if lock(&SEEDED).iter().any(|(p, lo, hi)| *p == path && start >= *lo && start < *hi) {
             continue;
         }
-        let bytes = crate::with_host(|h| h.kernel.read_file(&path)).unwrap_or_default();
+        let bytes = home.read_file(&path).unwrap_or_default();
         let lds = loads(&bytes);
         // The vma's file offset gives its vaddr in the file, hence the bias.
         let Some(bias) = lds.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| start.wrapping_sub(v + (off - o))) else {
@@ -429,16 +430,16 @@ fn translate_root(addr: u64) -> Option<u32> {
     }
     let jit = JIT.get()?;
     seed_mapped(jit);
-    let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
+    let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = {
         use gex_kernel::mem::prot;
-        let mm = h.kernel.mem.lock();
+        let mm = crate::sigs::proc_home().mm().lock();
         let v = mm.vmas();
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
-    });
+    };
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
         return None;
     }
@@ -564,7 +565,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     }
     let idx = crate::cgen::index_of(addr);
     if TRACE.load(Ordering::Relaxed) {
-        let names: Vec<String> = crate::with_host(|h| funcs.iter().map(|&a| format!("{a:#x} {}", crate::object_off_at(h, a))).collect());
+        let names: Vec<String> = funcs.iter().map(|&a| format!("{a:#x} {}", crate::object_off_at(a))).collect();
         trace(&format!("module {n}: {addr:#x} {} funcs, install {install}, index {idx:?}: {}", funcs.len(), names.join(", ")));
     }
     idx
@@ -698,7 +699,7 @@ pub(crate) fn watch_check(pc: u64, at: &str) {
     let v = u64::from_le_bytes(b.try_into().unwrap());
     let last = WATCH_LAST.swap(v, Ordering::Relaxed);
     if last != v && WATCH_SAID.fetch_add(1, Ordering::Relaxed) < 64 {
-        let (thread, whose, vwhose) = crate::with_host(|h| (crate::cur(), crate::object_off_at(h, pc), crate::object_off_at(h, v)));
+        let (thread, whose, vwhose) = (crate::cur(), crate::object_off_at(pc), crate::object_off_at(v));
         crate::warn_line(&format!(
             "[watch] {a:#x}: {last:#x} -> {v:#x} ({vwhose}), seen by thread {thread} at {at} pc {pc:#x} ({whose}), {} JIT modules\n",
             lock(&MODULES).len()

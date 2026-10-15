@@ -1253,8 +1253,8 @@ pub fn console_file(k: &crate::Kernel, fd: i32, access: u32) -> Option<Arc<NtFil
 }
 
 /// Read a whole file by guest path (NLS files, images).
-pub fn read_guest_file(k: &crate::Kernel, path: &str) -> Result<Vec<u8>, crate::Errno> {
-    let h = k.vfs.open(path, oflags::O_RDONLY, 0);
+pub fn read_guest_file(ns: &crate::vfs::Namespace, path: &str) -> Result<Vec<u8>, crate::Errno> {
+    let h = ns.open(path, oflags::O_RDONLY, 0);
     if let Some(hook) = FILE_HOOK.get() {
         hook(&FileAccess { path, read: true, write: false, create: false, directory: false, ok: h.is_ok() });
     }
