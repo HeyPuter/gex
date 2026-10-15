@@ -745,6 +745,28 @@ in the scheduler pick after each wake of the global WAKE word: about
      thread and signal programs (`main-thread-exit`, `thread-churn`,
      `thread-signals`, `kernel-contend`) in the shared, memory64 and
      single-thread builds.
+   - The calls on the process's and thread's own signal state, and
+     `getrandom`, without the kernel lock (L15): `rt_sigaction` (the
+     dispositions, `ProcSig`'s `RwLock`), `rt_sigpending`, `sigaltstack`
+     (the thread's `ThreadSig`), `setitimer`, `getitimer` and `alarm` (the
+     process's timers, behind their own lock, with the earliest deadline
+     an atomic) run on the free path (`is_own_state`; the same functions
+     the kernel's arms call). After an arming the page publishes the next
+     deadline itself (`waitq::publish_timer`), as the locked call's end
+     did. `getrandom` reads the namespace's `/dev/urandom` there: in the
+     Undertale census it was the longest single hold left (2 calls, 49 ms).
+     Fixed with it: an i386 `setitimer` now reports the old value and
+     `getitimer` is answered (it was `ENOSYS`), both narrowed from the
+     64-bit itimerval (`Post::Itimerspec32`'s four words); musl's i386
+     `alarm` is `setitimer`, so `alarm` there always answered 0. `kill`,
+     `tgkill` and `rt_sigtimedwait` follow, on top of W's cross-process
+     `tgkill` (801a8221). Legs: `free_own_state_calls_answer_as_the_kernel_does`,
+     the i386 forms in `free_i386_path_calls_answer_as_the_kernel_does`;
+     `sig-state-threads` (x86-64, i386, aarch64; page tier, SP and gexc):
+     threads set and read back their own signals' handlers, keep their
+     own alternate stacks, see a blocked raised signal pending and draw
+     random bytes while an interval timer fires; then `getitimer`, the old
+     value of a disarm, and `alarm`'s seconds left.
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
    - The compositor's pump (L8): no lock. What it asked of the kernel is

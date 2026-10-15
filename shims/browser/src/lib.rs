@@ -11431,6 +11431,11 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             ftx_note(a1, a0, ret as i64, pc as u64, my_tid());
         }
     }
+    if matches!(n, nr::SETITIMER | nr::ALARM) {
+        // A timer armed sooner than the parked threads sleep to: they look
+        // again (as the locked call's end does).
+        waitq::publish_timer();
+    }
     if let FreeOutcome::Done(_) = &outcome {
         let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);

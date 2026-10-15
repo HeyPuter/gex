@@ -85,7 +85,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # kept by its execve; *at calls through a directory descriptor racing
 # renames of files and directories in it and of its own directory, which it
 # follows (L14b, L14c: the path calls without the kernel lock).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads"}
+# sig-state-threads: sigaction, sigaltstack, sigpending and getrandom from
+# several threads while an interval timer fires (L15: the calls on a
+# process's and thread's own signal state without the kernel lock).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

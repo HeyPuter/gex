@@ -1735,6 +1735,136 @@ fn call_sigmask(m: &GuestMem<'_>, n: u64, a: &[u64; 6]) -> Result<Option<u64>, E
 
 /// `rt_sigprocmask` on `signals`, the calling thread's: the whole call,
 /// which needs nothing else of a kernel.
+/// `rt_sigaction`: the process's disposition of `signo`, read and set
+/// through its own lock (`ProcSig`'s), no kernel lock. The i386 struct
+/// sigaction is { u32 handler; u32 flags; u32 restorer; u64 mask }.
+pub fn sigaction(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, signo: u32, act: u64, old: u64) -> SysResult {
+    if signo == 0 || signo > signal::sig::MAX {
+        return Err(Errno::EINVAL);
+    }
+    // Read before the old one is written: they may be the same struct.
+    let new = if act == 0 {
+        None
+    } else if compat {
+        Some(SigAction {
+            handler: m.read_u32(act)? as u64,
+            flags: m.read_u32(act + 4)? as u64,
+            restorer: m.read_u32(act + 8)? as u64,
+            mask: m.read_bits64(act + 12)?,
+        })
+    } else {
+        Some(SigAction { handler: m.read_u64(act)?, flags: m.read_u64(act + 8)?, restorer: m.read_u64(act + 16)?, mask: m.read_bits64(act + 24)? })
+    };
+    if old != 0 {
+        let a = signals.action(signo);
+        if compat {
+            m.write_u32(old, a.handler as u32)?;
+            m.write_u32(old + 4, a.flags as u32)?;
+            m.write_u32(old + 8, a.restorer as u32)?;
+            m.write_bits64(old + 12, a.mask)?;
+        } else {
+            m.write_u64(old, a.handler)?;
+            m.write_u64(old + 8, a.flags)?;
+            m.write_u64(old + 16, a.restorer)?;
+            m.write_bits64(old + 24, a.mask)?;
+        }
+    }
+    if let Some(a) = new {
+        signals.set_action(signo, a)?;
+    }
+    Ok(0)
+}
+
+/// `rt_sigpending`: the signals raised on this thread or its process while
+/// blocked and not yet delivered, as a `sigset_t` (bit `signal-1`).
+pub fn sigpending(signals: &Signals, m: &mut GuestMem<'_>, set: u64) -> SysResult {
+    if set != 0 {
+        m.write_bits64(set, signals.pending_raw())?;
+    }
+    Ok(0)
+}
+
+/// `sigaltstack`: the calling thread's own (`ThreadSig`). The 32-bit
+/// stack_t is { u32 sp; i32 flags; u32 size }.
+pub fn sigaltstack(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, new: u64, old: u64) -> SysResult {
+    let want = if new == 0 {
+        None
+    } else if compat {
+        Some(SigAltStack { sp: m.read_u32(new)? as u64, flags: m.read_u32(new + 4)?, size: m.read_u32(new + 8)? as u64 })
+    } else {
+        Some(SigAltStack { sp: m.read_u64(new)?, flags: m.read_u32(new + 8)?, size: m.read_u64(new + 16)? })
+    };
+    if old != 0 {
+        let a = signals.alt_stack();
+        if compat {
+            m.write_u32(old, a.sp as u32)?;
+            m.write_u32(old + 4, a.flags)?;
+            m.write_u32(old + 8, a.size as u32)?;
+        } else {
+            m.write_u64(old, a.sp)?;
+            m.write_u32(old + 8, a.flags)?;
+            m.write_u64(old + 16, a.size)?;
+        }
+    }
+    if let Some(a) = want {
+        signals.set_alt_stack(a);
+    }
+    Ok(0)
+}
+
+/// `setitimer` and `getitimer` (`set`) at `now` (wall nanoseconds). A
+/// `struct itimerval` is two `timeval`s (reload interval, then time
+/// remaining), each two 64-bit words; the process's timers are behind
+/// their own lock (`ProcSig`), and a host that parks threads publishes the
+/// next deadline after an arming (`waitq::publish_timer` in the page).
+pub fn itimer(signals: &Signals, now: u128, m: &mut GuestMem<'_>, which: u64, new: u64, old: u64, set: bool) -> SysResult {
+    let which = which as usize;
+    if which > ITIMER_PROF {
+        return Err(Errno::EINVAL);
+    }
+    let want = if !set {
+        None
+    } else if new == 0 {
+        return Err(Errno::EFAULT);
+    } else {
+        Some((read_timeval(m, new)?, read_timeval(m, new + 16)?))
+    };
+    // What is left, which both calls may be asked to report.
+    if old != 0 {
+        let (interval, remaining) = match signals.process().timer(which) {
+            Some(t) => (t.interval, t.next.saturating_sub(now)),
+            None => (0, 0),
+        };
+        write_timeval(m, old, interval)?;
+        write_timeval(m, old + 16, remaining)?;
+    }
+    if let Some((interval, value)) = want {
+        // A zero `it_value` disarms, whatever the interval says.
+        signals.process().set_timer(which, (value != 0).then(|| Itimer { next: now + value, interval }));
+    }
+    Ok(0)
+}
+
+/// `alarm(secs)`: `ITIMER_REAL` armed for `secs` (0 disarms), answering the
+/// whole seconds the old one had left, rounded up.
+pub fn alarm(signals: &Signals, now: u128, secs: u64) -> u64 {
+    let left = signals.process().timer(0).map_or(0, |t| t.next.saturating_sub(now));
+    signals.process().set_timer(0, (secs != 0).then(|| Itimer { next: now + secs as u128 * 1_000_000_000, interval: 0 }));
+    // As the timeval it was: whole seconds, plus one for any microseconds.
+    (left / 1_000_000_000) as u64 + u64::from(left % 1_000_000_000 >= 1_000)
+}
+
+/// `getrandom`: bytes from the namespace's `/dev/urandom` (a host may put
+/// real entropy behind it), at most 1 MiB a call.
+pub fn getrandom(ns: &crate::vfs::Namespace, m: &mut GuestMem<'_>, buf: u64, len: u64) -> SysResult {
+    let len = len.min(1 << 20) as usize;
+    let handle = ns.open("/dev/urandom", oflags::O_RDONLY, 0)?;
+    let mut tmp = vec![0u8; len];
+    handle.read_at(0, &mut tmp)?;
+    m.write(buf, &tmp)?;
+    Ok(len as u64)
+}
+
 pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, old: u64) -> SysResult {
         const SIG_BLOCK: u32 = 0;
         const SIG_UNBLOCK: u32 = 1;
@@ -3241,6 +3371,12 @@ fn is_path(n: u64) -> bool {
     )
 }
 
+/// The calls on the process's and the thread's own signal state, behind
+/// their own locks (`ProcSig`, `ThreadSig`), and `getrandom`: canonical.
+pub fn is_own_state(n: u64) -> bool {
+    matches!(n, nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::SIGALTSTACK | nr::SETITIMER | nr::GETITIMER | nr::ALARM | nr::GETRANDOM)
+}
+
 fn is_mapping(n: u64) -> bool {
     matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
 }
@@ -3310,6 +3446,14 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::LCHOWN16 | x::FCHOWNAT => nr::FCHOWNAT,
             x::FCHOWN | x::FCHOWN16 => nr::FCHOWN,
+            x::RT_SIGACTION => nr::RT_SIGACTION,
+            x::RT_SIGPENDING => nr::RT_SIGPENDING,
+            x::SIGALTSTACK => nr::SIGALTSTACK,
+            // Their itimervals widened and narrowed (`i386::translate`).
+            x::SETITIMER => nr::SETITIMER,
+            x::GETITIMER => nr::GETITIMER,
+            x::ALARM => nr::ALARM,
+            x::GETRANDOM => nr::GETRANDOM,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -3371,6 +3515,13 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::FCHOWNAT => nr::FCHOWNAT,
             x::FCHOWN => nr::FCHOWN,
+            x::RT_SIGACTION => nr::RT_SIGACTION,
+            x::RT_SIGPENDING => nr::RT_SIGPENDING,
+            x::SIGALTSTACK => nr::SIGALTSTACK,
+            x::SETITIMER => nr::SETITIMER,
+            x::GETITIMER => nr::GETITIMER,
+            x::ALARM => nr::ALARM,
+            x::GETRANDOM => nr::GETRANDOM,
             _ => return None,
         }
     } else {
@@ -3381,6 +3532,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK | nr::BRK | nr::MMAP | nr::MUNMAP
             | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC => raw,
             n if is_path(n) => raw,
+            // No `alarm` in this ABI.
+            n if is_own_state(n) && n != nr::ALARM => raw,
             _ => return None,
         }
     };
@@ -3405,7 +3558,10 @@ pub struct FreeCall {
 /// `sendmsg`, `recvmsg`, `ioctl`, and the descriptor table's own calls
 /// (`close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `flock`), and
 /// the mapping calls (`mmap`, `munmap`, `mprotect`, `brk`, `mremap`,
-/// `madvise`, `msync`: [`MapIo`]); the 32-bit ABI's `pread64`, `pwrite64`,
+/// `madvise`, `msync`: [`MapIo`]), the calls on the process's and thread's
+/// own signal state (`rt_sigaction`, `rt_sigpending`, `sigaltstack`,
+/// `setitimer`, `getitimer`, `alarm`) and `getrandom` ([`is_own_state`]);
+/// the 32-bit ABI's `pread64`, `pwrite64`,
 /// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
 /// call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
@@ -3431,7 +3587,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -3469,7 +3625,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || (is_path(n) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -3514,6 +3670,20 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
         r
+    } else if is_own_state(n) {
+        let now = || {
+            let (secs, nanos) = (f.futex.clock)();
+            secs as u128 * 1_000_000_000 + nanos as u128
+        };
+        match n {
+            nr::RT_SIGACTION => sigaction(f.signals, m, compat, a[0] as u32, a[1], a[2]),
+            nr::RT_SIGPENDING => sigpending(f.signals, m, a[0]),
+            nr::SIGALTSTACK => sigaltstack(f.signals, m, compat, a[0], a[1]),
+            nr::SETITIMER => itimer(f.signals, now(), m, a[0], a[1], a[2], true),
+            nr::GETITIMER => itimer(f.signals, now(), m, a[0], 0, a[1], false),
+            nr::ALARM => Ok(alarm(f.signals, now(), a[0])),
+            _ => getrandom(f.path.ns, m, a[0], a[1]),
+        }
     } else if is_path(n) {
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
@@ -6043,7 +6213,7 @@ impl Kernel {
             // issuing one raw falls through to ENOSYS below.
             nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
             nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(m, a[0]),
+            nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(a[0]),
             nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
             nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC || self.compat => Ok(0),
 
@@ -6258,10 +6428,8 @@ impl Kernel {
             // One processor, and it is the one the caller is on. dpkg asks
             // to size its worker pool.
             nr::SCHED_GETAFFINITY => self.sys_getaffinity(m, a[1], a[2]),
-            // Interval timers are not delivered: nothing here raises SIGALRM.
-            // Accepting the call is still right -- a program that cannot arm
-            // a timeout does not conclude it has no timeout, it concludes
-            // something is badly wrong, and busybox's wget spins on it.
+            // Interval timers raise their signal when due (`check_timers`,
+            // and a page Worker's own `sigs::gather`).
             nr::SETITIMER => self.sys_itimer(m, a[0], a[1], a[2], true),
             nr::GETITIMER => self.sys_itimer(m, a[0], 0, a[1], false),
             nr::SCHED_YIELD => {
@@ -6366,61 +6534,12 @@ impl Kernel {
 
     // -- signals -------------------------------------------------------------
 
-    fn sys_rt_sigaction(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        signo: u32,
-        act: u64,
-        old: u64,
-    ) -> SysResult {
-        if signo == 0 || signo > signal::sig::MAX {
-            return Err(Errno::EINVAL);
-        }
-        // The i386 struct sigaction is { u32 handler; u32 flags; u32 restorer;
-        // u64 mask }, 20 bytes.
-        if old != 0 {
-            let a = self.signals.action(signo);
-            if self.compat {
-                m.write_u32(old, a.handler as u32)?;
-                m.write_u32(old + 4, a.flags as u32)?;
-                m.write_u32(old + 8, a.restorer as u32)?;
-                m.write_bits64(old + 12, a.mask)?;
-            } else {
-                m.write_u64(old, a.handler)?;
-                m.write_u64(old + 8, a.flags)?;
-                m.write_u64(old + 16, a.restorer)?;
-                m.write_bits64(old + 24, a.mask)?;
-            }
-        }
-        if act != 0 {
-            let a = if self.compat {
-                SigAction {
-                    handler: m.read_u32(act)? as u64,
-                    flags: m.read_u32(act + 4)? as u64,
-                    restorer: m.read_u32(act + 8)? as u64,
-                    mask: m.read_bits64(act + 12)?,
-                }
-            } else {
-                SigAction {
-                    handler: m.read_u64(act)?,
-                    flags: m.read_u64(act + 8)?,
-                    restorer: m.read_u64(act + 16)?,
-                    mask: m.read_bits64(act + 24)?,
-                }
-            };
-            self.signals.set_action(signo, a)?;
-        }
-        Ok(0)
+    fn sys_rt_sigaction(&mut self, m: &mut GuestMem<'_>, signo: u32, act: u64, old: u64) -> SysResult {
+        sigaction(&self.signals, m, self.compat, signo, act, old)
     }
 
-    /// `rt_sigpending`: the signals raised on this process while blocked, which
-    /// have not been delivered. Written as a `sigset_t` -- a bitmask with bit
-    /// `signal-1` set, which is exactly the shape `Signals::pending` holds.
     fn sys_rt_sigpending(&self, m: &mut GuestMem<'_>, set: u64) -> SysResult {
-        if set != 0 {
-            m.write_bits64(set, self.signals.pending_raw())?;
-        }
-        Ok(0)
+        sigpending(&self.signals, m, set)
     }
 
     /// `getcpu`: which CPU/NUMA node the caller runs on. We present a single
@@ -6447,35 +6566,7 @@ impl Kernel {
     }
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
-        // The 32-bit stack_t is { u32 sp; i32 flags; u32 size }.
-        if old != 0 {
-            let a = self.signals.alt_stack();
-            if self.compat {
-                m.write_u32(old, a.sp as u32)?;
-                m.write_u32(old + 4, a.flags)?;
-                m.write_u32(old + 8, a.size as u32)?;
-            } else {
-                m.write_u64(old, a.sp)?;
-                m.write_u32(old + 8, a.flags)?;
-                m.write_u64(old + 16, a.size)?;
-            }
-        }
-        if new != 0 {
-            self.signals.set_alt_stack(if self.compat {
-                SigAltStack {
-                    sp: m.read_u32(new)? as u64,
-                    flags: m.read_u32(new + 4)?,
-                    size: m.read_u32(new + 8)? as u64,
-                }
-            } else {
-                SigAltStack {
-                    sp: m.read_u64(new)?,
-                    flags: m.read_u32(new + 8)?,
-                    size: m.read_u64(new + 16)?,
-                }
-            });
-        }
-        Ok(0)
+        sigaltstack(&self.signals, m, self.compat, new, old)
     }
 
     /// Deliver a pending signal, if any is deliverable right now.
@@ -7695,49 +7786,8 @@ impl Kernel {
     /// (reload interval then time remaining), each two 64-bit words of seconds
     /// and *microseconds*: 32 bytes. These actually fire -- `openssl speed`
     /// runs its loop until SIGALRM and nothing else stops it.
-    fn sys_itimer(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        which: u64,
-        new: u64,
-        old: u64,
-        set: bool,
-    ) -> SysResult {
-        let which = which as usize;
-        if which > ITIMER_PROF {
-            return Err(Errno::EINVAL);
-        }
-        let now = self.now_nanos();
-        // What is left, which both calls may be asked to report.
-        if old != 0 {
-            let (interval, remaining) = match self.signals.process().timer(which) {
-                Some(t) => (t.interval, t.next.saturating_sub(now)),
-                None => (0, 0),
-            };
-            write_timeval(m, old, interval)?;
-            write_timeval(m, old + 16, remaining)?;
-        }
-        if !set {
-            return Ok(0);
-        }
-        if new == 0 {
-            return Err(Errno::EFAULT);
-        }
-        let interval = read_timeval(m, new)?;
-        let value = read_timeval(m, new + 16)?;
-        // A zero `it_value` disarms, whatever the interval says.
-        self.signals.process().set_timer(
-            which,
-            if value == 0 {
-                None
-            } else {
-                Some(Itimer {
-                    next: now + value,
-                    interval,
-                })
-            },
-        );
-        Ok(0)
+    fn sys_itimer(&mut self, m: &mut GuestMem<'_>, which: u64, new: u64, old: u64, set: bool) -> SysResult {
+        itimer(&self.signals, self.now_nanos(), m, which, new, old, set)
     }
 
     /// Whether this read or write, about to be made, can end anyone's wait
@@ -8730,16 +8780,8 @@ impl Kernel {
     /// `alarm(s)`: `setitimer(ITIMER_REAL, {0, s})`, returning the seconds the
     /// previous timer had left. Both itimervals live in the thread's scratch
     /// area, since the call has none of its own.
-    fn sys_alarm(&mut self, m: &mut GuestMem<'_>, secs: u64) -> SysResult {
-        let scratch = self.ctx_addr + ctx::COMPAT_SCRATCH as u64;
-        for off in 0..4 {
-            m.write_u64(scratch + off * 8, 0)?;
-        }
-        m.write_u64(scratch + 16, secs)?;
-        self.sys_itimer(m, 0, scratch, scratch + 32, true)?;
-        let left = m.read_u64(scratch + 32 + 16)?;
-        let left_us = m.read_u64(scratch + 32 + 24)?;
-        Ok(left + u64::from(left_us > 0))
+    fn sys_alarm(&mut self, secs: u64) -> SysResult {
+        Ok(alarm(&self.signals, self.now_nanos(), secs))
     }
 
     /// x86-64 `arch_prctl`: the FS and GS segment bases, which is how that
@@ -8906,12 +8948,7 @@ impl Kernel {
     }
 
     fn sys_getrandom(&mut self, m: &mut GuestMem<'_>, buf: u64, len: u64) -> SysResult {
-        let len = len.min(1 << 20) as usize;
-        let handle = self.vfs.open("/dev/urandom", oflags::O_RDONLY, 0)?;
-        let mut tmp = vec![0u8; len];
-        handle.read_at(0, &mut tmp)?;
-        m.write(buf, &tmp)?;
-        Ok(len as u64)
+        getrandom(&self.vfs, m, buf, len)
     }
 
     /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
@@ -9764,6 +9801,103 @@ mod tests {
     /// `free_call`, the lock-free class, answers as the full call does:
     /// the same results and bytes, the same park on an empty pipe, the same
     /// mask, the same `SIGPIPE`; and it declines every other call by number.
+    /// The calls on a process's and thread's own signal state, and
+    /// `getrandom`, made lock-free (L15): what one path sets the other
+    /// reads back.
+    #[test]
+    fn free_own_state_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        const SIGUSR1: u64 = 10;
+
+        // A handler set lock-free is the kernel's, and back.
+        m.write_u64(0x20000, 0x1234).unwrap();
+        m.write_u64(0x20008, 0x4000_0000).unwrap(); // SA_RESTART
+        m.write_u64(0x20010, 0).unwrap();
+        m.write_bits64(0x20018, 1 << 3).unwrap();
+        set_args(&mut m, at, nr::RT_SIGACTION, &[SIGUSR1, 0x20000, 0, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 0);
+        set_args(&mut m, at, nr::RT_SIGACTION, &[SIGUSR1, 0, 0x20100, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(m.read_u64(0x20100).unwrap(), 0x1234);
+        assert_eq!(m.read_bits64(0x20118).unwrap(), 1 << 3);
+        // SIGKILL's cannot be set, either way; the old one is read first
+        // when both are the same struct.
+        set_args(&mut m, at, nr::RT_SIGACTION, &[9, 0x20000, 0, 8]);
+        free(&k, &mut m, at);
+        assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
+        m.write_u64(0x20100, 0x5678).unwrap();
+        set_args(&mut m, at, nr::RT_SIGACTION, &[SIGUSR1, 0x20100, 0x20100, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(m.read_u64(0x20100).unwrap(), 0x1234);
+        assert_eq!(k.signals.action(SIGUSR1 as u32).handler, 0x5678);
+
+        // The thread's alternate stack.
+        m.write_u64(0x21000, 0x7000_0000).unwrap();
+        m.write_u32(0x21008, 0).unwrap();
+        m.write_u64(0x21010, 0x8000).unwrap();
+        set_args(&mut m, at, nr::SIGALTSTACK, &[0x21000, 0]);
+        assert!(done(free(&k, &mut m, at)));
+        set_args(&mut m, at, nr::SIGALTSTACK, &[0, 0x21100]);
+        k.syscall(&mut m, 0);
+        assert_eq!(m.read_u64(0x21100).unwrap(), 0x7000_0000);
+        assert_eq!(m.read_u64(0x21110).unwrap(), 0x8000);
+
+        // A blocked signal raised is pending, read lock-free.
+        k.signals.set_blocked(1 << (SIGUSR1 - 1));
+        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.uid });
+        set_args(&mut m, at, nr::RT_SIGPENDING, &[0x22000, 8]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(m.read_bits64(0x22000).unwrap() & (1 << (SIGUSR1 - 1)), 1 << (SIGUSR1 - 1));
+
+        // An interval timer armed lock-free is the kernel's to report, and
+        // a kernel-armed one the free path's.
+        for (i, v) in [0u64, 0, 100, 0].into_iter().enumerate() {
+            m.write_u64(0x23000 + i as u64 * 8, v).unwrap();
+        }
+        set_args(&mut m, at, nr::SETITIMER, &[0, 0x23000, 0]);
+        assert!(done(free(&k, &mut m, at)));
+        set_args(&mut m, at, nr::GETITIMER, &[0, 0x23100]);
+        k.syscall(&mut m, 0);
+        let left = m.read_u64(0x23110).unwrap();
+        assert!((98..=100).contains(&left), "{left} s left");
+        assert!(k.timers_armed());
+        for (i, v) in [0u64, 0, 0, 0].into_iter().enumerate() {
+            m.write_u64(0x23000 + i as u64 * 8, v).unwrap();
+        }
+        set_args(&mut m, at, nr::SETITIMER, &[0, 0x23000, 0x23200]);
+        k.syscall(&mut m, 0);
+        assert!(!k.timers_armed());
+        if gex_abi::X86 {
+            // alarm: the seconds the old one had left, rounded up.
+            set_args(&mut m, at, nr::ALARM, &[30]);
+            assert!(done(free(&k, &mut m, at)));
+            assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::ALARM, &[0]);
+            assert!(done(free(&k, &mut m, at)));
+            assert_eq!(ret(&m, at), 30);
+            assert!(!k.timers_armed());
+        }
+
+        // getrandom: the bytes /dev/urandom gives.
+        set_args(&mut m, at, nr::GETRANDOM, &[0x24000, 64, 0]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), 64);
+        assert!(m.read(0x24000, 64).unwrap().iter().any(|&b| b != 0));
+    }
+
     #[test]
     fn free_call_answers_as_the_kernel_does() {
         if gex_abi::PPC {
@@ -11120,13 +11254,35 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::UNLINK, [0x20700, 0, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::RMDIR, [0x20600, 0, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::OPENAT, [cwd32, 0x20200, 0, 0, 0, 0]));
+            // The own-state calls (L15) in their 32-bit layouts: a handler
+            // set and read back, an interval timer armed and its old value
+            // narrowed back (musl's `alarm`), `getitimer`, `alarm`.
+            for (o, v) in [(0u64, 0x1234u32), (4, 0), (8, 0)] {
+                m.write_u32(0x26000 + o, v).unwrap();
+            }
+            m.write_bits64(0x2600c, 1 << 3).unwrap();
+            got.push(sys(&mut m, &mut k, raw::RT_SIGACTION, [10, 0x26000, 0, 8, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::RT_SIGACTION, [10, 0, 0x26100, 8, 0, 0]));
+            got.push(m.read_u32(0x26100).unwrap() as i64);
+            for (o, v) in [(0u64, 0u32), (4, 0), (8, 50), (12, 0)] {
+                m.write_u32(0x26200 + o, v).unwrap();
+            }
+            got.push(sys(&mut m, &mut k, raw::SETITIMER, [0, 0x26200, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::GETITIMER, [0, 0x26300, 0, 0, 0, 0]));
+            got.push((48..=50).contains(&m.read_u32(0x26308).unwrap()) as i64);
+            m.write(0x26400, &[0u8; 16]).unwrap();
+            got.push(sys(&mut m, &mut k, raw::SETITIMER, [0, 0x26400, 0x26500, 0, 0, 0]));
+            got.push((48..=50).contains(&m.read_u32(0x26508).unwrap()) as i64);
+            got.push(sys(&mut m, &mut k, raw::ALARM, [7, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::ALARM, [0, 0, 0, 0, 0, 0]));
             seen.push(got);
         }
         assert_eq!(seen[0], seen[1]);
         let g = &seen[0];
         assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 3, "{:?}", &g[..3]);
         let n = g.len();
-        assert_eq!(&g[n - 17..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
+        assert_eq!(&g[n - 27..n - 10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
+        assert_eq!(&g[n - 10..], &[0, 0, 0x1234, 0, 0, 1, 0, 1, 0, 7]);
     }
 
     /// The mapping calls through the lock-free path ([`MapIo`]) answer as

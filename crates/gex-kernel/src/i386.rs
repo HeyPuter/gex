@@ -282,7 +282,9 @@ pub enum Post {
     /// at `scratch`; each half saturates to the 32-bit `RLIM_INFINITY`.
     Rlimit32 { user: u64, scratch: u64 },
     /// A `struct itimerspec` with 32-bit fields (`timerfd_settime`'s old
-    /// value, `timerfd_gettime`): two timespecs at `scratch`, narrowed.
+    /// value, `timerfd_gettime`): two timespecs at `scratch`, narrowed. An
+    /// itimerval (`setitimer`'s old value, `getitimer`) has the same four
+    /// words, its second and fourth microseconds.
     Itimerspec32 { user: u64, scratch: u64 },
 }
 
@@ -901,9 +903,11 @@ pub fn translate(
         x::SIGALTSTACK => nr::SIGALTSTACK,
         x::SETITIMER => {
             // setitimer(which, &new32, &old32): the itimerval's two timevals
-            // are widened into scratch; the old value is not reported back.
-            // Microseconds stay microseconds (`sys_itimer` reads timevals):
-            // scaled to nanoseconds, a 100 ms timer fired after 100 s.
+            // are widened into scratch, and the old one, written in the
+            // scratch's second half, narrowed back (musl's i386 `alarm` is
+            // this call, and answers from the old value). Microseconds stay
+            // microseconds (`itimer` reads timevals): scaled to nanoseconds,
+            // a 100 ms timer fired after 100 s.
             let p = a[1];
             let new = if p == 0 {
                 0
@@ -912,7 +916,13 @@ pub fn translate(
                 widen_time(m, p + 8, scratch + 16, 1);
                 scratch
             };
-            *a = [a[0], new, 0, 0, 0, 0];
+            let old = if a[2] == 0 {
+                0
+            } else {
+                post = Post::Itimerspec32 { user: a[2], scratch: scratch + 32 };
+                scratch + 32
+            };
+            *a = [a[0], new, old, 0, 0, 0];
             nr::SETITIMER
         }
         x::GETRLIMIT | x::UGETRLIMIT => {
@@ -926,9 +936,11 @@ pub fn translate(
         x::GETRUSAGE => nr::GETRUSAGE,
         x::TIMES => nr::TIMES,
         x::GETITIMER => {
-            // Its 32-bit result layout is not written yet. ENOSYS is loud
-            // where a silently wrong struct would not be.
-            UNKNOWN
+            // getitimer(which, &cur32): the 64-bit itimerval in scratch,
+            // narrowed (the same four words as an itimerspec's).
+            post = Post::Itimerspec32 { user: a[1], scratch };
+            *a = [a[0], scratch, 0, 0, 0, 0];
+            nr::GETITIMER
         }
         x::PRLIMIT64 => {
             a[0] = sext(a[0]);
