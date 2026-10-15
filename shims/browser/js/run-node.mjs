@@ -344,6 +344,8 @@ const host = new ProcessHost({
     // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
     wasmDlls: process.env.GEX_WASM_DLLS || undefined,
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
+    // GEX_STRAY_TRAP=1: as the page's ?straytrap=1 (cgen.rs STRAY_TRAP).
+    strayTrap: !!process.env.GEX_STRAY_TRAP,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).

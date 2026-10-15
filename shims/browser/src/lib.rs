@@ -12174,6 +12174,13 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // As in `gex_illegal`: the browser traps out of a resumable fault too.
     let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
+    // Native Wine's return pad (its int3 filler), translated by an earlier
+    // stray return, reached past the call-outs waiting: as the miss path.
+    if cgen::native_return_stray(pc as u64, my_ctx()) {
+        set_resume(pc as u64);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     if raw == gex_abi::imports::BRK_TRACE {
         let line = with_host(|h| {
             let gm = GuestMem::new(guest_bytes());
@@ -13055,6 +13062,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if !no_leave && cgen::may_leave() {
             return gex_emit::module::DISPATCH_MISS_LEAVE;
         }
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
+    // Native Wine's return pad, reached past the call-outs waiting: they
+    // leave (`cgen::native_return_stray`), and it is not translated.
+    if cgen::native_return_stray(pc, my_ctx()) {
+        miss_way(pc, 3);
         set_resume(pc);
         set_resume_ctx(my_ctx());
         trap();

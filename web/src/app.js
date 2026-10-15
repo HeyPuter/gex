@@ -629,6 +629,8 @@ export function setGlobals(get, b = {}) {
   if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
+  // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
+  if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a W3 program's start-up;
