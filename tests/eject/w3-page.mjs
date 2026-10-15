@@ -28,7 +28,9 @@
 //      one inside shrinks it (Win32's own SC_MOVE/SC_SIZE loops, the pointer
 //      held by the canvas), and a click on Paint leaves its owned dialog
 //      (Ctrl+W, Resize and Skew) above it: the page neither cascades nor
-//      raises a placed window.
+//      raises a placed window. A right click on the caption opens Wine's
+//      window menu (the guest has the right button) and the browser's
+//      context menu is cancelled.
 //   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
 //      the site's page instead, a hand-written one with its own container,
 //      size, arguments and onExit. The desktop is its box's size, inside the
@@ -388,6 +390,24 @@ if (placedChecks) {
       await key('Enter', 'Enter', 13);
       await until(wins, (l) => l.length === 1);
     }
+    // The right button is the guest's: a right click on the caption opens
+    // Wine's window menu (WM_CONTEXTMENU on the caption, so the client saw
+    // BTN_RIGHT go down and up), and the browser's own context menu is
+    // cancelled (it opens on the press on Linux and took the release).
+    await ev(`(() => { globalThis.__ctxMenus = []; addEventListener('contextmenu', (e) => globalThis.__ctxMenus.push(e.defaultPrevented)); return 1; })()`);
+    m = await main();
+    const rx = m.x + Math.round(m.w / 2), ry = m.y + 10;
+    const right = (type, held) => browser.send('Input.dispatchMouseEvent',
+      { type, x: rx, y: ry, button: 'right', buttons: held ? 2 : 0, clickCount: 1 }, page);
+    await mouse('mouseMoved', rx, ry, false); await sleep(150);
+    await right('mousePressed', true); await sleep(100);
+    await right('mouseReleased', false);
+    ws = await until(wins, (l) => l.length >= 2);
+    const menus = (await ev('JSON.stringify(globalThis.__ctxMenus)')) ?? '[]';
+    check(JSON.parse(menus).length >= 1 && JSON.parse(menus).every(Boolean), `the browser's context menu is cancelled over the desktop (contextmenu events, defaultPrevented: ${menus})`);
+    check(ws.length >= 2, `a right click on the caption opens the window menu: the guest has the right button (${ws.length} placed window(s))`);
+    await key('Escape', 'Escape', 27);
+    await until(wins, (l) => l.length === 1);
   }
 }
 done();
