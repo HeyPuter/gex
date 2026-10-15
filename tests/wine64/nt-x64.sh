@@ -2,7 +2,9 @@
 # W64.1 (docs/wine-native-x64.md §5): tests/nt's x64 programs on 64-bit
 # native Wine, its Unix side wasm64 lowered to wasm32 (link-w64.sh), its
 # x86_64 PE DLLs translated, the W3 wineserver serving a win64 prefix, no
-# doors (WINEGEX_DOOR=0). Each case checks stdout and the exit code, as
+# doors (WINEGEX_DOOR=0; DOOR=1 runs with them, W64.3's LP64 door call,
+# which needs a loader with `gex.door_call_lp64`). Each case checks stdout
+# and the exit code, as
 # tests/nt/run.sh does, and highdata.c (built with x86_64-w64-mingw32-gcc).
 #
 #   tests/wine64/nt-x64.sh DIST PREFIX [gexc]
@@ -29,18 +31,44 @@
 # NATIVE=DIR runs them with every file in DIR in place of (or beside) DIST's
 # PE DLLs: W64.2's skeletons over one module, winepe.wasm (w64-dist.sh's
 # W64_NATIVE, pelink.py).
+# PAGE=mp|sp (W64.5) runs the cases in the browser runtime instead
+# (shims/browser/js/run-node.mjs, the shim and glue a page loads, under
+# Node): mp the default build (SharedArrayBuffer), sp the single-thread one
+# (GEX_SINGLE=1, no SharedArrayBuffer, JSPI). It needs the x86 shared shim
+# and seed in web/public/gex (GEX_ARCH=x86 shims/browser/build.sh), and
+# runs on a page prefix template made from PREFIX (page-prefix.sh). Not
+# with NATIVE or NTDLL, whose DIST is links (a page mount does not follow
+# a link out of it), nor with WL or GL.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 dist=$(realpath "${1:?DIST}"); prefix=$(realpath "${2:?PREFIX}")
 gexc=$(realpath -m "${3:-$root/target/x86/release/gexc}")
-[ -x "$gexc" ] || { echo "no gexc at $gexc" >&2; exit 2; }
+[ -n "${PAGE:-}" ] || [ -x "$gexc" ] || { echo "no gexc at $gexc" >&2; exit 2; }
 wine=$dist/lib/wine/x86_64-unix/wine
 [ -f "$wine" ] && [ -f "$dist/lib/wine/x86_64-unix/wineserver" ] || { echo "no W64 loader and server in $dist" >&2; exit 2; }
 bin=$root/tests/nt/bin/x64
+door=0; [ "${DOOR:-0}" = 1 ] && door=1
+single=; [ "${PAGE:-}" = sp ] && single=1
 w=${WORK:-$(mktemp -d)}
 mkdir -p "$w"
 tag=W64
+page=${PAGE:-}
+if [ -n "$page" ]; then
+	case $page in mp|sp) ;; *) echo "PAGE is mp or sp" >&2; exit 2 ;; esac
+	[ -z "${NTDLL:-}${NATIVE:-}${GL:-}" ] || { echo "PAGE runs without NATIVE, NTDLL and GL" >&2; exit 2; }
+	seed=$root/web/public/gex/seed.x86.shared.wasm
+	[ -f "$seed" ] && [ -f "$root/web/public/gex/gex_browser.x86.shared.wasm" ] ||
+		{ echo "no x86 shared shim and seed in web/public/gex; GEX_ARCH=x86 shims/browser/build.sh" >&2; exit 2; }
+	# the single-thread build needs JSPI (on by default from node 25)
+	jspi=; node -e 'process.exit(typeof WebAssembly.Suspending === "function" ? 0 : 1)' 2>/dev/null || jspi=--experimental-wasm-jspi
+	"$root/tools/wine-wasm/page-prefix.sh" "$prefix" "$dist" "$w/page-pfx" > "$w/page-pfx.log" 2>&1 ||
+		{ echo "FAIL page prefix template"; tail -5 "$w/page-pfx.log"; exit 1; }
+	prefix=$w/page-pfx
+	tag="W64 page $page"
+	# the door off in the single-thread build (it has none: the pipes)
+	[ "$page" = sp ] && door=0
+fi
 if [ -n "${NTDLL:-}${NATIVE:-}" ]; then
 	# DIST with those DLLs: the Unix side copied (the loader finds the PE
 	# DLLs beside itself), links to the other DLLs
@@ -69,6 +97,8 @@ pass=0 fail=0
 check() {
 	local name=$1 want_code=$2 want_out=$3 exe=$4; shift 4
 	case " ${CASES:-$name} " in *" $name "*) ;; *) return ;; esac
+	# (the display and GL cases are native only for now)
+	[ -n "$page" ] && [ -n "${WL:-}${GL:-}" ] && return
 	local p=$w/pfx-$name out code src=$bin/$exe
 	case $exe in /*) src=$exe; exe=$(basename "$exe") ;; esac
 	rm -rf "$p"; cp -a "$prefix" "$p"; cp "$src" ${EXTRA:-} "$p/drive_c/"
@@ -87,9 +117,19 @@ check() {
 		wl=(--wayland "$w/wl-$name" --wayland-size "${WL_SIZE:-640x480}" --wayland-out "$w/$name")
 	fi
 	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
+	if [ -n "$page" ]; then
+		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
+			node $jspi --max-old-space-size=8192 \
+			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
+			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
+			--env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
+			--cwd /pfx/drive_c --argv0 /w64/lib/wine/x86_64-unix/wine \
+			"$seed" "$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
+	else
 	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${gl[@]}" "${wl[@]}" \
-		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
+		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
 		"$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
+	fi
 	code=${out##*exit=}
 	out=${out%$'\n'exit=*}; out=${out%exit=*}; out=${out//$'\r'/}
 	local fr=""

@@ -453,9 +453,19 @@ pub(crate) fn session_seq(off: u32) -> i64 {
     gex_atomic::load_u64(s.mem.bytes(), (base + off) as u64).unwrap_or(0) as i64
 }
 
+/// Where a client's `struct __server_request_info` keeps its gather list,
+/// past the 64-byte request/reply union: (data_count, reply_data, data[0],
+/// one data[] entry's size). ILP32 (W3) and LP64 (W64's lowered wasm32
+/// client, `gex.door_call_lp64`: pointers 8 bytes, below 4 GiB).
+pub(crate) const fn req_layout(lp64: bool) -> (u32, u32, u32, u32) {
+    if lp64 { (64, 72, 80, 16) } else { (64, 68, 72, 8) }
+}
+
 /// `gex.door_call(req, unix_pid, unix_tid)`: 0 done (reply in `req`), 1 use
-/// the pipes, 2 the thread died in the request.
-pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: i32) -> Result<i32> {
+/// the pipes, 2 the thread died in the request. `lp64`: the request is a
+/// 64-bit client's (`gex.door_call_lp64`, [`req_layout`]).
+pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: i32, lp64: bool) -> Result<i32> {
+    let (count_at, reply_at, data_at, entry) = req_layout(lp64);
     let Some(s) = SERVER.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return Ok(1) };
     if s.get(area::POISONED) != 0 {
         return Ok(1);
@@ -464,8 +474,8 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
     let rd = |at: u32| u32::from_le_bytes(cm.bytes()[at as usize..][..4].try_into().unwrap());
     let req_size = rd(req + 4);
     let reply_max = rd(req + 8);
-    let data_count = rd(req + 64).min(16);
-    let reply_data = rd(req + 68);
+    let data_count = rd(req + count_at).min(16);
+    let reply_data = rd(req + reply_at);
     let reply_off = (64 + req_size + 7) & !7;
     let buf = s.get(area::BUF);
     let buf_size = s.get(area::BUF_SIZE);
@@ -494,8 +504,9 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, req: u32, pid: i32, tid: 
         sb[b0..b0 + 64].copy_from_slice(&cm.bytes()[req as usize..req as usize + 64]);
         let mut at = b0 + 64;
         for k in 0..data_count {
-            let ptr = rd(req + 72 + 8 * k) as usize;
-            let size = rd(req + 76 + 8 * k) as usize;
+            // the pointer's low word (a lowered client's are below 4 GiB), then the size
+            let ptr = rd(req + data_at + entry * k) as usize;
+            let size = rd(req + data_at + entry * k + entry / 2) as usize;
             sb[at..at + size].copy_from_slice(&cm.bytes()[ptr..ptr + size]);
             at += size;
         }
