@@ -196,6 +196,29 @@ fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
+/// Data a 64-bit skeleton's export table points at (W64, Wine's PE module:
+/// wasmdll::install_shared): above every image, so the RVA from any
+/// skeleton's base is positive. W64's images stay in its code space, below
+/// 2 GiB (Wine's w64_code_space_limit); its data may use the whole 4 GiB.
+/// Top-down from 4 GiB, the first free range.
+pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    use gex_kernel::mem::{flags, prot};
+    const FLOOR: u64 = 0x8000_0000;
+    const STEP: u64 = 0x10_0000;
+    let len = (size + 0xffff) & !0xffff;
+    let mut at = (0x1_0000_0000u64.saturating_sub(len + STEP)) & !0xffff;
+    while at >= FLOOR {
+        let r = state.with_kernel(|k| {
+            k.mem.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, name)
+        });
+        if let Ok(a) = r {
+            return Ok(a);
+        }
+        at -= STEP;
+    }
+    bail!("mapping {name}: no {len:#x} bytes free above {FLOOR:#x}")
+}
+
 /// A provider's code region: its thread entry at 0, the return addresses
 /// its guest calls push in [0x100, 0x1000), reverse slots from
 /// `REVERSE_FIRST`, one per `REVERSE_STRIDE` bytes.

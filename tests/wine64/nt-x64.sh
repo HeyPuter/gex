@@ -19,6 +19,9 @@
 # (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
+# NATIVE=DIR runs them with every file in DIR in place of (or beside) DIST's
+# PE DLLs: W64.2's skeletons over one module, winepe.wasm (w64-dist.sh's
+# W64_NATIVE, pelink.py).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -31,16 +34,26 @@ bin=$root/tests/nt/bin/x64
 w=${WORK:-$(mktemp -d)}
 mkdir -p "$w"
 tag=W64
-if [ -n "${NTDLL:-}" ]; then
-	# DIST with that ntdll: the Unix side copied (the loader finds the PE
+if [ -n "${NTDLL:-}${NATIVE:-}" ]; then
+	# DIST with those DLLs: the Unix side copied (the loader finds the PE
 	# DLLs beside itself), links to the other DLLs
-	[ -f "$NTDLL" ] || { echo "no ntdll at $NTDLL" >&2; exit 2; }
+	[ -z "${NTDLL:-}" ] || [ -f "$NTDLL" ] || { echo "no ntdll at $NTDLL" >&2; exit 2; }
+	[ -z "${NATIVE:-}" ] || [ -f "$NATIVE/winepe.wasm" ] || { echo "no winepe.wasm in $NATIVE" >&2; exit 2; }
 	o=$w/dist; rm -rf "$o"; mkdir -p "$o/lib/wine/x86_64-windows"
 	cp -a "$dist/lib/wine/x86_64-unix" "$o/lib/wine/"
 	ln -s "$dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
 	for f in "$dist"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
-	rm "$o/lib/wine/x86_64-windows/ntdll.dll"; cp "$NTDLL" "$o/lib/wine/x86_64-windows/ntdll.dll"
-	dist=$o; wine=$dist/lib/wine/x86_64-unix/wine; tag="W64 native ntdll"
+	if [ -n "${NTDLL:-}" ]; then
+		rm "$o/lib/wine/x86_64-windows/ntdll.dll"; cp "$NTDLL" "$o/lib/wine/x86_64-windows/ntdll.dll"
+		tag="W64 native ntdll"
+	fi
+	if [ -n "${NATIVE:-}" ]; then
+		for f in "$NATIVE"/*; do
+			rm -f "$o/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$o/lib/wine/x86_64-windows/"
+		done
+		tag="W64 native $(cd "$NATIVE" && ls -- *.dll *.exe 2>/dev/null | sed 's/\.[^.]*$//' | tr '\n' ' ' | sed 's/ $//')"
+	fi
+	dist=$o; wine=$dist/lib/wine/x86_64-unix/wine
 fi
 nl=$'\n'
 allok="(ok [^$nl]*$nl)+0 failures"
@@ -76,6 +89,10 @@ check cxx 0 "$allok" cxx.exe
 check exitproc 33 "worker exiting${nl}atexit ran" exitproc.exe
 check seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" seh.exe
 check seh-traps 0 "$allok" seh.exe traps
+# W64.2: MSVC's x64 C++ exceptions, SEH and setjmp/longjmp through msvcrt
+# (tests/nt/msvc/build-x64.sh)
+check msvc_cxxeh 0 "$allok" msvc_cxxeh.exe
+check fiber 0 "$allok" fiber.exe
 # W64.1b: data above 2 GiB, code below it (highdata.c)
 if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	check highdata 0 "$allok" "$w/highdata.exe"

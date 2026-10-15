@@ -98,6 +98,9 @@ pub(crate) struct WinePe {
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     /// The entry thunks are bound (`bind_entry_thunks`, once).
     entries_bound: std::sync::atomic::AtomicBool,
+    /// An LLP64 module (W64, its skeletons PE32+): pointers in its data are
+    /// 8 bytes, the entry pairs 16.
+    ptr64: bool,
     /// The DLLs whose skeleton has been mapped: a later mapping of one (an
     /// image view, LoadLibraryEx as an image resource) binds its exports
     /// but writes none of the variables, which belong to the loaded DLL.
@@ -134,17 +137,21 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
 fn bind_entry_thunks(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) -> Result<()> {
     let Some(&off) = wp.data_exports.get("__gexw_entries") else { return Ok(()) };
     let at = wp.data + off as u64;
-    let (start, stop) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + 4)? as u64);
+    // A pointer of the module's (an LLP64 module's are 8 bytes, its values
+    // below 4 GiB: the lowering's addresses and table indices).
+    let w = if wp.ptr64 { 8 } else { 4 };
+    let ptr = |a: u64| memory_u32(memory, a);
+    let (start, stop) = (ptr(at)? as u64, ptr(at + w)? as u64);
     if start == 0 || stop <= start {
         return Ok(());
     }
     let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(wp.install).base;
     let read = |start: u64, stop: u64| -> Result<Vec<(u64, u32)>> {
-        let mut out = Vec::with_capacity(((stop.saturating_sub(start)) / 8) as usize);
+        let mut out = Vec::with_capacity(((stop.saturating_sub(start)) / (2 * w)) as usize);
         let mut a = start;
-        while a + 8 <= stop {
-            let (f, t) = (memory_u32(memory, a)?, memory_u32(memory, a + 4)?);
-            a += 8;
+        while a + 2 * w <= stop {
+            let (f, t) = (ptr(a)?, ptr(a + w)?);
+            a += 2 * w;
             if f < base || t < base || f as u64 >= 0x3f0000 {
                 continue;
             }
@@ -157,7 +164,7 @@ fn bind_entry_thunks(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_m
     // functions no defining object gave one (it knows the convention).
     if let Some(&off) = wp.data_exports.get("__gexw_entries_decl") {
         let at = wp.data + off as u64;
-        let (s2, e2) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + 4)? as u64);
+        let (s2, e2) = (ptr(at)? as u64, ptr(at + w)? as u64);
         if s2 != 0 && e2 > s2 {
             let strong: std::collections::HashSet<u64> = pairs.iter().map(|&(f, _)| f).collect();
             let mut seen = std::collections::HashSet::new();
@@ -207,8 +214,8 @@ fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
     out
 }
 
-/// Exported i32 globals with constant initialisers: a PIC module's data
-/// symbols, as offsets from `__memory_base`.
+/// Exported i32 (or a wasm64 module's i64) globals with constant
+/// initialisers: a PIC module's data symbols, as offsets from `__memory_base`.
 /// Wine's PE module, read, parsed and loaded: what every process that
 /// installs it shares (all but its data's address). Kept for the host
 /// process by path, size and modification time, so a Wine child does not
@@ -300,6 +307,8 @@ fn exported_offsets(wasm: &[u8]) -> Result<std::collections::HashMap<String, u32
                     let mut ops = g.init_expr.get_operators_reader();
                     inits.push(match ops.read()? {
                         wasmparser::Operator::I32Const { value } => Some(value as u32),
+                        // a wasm64 module's, lowered: offsets below 4 GiB
+                        wasmparser::Operator::I64Const { value } => u32::try_from(value).ok(),
                         _ => None,
                     });
                 }
@@ -365,11 +374,28 @@ fn install_shared(
             let pm = parsed_module(&file, engine, t0)?;
             let (size, align) = (pm.size, pm.align);
             let a = 1u64 << align;
-            let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?;
+            // (an LLP64 module's above the images: a PE32+ export's RVA is
+            // added to its base in 64 bits, so data below an image's base
+            // would be past 4 GiB)
+            let data = if pe.is64 {
+                crate::libprov::alloc_above_code(state, (size as u64).max(16) + a, "[wine PE data]")?
+            } else {
+                crate::libprov::alloc_top(state, (size as u64).max(16) + a, "[wine PE data]")?
+            };
             let data = (data + a - 1) & !(a - 1);
             let (slots, any_dll, module, n_names) = (pm.slots.clone(), pm.any_dll.clone(), pm.module.clone(), pm.n_names);
             let data_exports_map = pm.data_exports.clone();
-            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: data_exports_map, pending: Mutex::new(Vec::new()), entries_bound: Default::default(), mapped: Default::default() };
+            let wp = WinePe {
+                install: 0,
+                data,
+                slots,
+                any_dll,
+                data_exports: data_exports_map,
+                pending: Mutex::new(Vec::new()),
+                entries_bound: Default::default(),
+                ptr64: pe.is64,
+                mapped: Default::default(),
+            };
             (Arc::new(wp), Some((module, n_names)))
         }
     };
@@ -421,9 +447,12 @@ fn install_shared(
     // winecrt0's base of this DLL (its unix calls, delay loads and version
     // resources find the DLL by it): the skeleton's.
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
-        wp.pending.lock().unwrap_or_else(|e| e.into_inner()).push((wp.data + *off as u64, (base as u32).to_le_bytes().to_vec()));
+        let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
+        wp.pending.lock().unwrap_or_else(|e| e.into_inner()).push((wp.data + *off as u64, bytes));
     }
-    if first_mapping && dll == "ntdll.dll" {
+    // (W64's ntdll has Wine's own Unix side, whose load_ntdll_functions
+    // sets them: gex-kernel's are i386 trampolines)
+    if first_mapping && dll == "ntdll.dll" && !wp.ptr64 {
         let mut pending = wp.pending.lock().unwrap_or_else(|e| e.into_inner());
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {

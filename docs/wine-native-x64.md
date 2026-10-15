@@ -297,6 +297,56 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
     to a native target below 0x3f0000) records the jump in the TEB, leaves
     the innermost entry with the guest at the pad of the call-out below the
     target frame, and that call-out's native frame makes the jump.
+- **As built (W64.2, the native PE core: ntdll, kernelbase, kernel32,
+  msvcrt, ucrtbase in one module).**
+  - *pelink for wasm64.* `pelink.py` takes a wasm64 build tree (its
+    Makefile's `HOST_ARCH = wasm64`, or `--wasm64`): `wasm-ld -mwasm64`,
+    its generated C (forward thunks, guest-import stubs, module imports,
+    gap stubs) through `wcc64 -D_WIN32`, compiler-rt from
+    GEX_WASM64_SYSROOT, and the module lowered to wasm32 and optimised as
+    wcc64 does a DLL's own side module. `pesym.py` needed nothing.
+    `stage-native64.sh BUILD SRC OUT DLL...` links the module and writes a
+    PE32+ skeleton per DLL naming it (`winebuild --wasm-shared`);
+    w64-dist.sh's `pen64` step does that for W64_NATIVE_DLLS and prints
+    `W64_NATIVE`, which `nt-x64.sh NATIVE=DIR` puts in place of the
+    install's DLLs.
+  - *gex.* `wasmdll::install_shared` takes an LLP64 module from its
+    skeleton's PE32+ header: the entry pairs are 16 bytes, `__gexw_image_base`
+    8, and the module's data exports are i64 globals (offsets below
+    4 GiB). The data goes above 2 GiB (`libprov::alloc_above_code`): a
+    PE32+ export's RVA is added to its DLL's base in 64 bits, and every
+    image is in the code space below 2 GiB, so data below a base was read
+    past 4 GiB (ws2_32's `__wine_unix_call_dispatcher` lookup faulted).
+    gex-kernel's i386 boot variables are not written into a 64-bit
+    module: Wine's own Unix side sets them.
+  - *The loader* asks the module for a DLL's imports
+    (`__gexw_module_imports`, pelink's) on wasm64 too; gexrt64 has a weak
+    one that answers none for a DLL linked as its own module.
+  - *msvcrt and ucrtbase* build as x86-64's: `except_x86_64.c` (catch and
+    unwind funclets are guest calls through the ICALL exit stub),
+    `__C_specific_handler`, handler4, the SSE control word through
+    `__gexw_guest_fpu` (gexrt64), sqrt as builtins. setjmp and longjmp
+    are the guest's, so the CRTs forward `_setjmp`, `_setjmpex`, `setjmp`
+    and `longjmp` to ntdll's on wasm64 (an adapter calling `longjmp` by
+    name is taken by clang's wasm SjLj lowering). Vtables are `.int64`
+    table indices, each method given an entry thunk by `__thiscall`'s
+    annotation; the exception and RTTI data's RVAs are from 0 (the
+    module's data is outside every DLL's image, and all addresses are
+    below 4 GiB), which RtlPcToFileHeader's 0 for them matches.
+  - *Leaving a call-out.* A catch block continuing in an outer frame
+    leaves the guest above the native frames of the call-out the throw was
+    dispatched in (the frame handler is reached through one). An entry that
+    ends that way, or one the guest makes from there, sends gex
+    NATIVE_LEFT as wasm32 does: the call-out is abandoned and its native
+    caller drops its frames, so nothing piles up per throw (x64/msvc_cxxeh
+    throws 20000 times; it died near 8470 without this).
+  - *Fibers* (kernelbase): a switch saves the guest's state as
+    SwitchToFiber returns to it and loads the other fiber's with
+    NtContinue; a new fiber starts at `start_fiber`'s entry thunk.
+  - tests/wine64/nt-x64.sh with `NATIVE=` (the five DLLs native, the rest
+    translated) adds `msvc_cxxeh` (tests/nt/msvc/build-x64.sh: clang-cl
+    x64 C++ EH, SEH, setjmp with a frame) and `fiber` (tests/nt/src/fiber.c)
+    to the set.
 
 ## 3. wow64: no
 
@@ -361,7 +411,7 @@ layer are untouched.
 |---|---|---|---|
 | W64.0 toolchain | the GexLLP64 plugin and `llp64.h` in `tools/wine-wasm/llp64/`; musl wasm64 as a program, lowered; libgex64; ELF64 container plus `GUEST_X86_64`; gex-kernel's x86-64 wasm-program signal frames; configure `--host=wasm64-unknown-linux-musl` (Unix side) | `tests/wine64/layout.sh`: about 80 Win32 and Wine structures (CONTEXT, TEB, PEB, EXCEPTION_RECORD, MSG, OVERLAPPED, ...) compared field by field with `x86_64-pc-windows-msvc`, clang only. `tests/wasm64/run.sh`: tests/wasm32's signals, threads, posix_spawn, dlopen and sjlj, built LP64 and lowered, run natively and in the browser runtime | 2-3 d |
 | W64.1 first proof: Unix side native, PE side translated | `signal_wasm64.c`, `current_machine`, virtual.c limits, `link-w64.sh` (loader, ntdll.so), the server's AMD64 personality, `WINEGEX_DOOR=0`; Wine's x86_64 PE DLLs built from the fork with MinGW and translated (Wine's own `[0x7ffe1000]` path) | tests/nt **x64** hello_args, then sync, mtx, tls, seh, cxx, apc, crtmem and exitproc on the W64 loader (`tests/wine64/nt-x64.sh` over `tools/wine-wasm/w64-dist.sh`'s install): **10 of 10 pass** (2026-10-14). mtx takes about 7 minutes: every contended wait is a system call through the `ud2` entry | 3-5 d |
-| W64.2 PE side native | winebuild `CPU_WASM64` adapters and skeletons, ICALL x64 stubs and entry thunks, gexrt64, x64 table unwinding across native frames, pelink and pesym for wasm64; native ntdll, kernelbase, kernel32, ucrtbase and msvcrt, with the other DLLs still translated; QPC fast path; typed dispatcher | `tests/wasm64/dll`: every adapter kind (register and stack integers, XMM arguments, a structure by reference, a structure return, varargs, callbacks, a data export, a forwarder) from a MinGW x64 program; the W64.1 tests/nt set with the native core; `x64/msvc_cxxeh`. **Native ntdll, the other DLLs translated: tests/nt x64 and `dll`, 12 of 12** (2026-10-15; `nt-x64.sh` with `NTDLL=`, w64-dist.sh's `W64_NTDLL`). Still to do: pelink and pesym for wasm64, so kernelbase, kernel32, msvcrt and ucrtbase run natively; kernelbase's fibers; msvcrt's x64 C++ EH | 4-6 d |
+| W64.2 PE side native | winebuild `CPU_WASM64` adapters and skeletons, ICALL x64 stubs and entry thunks, gexrt64, x64 table unwinding across native frames, pelink and pesym for wasm64; native ntdll, kernelbase, kernel32, ucrtbase and msvcrt, with the other DLLs still translated; QPC fast path; typed dispatcher | `tests/wasm64/dll`: every adapter kind (register and stack integers, XMM arguments, a structure by reference, a structure return, varargs, callbacks, a data export, a forwarder) from a MinGW x64 program; the W64.1 tests/nt set with the native core; `x64/msvc_cxxeh`. **Native ntdll, the other DLLs translated: tests/nt x64 and `dll`, 12 of 12** (2026-10-15; `nt-x64.sh` with `NTDLL=`, w64-dist.sh's `W64_NTDLL`). **The native PE core (ntdll, kernelbase, kernel32, msvcrt, ucrtbase in one pelink module), the other DLLs translated: 14 of 14 with `msvc_cxxeh` and `fiber`** (2026-10-15; `nt-x64.sh` with `NATIVE=`, w64-dist.sh's `W64_NATIVE`) | 4-6 d |
 | W64.3 prefix and door | wineboot's install as children for a win64 prefix; the door with the LP64 request layout (both hosts), USD, the fd-cache section, the session copy | the install-as-children leg on win64; every console tests/nt x64 case, door on and off | 2-3 d |
 | W64.4 GUI and GL | win32u.so; winewayland with libwayland, xkbcommon and FreeType built LP64; opengl32 and gex-gl's guest library LP64; the opengl32 id fast path | x64 window, user_win, gdi, input, display, glcompat and glfast on gex's compositor | 3-5 d |
 | W64.5 page | the ELF64 wasm program in the browser runtime, the door's LP64 parsing in `gex.mjs`, the page prefix template for win64 | browser tests/nt x64 (both builds, SP leg) | 2-4 d |

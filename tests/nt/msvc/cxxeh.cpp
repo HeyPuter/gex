@@ -4,11 +4,18 @@
 // catch(...), __try/__except (_except_handler3), _setjmp3/longjmp, and many
 // throws in a row (nothing may pile up per exception). Built with clang-cl
 // and lld-link against an import library from msvcrt.def (build.sh): no
-// MSVC headers or libraries.
+// MSVC headers or libraries. The x64 build (build-x64.sh, x64/msvc_cxxeh)
+// is the same through x64's table-based handlers: __CxxFrameHandler3's
+// funclets, __C_specific_handler, _setjmp with a frame and an unwinding
+// longjmp.
 extern "C" {
 __declspec(dllimport) int __cdecl printf(const char *, ...);
 __declspec(dllimport) void __cdecl exit(int);
+#ifdef _M_X64
+__declspec(dllimport) int __cdecl _setjmp(void *, void *) __attribute__((returns_twice));
+#else
 __declspec(dllimport) int __cdecl _setjmp3(void *, int, ...);
+#endif
 __declspec(dllimport) void __cdecl longjmp(void *, int);
 __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long, const unsigned long *);
 }
@@ -17,7 +24,7 @@ __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long
  * referenced by the type descriptors (catch matching compares names). */
 extern "C" int _fltused = 0;
 extern "C" const void *const type_info_vftable[2] __asm__("??_7type_info@@6B@") = {0, 0};
-void operator delete(void *, unsigned int) noexcept {}
+void operator delete(void *, decltype(sizeof 0)) noexcept {}
 
 static int failures, dtors, copies;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok" : "FAIL", name); if (!ok_) failures++; } while (0)
@@ -79,9 +86,14 @@ int entry(void) {
 
     seh_tests();
 
-    int jb[16];
     volatile int jumps = 0;
+#ifdef _M_X64
+    alignas(16) unsigned long long jb[32];
+    if (_setjmp(jb, __builtin_frame_address(0)) == 0) { jumps++; longjmp(jb, 5); }
+#else
+    int jb[16];
     if (_setjmp3(jb, 0) == 0) { jumps++; longjmp(jb, 5); }
+#endif
     CHECK("setjmp/longjmp", jumps == 1);
 
     printf("%d failures\n", failures);

@@ -6,7 +6,8 @@
 #
 # prints W64_DIST=..., W64_PREFIX=..., and W64_TOOLS=... and W64_SRC=...
 # (the native tools build and the Wine tree: the native PE side's case),
-# for tests/wine64/nt-x64.sh, and W64_NTDLL=... (the native PE ntdll, W64.2).
+# for tests/wine64/nt-x64.sh, W64_NTDLL=... (the native PE ntdll, W64.2) and
+# W64_NATIVE=... (the native PE core, W64.2: nt-x64.sh's NATIVE=).
 # Each step is cached in CACHE by what it depends on, and skipped when done:
 #   tools-P     Wine's build tools, native (widl and winebuild know wasm64)
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
@@ -17,8 +18,13 @@
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               share/wine
 #   ntdll64-K-S the native PE ntdll (W64.2), made in b64-K-S
+#   pen64-K-N   the native PE core (W64.2): W64_NATIVE_DLLS (default ntdll,
+#               kernelbase, kernel32, msvcrt, ucrtbase) made in b64-K-S and
+#               linked as one module behind their skeletons
+#               (stage-native64.sh)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
-# pfx64), S the sysroot and gex's link tools.
+# pfx64), S the sysroot and gex's link tools, N those, the PE linker and
+# the DLL list.
 # Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16).
 # The server is compiled with a configured W3 build tree's commands:
 # W3_BUILD and GEX_WASM_SYSROOT, or, unset, tools/wine-wasm's own (`make
@@ -124,8 +130,24 @@ ntdll_native() {
 	cp -p "$C/b64-$K-$S"/dlls/ntdll/wasm64-windows/ntdll.dll .
 }
 log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native
+
+D=${W64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll}
+NK=$( { echo "$S $D"; cat "$here"/pelink.py "$here"/pesym.py "$here"/stage-native64.sh; } | sha256sum | cut -c1-10)
+pe_native() {
+	# W64.2's native PE core: each DLL's relocatable object and export list
+	# from the wasm64 tree (winegcc leaves them beside the DLL), one module
+	local b=$C/b64-$K-$S t
+	t="libs/gexrt/libgexrt.a"
+	for dll in $D; do t="$t dlls/${dll%.*}/wasm64-windows/$dll"; done
+	# shellcheck disable=SC2086
+	( cd "$b" && nice -n 10 make -j"$J" $t )
+	# shellcheck disable=SC2086
+	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
+}
+log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 echo "W64_DIST=$C/dist64-$K-$S"
 echo "W64_PREFIX=$C/pfx64-$P/pfx"
 echo "W64_TOOLS=$T"
 echo "W64_SRC=$W"
 echo "W64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
+echo "W64_NATIVE=$C/pen64-$K-$NK/native"
