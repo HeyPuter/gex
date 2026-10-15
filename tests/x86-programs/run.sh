@@ -99,6 +99,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # sock-threads: a unix listener, its clients, socketpairs and internet
 # sockets from several threads at once (L18: the socket calls without the
 # kernel lock).
+# quiet-threads: uname, the scheduling calls, getcpu, fsync, getgroups,
+# getppid, arch_prctl, times and time from several threads at once while
+# children are forked (L22: the calls that need nothing of the process,
+# without the kernel lock).
 # fork-maps-threads (native tiers only for now): forks while other threads
 # map, protect and unmap memory and files (L19: a fork's image, code names
 # and the translator's file reads come from the published map, not the
@@ -106,7 +110,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # of a threaded parent can fault walking musl's thread list, whose
 # descriptors sit on thread stacks above 4 GiB that its memory was not grown
 # to cover (fails the same on 31a21cad).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads quiet-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

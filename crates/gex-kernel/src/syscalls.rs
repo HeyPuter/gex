@@ -889,8 +889,48 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
+/// A call's answer as the word its result register holds: the value, or
+/// the negated errno.
+fn result_word(r: SysResult) -> u64 {
+    match r {
+        Ok(v) => v,
+        Err(e) => (e.0 as i64).wrapping_neg() as u64,
+    }
+}
+
+/// `times`: four `clock_t` -- user, system, and the same for reaped
+/// children -- counted in the hundredths of a second that `USER_HZ` means
+/// on Linux, and a return value on the same scale; `cpu_ns` the processor
+/// time used. i386's are 32-bit.
+fn times_answer(m: &mut GuestMem<'_>, compat: bool, cpu_ns: u128, buf: u64) -> SysResult {
+    let ticks = (cpu_ns / 10_000_000) as u64;
+    if buf != 0 && compat {
+        m.zero(buf, 16)?;
+        m.write_u32(buf, ticks as u32)?;
+    } else if buf != 0 {
+        m.zero(buf, 32)?;
+        m.write_u64(buf, ticks)?;
+    }
+    Ok(if compat { ticks as u32 as u64 } else { ticks })
+}
+
+/// `time`: the wall clock's seconds, also stored at `tloc` unless it is
+/// null -- as a 32-bit `time_t` for i386, whose 64-bit store wrote four
+/// bytes past the caller's variable.
+fn time_answer(m: &mut GuestMem<'_>, compat: bool, clock: ClockFn, tloc: u64) -> SysResult {
+    let (secs, _) = guest_wall(clock());
+    if tloc != 0 {
+        if compat {
+            m.write_u32(tloc, secs as u32)?;
+        } else {
+            m.write_u64(tloc, secs)?;
+        }
+    }
+    Ok(if compat { secs as u32 as u64 } else { secs })
+}
+
 /// Answer one of the calls that only read the clock -- `clock_gettime`,
-/// `gettimeofday`, `getrusage`, `sched_yield` -- straight from the context at
+/// `gettimeofday`, `getrusage`, `times`, `time`, `sched_yield` -- straight from the context at
 /// `ctx_addr`, without a [`Kernel`], and say whether it was one.
 ///
 /// A host takes its kernel lock for every syscall, and Wine asks the time
@@ -938,6 +978,10 @@ pub fn clock_call(
         // (buffer, 32-bit timeval)
         Tod(u64, bool),
         Rusage(u64),
+        // (buffer): `times`, in the ABI's `clock_t`.
+        Times(u64),
+        // (where to store it, or 0): `time`, x86-64's and i386's.
+        Time(u64),
         Yield,
     }
     let call = if compat {
@@ -949,6 +993,8 @@ pub fn clock_call(
             x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
             x::GETTIMEOFDAY => Call::Tod(a0, true),
             x::GETRUSAGE => Call::Rusage(a1),
+            x::TIMES => Call::Times(a0),
+            x::TIME => Call::Time(a0),
             x::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
@@ -960,6 +1006,8 @@ pub fn clock_call(
             229 => Call::Res(a1, false),
             96 => Call::Tod(a0, false),
             98 => Call::Rusage(a1),
+            100 => Call::Times(a0),
+            201 => Call::Time(a0),
             24 => Call::Yield,
             _ => return false,
         }
@@ -969,6 +1017,7 @@ pub fn clock_call(
             nr::CLOCK_GETRES => Call::Res(a1, false),
             nr::GETTIMEOFDAY => Call::Tod(a0, false),
             nr::GETRUSAGE => Call::Rusage(a1),
+            nr::TIMES => Call::Times(a0),
             nr::SCHED_YIELD => Call::Yield,
             _ => return false,
         }
@@ -1020,6 +1069,22 @@ pub fn clock_call(
         // A pure yield: the caller's Worker is its own OS thread, and the
         // browser schedules those without being asked.
         Call::Yield => true,
+        Call::Times(buf) => {
+            let r = times_answer(m, compat, cpu(), buf);
+            if gex_abi::X86 {
+                let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+            }
+            let _ = set_result(m, ctx_addr, result_word(r));
+            return true;
+        }
+        Call::Time(tloc) => {
+            let r = time_answer(m, compat, clock, tloc);
+            if gex_abi::X86 {
+                let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+            }
+            let _ = set_result(m, ctx_addr, result_word(r));
+            return true;
+        }
     };
     if gex_abi::X86 {
         let _ = m.write_u64(ctx_addr + ctx::LAST_SYSCALL as u64, raw);
@@ -4165,6 +4230,154 @@ pub fn is_fd_misc(n: u64) -> bool {
     )
 }
 
+/// The calls that need nothing of the process but its descriptor table
+/// (`fsync`, `fdatasync`: a check that the descriptor is open), the process
+/// table (`getppid`), the calling thread's own context (`arch_prctl`) or
+/// nothing at all: `uname`, `prctl`, `sync`, the robust list and `rseq`,
+/// the scheduling policy calls, `sched_getaffinity`, `getcpu`,
+/// `membarrier`, the supplementary groups, and the calls that are
+/// accepted and do nothing here (L22). Canonical, for this process's ABI
+/// (`compat`): `arch_prctl` is x86's, and the do-nothing number is made
+/// only by a translation from x86-64 or i386.
+pub fn is_quiet(n: u64, compat: bool) -> bool {
+    matches!(
+        n,
+        nr::UNAME
+            | nr::PRCTL
+            | nr::SYNC
+            | nr::FSYNC
+            | nr::FDATASYNC
+            | nr::SET_ROBUST_LIST
+            | nr::GET_ROBUST_LIST
+            | nr::RSEQ
+            | nr::SCHED_GETAFFINITY
+            | nr::SCHED_GETSCHEDULER
+            | nr::SCHED_GETPARAM
+            | nr::SCHED_SETPARAM
+            | nr::SCHED_SETSCHEDULER
+            | nr::SCHED_GET_PRIORITY_MAX
+            | nr::SCHED_GET_PRIORITY_MIN
+            | nr::GETCPU
+            | nr::MEMBARRIER
+            | nr::GETGROUPS
+            | nr::SETGROUPS
+            | nr::GETPPID
+    ) || (n == nr::ARCH_PRCTL && gex_abi::X86)
+        || (n == nr::NOOP_OK && (gex_abi::X86 || gex_abi::PPC || compat))
+}
+
+/// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
+/// both answer them here. `ctx_addr` is the calling thread's context.
+pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
+    match n {
+        nr::UNAME => uname(m, io.compat, a[0]),
+        // Names, death signals and dumpability: all things a process may
+        // set about itself that change nothing observable here.
+        nr::PRCTL => Ok(0),
+        // Nothing here is written back to a device, so there is nothing
+        // to flush -- but an init script's last act is usually to call it.
+        nr::SYNC => Ok(0),
+        // `fdatasync` like `fsync`: everything is already durable (the VFS
+        // is in memory), so validating the fd and returning success is the
+        // honest answer. Missing it made sqlite's journal sync return
+        // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
+        // and refuses to write any file-backed database.
+        nr::FSYNC | nr::FDATASYNC => io.fds.get(a[0] as i32).map(|_| 0),
+        nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
+        // Restartable sequences are an optimisation the guest can live
+        // without, and both libcs treat ENOSYS as "not available".
+        nr::RSEQ => Err(Errno::ENOSYS),
+        // One processor, and it is the one the caller is on. dpkg asks
+        // to size its worker pool.
+        nr::SCHED_GETAFFINITY => {
+            let (len, mask) = ((a[1] as usize).min(1024), a[2]);
+            if mask != 0 && len >= 8 {
+                m.zero(mask, len)?;
+                m.write_u64(mask, 1)?;
+            }
+            Ok(8)
+        }
+        // Scheduling policy: every guest thread runs SCHED_OTHER at
+        // priority 0, which is what these report. Setting a normal policy
+        // is accepted; a real-time one is refused as for an unprivileged
+        // process. Mono treats a failed priority query as fatal.
+        nr::SCHED_GETSCHEDULER => Ok(0),
+        nr::SCHED_GETPARAM => {
+            m.write_u32(a[1], 0)?;
+            Ok(0)
+        }
+        nr::SCHED_SETPARAM => Ok(0),
+        nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
+            1 | 2 => Err(Errno::EPERM),
+            0 | 3 | 5 => Ok(0),
+            _ => Err(Errno::EINVAL),
+        },
+        nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
+        nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
+        // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
+        nr::GETCPU => {
+            if a[0] != 0 {
+                m.write_u32(a[0], 0)?;
+            }
+            if a[1] != 0 {
+                m.write_u32(a[1], 0)?;
+            }
+            Ok(0)
+        }
+        nr::MEMBARRIER => Ok(0),
+        // No supplementary groups. `getgroups(0, _)` asks for the count.
+        nr::GETGROUPS | nr::SETGROUPS => Ok(0),
+        nr::GETPPID => Ok(procs.ppid(io.pid) as u64),
+        nr::ARCH_PRCTL => arch_prctl(m, ctx_addr, a[0], a[1]),
+        nr::NOOP_OK => Ok(0),
+        _ => unreachable!("is_quiet admitted a call quiet_call does not make"),
+    }
+}
+
+/// `uname`: the kernel gex says it is.
+fn uname(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+    let fields = [
+        "Linux",
+        "gex",
+        "6.1.0-gex",
+        "#1 SMP gex",
+        // An i386 process on the x86 build; a wasm32 program on the
+        // AArch64 build is part of an aarch64 system (its dpkg and
+        // config.guess should agree with the arm64 programs beside it).
+        if compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
+        "(none)",
+    ];
+    let mut out = vec![0u8; 65 * 6];
+    for (i, f) in fields.iter().enumerate() {
+        let b = f.as_bytes();
+        out[i * 65..i * 65 + b.len()].copy_from_slice(b);
+    }
+    m.write(buf, &out)?;
+    Ok(0)
+}
+
+/// `arch_prctl`: the calling thread's segment bases, in its context.
+fn arch_prctl(m: &mut GuestMem<'_>, ctx_addr: u64, code: u64, addr: u64) -> SysResult {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+    match code {
+        ARCH_SET_FS => m.write_u64(ctx_addr + ctx::FS_BASE as u64, addr)?,
+        ARCH_SET_GS => m.write_u64(ctx_addr + ctx::GS_BASE as u64, addr)?,
+        ARCH_GET_FS => {
+            let v = m.read_u64(ctx_addr + ctx::FS_BASE as u64)?;
+            m.write_u64(addr, v)?;
+        }
+        ARCH_GET_GS => {
+            let v = m.read_u64(ctx_addr + ctx::GS_BASE as u64)?;
+            m.write_u64(addr, v)?;
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
+}
+
 fn is_mapping(n: u64) -> bool {
     matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
 }
@@ -4268,7 +4481,12 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SHUTDOWN => nr::SHUTDOWN,
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG_TIME64 => nr::RECVMMSG,
-            _ => return None,
+            // The quiet calls, as the translation numbers them (several
+            // numbers become the do-nothing one).
+            r => match crate::i386::canonical_number(r) {
+                c if is_quiet(c, true) => c,
+                _ => return None,
+            },
         }
     } else if gex_abi::X86 {
         use crate::x86::raw as x;
@@ -4361,7 +4579,10 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SHUTDOWN => nr::SHUTDOWN,
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
-            _ => return None,
+            r => match crate::x86::canonical_number(r) {
+                c if is_quiet(c, false) => c,
+                _ => return None,
+            },
         }
     } else {
         match raw {
@@ -4375,6 +4596,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
+            n if is_quiet(n, false) => raw,
             _ => return None,
         }
     };
@@ -4428,7 +4650,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -4466,7 +4688,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -4528,6 +4750,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     } else if is_path(n) {
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
+    } else if is_quiet(n, compat) {
+        quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
     } else if is_fd_misc(n) {
         match n {
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -7088,6 +7312,9 @@ impl Kernel {
     fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
         let r: SysResult = match n {
             nr::EXIT | nr::EXIT_GROUP => return Err((a[0] & 0xff) as i32),
+            // The calls that need nothing of the process ([`quiet_call`],
+            // the free path's code).
+            n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, m, self.ctx_addr, n, a),
 
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
@@ -7095,8 +7322,6 @@ impl Kernel {
             nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
             nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
             nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(a[0]),
-            nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC || self.compat => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -7125,12 +7350,6 @@ impl Kernel {
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(a[0] as i32, a[1]),
-            // `fdatasync` like `fsync`: everything is already durable (the VFS
-            // is in memory), so validating the fd and returning success is the
-            // honest answer. Missing it made sqlite's journal sync return
-            // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
-            // and refuses to write any file-backed database.
-            nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
             // Only a thread's own working directory (CLONE_FS) is unshared;
             // a private descriptor table or namespace is not supported.
             nr::UNSHARE => {
@@ -7161,9 +7380,7 @@ impl Kernel {
             }
 
             // -- process and time --------------------------------------------
-            nr::UNAME => self.sys_uname(m, a[0]),
             nr::GETPID => Ok(self.pid as u64),
-            nr::GETPPID => Ok(self.procs.ppid(self.pid) as u64),
             nr::GETTID => Ok(self.tid as u64),
             nr::GETUID | nr::GETEUID => Ok(self.uid as u64),
             nr::GETGID | nr::GETEGID => Ok(self.gid as u64),
@@ -7190,17 +7407,8 @@ impl Kernel {
             nr::SETRESGID => set_id(&mut self.gid, a[1]),
             nr::GETRESUID => self.sys_getres(m, a, self.uid),
             nr::GETRESGID => self.sys_getres(m, a, self.gid),
-            // No supplementary groups. `getgroups(0, _)` asks for the count.
-            nr::GETGROUPS => Ok(0),
-            nr::SETGROUPS => Ok(0),
-            // Names, death signals and dumpability: all things a process may
-            // set about itself that change nothing observable here.
-            nr::PRCTL => Ok(0),
 
             // -- mounts ------------------------------------------------------
-            // Nothing here is written back to a device, so there is nothing
-            // to flush -- but an init script's last act is usually to call it.
-            nr::SYNC => Ok(0),
             nr::MOUNT => self.sys_mount(m, a),
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
@@ -7220,7 +7428,6 @@ impl Kernel {
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.fd_io().poll_now(m, n, a),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
-            nr::MEMBARRIER => self.sys_membarrier(a[0]),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -7231,9 +7438,6 @@ impl Kernel {
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
-            // One processor, and it is the one the caller is on. dpkg asks
-            // to size its worker pool.
-            nr::SCHED_GETAFFINITY => self.sys_getaffinity(m, a[1], a[2]),
             // Interval timers raise their signal when due (`check_timers`,
             // and a page Worker's own `sigs::gather`).
             nr::SETITIMER => self.sys_itimer(m, a[0], a[1], a[2], true),
@@ -7242,28 +7446,12 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
-            // Scheduling policy: every guest thread runs SCHED_OTHER at
-            // priority 0, which is what these report. Setting a normal policy
-            // is accepted; a real-time one is refused as for an unprivileged
-            // process. Mono treats a failed priority query as fatal.
-            nr::SCHED_GETSCHEDULER => Ok(0),
-            nr::SCHED_GETPARAM => self.sys_sched_getparam(m, a[1]),
-            nr::SCHED_SETPARAM => Ok(0),
-            nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
-                1 | 2 => Err(Errno::EPERM),
-                0 | 3 | 5 => Ok(0),
-                _ => Err(Errno::EINVAL),
-            },
-            nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
-            nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
             // Scheduling niceness: we run every guest thread at the default
             // priority, so report nice 0 and accept any set as a no-op. The
             // raw getpriority ABI returns `20 - nice` (kept non-negative so a
             // real nice value is never mistaken for an -errno), i.e. 20 here.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
-            // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
-            nr::GETCPU => self.sys_getcpu(m, a[0], a[1]),
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
@@ -7308,11 +7496,7 @@ impl Kernel {
                 Ok(0)
             }
 
-            nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
             nr::FUTEX => self.sys_futex(m, a),
-            // Restartable sequences are an optimisation the guest can live
-            // without, and both libcs treat ENOSYS as "not available".
-            nr::RSEQ => Err(Errno::ENOSYS),
 
             _ => {
                 if !self.unimplemented.contains(&n) {
@@ -7348,18 +7532,6 @@ impl Kernel {
         sigpending(&self.signals, m, set)
     }
 
-    /// `getcpu`: which CPU/NUMA node the caller runs on. We present a single
-    /// scheduling domain, so both are 0. The third arg (tcache) is ignored on
-    /// modern kernels; null pointers are skipped.
-    fn sys_getcpu(&self, m: &mut GuestMem<'_>, cpu: u64, node: u64) -> SysResult {
-        if cpu != 0 {
-            m.write_u32(cpu, 0)?;
-        }
-        if node != 0 {
-            m.write_u32(node, 0)?;
-        }
-        Ok(0)
-    }
 
     fn sys_rt_sigprocmask(
         &mut self,
@@ -8576,16 +8748,6 @@ impl Kernel {
         }
     }
 
-    /// `sched_getaffinity`. One processor, and it is the one the caller is
-    /// already on. dpkg asks in order to size its worker pool.
-    fn sys_getaffinity(&mut self, m: &mut GuestMem<'_>, len: u64, mask: u64) -> SysResult {
-        let len = (len as usize).min(1024);
-        if mask != 0 && len >= 8 {
-            m.zero(mask, len)?;
-            m.write_u64(mask, 1)?;
-        }
-        Ok(8)
-    }
 
     /// `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
     /// signal goes to that thread. Mono's GC stops the world with
@@ -8633,11 +8795,6 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `sched_getparam(pid, *param)`: priority 0, the only one there is.
-    fn sys_sched_getparam(&mut self, m: &mut GuestMem<'_>, param: u64) -> SysResult {
-        m.write_u32(param, 0)?;
-        Ok(0)
-    }
 
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
@@ -8837,18 +8994,6 @@ impl Kernel {
         self.fd_io().close_range(first, last, flags)
     }
 
-    /// `membarrier`: force a memory barrier across the process's threads.
-    ///
-    /// A no-op that succeeds. Every gex thread runs against one shared linear
-    /// memory and the runtime already emits the atomic accesses the guest asks
-    /// for, so there is no per-thread view to reconcile -- which is the whole
-    /// job of this call. The `MEMBARRIER_CMD_QUERY` (cmd 0) case returns the
-    /// bitmask of supported commands, and reporting none is honest and is what
-    /// a caller that falls back to a heavier barrier expects.
-    fn sys_membarrier(&mut self, cmd: u64) -> SysResult {
-        let _ = cmd;
-        Ok(0)
-    }
 
     /// `epoll_create1`.
     fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
@@ -8986,11 +9131,7 @@ impl Kernel {
     }
 
     fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
-        let (secs, _) = guest_wall((self.clock)());
-        if tloc != 0 {
-            m.write_u64(tloc, secs)?;
-        }
-        Ok(secs)
+        time_answer(m, self.compat, self.clock, tloc)
     }
 
     /// `alarm(s)`: `setitimer(ITIMER_REAL, {0, s})`, returning the seconds the
@@ -9000,49 +9141,7 @@ impl Kernel {
         Ok(alarm(&self.signals, self.now_nanos(), secs))
     }
 
-    /// x86-64 `arch_prctl`: the FS and GS segment bases, which is how that
-    /// ABI sets its thread pointer.
-    fn sys_arch_prctl(&mut self, m: &mut GuestMem<'_>, code: u64, addr: u64) -> SysResult {
-        const ARCH_SET_GS: u64 = 0x1001;
-        const ARCH_SET_FS: u64 = 0x1002;
-        const ARCH_GET_FS: u64 = 0x1003;
-        const ARCH_GET_GS: u64 = 0x1004;
-        match code {
-            ARCH_SET_FS => m.write_u64(self.ctx_addr + ctx::FS_BASE as u64, addr)?,
-            ARCH_SET_GS => m.write_u64(self.ctx_addr + ctx::GS_BASE as u64, addr)?,
-            ARCH_GET_FS => {
-                let v = m.read_u64(self.ctx_addr + ctx::FS_BASE as u64)?;
-                m.write_u64(addr, v)?;
-            }
-            ARCH_GET_GS => {
-                let v = m.read_u64(self.ctx_addr + ctx::GS_BASE as u64)?;
-                m.write_u64(addr, v)?;
-            }
-            _ => return Err(Errno::EINVAL),
-        }
-        Ok(0)
-    }
 
-    fn sys_uname(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        let fields = [
-            "Linux",
-            "gex",
-            "6.1.0-gex",
-            "#1 SMP gex",
-            // An i386 process on the x86 build; a wasm32 program on the
-            // AArch64 build is part of an aarch64 system (its dpkg and
-            // config.guess should agree with the arm64 programs beside it).
-            if self.compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
-            "(none)",
-        ];
-        let mut out = vec![0u8; 65 * 6];
-        for (i, f) in fields.iter().enumerate() {
-            let b = f.as_bytes();
-            out[i * 65..i * 65 + b.len()].copy_from_slice(b);
-        }
-        m.write(buf, &out)?;
-        Ok(0)
-    }
 
     fn sys_clock_gettime(&mut self, m: &mut GuestMem<'_>, clk: u64, buf: u64) -> SysResult {
         // The two processor clocks count from when the process started, not
@@ -9111,16 +9210,8 @@ impl Kernel {
     /// children -- counted in the hundredths of a second that `USER_HZ` means
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        let ticks = (self.cpu_nanos() / 10_000_000) as u64;
-        if buf != 0 && self.compat {
-            // i386: four 32-bit clock_t
-            m.zero(buf, 16)?;
-            m.write_u32(buf, ticks as u32)?;
-        } else if buf != 0 {
-            m.zero(buf, 32)?;
-            m.write_u64(buf, ticks)?;
-        }
-        Ok(if self.compat { ticks as u32 as u64 } else { ticks })
+        let cpu = self.cpu_nanos();
+        times_answer(m, self.compat, cpu, buf)
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
@@ -9609,6 +9700,9 @@ mod tests {
             (nr::CLOCK_GETTIME, [3, buf]),
             (nr::GETTIMEOFDAY, [buf, 0]),
             (nr::GETRUSAGE, [0, buf]),
+            (nr::TIMES, [buf, 0]),
+            (nr::TIMES, [0, 0]),
+            (if gex_abi::X86 { nr::TIME } else { nr::TIMES }, [buf, 0]),
             (nr::SCHED_YIELD, [0, 0]),
         ] {
             let mut m = GuestMem::new(&mut mem);
@@ -10187,6 +10281,140 @@ mod tests {
                 k.syscall(&mut m, 0);
             }
         }
+    }
+
+    #[test]
+    fn free_quiet_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, false)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            Some(free_call(&f, m, at, call))
+        }
+        let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
+        let buf_at = 0x30000u64;
+        let mut cases: Vec<(u64, [u64; 3])> = vec![
+            (nr::UNAME, [buf_at, 0, 0]),
+            (nr::PRCTL, [15, buf_at, 0]),
+            (nr::SYNC, [0, 0, 0]),
+            (nr::FSYNC, [1, 0, 0]),
+            (nr::FSYNC, [999, 0, 0]),
+            (nr::FDATASYNC, [2, 0, 0]),
+            (nr::SET_ROBUST_LIST, [buf_at, 24, 0]),
+            (nr::GET_ROBUST_LIST, [0, buf_at, buf_at + 8]),
+            (nr::RSEQ, [buf_at, 32, 0]),
+            (nr::SCHED_GETAFFINITY, [0, 128, buf_at]),
+            (nr::SCHED_GETAFFINITY, [0, 4, buf_at]),
+            (nr::SCHED_GETSCHEDULER, [0, 0, 0]),
+            (nr::SCHED_GETPARAM, [0, buf_at, 0]),
+            (nr::SCHED_SETPARAM, [0, buf_at, 0]),
+            (nr::SCHED_SETSCHEDULER, [0, 1, buf_at]),
+            (nr::SCHED_SETSCHEDULER, [0, 3, buf_at]),
+            (nr::SCHED_SETSCHEDULER, [0, 9, buf_at]),
+            (nr::SCHED_GET_PRIORITY_MAX, [1, 0, 0]),
+            (nr::SCHED_GET_PRIORITY_MIN, [0, 0, 0]),
+            (nr::GETCPU, [buf_at, buf_at + 4, 0]),
+            (nr::MEMBARRIER, [0, 0, 0]),
+            (nr::GETGROUPS, [0, 0, 0]),
+            (nr::SETGROUPS, [0, 0, 0]),
+            (nr::GETPPID, [0, 0, 0]),
+        ];
+        if gex_abi::X86 {
+            // arch_prctl: set the fs base, read it back.
+            cases.push((nr::ARCH_PRCTL, [0x1002, 0x1234_5000, 0]));
+            cases.push((nr::ARCH_PRCTL, [0x1003, buf_at, 0]));
+            cases.push((nr::ARCH_PRCTL, [0x9999, buf_at, 0]));
+        }
+        for (n, args) in cases {
+            m.zero(buf_at, 256).unwrap();
+            m.write_u64(buf_at + 200, 0x5a5a).unwrap();
+            set_args(&mut m, at, n, &args);
+            k.syscall(&mut m, 0);
+            let (want, want_ret) = (m.read(buf_at, 256).unwrap().to_vec(), ret(&m, at));
+            let fs = m.read_u64(at + ctx::FS_BASE as u64).unwrap();
+            m.zero(buf_at, 256).unwrap();
+            m.write_u64(buf_at + 200, 0x5a5a).unwrap();
+            set_args(&mut m, at, n, &args);
+            assert!(done(free(&k, &mut m, at)), "call {n} in the class");
+            assert_eq!(m.read(buf_at, 256).unwrap(), &want[..], "call {n} {args:?}");
+            assert_eq!(ret(&m, at), want_ret, "call {n} {args:?}");
+            assert_eq!(m.read_u64(at + ctx::FS_BASE as u64).unwrap(), fs, "call {n}");
+        }
+        // Not quiet: declined, for the kernel.
+        set_args(&mut m, at, nr::SETSID, &[]);
+        assert!(free_class(&m, at, false).is_none());
+    }
+
+    #[test]
+    fn free_i386_quiet_calls_answer_as_the_kernel_does() {
+        if !gex_abi::X86 {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+            free_call(&f, m, at, call)
+        }
+        let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 3]| {
+            m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+            for (i, v) in a.iter().enumerate() {
+                m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+            }
+        };
+        let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+        use crate::i386::raw;
+        let buf_at = 0x30000u64;
+        for (n, args) in [
+            (raw::UNAME, [buf_at, 0, 0]),
+            (raw::GETCPU, [buf_at, buf_at + 4, 0]),
+            (raw::SCHED_GETAFFINITY, [0, 64, buf_at]),
+            (raw::FSYNC, [1, 0, 0]),
+            (raw::FSYNC, [0xffff_ffff, 0, 0]),
+            (raw::GETGROUPS, [0, 0, 0]),
+            (raw::PERSONALITY, [0, 0, 0]),
+            (raw::GETPPID, [0, 0, 0]),
+        ] {
+            m.zero(buf_at, 512).unwrap();
+            set32(&mut m, n, args);
+            k.syscall(&mut m, 0);
+            let (want, want_ret) = (m.read(buf_at, 512).unwrap().to_vec(), r32(&m));
+            m.zero(buf_at, 512).unwrap();
+            set32(&mut m, n, args);
+            assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)), "raw {n}");
+            assert_eq!(m.read(buf_at, 512).unwrap(), &want[..], "raw {n}");
+            assert_eq!(r32(&m), want_ret, "raw {n}");
+        }
+        // uname's machine is i686 for an i386 process.
+        set32(&mut m, raw::UNAME, [buf_at, 0, 0]);
+        let _ = free(&k, &mut m, at);
+        assert_eq!(&m.read(buf_at + 4 * 65, 4).unwrap(), b"i686");
+        // set_thread_area: the entry number chosen and the base in %gs, as
+        // the full call's translation does.
+        m.write_u32(buf_at + 0x100, u32::MAX).unwrap();
+        m.write_u32(buf_at + 0x104, 0x0abc_d000).unwrap();
+        set32(&mut m, raw::SET_THREAD_AREA, [buf_at + 0x100, 0, 0]);
+        assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
+        assert_eq!(r32(&m), 0);
+        assert_eq!(m.read_u32(buf_at + 0x100).unwrap(), 6);
+        assert_eq!(m.read_u64(at + ctx::GS_BASE as u64).unwrap(), 0x0abc_d000);
+        // time(&t): a 32-bit time_t stored, nothing past it (the clocks'
+        // own path answers it).
+        m.write_u64(buf_at, !0).unwrap();
+        set32(&mut m, raw::TIME, [buf_at, 0, 0]);
+        assert!(clock_call(&mut m, at, true, k.clock, k.started));
+        assert_eq!(m.read_u32(buf_at + 4).unwrap(), u32::MAX, "only four bytes stored");
+        assert_eq!(m.read_u32(buf_at).unwrap() as i32, r32(&m));
     }
 
     #[test]
