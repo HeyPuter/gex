@@ -128,6 +128,15 @@ impl MapView {
             r[..i].last().is_some_and(|&(_, e, _)| end <= e)
         })
     }
+
+    /// The protection of the mapping holding `addr`, as
+    /// [`MemoryMap::vma_at`] would say; `None` where nothing is mapped.
+    pub fn prot_at(&self, addr: u64) -> Option<u32> {
+        self.cur.read(crate::sync::me() as usize, |r| {
+            let i = r.partition_point(|&(s, _, _)| s <= addr);
+            r[..i].last().filter(|&&(_, e, _)| addr < e).map(|&(_, _, p)| p)
+        })
+    }
 }
 
 /// A map's view, which a copy of the map does not share: a forked child's

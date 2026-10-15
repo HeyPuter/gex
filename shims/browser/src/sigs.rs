@@ -243,6 +243,31 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     syscalls::free_call(&f, gm, ctx_addr, call)
 }
 
+/// Return from a signal handler for this Worker's thread, whose context is
+/// at `ctx_addr`: the frame's context and mask back (`signal::sigreturn`).
+/// The pc to go on at. No kernel lock: the thread's signal state is its own.
+pub(crate) fn sigreturn(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, gex_kernel::Errno> {
+    let home = home().ok_or(gex_kernel::Errno::EFAULT)?;
+    let view = view(home).ok_or(gex_kernel::Errno::EFAULT)?;
+    let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
+    signal::sigreturn(&view, gm, ctx_addr, compat, false)
+}
+
+/// Whether `pc` is in an executable mapping of this process: the map's
+/// published view where other Workers may be changing the map; the map
+/// itself in the single-threaded build, which keeps no view and has nobody
+/// inside the kernel now.
+pub(crate) fn executable(pc: u64) -> bool {
+    #[cfg(feature = "shared-memory")]
+    {
+        home().and_then(|h| h.map.prot_at(pc)).is_some_and(|p| p & gex_kernel::mem::prot::EXEC != 0)
+    }
+    #[cfg(not(feature = "shared-memory"))]
+    {
+        crate::with_host(|h| h.kernel.mem.vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
+    }
+}
+
 /// How long until this process's next interval timer fires, by its own
 /// clock; `None` with none armed. No kernel lock (`Kernel::timer_in_ns`).
 pub(crate) fn timer_in_ns() -> Option<u64> {

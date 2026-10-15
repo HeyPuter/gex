@@ -562,6 +562,21 @@ in the scheduler pick after each wake of the global WAKE word: about
      second in Noita's process, 16 in each Wine process's). Legs:
      `the_shared_map_view_follows_the_list`; the Noita page and the core
      gate's browser and gears legs, which pump.
+   - The miss path before a translation (L11, §3.6's first part): no
+     lock.
+     - A handler's return through `SIGRETURN_TRAMPOLINE` (every handler
+       on aarch64, where musl sets no restorer) restores the frame
+       through the thread's own signal state (`sigs::sigreturn`).
+     - The x86 check that a branch target is executable reads the map's
+       published view (`MapView::prot_at`; the map itself in SP).
+     - The fill's record of the spans it asked about and the pages nobody
+       could fill has its own lock (`FILL_ASKED`, `gex_kernel::sync::Mutex`).
+     A miss a module already in the process answers (a fill) took the
+     lock twice, and now takes none. A miss that translates still takes
+     it in `with_jit` (§3.6's lift and install), as do the wild-branch
+     report and the eject stop, which end the process. Legs: the page
+     tier's signal programs (`signal-storm`, `thread-signals`,
+     `sa-restart`, `pwait-sigmask`) built for aarch64 as well as x86.
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

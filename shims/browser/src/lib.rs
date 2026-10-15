@@ -6115,10 +6115,24 @@ thread_local! {
     static FILL_WANTED: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
 }
 
-/// Pages already asked about, so one nobody can fill is asked once and then
-/// takes the ordinary path rather than asking forever.
-static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
-    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
+/// The fill's memory of what it asked, under its own lock: misses on every
+/// Worker of the process ask and answer at once (a lock-free `RefCell` here
+/// raced the trees' structure and smashed a live stack).
+struct FillAsked {
+    /// Spans already asked about, so one nobody can fill is asked once and
+    /// then takes the ordinary path rather than asking forever.
+    asked: std::collections::BTreeSet<u64>,
+    /// Pages asked about that nobody could fill. Not permanent: the covering
+    /// module may just not be installed in this process yet (the ordinary
+    /// case for a forked child), so `gex_fill_possible` forgives these when
+    /// a module arrives.
+    failed: std::collections::BTreeSet<u64>,
+}
+
+static FILL_ASKED: gex_kernel::sync::Mutex<FillAsked> = gex_kernel::sync::Mutex::new(FillAsked {
+    asked: std::collections::BTreeSet::new(),
+    failed: std::collections::BTreeSet::new(),
+});
 
 /// Whether the host is holding any module unwritten. Without it the miss path
 /// traps into JS for a fill on the first miss of every page whose base it has,
@@ -6127,11 +6141,6 @@ static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
 static FILL_POSSIBLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Pages asked about that nobody could fill. Not permanent: the covering module
-/// may just not be installed in this process yet (the ordinary case for a
-/// forked child), so `gex_fill_possible` forgives these when a module arrives.
-static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
-    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
 /// Pages already served whole from the shared store for a fault, so a second
 /// fault on one is not served again. A served batch covers whatever the process
@@ -6173,22 +6182,17 @@ thread_local! {
 pub extern "C" fn gex_fill_possible(on: i32) {
     FILL_POSSIBLE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
     if on != 0 {
-        // Under KLOCK: these two `SingleThreaded<RefCell<BTreeSet>>` are mutated
-        // by `gex_dispatch_miss` on other Workers at the same time; a lock-free
-        // `borrow_mut` here races the tree structure. See the note at the miss.
-        with_host(|_| {
-            let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
-            let mut asked = FILL_ASKED.0.borrow_mut();
-            let spans = gex_abi::SLOTS_PER_PAGE as u64
-                / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
-            for page in failed {
-                // Every span of it: the module that has just arrived may cover
-                // parts of the page this one could not.
-                for i in 0..spans {
-                    asked.remove(&(page * spans + i));
-                }
+        let mut f = FILL_ASKED.lock();
+        let failed = std::mem::take(&mut f.failed);
+        let spans = gex_abi::SLOTS_PER_PAGE as u64
+            / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        for page in failed {
+            // Every span of it: the module that has just arrived may cover
+            // parts of the page this one could not.
+            for i in 0..spans {
+                f.asked.remove(&(page * spans + i));
             }
-        });
+        }
     }
 }
 
@@ -6247,8 +6251,7 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
 pub extern "C" fn gex_fill_done(ok: i32) {
     let page = FILL_PENDING.with(|c| c.replace(-1));
     if ok == 0 && page >= 0 {
-        // Under KLOCK: shared with the miss path's `FILL_ASKED`/`FILL_FAILED`.
-        with_host(|_| FILL_FAILED.0.borrow_mut().insert(page as u64));
+        FILL_ASKED.lock().failed.insert(page as u64);
     }
     FILL_WANTED.with(|c| c.set(-1));
 }
@@ -9370,8 +9373,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // span, which is only safe while the fill's answer is reachable -- and
     // clearing the directory above made it unreachable, so a stale mark would
     // strand every block on the page on the translator for the process's life.
-    FILL_ASKED.0.borrow_mut().clear();
-    FILL_FAILED.0.borrow_mut().clear();
+    {
+        let mut f = FILL_ASKED.lock();
+        f.asked.clear();
+        f.failed.clear();
+    }
     SERVED_PAGE.0.borrow_mut().clear();
     // And the bases blocks were installed under: the page table starts over
     // below, and a page of the new program has nothing installed yet.
@@ -13146,40 +13152,33 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A signal handler returning: with no `sa_restorer` the kernel puts
     // `SIGRETURN_TRAMPOLINE` in x30, an address with nothing translated at it,
     // so the handler's `ret` arrives here -- the whole mechanism.
+    // No kernel lock: the thread's signal state and run state are its own.
     if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
-        let resumed = with_host(|h| {
-            let mut gm = GuestMem::new(guest_bytes());
-            let kstate = h.threads[cur()].kstate.clone();
-            h.kernel.enter_thread(&kstate);
-            let r = h.kernel.sigreturn(&mut gm);
-            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
-            match r {
-                Ok(target) => {
-                    if tracing() {
-                        trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
-                    }
-                    h.threads[cur()].run().pc = target;
-                    set_resume(target);
-                    set_resume_ctx(kstate.ctx_addr);
-                    true
+        let mut gm = GuestMem::new(guest_bytes());
+        let ctx_addr = my_ctx();
+        match sigs::sigreturn(&mut gm, ctx_addr) {
+            Ok(target) => {
+                if tracing() {
+                    trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
                 }
-                Err(_) => {
-                    warn_line("gex: corrupt signal frame on sigreturn\n");
-                    set_exit(h, 128 + 11);
-                    false
+                if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                    run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
                 }
+                set_resume(target);
+                set_resume_ctx(ctx_addr);
             }
-        });
-        let _ = resumed;
+            Err(_) => {
+                warn_line("gex: corrupt signal frame on sigreturn\n");
+                with_host(|h| set_exit(h, 128 + 11));
+            }
+        }
         trap();
     }
     // A branch to memory nothing executable is mapped at: a bad return
     // address or function pointer. Said before any slot arithmetic, because a
     // wild `pc` makes a wild directory index, and a shim trap on that reads as
     // a runtime bug where the guest's own crash is the story.
-    let wild = gex_abi::X86 && with_host(|h| {
-        !h.kernel.mem.vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
-    });
+    let wild = gex_abi::X86 && !sigs::executable(pc);
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
     }
@@ -13269,14 +13268,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
-        // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
-        // with a Worker per thread this is entered concurrently. Two threads
-        // missing at once (the main thread and a dbus/gsettings worker, both
-        // faulting in glib/gobject closure pages) would `borrow_mut` and rebalance
-        // the tree simultaneously -- a data race that stores through a freed/moved
-        // node into unrelated linear memory, smashing a live stack. See
-        // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
-        let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
+        // Under the fill's own lock (`FILL_ASKED`): two threads missing at
+        // once (the main thread and a dbus/gsettings worker, both faulting in
+        // glib/gobject closure pages) ask together.
+        let fresh = FILL_ASKED.lock().asked.insert(key);
         if fresh {
             miss_way(pc, 10);
             FILL_FROM.with(|c| c.set(from));
@@ -13415,7 +13410,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
-            if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
+            if FILL_ASKED.lock().asked.contains(&key) { 2 } else { 3 }
         };
         LIFT_WHY[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Keep the addresses of `why == 2` (a span the fill already answered):
