@@ -24,7 +24,7 @@
 #define ROUNDS 60
 #define THREADS 3
 static long bad;
-static char lib[64];
+static char dir[64], lib[96];
 static long size, leaf_off;
 
 #if UINTPTR_MAX > 0xffffffff
@@ -90,7 +90,11 @@ int main(void) {
     if (leaf_off < 0) { fprintf(stderr, "leaf not found\n"); return 1; }
     /* The copy, named as a shared object is: this program's file rebuilt
      * from its loaded segments (the page has no /proc/self/exe). */
-    snprintf(lib, sizeof lib, "/tmp/libcodemap-%d.so", (int)getpid());
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    snprintf(dir, sizeof dir, "/tmp/codemap-XXXXXX");
+    if (!mkdtemp(dir)) return 1;
+    snprintf(lib, sizeof lib, "%s/libcodemap.so", dir);
     int out = open(lib, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (out < 0) { fprintf(stderr, "create: errno %d\n", errno); return 1; }
     for (long i = 0; i < n; i++) {
@@ -106,6 +110,7 @@ int main(void) {
     for (int i = 0; i < THREADS; i++) pthread_join(c[i], NULL);
     for (int i = 0; i < 2; i++) pthread_join(a[i], NULL);
     unlink(lib);
+    rmdir(dir);
     printf("rounds %d bad %ld\n", ROUNDS, bad);
     return bad != 0;
 }

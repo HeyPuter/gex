@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
@@ -110,6 +111,11 @@ static void *limiter(void *arg) {
 }
 
 int main(void) {
+    /* Its own directory: concurrent runs under gexc share /tmp. */
+    static char dir[64] = "/tmp/fdmisc-XXXXXX", fa[80], fb[80];
+    if (!mkdtemp(dir)) return 2;
+    snprintf(fa, sizeof fa, "%s/a", dir);
+    snprintf(fb, sizeof fb, "%s/b", dir);
     ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) return 2;
     pthread_t t[7];
@@ -117,10 +123,11 @@ int main(void) {
     pthread_create(&t[1], 0, piper, 0);
     pthread_create(&t[2], 0, watcher, (void *)1L);
     pthread_create(&t[3], 0, watcher, (void *)2L);
-    pthread_create(&t[4], 0, truncater, "/tmp/fdmisc-a");
-    pthread_create(&t[5], 0, truncater, "/tmp/fdmisc-b");
+    pthread_create(&t[4], 0, truncater, fa);
+    pthread_create(&t[5], 0, truncater, fb);
     pthread_create(&t[6], 0, limiter, 0);
     for (int i = 0; i < 7; i++) pthread_join(t[i], 0);
+    rmdir(dir);
     struct rlimit r;
     getrlimit(RLIMIT_NOFILE, &r);
     printf("rounds %d bad %d nofile %lu\n", ROUNDS, atomic_load(&bad), (unsigned long)r.rlim_cur);

@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -32,6 +33,7 @@
 
 static atomic_int bad;
 static struct utsname first;
+static char dir[64] = "/tmp/quiet-threads-XXXXXX";
 
 static void fail(const char *what, long n) {
     if (atomic_fetch_add(&bad, 1) < 8) printf("bad: %s (%ld, errno %d)\n", what, n, errno);
@@ -40,7 +42,7 @@ static void fail(const char *what, long n) {
 static void *asker(void *arg) {
     int id = (int)(long)arg;
     char path[64];
-    snprintf(path, sizeof path, "/tmp/quiet-threads-%d-%d", (int)getpid(), id);
+    snprintf(path, sizeof path, "%s/%d", dir, id);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { fail("open", id); return 0; }
     char name[16];
@@ -91,6 +93,9 @@ static void *asker(void *arg) {
 }
 
 int main(void) {
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    if (!mkdtemp(dir)) return 2;
     if (uname(&first)) return 2;
     pthread_t t[THREADS];
     for (int i = 0; i < THREADS; i++) pthread_create(&t[i], 0, asker, (void *)(long)i);
@@ -102,6 +107,7 @@ int main(void) {
         if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st)) fail("child's parent", st);
     }
     for (int i = 0; i < THREADS; i++) pthread_join(t[i], 0);
+    rmdir(dir);
     printf("threads %d rounds %d bad %d\n", THREADS, ROUNDS, atomic_load(&bad));
     return atomic_load(&bad) != 0;
 }

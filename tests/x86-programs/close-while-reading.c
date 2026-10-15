@@ -69,6 +69,10 @@ static void *file_reader(void *arg) {
     return 0;
 }
 
+/* Its files, in a directory of its own: concurrent runs under gexc share
+ * /tmp. */
+static char cwr_dir[64] = "/tmp/cwr-XXXXXX", cwr_a[96], cwr_b[96], cwr_off[96];
+
 static int make_file(const char *path, char c, size_t n) {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
@@ -80,8 +84,8 @@ static int make_file(const char *path, char c, size_t n) {
 }
 
 static const char *files(void) {
-    int fa = make_file("/tmp/cwr-a", 'A', 4096);
-    int fb = make_file("/tmp/cwr-b", 'B', 4096);
+    int fa = make_file(cwr_a, 'A', 4096);
+    int fb = make_file(cwr_b, 'B', 4096);
     if (fa < 0 || fb < 0) return "setup failed";
     if (dup2(fa, TARGET) != TARGET) return "dup2 failed";
     pthread_t t[4];
@@ -98,7 +102,7 @@ static const char *files(void) {
             /* And an open that lands on the target: the lowest free
              * descriptor is not it, so make it so with a close first. */
             close(TARGET);
-            int f = open(i & 2 ? "/tmp/cwr-a" : "/tmp/cwr-b", O_RDONLY);
+            int f = open(i & 2 ? cwr_a : cwr_b, O_RDONLY);
             if (f < 0) atomic_fetch_add(&bad, 1);
             else if (f != TARGET) {
                 dup2(f, TARGET);
@@ -111,8 +115,8 @@ static const char *files(void) {
     close(TARGET);
     close(fa);
     close(fb);
-    unlink("/tmp/cwr-a");
-    unlink("/tmp/cwr-b");
+    unlink(cwr_a);
+    unlink(cwr_b);
     if (atomic_load(&bad)) return "a read saw a mix, another errno or nothing";
     if (atomic_load(&reads_ok) == 0) return "no read succeeded";
     return 0;
@@ -143,7 +147,7 @@ static void *off_reader(void *arg) {
 }
 
 static const char *offsets(void) {
-    int fd = open("/tmp/cwr-off", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int fd = open(cwr_off, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return "setup failed";
     for (unsigned i = 0; i < PIECES; i++) {
         unsigned char p[16] = {i & 0xff, i >> 8, (unsigned char)~(i & 0xff)};
@@ -155,7 +159,7 @@ static const char *offsets(void) {
     for (int i = 0; i < 4; i++) pthread_create(&t[i], 0, off_reader, 0);
     for (int i = 0; i < 4; i++) pthread_join(t[i], 0);
     close(fd);
-    unlink("/tmp/cwr-off");
+    unlink(cwr_off);
     for (int i = 0; i < PIECES; i++)
         if (atomic_load(&seen[i]) != 1) return "a piece was read twice or never";
     if (atomic_load(&off_bad)) return "a short or duplicated read";
@@ -454,6 +458,10 @@ static const char *sockets(void) {
 }
 
 int main(void) {
+    if (!mkdtemp(cwr_dir)) return 2;
+    snprintf(cwr_a, sizeof cwr_a, "%s/a", cwr_dir);
+    snprintf(cwr_b, sizeof cwr_b, "%s/b", cwr_dir);
+    snprintf(cwr_off, sizeof cwr_off, "%s/off", cwr_dir);
     struct {
         const char *name;
         const char *(*run)(void);
@@ -465,5 +473,6 @@ int main(void) {
         fflush(stdout);
         if (why) fail = 1;
     }
+    rmdir(cwr_dir);
     return fail;
 }

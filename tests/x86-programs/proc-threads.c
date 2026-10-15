@@ -18,7 +18,7 @@
 #define ROUNDS 150
 #define THREADS 3
 static long bad;
-static char tmpl[64];
+static char dir[64], tmpl[80];
 
 static void fail(const char *what) {
     if (__atomic_add_fetch(&bad, 1, __ATOMIC_RELAXED) < 5) fprintf(stderr, "bad: %s\n", what);
@@ -96,7 +96,11 @@ static int cmdline_is(char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "after-exec")) return cmdline_is(argv) ? 0 : 3;
-    snprintf(tmpl, sizeof tmpl, "/tmp/proc-threads-%d", (int)getpid());
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    snprintf(dir, sizeof dir, "/tmp/proc-threads-XXXXXX");
+    if (!mkdtemp(dir)) return 2;
+    snprintf(tmpl, sizeof tmpl, "%s/f", dir);
     if (!cmdline_is(argv)) fail("cmdline");
     pthread_t t[2 + THREADS];
     for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, maps_thread, (void *)i);
@@ -122,6 +126,7 @@ int main(int argc, char **argv) {
     }
     int st = 0;
     if (c < 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st)) fail("cmdline after exec");
+    rmdir(dir);
     printf("rounds %d bad %ld\n", ROUNDS, bad);
     return bad != 0;
 }

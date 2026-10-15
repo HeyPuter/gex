@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@ static atomic_int bad, stop;
  * checkers have finished it. */
 static atomic_int round_set = -1, checked;
 static atomic_uint want_uid, want_gid;
+static char dir[64] = "/tmp/cred-threads-XXXXXX";
 
 static void fail(const char *what, long n) {
     if (atomic_fetch_add(&bad, 1) < 8) printf("bad: %s (%ld, errno %d)\n", what, n, errno);
@@ -62,7 +64,7 @@ static void check(int id, int r) {
     uid_t ru, eu, su;
     if (getresuid(&ru, &eu, &su) || eu != u) fail("getresuid", (long)eu);
     char path[64];
-    snprintf(path, sizeof path, "/tmp/cred-threads-%d-%d", (int)getpid(), id);
+    snprintf(path, sizeof path, "%s/%d", dir, id);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     struct stat st;
     if (fd < 0 || fstat(fd, &st)) fail("open and stat", r);
@@ -94,7 +96,7 @@ static void *checker(void *arg) {
 static void *asker(void *arg) {
     (void)arg;
     char path[64];
-    snprintf(path, sizeof path, "/tmp/cred-threads-%d-asker", (int)getpid());
+    snprintf(path, sizeof path, "%s/asker", dir);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { fail("asker open", 0); return 0; }
     pid_t pg = getpgid(0), sid = getsid(0);
@@ -109,6 +111,9 @@ static void *asker(void *arg) {
 }
 
 int main(void) {
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    if (!mkdtemp(dir)) return 2;
     /* Every thread blocks SIGUSR1, so the one a checker sends its process
      * waits for that checker's sigtimedwait. */
     sigset_t set;
@@ -121,6 +126,7 @@ int main(void) {
     pthread_create(&t[2], 0, asker, 0);
     pthread_create(&t[3], 0, setter, 0);
     for (int i = 0; i < 4; i++) pthread_join(t[i], 0);
+    rmdir(dir);
     printf("rounds %d bad %d\n", ROUNDS, atomic_load(&bad));
     return atomic_load(&bad) != 0;
 }

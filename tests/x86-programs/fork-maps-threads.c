@@ -26,7 +26,7 @@
 
 static atomic_int stop, bad;
 static unsigned char *fixed;
-static char file_path[64];
+static char dir[64] = "/tmp/fork-maps-threads-XXXXXX", file_path[96];
 
 static void fail(const char *what, long n) {
     if (atomic_fetch_add(&bad, 1) < 8) printf("bad: %s (%ld)\n", what, n);
@@ -78,7 +78,10 @@ static int child(unsigned want) {
 }
 
 int main(void) {
-    snprintf(file_path, sizeof file_path, "/tmp/fork-maps-threads-%d", (int)getpid());
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    if (!mkdtemp(dir)) return 2;
+    snprintf(file_path, sizeof file_path, "%s/f", dir);
     int fd = open(file_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return 2;
     unsigned char page[2 * 4096];
@@ -108,6 +111,7 @@ int main(void) {
     atomic_store(&stop, 1);
     for (int i = 0; i < 3; i++) pthread_join(t[i], 0);
     unlink(file_path);
+    rmdir(dir);
     printf("forks %d bad %d\n", FORKS, atomic_load(&bad));
     return atomic_load(&bad) != 0;
 }

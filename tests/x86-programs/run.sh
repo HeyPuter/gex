@@ -9,7 +9,12 @@
 # x86-64 build under the browser shim in Node (run-node.mjs, memory64 shared
 # seed) for the programs listed in PAGE_PROGRAMS, when that seed has been built
 # (GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh) and node is on PATH.
+#
+# TIERS limits the run to those tiers (a space-separated list of t1, fjit,
+# page; all by default): a job that only wants the page, beside another that
+# runs the rest, sets TIERS=page.
 set -u
+TIERS=${TIERS:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 WORK=${WORK:-$(mktemp -d)}
@@ -142,6 +147,7 @@ for src in "$HERE"/*.c; do
     for target in $targets; do
     for tier in $tiers; do
         [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
+        case " ${TIERS:-$tier} " in *" $tier "*) ;; *) continue ;; esac
         flags=$gexflags
         [ $tier = fjit ] && flags="$flags --fjit"
         extra=""

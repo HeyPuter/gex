@@ -6,7 +6,7 @@
  * - One thread makes timerfds, arms them a few milliseconds ahead and reads
  *   the expiry, and makes epoll sets that watch an eventfd.
  * - One thread makes memfds, grows them with fallocate, maps them and checks
- *   the size and a byte written through the map.
+ *   the size, and a byte written through the map once it is unmapped.
  * - One thread splices from an empty pipe, which blocks until another
  *   thread writes it, then copies the bytes on with sendfile and
  *   copy_file_range and checks them. */
@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -33,6 +34,7 @@
 static atomic_int bad;
 static int ping, pong;
 static int feed[2];
+static char dir[64] = "/tmp/fdobj-threads-XXXXXX";
 
 static void fail(const char *what, long n) {
     if (atomic_fetch_add(&bad, 1) < 8) printf("bad: %s (%ld, errno %d)\n", what, n, errno);
@@ -95,9 +97,11 @@ static void *memfds(void *arg) {
         unsigned char *p = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, m, 0);
         if (p == MAP_FAILED) { fail("memfd mmap", i); close(m); continue; }
         p[len - 1] = (unsigned char)i;
+        /* Read back once unmapped: gex's shared file mappings are copies
+         * written back at munmap, not coherent with pread while mapped. */
+        munmap(p, len);
         unsigned char c = 0;
         if (pread(m, &c, 1, len - 1) != 1 || c != (unsigned char)i) fail("memfd byte", c);
-        munmap(p, len);
         close(m);
     }
     return 0;
@@ -117,7 +121,7 @@ static void *feeder(void *arg) {
 static void *splicer(void *arg) {
     (void)arg;
     char path[64];
-    snprintf(path, sizeof path, "/tmp/fdobj-threads-%d", (int)getpid());
+    snprintf(path, sizeof path, "%s/f", dir);
     int f = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     int g[2];
     if (f < 0 || pipe(g)) { fail("splice setup", 0); return 0; }
@@ -149,6 +153,9 @@ static void *splicer(void *arg) {
 }
 
 int main(void) {
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    if (!mkdtemp(dir)) return 2;
     ping = eventfd(0, EFD_CLOEXEC);
     pong = eventfd(0, EFD_CLOEXEC);
     if (ping < 0 || pong < 0 || pipe(feed)) return 2;
@@ -160,6 +167,7 @@ int main(void) {
     pthread_create(&t[4], 0, splicer, 0);
     pthread_create(&t[5], 0, feeder, 0);
     for (int i = 0; i < 6; i++) pthread_join(t[i], 0);
+    rmdir(dir);
     printf("rounds %d bad %d\n", ROUNDS, atomic_load(&bad));
     return atomic_load(&bad) != 0;
 }

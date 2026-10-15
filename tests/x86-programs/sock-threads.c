@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -151,7 +152,11 @@ static void *inet(void *arg) {
 
 int main(void) {
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof addr.sun_path, "/tmp/sock-threads-%d", (int)getpid());
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    static char dir[64] = "/tmp/sock-threads-XXXXXX";
+    if (!mkdtemp(dir)) return 2;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s/s", dir);
     unlink(addr.sun_path);
     addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(addr.sun_path) + 1);
     pthread_barrier_init(&listening, 0, 1 + CLIENTS);
@@ -162,6 +167,7 @@ int main(void) {
     pthread_create(&t[4], 0, inet, 0);
     for (int i = 0; i < 5; i++) pthread_join(t[i], 0);
     unlink(addr.sun_path);
+    rmdir(dir);
     printf("rounds %d bad %d\n", ROUNDS, atomic_load(&bad));
     return atomic_load(&bad) != 0;
 }

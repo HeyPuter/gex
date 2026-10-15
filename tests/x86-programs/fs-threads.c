@@ -238,9 +238,12 @@ int main(int argc, char **argv) {
     if (argv[0][0] == '/') snprintf(me, sizeof me, "%s", argv[0]);
     else if (getcwd(me, 256)) snprintf(me + strlen(me), sizeof me - strlen(me), "/%s", argv[0]);
     self = me;
-    snprintf(root, sizeof root, "/tmp/fs-threads-%d", (int)getpid());
+    /* Its own directory: concurrent runs under gexc share /tmp, and the
+     * guest's pid is the same in each. */
+    snprintf(root, sizeof root, "/tmp/fs-threads-XXXXXX");
+    if (!mkdtemp(root)) return 2;
+    chmod(root, 0755);
     char p[128];
-    mkdir(root, 0755);
     snprintf(p, sizeof p, "%s/a", root); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/b", root); mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/b/c", root); mkdir(p, 0755);
