@@ -5993,7 +5993,19 @@ impl Kernel {
         m: &GuestMem<'_>,
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
-        let (path, argv, envp) = self.read_exec_args(m, a)?;
+        let (mut path, argv, envp) = self.read_exec_args(m, a)?;
+        // `/proc/self/exe` and its kind name this process's files, which the
+        // exec replaces before the loader reads its program's segments: the
+        // file they name now, not the link.
+        for _ in 0..4 {
+            if !path.starts_with("/proc/") {
+                break;
+            }
+            match self.vfs.read_link(&path) {
+                Ok(to) if to.starts_with('/') => path = to,
+                _ => break,
+            }
+        }
         let (path, argv) = self.resolve_interpreter(path, argv)?;
         // Its head only: the loader reads the whole file once it is past the
         // point of no return (apt's methods are one 14 MB program, read
