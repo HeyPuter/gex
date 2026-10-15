@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Checks the frames gexc's compositor wrote (--wayland-out PREFIX:
 PREFIX-NNN.ppm, binary P6) for a picture: passes when one frame has at
-least MIN pixels of every COLOR (R,G,B, exact).
+least MIN pixels of every COLOR (R,G,B, exact; R,G,B:N wants N of it).
 
     frame.py PREFIX MIN COLOR...
 
 Prints the frame that matched, or each colour's best count."""
 import glob, sys
 
-prefix, need, colors = sys.argv[1], int(sys.argv[2]), [tuple(map(int, c.split(','))) for c in sys.argv[3:]]
+prefix, need = sys.argv[1], int(sys.argv[2])
+colors, needs = [], {}
+for a in sys.argv[3:]:
+    c, _, n = a.partition(':')
+    colors.append(tuple(map(int, c.split(','))))
+    needs[colors[-1]] = int(n) if n else need
 
 def pixels(path):
     data = open(path, 'rb').read()
@@ -32,8 +37,8 @@ for f in frames:
     # which these distinct colours make rare enough not to matter
     count = {bytes(c): px.count(bytes(c)) for c in colors}
     for c in colors: best[c] = max(best[c], count[bytes(c)])
-    if all(count[bytes(c)] >= need for c in colors):
+    if all(count[bytes(c)] >= needs[c] for c in colors):
         print(f'frame {f}: ' + ' '.join(f'{c}={count[bytes(c)]}' for c in colors))
         sys.exit(0)
-print(f'no frame of {len(frames)} has {need} pixels of each colour; best: ' + ' '.join(f'{c}={n}' for c, n in best.items()))
+print(f'no frame of {len(frames)} has enough of each colour ({" ".join(f"{c}>={needs[c]}" for c in colors)}); best: ' + ' '.join(f'{c}={n}' for c, n in best.items()))
 sys.exit(1)

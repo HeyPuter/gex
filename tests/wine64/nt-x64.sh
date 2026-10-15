@@ -115,6 +115,10 @@ check fiber 0 "$allok" fiber.exe
 # W64.4: a window painted with GDI, shown by the Wayland driver (for 3 s)
 if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/winewayland.drv" ]; then
 	WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255" check window 0 "shown${nl}bye" window.exe 3
+	# Wine's x64 notepad, up for 5 s and closed by WM_CLOSE (notepadrun.c):
+	# its caption, edit field, and the text of title, menu bar and status
+	# bar (black: about 740 pixels, 335 of them the menus')
+	WL="50,150,250:5000 255,255,255:50000 0,0,0:600" check notepad 0 "title [^$nl]*Notepad${nl}closed 0" notepadrun.exe 5
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c)
 if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
