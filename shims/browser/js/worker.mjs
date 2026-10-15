@@ -116,6 +116,10 @@ const bridgeImports = {
 };
 const bridges = {};
 const bridge = (k) => bridges[k] ?? bridgeImports[k]().then((m) => (bridges[k] = m));
+/// This Worker's runtime made ahead of its process (`preattach`, host.mjs):
+/// a promise of `{ gex, shared, stack }`, or null. Used by an exec'd
+/// posix_spawn child, which runs on a fresh memory; anything else leaves it.
+let preattached = null;
 /// Whether this process's memory can go to the next fork child when it exits
 /// (`Gex#recycleMemory`): not once another Worker holds it -- a thread, the
 /// compositor reading its pixels, the session reaching its door.
@@ -255,6 +259,26 @@ async function handle(msg) {
   }
   if (msg?.kind === 'pooledModules') {
     for (const [key, mod] of msg.entries ?? []) pooled.set(key, mod);
+    return;
+  }
+  // While this Worker waits in the pool: the kernel, shim and guest
+  // instances on a fresh memory, which `attach` would otherwise make after
+  // the process arrived (3.3 ms of an exec'd child's 10.6 ms start).
+  if (msg?.kind === 'preattach') {
+    const shared = !!msg.shared;
+    const stack = msg.kernelStack;
+    preattached = (async () => {
+      const gex = new Gex(new Env(), {
+        kernel: { ...msg.kernel, stackTop: stack },
+        shared,
+        modules: pooled,
+      });
+      await gex.preattach(msg.shim, msg.guest);
+      return { gex, shared, stack };
+    })().catch((err) => {
+      console.error(`[gex] a pooled Worker could not prepare a runtime: ${err?.message ?? err}`);
+      return null;
+    });
     return;
   }
   // The wineserver's door, from the host: this Worker's door calls go to it
@@ -543,17 +567,25 @@ async function handle(msg) {
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
-  const gex = new Gex(new WorkerEnv(), {
-    kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
-    // A thread joins its process's memory; a process makes one. `shared` only
-    // decides whether the memory a process builds can have threads later.
-    // A fork child may be given an exited process's memory, zeroed
-    // (`recycledMemory`, host.mjs): the same as a new one, its pages touched.
-    memory: msg.memory ?? msg.recycledMemory ?? null,
-    moduleStore: msg.moduleStore ?? null,
-    shared: !!msg.shared,
-    modules: pooled,
-  });
+  // The runtime made in the pool, when this process runs on a fresh memory
+  // of its own as that one does, on the same kernel stack.
+  const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
+    && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
+  preattached = null;
+  const gex = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+    ? pre.gex
+    : new Gex(new WorkerEnv(), {
+      kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
+      // A thread joins its process's memory; a process makes one. `shared` only
+      // decides whether the memory a process builds can have threads later.
+      // A fork child may be given an exited process's memory, zeroed
+      // (`recycledMemory`, host.mjs): the same as a new one, its pages touched.
+      memory: msg.memory ?? msg.recycledMemory ?? null,
+      moduleStore: msg.moduleStore ?? null,
+      shared: !!msg.shared,
+      modules: pooled,
+    });
+  if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;

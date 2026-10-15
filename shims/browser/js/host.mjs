@@ -59,6 +59,9 @@ const EARLY = Symbol('gex.early');
 /// The keys of the page's modules a pooled Worker was sent while it waited
 /// (`#poolModules`), so its start message carries only the rest.
 const POOLED = Symbol('gex.pooled');
+/// A pooled Worker's global-kernel stack slice, taken when it was sent
+/// `preattach` (keyed `pool:N` until a process or thread takes the Worker).
+const STACK_KEY = Symbol('gex.stackKey');
 /** How many exited processes' memories are kept for fork children, and how
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
@@ -155,6 +158,49 @@ export class ProcessHost {
     const entries = [...this.#pageModules.entries(), ...this.#unitModules.entries()];
     w[POOLED] = new Set(entries.map(([k]) => k));
     if (entries.length) w.postMessage({ kind: 'pooledModules', entries });
+  }
+
+  /**
+   * Have a pooled Worker make its runtime's instances (kernel, shim, guest)
+   * on a fresh memory while it waits (worker.mjs `preattach`), for an exec'd
+   * posix_spawn child to start on. On the kernel stack slice its start
+   * message will name, taken now. Only with a global kernel whose stacks are
+   * known, and shared memory (the build every Worker of a page is); nothing
+   * of a process is in it, so a Worker taken for anything else drops it.
+   * About what a fresh process's memory holds before it runs: the shim's
+   * data and the Worker's shim stack.
+   */
+  #preattach(w) {
+    if (!this.#kernel || !this.#stacks || !this.#extra?.shared || w[STACK_KEY]) return;
+    const key = `pool:${++this.#poolSeq}`;
+    let stack;
+    try {
+      stack = this.#nextKernelStack(key);
+    } catch {
+      return;
+    }
+    w[STACK_KEY] = key;
+    this.#shimModule().then((shim) => w.postMessage({
+      kind: 'preattach',
+      shim,
+      guest: this.#guest,
+      kernel: this.#kernel,
+      kernelStack: stack,
+      shared: true,
+    }));
+  }
+  #poolSeq = 0;
+
+  /** The kernel stack slice for the Worker `w` starting `key`: the one it
+   *  was given in the pool (`#preattach`), now `key`'s, or a new one. */
+  #stackFor(w, key) {
+    const pooled = w[STACK_KEY];
+    if (pooled === undefined) return this.#nextKernelStack(key);
+    delete w[STACK_KEY];
+    const slice = this.#stackOf.get(pooled);
+    this.#stackOf.delete(pooled);
+    this.#stackOf.set(key, slice);
+    return this.#stacks.area + slice * this.#stacks.size;
   }
 
   /** A module the page just kept, to the Workers waiting in the pool. */
@@ -365,7 +411,10 @@ export class ProcessHost {
         const m = e && e.data !== undefined ? e.data : e;
         early.push(m);
         // Listening now (`ready` is posted once its handler is on).
-        if (m?.kind === 'ready' && !w[POOLED]) this.#poolModules(w);
+        if (m?.kind === 'ready' && !w[POOLED]) {
+          this.#poolModules(w);
+          this.#preattach(w);
+        }
         // Still pooled (not taken, the host not stopped): start the next.
         if (m?.kind === 'ready' && this.#warm.includes(w)) this.#topUp();
       };
@@ -589,7 +638,7 @@ export class ProcessHost {
             closureCount: (closure ?? []).length,
             ...msg,
             outputAck: this.#outputAck(w),
-            kernelStack: this.#nextKernelStack(pid),
+            kernelStack: this.#stackFor(w, pid),
             // Compiled once here, not from bytes in every Worker.
             shim: shimMod,
             guest: this.#guest,
@@ -798,7 +847,7 @@ export class ProcessHost {
             memory: m.thread.memory,
             moduleStore: m.thread.moduleStore,
             procOpts: m.thread.procOpts,
-            kernelStack: this.#nextKernelStack(key),
+            kernelStack: this.#stackFor(w2, key),
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,

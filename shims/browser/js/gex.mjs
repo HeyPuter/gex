@@ -1982,19 +1982,9 @@ export class Gex {
     this.#closureModules = [];
   }
 
-  /**
-   * Join a process that is already loaded, as one of its threads. Same memory,
-   * shim and guest as `load`, but no program is placed and no kernel built --
-   * both already exist in the adopted memory.
-   *
-   * Instantiating a second time is safe only because the shared build is linked
-   * with `--shared-memory`: wasm-ld emits passive data segments and an
-   * atomic-guarded `__wasm_init_memory`, so the first instance initialises the
-   * data and later ones leave it alone. A plain memory would wipe the kernel.
-   */
-  async attach(shimWasm, guestWasm, { devices = true } = {}) {
-    const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
-    _at('start');
+  /** The kernel, shim and guest instances on this Worker's memory: what
+   *  `attach` starts with, and what `preattach` does ahead of a process. */
+  async #instantiate(shimWasm, guestWasm, _at = () => {}) {
     await this.#startKernel();
     _at('kernel started');
     // A compiled `Module` if the host has one, bytes otherwise: passing a
@@ -2015,25 +2005,6 @@ export class Gex {
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes.
     this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
-    // The devices this process has -- process-wide flags in shared memory, so
-    // only a *process* sets them. A thread answering for itself would turn a
-    // GPU or network off underneath the threads using it. Before the kernel is
-    // built, which is when the device nodes are made and the vtest socket bound.
-    if (devices) {
-      this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
-      this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
-      if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
-      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
-      this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
-      // The unit cache and ELF export providers, as `load` gives a process its
-      // own: a forked child's table starts empty while its GOT holds what
-      // its parent's providers made code (cgen/elfprov.rs).
-      if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
-      if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
-      this.#libprovConfig();
-    // Narrate one page's directory writes, in every process. See #136.
-    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
-    }
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -2057,6 +2028,69 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     _at('guest instantiated');
+  }
+
+  /**
+   * `attach`'s instances, made while this Worker waits in the host's pool for
+   * a process to run on a memory of its own (an exec'd posix_spawn child,
+   * `#adoptExec`): the kernel's, the shim's and the guest's, on this Gex's
+   * fresh memory. Nothing of a process is in them yet -- its pid, descriptors,
+   * environment and devices are its kernel's, built at adopt -- so the Worker
+   * can still be given any process; one that brings its own memory (a thread,
+   * a forked child) leaves this Gex unused.
+   */
+  async preattach(shimWasm, guestWasm) {
+    await this.#instantiate(shimWasm, guestWasm);
+    this.#preattached = true;
+  }
+
+  /** Whether `preattach` has run and no `attach` has used it yet. */
+  get preattached() {
+    return this.#preattached;
+  }
+  #preattached = false;
+
+  /** The process's environment, for a Gex made before its process was known
+   *  (`preattach`). */
+  setEnv(env) {
+    this.#env = env;
+  }
+
+  /**
+   * Join a process that is already loaded, as one of its threads. Same memory,
+   * shim and guest as `load`, but no program is placed and no kernel built --
+   * both already exist in the adopted memory.
+   *
+   * Instantiating a second time is safe only because the shared build is linked
+   * with `--shared-memory`: wasm-ld emits passive data segments and an
+   * atomic-guarded `__wasm_init_memory`, so the first instance initialises the
+   * data and later ones leave it alone. A plain memory would wipe the kernel.
+   */
+  async attach(shimWasm, guestWasm, { devices = true } = {}) {
+    const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
+    _at('start');
+    if (this.#preattached) this.#preattached = false;
+    else await this.#instantiate(shimWasm, guestWasm, _at);
+    // The devices this process has -- process-wide flags in shared memory, so
+    // only a *process* sets them. A thread answering for itself would turn a
+    // GPU or network off underneath the threads using it. Before the kernel is
+    // built, which is when the device nodes are made and the vtest socket bound.
+    if (devices) {
+      this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
+      this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+      // The unit cache and ELF export providers, as `load` gives a process its
+      // own: a forked child's table starts empty while its GOT holds what
+      // its parent's providers made code (cgen/elfprov.rs).
+      if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+      this.#libprovConfig();
+    // Narrate one page's directory writes, in every process. See #136.
+    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
+    }
+    const e = this.#shim.exports;
     // A thread joins its process's numbering; a forked child decides once its
     // kernel exists (`adoptProcess`).
     this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
