@@ -5,7 +5,11 @@
 # page runs the child in the calling thread's Worker until its exec
 # (shims/browser/src/vfork.rs). The output must be the native run's, and
 # every child (24 spawns and a missing program) must have run in place
-# rather than as a copied fork.
+# rather than as a copied fork. And the children's exec'd programs start on
+# the runtimes their Workers made in the host's pool (`preattach`): at least
+# one does, and none fails to be made or is dropped as not fitting -- under
+# the mem64 seed every one failed ("cannot import i32 memory as i64") and
+# each spawn quietly paid for a new one.
 #
 #   tests/browser-spawn.sh [x86] [a64]      (default both)
 #
@@ -26,15 +30,20 @@ parent: fd5 open, usr2 handled, usr1 open
 missing program: ENOENT
 3 of 3 other threads ran"
 
-# check LABEL TRACEFILE OUTFILE STATUS
+# check LABEL TRACEFILE OUTFILE STATUS ERRFILE
 check() {
     got=$(grep -v '^\[' "$3")
     inplace=$(grep -c '^\[vfork\] pid [0-9]*: \(exec\|exit\)' "$2" 2>/dev/null)
-    if [ "$4" = 0 ] && [ "$got" = "$want" ] && [ "${inplace:-0}" = 25 ]; then
-        echo "ok   spawn-threads ($1, page, 25 children in place)"
+    pooled=$(grep -c '^\[pool\] pid [0-9]*: pooled runtime' "$2" 2>/dev/null)
+    unfit=$(grep -c 'could not prepare a runtime\|pooled runtime does not fit' "$5" 2>/dev/null)
+    if [ "$4" = 0 ] && [ "$got" = "$want" ] && [ "${inplace:-0}" = 25 ] \
+        && [ "${pooled:-0}" -ge 1 ] && [ "${unfit:-0}" = 0 ]; then
+        echo "ok   spawn-threads ($1, page, 25 children in place, $pooled on pooled runtimes)"
     else
-        echo "FAIL spawn-threads ($1, page): exit $4, ${inplace:-0} of 25 children in place"
+        echo "FAIL spawn-threads ($1, page): exit $4, ${inplace:-0} of 25 children in place," \
+            "${pooled:-0} on pooled runtimes, ${unfit:-0} pooled runtimes failed or unfit"
         printf '%s\n' "$got" | head -10
+        grep -m3 'could not prepare a runtime\|pooled runtime does not fit' "$5"
         fail=1
     fi
 }
@@ -54,8 +63,8 @@ for arch in ${*:-x86 a64}; do
         GEX_VFORK_TRACE="$WORK/x86.trace" GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 180 \
             node shims/browser/js/run-node.mjs --file /bin/spawn-threads="$bin" \
             --file "$ld=$(readlink -f $ld)" --file "$libc=$(readlink -f $libc)" \
-            --argv0 /bin/spawn-threads "$seed" "$bin" >"$WORK/x86.out" 2>/dev/null
-        check x86 "$WORK/x86.trace" "$WORK/x86.out" $?
+            --argv0 /bin/spawn-threads "$seed" "$bin" >"$WORK/x86.out" 2>"$WORK/x86.err"
+        check x86 "$WORK/x86.trace" "$WORK/x86.out" $? "$WORK/x86.err"
         ;;
     a64)
         seed=web/public/gex/seed.shared.wasm
@@ -73,8 +82,8 @@ for arch in ${*:-x86 a64}; do
             node shims/browser/js/run-node.mjs --file /bin/spawn-threads="$bin" \
             --file /lib/ld-linux-aarch64.so.1="$root/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
             --file /lib/aarch64-linux-gnu/libc.so.6="$root/usr/lib/aarch64-linux-gnu/libc.so.6" \
-            --argv0 /bin/spawn-threads "$seed" "$bin" >"$WORK/a64.out" 2>/dev/null
-        check a64 "$WORK/a64.trace" "$WORK/a64.out" $?
+            --argv0 /bin/spawn-threads "$seed" "$bin" >"$WORK/a64.out" 2>"$WORK/a64.err"
+        check a64 "$WORK/a64.trace" "$WORK/a64.out" $? "$WORK/a64.err"
         ;;
     esac
 done

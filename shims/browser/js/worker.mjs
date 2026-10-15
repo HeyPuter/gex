@@ -117,7 +117,7 @@ const bridgeImports = {
 const bridges = {};
 const bridge = (k) => bridges[k] ?? bridgeImports[k]().then((m) => (bridges[k] = m));
 /// This Worker's runtime made ahead of its process (`preattach`, host.mjs):
-/// a promise of `{ gex, shared, stack }`, or null. Used by an exec'd
+/// a promise of `{ gex, shared, stack, mem64 }`, or null. Used by an exec'd
 /// posix_spawn child, which runs on a fresh memory; anything else leaves it.
 let preattached = null;
 /// Whether this process's memory can go to the next fork child when it exits
@@ -267,6 +267,12 @@ async function handle(msg) {
   if (msg?.kind === 'preattach') {
     const shared = !!msg.shared;
     const stack = msg.kernelStack;
+    // The memory's index type is the process's, and the host says which: a
+    // wasm64 shim imports an i64 memory. Decided here, before the memory is
+    // made, since no start message has said it yet (it was left i32, and
+    // every m64 Worker's runtime failed to instantiate).
+    const mem64 = !!msg.mem64;
+    if (mem64) globalThis.GEX_MEM64 = 1;
     preattached = (async () => {
       const gex = new Gex(new Env(), {
         kernel: { ...msg.kernel, stackTop: stack },
@@ -274,7 +280,7 @@ async function handle(msg) {
         modules: pooled,
       });
       await gex.preattach(msg.shim, msg.guest);
-      return { gex, shared, stack };
+      return { gex, shared, stack, mem64 };
     })().catch((err) => {
       console.error(`[gex] a pooled Worker could not prepare a runtime: ${err?.message ?? err}`);
       return null;
@@ -580,7 +586,17 @@ async function handle(msg) {
   const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
     && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
   preattached = null;
-  const gex = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+  // A runtime made in the pool that does not fit the process it was made
+  // for is a host bug, not a choice: said, and the process gets a new one.
+  const fits = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+    && pre.mem64 === !!msg.mem64;
+  if (pre && !fits) {
+    console.error(`[gex] pid ${msg.child?.pid}: the pooled runtime does not fit its process `
+      + `(shared ${pre.shared}/${!!msg.shared}, stack ${pre.stack}/${msg.kernelStack}, mem64 ${pre.mem64}/${!!msg.mem64}); a new one is made`);
+  }
+  // Back to the process's own type, should the pool's have been the other.
+  if (pre && pre.mem64 && !msg.mem64) delete globalThis.GEX_MEM64;
+  const gex = fits
     ? pre.gex
     : new Gex(new WorkerEnv(), {
       kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,

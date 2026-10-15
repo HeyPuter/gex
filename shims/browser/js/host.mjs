@@ -187,6 +187,9 @@ export class ProcessHost {
       kernel: this.#kernel,
       kernelStack: stack,
       shared: true,
+      // The process memory's index type, which every Worker of this host
+      // makes or joins the same way (`?mem64=1`, run-node's GEX_MEM64).
+      mem64: !!this.#extra?.mem64,
     }));
   }
   #poolSeq = 0;

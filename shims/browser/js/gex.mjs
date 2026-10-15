@@ -2626,7 +2626,11 @@ export class Gex {
    */
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
+    const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
+    // Whether the exec started on the runtime its Worker made in the pool
+    // (tests/browser-spawn.sh counts these).
+    vforkTrace(`[pool] pid ${child.pid}: ${pooled ? 'pooled runtime' : 'new runtime'}`);
     const e = this.#shim.exports;
     this.#setMetadata(guestWasm);
     const o = child.opts ?? {};
