@@ -51,19 +51,24 @@ if [ ! -f "$U/.complete" ]; then
 		run --providers 2>&1
 	} > "$log"
 	grep -q '^provider wine_libm:' "$log" || { rm -rf "$U.new"; fail "$G is not an x86 gexc (no wine_libm provider; log $log)"; }
-	n=0 bad=0 nohints=0
+	n=0 bad=0 nohints=0 nocode=0
 	while read -r f b; do
 		[ -z "$f" ] || [ "${f#\#}" != "$f" ] && continue
 		case $f in /*) ;; *) f=$D/$f ;; esac
 		n=$((n + 1))
 		out=$(run "$f" --pe-base "$b" --jobs "${UNITS_JOBS:-12}" 2>&1); rc=$?
 		echo "$out" | grep -a "indirect-call hints\|rror\|^\[cgen\] [0-9]\| at 0x" | cut -c1-300 >> "$log"
+		# An image with no code (resources only: normaliz.dll, tzres.dll) has
+		# nothing to link and no unit; not a failure.
+		if [ $rc != 0 ] && echo "$out" | grep -q "wasm-ld: error: no input files"; then
+			rc=0; nocode=$((nocode + 1)); echo "no code: $f at $b" >> "$log"
+		fi
 		[ $rc = 0 ] || { bad=$((bad + 1)); echo "FAILED ($rc): $f at $b" >> "$log"; }
 		[ -d "$D/icall" ] && echo "$out" | grep -q "indirect-call hints: none" && nohints=$((nohints + 1))
 	done < "$D/units.list"
 	[ $bad = 0 ] || { rm -rf "$U.new"; fail "$bad of $n images did not build (log $log)"; }
 	mv "$U.new" "$U" && touch "$U/.complete"
-	echo "units: built $n images for inputs $K in $(( $(date +%s) - t0 )) s ($nohints without an indirect-call profile; log $log)" >&2
+	echo "units: built $n images for inputs $K in $(( $(date +%s) - t0 )) s ($nohints without an indirect-call profile, $nocode with no code; log $log)" >&2
 fi
 touch "$U"
 # Keep the three most recently used sets.
