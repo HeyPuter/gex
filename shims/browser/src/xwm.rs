@@ -6,7 +6,6 @@
 //! a server in another) or in this process's own name table when there is no
 //! global kernel at all.
 
-use gex_kernel::syscalls::Kernel;
 use gex_kernel::unix::{RemoteUnix, UnixSocket};
 use gex_kernel::vfs::FileHandle;
 use std::sync::Arc;
@@ -19,14 +18,14 @@ pub use gex_xwm::Xwm;
 const X_SOCKETS: &[&str] = &["/tmp/.X11-unix/X0", "\0/tmp/.X11-unix/X0"];
 
 /// Connect to the X server this process is running, if it is running one.
-pub fn connect(kernel: &Kernel) -> Option<Xwm> {
-    Xwm::start(open(kernel)?)
+pub(crate) fn connect(cx: &crate::wl::ProcCx) -> Option<Xwm> {
+    Xwm::start(open(cx)?)
 }
 
 /// The socket, whichever kind of name table holds the X server.
-fn open(kernel: &Kernel) -> Option<Arc<dyn FileHandle>> {
+fn open(cx: &crate::wl::ProcCx) -> Option<Arc<dyn FileHandle>> {
     for name in X_SOCKETS {
-        if let Some(r) = kernel.unix_remote {
+        if let Some(r) = cx.unix_remote {
             let id = (r.connect)(name.as_ptr() as gex_kernel::PAddr, name.len() as u32);
             if id >= 0 {
                 unsafe {
@@ -41,7 +40,7 @@ fn open(kernel: &Kernel) -> Option<Arc<dyn FileHandle>> {
             }
         }
         let sock = Arc::new(UnixSocket::new(true));
-        if kernel.socket_names.connect(&sock, name).is_ok() {
+        if cx.socket_names.connect(&sock, name).is_ok() {
             unsafe {
                 crate::write_stderr(&format!(
                     "[xwm] connected to the X server on {name:?}\n"

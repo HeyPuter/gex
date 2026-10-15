@@ -3242,6 +3242,7 @@ fn set_host(host: Host) {
 fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
+    wl::publish_process(&h.kernel);
     publish_runs(h);
     bind_mine(h, 0);
 }
@@ -9234,6 +9235,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
+    // The program the compositor's pump asks about (`wl::ProcCx`).
+    wl::publish_process(&h.kernel);
     if let Some(p) = program.as_ref() {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());
@@ -11022,7 +11025,7 @@ fn schedule() -> i32 {
     // thread woken by something it does not wait for, or by nothing, looks
     // and parks again (docs/kernel-locking.md §5.2 step 2); one whose wait
     // is over finishes its call and runs (§3.7).
-    match if first { waitq::Turn::Locked } else { waitq::idle_turn() } {
+    match if first { waitq::Turn::Full } else { waitq::idle_turn() } {
         waitq::Turn::Idle(why, ends_by_itself) => {
             if why != 0 {
                 report_idle(why);
@@ -11045,7 +11048,7 @@ fn schedule() -> i32 {
             set_paused_to(2);
             return 2;
         }
-        waitq::Turn::Locked => {}
+        waitq::Turn::Full => {}
     }
     loop {
         // Before anything is chosen, the compositor: a wayland client writes
@@ -11179,23 +11182,14 @@ fn report_deadlock() {
     with_host(|h| set_exit(h, 128 + 31));
 }
 
-/// The compositor's work, when it has any (`wl::pump_wanted`), before a
-/// scheduler turn: a wayland client writes a request then blocks on the
-/// reply, so it must run where every thread passes on its way to waiting.
-/// What it writes to a client's socket (a frame callback, a buffer release,
-/// input) notifies the socket's waiters. It needs the kernel (a buffer's
-/// shared mapping) and so takes the lock, for the pump alone; the turn
-/// itself takes none ([`pick_mine`]).
+/// The compositor's work, when it has any, before a scheduler turn: a
+/// wayland client writes a request then blocks on the reply, so it must run
+/// where every thread passes on its way to waiting. What it writes to a
+/// client's socket (a frame callback, a buffer release, input) notifies the
+/// socket's waiters. No kernel lock: what it needs of the process is
+/// published (`wl::ProcCx`).
 fn pump_compositor() {
-    if !wl::pump_wanted() {
-        return;
-    }
-    with_host(|h| {
-        if let Some(w) = h.wayland.clone().filter(|w| w.needs_pump()) {
-            let gm = GuestMem::new(guest_bytes());
-            w.pump(&h.kernel, &gm);
-        }
-    });
+    wl::pump_if_wanted();
 }
 
 /// Every thread gone ends this process, all this Worker has; the status is
