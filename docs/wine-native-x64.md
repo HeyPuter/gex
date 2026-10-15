@@ -52,8 +52,9 @@ possible.
   `gex.mjs`). The translator's x86-64 code uses the mem64 flavour
   (docs/mem64.md §3, §7).
 - **Address limit.** Wine's user-space limit (virtual.c) is a value the
-  process gets at start. It is 4 GiB in a lowered process and the full
-  x86-64 limit in a memory64 one.
+  process gets at start: 4 GiB in a lowered process, with code below gex's
+  2 GiB code reach (§2, "Pointers"), and the full x86-64 limit in a
+  memory64 one.
 - **Fixed-base images.** x64 images at 0x1_4000_0000 with no relocations
   map at their base, which the lowered flavour cannot do (§2, "Pointers").
 - **What stays the same.** The LLP64 and LP64 layouts, the kernel
@@ -130,7 +131,12 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
 - **Wine's headers.** On `__wasm64__` they take the AMD64 `CONTEXT` and
   `_WIN64` layouts, the way `__wasm32__` takes i386's, but without x86
   inline asm or intrinsics. `include/` gets guards beside the wasm32 ones.
-- **winebuild `CPU_WASM64`** has x86-64's data layout and a new file,
+- **`CPU_WASM64` in Wine's tools** (W64.1, Wine fe342afc4bc): widl,
+  winebuild and winegcc know `wasm64`, with x86-64's data layout, NDR stack
+  layout and NT header machine (AMD64), and no assembly. A spec file's
+  `-arch=x86_64` entries reach wasm64 too, as `-arch=i386` ones reach
+  wasm32: an x86_64-only assembly export writes `-arch=x86_64,!wasm64`.
+- **winebuild `CPU_WASM64`** (W64.2) has a new file,
   `tools/winebuild/wasm64.c`, beside `wasm32.c`. It writes one entry adapter
   per export, reading the **Win64 ABI** from gex's x86-64 context:
   - arguments 1-4 in RCX, RDX, R8 and R9, or XMM0-3 by position; then the
@@ -192,7 +198,22 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
   start: under 4 GiB when lowered, and x86-64's own limit in the memory64
   flavour (Windows' own `/LARGEADDRESSAWARE:NO` x64 layout is
   similar). Images are placed low, as the NT layer packs them: code below
-  `MMAP_TOP`, so the dispatch directory can name it. An x64 image that
+  `MMAP_TOP`, so the dispatch directory can name it.
+  **As built (W64.1b):** a lowered process's data uses the whole 4 GiB;
+  its code stays below gex's code reach, `DISPATCH_MAX_PAGES` *
+  `DISPATCH_PAGE` = 2 GiB (`w64_code_space_limit` in virtual.c, a setting
+  of the flavour), mem64's policy (docs/mem64.md §3). Every executable view
+  (images, `PAGE_EXECUTE*` allocations and section views) is placed below
+  it; an image whose base is above it is relocated, as any image whose base
+  is taken. A page above it made executable later (a JIT's data turned to
+  code) is refused with `STATUS_INVALID_PAGE_PROTECTION` and an `err:virtual`
+  line naming the range, never moved. Data without an address is found by
+  address (`map_free_area`): gex places a mapping without one below its
+  code space only. `tests/wine64/highdata.c` allocates 2.5 GiB and checks
+  all of it. Growing the directory to 4 GiB instead doubles it to 4 MiB,
+  which no longer fits between `RESERVED_END` and `EXEC_BASE` (0x400000,
+  where i386 executables load), so it would have to move: an ABI change for
+  every generator, unit and translation cache. An x64 image that
   cannot move (a fixed base at 0x1_4000_0000 with no relocations) fails to
   map when lowered, as it does under the NT layer
   (`pe-x64/highbase-fixed`). Such a program runs in the memory64 flavour. The
@@ -276,7 +297,7 @@ layer are untouched.
 | phase | work | gate (runs on gooner unless noted) | estimate |
 |---|---|---|---|
 | W64.0 toolchain | the GexLLP64 plugin and `llp64.h` in `tools/wine-wasm/llp64/`; musl wasm64 as a program, lowered; libgex64; ELF64 container plus `GUEST_X86_64`; gex-kernel's x86-64 wasm-program signal frames; configure `--host=wasm64-unknown-linux-musl` (Unix side) | `tests/wine64/layout.sh`: about 80 Win32 and Wine structures (CONTEXT, TEB, PEB, EXCEPTION_RECORD, MSG, OVERLAPPED, ...) compared field by field with `x86_64-pc-windows-msvc`, clang only. `tests/wasm64/run.sh`: tests/wasm32's signals, threads, posix_spawn, dlopen and sjlj, built LP64 and lowered, run natively and in the browser runtime | 2-3 d |
-| W64.1 first proof: Unix side native, PE side translated | `signal_wasm64.c`, `current_machine`, virtual.c limits, `link-w64.sh` (loader, ntdll.so), the server's AMD64 personality, `WINEGEX_DOOR=0`; Wine's x86_64 PE DLLs built from the fork with MinGW and translated (Wine's own `[0x7ffe1000]` path) | tests/nt **x64** hello_args, then sync, mtx, tls, seh, cxx, apc, crtmem and exitproc on the W64 loader (`nt-run-x64.sh`, like W3's) | 3-5 d |
+| W64.1 first proof: Unix side native, PE side translated | `signal_wasm64.c`, `current_machine`, virtual.c limits, `link-w64.sh` (loader, ntdll.so), the server's AMD64 personality, `WINEGEX_DOOR=0`; Wine's x86_64 PE DLLs built from the fork with MinGW and translated (Wine's own `[0x7ffe1000]` path) | tests/nt **x64** hello_args, then sync, mtx, tls, seh, cxx, apc, crtmem and exitproc on the W64 loader (`tests/wine64/nt-x64.sh` over `tools/wine-wasm/w64-dist.sh`'s install): **10 of 10 pass** (2026-10-14). mtx takes about 7 minutes: every contended wait is a system call through the `ud2` entry | 3-5 d |
 | W64.2 PE side native | winebuild `CPU_WASM64` adapters and skeletons, ICALL x64 stubs and entry thunks, gexrt64, x64 table unwinding across native frames, pelink and pesym for wasm64; native ntdll, kernelbase, kernel32, ucrtbase and msvcrt, with the other DLLs still translated; QPC fast path; typed dispatcher | `tests/wasm64/dll`: every adapter kind (register and stack integers, XMM arguments, a structure by reference, a structure return, varargs, callbacks, a data export, a forwarder) from a MinGW x64 program; the W64.1 tests/nt set with the native core; `x64/msvc_cxxeh` | 4-6 d |
 | W64.3 prefix and door | wineboot's install as children for a win64 prefix; the door with the LP64 request layout (both hosts), USD, the fd-cache section, the session copy | the install-as-children leg on win64; every console tests/nt x64 case, door on and off | 2-3 d |
 | W64.4 GUI and GL | win32u.so; winewayland with libwayland, xkbcommon and FreeType built LP64; opengl32 and gex-gl's guest library LP64; the opengl32 id fast path | x64 window, user_win, gdi, input, display, glcompat and glfast on gex's compositor | 3-5 d |
