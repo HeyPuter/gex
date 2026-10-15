@@ -926,7 +926,8 @@ async function preloadUnits(list, f, at) {
           // Every unit in one archive (web/eject-site.mjs): its modules
           // compiled, its other files shared, and `closed`: the Workers
           // ask the host for no unit file the archive does not hold.
-          const t = untar((await fetchShared(href, f)).buffer);
+          const tar = (await fetchShared(href, f)).buffer;
+          const t = untar(tar);
           const mods = [];
           for (const [p, bytes] of Object.entries(t.files)) {
             const rel = p.replace(/^\/+/, '');
@@ -943,6 +944,11 @@ async function preloadUnits(list, f, at) {
             out.push([`file:${rel}`, s]);
           }
           out.push(...await Promise.all(mods), ['closed', true]);
+          // Everything in it is compiled (V8 keeps its own copy of each
+          // module's bytes) or copied out: the archive itself goes now. Left
+          // to the collector it stayed until the next full collection, the
+          // shell's 361 MiB for minutes.
+          if (!(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
           continue;
         }
         if (name.startsWith('file:')) {
