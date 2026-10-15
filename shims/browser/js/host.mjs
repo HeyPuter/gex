@@ -213,6 +213,12 @@ export class ProcessHost {
   }
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
+  /** A process whose first Worker's thread went with the old program when
+   *  another thread called `execve` (Linux's de_thread): the process runs on,
+   *  and ends, in that thread's Worker. Per pid, whichever of the two exits
+   *  arrives first waits here for the other: `{ resolve }` from the first
+   *  Worker, `{ status }` from the thread Worker that carried it. */
+  #carried = new Map();
   #threads = 0;
   // The global kernel's per-Worker stacks, as the first Worker reported them.
   // Each Worker's kernel instance has its own `__stack_pointer` global, all
@@ -883,6 +889,33 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        if (m.threadGone) {
+          // Not the process's end: it goes on in another Worker.
+          const c = this.#carried.get(pid);
+          this.#release(pid, w);
+          if (c && 'status' in c) {
+            this.#carried.delete(pid);
+            resolve(c.status);
+          } else {
+            this.#carried.set(pid, { resolve });
+          }
+          break;
+        }
+        if (m.carries) {
+          // A thread Worker that took its process over by `execve`: its exit
+          // is the process's, owed to whoever waits on the first Worker.
+          const proc = Number(String(pid).split(':')[0]);
+          const c = this.#carried.get(proc);
+          this.#onExit(m, proc);
+          this.#release(pid, w);
+          if (c?.resolve) {
+            this.#carried.delete(proc);
+            c.resolve(m.status);
+          } else {
+            this.#carried.set(proc, { status: m.status });
+          }
+          break;
+        }
         if (m.recycle instanceof WebAssembly.Memory) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
           this.#onOutput(

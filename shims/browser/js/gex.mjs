@@ -3072,7 +3072,9 @@ export class Gex {
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
-    if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    // Gone before its Worker came up: the process exec'd (the other threads go
+    // with the old program) or ended. Nothing to run, and nothing wrong.
+    if (!entry) return { entry: 0n, ctx: Number(thread.ctx), gone: true };
     if (thread.procOpts) this.#opts = thread.procOpts;
     if (thread.compat) this.#shim.exports.gex_set_compat?.(1);
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);

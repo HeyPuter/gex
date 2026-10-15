@@ -323,6 +323,12 @@ struct SpawnContext {
     /// (`exit_group`, a fatal signal, a gex failure): the first thread only
     /// sees `stopping`, and reports this instead of its own way out.
     ended: Arc<Mutex<Option<Exit>>>,
+    /// An `execve` made by a thread other than the first. Linux's de_thread:
+    /// the other threads go, and the process carries on as the new program
+    /// under its pid. The first thread, which owns the process's end, sees
+    /// `stopping` and runs it. Claimed under `ended`'s lock, so an exec and
+    /// an `exit_group` racing in two threads give one outcome.
+    exec: Arc<Mutex<Option<ExecRequest>>>,
     engine: Engine,
     /// The image module, instantiated fresh in each thread's store.
     image_module: Module,
@@ -1329,6 +1335,7 @@ fn run_program_with(
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ended: Arc::new(Mutex::new(None)),
+        exec: Arc::new(Mutex::new(None)),
         engine: engine.clone(),
         image_module: module.clone(),
         linker: base_linker,
@@ -1392,6 +1399,17 @@ fn run_program_with(
         }
     };
     profile::harvest(&mut store)?;
+    // The first thread ended with `exit` while others run: the process goes
+    // on, as on Linux, until one of them ends it or execs.
+    let stopped = match stopped {
+        Stopped::Exited(exit) => {
+            if store.data().thread_only {
+                wait_for_process_end(&spawn);
+            }
+            thread_exec(&spawn).map_or(Stopped::Exited(exit), Stopped::Exec)
+        }
+        s => s,
+    };
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
@@ -1407,11 +1425,6 @@ fn run_program_with(
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
     };
-    // The first thread ended with `exit` while others run: the process goes
-    // on, as on Linux, until one of them ends it.
-    if store.data().thread_only {
-        wait_for_process_end(&spawn);
-    }
     // Another thread may have ended the process (this one then only saw
     // `stopping`).
     let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
@@ -2265,6 +2278,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ended: Arc::new(Mutex::new(None)),
+        exec: Arc::new(Mutex::new(None)),
         engine: cx.engine.clone(),
         image_module: cx.image_module.clone(),
         linker: cx.linker.clone(),
@@ -2408,11 +2422,17 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     catch_up_table(&mut store)?;
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     profile::harvest(&mut store)?;
-    match stopped {
+    let stopped = match stopped {
         Stopped::Exited(exit) => {
             if store.data().thread_only {
                 wait_for_process_end(&cx);
             }
+            thread_exec(&cx).map_or(Stopped::Exited(exit), Stopped::Exec)
+        }
+        s => s,
+    };
+    match stopped {
+        Stopped::Exited(exit) => {
             stop_other_threads(&cx, false);
             Ok(cx.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit))
         }
@@ -2745,7 +2765,10 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     libprov::guest_stop().forget(thread.tid as u32);
     profile::harvest(&mut store)?;
     match stopped {
-        Stopped::Exec(_) => bail!("execve from a non-main thread is not supported"),
+        Stopped::Exec(req) => {
+            exec_from_thread(&cx, req);
+            Ok(None)
+        }
         // Stopped because another thread ended the process: that one says how.
         Stopped::Exited(_) if cx.stopping.load(std::sync::atomic::Ordering::Acquire) => Ok(None),
         Stopped::Exited(_) if store.data().thread_only => Ok(None),
@@ -2759,6 +2782,28 @@ fn wait_for_process_end(cx: &SpawnContext) {
     while !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+}
+
+/// A thread other than the first called `execve`: hand the exec to the first
+/// thread and stop the rest, without waiting for them (this thread is one of
+/// the ones counted). Lost to an `exit_group` or exec that came first.
+fn exec_from_thread(cx: &SpawnContext, req: ExecRequest) {
+    use std::sync::atomic::Ordering;
+    {
+        let ended = cx.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if ended.is_some() || cx.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        *cx.exec.lock().unwrap_or_else(|e| e.into_inner()) = Some(req);
+        cx.stopping.store(true, Ordering::Release);
+    }
+    cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).futexes.wake_everything();
+}
+
+/// The exec a thread other than the first handed over, once the first thread
+/// has stopped.
+fn thread_exec(cx: &SpawnContext) -> Option<ExecRequest> {
+    cx.exec.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// A thread other than the first ended the process with `exit`: keep the
