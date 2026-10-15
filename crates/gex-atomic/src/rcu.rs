@@ -140,13 +140,22 @@ impl<T> Published<T> {
 
     /// Drop what no reader can see; true when nothing is left waiting.
     fn reclaim(&self) -> bool {
+        // The epoch before the slots are looked at bounds what they can
+        // vouch for. This runs outside the writers' mutex, so a value can be
+        // retired after the scan below, while a reader pinned since the scan
+        // is still holding it: with no bound, a scan that found every slot
+        // idle freed that value too (the settle test's intermittent SIGSEGV).
+        // A value retired before this load was replaced before the scan, so
+        // a reader that still holds it was pinned during the scan.
+        let limit = self.epoch.load(SeqCst);
         let oldest = self
             .slots
             .iter()
             .map(|s| s.load(SeqCst))
             .filter(|&e| e != 0)
             .min()
-            .unwrap_or(u64::MAX);
+            .unwrap_or(u64::MAX)
+            .min(limit);
         let (gone, empty) = {
             let mut r = self.retired.lock().unwrap_or_else(|e| e.into_inner());
             let mut gone = Vec::new();
