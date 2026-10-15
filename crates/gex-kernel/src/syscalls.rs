@@ -491,7 +491,7 @@ pub trait ObjectPlace: Send + Sync {
 /// One guest process's kernel state.
 pub struct Kernel {
     pub fds: FdTable,
-    pub mem: MemoryMap,
+    pub mem: crate::mem::Mm,
     pub vfs: Vfs,
     /// Address of the running thread's context struct.
     pub ctx_addr: u64,
@@ -3349,7 +3349,7 @@ impl Kernel {
         }
         Kernel {
             fds,
-            mem: MemoryMap::new(brk_start),
+            mem: crate::mem::Mm::new(MemoryMap::new(brk_start)),
             vfs: Vfs::new(),
             ctx_addr,
             pid: 1,
@@ -4235,7 +4235,7 @@ impl Kernel {
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
     /// set the waiters bit and answered `EAGAIN`).
     fn lock_pi_op(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
-        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
         futex_pi_park(&self.futex_cx(&mapped), m, a)
     }
 
@@ -4336,7 +4336,7 @@ impl Kernel {
                 Some(op)
             }
             nr::FUTEX => {
-                let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+                let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
                 futex_block(&self.futex_cx(&mapped), m, a)
             }
             nr::WAIT4 => {
@@ -4579,7 +4579,7 @@ impl Kernel {
             // -- memory ------------------------------------------------------
             nr::BRK => {
                 // Zeroed, because Linux zeroes it and libc counts on that.
-                let (result, grew) = self.mem.brk_grow(a[0]);
+                let (result, grew) = self.mem.lock().brk_grow(a[0]);
                 if let Some((from, to)) = grew {
                     let _ = m.zero_dirty(from, (to - from) as usize);
                 }
@@ -4591,7 +4591,7 @@ impl Kernel {
                 self.shared_maps
                     .retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
                 self.retire_code(a[0], a[1]);
-                flushed.and_then(|_| self.mem.unmap(a[0], a[1])).map(|_| 0)
+                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
             }
             nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
             nr::MREMAP => self.sys_mremap(m, a),
@@ -4605,7 +4605,7 @@ impl Kernel {
                 if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
                     self.retire_code(a[0], a[1]);
                 }
-                let r = self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
+                let r = self.mem.lock().protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
                 // Executable again (a loader filling an import table in
                 // `.text`, a JIT done writing): what is there now is checked
                 // against the function tier's units (`cgen::on_retire`
@@ -4868,7 +4868,7 @@ impl Kernel {
     }
 
     fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
         futex_call(&self.futex_cx(&mapped), m, a)
     }
 
@@ -7059,6 +7059,7 @@ impl Kernel {
         let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
         let (dst, moved) = self
             .mem
+            .lock()
             .mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
         if moved {
             let keep = old_len.min(new_len) as usize;
@@ -7114,6 +7115,7 @@ impl Kernel {
             let end = addr.saturating_add(len);
             let anon: Vec<(u64, u64)> = self
                 .mem
+                .lock()
                 .vmas()
                 .iter()
                 .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
@@ -7183,7 +7185,7 @@ impl Kernel {
             // that map the same library at the same address then agree that
             // the code is the same, which is what lets them share the
             // dispatch slots it was translated into.
-            let start = self.mem.mmap_from(
+            let start = self.mem.lock().mmap_from(
                 addr,
                 len_aligned,
                 prot_bits,
@@ -7257,15 +7259,15 @@ impl Kernel {
         // code, so in a 64-bit memory it stays below 4 GiB with the code; the
         // loader runs at INTERP_BASE (docs/mem64.md §3).
         // What was known to be zero before the mapping (which forgets it).
-        let clean_before = self.mem.clean_ranges().to_vec();
+        let clean_before = self.mem.lock().clean_ranges().to_vec();
         // Only what this mapping claims (another caller's claim may since
         // have been written).
-        let _ = self.mem.take_fresh();
+        let _ = self.mem.lock().take_fresh();
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
         let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
-            self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
+            self.mem.lock().mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
         } else {
-            self.mem.mmap(addr, len, prot_bits, flags, "")?
+            self.mem.lock().mmap(addr, len, prot_bits, flags, "")?
         };
         if let Some((path, base)) = pinned {
             // Said as it happens: the end-of-run report is lost when the
@@ -7285,18 +7287,19 @@ impl Kernel {
         // the claim took past the mapping is free arena, still zero, and
         // known clean for the next mapping into it.
         let mut clean_before = clean_before;
-        if let Some((fs, fe)) = self.mem.take_fresh() {
+        let fresh = self.mem.lock().take_fresh();
+        if let Some((fs, fe)) = fresh {
             let at = clean_before.partition_point(|&(s, _)| s < fs);
             clean_before.insert(at, (fs, fe));
             if end < fe {
-                self.mem.mark_clean(end.max(fs), fe);
+                self.mem.lock().mark_clean(end.max(fs), fe);
             }
         }
         for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
             m.zero_dirty(a, (b - a) as usize)?;
         }
         if prot_bits & crate::mem::prot::WRITE == 0 {
-            self.mem.mark_clean(start, end);
+            self.mem.lock().mark_clean(start, end);
         }
         Ok(start)
     }
@@ -7677,6 +7680,7 @@ impl Kernel {
         }
         let executable = self
             .mem
+            .lock()
             .vmas()
             .iter()
             .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
@@ -8509,9 +8513,9 @@ impl Kernel {
         // execution in a browser run of an X server, which polls in a tight
         // loop with several hundred mappings live -- and between two `mmap`s
         // it produces the identical string every time.
-        let generation = self.mem.generation();
+        let generation = self.mem.lock().generation();
         if s.maps_generation != generation || s.maps.is_empty() {
-            s.maps = self.mem.proc_maps();
+            s.maps = self.mem.lock().proc_maps();
             s.maps_generation = generation;
         }
         // Compared before cloning, for the same reason at a smaller scale:
@@ -9696,7 +9700,7 @@ mod tests {
         k.syscall(&mut m, 0);
         assert_eq!(errno(&m), Errno::EFAULT.as_return() as i64);
         // Mapped: the view follows the map.
-        k.mem.insert(word, word + 0x1000, crate::mem::prot::READ | crate::mem::prot::WRITE, "futex");
+        k.mem.lock().insert(word, word + 0x1000, crate::mem::prot::READ | crate::mem::prot::WRITE, "futex");
         assert!(k.mem.view().mapped(word, 4));
         assert!(!k.mem.view().mapped(word + 0xffe, 4));
         m.write_u32(word, 7).unwrap();
@@ -9731,7 +9735,7 @@ mod tests {
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
         assert_eq!(errno(&m), Errno::EAGAIN.as_return() as i64);
         // Unmapped again: EFAULT.
-        k.mem.unmap(word, 0x1000).unwrap();
+        k.mem.lock().unmap(word, 0x1000).unwrap();
         assert!(!k.mem.view().mapped(word, 4));
         set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 7, 0]);
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));

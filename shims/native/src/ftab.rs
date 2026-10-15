@@ -831,6 +831,7 @@ fn libs_allow(caller: &mut Caller<'_, HostState>, addr: u64) -> bool {
     }
     let name = caller.data_mut().with_kernel(|k| {
         k.mem
+            .lock()
             .vmas()
             .iter()
             .find(|v| addr >= v.start && addr < v.end)
@@ -852,7 +853,8 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         return None;
     }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
-        let v = k.mem.vmas();
+        let mm = k.mem.lock();
+        let v = mm.vmas();
         (
             // A library a stateful provider replaced is not code to translate (`libprov::replaced`).
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && !crate::libprov::replaced(v.start, v.end)).map(|v| (v.start, v.end)).collect(),

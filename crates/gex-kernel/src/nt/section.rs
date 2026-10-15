@@ -486,7 +486,7 @@ pub fn map_image(
     }
     g.zero(base, size as usize)?;
     g.write(base, &bytes)?;
-    if stl.vm.mirror(&mut k.mem, base, base + size) {
+    if stl.vm.mirror(&mut k.mem.lock(), base, base + size) {
         k.retired_code.push((base, base + size));
         crate::note_code_change();
     }

@@ -286,7 +286,7 @@ fn elf_entry(head: &[u8]) -> Option<u64> {
 /// Name every file-backed executable mapping the kernel has now.
 fn note_mappings(st: &mut RecState, kernel: &gex_kernel::Kernel, proc: &ProcProf) {
     let mut pl = proc.placements.lock().unwrap_or_else(|e| e.into_inner());
-    for v in kernel.mem.vmas() {
+    for v in kernel.mem.lock().vmas() {
         if v.prot & gex_kernel::mem::prot::EXEC == 0 {
             continue;
         }

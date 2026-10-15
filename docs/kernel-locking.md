@@ -534,6 +534,16 @@ in the scheduler pick after each wake of the global WAKE word: about
 7. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
    published VMA snapshot for readers (dispatch_miss, faults,
    /proc/self/maps).
+   - The mm lock (L12a): `Kernel::mem` is an `Mm`, the process's
+     `MemoryMap` behind its own `gex_kernel::sync::Mutex`, with the
+     published view (`MapView`) beside it, read without the lock. Every
+     reader and writer takes it for a leaf computation (`k.mem.lock()`),
+     never across a trap; a copy (`fork`, a vfork child) is a copy of the
+     map with its own lock and view, and `Mm::shared` is the same map for
+     a holder outside the kernel. Nothing is lock-free yet: every caller
+     still holds the kernel lock too. That is the next two pieces, the
+     mapping calls in the free class (L12b) and the shim's code
+     registration drained from the mm (L12c).
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a

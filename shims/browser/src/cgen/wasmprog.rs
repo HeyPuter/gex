@@ -162,8 +162,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // guest's slice (`GUEST_LIMIT`, just under 2 GiB).
         let lo = crate::nt::split_windows_space().map_err(|e| format!("W3: {e}"))?;
         crate::with_host(|h| {
-            crate::w3_address_space(&mut h.kernel.mem, lo);
-            h.kernel.mem.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
+            crate::w3_address_space(&mut h.kernel.mem.lock(), lo);
+            h.kernel.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
         });
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();

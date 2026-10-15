@@ -771,8 +771,8 @@ pub fn create_thread_state(
         stl.vm.reserve(teb, teb_size, page_prot::READWRITE, true, Kind::Private, "[teb]");
         let lo = stl.vm.find_free(stack_size, false, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?;
         stl.vm.reserve(lo, stack_size, page_prot::READWRITE, true, Kind::Private, "[stack]");
-        let _ = stl.vm.mirror(&mut k.mem, teb, teb + teb_size);
-        let _ = stl.vm.mirror(&mut k.mem, lo, lo + stack_size);
+        let _ = stl.vm.mirror(&mut k.mem.lock(), teb, teb + teb_size);
+        let _ = stl.vm.mirror(&mut k.mem.lock(), lo, lo + stack_size);
         (teb, lo)
     };
     g.zero(teb, teb_size as usize)?;

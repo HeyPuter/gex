@@ -318,7 +318,7 @@ pub(crate) fn reserve_region(kernel: &mut gex_kernel::Kernel, aot: &Aot) {
     if aot.replacements.is_empty() {
         return;
     }
-    kernel.mem.insert(
+    kernel.mem.lock().insert(
         REPL_BASE,
         REPL_END,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
@@ -722,6 +722,7 @@ pub(crate) fn unseen_code(caller: &mut Caller<'_, HostState>, pc: u64) -> Option
     })?;
     let name = caller.data_mut().with_kernel(|k| {
         k.mem
+            .lock()
             .vmas()
             .iter()
             .find(|v| v.start <= pc && pc < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)

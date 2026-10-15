@@ -157,6 +157,55 @@ impl std::fmt::Debug for ViewCell {
     }
 }
 
+/// A process's memory map behind its own lock, the process's mm lock
+/// (docs/kernel-locking.md §3.5): what a mapping call changes and every
+/// reader that needs more than the published view ([`MapView`]) looks at.
+/// Held for a leaf computation only, never across a trap back to JS.
+///
+/// A copy is a copy of the map, as a fork's or a vfork child's is: its own
+/// lock and its own view. [`Mm::shared`] is the same map, for a holder of
+/// the process's state outside its kernel.
+pub struct Mm {
+    map: std::sync::Arc<crate::sync::Mutex<MemoryMap>>,
+    /// The map's published view, the same one for the map's life (`renew`
+    /// keeps it): read without the lock.
+    view: std::sync::Arc<MapView>,
+}
+
+impl Mm {
+    pub fn new(map: MemoryMap) -> Mm {
+        let view = std::sync::Arc::clone(map.view());
+        Mm { map: std::sync::Arc::new(crate::sync::Mutex::new(map)), view }
+    }
+
+    pub fn lock(&self) -> crate::sync::MutexGuard<'_, MemoryMap> {
+        self.map.lock()
+    }
+
+    /// The same map, not a copy.
+    pub fn shared(&self) -> Mm {
+        Mm { map: std::sync::Arc::clone(&self.map), view: std::sync::Arc::clone(&self.view) }
+    }
+
+    /// The map's published view.
+    pub fn view(&self) -> &std::sync::Arc<MapView> {
+        &self.view
+    }
+}
+
+impl Clone for Mm {
+    fn clone(&self) -> Mm {
+        let map = self.lock().clone();
+        Mm::new(map)
+    }
+}
+
+impl std::fmt::Debug for Mm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mm")
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
