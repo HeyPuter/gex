@@ -59,13 +59,20 @@ if (isMainThread) {
   setKernelMemory(compositorChannel, memory);
 
   const seq = k.k_ws_seq(slot);
+  // The event goes once the Worker is about to park, not at a fixed time
+  // after it starts: a Worker instantiating the kernel can take longer than
+  // that (Node 24 under a gate's load), and an event sent before the park
+  // reads as a park that never waited (`atomic.wait` says 1, "not equal").
+  let ready;
+  const parking = new Promise((r) => { ready = r; });
   const parked = new Promise((resolve, reject) => {
     const w = new Worker(fileURLToPath(import.meta.url), {
       workerData: { module, memory, process_, slot, seq, ns: 5000 * 1e6 },
     });
-    w.once('message', resolve);
+    w.on('message', (m) => (m === 'parking' ? ready() : resolve(m)));
     w.once('error', reject);
   });
+  await parking;
   await new Promise((r) => setTimeout(r, 100));
   const sent = performance.timeOrigin + performance.now();
   // Block 0: the first block a lone process claims.
@@ -82,6 +89,7 @@ if (isMainThread) {
 } else {
   const { module, memory, process_, slot, seq, ns } = workerData;
   const k = await instantiate(module, memory, process_);
+  parentPort.postMessage('parking');
   const r = k.k_ws_park(slot, seq, BigInt(ns));
   // `performance.now()` counts from each thread's own origin.
   parentPort.postMessage({ r, end: performance.timeOrigin + performance.now() });
