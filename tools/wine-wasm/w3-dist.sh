@@ -15,7 +15,7 @@
 # target/x86/release/gexc). The PE side is Wine's own DLLs (the host's
 # staged x86 Wine prefix, GEX_WINE_PREFIX, with the core DLLs from WINE):
 # no Windows binaries.
-# Env: GEXC; W3_JOBS (default 12). The log of a build is CACHE/w3-dist-K.log.
+# Env: GEXC; W3_JOBS (default 12). The log of a build is CACHE/w3-dist-KEY.log.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
@@ -24,8 +24,10 @@ W=$(cd "${1:?WINE}" && pwd); mkdir -p "${2:?CACHE}"; C=$(cd "$2" && pwd)
 K=$(git -C "$W" rev-parse --short=12 HEAD)
 mk() { make -s -C "$here" WINE_DIR="$W" W3_CACHE="$C" ${GEXC:+GEXC="$GEXC"} "$@"; }
 paths=$(mk paths) || { echo "w3-dist: make paths failed" >&2; exit 1; }
-echo "w3-dist: Wine $K, $(sed -n 's/^W3_KEY=//p' <<< "$paths") (log $C/w3-dist-$K.log)" >&2
-mk dist prefix prefix-null > "$C/w3-dist-$K.log" 2>&1 ||
-  { echo "w3-dist: the build failed: $C/w3-dist-$K.log" >&2; tail -5 "$C/w3-dist-$K.log" >&2; exit 1; }
+# the log by the whole key: two builds of one commit with different gex inputs may run at once
+key=$(sed -n 's/^W3_KEY=//p' <<< "$paths"); log=$C/w3-dist-$key.log
+echo "w3-dist: Wine $K, $key (log $log)" >&2
+mk dist prefix prefix-null > "$log" 2>&1 ||
+  { echo "w3-dist: the build failed: $log" >&2; tail -5 "$log" >&2; exit 1; }
 grep -E '^(W3_DIST|W3_PREFIX|W3_PREFIX_NULL|W3_PREFIX_BARE|W3_KEY)=' <<< "$paths"
 echo "W3_WINE=$W"
