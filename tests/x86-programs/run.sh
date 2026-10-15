@@ -106,7 +106,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # of a threaded parent can fault walking musl's thread list, whose
 # descriptors sit on thread stacks above 4 GiB that its memory was not grown
 # to cover (fails the same on 31a21cad).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads"}
+# exec-dethread: an exec from a second thread while the first joins, spins,
+# reads or waits on a futex; the old program must not run over the new one
+# (the page's de_thread). Page only, as spawn-threads.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -120,7 +123,7 @@ for src in "$HERE"/*.c; do
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
-    case $name in spawn-threads) tiers=${tiers#t1} ;; esac
+    case $name in spawn-threads | exec-dethread) tiers=${tiers#t1} ;; esac
     for target in $targets; do
     for tier in $tiers; do
         [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
@@ -141,7 +144,7 @@ for src in "$HERE"/*.c; do
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
-        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ] || [ $name = fs-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
+        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ] || [ $name = fs-threads ] || [ $name = exec-dethread ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then

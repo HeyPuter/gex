@@ -2885,6 +2885,11 @@ struct Thread {
     /// while the process goes on. Its Worker reads it, without the kernel
     /// lock, through [`thread_gone`].
     gone: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the thread itself once it is `gone` and has stopped: it runs
+    /// no more guest code. An `execve` from another thread waits for this
+    /// before it replaces the image (`exec_waits`), as Linux's de_thread
+    /// waits for the other threads to die.
+    halted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A thread's place in its run: what it waits for and what its parked call
@@ -2922,6 +2927,7 @@ impl Thread {
             kstate,
             run: Arc::new(Mutex::new(Run { pc, waiting, blocked_on: None, owed: Owed::default() })),
             gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3175,6 +3181,9 @@ struct Host {
     threads: Vec<Thread>,
     exit: Option<i32>,
     jit: JitHere,
+    /// When an `execve` from a threaded process began waiting for its other
+    /// threads to stop (`exec_waits`).
+    exec_waited_since: Option<u64>,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
@@ -5102,6 +5111,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             threads: vec![Thread::new(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable)],
             exit: None,
             jit: JitHere,
+            exec_waited_since: None,
         magic_tail: HOST_MAGIC,
     });
     entry
@@ -7151,17 +7161,21 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
     let mut mapped = Vec::new();
-    let stop = match free_syscall(ctx, pc, &mut mapped) {
+    // Another thread's `execve` took the process from this one: not even a
+    // lock-free call runs, since the memory it would touch is about to be the
+    // new program's (`exec_waits`).
+    let gone_now = thread_gone();
+    if gone_now {
+        stop_gone();
+    }
+    let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped) } {
     Some(stop) => stop,
     None => with_host(|h| {
         let stop = (|h: &mut Host| -> i32 {
         // Another thread's `execve` took the process from this one: the
         // thread table is the new program's, and this thread is not in it.
         if thread_gone() {
-            set_resume_none();
-            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
-                run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
-            }
+            stop_gone();
             return 3;
         }
         // Whether the kernel this call is about to run against is still
@@ -7632,7 +7646,24 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 vfork::stage_exec(h, &path, &argv, &envp);
                 1
             }
+            // Not for a wasm32 program, whose call cannot be made again from
+            // its instruction: its threads have no translated code to run
+            // over the new image, and stop at their next call (`do_exec`).
+            SyscallOutcome::Exec { path, argv, envp } if !frames_stay() && exec_waits(h) => {
+                // The other threads are told to go and this one waits a
+                // moment and makes the call again, until they have.
+                let _ = (path, argv, envp);
+                let mut r = h.threads[cur()].run();
+                r.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
+                r.waiting = Waiting::Sleep(turn_now() + EXEC_WAIT_STEP_NS);
+                r.blocked_on = Some(gex_kernel::BlockOp::Sleep(std::time::Duration::from_nanos(EXEC_WAIT_STEP_NS)));
+                r.owed = Owed { reissue: true, ..Owed::default() };
+                drop(r);
+                waitq::leave();
+                3
+            }
             SyscallOutcome::Exec { path, argv, envp } => {
+                h.exec_waited_since = None;
                 let entry = do_exec(h, &path, &argv, &envp);
                 if entry == 0 {
                     // The kernel checked the path before saying `Exec`, so a
@@ -8794,6 +8825,7 @@ pub(crate) fn bind_mine(h: &mut Host, i: usize) {
         MY_TID.with(|c| c.set(tid));
         MY_RUN.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.run)));
         MY_GONE.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.gone)));
+        MY_HALTED.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.halted)));
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -8815,13 +8847,31 @@ thread_local! {
     static MY_RUN: RefCell<Option<Arc<Mutex<Run>>>> = const { RefCell::new(None) };
     /// And its [`Thread::gone`].
     static MY_GONE: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
+    /// And its [`Thread::halted`].
+    static MY_HALTED: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
 }
 
 /// Whether this Worker's thread went with its old program when another
 /// thread of the process called `execve`. Its index into the thread table
 /// (`cur()`) means nothing any more: the table is the new program's.
 pub(crate) fn thread_gone() -> bool {
-    MY_GONE.with(|c| c.borrow().as_ref().is_some_and(|g| g.load(std::sync::atomic::Ordering::Acquire)))
+    MY_GONE.with(|c| c.borrow().as_ref().is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// This Worker's thread, found [`thread_gone`], stops: it is exited, runs no
+/// more guest code, and says so to the `execve` waiting for it
+/// ([`Thread::halted`]). Nowhere to resume.
+pub(crate) fn stop_gone() {
+    if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+        run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+    }
+    MY_HALTED.with(|c| {
+        if let Some(h) = c.borrow().as_ref() {
+            h.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    set_resume_none();
+    set_resume_ctx_none();
 }
 
 /// [`thread_gone`], for the host: a process Worker whose thread is gone must
@@ -8961,6 +9011,12 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
         let Some(i) = h.threads.iter().position(|t| t.kstate.tid == tid) else {
             return 0;
         };
+        // Gone before it ever ran: another thread's `execve` is replacing
+        // the program it was made for.
+        if h.threads[i].gone.load(std::sync::atomic::Ordering::SeqCst) {
+            h.threads[i].halted.store(true, std::sync::atomic::Ordering::SeqCst);
+            return 0;
+        }
         h.threads[i].run().waiting = Waiting::Runnable;
         set_current(h, i);
         h.threads[i].run().pc as i64
@@ -9177,6 +9233,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         threads: vec![Thread::new(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable)],
         exit: None,
         jit: JitHere,
+        exec_waited_since: None,
         magic_tail: HOST_MAGIC,
     }
 }
@@ -9700,6 +9757,63 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         link_state(4);
     }
     entry
+}
+
+/// How long an `execve` waits between looks at its other threads, and how
+/// long it waits for them in all before it replaces the image anyway.
+const EXEC_WAIT_STEP_NS: u64 = 1_000_000;
+const EXEC_WAIT_MAX_NS: u64 = 2_000_000_000;
+
+/// Whether an `execve` from a threaded process has to wait before it
+/// replaces the image (Linux's de_thread): each other thread is told to go
+/// (`gone`); one parked in a call is exited where it parked, and woken, and
+/// ends there without running guest code again; one not yet in its Worker
+/// will not be adopted. One that may be running guest code is waited for:
+/// it stops at its next safepoint, dispatch miss or call ([`stop_gone`]),
+/// before the image under it changes. A thread that never gets there (lost
+/// in a host call) is given up on after `EXEC_WAIT_MAX_NS`.
+fn exec_waits(h: &mut Host) -> bool {
+    if h.threads.len() < 2 {
+        return false;
+    }
+    let me = cur();
+    let mut running = false;
+    let mut woke = false;
+    for (i, t) in h.threads.iter().enumerate() {
+        if i == me {
+            continue;
+        }
+        t.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut r = t.run();
+        match r.waiting {
+            Waiting::Exited => {}
+            // Running, as far as anyone can tell: its Worker says when not.
+            Waiting::Runnable => running |= !t.halted.load(std::sync::atomic::Ordering::SeqCst),
+            // Not adopted yet (`gex_adopt_thread` refuses it now), or parked.
+            _ => {
+                woke |= !matches!(r.waiting, Waiting::Elsewhere);
+                r.waiting = Waiting::Exited;
+                r.blocked_on = None;
+            }
+        }
+    }
+    if woke {
+        waitq::wake_process();
+    }
+    if !running {
+        return false;
+    }
+    let now = turn_now();
+    let since = *h.exec_waited_since.get_or_insert(now);
+    if now.saturating_sub(since) >= EXEC_WAIT_MAX_NS {
+        warn_line(&format!(
+            "[gex] pid {}: execve went ahead after {} ms with a thread still running",
+            h.kernel.pid,
+            (now - since) / 1_000_000
+        ));
+        return false;
+    }
+    true
 }
 
 /// What identifies the code at `page`, when anything does.
@@ -12877,8 +12991,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // running the old program's code (a loop that makes no syscall): it goes
     // here, as on Linux it would at once.
     if thread_gone() {
-        set_resume_none();
-        set_resume_ctx_none();
+        stop_gone();
         trap();
     }
     // Rearm: translated code counts a word down to zero and calls here; leaving
@@ -13247,6 +13360,14 @@ pub extern "C" fn gex_my_pid() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
+    // A thread another thread's `execve` took the process from, which got
+    // here before a safepoint or syscall stopped it: the code it was running
+    // is gone, and the new program's memory is under this address. It goes,
+    // as at a safepoint, rather than translating whatever is there now.
+    if thread_gone() {
+        stop_gone();
+        trap();
+    }
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
     miss_count(0);
