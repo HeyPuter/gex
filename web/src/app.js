@@ -503,9 +503,38 @@ async function begin(opts, base, at, state, meter) {
     const counter = new Int32Array(new SharedArrayBuffer(4));
     fill = { buf, at: counter, files: fl.files };
     const t0 = performance.now();
+    // The late units (eject-site.mjs --late: `unit:KEY/FILE` entries), each
+    // compiled once its bytes are in and added to the modules every Worker
+    // started from then on is given (`preModules`, in the host's `extra`); a
+    // Worker started before takes the bytes from the fill itself
+    // (worker.mjs `loadFile`).
+    const late = fl.files.filter(([p]) => p.startsWith('unit:'));
+    let li = 0, lateN = 0;
+    const add = (entry) => {
+      if (!preModules) return;
+      // Before `closed`, which a Worker reads as the end of the list.
+      const c = preModules.findIndex(([k]) => k === 'closed');
+      preModules.splice(c < 0 ? preModules.length : c, 0, entry);
+      if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+    };
+    const takeLate = (n) => {
+      for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
+        const [name, off, size] = late[li];
+        const rel = name.slice('unit:'.length);
+        const bytes = new Uint8Array(buf, off, size).slice();
+        if (rel.endsWith('/c.wasm')) {
+          WebAssembly.compile(bytes).then((m) => add([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m]),
+            (e) => say(`[app] late unit ${rel}: ${e}\n`));
+        } else {
+          const s = new Uint8Array(new SharedArrayBuffer(size));
+          s.set(bytes);
+          add([`file:${rel}`, s]);
+        }
+      }
+    };
     fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
       into: buf,
-      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); },
+      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); takeLate(n); },
     }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
       .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
   }

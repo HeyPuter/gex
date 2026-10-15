@@ -66,7 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill } from './lazy-fetch.mjs';
+import { setFill, fillFile } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
@@ -493,6 +493,10 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
+      // A late unit's (eject-site.mjs --late), in the fill: a Worker started
+      // before the page had compiled it waits for its bytes there.
+      const late = fillFile(`unit:${rel}`);
+      if (late) return late;
       if (preClosed) return null;
       try {
         if (c.root) {
