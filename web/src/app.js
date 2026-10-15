@@ -109,6 +109,17 @@ export async function start(opts = {}) {
  *                handle.ready() with `ready: 'manual'`
  * and then 'exited' or 'failed' (with `error`). `at` holds each phase's
  * start, and `elapsed` the time at the call, in ms since start().
+ *
+ * From 'boot' on, what the program has reached (a W3 build's units, as each
+ * process installs them: shims/browser/js/fetch-note.mjs `noteStatus`):
+ *   boot   {units: {done, total}, programs: {done, total}, program, image}:
+ *          the build's units installed so far (distinct images) of all it
+ *          ships, the .exe ones among them (each a process), the latest
+ *          program started and the latest image loaded (file names; a
+ *          native wasm32 module, a Wine builtin, counts there but is no
+ *          unit); a build without units has totals of 0
+ *   log    the latest events, oldest first, at most 50: {t (ms since
+ *          start()), kind ('phase', 'program', 'image', 'fetch'), text}
  */
 function progressMeter(state, onProgress) {
   const t0 = performance.now();
@@ -121,8 +132,14 @@ function progressMeter(state, onProgress) {
     elapsed: 0,
     error: null,
     fetch: null,
+    boot: { units: { done: 0, total: 0 }, programs: { done: 0, total: 0 }, program: null, image: null },
+    log: [],
   };
   state.progress = p;
+  const log = (kind, text) => {
+    p.log.push({ t: Math.round(performance.now() - t0), kind, text });
+    if (p.log.length > 50) p.log.splice(0, p.log.length - 50);
+  };
   let timer = null;
   let last = -1e9;
   const emit = () => {
@@ -132,7 +149,11 @@ function progressMeter(state, onProgress) {
     p.elapsed = Math.round(last - t0);
     if (!onProgress) return;
     try {
-      onProgress({ ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch } });
+      const b = p.boot;
+      onProgress({
+        ...p, download: { ...p.download }, compile: { ...p.compile }, at: { ...p.at }, fetch: p.fetch && { ...p.fetch },
+        boot: { ...b, units: { ...b.units }, programs: { ...b.programs } }, log: p.log.map((l) => ({ ...l })),
+      });
     } catch (e) {
       console.warn(`[app] onProgress: ${e?.stack ?? e}`);
     }
@@ -154,6 +175,53 @@ function progressMeter(state, onProgress) {
       const ch = new BroadcastChannel('gex-fetch');
       const live = new Map(); // id -> { name, key }
       const files = new Map(); // key -> { name, done, total }
+      // The build's units, and which of them a process has installed.
+      const base = (path) => String(path ?? '').split(/[\\/]/).pop();
+      const shipped = new Map(Object.entries(unitNames));
+      const isExe = (name) => /\.exe$/i.test(name);
+      p.boot.units.total = shipped.size;
+      p.boot.programs.total = [...shipped.values()].filter(isExe).length;
+      const seen = new Set();
+      const modules = new Set();
+      // Each thread of a process installs its modules: a program is said once
+      // per command line.
+      const started = new Set();
+      const start = (name, st) => {
+        const k = `${st.path} ${st.program}`;
+        if (started.has(k)) return;
+        started.add(k);
+        p.boot.program = name;
+        log('program', `Started ${name}`);
+      };
+      const status = (st) => {
+        if (st?.kind === 'module') {
+          // A native module (a Wine builtin): a program when it is an .exe,
+          // else an image, said once; not one of the build's units.
+          const name = base(st.path);
+          if (st.program !== undefined) start(name, st);
+          else if (!modules.has(st.path)) {
+            p.boot.image = name;
+            log('image', `Loaded ${name}`);
+          }
+          modules.add(st.path);
+          this.tick();
+          return;
+        }
+        if (st?.kind !== 'unit') return;
+        const name = base(st.path);
+        const first = !seen.has(st.key);
+        seen.add(st.key);
+        if (first && shipped.has(st.key)) {
+          p.boot.units.done++;
+          if (isExe(name)) p.boot.programs.done++;
+        }
+        if (st.program !== undefined) start(name, st);
+        else if (first) {
+          p.boot.image = name;
+          log('image', st.hit ? `Loaded ${name}` : `Loaded ${name} (no unit: translated as it runs)`);
+        }
+        this.tick();
+      };
       const show = () => {
         let last = null;
         for (const f of live.values()) last = f;
@@ -163,6 +231,7 @@ function progressMeter(state, onProgress) {
         emit();
       };
       ch.onmessage = ({ data: m }) => {
+        if (m?.status) { status(m.status); return; }
         if (!m || typeof m.what !== 'string') return;
         // A unit's indirect-call side file: a probe the runtime makes, not
         // code the program waits for.
@@ -182,6 +251,7 @@ function progressMeter(state, onProgress) {
           total = l?.size ?? 0;
         }
         const f = files.get(key) ?? { kind, name, done: 0, total };
+        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching code for ${name || 'the program'}` : `Fetching ${name}`);
         files.set(key, f);
         if (m.phase === 'start') {
           live.set(m.id, { key });
@@ -204,8 +274,13 @@ function progressMeter(state, onProgress) {
     /** On to `name`, if it is further along than where it is. */
     phase(name) {
       if (!order.includes(name) || order.indexOf(name) <= order.indexOf(p.phase)) return;
+      const from = p.phase;
       p.phase = name;
       p.at[name] = Math.round(performance.now() - t0);
+      const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
+      if (from === 'download') log('phase', `Downloaded ${(p.download.done / 1e6).toFixed(1)} MB in ${secs(p.at[name])}`);
+      if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
+      if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
       emit();
     },
     /** The run is over: 'exited' or 'failed'. */
