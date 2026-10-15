@@ -3729,12 +3729,19 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // Code that has gone away, retired before the newly mapped code
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
             // would throw away the fresh translation.
-            let retired: Vec<(u64, u64)> = caller
-                .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.retired_code));
+            let retired: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
+                let r = std::mem::take(&mut k.mem.lock().log.retired_code);
+                if !r.is_empty() {
+                    RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                r
+            });
             if !retired.is_empty() {
-                retire_translations(&mut caller, &retired)?;
+                let r = retire_translations(&mut caller, &retired);
+                RETIRING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                r?;
             }
+            await_retires();
             recheck_units(&mut caller);
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
@@ -5807,6 +5814,27 @@ fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
     }
     if let Some(memory) = caller.as_context().data().memory.clone() {
         nt_cgen::on_retire(&memory, &recheck, &[]);
+    }
+}
+
+/// Drains of retired code taken from the map's log whose translations are
+/// not forgotten yet (`retire_translations` in flight).
+///
+/// The log is shared by the process's threads and any of them may take what
+/// another's call put there: a thread that frees code, or makes it writable,
+/// can find the log already emptied by a neighbour that is still forgetting
+/// those pages, and must not run on until that is done -- it would reuse the
+/// address (`VirtualAlloc` after `VirtualFree`, tests/w3/vmreuse) and branch
+/// into the old translation, which the dispatch directory still answers for.
+/// Raised before the take is visible to anyone else (under the kernel lock,
+/// or before swapping [`gex_kernel::CODE_EVENTS`]), lowered once forgotten.
+pub(crate) static RETIRING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Wait out the drains in flight ([`RETIRING`]), on the way back to the guest
+/// from a call that may have retired code.
+pub(crate) fn await_retires() {
+    while RETIRING.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
     }
 }
 

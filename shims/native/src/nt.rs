@@ -545,18 +545,28 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
     // The kernel lock only when something was recorded since the last look.
-    if gex_kernel::CODE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) != 0 && gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
-        let (retired, _mapped) = caller
-            .data_mut()
-            .with_kernel(|k| {
-                let mut mm = k.mem.lock();
-                (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.new_code))
-            });
-        if !retired.is_empty() {
-            retire_translations(caller, &retired)?;
-        }
-        recheck_units(caller);
+    // Raised before the swap, so a thread that finds the count already zero
+    // (this one took its events) waits for this drain (`RETIRING`).
+    use std::sync::atomic::Ordering::SeqCst;
+    if gex_kernel::CODE_EVENTS.load(SeqCst) != 0 {
+        super::RETIRING.fetch_add(1, SeqCst);
+        let drained = (|| -> Result<()> {
+            if gex_kernel::CODE_EVENTS.swap(0, SeqCst) != 0 {
+                let (retired, _mapped) = caller.data_mut().with_kernel(|k| {
+                    let mut mm = k.mem.lock();
+                    (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.new_code))
+                });
+                if !retired.is_empty() {
+                    retire_translations(caller, &retired)?;
+                }
+                recheck_units(caller);
+            }
+            Ok(())
+        })();
+        super::RETIRING.fetch_sub(1, SeqCst);
+        drained?;
     }
+    super::await_retires();
     // An image just mapped that has a hot set gets its function-tier unit.
     super::nt_cgen::drain_in_caller(caller)?;
     let state = caller.data_mut();
