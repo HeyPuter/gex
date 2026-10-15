@@ -1278,6 +1278,28 @@ and `web/node_modules`. The page gets two bundles:
 units. `--build-units` builds the ones the run named afterwards
 (`w3/units.sh`).
 
+**Where the sandbox's build is (2026-10-14).** The sandbox uses
+`W3_CACHE=~/gex-sandbox/cache/w3`, which holds the mirrors and every keyed
+output. Get the current paths with:
+
+```
+W3_CACHE=~/gex-sandbox/cache/w3 make -s -C tools/wine-wasm paths
+```
+
+For the pin b57ea7f7d69 (key `b57ea7f7d694-93c5dfda327a-b19555f3cd-85636b9b-ccc072e29a-937c60cc`)
+they are:
+
+- `cache/w3/dist-KEY` (W3_DIST);
+- `cache/w3/pfx-KEY-wayland` (W3_PREFIX, games);
+- `cache/w3/pfx-KEY-null` (W3_PREFIX_NULL, tests);
+- `cache/w3/units` (W3_UNITS).
+
+These directories are read-only inputs: copy a prefix before you run in it,
+as `run.sh` does. A key changes whenever an input changes, so take paths
+from `make paths`, never from this list. The gate's W3 legs
+(`scratch/K/gate-w3legs/run.sh`) build and use them; `FROZEN=1` keeps the
+older frozen inputs.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
