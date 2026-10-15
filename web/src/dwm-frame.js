@@ -140,6 +140,42 @@ const PARTS = {
   tool: { top: 'SMALLTOPFRAME', left: 'SMALLLEFTFRAME', right: 'SMALLRIGHTFRAME', bottom: 'SMALLBOTTOMFRAME' },
 };
 
+/** The environment map (REFLECTIONMAP) at `opacity` (the frame's, before
+ *  ColorizationGlassReflectionIntensity), stretched over the virtual screen
+ *  and shifted by an eighth of the window's offset from its centre
+ *  (CTopLevelWindow::UpdateEnvironmentMapViewPort), into the current clip. */
+function envMap(ctx, atlas, f, opacity) {
+  const env = slice(atlas, 'REFLECTIONMAP', 1) ?? slice(atlas, 'REFLECTIONMAP', 0);
+  if (!env) return;
+  const scr = f.screen ?? { x: 0, y: 0, vx: 0, vy: 0, vcx: 1024, vcy: 768 };
+  const rl = scr.x + 1, rt = scr.y + 1;
+  const w = Math.max(f.W - 2, 0);
+  const t = Math.trunc;
+  const vpx = scr.vx - rl + t((rl + t(w / 2) - t(scr.vcx / 2) - scr.vx) * 0.125);
+  const vpy = scr.vy - rt;
+  // the viewport is relative to the deflated window rect's corner, (1, 1)
+  ctx.globalAlpha = op255(opacity * ((f.reflection ?? 50) / 50));
+  ctx.drawImage(atlas.img, ...env.src, 1 + vpx, 1 + vpy, scr.vcx, scr.vcy);
+}
+
+/**
+ * The environment map over a window's blur-behind glass (no DWM frame: the
+ * taskbar, the Start menu), clipped to the glass (CTopLevelWindow's blur
+ * canvas and its CImage). `f`: W, H, rects (window pixels), active, screen,
+ * reflection, as drawDwmFrame's.
+ */
+export function drawDwmBlurBehind(ctx, atlas, f) {
+  if (!f.rects?.length) return;
+  const p = atlas.parts.get(`REFLECTIONMAP:${f.active ? 1 : 2}`);
+  const v = p?.properties?.OPACITY;
+  ctx.save();
+  ctx.beginPath();
+  for (const r of f.rects) ctx.rect(r.x, r.y, r.w, r.h);
+  ctx.clip();
+  envMap(ctx, atlas, f, typeof v === 'number' ? v / 100 : f.active ? 0.9 : 0.75);
+  ctx.restore();
+}
+
 /** Shadow sizes, deflated: left, top, right, bottom. */
 export const DWM_SHADOW = { l: 14, t: 14, r: 20, b: 20 };
 
@@ -179,22 +215,10 @@ export function drawDwmFrame(ctx, atlas, f) {
     : roundRectRegion(G.l - 1, G.t - 1, Math.max(G.l - 1, W - G.r + 1), Math.max(G.t - 1, H - G.b + 1), 2, 2);
 
   // 1. The environment map, over the virtual screen.
-  const env = slice(atlas, 'REFLECTIONMAP', 0) ?? slice(atlas, 'REFLECTIONMAP', 1);
-  const scr = f.screen ?? { x: 0, y: 0, vx: 0, vy: 0, vcx: 1024, vcy: 768 };
-  if (env) {
-    const rl = scr.x + 1, rt = scr.y + 1;
-    const w = Math.max(W - 2, 0), h = Math.max(H - 2, 0);
-    const t = (v) => Math.trunc(v);
-    const vpx = scr.vx - rl + t((rl + t(w / 2) - t(scr.vcx / 2) - scr.vx) * 0.125);
-    const vpy = scr.vy - rt;
-    // the viewport is relative to the deflated window rect's corner
-    const ox = 1, oy = 1;
-    ctx.save();
-    clipRegion(ctx, outer, inner);
-    ctx.globalAlpha = op255(prop('REFLECTIONMAP', 'OPACITY', f.active ? 0.9 : 0.75) * ((f.reflection ?? 50) / 50));
-    ctx.drawImage(img, ...env.src, ox + vpx, oy + vpy, scr.vcx, scr.vcy);
-    ctx.restore();
-  }
+  ctx.save();
+  clipRegion(ctx, outer, inner);
+  envMap(ctx, atlas, f, prop('REFLECTIONMAP', 'OPACITY', f.active ? 0.9 : 0.75));
+  ctx.restore();
 
   // 2. The highlight corners: the left one, and its mirror on the right.
   const corner = slice(atlas, 'LEFTHIGHLIGHTCORNER', st);

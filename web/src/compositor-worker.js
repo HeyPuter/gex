@@ -2,7 +2,7 @@
 import './zfetch.js';
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
+import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -1113,16 +1113,18 @@ class Compositor {
    *  context into an OffscreenCanvas the window's size plus the shadows'
    *  room, uploaded when it changes, and drawn under the window's client
    *  area as DWM's frame mesh is. */
-  #drawAeroFrame(win) {
+  #drawAeroFrame(win, glass) {
     const aero = this.#aeroAtlas();
     if (!aero) return;
     const g = win.info.glass;
+    const framed = (g.frame & 1) !== 0;
+    const active = framed ? (g.frame & 2) !== 0 : this.#focus === win.key;
     const f = this.#frameOf(win);
     const p = this.#painter;
     const S = DWM_SHADOW;
     const W = win.width + S.l + S.r, H = win.height + S.t + S.b;
     const hovered = this.#hoveredButton(win);
-    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y]]);
+    const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y], active]);
     let d = win.dwmFrame;
     if (!d || d.canvas.width !== W || d.canvas.height !== H) {
       d?.tex.destroy();
@@ -1134,7 +1136,14 @@ class Compositor {
       ctx.clearRect(0, 0, W, H);
       ctx.save();
       ctx.translate(S.l, S.t);
-      drawDwmFrame(ctx, aero, dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered));
+      if (framed) drawDwmFrame(ctx, aero, dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered));
+      else {
+        drawDwmBlurBehind(ctx, aero, {
+          W: win.width, H: win.height, active,
+          rects: (glass ?? []).map((r) => ({ x: r.x - f.x, y: r.y - f.y, w: r.w, h: r.h })),
+          screen: { x: f.x, y: f.y, vx: 0, vy: 0, vcx: this.#outW, vcy: this.#outH },
+        });
+      }
       ctx.restore();
       p.device.queue.copyExternalImageToTexture({ source: d.canvas }, { texture: d.tex, premultipliedAlpha: false }, [W, H]);
     }
@@ -1465,7 +1474,7 @@ class Compositor {
       if (!win || (win.role !== ROLE_TOPLEVEL && !win.placed)) continue;
       if (this.#decorated(win)) this.#drawDecoration(win, this.#focus === k);
       const glass = win.info?.glass ? this.#drawGlass(win) : null;
-      if (win.info?.glass?.frame & 1) this.#drawAeroFrame(win);
+      if (glass?.length || win.info?.glass?.frame & 1) this.#drawAeroFrame(win, glass);
       this.#drawSurface(k, win, glass);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);

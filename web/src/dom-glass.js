@@ -24,7 +24,7 @@
 
 import { glassFeColorMatrix } from './glass-colorization.js';
 import { DwmGlass, dwmGlassConstants } from './dwm-glass.js';
-import { drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
+import { drawDwmBlurBehind, drawDwmFrame, dwmFrameOf, dwmGlassClips, DWM_SHADOW } from './dwm-frame.js';
 
 const UI = 1;
 /** The blur's standard deviation, in pixels: DWM's look at 96 dpi. */
@@ -171,7 +171,7 @@ export function domGlass(win, mount, scene = null) {
     }
     scene?.dirty();
     const framed = g && (g.frame & 1) !== 0;
-    if (!framed) {
+    if (!framed && !rects.length) {
       overlay?.remove();
       overlay = null;
       return;
@@ -197,7 +197,8 @@ export function domGlass(win, mount, scene = null) {
       sig = '';
     }
     const W = mount.clientWidth, H = mount.clientHeight;
-    const now = JSON.stringify([win.glass, win.title, hovered && [hovered.x, hovered.y], !!aeroAtlas(), x, y, W, H]);
+    const now = JSON.stringify([win.glass, win.title, hovered && [hovered.x, hovered.y], !!aeroAtlas(), x, y, W, H,
+      !framed && win.focused]);
     if (now === sig) return;
     sig = now;
     const ctx = overlay.getContext('2d');
@@ -206,7 +207,13 @@ export function domGlass(win, mount, scene = null) {
     if (a) {
       ctx.save();
       ctx.translate(S.l, S.t);
-      drawDwmFrame(ctx, a, dwmFrameOf(win.glass, win.width, win.height, win.title, x, y, W, H, hovered));
+      if (framed) drawDwmFrame(ctx, a, dwmFrameOf(win.glass, win.width, win.height, win.title, x, y, W, H, hovered));
+      else {
+        drawDwmBlurBehind(ctx, a, {
+          W: win.width, H: win.height, rects, active: win.focused === true,
+          screen: { x, y, vx: 0, vy: 0, vcx: W, vcy: H },
+        });
+      }
       ctx.restore();
     }
     overlay.version++;
