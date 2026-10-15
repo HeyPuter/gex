@@ -704,6 +704,8 @@ export function setGlobals(get, b = {}) {
   if (get('doorstats')) globalThis.GEX_DOOR_STATS = Number(get('doorstats')) || 1;
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
+  // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
+  if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));

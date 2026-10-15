@@ -945,6 +945,8 @@ async function runProgramHere(
       timeScale: globalThis.GEX_TIME_SCALE || undefined,
       fixedTime: globalThis.GEX_FIXED_TIME || undefined,
       calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,
+      // `?straytrap=1`: native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
+      strayTrap: globalThis.GEX_STRAY_TRAP || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for

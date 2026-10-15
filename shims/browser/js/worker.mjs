@@ -570,6 +570,7 @@ async function handle(msg) {
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
   if (msg.fjitLibs) Gex.fjitLibs = msg.fjitLibs;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
+  if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for

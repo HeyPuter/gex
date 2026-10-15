@@ -262,6 +262,9 @@ const CALLOUT_UNWOUND = 64n << 10n;
  *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
 const NATIVE_RETURN_PAD = 0x3ffff1n;
 const NATIVE_UNWOUND = 512n;
+/** Where a native caller's `run_until` goes after a stray return to its
+ *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
+const STRAY_PC = NATIVE_RETURN_PAD + 1n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -3569,6 +3572,9 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    // `?straytrap=1`: a guest return to native Wine's pad past open
+    // call-outs traps as "breakpoint" (cgen.rs `STRAY_TRAP`).
+    if (globalThis.GEX_STRAY_TRAP) e.gex_set_stray_trap?.(1);
     if (Gex.fjitLibs && e.gex_fjit_libs) {
       const b = new TextEncoder().encode(Gex.fjitLibs);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
@@ -6545,9 +6551,28 @@ export class Gex {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: resume on ctx ${rc.toString(16)} not ${ctx.toString(16)}`);
             return 0;
           }
+          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+          // Native Wine's return pad, reached with nobody's watch or miss
+          // taking it (cgen.rs `native_return_stray`): the guest went on
+          // past this call-out to a native caller's return (an exception
+          // handled in the function that made it, which then returned on
+          // tier-1). It leaves, as every call-out down to that caller does,
+          // with the guest at STRAY_PC: the caller's `run_until` goes there,
+          // and its fallback puts back the registers the guest had at the
+          // pad (the bodies leaving between wrote stale ones) and ends the
+          // call (a body between two call-outs that leaves sends tier-1 to
+          // STRAY_PC inside the outer one, which leaves the same way). A
+          // call-out waiting for the pad itself with the stack where it
+          // wants it is simply done.
+          if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
+            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.unwound;
+            if (mine) e.gex_callout_stray(1);
+            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);
+            return mine ? 1 : 0;
+          }
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
-          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
           if (sp > c.spWant + c.unwound) {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
