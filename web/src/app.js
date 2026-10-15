@@ -56,6 +56,8 @@ const PIECES = {
  *   cwd, exe   the working directory and program (a path in the bundle)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
+ *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
+ *              guest's network (its TCP and DNS go over it); none by default
  *   strace     true (every process) or a pid: narrate system calls
  *   trapstack  a trap's wasm frames
  *   debug      more runtime switches, {name: value}, as gex's test page's
@@ -563,7 +565,15 @@ async function begin(opts, base, at, state, meter) {
   meter.phase('boot');
   meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
+  // The guest's network: a Wisp proxy the page names (runtime.js serves it
+  // to every Worker). With none, the guest's sockets reach nothing.
+  let network = null;
+  if (opts.wisp) {
+    const { WispNetwork } = await import('./net.js');
+    network = new WispNetwork(String(opts.wisp), (e) => say(`[net] ${e}\n`));
+  }
   const run = runProgram(term, {
+    network,
     elf: exeBytes,
     files,
     dirs: tree.dirs,
