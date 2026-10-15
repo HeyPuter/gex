@@ -1668,6 +1668,26 @@ pub extern "C" fn k_signal_seq() -> i32 {
     gex_kernel::proc::signal_seq() as i32
 }
 
+/// `tgkill` to a thread of another process: left for that thread alone, for
+/// its process to collect. Returns 0 or a negative errno.
+#[no_mangle]
+pub extern "C" fn k_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32 {
+    if signo != 0 {
+        note_kill(caller, pid, signo);
+    }
+    match procs().tkill(caller, pid, tid, signo) {
+        Ok(()) => 0,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// One thread-directed signal for `pid`'s thread `tid` (0: any thread),
+/// packed (`ProcTable::take_thread_signals`), or zero.
+#[no_mangle]
+pub extern "C" fn k_take_thread_signal(pid: i32, tid: i32) -> i64 {
+    procs().take_thread_signal_packed(pid, tid)
+}
+
 /// Signal every process in a group, naming the group positively. `k_kill`
 /// cannot reach group 1: target -1 means "every process", so the group a shell
 /// running as pid 1 is in has no negative spelling.

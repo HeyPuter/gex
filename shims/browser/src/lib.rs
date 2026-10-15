@@ -268,6 +268,8 @@ extern "C" {
     fn k_take_kill_signals(pid: i32, taken: u64) -> u64;
     fn k_kill_sender(pid: i32, signo: u32) -> i32;
     fn k_has_signals(pid: i32) -> i32;
+    fn k_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32;
+    fn k_take_thread_signal(pid: i32, tid: i32) -> i64;
     fn k_ppid(pid: i32) -> i32;
     fn k_pgid(caller: i32, of: i32) -> i32;
     fn k_sid(caller: i32, of: i32) -> i32;
@@ -656,6 +658,13 @@ extern "C" fn r_take_kill_signals(pid: i32, taken: u64) -> u64 {
 extern "C" fn r_kill_sender(pid: i32, signo: u32) -> i32 {
     unsafe { k_kill_sender(pid, signo) }
 }
+extern "C" fn r_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32 {
+    signal_note("tid", caller, pid, signo);
+    unsafe { k_tkill(caller, pid, tid, signo) }
+}
+extern "C" fn r_take_thread_signal(pid: i32, tid: i32) -> i64 {
+    unsafe { k_take_thread_signal(pid, tid) }
+}
 extern "C" fn r_has_signals(pid: i32) -> i32 {
     unsafe { k_has_signals(pid) }
 }
@@ -721,6 +730,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             take_kill_signals: r_take_kill_signals,
             kill_sender: r_kill_sender,
             has_signals: r_has_signals,
+            tkill: r_tkill,
+            take_thread_signal: r_take_thread_signal,
             ppid: r_ppid,
             pgid: r_pgid,
             sid: r_sid,

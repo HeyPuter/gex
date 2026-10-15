@@ -4905,6 +4905,26 @@ impl Kernel {
     /// picks it up here. This is what makes `timeout`, job control and every
     /// supervisor work.
     pub fn collect_signals(&self) {
+        // `tgkill`s from other processes, each for one thread.
+        if self.procs.has_signals(self.pid) {
+            let mut other = false;
+            for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.uid };
+                if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
+                    self.signals.raise_from(signo, source);
+                } else if let Some(t) = self.thread_signals.get(&tid) {
+                    t.raise_from(signo, source);
+                    other = true;
+                }
+            }
+            // Another thread's, taken here: it may have woken for the send
+            // (`ProcTable::tkill`), found nothing yet and gone back to its
+            // wait, so it is woken again to see it (tests/gexcc
+            // tgkill-thread.c hung two runs in three in the page).
+            if other {
+                crate::wait::notify(self.procs.queue(self.pid));
+            }
+        }
         let inbox = self.signals.process().collect(&self.procs, self.pid, self.uid);
         if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
@@ -6785,8 +6805,13 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         if tgid != self.pid {
-            // Another process's thread: its process, as `kill` does.
-            return self.procs.kill(self.pid, tgid, signo).map(|_| 0);
+            // Another process's thread: that thread alone, collected by its
+            // process (`collect_signals`). A probe (`signo` 0) asks after
+            // the process only.
+            if signo == 0 {
+                return self.procs.kill(self.pid, tgid, 0).map(|_| 0);
+            }
+            return self.procs.tkill(self.pid, tgid, tid, signo).map(|_| 0);
         }
         let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
         if tid == self.tid {
