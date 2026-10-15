@@ -157,6 +157,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
     /// List a directory. Only directories implement this.
+    /// Where a directory opened here is now, for a descriptor that relative
+    /// paths resolve through (`openat(dirfd, ...)`, `fchdir`), or `ENOENT`
+    /// once it is removed. Linux resolves such a descriptor by the
+    /// directory, not by its name, so it follows a rename of the directory
+    /// or of any directory above it. `None` for a handle that does not
+    /// follow its node: its recorded path stands.
+    fn moved(&self) -> Option<Result<Moved, Errno>> {
+        None
+    }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
     }
@@ -385,6 +394,19 @@ impl FileHandle for PathHandle {
     }
 }
 
+/// Where an open directory is ([`FileHandle::moved`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    /// The path it was opened at and the path it has now, both relative to
+    /// its filesystem.
+    pub was: String,
+    pub now: String,
+    /// How many times it has moved, renamed itself or with a directory
+    /// above it: a lookup through the path that missed while this changed
+    /// raced a rename, and is made again (`PathIo::call`).
+    pub epoch: u64,
+}
+
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
     /// Open a path relative to this mount's root (no leading slash).
@@ -442,6 +464,15 @@ pub trait FileSystem: Send + Sync {
     fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
         let _ = (from, to);
         Err(Errno::EROFS)
+    }
+    /// `rename`, refusing (`EEXIST`) a destination that exists when
+    /// `noreplace` (`RENAME_NOREPLACE`). A filesystem that can make the
+    /// check and the move one step does; this default checks first.
+    fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
+        if noreplace && self.metadata_nofollow(to).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+        self.rename(from, to)
     }
     /// Change a file's mode. Filesystems that do not model permissions
     /// accept it and do nothing, which is what the guest expects to see.
@@ -589,6 +620,18 @@ impl Vfs {
         self.ns.set_cwd(path)?;
         self.publish();
         Ok(())
+    }
+    /// Whether a thread's own directory is in for its call
+    /// ([`Vfs::enter_cwd`]).
+    pub fn in_thread_cwd(&self) -> bool {
+        self.held.is_some()
+    }
+    /// Make `cwd` the process's directory as it is, checked when it was
+    /// set: an `execve` from a thread with an fs_struct of its own keeps
+    /// that thread's directory.
+    pub fn put_cwd(&mut self, cwd: String) {
+        self.ns.cwd = cwd;
+        self.publish();
     }
     /// Resolve against `cwd`, a thread's own fs_struct's directory, until
     /// [`Vfs::leave_cwd`]: the process's stays what is published, a `chdir`
@@ -855,13 +898,19 @@ impl Namespace {
     }
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
+        self.rename2(from, to, false)
+    }
+
+    /// `rename`, or with `noreplace` `RENAME_NOREPLACE`: `EEXIST` for a
+    /// destination that exists, decided with the move by the filesystem.
+    pub fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         let (fs, rel_from) = self.resolve(from)?;
         let (fs_to, rel_to) = self.resolve(to)?;
         // Crossing a mount boundary needs a copy, which Linux also refuses.
         if !Arc::ptr_eq(fs, fs_to) {
             return Err(Errno::EXDEV);
         }
-        fs.rename(&rel_from, &rel_to)
+        fs.rename2(&rel_from, &rel_to, noreplace)
     }
 
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {

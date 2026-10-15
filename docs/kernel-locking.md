@@ -656,20 +656,53 @@ in the scheduler pick after each wake of the global WAKE word: about
      the process's directory while a call runs in a thread's own
      (`Vfs::enter_cwd`/`leave_cwd`). The tmpfile counter is an atomic and
      the page's record of the last open (`LAST_OPEN`) its own lock, so
-     `note_process_syscall` no longer takes KLock on every `openat`. Still
-     under the kernel lock: the path writers (`mkdir`, `unlink`, `rename`,
-     `symlink`, `link`, `chmod`, `utimensat`, `chdir`), next (L14c). Known
-     gaps, both older than L14b: the page's tmpfs renames a directory
-     without its descendants (a flat map of paths), and a directory
-     descriptor resolves through the path it was opened at, not the
-     directory, so a rename of the directory itself leaves it stale; an
-     exec by a thread with its own fs_struct starts in the process's
-     directory. Legs: `free_path_calls_answer_as_the_kernel_does`,
+     `note_process_syscall` no longer takes KLock on every `openat`. Legs: `free_path_calls_answer_as_the_kernel_does`,
      `free_i386_path_calls_answer_as_the_kernel_does`; `fs-threads`
      (x86-64, i386, aarch64; page tier and SP): a pthread's `chdir` seen by
      its siblings and main, `unshare(CLONE_FS)` shared with the threads made
      after it and not by the rest, and `openat`/`fstatat` through a
      directory descriptor while another thread renames files in it.
+   - The path writers without the kernel lock (L14c): `mkdirat`,
+     `unlinkat`, `renameat(2)`, `linkat`, `symlinkat`, `utimensat`,
+     `fchmod(at)` and `fchown(at)` (and their older forms) are `PathIo`'s
+     too. The umask they apply is an atomic. `RENAME_NOREPLACE`'s check
+     and the move are one step under the filesystem's own lock
+     (`FileSystem::rename2`, also over the remote filesystem), where the
+     kernel lock had made them one. Three Linux behaviours that were
+     missing, fixed with it:
+     - A renamed directory takes everything under it. The tmpfs is a map
+       of whole paths and moved only the directory's own name, so its
+       contents were lost (dpkg, apt, cargo and git all rename
+       directories). Linux's refusals are kept: a directory into itself
+       (`EINVAL`), over a file (`ENOTDIR`) or over a directory that is not
+       empty (`ENOTEMPTY`), a file over a directory (`EISDIR`).
+     - A directory descriptor resolves by the directory, not by the path it
+       was opened at (`FileHandle::moved`, `OpenFile::dir_path`; tmpfs by
+       inode, the remote filesystem through `k_fs_moved`, hostfs through
+       the host's descriptor). `openat(dirfd, ...)`, `fchdir`, `getdents64`
+       and `fstat` on it follow a rename of the directory or of one above
+       it. Finding the directory and then the name is two steps, so a call
+       through a descriptor that misses while its directory moved (a
+       per-directory move count) is made again, as Linux's walk retries on
+       its rename seqlock; bounded, 64 times. `fchmod` follows a renamed
+       file the same way.
+     - `execve` keeps the calling thread's fs_struct and a `fork` copies
+       it. A thread with a directory of its own (`unshare(CLONE_FS)`) execs
+       into that directory, not the process's; the directory is taken from
+       the call itself (`Kernel::call_cwd`), since by the time the host acts
+       another thread's call may have run.
+     Still under the kernel lock: `chdir` and `fchdir` (the process's
+     directory is the namespace's, published by the lock's holder) and
+     `umask`'s swap. A working directory itself is still kept by name, so
+     a process's directory renamed away under it is not followed. Legs:
+     `free_path_writers_answer_as_the_kernel_does`, the writers' older
+     forms in `free_i386_path_calls_answer_as_the_kernel_does`,
+     `a_renamed_directory_takes_its_subtree`,
+     `an_open_directory_follows_its_renames`; `fs-threads` (x86-64, i386,
+     aarch64; page tier, SP and gexc). It now also renames a directory with
+     a file in it back and forth, and renames a descriptor's own directory
+     back and forth while threads open through it; a child execs from a
+     thread with its own fs_struct.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a

@@ -45,11 +45,12 @@ pub(crate) struct Home {
     pins: Arc<std::collections::HashMap<String, u64>>,
     place: Option<Arc<dyn gex_kernel::syscalls::ObjectPlace>>,
     /// For the path calls: the threads' own fs_structs, the group, the
-    /// terminals and `O_TMPFILE`'s serial (`Kernel::path_io`).
+    /// terminals, `O_TMPFILE`'s serial and the umask (`Kernel::path_io`).
     thread_fs: Arc<gex_kernel::syscalls::ThreadFs>,
     gid: u32,
     ptys: Option<gex_kernel::pty::Remote>,
     tmpfiles: Arc<std::sync::atomic::AtomicU64>,
+    umask: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -90,6 +91,7 @@ fn home_of(k: &Kernel) -> Home {
         gid: k.gid,
         ptys: k.ptys,
         tmpfiles: Arc::clone(&k.tmpfiles),
+        umask: Arc::clone(&k.umask),
     }
 }
 
@@ -323,6 +325,8 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             procs: &home.procs,
             ptys: home.ptys,
             tmpfiles: &home.tmpfiles,
+            umask: &home.umask,
+            clock: home.clock,
         },
         signals: &view,
         procs: &home.procs,

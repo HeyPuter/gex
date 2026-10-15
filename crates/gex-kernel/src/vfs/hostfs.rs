@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 pub struct HostFs {
     root: PathBuf,
     read_only: bool,
+    /// `root` as the host resolves it, once asked (`HostDir::moved`).
+    canon: std::sync::OnceLock<Option<PathBuf>>,
 }
 
 impl HostFs {
@@ -24,6 +26,7 @@ impl HostFs {
         HostFs {
             root: root.into(),
             read_only: false,
+            canon: Default::default(),
         }
     }
 
@@ -31,6 +34,7 @@ impl HostFs {
         HostFs {
             root: root.into(),
             read_only: true,
+            canon: Default::default(),
         }
     }
 
@@ -172,6 +176,11 @@ impl FileHandle for HostHandle {
 struct HostDir {
     entries: Vec<DirEntry>,
     md: Metadata,
+    /// The directory held open, the path it was opened at (relative to the
+    /// mount) and the mount's root as the host resolves it: where the
+    /// directory is now is what the host says of the open descriptor
+    /// ([`FileHandle::moved`]).
+    held: Option<(File, String, PathBuf)>,
 }
 
 impl FileHandle for HostDir {
@@ -183,6 +192,19 @@ impl FileHandle for HostDir {
     }
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Ok(self.entries.clone())
+    }
+    #[cfg(target_os = "linux")]
+    fn moved(&self) -> Option<Result<super::Moved, Errno>> {
+        use std::os::fd::AsRawFd;
+        let (file, was, root) = self.held.as_ref()?;
+        let now = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        let now = now.to_str()?;
+        if now.ends_with(" (deleted)") {
+            return Some(Err(Errno::ENOENT));
+        }
+        // Moved out of the mount: the path it was opened at is all there is.
+        let rel = Path::new(now).strip_prefix(root).ok()?;
+        Some(Ok(super::Moved { was: was.clone(), now: rel.to_str()?.to_string(), epoch: 0 }))
     }
 }
 
@@ -218,9 +240,11 @@ impl FileSystem for HostFs {
                         ino: emd.ino(),
                     });
                 }
+                let held = File::open(&host).ok().zip(self.canon.get_or_init(|| self.root.canonicalize().ok()).clone()).map(|(f, root)| (f, path.to_string(), root));
                 return Ok(Arc::new(HostDir {
                     entries,
                     md: convert(md),
+                    held,
                 }));
             }
         }

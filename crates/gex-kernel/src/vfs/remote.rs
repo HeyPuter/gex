@@ -49,7 +49,15 @@ pub struct Remote {
     pub unlink: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
-    pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
+    /// `rename`; `noreplace` (1) is `RENAME_NOREPLACE`, checked with the
+    /// move under the filesystem's lock.
+    pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32, noreplace: u32) -> i32,
+    /// [`FileHandle::moved`]: the path the handle's directory was opened at,
+    /// the path it has now and the epoch in decimal, NUL-separated, at
+    /// `at`; their length, `-ENOSYS` for
+    /// a handle that does not follow its directory, `-ENOENT` once it is
+    /// removed, `-ERANGE` when `cap` will not hold them.
+    pub moved: extern "C" fn(handle: i32, at: crate::PAddr, cap: u32) -> i32,
     pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
     /// `fchmod` on an open handle.
     pub fchmod: extern "C" fn(handle: i32, mode: u32) -> i32,
@@ -309,9 +317,13 @@ impl FileSystem for RemoteFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
+        self.rename2(from, to, false)
+    }
+
+    fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         let (fa, fn_) = at(from.as_bytes());
         let (ta, tn) = at(to.as_bytes());
-        ok((self.remote.rename)(fa, fn_, ta, tn)).map(|_| ())
+        ok((self.remote.rename)(fa, fn_, ta, tn, noreplace as u32)).map(|_| ())
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
@@ -433,6 +445,25 @@ impl FileHandle for RemoteHandle {
 
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         Some(ok((self.remote.fchmod)(self.id, mode)).map(|_| ()))
+    }
+
+    fn moved(&self) -> Option<Result<super::Moved, Errno>> {
+        let mut cap = 512;
+        loop {
+            let mut buf = vec![0u8; cap];
+            match (self.remote.moved)(self.id, buf.as_mut_ptr() as crate::PAddr, cap as u32) {
+                n if n >= 0 => {
+                    buf.truncate(n as usize);
+                    let s = String::from_utf8(buf).ok()?;
+                    let mut parts = s.split('\0');
+                    let (was, now, epoch) = (parts.next()?, parts.next()?, parts.next()?.parse().ok()?);
+                    return Some(Ok(super::Moved { was: was.to_string(), now: now.to_string(), epoch }));
+                }
+                n if -n == Errno::ERANGE.0 && cap < 1 << 16 => cap *= 8,
+                n if -n == Errno::ENOSYS.0 => return None,
+                n => return Some(Err(Errno(-n))),
+            }
+        }
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {

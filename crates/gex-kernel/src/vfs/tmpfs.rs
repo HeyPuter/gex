@@ -242,6 +242,9 @@ struct Inner {
     /// as names come and go (counting `inos` at every `stat` scanned the
     /// whole tree, 16 us a call once a Python was installed).
     links: BTreeMap<u64, u32>,
+    /// How many times each directory that has moved has moved, itself or
+    /// with a directory above it ([`super::Moved::epoch`]). Sparse.
+    moves: BTreeMap<u64, u64>,
 }
 
 impl Inner {
@@ -287,6 +290,55 @@ impl Inner {
 
     fn nlink(&self, ino: u64) -> u32 {
         self.links.get(&ino).copied().unwrap_or(0)
+    }
+
+    /// Where directory `ino`, opened at `was`, is now: `was` unless it has
+    /// been renamed since (or something under it has been: a directory
+    /// moves with its parent), `None` once it is removed. A directory has
+    /// one name, so its inode names it.
+    fn dir_now(&self, was: &str, ino: u64) -> Option<String> {
+        if self.inos.get(was) == Some(&ino) && matches!(self.nodes.get(was), Some(Node::Dir)) {
+            return Some(was.to_string());
+        }
+        self.inos
+            .iter()
+            .find(|(p, i)| **i == ino && matches!(self.nodes.get(p.as_str()), Some(Node::Dir)))
+            .map(|(p, _)| p.clone())
+    }
+
+    /// Whether directory `path` has anything in it.
+    fn has_children(&self, path: &str) -> bool {
+        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        self.nodes.range::<String, _>(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix) && k.len() > prefix.len())
+    }
+
+    /// Remove name `path` and what it keeps beside the node.
+    fn forget(&mut self, path: &str) {
+        self.nodes.remove(path);
+        self.drop_ino(path);
+        self.modes.remove(path);
+        self.mtimes.remove(path);
+    }
+
+    /// Move everything named under directory `from` to the same names under
+    /// `to`: nodes, inodes, modes and times (a link count does not change,
+    /// a name only moves).
+    fn move_under(&mut self, from: &str, to: &str) {
+        fn rekey<V>(map: &mut BTreeMap<String, V>, from: &str, to: &str) {
+            // A directory's descendants are the keys from "from/" up to
+            // "from0", '0' following '/'.
+            let lo = format!("{from}/");
+            let hi = format!("{from}0");
+            let keys: Vec<String> = map.range::<String, _>(lo..hi).map(|(k, _)| k.clone()).collect();
+            for k in keys {
+                let v = map.remove(&k).unwrap();
+                map.insert(format!("{to}{}", &k[from.len()..]), v);
+            }
+        }
+        rekey(&mut self.nodes, from, to);
+        rekey(&mut self.inos, from, to);
+        rekey(&mut self.modes, from, to);
+        rekey(&mut self.mtimes, from, to);
     }
 }
 
@@ -490,6 +542,28 @@ struct TmpHandle {
     /// The contents, when this handle is onto a file. Held directly, so the
     /// descriptor keeps working after the name is unlinked or renamed.
     file: Option<Arc<FileNode>>,
+    /// The inode, when this handle is onto a directory: what it follows
+    /// through a rename of the directory or of one above it, as a Linux
+    /// descriptor follows its dentry (`Inner::dir_now`).
+    dir: Option<u64>,
+}
+
+impl TmpHandle {
+    /// The name this handle's node has now: a directory's where it has
+    /// moved to, a file's one of its names (`None` once removed or
+    /// unlinked), anything else's as opened.
+    fn here(&self, inner: &Inner) -> Option<String> {
+        match (self.dir, &self.file) {
+            (Some(ino), _) => inner.dir_now(&self.path, ino),
+            (None, Some(f)) => {
+                if inner.inos.get(&self.path) == Some(&f.ino) {
+                    return Some(self.path.clone());
+                }
+                inner.inos.iter().find(|(_, i)| **i == f.ino).map(|(p, _)| p.clone())
+            }
+            (None, None) => Some(self.path.clone()),
+        }
+    }
 }
 
 impl FileHandle for TmpHandle {
@@ -540,13 +614,19 @@ impl FileHandle for TmpHandle {
             });
         }
         let inner = self.inner.lock().unwrap();
-        let ino = TmpFs::ino_of(&inner, &self.path);
-        let mtime = inner.mtimes.get(&self.path).copied().unwrap_or(0);
-        match inner.nodes.get(&self.path) {
+        let Some(path) = self.here(&inner) else {
+            // A directory removed while open: still a directory, with no
+            // names left, as `fstat` of one says on Linux.
+            return Ok(Metadata { ino: self.dir.unwrap_or(1), nlink: 0, ..Metadata::dir() });
+        };
+        let path = &path;
+        let ino = TmpFs::ino_of(&inner, path);
+        let mtime = inner.mtimes.get(path).copied().unwrap_or(0);
+        match inner.nodes.get(path) {
             Some(Node::File(f)) => Ok(Metadata {
                 file_type: FileType::Regular,
                 size: f.size(),
-                mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
+                mode: inner.modes.get(path).copied().unwrap_or(0o644),
                 ino,
                 mtime: f.mtime.load(Ordering::Relaxed),
                 // Every name that maps to this inode is a hard link to it.
@@ -559,8 +639,8 @@ impl FileHandle for TmpHandle {
                 Ok(Metadata {
                     ino,
                     mtime,
-                    nlink: TmpFs::dir_nlink(&inner, &self.path),
-                    mode: inner.modes.get(&self.path).copied().unwrap_or(d.mode),
+                    nlink: TmpFs::dir_nlink(&inner, path),
+                    mode: inner.modes.get(path).copied().unwrap_or(d.mode),
                     ..d
                 })
             }
@@ -590,19 +670,21 @@ impl FileHandle for TmpHandle {
 
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         let inner = self.inner.lock().unwrap();
-        if !matches!(inner.nodes.get(&self.path), Some(Node::Dir)) {
+        // A directory removed while open lists nothing, not even `.`.
+        let Some(path) = self.here(&inner) else { return Ok(Vec::new()) };
+        if !matches!(inner.nodes.get(&path), Some(Node::Dir)) {
             return Err(Errno::ENOTDIR);
         }
-        let prefix = if self.path.is_empty() {
+        let prefix = if path.is_empty() {
             String::new()
         } else {
-            format!("{}/", self.path)
+            format!("{path}/")
         };
         let mut out = vec![
             DirEntry {
                 name: ".".into(),
                 file_type: FileType::Directory,
-                ino: TmpFs::ino_of(&inner, &self.path),
+                ino: TmpFs::ino_of(&inner, &path),
             },
             DirEntry {
                 name: "..".into(),
@@ -638,7 +720,10 @@ impl FileHandle for TmpHandle {
                 f.stamp(secs);
                 Ok(())
             }
-            None => FileSystem::set_mtime(&TmpFs { inner: Arc::clone(&self.inner) }, &self.path, secs),
+            None => {
+                let path = self.here(&self.inner.lock().unwrap()).ok_or(Errno::ENOENT)?;
+                FileSystem::set_mtime(&TmpFs { inner: Arc::clone(&self.inner) }, &path, secs)
+            }
         }
     }
 
@@ -652,7 +737,10 @@ impl FileHandle for TmpHandle {
                 f.set_times(atime, mtime, now);
                 Ok(())
             }
-            None => TmpFs { inner: Arc::clone(&self.inner) }.set_times_now(&self.path, atime, mtime, now),
+            None => {
+                let path = self.here(&self.inner.lock().unwrap()).ok_or(Errno::ENOENT)?;
+                TmpFs { inner: Arc::clone(&self.inner) }.set_times_now(&path, atime, mtime, now)
+            }
         }
     }
 
@@ -671,20 +759,36 @@ impl FileHandle for TmpHandle {
         Ok(())
     }
 
-    /// By the name it was opened under, as `chmod` on that name: a mode
-    /// lives with the name here, not the node.
+    /// By the name it has now, as `chmod` on that name: a mode lives with
+    /// the name here, not the node. A file with no name left has no mode to
+    /// keep, and the call succeeds as on Linux.
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         let mut inner = self.inner.lock().unwrap();
-        if matches!(inner.nodes.get(&self.path), Some(Node::Symlink(_))) {
+        let Some(path) = self.here(&inner) else {
+            return Some(if self.file.is_some() { Ok(()) } else { Err(Errno::ENOENT) });
+        };
+        if matches!(inner.nodes.get(&path), Some(Node::Symlink(_))) {
             return Some(Err(Errno::EOPNOTSUPP));
         }
-        Some(inner.chmod(&self.path, mode))
+        Some(inner.chmod(&path, mode))
+    }
+
+    fn moved(&self) -> Option<Result<super::Moved, Errno>> {
+        let ino = self.dir?;
+        let inner = self.inner.lock().unwrap();
+        Some(
+            inner
+                .dir_now(&self.path, ino)
+                .map(|now| super::Moved { was: self.path.clone(), now, epoch: inner.moves.get(&ino).copied().unwrap_or(0) })
+                .ok_or(Errno::ENOENT),
+        )
     }
 }
 
 impl FileSystem for TmpFs {
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.to_string();
+        let mut dir = None;
         let file = {
             let mut inner = self.inner.lock().unwrap();
             match inner.nodes.get(&path) {
@@ -696,6 +800,9 @@ impl FileSystem for TmpFs {
                     let acc = flags & oflags::ACCMODE;
                     if matches!(node, Node::Dir) && (acc == oflags::O_WRONLY || acc == oflags::O_RDWR) {
                         return Err(Errno::EISDIR);
+                    }
+                    if matches!(node, Node::Dir) {
+                        dir = Some(TmpFs::ino_of(&inner, &path));
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
@@ -749,6 +856,7 @@ impl FileSystem for TmpFs {
             inner: Arc::clone(&self.inner),
             path,
             file,
+            dir,
         }))
     }
 
@@ -757,6 +865,7 @@ impl FileSystem for TmpFs {
             inner: Arc::clone(&self.inner),
             path: path.to_string(),
             file: None,
+            dir: None,
         };
         handle.metadata()
     }
@@ -857,35 +966,77 @@ impl FileSystem for TmpFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
+        self.rename2(from, to, false)
+    }
+
+    /// `rename`, under the one lock, so `RENAME_NOREPLACE`'s check and the
+    /// move are one step. A directory moves with everything under it, as
+    /// on Linux (the map is of whole paths, so each name below is moved).
+    /// Linux's refusals: a directory into itself (`EINVAL`), over a file
+    /// (`ENOTDIR`) or over a directory that is not empty (`ENOTEMPTY`); a
+    /// file over a directory (`EISDIR`); a destination whose directory is
+    /// not there (`ENOENT`).
+    fn rename2(&self, from: &str, to: &str, noreplace: bool) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
-        let Some(node) = inner.nodes.remove(from) else {
+        let Some(node) = inner.nodes.get(from) else {
             return Err(Errno::ENOENT);
         };
-        let ino = inner.drop_ino(from).unwrap_or(1);
+        let is_dir = matches!(node, Node::Dir);
+        let parent = to.rfind('/').map_or("", |i| &to[..i]);
+        if !matches!(inner.nodes.get(parent), Some(Node::Dir)) {
+            return Err(if inner.nodes.contains_key(parent) { Errno::ENOTDIR } else { Errno::ENOENT });
+        }
+        if from == to {
+            return if noreplace { Err(Errno::EEXIST) } else { Ok(()) };
+        }
+        if is_dir && to.starts_with(from) && (from.is_empty() || to.as_bytes().get(from.len()) == Some(&b'/')) {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(dst) = inner.nodes.get(to) {
+            if noreplace {
+                return Err(Errno::EEXIST);
+            }
+            match (is_dir, matches!(dst, Node::Dir)) {
+                (false, true) => return Err(Errno::EISDIR),
+                (true, false) => return Err(Errno::ENOTDIR),
+                (true, true) if inner.has_children(to) => return Err(Errno::ENOTEMPTY),
+                _ => {}
+            }
+            // Two names for one file: Linux leaves both.
+            if !is_dir && inner.inos.get(from).is_some() && inner.inos.get(from) == inner.inos.get(to) {
+                return Ok(());
+            }
+            inner.forget(to);
+        }
+        let node = inner.nodes.remove(from).unwrap();
+        let ino = inner.inos.remove(from).unwrap_or(1);
         // The mode travels with the name. `dpkg` unpacks a program to
         // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
         // mode behind here means every binary a package installs arrives
         // without its execute bit, and the failure surfaces later as a shell
         // saying the program does not exist.
-        let mode = inner.modes.remove(from);
-        match inner.mtimes.remove(from) {
-            Some(t) => {
-                inner.mtimes.insert(to.to_string(), t);
-            }
-            None => {
-                inner.mtimes.remove(to);
-            }
+        if let Some(m) = inner.modes.remove(from) {
+            inner.modes.insert(to.to_string(), m);
+        }
+        if let Some(t) = inner.mtimes.remove(from) {
+            inner.mtimes.insert(to.to_string(), t);
         }
         inner.nodes.insert(to.to_string(), node);
-        inner.set_ino(to.to_string(), ino);
-        match mode {
-            Some(m) => {
-                inner.modes.insert(to.to_string(), m);
-            }
-            // The destination may have had a mode of its own, and this is a
-            // different file now.
-            None => {
-                inner.modes.remove(to);
+        inner.inos.insert(to.to_string(), ino);
+        if is_dir {
+            inner.move_under(from, to);
+            // It and every directory under it are somewhere else now.
+            let lo = format!("{to}/");
+            let hi = format!("{to}0");
+            let mut moved: Vec<u64> = inner
+                .nodes
+                .range::<String, _>(lo..hi)
+                .filter(|(_, n)| matches!(n, Node::Dir))
+                .filter_map(|(k, _)| inner.inos.get(k).copied())
+                .collect();
+            moved.push(ino);
+            for i in moved {
+                *inner.moves.entry(i).or_insert(0) += 1;
             }
         }
         Ok(())
@@ -954,6 +1105,75 @@ impl FileSystem for TmpFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory renamed takes everything under it, with its inodes,
+    /// modes and times; Linux's refusals, and `RENAME_NOREPLACE`.
+    #[test]
+    fn a_renamed_directory_takes_its_subtree() {
+        let fs = TmpFs::new();
+        fs.mkdir("a", 0o755).unwrap();
+        fs.mkdir("a/b", 0o700).unwrap();
+        fs.add_file("a/b/f", b"hello".to_vec());
+        fs.symlink("f", "a/b/l").unwrap();
+        let ino = fs.metadata("a/b/f").unwrap().ino;
+        fs.rename("a", "c").unwrap();
+        assert_eq!(fs.metadata("a/b/f").err(), Some(Errno::ENOENT));
+        assert_eq!(fs.metadata("a").err(), Some(Errno::ENOENT));
+        assert_eq!(fs.metadata("c/b/f").unwrap().ino, ino);
+        assert_eq!(fs.metadata("c/b").unwrap().mode, 0o700);
+        assert_eq!(fs.read_link("c/b/l").unwrap(), "f");
+        let mut buf = [0u8; 5];
+        fs.open("c/b/f", 0, 0).unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(fs.open("c/b", 0, 0).unwrap().read_dir().unwrap().len(), 4);
+        // Not into itself; not over a file or a full directory; a file not
+        // over a directory; not into a directory that is not there.
+        assert_eq!(fs.rename("c", "c/b/x"), Err(Errno::EINVAL));
+        assert_eq!(fs.rename("c", "c/b/f"), Err(Errno::EINVAL));
+        fs.add_file("g", vec![]);
+        fs.mkdir("e", 0o755).unwrap();
+        fs.mkdir("full", 0o755).unwrap();
+        fs.add_file("full/x", vec![]);
+        assert_eq!(fs.rename("c", "g"), Err(Errno::ENOTDIR));
+        assert_eq!(fs.rename("c", "full"), Err(Errno::ENOTEMPTY));
+        assert_eq!(fs.rename("g", "e"), Err(Errno::EISDIR));
+        assert_eq!(fs.rename("g", "nowhere/g"), Err(Errno::ENOENT));
+        assert_eq!(fs.rename2("c", "e", true), Err(Errno::EEXIST));
+        // Over an empty directory.
+        fs.rename("c", "e").unwrap();
+        assert_eq!(fs.metadata("e/b/f").unwrap().ino, ino);
+        // A name with the directory's as a prefix is not under it.
+        fs.mkdir("e2", 0o755).unwrap();
+        fs.rename("e", "z").unwrap();
+        assert!(fs.metadata("e2").is_ok());
+        assert!(fs.metadata("z/b/f").is_ok());
+    }
+
+    /// An open directory follows its renames, and those of a directory
+    /// above it, as a Linux descriptor does; once removed it is nowhere.
+    #[test]
+    fn an_open_directory_follows_its_renames() {
+        let fs = TmpFs::new();
+        fs.mkdir("a", 0o755).unwrap();
+        fs.mkdir("a/b", 0o755).unwrap();
+        fs.add_file("a/b/f", vec![]);
+        let h = fs.open("a/b", 0, 0).unwrap();
+        let at = |now: &str, epoch| Some(Ok(super::super::Moved { was: "a/b".into(), now: now.into(), epoch }));
+        assert_eq!(h.moved(), at("a/b", 0));
+        fs.rename("a", "c").unwrap();
+        assert_eq!(h.moved(), at("c/b", 1));
+        assert!(h.read_dir().unwrap().iter().any(|e| e.name == "f"));
+        fs.rename("c/b", "d").unwrap();
+        assert_eq!(h.moved(), at("d", 2));
+        assert_eq!(h.metadata().unwrap().file_type, FileType::Directory);
+        fs.unlink("d/f").unwrap();
+        fs.rmdir("d").unwrap();
+        assert_eq!(h.moved(), Some(Err(Errno::ENOENT)));
+        assert!(h.read_dir().unwrap().is_empty());
+        // A file's handle has its node, not a directory to follow.
+        fs.add_file("g", vec![]);
+        assert_eq!(fs.open("g", 0, 0).unwrap().moved(), None);
+    }
 
     #[test]
     fn link_counts_follow_links_unlinks_and_renames() {

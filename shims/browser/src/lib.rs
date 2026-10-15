@@ -299,7 +299,8 @@ extern "C" {
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
-    fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
+    fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
+    fn k_fs_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
@@ -789,8 +790,11 @@ extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32
 extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_rmdir(path, path_len) }
 }
-extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
-    unsafe { k_fs_rename(from, from_len, to, to_len) }
+extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32 {
+    unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) }
+}
+extern "C" fn rf_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
+    unsafe { k_fs_moved(handle, at, cap) }
 }
 extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
@@ -1318,6 +1322,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             mkdir: rf_mkdir,
             rmdir: rf_rmdir,
             rename: rf_rename,
+            moved: rf_moved,
             chmod: rf_chmod,
             fchmod: rf_fchmod,
             symlink: rf_symlink,
@@ -8053,7 +8058,8 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     // The working directory is per-process state the child must inherit: its
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
-    *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
+    // The calling thread's (its fs_struct's, which a fork copies).
+    *FORK_CWD.0.borrow_mut() = h.kernel.caller_cwd();
     // And the program, which a fork child is too: `/proc/self/{exe,cmdline}`
     // (tests/gexcc/longargs re-execs `/proc/self/exe` from a child).
     // Dispositions (an ignored SIGPIPE, SIGINT), mask, umask and limits,
@@ -8123,7 +8129,7 @@ fn state_bytes(k: &Kernel, pending: bool) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + sig.len() + k.rlimits.len() * 16);
     v.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     v.extend_from_slice(&sig);
-    v.extend_from_slice(&k.umask.to_le_bytes());
+    v.extend_from_slice(&k.umask.load(std::sync::atomic::Ordering::Relaxed).to_le_bytes());
     for [soft, hard] in k.rlimits {
         v.extend_from_slice(&soft.to_le_bytes());
         v.extend_from_slice(&hard.to_le_bytes());
@@ -8143,7 +8149,7 @@ fn apply_state(k: &mut Kernel, b: &[u8]) {
     k.signals = sig;
     k.thread_signals.clear();
     k.sig_tid = 0;
-    k.umask = u32::from_le_bytes(rest[..4].try_into().unwrap());
+    k.umask.store(u32::from_le_bytes(rest[..4].try_into().unwrap()), std::sync::atomic::Ordering::Relaxed);
     for (i, lim) in k.rlimits.iter_mut().enumerate() {
         let at = 4 + i * 16;
         lim[0] = u64::from_le_bytes(rest[at..at + 8].try_into().unwrap());

@@ -1,11 +1,15 @@
 /* The working directory belongs to the fs_struct, not the thread, and the
- * path calls run without the kernel lock (docs/kernel-locking.md, L14b).
- * pthreads share their creator's fs_struct: a chdir in one is seen by its
- * siblings. unshare(CLONE_FS) gives a thread its own, which the threads it
- * then creates share and the rest of the process does not see. While
- * threads open, stat and readlink through a directory descriptor, another
- * renames the files in that directory back and forth: every open finds one
- * of the two names or neither, and what it opens is the file. */
+ * path calls run without the kernel lock (docs/kernel-locking.md, L14b,
+ * L14c). pthreads share their creator's fs_struct: a chdir in one is seen
+ * by its siblings. unshare(CLONE_FS) gives a thread its own, which the
+ * threads it then creates share and the rest of the process does not see,
+ * and which an execve from that thread keeps. While threads open and stat
+ * through a directory descriptor, others rename in it: files back and
+ * forth, a directory with a file in it back and forth, and the descriptor's
+ * own directory back and forth. Every open of a file finds one of its two
+ * names or neither and what it opens is the file; a directory renamed takes
+ * its file along; and a descriptor follows its own directory, so an open
+ * through it never misses. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define ROUNDS 400
@@ -93,9 +98,23 @@ static void *unsharer(void *arg) {
     return NULL;
 }
 
-/* --- *at calls racing a rename ------------------------------------- */
+/* --- execve keeps the caller's fs_struct ---------------------------- */
 
-static int dfd;
+static char *self;
+static int hold[2], up[2];
+
+/* A thread that stays on the process's first fs_struct until the exec. */
+static void *bystander(void *arg) {
+    (void)arg;
+    char c = 1;
+    (void)!write(up[1], &c, 1);
+    (void)!read(hold[0], &c, 1);
+    return NULL;
+}
+
+/* --- *at calls racing renames -------------------------------------- */
+
+static int dfd, efd;
 static volatile int stop;
 
 static void *renamer(void *arg) {
@@ -108,6 +127,37 @@ static void *renamer(void *arg) {
     return NULL;
 }
 
+/* A directory with a file in it, renamed back and forth in d/. */
+static void *dir_renamer(void *arg) {
+    (void)arg;
+    for (int i = 0; !stop; i++) {
+        if (renameat(dfd, i & 1 ? "s2" : "s1", dfd, i & 1 ? "s1" : "s2")) fail("rename a directory");
+        if (i % 16 == 0) sched_yield();
+    }
+    return NULL;
+}
+
+/* The directory efd is open on, renamed back and forth under the root. */
+static void *own_renamer(void *arg) {
+    (void)arg;
+    char a[96], b[96];
+    snprintf(a, sizeof a, "%s/e1", root);
+    snprintf(b, sizeof b, "%s/e2", root);
+    for (int i = 0; !stop; i++) {
+        if (rename(i & 1 ? b : a, i & 1 ? a : b)) fail("rename the descriptor's directory");
+        if (i % 16 == 0) sched_yield();
+    }
+    return NULL;
+}
+
+static int check(int fd, const char *want) {
+    char buf[16] = {0};
+    size_t n = strlen(want);
+    int ok = read(fd, buf, sizeof buf - 1) == (ssize_t)n && !strcmp(buf, want);
+    close(fd);
+    return ok;
+}
+
 static void *opener(void *arg) {
     (void)arg;
     long found = 0;
@@ -118,19 +168,43 @@ static void *opener(void *arg) {
                 if (errno != ENOENT) fail("openat: not ENOENT");
                 continue;
             }
-            char buf[16] = {0};
-            if (read(fd, buf, sizeof buf - 1) != 8 || strcmp(buf, "the file")) fail("opened something else");
-            close(fd);
+            if (!check(fd, "the file")) fail("opened something else");
             found++;
             struct stat st;
             if (fstatat(dfd, n, &st, 0) == 0 && st.st_size != 8) fail("fstatat size");
         }
+        /* The file in the directory being renamed: under one name or the
+         * other, never left behind under both or neither for long. */
+        for (const char *n = "s1/in"; n; n = n[1] == '1' ? "s2/in" : NULL) {
+            int fd = openat(dfd, n, O_RDONLY);
+            if (fd < 0) {
+                if (errno != ENOENT) fail("openat in a renamed directory: not ENOENT");
+                continue;
+            }
+            if (!check(fd, "inside")) fail("opened something else in a renamed directory");
+        }
+        /* Through the descriptor whose own directory is being renamed: it
+         * follows the directory, so the file is always there. */
+        int fd = openat(efd, "own", O_RDONLY);
+        if (fd < 0) fail("openat through a descriptor whose directory was renamed");
+        else if (!check(fd, "own")) fail("opened something else through a renamed directory");
+        struct stat st;
+        if (fstatat(efd, "own", &st, 0) || st.st_size != 3) fail("fstatat through a renamed directory");
     }
     if (!found) fail("never found either name");
     return NULL;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "exec-cwd")) {
+        char cwd[256];
+        return getcwd(cwd, sizeof cwd) && ends_with(cwd, "/b") ? 0 : 7;
+    }
+    /* Absolute: the exec runs from another directory. */
+    static char me[512];
+    if (argv[0][0] == '/') snprintf(me, sizeof me, "%s", argv[0]);
+    else if (getcwd(me, 256)) snprintf(me + strlen(me), sizeof me - strlen(me), "/%s", argv[0]);
+    self = me;
     snprintf(root, sizeof root, "/tmp/fs-threads-%d", (int)getpid());
     char p[128];
     mkdir(root, 0755);
@@ -141,6 +215,10 @@ int main(void) {
     snprintf(p, sizeof p, "%s/a/only-in-a", root); put(p, "a");
     snprintf(p, sizeof p, "%s/b/c/only-in-c", root); put(p, "c");
     snprintf(p, sizeof p, "%s/d/f", root); put(p, "the file");
+    snprintf(p, sizeof p, "%s/d/s1", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/d/s1/in", root); put(p, "inside");
+    snprintf(p, sizeof p, "%s/e1", root); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/e1/own", root); put(p, "own");
     if (chdir(root)) return 1;
 
     pthread_barrier_init(&moved, NULL, 3);
@@ -161,17 +239,60 @@ int main(void) {
     if (!getcwd(cwd, sizeof cwd) || !ends_with(cwd, "/a")) fail("the process's cwd after a private chdir");
     if (access("only-in-a", R_OK)) fail("relative lookups after a private chdir");
 
+    /* A forked child (in a/) whose main thread takes an fs_struct of its
+     * own, apart from its other thread's, moves to b/ and execs: the new
+     * image starts in b/, the caller's directory, not the one the rest of
+     * the process had. (From the main thread: gexc runs an execve from no
+     * other.) */
+    pid_t c = fork();
+    if (c == 0) {
+        pthread_t t;
+        char ready;
+        if (pipe(hold) || pipe(up)) _exit(4);
+        pthread_create(&t, NULL, bystander, NULL);
+        /* Running before the exec (an exec racing its start is another
+         * matter). */
+        if (read(up[0], &ready, 1) != 1) _exit(4);
+        if (unshare(CLONE_FS) || chdir("../b")) _exit(5);
+        char *av[] = {self, "exec-cwd", NULL};
+        execv(self, av);
+        _exit(6);
+    }
+    int status = 0;
+    if (c < 0 || waitpid(c, &status, 0) != c || !WIFEXITED(status) || WEXITSTATUS(status)) {
+        errno = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        fail("execve from a thread with its own fs_struct: not in its directory");
+    }
+
     snprintf(p, sizeof p, "%s/d", root);
     dfd = open(p, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) return 1;
-    pthread_t r, o[3];
+    snprintf(p, sizeof p, "%s/e1", root);
+    efd = open(p, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0 || efd < 0) return 1;
+    pthread_t r, dr, er, o[3];
     for (int i = 0; i < 3; i++) pthread_create(&o[i], NULL, opener, NULL);
+    pthread_create(&dr, NULL, dir_renamer, NULL);
+    pthread_create(&er, NULL, own_renamer, NULL);
     pthread_create(&r, NULL, renamer, NULL);
     pthread_join(r, NULL);
+    pthread_join(dr, NULL);
+    pthread_join(er, NULL);
     for (int i = 0; i < 3; i++) pthread_join(o[i], NULL);
+    /* Wherever the renames left them, the descriptors still name them. */
+    if (fchdir(efd)) fail("fchdir to a renamed directory");
+    if (access("own", R_OK)) fail("a relative lookup after fchdir to a renamed directory");
+    if (chdir(root)) return 1;
 
     snprintf(p, sizeof p, "%s/d/f", root); unlink(p);
     snprintf(p, sizeof p, "%s/d/g", root); unlink(p);
+    for (const char *n = "s1s2"; *n; n += 2) {
+        snprintf(p, sizeof p, "%s/d/%.2s/in", root, n); unlink(p);
+        snprintf(p, sizeof p, "%s/d/%.2s", root, n); rmdir(p);
+    }
+    for (const char *n = "e1e2"; *n; n += 2) {
+        snprintf(p, sizeof p, "%s/%.2s/own", root, n); unlink(p);
+        snprintf(p, sizeof p, "%s/%.2s", root, n); rmdir(p);
+    }
     snprintf(p, sizeof p, "%s/a/only-in-a", root); unlink(p);
     snprintf(p, sizeof p, "%s/b/c/only-in-c", root); unlink(p);
     snprintf(p, sizeof p, "%s/b/c", root); rmdir(p);

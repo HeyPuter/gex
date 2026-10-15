@@ -81,9 +81,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # close; cmdline in a forked child and after execve; a child's stat (L14a:
 # /proc reads the process's published state, no refresh under the lock).
 # fs-threads: a chdir in one pthread seen by its siblings; unshare(CLONE_FS)
-# gives a thread its own directory, shared with the threads it makes; *at
-# calls through a directory descriptor racing renames in it (L14b: the path
-# calls without the kernel lock).
+# gives a thread its own directory, shared with the threads it makes and
+# kept by its execve; *at calls through a directory descriptor racing
+# renames of files and directories in it and of its own directory, which it
+# follows (L14b, L14c: the path calls without the kernel lock).
 PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
@@ -119,7 +120,7 @@ for src in "$HERE"/*.c; do
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
-        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
+        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ] || [ $name = fs-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then

@@ -77,6 +77,45 @@ impl Drop for OpenFile {
 }
 
 impl OpenFile {
+    /// The absolute path this description's directory has now, for the
+    /// calls that resolve through it (`openat(dirfd, ...)`, `fchdir`): the
+    /// path it was opened at, unless the directory (or one above it) has
+    /// been renamed since -- Linux resolves a directory descriptor by the
+    /// directory, not by its name ([`FileHandle::moved`]). `ENOENT` once it
+    /// is removed. A directory opened through a symlink among the
+    /// directories of its path keeps the path it was opened at.
+    ///
+    /// [`FileHandle::moved`]: crate::vfs::FileHandle::moved
+    pub fn dir_path(&self) -> Result<Option<String>, crate::errno::Errno> {
+        Ok(self.dir_at()?.map(|(p, _)| p))
+    }
+
+    /// [`OpenFile::dir_path`], and its filesystem's directory-rename epoch
+    /// ([`crate::vfs::Moved::epoch`]).
+    pub fn dir_at(&self) -> Result<Option<(String, u64)>, crate::errno::Errno> {
+        let crate::vfs::Moved { was, now, epoch } = match self.handle.moved() {
+            None => return Ok(None),
+            Some(r) => r?,
+        };
+        if was == now {
+            return Ok(Some((self.path.clone(), epoch)));
+        }
+        // The mount's part of the recorded path does not change.
+        let mount = if was.is_empty() {
+            Some(self.path.as_str())
+        } else {
+            self.path.strip_suffix(was.as_str()).and_then(|m| m.strip_suffix('/'))
+        };
+        Ok(Some((
+            match mount {
+                Some(m) if now.is_empty() => if m.is_empty() { "/".to_string() } else { m.to_string() },
+                Some(m) => format!("{m}/{now}"),
+                None => self.path.clone(),
+            },
+            epoch,
+        )))
+    }
+
     pub fn new(
         handle: Arc<dyn FileHandle>,
         path: String,

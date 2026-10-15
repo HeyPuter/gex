@@ -673,13 +673,19 @@ pub struct Kernel {
     /// Entered into `vfs` for each of such a thread's calls; read by its
     /// calls made without the kernel lock.
     pub thread_fs: Arc<ThreadFs>,
+    /// The directory of the fs_struct of the thread whose `fork` or
+    /// `execve` the host is carrying out, when that thread has its own:
+    /// what the child or the new image starts in ([`Kernel::caller_cwd`],
+    /// [`Kernel::exec_signals`]). Kept from the call itself: by the time the
+    /// host acts, another thread's call may have run.
+    pub call_cwd: Option<String>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub tmpfiles: Arc<std::sync::atomic::AtomicU64>,
     /// The file-creation mask. Recorded rather than applied: nothing here
     /// enforces permissions, but `umask(022)` is expected to hand back what
     /// it replaced, and a build system that does not get one back concludes
     /// the mask was zero and re-runs itself.
-    pub umask: u32,
+    pub umask: Arc<std::sync::atomic::AtomicU32>,
     /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource.
     /// RLIMIT_NOFILE's soft limit is the descriptor table's (`FdTable`).
     pub rlimits: [[u64; 2]; RLIM_NLIMITS],
@@ -1792,6 +1798,11 @@ impl ThreadFs {
         self.by_ctx.lock().unwrap_or_else(|e| e.into_inner()).get(&ctx).cloned()
     }
 
+    /// Every thread back on the process's fs_struct (`execve`).
+    fn clear(&self) {
+        self.by_ctx.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     fn set(&self, ctx: u64, fs: Option<Arc<FsCwd>>) {
         let mut m = self.by_ctx.lock().unwrap_or_else(|e| e.into_inner());
         match fs {
@@ -1829,11 +1840,49 @@ pub struct PathIo<'a> {
     pub ptys: Option<crate::pty::Remote>,
     /// `O_TMPFILE`'s names, numbered per process.
     pub tmpfiles: &'a std::sync::atomic::AtomicU64,
+    /// What `mkdir` leaves out of the mode it is asked for.
+    pub umask: &'a std::sync::atomic::AtomicU32,
+    /// For `utimensat`'s "now".
+    pub clock: ClockFn,
+}
+
+thread_local! {
+    /// The directory descriptors this thread's path call resolved through,
+    /// and their filesystems' rename epochs then ([`PathIo::call`]).
+    static DIRS_SEEN: std::cell::RefCell<Vec<(i32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl PathIo<'_> {
     /// The path call `n` (canonical; [`is_path`]), or `None` for another.
+    ///
+    /// A descriptor's directory is found where it is now and the call then
+    /// resolves through that path, two steps: a directory renamed between
+    /// them leaves the call looking where the directory was. So a call
+    /// through a directory descriptor that finds nothing (`ENOENT`,
+    /// `ENOTDIR`) while a directory was renamed on that filesystem is made
+    /// again, as Linux's lookup by the directory itself would not have
+    /// missed (Linux's own path walk retries on its rename seqlock the same
+    /// way). A miss has done nothing to undo. Bounded: a directory renamed
+    /// without pause by another thread can still make a call miss.
     pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        for _ in 0..64 {
+            DIRS_SEEN.with(|d| d.borrow_mut().clear());
+            let r = self.call_once(m, n, a)?;
+            if !matches!(r, Err(Errno::ENOENT) | Err(Errno::ENOTDIR)) {
+                return Some(r);
+            }
+            let seen = DIRS_SEEN.with(|d| std::mem::take(&mut *d.borrow_mut()));
+            let raced = seen.iter().any(|&(fd, epoch)| {
+                self.map.fds.get(fd).ok().and_then(|f| f.dir_at().ok().flatten()).is_some_and(|(_, now)| now != epoch)
+            });
+            if !raced {
+                return Some(r);
+            }
+        }
+        self.call_once(m, n, a)
+    }
+
+    fn call_once(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         Some(match n {
             nr::OPENAT => self.openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             nr::OPENAT2 => self.openat2(m, a[0] as i32, a[1], a[2], a[3]),
@@ -1844,6 +1893,40 @@ impl PathIo<'_> {
             nr::FACCESSAT | nr::FACCESSAT2 => self.faccessat(m, a[0] as i32, a[1], a[2] as u32),
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
+            nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
+            nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
+            nr::RENAMEAT2 => self.sys_renameat2(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
+            nr::LINKAT => self.sys_linkat(m, a),
+            nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[1] as i32, a[2]),
+            // Modification times are not settable here: tmpfs keeps one it
+            // maintains itself and hostfs reports the host's. Accepting the
+            // call is still better than refusing it -- apt sets the time on
+            // a file it has just downloaded, and treats the failure as a
+            // failure of the download.
+            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[2], a[3] as u32),
+            // Permission bits are not modelled; reporting success keeps
+            // installers and build systems moving.
+            nr::FCHMOD | nr::FCHMODAT => self.sys_chmod(m, n, a),
+            // Ownership is not modelled: there is one user and the guest is
+            // it. Refusing would be worse than accepting -- tar treats a
+            // failed chown while unpacking as a failure to unpack.
+            // Ownership is not kept, but the file must be there.
+            nr::FCHOWN => self.map.fds.get(a[0] as i32).map(|_| 0),
+            nr::FCHOWNAT => {
+                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
+                if empty && a[4] & AT_EMPTY_PATH != 0 {
+                    self.map.fds.get(a[0] as i32).map(|_| 0)
+                } else {
+                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
+                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
+                            self.ns.metadata_nofollow(&p).map(|_| 0)
+                        } else {
+                            self.ns.metadata(&p).map(|_| 0)
+                        }
+                    })
+                }
+            }
             _ => return None,
         })
     }
@@ -1971,7 +2054,7 @@ impl PathIo<'_> {
             }
             // O_CREAT of "name/" that is not there: a slash names a
             // directory, which open does not create (EISDIR, as Linux).
-            if flags & oflags::O_CREAT != 0 && Kernel::path_tail(m, path)?.0 && self.ns.metadata(&p).is_err() {
+            if flags & oflags::O_CREAT != 0 && Self::path_tail(m, path)?.0 && self.ns.metadata(&p).is_err() {
                 return Err(Errno::EISDIR);
             }
             // O_NOFOLLOW on a symlink: ELOOP.
@@ -2173,6 +2256,265 @@ impl PathIo<'_> {
         Ok(bytes.len() as u64)
     }
 
+    /// How the path at `ptr` ends, which normalising loses: with a slash
+    /// (`name/`), and whether its last component is `.` (1) or `..` (2).
+    pub fn path_tail(m: &GuestMem<'_>, ptr: u64) -> Result<(bool, u8), Errno> {
+        let raw = m.read_cstr(ptr, 4096)?;
+        let slash = raw.len() > 1 && raw.ends_with(b"/");
+        let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+        let dot = match last {
+            Some(b".") => 1,
+            Some(b"..") => 2,
+            _ => 0,
+        };
+        Ok((slash, dot))
+    }
+
+    /// A new non-directory name (link, symlink) that ends in a slash or in
+    /// `.`/`..` names a directory: EEXIST when something is there, else
+    /// ENOENT, as Linux answers.
+    pub fn new_name_check(&self, m: &GuestMem<'_>, ptr: u64, p: &str) -> Result<(), Errno> {
+        let (slash, dot) = Self::path_tail(m, ptr)?;
+        if slash || dot != 0 {
+            return Err(if self.ns.metadata_nofollow(p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
+        Ok(())
+    }
+
+    /// `linkat`: a second name for a file that already exists.
+    pub fn sys_linkat(&self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        const AT_SYMLINK_FOLLOW: u64 = 0x400;
+        let from = self.at_path(m, a[0] as i32, a[1])?;
+        // With AT_SYMLINK_FOLLOW the link is to what `from` points at, not the
+        // symlink itself. This is how the O_TMPFILE atomic-create idiom names an
+        // unnamed file: write to an `O_TMPFILE` fd, then
+        // `linkat("/proc/self/fd/N", target, AT_SYMLINK_FOLLOW)`. gex's
+        // `/proc/self/fd/N` is a symlink to the temp's real path, so following it
+        // here turns a would-be cross-mount link (/proc vs the target's fs, an
+        // EXDEV) into the same-fs link it really is. QSaveFile (Qt, hence every
+        // KDE app) relies on it -- without it dolphin cannot save its bookmarks.
+        let from = if a[4] & AT_SYMLINK_FOLLOW != 0 {
+            let mut cur = from;
+            for _ in 0..40 {
+                match self.ns.read_link(&cur) {
+                    Ok(target) => {
+                        cur = if target.starts_with('/') {
+                            crate::vfs::normalize(&target, "/")
+                        } else {
+                            let parent = crate::vfs::parent_of(&cur);
+                            crate::vfs::normalize(&target, &parent)
+                        };
+                    }
+                    Err(_) => break,
+                }
+            }
+            cur
+        } else {
+            from
+        };
+        let to = self.at_path(m, a[2] as i32, a[3])?;
+        self.new_name_check(m, a[3], &to)?;
+        self.ns.link(&from, &to).map(|_| 0)
+    }
+
+    pub fn sys_mkdirat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        // "link/" where link dangles: the name is taken (EEXIST); resolving
+        // the slash would say ENOENT
+        if Self::path_tail(m, path)?.0 {
+            let raw = String::from_utf8(m.read_cstr(path, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(dirfd, raw.trim_end_matches('/'))?;
+            if self.ns.metadata_nofollow(&bare).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+        }
+        let p = self.at_path(m, dirfd, path)?;
+        // "dir/." and "dir/.." exist if dir does, else ENOENT
+        if Self::path_tail(m, path)?.1 != 0 {
+            return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
+        self.ns.mkdir(&p, mode & !self.umask.load(std::sync::atomic::Ordering::Relaxed)).map(|_| 0)
+    }
+
+    pub fn sys_unlinkat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
+        let tail = Self::path_tail(m, path)?;
+        let p = self.at_path(m, dirfd, path)?;
+        if flags & AT_REMOVEDIR != 0 {
+            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY
+            match tail.1 {
+                1 => return Err(Errno::EINVAL),
+                2 => return Err(Errno::ENOTEMPTY),
+                _ => {}
+            }
+            self.ns.rmdir(&p).map(|_| 0)
+        } else {
+            self.ns.unlink(&p).map(|_| 0)
+        }
+    }
+
+    pub fn sys_renameat(
+        &self,
+        m: &GuestMem<'_>,
+        old_fd: i32,
+        old: u64,
+        new_fd: i32,
+        new: u64,
+    ) -> SysResult {
+        self.sys_renameat2(m, old_fd, old, new_fd, new, 0)
+    }
+
+    /// `renameat2`: `renameat` plus a flags word. The flags matter -- programs
+    /// reach for this syscall specifically to get the atomic guarantee, so
+    /// silently ignoring them would corrupt the very race they were avoiding.
+    ///
+    /// - `flags == 0` is plain `renameat`.
+    /// - `RENAME_NOREPLACE` (1): fail with `EEXIST` if the destination already
+    ///   exists, rather than clobbering it -- the atomic create-or-fail idiom.
+    ///   The filesystem makes the check and the move one step
+    ///   (`FileSystem::rename2`), so no other thread's call comes between.
+    /// - `RENAME_EXCHANGE` (2) and `RENAME_WHITEOUT` (4) are not something this
+    ///   VFS can do atomically, so they get `EINVAL` -- the same answer Linux
+    ///   gives on a filesystem that does not support them.
+    pub fn sys_renameat2(
+        &self,
+        m: &GuestMem<'_>,
+        old_fd: i32,
+        old: u64,
+        new_fd: i32,
+        new: u64,
+        flags: u32,
+    ) -> SysResult {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        // "." or ".." as the last component of either name: EINVAL (the
+        // normalised paths would name the directory itself)
+        for ptr in [old, new] {
+            let raw = m.read_cstr(ptr, 4096)?;
+            let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+            if matches!(last, Some(b".") | Some(b"..")) {
+                return Err(Errno::EINVAL);
+            }
+        }
+        let from = self.at_path(m, old_fd, old)?;
+        // "x" to "link/" where link is a symlink: the slash asks to follow
+        // it, and rename never replaces through a link (ENOTDIR, as GNU)
+        if Self::path_tail(m, new)?.0 {
+            let raw = String::from_utf8(m.read_cstr(new, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(new_fd, raw.trim_end_matches('/'))?;
+            if self.ns.metadata_nofollow(&bare).is_ok_and(|md| md.file_type == FileType::Symlink) {
+                return Err(Errno::ENOTDIR);
+            }
+        }
+        let to = self.at_path(m, new_fd, new)?;
+        // "file" to "name/": a slash names a directory, which a file is not
+        if Self::path_tail(m, new)?.0
+            && self.ns.metadata_nofollow(&from).is_ok_and(|md| md.file_type != FileType::Directory)
+        {
+            return Err(Errno::ENOTDIR);
+        }
+        if flags & !RENAME_NOREPLACE != 0 {
+            // EXCHANGE, WHITEOUT, or any unknown bit: unsupported here.
+            let _ = RENAME_EXCHANGE;
+            return Err(Errno::EINVAL);
+        }
+        self.ns.rename2(&from, &to, flags & RENAME_NOREPLACE != 0).map(|_| 0)
+    }
+
+    /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
+    ///
+    /// gex keeps one time per file, the modification time (`stat` reports
+    /// it for all three), so the access time in `times` is checked and
+    /// dropped. `times` NULL or `UTIME_NOW` means now; `UTIME_OMIT` leaves
+    /// the time alone. A missing path is `ENOENT`, which `touch` relies on
+    /// to create the file. A NULL path is `futimens` on `dirfd`, whose
+    /// descriptor is validated; its time is not kept (an open file's name
+    /// is not tracked).
+    pub fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, times: u64, flags: u32) -> SysResult {
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+        // The access and modification times to set (`None`: leave it).
+        let now = {
+            let (s, ns) = (self.clock)();
+            (s as i64, ns as u32)
+        };
+        let (atime, mtime) = if times == 0 {
+            (Some(now), Some(now))
+        } else {
+            let mut v = [None, None];
+            for (k, t) in [times, times + 16].into_iter().enumerate() {
+                let ns = m.read_u64(t + 8)?;
+                v[k] = match ns {
+                    UTIME_OMIT => None,
+                    UTIME_NOW => Some(now),
+                    _ if ns >= 1_000_000_000 => return Err(Errno::EINVAL),
+                    _ => Some((m.read_u64(t)? as i64, ns as u32)),
+                };
+            }
+            (v[0], v[1])
+        };
+        if path == 0 {
+            // futimens: the "path" is really the open descriptor in `dirfd`.
+            self.map.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
+            return Ok(0);
+        }
+        let p = self.at_path(m, dirfd, path)?;
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        if atime.is_some() || mtime.is_some() {
+            // Which says `ENOENT` itself.
+            self.ns.set_times(&p, atime, mtime, follow)?;
+        } else if follow {
+            self.ns.metadata(&p)?;
+        } else {
+            self.ns.metadata_nofollow(&p)?;
+        }
+        Ok(0)
+    }
+
+    /// `symlinkat(target, newdirfd, linkpath)`. The link path resolves
+    /// against `newdirfd`, not the working directory -- tar works relative to
+    /// a descriptor it just created, and against the cwd that is `ENOENT`.
+    pub fn sys_symlinkat(
+        &self,
+        m: &GuestMem<'_>,
+        target: u64,
+        newdirfd: i32,
+        path: u64,
+    ) -> SysResult {
+        let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
+        let p = self.at_path(m, newdirfd, path)?;
+        self.new_name_check(m, path, &p)?;
+        self.ns.symlink(&t, &p).map(|_| 0)
+    }
+
+    /// `fchmod` and `fchmodat`. The first names an open file, whose path the
+    /// descriptor kept; the second names a path directly.
+    pub fn sys_chmod(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let (path, mode, flags) = if n == nr::FCHMOD {
+            let f = self.map.fds.get(a[0] as i32)?;
+            // The handle, when it can: no walk of the name it kept, and
+            // what it is open on is not a symlink.
+            if let Some(r) = f.handle.chmod(a[1] as u32) {
+                return r.map(|_| 0);
+            }
+            (f.path.clone(), a[1] as u32, 0)
+        } else {
+            (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32, a[3])
+        };
+        // `chmod` on a symlink itself is `EOPNOTSUPP`, as on Linux: a symlink
+        // has no mode of its own. Following the link would change a different
+        // file, and answers `ENOENT` when the target does not exist yet --
+        // which tar hits unpacking a package with a dangling symlink.
+        if self
+            .ns
+            .metadata_nofollow(&path)
+            .is_ok_and(|m| m.file_type == FileType::Symlink)
+            && (flags & AT_SYMLINK_NOFOLLOW != 0 || n == nr::FCHMOD)
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.ns.chmod(&path, mode).map(|_| 0)
+    }
+
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
@@ -2221,14 +2563,18 @@ impl PathIo<'_> {
     }
 
     pub fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        // Relative to an open directory: its recorded path is the base. A
+        // Relative to an open directory: where the directory is now (it
+        // follows a rename, as on Linux), else its recorded path. A
         // descriptor that is not a directory is ENOTDIR.
         let f = self.map.fds.get(dirfd)?;
+        if let Some((base, epoch)) = f.dir_at()? {
+            DIRS_SEEN.with(|d| d.borrow_mut().push((dirfd, epoch)));
+            return Ok(crate::vfs::normalize(p, &base));
+        }
         if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
             return Err(Errno::ENOTDIR);
         }
-        let base = f.path.clone();
-        Ok(crate::vfs::normalize(p, &base))
+        Ok(crate::vfs::normalize(p, &f.path))
     }
 }
 
@@ -2681,6 +3027,17 @@ fn is_path(n: u64) -> bool {
             | nr::FACCESSAT2
             | nr::READLINKAT
             | nr::GETCWD
+            | nr::MKDIRAT
+            | nr::UNLINKAT
+            | nr::RENAMEAT
+            | nr::RENAMEAT2
+            | nr::LINKAT
+            | nr::SYMLINKAT
+            | nr::UTIMENSAT
+            | nr::FCHMOD
+            | nr::FCHMODAT
+            | nr::FCHOWN
+            | nr::FCHOWNAT
     )
 }
 
@@ -2739,6 +3096,17 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::READLINK | x::READLINKAT => nr::READLINKAT,
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
+            x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
+            x::RENAME | x::RENAMEAT => nr::RENAMEAT,
+            x::RENAMEAT2 => nr::RENAMEAT2,
+            x::LINK | x::LINKAT => nr::LINKAT,
+            x::SYMLINK | x::SYMLINKAT => nr::SYMLINKAT,
+            x::UTIMENSAT | x::UTIMENSAT_TIME64 => nr::UTIMENSAT,
+            x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
+            x::FCHMOD => nr::FCHMOD,
+            x::CHOWN | x::LCHOWN | x::LCHOWN16 | x::FCHOWNAT => nr::FCHOWNAT,
+            x::FCHOWN | x::FCHOWN16 => nr::FCHOWN,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -2786,6 +3154,17 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::READLINK | x::READLINKAT => nr::READLINKAT,
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
+            x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
+            x::RENAME | x::RENAMEAT => nr::RENAMEAT,
+            x::RENAMEAT2 => nr::RENAMEAT2,
+            x::LINK | x::LINKAT => nr::LINKAT,
+            x::SYMLINK | x::SYMLINKAT => nr::SYMLINKAT,
+            x::UTIMENSAT => nr::UTIMENSAT,
+            x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
+            x::FCHMOD => nr::FCHMOD,
+            x::CHOWN | x::LCHOWN | x::FCHOWNAT => nr::FCHOWNAT,
+            x::FCHOWN => nr::FCHOWN,
             _ => return None,
         }
     } else {
@@ -4188,7 +4567,15 @@ impl Kernel {
     /// threads are gone, and their state with them. The calling thread's
     /// (its mask and pending signals, which survive) goes on as thread
     /// `tid`: the process's leader, whichever thread called.
+    ///
+    /// And the fs_struct: the calling thread's, as Linux keeps it through
+    /// `execve`. A thread that had its own (`unshare(CLONE_FS)`) makes its
+    /// directory the process's; the other threads' go with them.
     pub fn exec_signals(&mut self, tid: i32) {
+        if let Some(cwd) = self.call_cwd.take() {
+            self.vfs.put_cwd(cwd);
+        }
+        self.thread_fs.clear();
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
         self.thread_signals.clear();
@@ -4284,8 +4671,9 @@ impl Kernel {
             wasm32: false,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
+            call_cwd: None,
             tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            umask: 0o022,
+            umask: Arc::new(std::sync::atomic::AtomicU32::new(0o022)),
             rlimits: default_rlimits(),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
@@ -4480,7 +4868,25 @@ impl Kernel {
     /// other. The VMA tree is copied because the child gets its own address
     /// space, and the child list starts empty because a grandchild is not the
     /// parent's to reap.
+    /// The working directory of the calling thread's fs_struct: what a
+    /// `fork` (which copies the caller's) starts in.
+    pub fn caller_cwd(&self) -> String {
+        match &self.call_cwd {
+            Some(cwd) if !self.vfs.in_thread_cwd() => cwd.clone(),
+            _ => self.vfs.cwd.clone(),
+        }
+    }
+
     pub fn fork_kernel(&self) -> Kernel {
+        let mut child = self.fork_kernel_inner();
+        let cwd = self.caller_cwd();
+        if cwd != child.vfs.cwd {
+            child.vfs.put_cwd(cwd);
+        }
+        child
+    }
+
+    fn fork_kernel_inner(&self) -> Kernel {
         Kernel {
             fds: Arc::new((*self.fds).clone()),
             mem: self.mem.clone(),
@@ -4534,8 +4940,9 @@ impl Kernel {
             wasm32: self.wasm32,
             sigreturn_legacy: false,
             thread_fs: Arc::new(ThreadFs::default()),
+            call_cwd: None,
             tmpfiles: Arc::new(std::sync::atomic::AtomicU64::new(self.tmpfiles.load(std::sync::atomic::Ordering::Relaxed))),
-            umask: self.umask,
+            umask: Arc::new(std::sync::atomic::AtomicU32::new(self.umask.load(std::sync::atomic::Ordering::Relaxed))),
             rlimits: self.rlimits,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
@@ -4669,12 +5076,21 @@ impl Kernel {
         // A thread with a working directory of its own (`unshare(CLONE_FS)`)
         // has it in `vfs` while its call runs.
         let me = self.ctx_addr;
+        let hands_on = |out: &SyscallOutcome| matches!(out, SyscallOutcome::SpawnProcess { .. } | SyscallOutcome::Exec { .. });
         let Some(fs) = self.thread_fs.of(me) else {
-            return self.syscall_inner(m, pc);
+            let out = self.syscall_inner(m, pc);
+            if hands_on(&out) {
+                // An `unshare` in the call may have given it one.
+                self.call_cwd = self.thread_fs.of(me).map(|fs| fs.get());
+            }
+            return out;
         };
         self.vfs.enter_cwd(fs.get());
         let out = self.syscall_inner(m, pc);
         let cwd = self.vfs.leave_cwd();
+        if hands_on(&out) {
+            self.call_cwd = Some(cwd.clone());
+        }
         // Into the thread's fs_struct as it is now (an `unshare` in the call
         // gave it a new one).
         if let Some(fs) = self.thread_fs.of(me) {
@@ -5147,6 +5563,8 @@ impl Kernel {
             procs: &self.procs,
             ptys: self.ptys,
             tmpfiles: &self.tmpfiles,
+            umask: &self.umask,
+            clock: self.clock,
         }
     }
 
@@ -5443,51 +5861,11 @@ impl Kernel {
                     Ok(0)
                 }
             }
-            nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
-            nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
-            nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
-            nr::RENAMEAT2 => {
-                self.sys_renameat2(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32)
-            }
-            nr::LINKAT => self.sys_linkat(m, a),
-            nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[1] as i32, a[2]),
             nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_now(m, n, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
-            // Modification times are not settable here: tmpfs keeps one it
-            // maintains itself and hostfs reports the host's. Accepting the
-            // call is still better than refusing it -- apt sets the time on
-            // a file it has just downloaded, and treats the failure as a
-            // failure of the download.
-            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
-            nr::UMASK => {
-                let old = self.umask;
-                self.umask = a[0] as u32 & 0o777;
-                Ok(old as u64)
-            }
-            // Permission bits are not modelled; reporting success keeps
-            // installers and build systems moving.
-            nr::FCHMOD | nr::FCHMODAT => self.sys_chmod(m, n, a),
-            // Ownership is not modelled: there is one user and the guest is
-            // it. Refusing would be worse than accepting -- tar treats a
-            // failed chown while unpacking as a failure to unpack.
-            // Ownership is not kept, but the file must be there.
-            nr::FCHOWN => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::FCHOWNAT => {
-                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
-                if empty && a[4] & AT_EMPTY_PATH != 0 {
-                    self.fds.get(a[0] as i32).map(|_| 0)
-                } else {
-                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
-                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
-                            self.vfs.metadata_nofollow(&p).map(|_| 0)
-                        } else {
-                            self.vfs.metadata(&p).map(|_| 0)
-                        }
-                    })
-                }
-            }
+            nr::UMASK => Ok(self.umask.swap(a[0] as u32 & 0o777, std::sync::atomic::Ordering::Relaxed) as u64),
 
             // -- memory ------------------------------------------------------
             nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
@@ -5988,30 +6366,7 @@ impl Kernel {
         self.path_io().at_path_str(dirfd, p)
     }
 
-    /// How the path at `ptr` ends, which normalising loses: with a slash
-    /// (`name/`), and whether its last component is `.` (1) or `..` (2).
-    fn path_tail(m: &GuestMem<'_>, ptr: u64) -> Result<(bool, u8), Errno> {
-        let raw = m.read_cstr(ptr, 4096)?;
-        let slash = raw.len() > 1 && raw.ends_with(b"/");
-        let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
-        let dot = match last {
-            Some(b".") => 1,
-            Some(b"..") => 2,
-            _ => 0,
-        };
-        Ok((slash, dot))
-    }
 
-    /// A new non-directory name (link, symlink) that ends in a slash or in
-    /// `.`/`..` names a directory: EEXIST when something is there, else
-    /// ENOENT, as Linux answers.
-    fn new_name_check(&self, m: &GuestMem<'_>, ptr: u64, p: &str) -> Result<(), Errno> {
-        let (slash, dot) = Self::path_tail(m, ptr)?;
-        if slash || dot != 0 {
-            return Err(if self.vfs.metadata_nofollow(p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
-        }
-        Ok(())
-    }
 
     /// `p` relative to the directory open at `dirfd`.
     fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
@@ -6216,41 +6571,6 @@ impl Kernel {
         self.fd_io().dup3(old, new, flags)
     }
 
-    /// `linkat`: a second name for a file that already exists.
-    fn sys_linkat(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        const AT_SYMLINK_FOLLOW: u64 = 0x400;
-        let from = self.at_path(m, a[0] as i32, a[1])?;
-        // With AT_SYMLINK_FOLLOW the link is to what `from` points at, not the
-        // symlink itself. This is how the O_TMPFILE atomic-create idiom names an
-        // unnamed file: write to an `O_TMPFILE` fd, then
-        // `linkat("/proc/self/fd/N", target, AT_SYMLINK_FOLLOW)`. gex's
-        // `/proc/self/fd/N` is a symlink to the temp's real path, so following it
-        // here turns a would-be cross-mount link (/proc vs the target's fs, an
-        // EXDEV) into the same-fs link it really is. QSaveFile (Qt, hence every
-        // KDE app) relies on it -- without it dolphin cannot save its bookmarks.
-        let from = if a[4] & AT_SYMLINK_FOLLOW != 0 {
-            let mut cur = from;
-            for _ in 0..40 {
-                match self.vfs.read_link(&cur) {
-                    Ok(target) => {
-                        cur = if target.starts_with('/') {
-                            crate::vfs::normalize(&target, "/")
-                        } else {
-                            let parent = crate::vfs::parent_of(&cur);
-                            crate::vfs::normalize(&target, &parent)
-                        };
-                    }
-                    Err(_) => break,
-                }
-            }
-            cur
-        } else {
-            from
-        };
-        let to = self.at_path(m, a[2] as i32, a[3])?;
-        self.new_name_check(m, a[3], &to)?;
-        self.vfs.link(&from, &to).map(|_| 0)
-    }
 
     /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
     ///
@@ -7139,7 +7459,8 @@ impl Kernel {
     /// `savewd` returns between components with `fchdir`.
     fn sys_fchdir(&mut self, fd: i32) -> SysResult {
         let file = self.fds.get(fd)?;
-        let path = file.path.clone();
+        // Where the directory is now, if it has moved since it was opened.
+        let path = file.dir_path()?.unwrap_or_else(|| file.path.clone());
         // A pipe or a socket has a name that is not a path. `ENOTDIR` is
         // what Linux says about a descriptor that is not a directory.
         if !path.starts_with('/') {
@@ -7148,207 +7469,13 @@ impl Kernel {
         self.vfs.set_cwd(&path).map(|_| 0)
     }
 
-    fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
-        // "link/" where link dangles: the name is taken (EEXIST); resolving
-        // the slash would say ENOENT
-        if Self::path_tail(m, path)?.0 {
-            let raw = String::from_utf8(m.read_cstr(path, 4096)?).map_err(|_| Errno::EINVAL)?;
-            let bare = self.at_path_str(dirfd, raw.trim_end_matches('/'))?;
-            if self.vfs.metadata_nofollow(&bare).is_ok() {
-                return Err(Errno::EEXIST);
-            }
-        }
-        let p = self.at_path(m, dirfd, path)?;
-        // "dir/." and "dir/.." exist if dir does, else ENOENT
-        if Self::path_tail(m, path)?.1 != 0 {
-            return Err(if self.vfs.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
-        }
-        self.vfs.mkdir(&p, mode & !self.umask).map(|_| 0)
-    }
-
-    fn sys_unlinkat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
-        let tail = Self::path_tail(m, path)?;
-        let p = self.at_path(m, dirfd, path)?;
-        if flags & AT_REMOVEDIR != 0 {
-            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY
-            match tail.1 {
-                1 => return Err(Errno::EINVAL),
-                2 => return Err(Errno::ENOTEMPTY),
-                _ => {}
-            }
-            self.vfs.rmdir(&p).map(|_| 0)
-        } else {
-            self.vfs.unlink(&p).map(|_| 0)
-        }
-    }
-
-    fn sys_renameat(
-        &mut self,
-        m: &GuestMem<'_>,
-        old_fd: i32,
-        old: u64,
-        new_fd: i32,
-        new: u64,
-    ) -> SysResult {
-        self.sys_renameat2(m, old_fd, old, new_fd, new, 0)
-    }
-
-    /// `renameat2`: `renameat` plus a flags word. The flags matter -- programs
-    /// reach for this syscall specifically to get the atomic guarantee, so
-    /// silently ignoring them would corrupt the very race they were avoiding.
-    ///
-    /// - `flags == 0` is plain `renameat`.
-    /// - `RENAME_NOREPLACE` (1): fail with `EEXIST` if the destination already
-    ///   exists, rather than clobbering it -- the atomic create-or-fail idiom.
-    ///   The KLock serialises syscalls, so the exists-check and rename are not
-    ///   interleaved by another guest thread.
-    /// - `RENAME_EXCHANGE` (2) and `RENAME_WHITEOUT` (4) are not something this
-    ///   VFS can do atomically, so they get `EINVAL` -- the same answer Linux
-    ///   gives on a filesystem that does not support them.
-    fn sys_renameat2(
-        &mut self,
-        m: &GuestMem<'_>,
-        old_fd: i32,
-        old: u64,
-        new_fd: i32,
-        new: u64,
-        flags: u32,
-    ) -> SysResult {
-        const RENAME_NOREPLACE: u32 = 1;
-        const RENAME_EXCHANGE: u32 = 2;
-        // "." or ".." as the last component of either name: EINVAL (the
-        // normalised paths would name the directory itself)
-        for ptr in [old, new] {
-            let raw = m.read_cstr(ptr, 4096)?;
-            let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
-            if matches!(last, Some(b".") | Some(b"..")) {
-                return Err(Errno::EINVAL);
-            }
-        }
-        let from = self.at_path(m, old_fd, old)?;
-        // "x" to "link/" where link is a symlink: the slash asks to follow
-        // it, and rename never replaces through a link (ENOTDIR, as GNU)
-        if Self::path_tail(m, new)?.0 {
-            let raw = String::from_utf8(m.read_cstr(new, 4096)?).map_err(|_| Errno::EINVAL)?;
-            let bare = self.at_path_str(new_fd, raw.trim_end_matches('/'))?;
-            if self.vfs.metadata_nofollow(&bare).is_ok_and(|md| md.file_type == FileType::Symlink) {
-                return Err(Errno::ENOTDIR);
-            }
-        }
-        let to = self.at_path(m, new_fd, new)?;
-        // "file" to "name/": a slash names a directory, which a file is not
-        if Self::path_tail(m, new)?.0
-            && self.vfs.metadata_nofollow(&from).is_ok_and(|md| md.file_type != FileType::Directory)
-        {
-            return Err(Errno::ENOTDIR);
-        }
-        if flags & !RENAME_NOREPLACE != 0 {
-            // EXCHANGE, WHITEOUT, or any unknown bit: unsupported here.
-            let _ = RENAME_EXCHANGE;
-            return Err(Errno::EINVAL);
-        }
-        if flags & RENAME_NOREPLACE != 0 && self.vfs.metadata_nofollow(&to).is_ok() {
-            return Err(Errno::EEXIST);
-        }
-        self.vfs.rename(&from, &to).map(|_| 0)
-    }
-
-    /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
-    ///
-    /// gex keeps one time per file, the modification time (`stat` reports
-    /// it for all three), so the access time in `times` is checked and
-    /// dropped. `times` NULL or `UTIME_NOW` means now; `UTIME_OMIT` leaves
-    /// the time alone. A missing path is `ENOENT`, which `touch` relies on
-    /// to create the file. A NULL path is `futimens` on `dirfd`, whose
-    /// descriptor is validated; its time is not kept (an open file's name
-    /// is not tracked).
-    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, times: u64, flags: u32) -> SysResult {
-        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
-        const UTIME_NOW: u64 = (1 << 30) - 1;
-        const UTIME_OMIT: u64 = (1 << 30) - 2;
-        // The access and modification times to set (`None`: leave it).
-        let now = {
-            let (s, ns) = (self.clock)();
-            (s as i64, ns as u32)
-        };
-        let (atime, mtime) = if times == 0 {
-            (Some(now), Some(now))
-        } else {
-            let mut v = [None, None];
-            for (k, t) in [times, times + 16].into_iter().enumerate() {
-                let ns = m.read_u64(t + 8)?;
-                v[k] = match ns {
-                    UTIME_OMIT => None,
-                    UTIME_NOW => Some(now),
-                    _ if ns >= 1_000_000_000 => return Err(Errno::EINVAL),
-                    _ => Some((m.read_u64(t)? as i64, ns as u32)),
-                };
-            }
-            (v[0], v[1])
-        };
-        if path == 0 {
-            // futimens: the "path" is really the open descriptor in `dirfd`.
-            self.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
-            return Ok(0);
-        }
-        let p = self.at_path(m, dirfd, path)?;
-        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
-        if atime.is_some() || mtime.is_some() {
-            // Which says `ENOENT` itself.
-            self.vfs.set_times(&p, atime, mtime, follow)?;
-        } else if follow {
-            self.vfs.metadata(&p)?;
-        } else {
-            self.vfs.metadata_nofollow(&p)?;
-        }
-        Ok(0)
-    }
-
-    /// `symlinkat(target, newdirfd, linkpath)`. The link path resolves
-    /// against `newdirfd`, not the working directory -- tar works relative to
-    /// a descriptor it just created, and against the cwd that is `ENOENT`.
-    fn sys_symlinkat(
-        &mut self,
-        m: &GuestMem<'_>,
-        target: u64,
-        newdirfd: i32,
-        path: u64,
-    ) -> SysResult {
-        let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
-        let p = self.at_path(m, newdirfd, path)?;
-        self.new_name_check(m, path, &p)?;
-        self.vfs.symlink(&t, &p).map(|_| 0)
-    }
 
 
-    /// `fchmod` and `fchmodat`. The first names an open file, whose path the
-    /// descriptor kept; the second names a path directly.
-    fn sys_chmod(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
-        let (path, mode, flags) = if n == nr::FCHMOD {
-            let f = self.fds.get(a[0] as i32)?;
-            // The handle, when it can: no walk of the name it kept, and
-            // what it is open on is not a symlink.
-            if let Some(r) = f.handle.chmod(a[1] as u32) {
-                return r.map(|_| 0);
-            }
-            (f.path.clone(), a[1] as u32, 0)
-        } else {
-            (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32, a[3])
-        };
-        // `chmod` on a symlink itself is `EOPNOTSUPP`, as on Linux: a symlink
-        // has no mode of its own. Following the link would change a different
-        // file, and answers `ENOENT` when the target does not exist yet --
-        // which tar hits unpacking a package with a dangling symlink.
-        if self
-            .vfs
-            .metadata_nofollow(&path)
-            .is_ok_and(|m| m.file_type == FileType::Symlink)
-            && (flags & AT_SYMLINK_NOFOLLOW != 0 || n == nr::FCHMOD)
-        {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        self.vfs.chmod(&path, mode).map(|_| 0)
-    }
+
+
+
+
+
 
     /// Nanoseconds on the guest's clock, for comparing deadlines against.
     pub fn now_nanos(&self) -> u128 {
@@ -10521,6 +10648,120 @@ mod tests {
         assert_eq!(g[g.len() - 2], -(Errno::ENOENT.0 as i64));
     }
 
+    /// The path writers through the lock-free path ([`PathIo`], L14c)
+    /// answer as the full call does. A directory renamed takes what is under
+    /// it, a descriptor on a directory below follows it there (Linux
+    /// resolves it by the directory, not its name), `RENAME_NOREPLACE`
+    /// refuses a name that is taken, and a descriptor on a removed
+    /// directory finds nothing.
+    #[test]
+    fn free_path_writers_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        const NOREPLACE: u64 = 1;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            let names: [&[u8]; 9] = [b"/d\0", b"/d/sub\0", b"/d/sub/f\0", b"/e\0", b"f\0", b"/e/sub/f\0", b"/d/l\0", b"/d/h\0", b"/x\0"];
+            let ptr = |i: usize| 0x20000u64 + 0x100 * i as u64;
+            for (i, t) in names.iter().enumerate() {
+                m.write(ptr(i), t).unwrap();
+            }
+            let (d, sub, sub_f, e, f, e_sub_f, l, h, x) = (ptr(0), ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7), ptr(8));
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, d, 0o777]));
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, sub, 0o777]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, d, 0x22000, 0]));
+            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            let file = sys(&mut m, &mut k, nr::OPENAT, &[cwd, sub_f, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            got.push(file);
+            let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, sub, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
+            got.push(dir);
+            // The directory and everything under it.
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT, &[cwd, d, cwd, e]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, sub_f, 0x22000, 0]));
+            got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, e_sub_f, 0x22000, 0]));
+            // The descriptor follows its directory.
+            got.push(sys(&mut m, &mut k, nr::OPENAT, &[dir as u64, f, 0, 0]));
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT2, &[cwd, e, cwd, x, NOREPLACE]));
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, d, 0o755]));
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT2, &[cwd, x, cwd, d, NOREPLACE]));
+            // Over an empty directory.
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT, &[cwd, x, cwd, d]));
+            got.push(sys(&mut m, &mut k, nr::SYMLINKAT, &[sub_f, cwd, l]));
+            got.push(sys(&mut m, &mut k, nr::LINKAT, &[cwd, sub_f, cwd, h, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCHMODAT, &[cwd, h, 0o600, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCHMODAT, &[cwd, l, 0o600, AT_SYMLINK_NOFOLLOW]));
+            got.push(sys(&mut m, &mut k, nr::FCHMOD, &[file as u64, 0o640]));
+            got.push(sys(&mut m, &mut k, nr::UTIMENSAT, &[cwd, h, 0, 0]));
+            got.push(sys(&mut m, &mut k, nr::UTIMENSAT, &[cwd, x, 0, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCHOWNAT, &[cwd, l, 0, 0, AT_SYMLINK_NOFOLLOW]));
+            got.push(sys(&mut m, &mut k, nr::FCHOWN, &[file as u64, 0, 0]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, l, 0]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, h, 0]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, sub, AT_REMOVEDIR]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[dir as u64, f, 0]));
+            got.push(sys(&mut m, &mut k, nr::UNLINKAT, &[cwd, sub, AT_REMOVEDIR]));
+            // Its directory gone, the descriptor finds nothing.
+            got.push(sys(&mut m, &mut k, nr::OPENAT, &[dir as u64, f, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]));
+            got.push(sys(&mut m, &mut k, nr::GETDENTS64, &[dir as u64, 0x26000, 4096]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        let e = |x: Errno| -(x.0 as i64);
+        assert_eq!(&g[..2], &[0, 0]);
+        let tail = &g[2 + 1 + 128..];
+        assert!(tail[0] >= 3 && tail[1] > tail[0], "{tail:?}");
+        assert_eq!(
+            &tail[2..],
+            &[
+                0,
+                e(Errno::ENOENT),
+                0,
+                tail[5],
+                0,
+                0,
+                e(Errno::EEXIST),
+                0,
+                0,
+                0,
+                0,
+                e(Errno::EOPNOTSUPP),
+                0,
+                0,
+                e(Errno::ENOENT),
+                0,
+                0,
+                0,
+                0,
+                e(Errno::ENOTEMPTY),
+                0,
+                0,
+                e(Errno::ENOENT),
+                0,
+            ]
+        );
+        assert!(tail[5] > tail[1], "an open through the moved directory: {}", tail[5]);
+    }
+
     /// The 32-bit ABI's path calls through the lock-free path, in their
     /// older forms too (`open`, `creat`, `stat64`, `lstat64`, `fstat64`,
     /// `access`, `readlink`): translated as the full call translates them,
@@ -10579,13 +10820,34 @@ mod tests {
             got.push(sys(&mut m, &mut k, raw::READLINK, [0x20100, 0x24000, 64, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::READLINKAT, [cwd32, 0x20100, 0x24000, 64, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::GETCWD, [0x25000, 64, 0, 0, 0, 0]));
+            // The writers' older forms (L14c).
+            for (p, t) in [(0x20400u64, &b"/dd\0"[..]), (0x20500, b"/dd/f\0"), (0x20600, b"/ee\0"), (0x20700, b"/ee/f\0"), (0x20800, b"/ee/h\0"), (0x20900, b"/ee/s\0")] {
+                m.write(p, t).unwrap();
+            }
+            got.push(sys(&mut m, &mut k, raw::MKDIR, [0x20400, 0o755, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::RENAME, [0x20000, 0x20500, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::RENAME, [0x20400, 0x20600, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::LINK, [0x20700, 0x20800, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::SYMLINK, [0x20700, 0x20900, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::CHMOD, [0x20800, 0o600, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::FCHMOD, [f as u64, 0o600, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::CHOWN, [0x20800, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::LCHOWN, [0x20900, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::FCHOWN, [f as u64, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::UTIMENSAT, [cwd32, 0x20800, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::UNLINK, [0x20900, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::UNLINK, [0x20800, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::RMDIR, [0x20600, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::UNLINK, [0x20700, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::RMDIR, [0x20600, 0, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::OPENAT, [cwd32, 0x20200, 0, 0, 0, 0]));
             seen.push(got);
         }
         assert_eq!(seen[0], seen[1]);
         let g = &seen[0];
         assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 3, "{:?}", &g[..3]);
-        assert_eq!(*g.last().unwrap(), -(Errno::ENOENT.0 as i64));
+        let n = g.len();
+        assert_eq!(&g[n - 17..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
     }
 
     /// The mapping calls through the lock-free path ([`MapIo`]) answer as

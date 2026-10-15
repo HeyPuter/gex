@@ -2763,8 +2763,26 @@ pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) -> i32 {
-    as_unit(rootfs().rename(&path_of(from, from_len), &path_of(to, to_len)))
+pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, noreplace: u32) -> i32 {
+    as_unit(rootfs().rename2(&path_of(from, from_len), &path_of(to, to_len), noreplace != 0))
+}
+
+/// Where an open directory is now (`remote::Remote::moved`).
+#[no_mangle]
+pub extern "C" fn k_fs_moved(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    match h.moved() {
+        None => -38, // ENOSYS
+        Some(Err(e)) => -e.0,
+        Some(Ok(m)) => {
+            let b = format!("{}\0{}\0{}", m.was, m.now, m.epoch).into_bytes();
+            if b.len() as u32 > cap {
+                return -34; // ERANGE
+            }
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+            b.len() as i32
+        }
+    }
 }
 
 /// `fchmod` on an open handle, by the name it was opened under: no walk.
