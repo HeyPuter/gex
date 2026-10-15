@@ -430,10 +430,12 @@ async function begin(opts, base, at, state, meter) {
   }
   const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
   // The runtime's wasm, compressed in the pack when the site packed it
-  // (plain, the shim alone was 6.6 MB of Paint's download).
+  // (plain, the shim alone was 6.6 MB of Paint's download), and fetched now,
+  // first, when it did not: a module left for pid 1 to fetch (the 2 KB seed,
+  // which packing does not shrink) waited 90 ms behind the bundle and the fill.
   const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
-    [k, (await packedEntry(url, fetcher)) ? await fetchShared(url, fetcher) : null]))
-    .then((kv) => primeRuntime(Object.fromEntries(kv.filter(([, v]) => v))));
+    [k, await fetchShared(url, fetcher, { priority: 'high' })]))
+    .then((kv) => primeRuntime(Object.fromEntries(kv)));
   const trees = [];
   const buffers = [];
   for (const url of b.tar) {
@@ -522,34 +524,47 @@ async function begin(opts, base, at, state, meter) {
     // Worker started before takes the bytes from the fill itself
     // (worker.mjs `loadFile`).
     const late = fl.files.filter(([p]) => p.startsWith('unit:'));
-    let li = 0, lateN = 0;
+    let lateN = 0;
     const add = (entry) => {
       if (!preModules) return;
       // Before `closed`, which a Worker reads as the end of the list.
       const c = preModules.findIndex(([k]) => k === 'closed');
       preModules.splice(c < 0 ? preModules.length : c, 0, entry);
-      if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
     };
-    const takeLate = (n) => {
-      for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
-        const [name, off, size] = late[li];
-        const rel = name.slice('unit:'.length);
-        const bytes = new Uint8Array(buf, off, size).slice();
-        if (rel.endsWith('/c.wasm')) {
-          WebAssembly.compile(bytes).then((m) => add([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m]),
-            (e) => say(`[app] late unit ${rel}: ${e}\n`));
-        } else {
-          const s = new Uint8Array(new SharedArrayBuffer(size));
-          s.set(bytes);
-          add([`file:${rel}`, s]);
-        }
+    // Downloaded, decoded into `buf` and its late units compiled in a Worker
+    // (fill-worker.js): on this thread the decode held pid 1's start-up,
+    // whose every await waited behind a chunk (running to pid 1 ready took
+    // 110-160 ms beside it, 53-69 ms before the fill).
+    const z = await packedEntry(at(fl.url), fetcher);
+    const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module' });
+    const failed = (e) => {
+      Atomics.store(counter, 0, -1);
+      Atomics.notify(counter, 0);
+      say(`[app] the fill failed: ${e}\n`);
+      fw.terminate();
+    };
+    fw.onerror = (e) => failed(e.message ?? e);
+    fw.onmessage = ({ data: m }) => {
+      if (m.kind === 'bytes') {
+        state.downloaded = (state.downloaded ?? 0) + m.n;
+      } else if (m.kind === 'late') {
+        if (m.error) say(`[app] late unit ${m.error}\n`);
+        else add(m.entry);
+        if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+      } else if (m.kind === 'done') {
+        mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+        // Its late units may still be compiling: it ends with the page.
+      } else if (m.kind === 'failed') {
+        failed(m.error);
       }
     };
-    fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
-      into: buf,
-      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); takeLate(n); },
-    }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
-      .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
+    if (!z) failed(`${fl.url} is not in the pack`);
+    else {
+      const u = new URL(at(fl.url));
+      u.search = z.build ? `v=${z.build}` : '';
+      u.pathname += '.zst';
+      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late });
+    }
   }
   state.phase = 'running';
   mark('running');
@@ -857,10 +872,10 @@ function zstdLoader(src) {
  * a clone would copy it, and a SharedArrayBuffer stays resident for the
  * session. The Worker frees it once loaded.
  */
-async function fetchShared(url, f, { shared = false } = {}) {
+async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   const z = await packedEntry(url, f);
-  if (z) return fetchPacked(url, z, shared, f);
-  const res = await fetch(url, { cache: 'no-cache' });
+  if (z) return fetchPacked(url, z, shared, f, { priority });
+  const res = await fetch(url, { cache: 'no-cache', priority });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length'));
   if (!total) throw new Error(`${url}: no content-length`);
@@ -881,11 +896,11 @@ async function fetchShared(url, f, { shared = false } = {}) {
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null } = {}) {
+async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null, priority = 'auto' } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
-  const res = await fetch(u.href);
+  const res = await fetch(u.href, { priority });
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
   // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();

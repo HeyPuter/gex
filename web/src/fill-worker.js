@@ -1,0 +1,83 @@
+// The background fill's Worker (app.js `startFill`): downloads the fill, a
+// packed (zstd) file of lazy files, and decodes it straight into the fill's
+// SharedArrayBuffer, off the page's main thread, which pid 1's start-up and
+// the compositor need. Every Worker reads the fill through `counter` (how
+// many leading bytes are whole); the page hears only what it acts on.
+//
+// In: { url, zsize, size, buf, counter, zstd, late: [[name, off, size]...] }
+// Out:
+//   { kind: 'late', entry }  a late unit whole: [`cgen:KEY`, Module] (compiled
+//                            here) or [`file:REL`, Uint8Array on a SAB]
+//   { kind: 'bytes', n }     compressed bytes since the last such message
+//   { kind: 'done' } | { kind: 'failed', error }
+
+self.onmessage = async ({ data: m }) => {
+  const counter = new Int32Array(m.counter);
+  const out = new Uint8Array(m.buf);
+  let n = 0;
+  let at = 0;
+  let li = 0;
+  let unsent = 0;
+  let lastPost = 0;
+  const late = m.late;
+  // A late unit whose bytes are all in: compiled (or copied) here, handed
+  // to the page.
+  const takeLate = () => {
+    for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
+      const [name, off, size] = late[li];
+      const rel = name.slice('unit:'.length);
+      if (rel.endsWith('/c.wasm')) {
+        WebAssembly.compile(out.slice(off, off + size)).then(
+          (mod) => postMessage({ kind: 'late', entry: [`cgen:${rel.slice(0, -'/c.wasm'.length)}`, mod] }),
+          (e) => postMessage({ kind: 'late', error: `${rel}: ${e}` }),
+        );
+      } else {
+        const s = new Uint8Array(new SharedArrayBuffer(size));
+        s.set(out.subarray(off, off + size));
+        postMessage({ kind: 'late', entry: [`file:${rel}`, s] });
+      }
+    }
+  };
+  try {
+    const { ZSTDDecoder } = await import(/* @vite-ignore */ m.zstd);
+    const d = new ZSTDDecoder();
+    await d.init();
+    const res = await fetch(m.url);
+    if (!res.ok) throw new Error(`${m.url}: ${res.status} ${res.statusText}`);
+    const emit = (part) => {
+      if (n + part.length > m.size) throw new Error(`${m.url}: longer than its ${m.size} bytes`);
+      out.set(part, n);
+      n += part.length;
+    };
+    const z = d.stream();
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        z.push(value, emit);
+        Atomics.store(counter, 0, n);
+        Atomics.notify(counter, 0);
+        takeLate();
+        at += value.length;
+        unsent += value.length;
+        const now = performance.now();
+        if (now - lastPost >= 100) {
+          postMessage({ kind: 'bytes', n: unsent });
+          unsent = 0;
+          lastPost = now;
+        }
+      }
+    } finally {
+      z.end();
+    }
+    if (unsent) postMessage({ kind: 'bytes', n: unsent });
+    if (at !== m.zsize) throw new Error(`${m.url}: ${at} of ${m.zsize} bytes`);
+    if (n !== m.size) throw new Error(`${m.url}: decoded ${n} of ${m.size} bytes`);
+    postMessage({ kind: 'done' });
+  } catch (e) {
+    Atomics.store(counter, 0, -1);
+    Atomics.notify(counter, 0);
+    postMessage({ kind: 'failed', error: String(e?.message ?? e) });
+  }
+};
