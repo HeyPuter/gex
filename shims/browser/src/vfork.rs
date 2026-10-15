@@ -387,6 +387,9 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
         argv.push(s);
     }
     let envp: Vec<String> = parts.filter(|s| !s.is_empty()).collect();
+    // This Worker's memory is new (host.mjs gives an exec child no recycled
+    // one), so the exec need not clear what no program wrote.
+    EXEC_FRESH.with(|c| c.set(true));
     with_host(|h| {
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
