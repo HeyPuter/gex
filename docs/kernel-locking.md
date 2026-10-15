@@ -346,6 +346,45 @@ trap does not unwind, so a guard held across it never drops.
 - **Cost:** two relaxed stores and one acquire load per syscall.
 - **Natively,** the same code runs with `std`.
 
+### 4.3 Lock order
+
+Three locks nest. Every path takes them in this order, and gives none back
+out of order:
+
+    KLock (rank 1)  ->  JIT state (rank 2)  ->  memory map (rank 3)
+
+- **KLock,** the rest of the old kernel lock (`with_host`): outermost.
+- **The JIT state** (`JIT` in shims/browser/src/lib.rs, step L13): the page
+  table, translated set, intrinsics, registry and pending queue of a
+  process, in a box of its own. A kernel call takes it on its first touch
+  of `Host::jit` (`JitHere`) and gives it back just before KLock
+  (`KLock`'s release; the end of an SP `with_host`). What touches only the
+  JIT state takes it alone, with no KLock (`with_jit_only`); its closure
+  may not enter the kernel. The translator still takes the page table,
+  translated set and intrinsics out (`jitout`) and lifts holding neither
+  lock; a waiter for them outside the kernel waits with the JIT lock given
+  back.
+- **The memory map** (`Mm`, step L12a): innermost. Nothing is taken under
+  it; a path that holds an `Mm` guard and then needs the JIT state drops
+  the guard first.
+- **Leaf locks** (a pipe's, a futex shard's, the descriptor table's, the
+  epoch lists) take nothing under them and are not ranked.
+
+**The check:** `gex_kernel::sync::rank` numbers the three, and
+`sync::rank_take` panics in a debug build (`debug_assertions`, or the
+`lock-ranks` feature) when a thread takes a ranked lock while holding one
+of the same or a higher rank: an order broken, or a re-entry that would
+hang. KLock calls it at its
+outermost take; `sync::Mutex::ranked` locks call it in `lock()`. A
+deadlock between two Workers then shows as a panic on one, naming the
+ranks it held. `check_trap_out` clears the record with the held count.
+Release builds skip it unless built with the `lock-ranks` feature
+(`GEX_LOCK_RANKS=1 shims/browser/build.sh`): the page shim cannot be built
+with debug assertions whole, since core's own checks reject its slices of
+guest memory at address 0. Tests: `ranked_locks_nest_in_rank_order`,
+`a_ranked_lock_under_a_higher_one_panics`,
+`a_ranked_lock_taken_again_panics_rather_than_hangs` (gex-kernel sync).
+
 ## 5. Order of landing, each step with its gate leg
 
 Every step lands alone, in a gate round. The gate runs:
@@ -587,6 +626,20 @@ in the scheduler pick after each wake of the global WAKE word: about
      report and the eject stop, which end the process. Legs: the page
      tier's signal programs (`signal-storm`, `thread-signals`,
      `sa-restart`, `pwait-sigmask`) built for aarch64 as well as x86.
+   - The JIT state's own lock (L13, §4.3): the page table, translated
+     set, intrinsics, registry and pending queue left `Host` for a
+     per-process box (`JIT`), ranked between KLock and the mm. Kernel
+     calls take it on first touch and give it back before KLock; the 24
+     `with_jit` callers that touch nothing else (a fill's directory
+     catch-up, the self-modifying-code retire, the unit and closure
+     directory writes, the coverage and slot getters) take it alone, with
+     no KLock (`with_jit_only`). The miss's lift and install still go
+     through `with_jit` (they read the thread table and the object
+     identities); the mapping calls (L12b) retire code under this lock.
+     Legs: the page tier's translation programs (`retire-during-lift`,
+     `smc-race`, `smc-threads`, `smc-direct-jump`, `page-cross-entry`)
+     and the rest of the page tier with the order checked
+     (`GEX_LOCK_RANKS=1`).
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

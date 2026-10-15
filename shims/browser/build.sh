@@ -78,6 +78,9 @@ FEATURES=""
 EXTRA=""
 [ -n "$ARCH_FEAT" ] && EXTRA=",$ARCH_FEAT"
 [ -n "${GEX_HEAP_COUNTERS:-}" ] && { FEATURES="--features heap-counters${ARCH_FEAT:+,$ARCH_FEAT}"; EXTRA="$EXTRA,heap-counters"; }
+# GEX_LOCK_RANKS=1: check the lock order (docs/kernel-locking.md §4.3) in this
+# release build. A test build, not a shipping one.
+[ -n "${GEX_LOCK_RANKS:-}" ] && { FEATURES="${FEATURES:---features }${FEATURES:+,}lock-ranks"; EXTRA="$EXTRA,lock-ranks"; }
 
 OUT=target/wasm32-unknown-unknown$TSUF/release/gex_browser.wasm
 RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES --target-dir target${TSUF:+/x86-browser}

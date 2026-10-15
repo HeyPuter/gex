@@ -23,3 +23,8 @@ ppc = ["gex-abi/ppc"]
 # The global kernel module serving processes with a 64-bit memory (the
 # wasm64 browser shim, docs/mem64.md step 6): `PAddr` is u64.
 process64 = []
+# Check the lock order (`sync::rank`) in a release build, as a debug build
+# always does: the page shim cannot be built with debug assertions whole
+# (core's own checks reject its guest-memory slices), so its order check is
+# this switch (shims/browser/build.sh: GEX_LOCK_RANKS=1).
+lock-ranks = []

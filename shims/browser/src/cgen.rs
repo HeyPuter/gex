@@ -833,7 +833,7 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
 pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
-    crate::with_jit(|h| {
+    crate::with_jit_only(|j| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         // Every page the entries are on, numbered here or before: the
         // install writes their directory entries. Only the fresh ones used to
@@ -847,9 +847,9 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 continue;
             }
-            let base = match h.jit.page_table.lookup(page) {
+            let base = match j.page_table.lookup(page) {
                 Some(b) => b,
-                None => h.jit.page_table.base(page),
+                None => j.page_table.base(page),
             };
             pages.insert(page, base);
             let t = gex_abi::dispatch_entry_table(base) as u32;
@@ -869,8 +869,8 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
                 regs.extend_from_slice(&[t, slot]);
             }
         }
-        h.jit.translated.extend(addrs.iter().copied());
-        (regs, pages.into_iter().collect(), h.jit.page_table.slots())
+        j.translated.extend(addrs.iter().copied());
+        (regs, pages.into_iter().collect(), j.page_table.slots())
     })
 }
 
@@ -1240,10 +1240,10 @@ pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
 }
 
 pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
-    crate::with_jit(|h| {
+    crate::with_jit_only(|j| {
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (page, base) in dirs {
-            if h.jit.page_table.lookup(page) == Some(base) {
+            if j.page_table.lookup(page) == Some(base) {
                 crate::dense::note_entry(base);
                 let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
             }

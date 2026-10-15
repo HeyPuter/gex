@@ -2890,41 +2890,85 @@ fn push_pending(h: &mut Host, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u
     h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
-/// A process's translation state, as its `Host` holds it: its own, or, in a
-/// vfork child running in a Worker of its parent, the parent's (vfork.rs).
-/// The child runs the parent's code in the parent's memory and this Worker's
-/// tables, which is what this state describes; a copy would hand out the
-/// same slots twice.
-struct JitRef {
-    ptr: *mut Jit,
-    _own: Option<Box<Jit>>,
+/// A process's translation state, behind its own lock (docs/kernel-locking.md
+/// §4.3, step L13) rather than inside the `Host` the kernel lock guards.
+///
+/// One per process: it lives in the process's memory, so the Workers of the
+/// process share it, a vfork child running in a Worker of its parent
+/// (vfork.rs) included -- the child runs the parent's code in the parent's
+/// memory and this Worker's tables, which is what this state describes; a
+/// copy would hand out the same slots twice.
+///
+/// Boxed behind a pointer, not a static lock in place, so a forked child
+/// starts from a fresh one: its image is a copy of the parent's, the lock's
+/// word included, taken or not when the copy was made.
+static JIT: std::sync::atomic::AtomicPtr<gex_kernel::sync::Mutex<Jit>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The process's JIT lock (`JIT`).
+fn jit_lock() -> &'static gex_kernel::sync::Mutex<Jit> {
+    let p = JIT.load(std::sync::atomic::Ordering::Acquire);
+    assert!(!p.is_null(), "gex: the JIT state was asked for before the process had one");
+    // SAFETY: set once per process by `install_jit` from a leaked box, never
+    // freed (a replaced one is leaked too: a fork's copy may hold it taken).
+    unsafe { &*p }
 }
 
-impl JitRef {
-    fn own(jit: Jit) -> Self {
-        let mut b = Box::new(jit);
-        JitRef { ptr: &mut *b, _own: Some(b) }
-    }
-
-    /// The parent's, which outlives the child.
-    fn borrowed(ptr: *mut Jit) -> Self {
-        JitRef { ptr, _own: None }
-    }
+/// Make `jit` the process's JIT state, before its `Host` is set.
+fn install_jit(jit: Jit) {
+    let b = Box::new(gex_kernel::sync::Mutex::ranked(jit, gex_kernel::sync::rank::JIT));
+    JIT.store(Box::into_raw(b), std::sync::atomic::Ordering::Release);
 }
 
-impl std::ops::Deref for JitRef {
+thread_local! {
+    /// The JIT lock as this thread holds it for a kernel call (`JitHere`),
+    /// from the first touch of `Host::jit` to the kernel lock's release.
+    static JIT_HELD: RefCell<Option<gex_kernel::sync::MutexGuard<'static, Jit>>> =
+        const { RefCell::new(None) };
+}
+
+/// The JIT state, taking its lock for this thread if it does not hold it.
+/// Whoever takes it here gives it back with `jit_give` (`KLock`'s release,
+/// the end of an SP `with_host`, `with_jit_only`).
+fn jit_held() -> *mut Jit {
+    JIT_HELD.with(|g| {
+        let mut g = g.borrow_mut();
+        let g = g.get_or_insert_with(|| jit_lock().lock());
+        &mut **g as *mut Jit
+    })
+}
+
+/// Whether this thread holds the JIT lock (`jit_held`).
+fn jit_holds() -> bool {
+    JIT_HELD.with(|g| g.borrow().is_some())
+}
+
+/// Give back the JIT lock if this thread holds it.
+fn jit_give() {
+    let g = JIT_HELD.with(|g| g.borrow_mut().take());
+    drop(g);
+}
+
+/// `Host::jit`: the process's JIT state, under its own lock. A kernel call
+/// that touches it takes the lock on the first touch and keeps it until it
+/// gives the kernel lock back, in that order: the kernel lock, then the JIT
+/// lock, then the memory map's (§4.3). A path outside the kernel takes the
+/// JIT lock alone (`with_jit_only`).
+struct JitHere;
+
+impl std::ops::Deref for JitHere {
     type Target = Jit;
     fn deref(&self) -> &Jit {
-        // SAFETY: an owned `Jit` lives in `_own`'s box for as long as this;
-        // a borrowed one is the parent's, which outlives its vfork child.
-        unsafe { &*self.ptr }
+        // SAFETY: the lock is this thread's until `jit_give`, which no kernel
+        // call does while it holds a borrow of the `Host` this sits in.
+        unsafe { &*jit_held() }
     }
 }
 
-impl std::ops::DerefMut for JitRef {
+impl std::ops::DerefMut for JitHere {
     fn deref_mut(&mut self) -> &mut Jit {
-        // SAFETY: as `deref`.
-        unsafe { &mut *self.ptr }
+        // SAFETY: as `deref`; one `&mut` at a time through the `Host`.
+        unsafe { &mut *jit_held() }
     }
 }
 
@@ -3066,7 +3110,7 @@ struct Host {
     /// Every guest thread, the running one included.
     threads: Vec<Thread>,
     exit: Option<i32>,
-    jit: JitRef,
+    jit: JitHere,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
@@ -3192,7 +3236,7 @@ fn install_panic_hook() {
 fn set_host(host: Host) {
     // A new process: its registry starts empty, whatever a fork copied.
     regview::reset();
-    regview::publish_marks(&host.jit.page_table);
+    regview::publish_marks(&jit_lock().lock().page_table);
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -3215,7 +3259,7 @@ fn set_host(host: Host) {
 #[cfg(feature = "shared-memory")]
 fn set_host(host: Host) {
     regview::reset();
-    regview::publish_marks(&host.jit.page_table);
+    regview::publish_marks(&jit_lock().lock().page_table);
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -3671,7 +3715,9 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     if let Some(child) = vfork::host_here() {
         // SAFETY: the child's boxed host (vfork.rs), which only this Worker
         // reaches, until `gex_vfork_end` (outside any call here) drops it.
-        return f(unsafe { &mut *child });
+        let r = f(unsafe { &mut *child });
+        jit_give();
+        return r;
     }
     HOST.with(|h| {
         let mut b = match h.try_borrow_mut() {
@@ -3692,6 +3738,8 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
             panic!("gex: not initialised, called from {}:{}", here.file(), here.line())
         }));
         HOST_HOLDER.store(0, std::sync::atomic::Ordering::Relaxed);
+        // The JIT lock, if the call took it (`JitHere`).
+        jit_give();
         r
     })
 }
@@ -3702,6 +3750,17 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 /// the crash with a complaint about the reporter.
 #[cfg(not(feature = "shared-memory"))]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    // A reporter that touches the JIT state takes its lock only for itself.
+    let held = jit_holds();
+    let r = with_host_free_in(f);
+    if !held {
+        jit_give();
+    }
+    r
+}
+
+#[cfg(not(feature = "shared-memory"))]
+fn with_host_free_in<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     if let Some(child) = vfork::host_here() {
         // SAFETY: as `with_host`.
         return Some(f(unsafe { &mut *child }));
@@ -3717,6 +3776,16 @@ fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
 /// gives, minus the initialisation panic.
 #[cfg(feature = "shared-memory")]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    let held = jit_holds();
+    let r = with_host_free_in(f);
+    if !held {
+        jit_give();
+    }
+    r
+}
+
+#[cfg(feature = "shared-memory")]
+fn with_host_free_in<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     if let Some(child) = vfork::host_here() {
         // SAFETY: as `with_host`.
         return Some(f(unsafe { &mut *child }));
@@ -4016,6 +4085,9 @@ impl KLock {
             DEPTH.with(|d| d.set(d.get() + 1));
             return KLock;
         }
+        // Outermost of the locks that nest: not under the JIT state's or
+        // the memory map's (docs/kernel-locking.md §4.3).
+        gex_kernel::sync::rank_take(gex_kernel::sync::rank::KERNEL);
         let mut spins: u32 = 0;
         loop {
             match KLOCK.compare_exchange_weak(
@@ -4068,7 +4140,10 @@ impl Drop for KLock {
         if d > 1 {
             return;
         }
+        // The JIT lock, if the call took it, before the kernel lock (§4.3).
+        jit_give();
         KLOCK.store(0, std::sync::atomic::Ordering::Release);
+        gex_kernel::sync::rank_give(gex_kernel::sync::rank::KERNEL);
         // SAFETY: as above.
         unsafe {
             warch::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, 1);
@@ -4122,7 +4197,7 @@ fn jit_me() -> u32 {
 
 /// Put the JIT state back into `h` if a translation has finished with it.
 /// False while another Worker is still translating with it out.
-fn jit_in(h: &mut Host) -> bool {
+fn jit_in(j: &mut Jit) -> bool {
     use std::sync::atomic::Ordering::{Acquire, Release};
     let s = jitout::OUT.load(Acquire);
     if s == 0 {
@@ -4139,10 +4214,10 @@ fn jit_in(h: &mut Host) -> bool {
     let Some((table, known, intr)) = jitout::BOX.0.borrow_mut().take() else {
         panic!("gex: a translation said it was done and left nothing");
     };
-    h.jit.page_table = table;
-    h.jit.translated = known;
-    h.jit.intrinsics = intr;
-    regview::publish_marks(&h.jit.page_table);
+    j.page_table = table;
+    j.translated = known;
+    j.intrinsics = intr;
+    regview::publish_marks(&j.page_table);
     jitout::OUT.store(0, Release);
     #[cfg(feature = "shared-memory")]
     // SAFETY: the address of a `static AtomicU32` in the shared memory.
@@ -4155,9 +4230,9 @@ fn jit_in(h: &mut Host) -> bool {
 /// `jit_in`, for a caller already inside the kernel: it cannot give the lock
 /// back, so it waits holding it. The translator needs nothing under the lock to
 /// finish, so this ends.
-fn jit_in_held(h: &mut Host) {
+fn jit_in_held(j: &mut Jit) {
     let mut waits = 0u32;
-    while !jit_in(h) {
+    while !jit_in(j) {
         #[cfg(feature = "shared-memory")]
         jit_wait();
         waits += 1;
@@ -4203,7 +4278,7 @@ fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     #[cfg(not(feature = "shared-memory"))]
     {
         with_host(|h| {
-            jit_in_held(h);
+            jit_in_held(&mut h.jit);
             f(h)
         })
     }
@@ -4215,8 +4290,8 @@ fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
         loop {
             let r = with_host(|h| {
                 if nested {
-                    jit_in_held(h);
-                } else if !jit_in(h) {
+                    jit_in_held(&mut h.jit);
+                } else if !jit_in(&mut h.jit) {
                     return None;
                 }
                 Some((f.take().expect("with_jit runs its closure once"))(h))
@@ -4228,6 +4303,41 @@ fn with_jit<R>(f: impl FnOnce(&mut Host) -> R) -> R {
             waits += 1;
             jit_wait_said(waits, false);
         }
+    }
+}
+
+/// `with_jit` for what touches only the JIT state: its lock alone, not the
+/// kernel's (docs/kernel-locking.md §4.3). Inside a kernel call it uses the
+/// JIT lock the call holds or takes it under the kernel lock; outside one,
+/// it waits for a translation in flight with the JIT lock given back. `f`
+/// may not enter the kernel: the kernel lock ranks above the JIT lock.
+#[track_caller]
+fn with_jit_only<R>(f: impl FnOnce(&mut Jit) -> R) -> R {
+    let held = jit_holds();
+    #[cfg(feature = "shared-memory")]
+    let nested = held || DEPTH.with(|d| d.get()) > 0;
+    #[cfg(not(feature = "shared-memory"))]
+    let nested = true;
+    let mut waits = 0u32;
+    loop {
+        // SAFETY: this thread holds the JIT lock until `jit_give` below (or
+        // the kernel call's own release), and `j` does not outlive `f`.
+        let j = unsafe { &mut *jit_held() };
+        if nested {
+            jit_in_held(j);
+        } else if !jit_in(j) {
+            jit_give();
+            #[cfg(feature = "shared-memory")]
+            jit_wait();
+            waits += 1;
+            jit_wait_said(waits, false);
+            continue;
+        }
+        let r = f(j);
+        if !held {
+            jit_give();
+        }
+        return r;
     }
 }
 
@@ -4929,6 +5039,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
     // A native wasm32 program: published before it runs (cgen/wasmprog.rs).
     cgen::wasmprog::stage(nt_abi.is_none().then_some(&program));
+    install_jit(fresh_jit(&meta));
     set_host(Host {
         magic_head: HOST_MAGIC,
             kernel,
@@ -4937,42 +5048,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             proc_state,
             threads: vec![Thread::new(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable)],
             exit: None,
-            jit: JitRef::own(Jit {
-                described: meta.next_slot != 0,
-                page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
-                translated: Default::default(),
-            provider: Default::default(),
-            coverage_snap: Vec::new(),
-                registry: Vec::new(),
-                registry_ext: Vec::new(),
-                store_grace: std::collections::VecDeque::new(),
-                registry_sums: Vec::new(),
-                registry_dense: Vec::new(),
-                ever_threaded: false,
-                shared: Default::default(),
-                installed_mods: Default::default(),
-            obj_cursor: Default::default(),
-                dense_base: Default::default(),
-                retired_pages: Default::default(),
-                remiss: Default::default(),
-                reuse_have: 0,
-                reuse_hit: 0,
-                reuse_miss: 0,
-                reuse_noident: 0,
-                reuse_served: 0,
-                store_ok: 0,
-                store_full: 0,
-                intrinsics: Default::default(),
-                intrinsics_scanned: Default::default(),
-                candidates: Vec::new(),
-                pending: Default::default(),
-                blocks: 0,
-                lift_in_closure: 0,
-            by_object: Default::default(),
-            obj_wasm: Default::default(),
-                compiles: 0,
-                nanos: 0,
-            }),
+            jit: JitHere,
         magic_tail: HOST_MAGIC,
     });
     entry
@@ -6026,9 +6102,9 @@ pub extern "C" fn gex_table_need(i: u32) -> u32 {
     // table (`regview`). JS asks this once per table per install.
     match regview::table_need(i as usize) {
         Some(n) => n as u32,
-        None => with_jit(|h| {
-            regview::publish_marks(&h.jit.page_table);
-            h.jit.page_table.table_need(i as usize) as u32
+        None => with_jit_only(|j| {
+            regview::publish_marks(&j.page_table);
+            j.page_table.table_need(i as usize) as u32
         }),
     }
 }
@@ -7964,7 +8040,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // Not with a sibling mid-translation: the child is a copy of this memory,
     // and a translator outside the lock is changing the heap.
-    jit_in_held(h);
+    jit_in_held(&mut h.jit);
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
     {
@@ -8862,8 +8938,53 @@ pub extern "C" fn gex_adopt_child(
     dense::child();
     // So is the probe cache, which names the parent's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
+    // Built from the module's `gex.meta`, as `gex_load` does: an empty
+    // table would report "nothing to translate" almost at once, since `fork`
+    // returns into libc. A fresh one, not the parent's copied in the image.
+    install_jit(fresh_jit(&gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default()));
     set_host(child_host(pid, ctx_addr, pc, sp, tls, brk));
     pc
+}
+
+/// A process's first JIT state, from the module's `gex.meta`, so runtime
+/// translation carries on where the build stopped.
+fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
+    Jit {
+        described: meta.next_slot != 0,
+        page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
+        translated: Default::default(),
+        provider: Default::default(),
+        coverage_snap: Vec::new(),
+        registry: Vec::new(),
+        registry_ext: Vec::new(),
+        store_grace: std::collections::VecDeque::new(),
+        registry_sums: Vec::new(),
+        registry_dense: Vec::new(),
+        ever_threaded: false,
+        shared: Default::default(),
+        installed_mods: Default::default(),
+        obj_cursor: Default::default(),
+        dense_base: Default::default(),
+        retired_pages: Default::default(),
+        remiss: Default::default(),
+        reuse_have: 0,
+        reuse_hit: 0,
+        reuse_miss: 0,
+        reuse_noident: 0,
+        reuse_served: 0,
+        store_ok: 0,
+        store_full: 0,
+        intrinsics: Default::default(),
+        intrinsics_scanned: Default::default(),
+        candidates: Vec::new(),
+        pending: Default::default(),
+        blocks: 0,
+        lift_in_closure: 0,
+        by_object: Default::default(),
+        obj_wasm: Default::default(),
+        compiles: 0,
+        nanos: 0,
+    }
 }
 
 /// The process state a forked child starts with: in a Worker of its own
@@ -8992,48 +9113,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         // across, and in this design they were never in this Worker anyway.
         threads: vec![Thread::new(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable)],
         exit: None,
-        // Built from the module's `gex.meta`, as `gex_load` does, so runtime
-        // translation carries on where the build stopped: an empty table would
-        // report "nothing to translate" almost at once, since `fork` returns
-        // into libc.
-        jit: JitRef::own({
-            let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
-            Jit {
-            described: meta.next_slot != 0,
-            page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
-            translated: Default::default(),
-            provider: Default::default(),
-            coverage_snap: Vec::new(),
-            registry: Vec::new(),
-            registry_ext: Vec::new(),
-            store_grace: std::collections::VecDeque::new(),
-            registry_sums: Vec::new(),
-            registry_dense: Vec::new(),
-            ever_threaded: false,
-            shared: Default::default(),
-            installed_mods: Default::default(),
-            obj_cursor: Default::default(),
-            dense_base: Default::default(),
-            retired_pages: Default::default(),
-            remiss: Default::default(),
-            reuse_have: 0,
-            reuse_hit: 0,
-            reuse_miss: 0,
-            reuse_noident: 0,
-            reuse_served: 0,
-            store_ok: 0,
-            store_full: 0,
-            intrinsics: Default::default(),
-            intrinsics_scanned: Default::default(),
-            candidates: Vec::new(),
-            pending: Default::default(),
-            blocks: 0,
-            lift_in_closure: 0,
-            by_object: Default::default(),
-            obj_wasm: Default::default(),
-            compiles: 0,
-            nanos: 0,
-        }}),
+        jit: JitHere,
         magic_tail: HOST_MAGIC,
     }
 }
@@ -9117,7 +9197,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// program could not be loaded (the caller already has an errno).
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A sibling's translation in flight is of the program this replaces.
-    jit_in_held(h);
+    jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     // Bumped so the host can drop what this exec makes worthless: a forked
     // child holds its parent's inherited modules (thousands in an `apt` run),
@@ -12460,14 +12540,14 @@ pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::a
 /// report (something numbered a page and left its entry unwritten).
 fn heal_dirs(start: u64) {
     let first = gex_abi::dispatch_page(start);
-    let healed: Vec<(u64, u32, u32)> = with_jit(|h| {
+    let healed: Vec<(u64, u32, u32)> = with_jit_only(|j| {
         let mut gm = GuestMem::new(guest_bytes());
         let mut out = Vec::new();
         for page in [first, first + 1] {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 continue;
             }
-            let Some(base) = h.jit.page_table.lookup(page) else { continue };
+            let Some(base) = j.page_table.lookup(page) else { continue };
             let at = gex_abi::DISPATCH_DIR + page * 4;
             let dir = gm.read_u32(at).unwrap_or(u32::MAX);
             if dir != base {
@@ -12535,11 +12615,11 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // Paint's startup stall: uiribbon's function at 0x604eefff,
         // translated about 155 times a second for minutes.
         heal_dirs(start);
-        let again = with_jit(|h| {
-            let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
+        let again = with_jit_only(|j| {
+            let again = repeat || j.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
-                h.jit.translated.remove(&start);
-                h.jit.provider.remove(&start);
+                j.translated.remove(&start);
+                j.provider.remove(&start);
             }
             again
         });
@@ -12565,8 +12645,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // The bridge left for this very address having run nothing: tier-1
         // takes the slot over, and the function JIT serves it no more.
         fjit::tier1_only(addr as u64);
-        with_jit(|h| {
-            h.jit.translated.remove(&(addr as u64));
+        with_jit_only(|j| {
+            j.translated.remove(&(addr as u64));
         });
         return;
     }
@@ -12582,8 +12662,8 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 _pc as u64, addr as u64
             ));
         }
-        with_jit(|h| {
-            h.jit.translated.remove(&(addr as u64));
+        with_jit_only(|j| {
+            j.translated.remove(&(addr as u64));
         });
         return;
     }
@@ -12600,16 +12680,16 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
-        with_jit(|h| {
-            if h.jit.page_table.forget(page).is_none() {
+        with_jit_only(|j| {
+            if j.page_table.forget(page).is_none() {
                 return;
             }
-            h.jit.retired_pages.insert(page);
+            j.retired_pages.insert(page);
             let mut gm = GuestMem::new(guest_bytes());
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
-            h.jit.translated.retain(|&a| a < lo || a >= hi);
+            j.translated.retain(|&a| a < lo || a >= hi);
             xlate_add(3, 1);
             let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             // Informational: a JIT (V8 under node) rewrites its code all the
@@ -12874,8 +12954,8 @@ fn remiss(pc: u64) {
     // hand-over (`FTAB_TIER1`) clear it before they come here, and a pc
     // translated again and again that way was never counted (Paint's
     // startup stall at 0x604eefff, scratch/P/stall85).
-    let said = with_jit(|h| {
-        let n = h.jit.remiss.entry(pc).or_insert(0);
+    let said = with_jit_only(|j| {
+        let n = j.remiss.entry(pc).or_insert(0);
         *n += 1;
         if *n != 64 {
             return None;
@@ -12884,9 +12964,9 @@ fn remiss(pc: u64) {
         let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
         Some(format!(
             "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} translations so far\n",
-            h.jit.page_table.lookup(page),
-            h.jit.retired_pages.contains(&page),
-            h.jit.remiss.values().sum::<u32>()
+            j.page_table.lookup(page),
+            j.retired_pages.contains(&page),
+            j.remiss.values().sum::<u32>()
         ))
     });
     if let Some(s) = said {
@@ -12953,10 +13033,10 @@ fn livelock_note(pc: u64) {
     let mut pages = Vec::new();
     for page in [gex_abi::dispatch_page(pc), gex_abi::dispatch_page(pc) + 1] {
         let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
-        let (pt, retired) = with_jit(|h| (h.jit.page_table.lookup(page), h.jit.retired_pages.contains(&page)));
+        let (pt, retired) = with_jit_only(|j| (j.page_table.lookup(page), j.retired_pages.contains(&page)));
         pages.push(format!("page {page:#x}: directory {dir:#x}, page table {pt:x?}, retired {retired}"));
     }
-    let (translated, remiss) = with_jit(|h| (h.jit.translated.contains(&pc), h.jit.remiss.get(&pc).copied().unwrap_or(0)));
+    let (translated, remiss) = with_jit_only(|j| (j.translated.contains(&pc), j.remiss.get(&pc).copied().unwrap_or(0)));
     let line = format!(
         "gex: LIVELOCK? pid {} missed dispatch at {pc:#x} {LIVELOCK_MISSES} times in {LIVELOCK_WINDOW} misses ({}); \
          the miss path: {way}; {}; dense index {}; function table: knows {}, index {:?}, unit serves {}, behind {}; \
@@ -13145,8 +13225,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             MISSES
         };
         if n.is_multiple_of(200) {
-            let (blocks, ms, intr) = with_jit(|h| {
-                (h.jit.blocks, h.jit.nanos / 1_000_000, h.jit.intrinsics.len())
+            let (blocks, ms, intr) = with_jit_only(|j| {
+                (j.blocks, j.nanos / 1_000_000, j.intrinsics.len())
             });
             trace_line(&format!(
                 "[beat] miss {n} at pc={pc:#x}, {blocks} blocks, {ms}ms lifting, \
@@ -14272,7 +14352,7 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
     // Inside the kernel, so it waits for a translation holding the lock; and a
     // translation that may have read the old code retires these ranges again
     // once its unit is queued (`jitout::EPOCH`).
-    jit_in_held(h);
+    jit_in_held(&mut h.jit);
     if !ranges.is_empty() {
         let e = jitout::EPOCH.fetch_add(1, Ordering::Release).wrapping_add(1);
         let mut log = jitout::RETIRED.0.borrow_mut();
@@ -14445,11 +14525,11 @@ fn maybe_recompile_at(pc: u64) -> bool {
     // visible only under a flag nobody reaches for.
     if tracing() || unsafe { HEARTBEAT } != 0 {
         let ms = (now_ns() - began) / 1_000_000;
-        let (slots, mods, bytes) = with_jit(|h| {
+        let (slots, mods, bytes) = with_jit_only(|j| {
             (
-                h.jit.page_table.slots(),
-                h.jit.pending.len(),
-                h.jit.pending.iter().map(|p| p.wasm.len()).sum::<usize>(),
+                j.page_table.slots(),
+                j.pending.len(),
+                j.pending.iter().map(|p| p.wasm.len()).sum::<usize>(),
             )
         });
         trace_line(&format!(
@@ -14539,7 +14619,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         return 0;
     }
     let seeds = object_seeds(map);
-    let intrinsics = with_jit(|h| h.jit.intrinsics.clone());
+    let intrinsics = with_jit_only(|j| j.intrinsics.clone());
     let (exec, page_table, known) = with_jit(|h| {
         let exec: Vec<(u64, u64)> = h
             .kernel
@@ -14749,11 +14829,11 @@ fn note_intrinsics(addr: u64) {
         return;
     };
     let (found, pending) = scan_intrinsics(&path, start);
-    let added = with_jit(|h| {
+    let added = with_jit_only(|j| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
-        *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
-        let before = h.jit.intrinsics.len();
+        *j.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
+        let before = j.intrinsics.len();
         let mask = unsafe { INTRINSICS_MASK };
         for (a, k) in found {
             let bit = match k {
@@ -14768,9 +14848,9 @@ fn note_intrinsics(addr: u64) {
             if mask & bit == 0 {
                 continue;
             }
-            h.jit.intrinsics.insert(a, k);
+            j.intrinsics.insert(a, k);
         }
-        h.jit.intrinsics.len() - before
+        j.intrinsics.len() - before
     });
     let _ = added;
 }
@@ -15205,11 +15285,11 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
 /// reachability-trimmed closure build.
 #[no_mangle]
 pub extern "C" fn gex_coverage_snapshot() -> u32 {
-    with_jit(|h| {
-        let mut v: Vec<u64> = h.jit.translated.iter().copied().collect();
+    with_jit_only(|j| {
+        let mut v: Vec<u64> = j.translated.iter().copied().collect();
         v.sort_unstable();
-        h.jit.coverage_snap = v;
-        h.jit.coverage_snap.len() as u32
+        j.coverage_snap = v;
+        j.coverage_snap.len() as u32
     })
 }
 
@@ -15260,9 +15340,9 @@ pub extern "C" fn gex_jit_slots() -> u32 {
 /// `gex_abi::dispatch_entry`.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
-    with_jit(|h| {
+    with_jit_only(|j| {
         let page = gex_abi::dispatch_page(addr as u64);
-        match h.jit.page_table.lookup(page) {
+        match j.page_table.lookup(page) {
             Some(entry) => gex_abi::dispatch_entry(
                 gex_abi::dispatch_entry_table(entry),
                 gex_abi::dispatch_index(addr as u64, entry) as u32,
@@ -15280,7 +15360,7 @@ pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
 /// pages the directory calls done, into fresh slots, then miss on the old ones.
 #[no_mangle]
 pub extern "C" fn gex_page_count() -> u32 {
-    with_jit(|h| h.jit.page_table.entries().len() as u32)
+    with_jit_only(|j| j.page_table.entries().len() as u32)
 }
 
 /// Write every page assignment to `out` as a `u64` page and a `u32` entry,
@@ -15290,8 +15370,8 @@ pub extern "C" fn gex_page_count() -> u32 {
 /// one per page: the table is a `BTreeMap` and a per-page export was quadratic.
 #[no_mangle]
 pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
-    with_jit(|h| {
-        let entries = h.jit.page_table.entries();
+    with_jit_only(|j| {
+        let entries = j.page_table.entries();
         if (entries.len() * 12) as u32 > cap {
             return -1;
         }
@@ -15311,7 +15391,7 @@ pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
     phase(3);
-    with_jit(|h| h.jit.page_table.assign(page as u64, entry));
+    with_jit_only(|j| j.page_table.assign(page as u64, entry));
 }
 
 /// How many pages the identity map answers for.
@@ -15917,9 +15997,9 @@ pub extern "C" fn gex_module_row(i: u32) -> u32 {
 pub extern "C" fn gex_jit_slots_total() -> u32 {
     match regview::slots() {
         Some(n) => n as u32,
-        None => with_jit(|h| {
-            regview::publish_marks(&h.jit.page_table);
-            h.jit.page_table.slots() as u32
+        None => with_jit_only(|j| {
+            regview::publish_marks(&j.page_table);
+            j.page_table.slots() as u32
         }),
     }
 }

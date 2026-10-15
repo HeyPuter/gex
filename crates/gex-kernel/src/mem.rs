@@ -175,7 +175,7 @@ pub struct Mm {
 impl Mm {
     pub fn new(map: MemoryMap) -> Mm {
         let view = std::sync::Arc::clone(map.view());
-        Mm { map: std::sync::Arc::new(crate::sync::Mutex::new(map)), view }
+        Mm { map: std::sync::Arc::new(crate::sync::Mutex::ranked(map, crate::sync::rank::MM)), view }
     }
 
     pub fn lock(&self) -> crate::sync::MutexGuard<'_, MemoryMap> {
