@@ -444,12 +444,19 @@ export function drawDwmFrame(ctx, atlas, f) {
 /** drawDwmFrame's description of a window with `glass` (gex_glass_v1, as the
  *  compositors keep it: rects, client, frame flags, buttons), `w` x `h`, at
  *  (x, y) on a screen W x H; `hovered` the caption button under the pointer. */
-export function dwmFrameOf(glass, w, h, title, x, y, W, H, hovered = null) {
+export function dwmFrameOf(glass, w0, h0, title, x0, y0, W, H, hovered = null) {
   const g = glass;
-  const c = g.client?.w > 0 ? g.client : { x: 0, y: 0, w, h };
+  // A thin frame is drawn out to a thick frame's size, outside the window
+  // (uDWM's outside margins, CalculateOutsideMargins): the frame glass says
+  // how far. The frame is described on that box, `ox`, `oy` from the window.
+  const B = dwmOutsideMargins(g, w0, h0);
+  const ox = B.l, oy = B.t;
+  const w = w0 - B.l - B.r, h = h0 - B.t - B.b, x = x0 + ox, y = y0 + oy;
+  const c0 = g.client?.w > 0 ? g.client : { x: 0, y: 0, w: w0, h: h0 };
+  const c = { x: c0.x - ox, y: c0.y - oy, w: c0.w, h: c0.h };
   const N = { l: c.x, t: c.y, r: w - c.x - c.w, b: h - c.y - c.h };
   // the glass margins: the bands' widths (a sheet of glass is one rect)
-  const rects = g.rects ?? [];
+  const rects = (g.rects ?? []).map((r) => ({ ...r, x: r.x - ox, y: r.y - oy }));
   const sheet = rects.some((r) => r.x <= 0 && r.y <= 0 && r.x + r.w >= w && r.y + r.h >= h);
   const G = { ...N };
   for (const r of rects) {
@@ -459,11 +466,11 @@ export function dwmFrameOf(glass, w, h, title, x, y, W, H, hovered = null) {
     else if (r.x + r.w >= w) G.r = Math.max(G.r, w - r.x);
   }
   const button = (kind, b) => ({
-    kind, x: b?.x ?? 0, y: b?.y ?? 0, w: b?.w ?? 0, h: b?.h ?? 0,
+    kind, x: (b?.x ?? 0) - ox, y: (b?.y ?? 0) - oy, w: b?.w ?? 0, h: b?.h ?? 0,
     state: !b ? 0 : b.state === 1 && hovered === b ? 2 : b.state,
   });
   return {
-    W: w, H: h, N, G, sheet,
+    W: w, H: h, N, G, sheet, ox, oy,
     active: (g.frame & 2) !== 0,
     maximized: (g.frame & 4) !== 0,
     title: title || '',
@@ -478,9 +485,26 @@ export function dwmFrameOf(glass, w, h, title, x, y, W, H, hovered = null) {
 export function dwmGlassClips(glass, w, h, x, y, rects) {
   const framed = (glass?.frame & 1) !== 0;
   const maximized = (glass?.frame & 4) !== 0;
-  const rr = framed && !maximized ? roundRectRegion(x, y, x + w, y + h, 12, 12) : null;
+  const B = framed ? dwmOutsideMargins(glass, w, h) : { l: 0, t: 0, r: 0, b: 0 };
+  const rr = framed && !maximized
+    ? roundRectRegion(x + B.l, y + B.t, x + w - B.r, y + h - B.b, 12, 12) : null;
   return rects.map((r) => {
     const band = rr && r.w >= w - 1 && (r.y <= 0 || r.y + r.h >= h);
     return { x: x + r.x, y: y + r.y, w: r.w, h: r.h, clip: band ? rr : null };
   });
+}
+
+/** uDWM's outside margins (each <= 0) for a window with `glass`, `w` x `h`:
+ *  how far its frame glass reaches outside it (a thin frame drawn out to a
+ *  thick one's size; Wine's win32u says so in the frame glass's rects). */
+export function dwmOutsideMargins(glass, w, h) {
+  const B = { l: 0, t: 0, r: 0, b: 0 };
+  if (!(glass?.frame & 1)) return B;
+  for (const r of glass.rects ?? []) {
+    B.l = Math.min(B.l, r.x);
+    B.t = Math.min(B.t, r.y);
+    B.r = Math.min(B.r, w - (r.x + r.w));
+    B.b = Math.min(B.b, h - (r.y + r.h));
+  }
+  return B;
 }

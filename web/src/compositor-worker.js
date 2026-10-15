@@ -1075,6 +1075,9 @@ class Compositor {
     const f = this.#frameOf(win);
     const inside = [];
     for (const r of g.rects) {
+      // a DWM frame's glass may reach outside the window (a thin frame
+      // drawn out to a thick one's size); other glass stays inside it
+      if (g.frame & 1) { if (r.w > 0 && r.h > 0) inside.push({ ...r }); continue; }
       const x = Math.max(0, r.x), y = Math.max(0, r.y);
       const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
       if (w > 0 && h > 0) inside.push({ x, y, w, h });
@@ -1123,8 +1126,10 @@ class Compositor {
     const f = this.#frameOf(win);
     const p = this.#painter;
     const S = DWM_SHADOW;
-    const W = win.width + S.l + S.r, H = win.height + S.t + S.b;
     const hovered = this.#hoveredButton(win);
+    const fr = framed ? dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered) : null;
+    const ox = fr?.ox ?? 0, oy = fr?.oy ?? 0;
+    const W = (fr?.W ?? win.width) + S.l + S.r, H = (fr?.H ?? win.height) + S.t + S.b;
     const sig = JSON.stringify([g, win.title, f.x, f.y, this.#outW, this.#outH, hovered && [hovered.x, hovered.y], active]);
     let d = win.dwmFrame;
     if (!d || d.canvas.width !== W || d.canvas.height !== H) {
@@ -1137,7 +1142,7 @@ class Compositor {
       ctx.clearRect(0, 0, W, H);
       ctx.save();
       ctx.translate(S.l, S.t);
-      if (framed) drawDwmFrame(ctx, aero, dwmFrameOf(g, win.width, win.height, win.title, f.x, f.y, this.#outW, this.#outH, hovered));
+      if (framed) drawDwmFrame(ctx, aero, fr);
       else {
         drawDwmBlurBehind(ctx, aero, {
           W: win.width, H: win.height, active,
@@ -1148,7 +1153,7 @@ class Compositor {
       ctx.restore();
       p.device.queue.copyExternalImageToTexture({ source: d.canvas }, { texture: d.tex, premultipliedAlpha: false }, [W, H]);
     }
-    p.textured(f.x - S.l, f.y - S.t, W, H, d.tex);
+    p.textured(f.x + ox - S.l, f.y + oy - S.t, W, H, d.tex);
   }
 
   /** The caption button of a glass frame under the pointer, if any. */

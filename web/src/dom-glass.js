@@ -93,6 +93,9 @@ function aeroAtlas() {
 /** The glass rectangles clipped to the window, in window pixels. */
 function glassRects(win) {
   const rects = [];
+  // a DWM frame's glass may reach outside the window (a thin frame drawn
+  // out to a thick one's size)
+  if (win.glass?.frame & 1) return (win.glass.rects ?? []).filter((r) => r.w > 0 && r.h > 0).map((r) => ({ ...r }));
   for (const r of win.glass?.rects ?? []) {
     const x = Math.max(0, r.x), y = Math.max(0, r.y);
     const w = Math.min(win.width, r.x + r.w) - x, h = Math.min(win.height, r.y + r.h) - y;
@@ -189,15 +192,17 @@ export function domGlass(win, mount, scene = null) {
     // shadows outside the window.
     if (overlay.nextSibling !== c) c.before(overlay);
     const S = DWM_SHADOW;
-    overlay.style.left = `${x - S.l}px`;
-    overlay.style.top = `${y - S.t}px`;
+    const W = mount.clientWidth, H = mount.clientHeight;
+    const fr = framed ? dwmFrameOf(win.glass, win.width, win.height, win.title, x, y, W, H, hovered) : null;
+    const ox = fr?.ox ?? 0, oy = fr?.oy ?? 0, fw = fr?.W ?? win.width, fh = fr?.H ?? win.height;
+    overlay.style.left = `${x + ox - S.l}px`;
+    overlay.style.top = `${y + oy - S.t}px`;
     overlay.style.zIndex = z;
-    if (overlay.width !== win.width + S.l + S.r || overlay.height !== win.height + S.t + S.b) {
-      overlay.width = Math.max(1, win.width + S.l + S.r);
-      overlay.height = Math.max(1, win.height + S.t + S.b);
+    if (overlay.width !== fw + S.l + S.r || overlay.height !== fh + S.t + S.b) {
+      overlay.width = Math.max(1, fw + S.l + S.r);
+      overlay.height = Math.max(1, fh + S.t + S.b);
       sig = '';
     }
-    const W = mount.clientWidth, H = mount.clientHeight;
     const now = JSON.stringify([win.glass, win.title, hovered && [hovered.x, hovered.y], !!aeroAtlas(), x, y, W, H,
       !framed && win.focused]);
     if (now === sig) return;
@@ -208,7 +213,7 @@ export function domGlass(win, mount, scene = null) {
     if (a) {
       ctx.save();
       ctx.translate(S.l, S.t);
-      if (framed) drawDwmFrame(ctx, a, dwmFrameOf(win.glass, win.width, win.height, win.title, x, y, W, H, hovered));
+      if (framed) drawDwmFrame(ctx, a, fr);
       else {
         drawDwmBlurBehind(ctx, a, {
           W: win.width, H: win.height, rects, active: win.focused === true,
