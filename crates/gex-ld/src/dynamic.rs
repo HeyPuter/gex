@@ -91,6 +91,42 @@ pub fn load_program(
     // The interpreter is position-independent and goes wherever we say, well
     // clear of the executable so neither can overlap the other's mappings.
     let interp = load(&interp_bytes, interp_base)?;
+    check_overlap(&exe, &interp)?;
+    Ok(Program {
+        exe,
+        interp: Some(interp),
+    })
+}
+
+/// [`load_program`] for `execve`, from headers alone ([`crate::elf::plan`]):
+/// the program with its segments' bytes left in the files, and where in
+/// each file they are -- `exe`'s ranges, then the interpreter's, in
+/// [`Program::placements`] order. `read_at` reads a range of a guest path.
+pub fn plan_program(
+    exe: &str,
+    pie_base: u64,
+    interp_base: u64,
+    read_at: &dyn Fn(&str, u64, &mut [u8]) -> Option<usize>,
+) -> Result<(Program, crate::elf::FileRanges), LoadError> {
+    let (exe_image, mut ranges) = crate::elf::plan(&|o, b| read_at(exe, o, b), pie_base)?;
+    let Some(path) = exe_image.interp.clone() else {
+        return Ok((Program { exe: exe_image, interp: None }, ranges));
+    };
+    let (interp, interp_ranges) = match crate::elf::plan(&|o, b| read_at(&path, o, b), interp_base) {
+        Ok(p) => p,
+        // Not there at all, as `load_program` says it.
+        Err(_) if read_at(&path, 0, &mut [0u8; 1]).is_none() => {
+            return Err(LoadError::NeedsInterpreter(path));
+        }
+        Err(e) => return Err(e),
+    };
+    check_overlap(&exe_image, &interp)?;
+    ranges.extend(interp_ranges);
+    Ok((Program { exe: exe_image, interp: Some(interp) }, ranges))
+}
+
+/// Two independently placed images must not claim the same addresses.
+fn check_overlap(exe: &crate::elf::Image, interp: &crate::elf::Image) -> Result<(), LoadError> {
     for a in &exe.segments {
         for b in &interp.segments {
             let a_end = a.vaddr + a.mem_size;
@@ -105,15 +141,54 @@ pub fn load_program(
             }
         }
     }
-    Ok(Program {
-        exe,
-        interp: Some(interp),
-    })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `execve`'s plan places what `load_program` places, from the files.
+    #[test]
+    fn a_plan_is_the_program_without_its_bytes() {
+        if gex_abi::PPC {
+            return;
+        }
+        let exe = minimal_elf(3, Some("/interp"));
+        let interp = minimal_elf(3, None);
+        let file = |path: &str| match path {
+            "/exe" => Some(exe.clone()),
+            "/interp" => Some(interp.clone()),
+            _ => None,
+        };
+        let read_at = |path: &str, off: u64, out: &mut [u8]| {
+            let f = file(path)?;
+            let from = (off as usize).min(f.len());
+            let n = out.len().min(f.len() - from);
+            out[..n].copy_from_slice(&f[from..from + n]);
+            Some(n)
+        };
+        let loaded = load_program(&exe, 0x2000_0000, 0x3000_0000, &|p| file(p)).unwrap();
+        let (planned, ranges) = plan_program("/exe", 0x2000_0000, 0x3000_0000, &read_at).unwrap();
+        assert_eq!(planned.entry(), loaded.entry());
+        assert_eq!(planned.brk(), loaded.brk());
+        assert_eq!(planned.exe.phdr_vaddr, loaded.exe.phdr_vaddr);
+        assert_eq!(planned.interp_base(), loaded.interp_base());
+        let segs: Vec<_> = loaded.placements().collect();
+        let plan: Vec<_> = planned.placements().collect();
+        assert_eq!(segs.len(), plan.len());
+        assert_eq!(ranges.len(), plan.len());
+        let files = [&exe, &interp];
+        for (i, ((l, lf), (p, pf))) in segs.iter().zip(&plan).enumerate() {
+            assert_eq!((l.vaddr, l.mem_size, lf), (p.vaddr, p.mem_size, pf));
+            assert!(p.bytes.is_empty());
+            let f = files[usize::from(pf.is_some())];
+            let (o, n) = ranges[i];
+            assert_eq!(&f[o as usize..(o + n) as usize], &l.bytes[..]);
+        }
+        let missing = plan_program("/nope", 0x2000_0000, 0x3000_0000, &read_at);
+        assert!(missing.is_err());
+    }
 
     #[test]
     fn a_static_program_needs_no_interpreter() {

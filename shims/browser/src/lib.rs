@@ -9280,15 +9280,16 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // space, and it goes back byte for byte.
     let key = snap_key(path, envp);
     let linked = snap_lookup(key);
-    let program = if linked.is_some() {
-        None
+    // Headers only: each segment is read from its file straight into place
+    // below, once the old image is gone. Reading the whole executable and its
+    // interpreter into the heap, parsing their symbols and dynamic tables and
+    // then copying every segment again was most of an exec's own cost.
+    let (program, ranges) = if linked.is_some() {
+        (None, Vec::new())
     } else {
-        let Some(bytes) = h.kernel.read_file(path) else {
-            return 0;
-        };
-        let read = |p: &str| h.kernel.read_file(p);
-        match gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &read) {
-            Ok(p) => Some(p),
+        let read_at = |p: &str, off: u64, out: &mut [u8]| h.kernel.read_file_at(p, off, out);
+        match gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, &read_at) {
+            Ok((p, r)) => (Some(p), r),
             Err(_) => return 0,
         }
     };
@@ -9410,22 +9411,25 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
-    cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
-    for (seg, from) in program.iter().flat_map(|p| p.placements()) {
+    for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
-        if b > data.len() {
+        let len = len as usize;
+        if b > data.len() || a + len > data.len() {
             return 0;
         }
         if !fresh {
             gex_kernel::zero_dirty_bytes(&mut data[a..b]);
         }
-        data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        // From the file into place: the one copy.
+        if h.kernel.read_file_at(from.unwrap_or(path), off, &mut data[a..a + len]) != Some(len) {
+            return 0;
+        }
         let mut prot = 0;
         if seg.readable {
             prot |= gex_kernel::mem::prot::READ;
@@ -9450,6 +9454,15 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         );
     }
 
+    // A wasm32 program is published before it runs: its magic, read where
+    // it now is.
+    cgen::wasmprog::stage_entry(program.as_ref().map(|p| p.exe.entry).filter(|&entry| {
+        let at = entry.wrapping_sub(0x40) as usize;
+        data.get(at..at + 8) == Some(&cgen::wasmprog::MAGIC[..])
+            && program.iter().flat_map(|p| p.exe.segments.iter()).any(|s| {
+                (at as u64) >= s.vaddr && (at as u64) + 8 <= s.vaddr + s.mem_size
+            })
+    }));
     // The recorded address space, when there is one. It replaces the map
     // this function just built, because the map is part of what was
     // recorded.

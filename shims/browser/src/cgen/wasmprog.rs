@@ -85,6 +85,13 @@ pub(crate) fn stage(program: Option<&gex_ld::Program>) {
     *lock(&STAGED) = program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true, None));
 }
 
+/// [`stage`] for an exec, which places its program from the files and knows
+/// whether it is a wasm32 one by the placed bytes: its entry if so.
+pub(crate) fn stage_entry(entry: Option<u64>) {
+    CURRENT.store(0, Ordering::Relaxed);
+    *lock(&STAGED) = entry.map(|e| (e, true, None));
+}
+
 /// A fork's child of a wasm32 program at `entry`: the same module, over the
 /// parent's data.
 #[no_mangle]
