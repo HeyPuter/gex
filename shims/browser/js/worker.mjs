@@ -449,8 +449,12 @@ async function handle(msg) {
     // What the process reached (an image's unit, a native module): the
     // page's start-up status (fetch-note.mjs).
     noteStatus(status) {
+      // The process's own .exe, once its main image is in: said with each unit
+      // fetch, so the page can name the program the code is for.
+      if (status?.program !== undefined) this.owner = String(status.path ?? '').split(/[\\/]/).pop();
       noteStatus(status);
     }
+    owner = '';
     loadUnit(key) {
       // The entries now; the module's bytes only if this Worker compiles it
       // (most get the Module from a sibling: see `Gex#cgenModule`). Fetching
@@ -491,7 +495,7 @@ async function handle(msg) {
         x.setRequestHeader('Range', `bytes=${off}-${off + len - 1}`);
         // Said to the page, as a unit's own files are: a cold cluster is
         // code the program is waiting for.
-        const done = noteFetch(`unit:${rel}`, len);
+        const done = noteFetch(`unit:${rel}`, len, this.owner);
         try {
           x.send();
         } finally {
@@ -530,7 +534,7 @@ async function handle(msg) {
         const x = new XMLHttpRequest();
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
-        const done = noteFetch(`unit:${rel}`);
+        const done = noteFetch(`unit:${rel}`, 0, this.owner);
         try {
           x.send();
         } finally {

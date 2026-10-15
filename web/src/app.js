@@ -169,7 +169,8 @@ function progressMeter(state, onProgress) {
      *  inflight}, or null when none is: kind 'file' (a lazy file: name its
      *  file name, done/total its bytes read so far and its size) or 'code'
      *  (a unit of translated code: name the module it is for, '' if not
-     *  known; done the bytes in, total 0). */
+     *  known; done the bytes in, total 0); `owner` the .exe of the process
+     *  that fetched it, '' if not known yet. */
     watchFetches(lazyNames, unitNames) {
       if (typeof BroadcastChannel !== 'function') return;
       const ch = new BroadcastChannel('gex-fetch');
@@ -177,6 +178,11 @@ function progressMeter(state, onProgress) {
       const files = new Map(); // key -> { name, done, total }
       // The build's units, and which of them a process has installed.
       const base = (path) => String(path ?? '').split(/[\\/]/).pop();
+      // A unit fetch as said to the user: the module, and the program it is for.
+      const codeFor = (f) => {
+        if (f.name && f.owner && f.name.toLowerCase() !== f.owner.toLowerCase()) return `code for ${f.name} (${f.owner})`;
+        return `code for ${f.name || f.owner || 'the program'}`;
+      };
       const shipped = new Map(Object.entries(unitNames));
       const isExe = (name) => /\.exe$/i.test(name);
       p.boot.units.total = shipped.size;
@@ -241,17 +247,22 @@ function progressMeter(state, onProgress) {
         let kind = 'file';
         let total = 0;
         if (m.what.startsWith('unit:')) {
-          const unit = m.what.slice('unit:'.length).split('/')[0];
+          const rel = m.what.slice('unit:'.length);
+          const unit = rel.split('/')[0];
           kind = 'code';
-          name = unitNames[unit] || '';
+          // A native module (a Wine builtin) is `providers/<name>-<fingerprint>.wasm`.
+          name = unit === 'providers' ? rel.slice('providers/'.length).replace(/-[0-9a-f]+\.wasm$/i, '') : unitNames[unit] || '';
         } else {
           try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
         }
-        const f = files.get(key) ?? { kind, name, done: 0, total };
-        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching code for ${name || 'the program'}` : `Fetching ${name}`);
+        // The fetching process's .exe (fetch-note.mjs), '' before its main image is in.
+        const owner = typeof m.owner === 'string' ? m.owner : '';
+        const f = files.get(key) ?? { kind, name, owner, done: 0, total };
+        if (!f.owner && owner) f.owner = owner;
+        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching ${codeFor(f)}` : `Fetching ${name}`);
         files.set(key, f);
         if (m.phase === 'start') {
           live.set(m.id, { key });
