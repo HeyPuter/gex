@@ -75,7 +75,8 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # codemap-threads: copies of a file's code mapped and called from several
 # threads while others map anonymous memory: a miss in file-backed code
 # (note_intrinsics) took the JIT lock under the map's, against the lock
-# order (L13).
+# order (L13). The drains after each mapping (providers, units, the
+# recompile queue) run without the kernel lock (L12c).
 PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)

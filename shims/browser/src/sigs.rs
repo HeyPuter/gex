@@ -88,6 +88,56 @@ impl Home {
     pub(crate) fn mm(&self) -> &gex_kernel::mem::Mm {
         &self.mm
     }
+
+    /// Up to `out.len()` bytes of `path` from `offset`, through the
+    /// published namespace (no kernel lock); bytes filled.
+    pub(crate) fn read_file_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Option<usize> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut done = 0usize;
+        while done < out.len() {
+            let n = f.read_at(offset + done as u64, &mut out[done..]).ok()? as usize;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Some(done)
+    }
+
+    /// The whole of `path` (at most 512 MiB), as [`Home::read_file_at`].
+    pub(crate) fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        let f = self.vfs.get().open(path, 0, 0).ok()?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = f.read_at(out.len() as u64, &mut buf).ok()? as usize;
+            if n == 0 {
+                return Some(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > 512 * 1024 * 1024 {
+                return None;
+            }
+        }
+    }
+
+    /// The executable mappings of files, as the log names new ones.
+    pub(crate) fn code_maps(&self) -> Vec<gex_kernel::CodeMap> {
+        use gex_kernel::mem::prot;
+        self.mm
+            .lock()
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
+            .collect()
+    }
+}
+
+/// This Worker's process, for the work after a syscall that runs without
+/// the kernel lock (the mapped-code drains, docs/kernel-locking.md L12c).
+pub(crate) fn proc_home() -> &'static Home {
+    home().expect("mapped code before its process was published")
 }
 
 thread_local! {

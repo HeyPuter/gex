@@ -14488,11 +14488,8 @@ fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
     if unsafe { RECOMPILE_OBJECTS } == 0 || mapped.is_empty() {
         return;
     }
-    with_host(|h| {
-        for m in mapped {
-            h.jit.candidates.push((m, 0));
-        }
-    });
+    // The JIT state's own lock alone (docs/kernel-locking.md, L12c).
+    with_jit_only(|j| j.candidates.extend(mapped.into_iter().map(|m| (m, 0))));
 }
 
 /// How many dispatch misses an object takes before the rest is translated in
@@ -14548,17 +14545,13 @@ fn maybe_recompile_at(pc: u64) -> bool {
     if unsafe { RECOMPILE_OBJECTS } == 0 {
         return false;
     }
-    let due = with_host(|h| {
-        let at = h
-            .jit
-            .candidates
-            .iter()
-            .position(|(m, _)| pc >= m.start && pc < m.end)?;
-        h.jit.candidates[at].1 += 1;
-        if h.jit.candidates[at].1 < RECOMPILE_AFTER_MISSES {
+    let due = with_jit_only(|j| {
+        let at = j.candidates.iter().position(|(m, _)| pc >= m.start && pc < m.end)?;
+        j.candidates[at].1 += 1;
+        if j.candidates[at].1 < RECOMPILE_AFTER_MISSES {
             return None;
         }
-        Some(h.jit.candidates.remove(at).0)
+        Some(j.candidates.remove(at).0)
     });
     let Some(map) = due else { return false };
     // Only if the slot space can afford it. Bulk recompilation claims slots for
@@ -14871,30 +14864,24 @@ fn note_intrinsics(addr: u64) {
     if compat_abi() {
         return;
     }
-    let Some((path, start)) = with_host(|h| {
-        // The map's lock given back before the JIT state is touched: the
-        // order is KLock, JIT, mm (docs/kernel-locking.md §4.3), and taking
-        // JIT under mm deadlocks against a thread taking them in order.
-        let (path, start) = {
-            let mm = h.kernel.mem.lock();
-            let v = mm.vmas().iter().find(|v| {
-                addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0
-            })?;
-            let (path, _) = v.origin.as_ref()?;
-            (path.clone(), v.start)
-        };
-        // Retried rather than answered once, because the answer does not
-        // exist yet the first time: `memcpy`'s slot is filled by the dynamic
-        // linker, and a miss inside `ld.so` itself happens before that.
-        // Bounded, so an object whose slots are never bound stops being
-        // re-parsed.
-        if h.jit.intrinsics_scanned.get(&path).copied().unwrap_or(0) >= 8 {
-            return None;
-        }
-        Some((path, start))
+    // The map first, the JIT state after it and not under it (KLock, JIT,
+    // mm: docs/kernel-locking.md §4.3), neither under the kernel lock.
+    let Some((path, start)) = ({
+        let mm = sigs::proc_home().mm().lock();
+        mm.vmas()
+            .iter()
+            .find(|v| addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)
+            .and_then(|v| v.origin.as_ref().map(|(p, _)| (p.clone(), v.start)))
     }) else {
         return;
     };
+    // Retried rather than answered once, because the answer does not exist
+    // yet the first time: `memcpy`'s slot is filled by the dynamic linker,
+    // and a miss inside `ld.so` itself happens before that. Bounded, so an
+    // object whose slots are never bound stops being re-parsed.
+    if with_jit_only(|j| j.intrinsics_scanned.get(&path).copied().unwrap_or(0) >= 8) {
+        return;
+    }
     let (found, pending) = scan_intrinsics(&path, start);
     let added = with_jit_only(|j| {
         // A scan with nothing left outstanding need never run again.
@@ -15180,7 +15167,7 @@ fn executable_object_at(a: u64) -> Option<String> {
 /// chosen implementation is written into the GOT at startup, so the address is
 /// read from the slot the linker wrote in live memory, after it has run.
 fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>, bool) {
-    let Some(bytes) = with_host(|h| h.kernel.read_file(path)) else {
+    let Some(bytes) = sigs::proc_home().read_file(path) else {
         return (Vec::new(), false);
     };
     let Ok(image) = gex_ld::elf::load(&bytes, 0) else {

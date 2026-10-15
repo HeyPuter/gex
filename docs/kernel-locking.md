@@ -604,15 +604,30 @@ in the scheduler pick after each wake of the global WAKE word: about
      took them to finish; none runs the old code there. `mprotect` merges
      the neighbours it makes alike again, as Linux does, so a range made
      read-only and writable again is one mapping for `mremap`. Still under
-     the kernel lock: the consumers of the mapped code
-     (`recompile_objects`, `elfprov::maps`, which take it themselves after
-     the call, L12c), and the NT layer's mapping calls themselves. Legs:
+     the kernel lock: the NT layer's mapping calls themselves. Legs:
      `free_mapping_calls_answer_as_the_kernel_does`,
      `free_i386_mapping_calls_answer_as_the_kernel_does`,
      `protect_back_merges_and_mremap_takes_the_whole`; `mmap-threads`
      (x86-64, i386, aarch64) in the page tier; W3 `vmreuse` (NT
      VirtualAlloc/VirtualProtect/VirtualFree with code at reused
      addresses, from four threads).
+   - The mapped-code drains without the kernel lock (L12c): what runs after
+     a call that mapped code -- the recompile queue (`recompile_objects`,
+     and `maybe_recompile_at` on a miss) under the JIT lock alone
+     (`with_jit_only`); export providers, replaced libraries and units
+     (`elfprov::maps`, `libprov::maps`, `elf_unit_maps`, the forked child's
+     `rescan_if_new`, `gex_libprov_guest_sym`/`guest_stack_end`, the
+     provider's own low mappings) and the intrinsics scan (`note_intrinsics`)
+     read files through the process's published namespace and the map
+     through `Mm::shared`, both in `sigs::Home` (`Home::read_file`,
+     `Home::code_maps`, `sigs::proc_home`). `note_intrinsics` had taken the
+     JIT lock under mm (against §4.3; fixed on its own first). Still under
+     the kernel lock: `recompile_object`, the bulk translator, which shares
+     the miss path's slot and identity bookkeeping. Leg: `codemap-threads`
+     (x86-64, i386; page tier, also with `GEX_ELF_UNITS=all` and
+     `GEX_RECOMPILE_OBJECTS=1`): copies of the program mapped executable
+     from a file and called from three threads while two churn anonymous
+     mappings.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
