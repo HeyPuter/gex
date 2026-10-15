@@ -36,6 +36,12 @@ pub trait ProcSource: Send + Sync {
     fn tty_of(&self, _sid: i32) -> Option<(u32, i32)> {
         None
     }
+    /// The process task `id` is part of, where `id` is a thread that is not
+    /// its process's first (`ProcTable::task_owner`): `/proc/<tid>` is that
+    /// thread's process's, as Linux shows it.
+    fn task_owner(&self, _id: i32) -> Option<i32> {
+        None
+    }
 }
 
 /// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and
@@ -131,6 +137,12 @@ impl ProcFs {
     /// process here has the one thread `/proc` reports.
     fn canonical(&self, path: &str) -> String {
         let path = untask(path);
+        // `/proc/<tid>`: the thread's process's directory.
+        let (first, rest) = path.split_at(path.find('/').unwrap_or(path.len()));
+        let path = match first.parse::<i32>().ok().and_then(|id| Some(id).zip(self.source.task_owner(id))) {
+            Some((id, owner)) if owner != id => format!("{owner}{rest}"),
+            _ => path,
+        };
         let pid = self.source.pid().to_string();
         match path.strip_prefix(&pid) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => {

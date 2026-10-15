@@ -69,6 +69,13 @@ pub struct Remote {
     /// Every process, encoded by [`encode_entries`], into `cap` bytes at `at`;
     /// returns the full length (larger than `cap`: ask again with more room).
     pub snapshot: extern "C" fn(at: crate::PAddr, cap: u32) -> i32,
+    /// A new thread of `pid`, numbered with the processes: see
+    /// [`ProcTable::new_tid`].
+    pub new_tid: extern "C" fn(pid: i32) -> i32,
+    /// See [`ProcTable::end_tid`].
+    pub end_tid: extern "C" fn(tid: i32),
+    /// See [`ProcTable::task_owner`]; zero for no such task.
+    pub task_owner: extern "C" fn(id: i32) -> i32,
 }
 
 /// One process as another process's `/proc` sees it.
@@ -173,8 +180,12 @@ struct Proc {
 }
 
 struct Table {
+    /// The next task id, a process's or a thread's: one numbering, as
+    /// Linux's pids and tids are one, so an id names exactly one task.
     next_pid: i32,
     procs: Vec<Proc>,
+    /// Each live thread that is not its process's first, and its process.
+    threads: std::collections::HashMap<i32, i32>,
 }
 
 /// Moved after every signal left in a process's inbox (`kill`, a group's
@@ -230,6 +241,7 @@ impl ProcTable {
             remote: None,
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
+                threads: std::collections::HashMap::new(),
                 procs: vec![Proc {
                     pid: INIT_PID,
                     ppid: 0,
@@ -277,6 +289,44 @@ impl ProcTable {
             info: Vec::new(),
         });
         pid
+    }
+
+    /// A new thread of `pid`, and its id: from the numbering the processes'
+    /// come from, so no thread shares a number with a process or with a
+    /// thread of another (a per-process count did both: `tkill(3)` meant pid
+    /// 2's second thread and pid 3 alike). `kill`, `tgkill` and `/proc` find
+    /// its process by it ([`Self::task_owner`]) until [`Self::end_tid`].
+    pub fn new_tid(&self, pid: i32) -> i32 {
+        if let Some(r) = self.remote {
+            return (r.new_tid)(pid);
+        }
+        let mut t = self.lock();
+        let tid = t.next_pid;
+        t.next_pid += 1;
+        t.threads.insert(tid, pid);
+        tid
+    }
+
+    /// Thread `tid` has ended (`exit`, or the others at an `execve`).
+    pub fn end_tid(&self, tid: i32) {
+        if let Some(r) = self.remote {
+            return (r.end_tid)(tid);
+        }
+        self.lock().threads.remove(&tid);
+    }
+
+    /// The process task `id` is part of: `id` itself when it is a process
+    /// (its first thread's id is its pid), the process of a thread
+    /// otherwise; `None` when neither is in the table.
+    pub fn task_owner(&self, id: i32) -> Option<i32> {
+        if let Some(r) = self.remote {
+            return Some((r.task_owner)(id)).filter(|&p| p > 0);
+        }
+        let t = self.lock();
+        if t.procs.iter().any(|p| p.pid == id) {
+            return Some(id);
+        }
+        t.threads.get(&id).copied()
     }
 
     /// What `/proc/<pid>` shows for `pid` in every other process: its name
@@ -381,6 +431,8 @@ impl ProcTable {
                     p.ppid = INIT_PID;
                 }
             }
+            // Its threads went with it.
+            t.threads.retain(|_, p| *p != pid);
             let parent_q = ppid
                 .and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid))
                 .map_or(0, |p| p.queue.id());
@@ -543,7 +595,12 @@ impl ProcTable {
                 };
                 (0..t.procs.len()).filter(|&i| t.procs[i].pgid == pgid).collect()
             }
-            n => (0..t.procs.len()).filter(|&i| t.procs[i].pid == n).collect(),
+            // A thread's id is its process, as on Linux (`kill` is
+            // process-directed whichever of its tasks it names).
+            n => {
+                let n = t.threads.get(&n).copied().unwrap_or(n);
+                (0..t.procs.len()).filter(|&i| t.procs[i].pid == n).collect()
+            }
         };
         if hits.is_empty() {
             return Err(Errno::ESRCH);
@@ -777,6 +834,36 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threads and processes are numbered from one count, so no id names
+    /// two tasks; a thread's id finds its process for `kill` and `/proc`
+    /// until it ends, and a process's ending takes its threads' ids along.
+    #[test]
+    fn thread_ids_are_numbered_with_the_processes() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let a2 = t.new_tid(a);
+        let b = t.spawn(INIT_PID);
+        let b2 = t.new_tid(b);
+        let ids = [INIT_PID, a, a2, b, b2];
+        for (i, x) in ids.iter().enumerate() {
+            assert!(!ids[i + 1..].contains(x), "{x} names two tasks: {ids:?}");
+        }
+        assert_eq!(t.task_owner(a), Some(a));
+        assert_eq!(t.task_owner(a2), Some(a));
+        assert_eq!(t.task_owner(b2), Some(b));
+        assert_eq!(t.task_owner(b2 + 100), None);
+        // `kill` of a thread's id is its process's signal, and only its.
+        assert_eq!(t.kill(INIT_PID, a2, 10), Ok(1));
+        assert_eq!(t.take_signals(a), 1 << 9);
+        assert_eq!(t.take_signals(b), 0);
+        t.end_tid(a2);
+        assert_eq!(t.task_owner(a2), None);
+        assert_eq!(t.kill(INIT_PID, a2, 10), Err(Errno::ESRCH));
+        t.exit(b, 0);
+        assert_eq!(t.task_owner(b2), None);
+        assert_eq!(t.kill(INIT_PID, b2, 0), Err(Errno::ESRCH));
+    }
 
     #[test]
     fn the_table_lists_processes_with_what_they_said() {

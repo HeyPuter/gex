@@ -252,6 +252,9 @@ extern "C" {
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
     fn k_spawn(ppid: i32) -> i32;
+    fn k_tid_new(pid: i32) -> i32;
+    fn k_tid_end(tid: i32);
+    fn k_task_owner(id: i32) -> i32;
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
     /// pid in the high 32 bits, wait status in the low 32; zero for none.
@@ -689,6 +692,15 @@ extern "C" fn r_set_info(pid: i32, at: gex_kernel::PAddr, len: u32) {
 extern "C" fn r_snapshot(at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_proc_snapshot(at, cap) }
 }
+extern "C" fn r_new_tid(pid: i32) -> i32 {
+    unsafe { k_tid_new(pid) }
+}
+extern "C" fn r_end_tid(tid: i32) {
+    unsafe { k_tid_end(tid) }
+}
+extern "C" fn r_task_owner(id: i32) -> i32 {
+    unsafe { k_task_owner(id) }
+}
 
 /// The process table every process shares, if the host gave us one.
 ///
@@ -733,6 +745,9 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             halt_code: r_halt_code,
             set_info: r_set_info,
             snapshot: r_snapshot,
+            new_tid: r_new_tid,
+            end_tid: r_end_tid,
+            task_owner: r_task_owner,
         },
     )))
 }
@@ -9049,15 +9064,6 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
-    // The main thread's tid is the pid, but `next_tid` (which numbers cloned
-    // threads) was inherited from the parent and is typically 2. A forked child
-    // at pid N that then spawns >= N-1 threads would hand a clone tid == N, a
-    // DUPLICATE of the main thread's tid. Thread lookups go by tid
-    // (`position(|t| t.kstate.tid == tid)`), so a duplicate makes an operation
-    // for one thread land on the other's register context -- two threads driven
-    // through one ctx, wild stores, the SMP stack smash GTK's multi-threaded
-    // startup hit (issue #126). Number clones strictly above the main tid.
-    kernel.next_tid = kernel.next_tid.max(pid + 1);
     // The process's start, unless this is a vfork child's kernel: the
     // memory's other Workers are its parent's threads (vfork.rs).
     if vfork::pid_here().is_none() {

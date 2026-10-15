@@ -1550,6 +1550,25 @@ pub extern "C" fn k_spawn(ppid: i32) -> i32 {
     procs().spawn(ppid)
 }
 
+/// A new thread of `pid`, numbered with the processes
+/// (`ProcTable::new_tid`).
+#[no_mangle]
+pub extern "C" fn k_tid_new(pid: i32) -> i32 {
+    procs().new_tid(pid)
+}
+
+/// Thread `tid` has ended.
+#[no_mangle]
+pub extern "C" fn k_tid_end(tid: i32) {
+    procs().end_tid(tid)
+}
+
+/// The process task `id` is part of; zero for none.
+#[no_mangle]
+pub extern "C" fn k_task_owner(id: i32) -> i32 {
+    procs().task_owner(id).unwrap_or(0)
+}
+
 /// Record that `pid` has exited. `status` is an exit code, or the negated
 /// signal number when it died of one (the `ProcTable::exit` convention);
 /// [`k_wait`] turns the two into the one word a parent reads.

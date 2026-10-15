@@ -129,6 +129,9 @@ impl ProcSource for KernelProcSource {
     fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
         tty_of(self.0.get()?.ptys, sid)
     }
+    fn task_owner(&self, id: i32) -> Option<i32> {
+        self.0.get()?.procs.task_owner(id)
+    }
     fn status(&self) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, _, _) = relations(&l);

@@ -517,9 +517,6 @@ pub struct Kernel {
     /// Syscalls seen but not implemented, for the ENOSYS telemetry in
     /// PLAN §14.
     pub unimplemented: Vec<u64>,
-    /// Next thread id to hand out. Thread ids are process-wide, so this lives
-    /// with the shared state rather than with a thread.
-    pub next_tid: i32,
     /// Next free register-context slot. Slot 0 is the initial thread's.
     pub next_ctx_slot: u32,
     /// Threads that have been created and not yet exited, including this one.
@@ -5158,6 +5155,12 @@ impl Kernel {
         }
         self.signals.exec();
         let cur = Arc::clone(self.signals.thread());
+        // The other threads are gone, and their ids with them.
+        for &t in self.thread_signals.keys() {
+            if t != tid && t != self.pid {
+                self.procs.end_tid(t);
+            }
+        }
         self.thread_signals.clear();
         self.thread_signals.insert(tid, cur);
         self.sig_tid = tid;
@@ -5222,7 +5225,6 @@ impl Kernel {
             futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
-            next_tid: 2,
             next_ctx_slot: 1,
             live_threads: 1,
             procs: Arc::new(ProcTable::new()),
@@ -5514,7 +5516,6 @@ impl Kernel {
             // Futexes live in the address space, and the child has its own.
             futexes: Arc::new(FutexTable::new()),
             unimplemented: Vec::new(),
-            next_tid: self.next_tid,
             next_ctx_slot: self.next_ctx_slot,
             live_threads: 1,
             // The table is the system's, not the process's.
@@ -5593,16 +5594,16 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
 
-        let tid = self.next_tid;
-        self.next_tid += 1;
         let slot = self.next_ctx_slot;
-        self.next_ctx_slot += 1;
         let child = ctx_addr(slot);
         // Contexts live in the reserved region below the guest's own memory;
         // running out of slots is a hard limit, not something to paper over.
         if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
             return Err(Errno::EAGAIN);
         }
+        self.next_ctx_slot += 1;
+        // Numbered with the processes (`ProcTable::new_tid`).
+        let tid = self.procs.new_tid(self.pid);
 
         let parent = self.ctx_addr;
         for off in (0..ctx::SIZE).step_by(8) {
@@ -5970,6 +5971,7 @@ impl Kernel {
             // Its signal state goes with it; the next thread to enter loads
             // its own.
             self.thread_signals.remove(&self.tid);
+            self.procs.end_tid(self.tid);
             self.thread_calls.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
         }
@@ -7966,12 +7968,21 @@ impl Kernel {
         } else {
             (a[0] as i32, a[1] as i32, a[2] as u32)
         };
-        if signo > crate::signal::sig::MAX || tid <= 0 {
+        if signo > crate::signal::sig::MAX || tid <= 0 || (n == nr::TGKILL && tgid <= 0) {
             return Err(Errno::EINVAL);
         }
+        // An id names one task in the whole system (`ProcTable::new_tid`).
+        // One not of this process is another's thread: that process takes
+        // the signal, as `kill` gives it; `tgkill` must name its process.
+        if !self.thread_signals.contains_key(&tid) && tid != self.tid {
+            let owner = self.procs.task_owner(tid).ok_or(Errno::ESRCH)?;
+            if owner == self.pid || (n == nr::TGKILL && owner != tgid) {
+                return Err(Errno::ESRCH);
+            }
+            return self.procs.kill(self.pid, owner, signo).map(|_| 0);
+        }
         if tgid != self.pid {
-            // Another process's thread: its process, as `kill` does.
-            return self.procs.kill(self.pid, tgid, signo).map(|_| 0);
+            return Err(Errno::ESRCH);
         }
         let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
         if tid == self.tid {

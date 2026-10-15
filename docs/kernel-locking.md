@@ -87,7 +87,7 @@ Fields of `Kernel` (crates/gex-kernel/src/syscalls.rs), by who writes them:
   - `fds` (`FdTable`: a `Vec<Option<Arc<OpenFile>>>`, cloexec, generation);
   - `mem` (`MemoryMap`: vmas, brk, mmap cursor, arena: no internal locking);
   - Signals' `actions` and process-directed `pending`/`sources`;
-  - `itimers`, `next_tid`, `next_ctx_slot`, `live_threads`,
+  - `itimers`, `next_ctx_slot`, `live_threads`,
     `unimplemented`;
   - `exe_path`, `argv`, `envp`, uid/gid;
   - `fd_activity`, `compat`, `sigreturn_legacy`.
@@ -782,6 +782,20 @@ in the scheduler pick after each wake of the global WAKE word: about
      set added to, waited on and deleted from by two threads, files
      truncated and read back, and the descriptor limit set and read while
      other threads open descriptors.
+   - Task ids (L15b, before `kill`/`tgkill` leave the lock): threads are
+     numbered with the processes, by the process table
+     (`ProcTable::new_tid`, the global kernel's `k_tid_new` in the page),
+     as Linux's tids and pids are one numbering. A per-process count
+     (`Kernel::next_tid`, from pid + 1) gave a forked child's thread the
+     number of the next process forked, so `tkill(n)`, `kill(n)` and
+     `/proc/<n>` could mean either. The table keeps each thread's process
+     until it ends (`end_tid`: `exit`, `execve`'s other threads, the
+     process's exit); `kill` of a thread's id is its process's signal,
+     `tkill`/`tgkill` of another process's thread reach that process (and
+     `tgkill` checks the tgid), and `/proc/<tid>` is its process's
+     directory (`ProcSource::task_owner`). Legs:
+     `thread_ids_are_numbered_with_the_processes`; `task-ids` (x86-64,
+     i386; page tier, SP and gexc).
 9. **Lifecycle, devices, introspection, NT; then KLock itself deleted
    (§3.9, §3.10).**
    - The compositor's pump (L8): no lock. What it asked of the kernel is

@@ -746,8 +746,7 @@ pub fn create_thread_state(
     let (slot, gex_tid) = match slot {
         Some(s) => s,
         None => {
-            let t = k.next_tid;
-            k.next_tid += 1;
+            let t = k.procs.new_tid(k.pid);
             let s = k.next_ctx_slot;
             k.next_ctx_slot += 1;
             (s, t)
