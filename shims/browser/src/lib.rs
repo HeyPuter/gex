@@ -1528,6 +1528,12 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
+    // Audio: OSS's /dev/dsp and /dev/mixer, a null output, as natively
+    // (shims/native). W3's wineoss.drv is a pure Unix library linked into
+    // the loader; without the device its test_connect says Unavailable,
+    // mmdevapi picks no driver and a program finds no audio device
+    // (waveOutGetNumDevs 0; tests/w3/audio.sh).
+    devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
     // for every process so a name one creates another opens (Chromium's
