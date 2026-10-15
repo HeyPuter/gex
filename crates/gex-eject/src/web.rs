@@ -552,7 +552,11 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
   };
 
   try {
-    const app = await start({ container: document.body, onProgress: progress });
+    // The guest's network over a Wisp proxy: gex's default (as its desktop
+    // page), or ?wisp=wss://…/; an empty ?wisp= leaves the guest offline.
+    const q = new URLSearchParams(location.search);
+    const wisp = q.has('wisp') ? q.get('wisp') : 'wss://anura.pro/';
+    const app = await start({ container: document.body, onProgress: progress, ...(wisp ? { wisp } : {}) });
     // A library that says nothing of its progress: no loading screen to keep.
     if (!app.state?.progress) hide();
     // The desktop follows the window (a resize, a zoom): 'fit' again,
