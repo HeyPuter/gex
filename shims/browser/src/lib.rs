@@ -451,6 +451,7 @@ extern "C" {
     fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
     fn k_sock_dup(id: i32) -> i32;
     fn k_boot_secs(want: u32) -> u32;
+    fn k_guest_clock(scale_milli: u32, wall_shift: i32) -> u64;
     fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn k_sock_read_fds(
@@ -1267,6 +1268,11 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     }
     // And one boot instant for every process's monotonic clocks.
     gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
+    // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
+    let gc = unsafe { k_guest_clock(0, 0) };
+    if gc != 0 {
+        gex_kernel::set_guest_clock((gc >> 32) as f64 / 1000.0, gc as u32 as i32 as i64);
+    }
     Some(gex_kernel::unix::Remote {
         queue: rs_queue,
         bind: rs_bind,

@@ -3086,6 +3086,27 @@ pub extern "C" fn k_boot_secs(want: u32) -> u32 {
     }
 }
 
+/// The benchmark clocks every process reads (gex-kernel `set_guest_clock`):
+/// the monotonic clocks' speed in thousandths (high half) and the seconds
+/// the wall clock is set back (low half, signed); 0 for real time.
+static GUEST_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the benchmark clocks if no one has (`scale_milli` 0: only asks) and
+/// returns what they are, packed as [`GUEST_CLOCK`]. The page's first
+/// process sets them, before any guest code reads a clock.
+#[no_mangle]
+pub extern "C" fn k_guest_clock(scale_milli: u32, wall_shift: i32) -> u64 {
+    use std::sync::atomic::Ordering;
+    let want = (scale_milli as u64) << 32 | wall_shift as u32 as u64;
+    if scale_milli == 0 {
+        return GUEST_CLOCK.load(Ordering::Acquire);
+    }
+    match GUEST_CLOCK.compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => want,
+        Err(had) => had,
+    }
+}
+
 // -- descriptors in flight ---------------------------------------------------
 //
 // `SCM_RIGHTS` between processes: the sender's process describes each

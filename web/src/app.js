@@ -630,6 +630,9 @@ export function setGlobals(get, b = {}) {
   if (get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
+  // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
+  if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));
+  if (get('fixedtime')) globalThis.GEX_FIXED_TIME = Number(get('fixedtime'));
   if (get('mem64') === '1' || b.mem64) globalThis.GEX_MEM64 = 1;
   // The function JIT: off by default (it doubles a W3 program's start-up;
   // nt-page.js said why).
