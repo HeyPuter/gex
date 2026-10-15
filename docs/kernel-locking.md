@@ -483,8 +483,11 @@ trap does not unwind, so a guard held across it never drops.
 - **Debug check:** a per-Worker held-lock count is checked at every
   trap-out site, and is non-zero only on a bug.
 - **The shim's scopes:** `trap` checks its own the same way
-  (`check_scopes_at_trap`): the kernel lock or the `HOST` borrow, the JIT
-  state's lock, a GL submit's deferral. It ends the ones it can end itself:
+  (`check_scopes_at_trap`): the kernel lock or the `HOST` borrow, and a GL
+  submit's deferral. The JIT state's lock, a guard kept in TLS
+  (`JIT_HELD`), is reported and given back by its own `Drop` before the
+  held-count check, so the lock and the count agree. It ends the ones it can
+  end itself:
   `IN_SYSCALL` and the clock's scope (`NowScope`), whose reading, left
   open, froze the clock for every timed wait after a stack handoff. Scopes
   that JS sets back when it catches a trap (call-out depth, a provider's

@@ -12233,6 +12233,17 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
+    // The JIT state's lock is the one guard kept where a trap can reach it
+    // (`JIT_HELD`, this Worker's TLS): a bug to be holding it here, said, and
+    // given back by its own `Drop`, so that the lock, its rank and the held
+    // count below agree. Left, the count was zeroed while the guard stayed.
+    if jit_holds() {
+        warn_line(&format!(
+            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}; given back (docs/kernel-locking.md §4.1)\n",
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ));
+        jit_give();
+    }
     // A kernel lock guard alive here never drops: a trap does not unwind, so
     // the lock would stay taken for good (docs/kernel-locking.md §4.1). Lock
     // regions are leaf computations; one that reaches a trap is a bug.
@@ -12267,8 +12278,6 @@ fn trap() -> ! {
 /// - the kernel: `KLock` in the shared build, which every other Worker
 ///   would then wait on, or the `HOST` borrow in the plain one, which would
 ///   make the next call panic as a re-entry;
-/// - the JIT state's lock (`JIT_HELD`), which only the kernel lock's
-///   release gives back;
 /// - a GL submit's deferral (`gl::DEFER`), under which a submit waits for
 ///   the end of a syscall that has already gone.
 ///
@@ -12282,13 +12291,11 @@ fn check_scopes_at_trap() {
     let kernel = DEPTH.with(|d| d.get()) > 0;
     #[cfg(not(feature = "shared-memory"))]
     let kernel = HOST.with(|h| h.try_borrow_mut().is_err());
-    let jit = jit_holds();
     let defer = gl::DEFER.with(|d| d.get());
-    if kernel || jit || defer {
+    if kernel || defer {
         warn_line(&format!(
-            "[gex] BUG: trapped out to JS with{}{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
+            "[gex] BUG: trapped out to JS with{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
             if kernel { " the kernel" } else { "" },
-            if jit { " the JIT lock" } else { "" },
             if defer { " a GL deferral" } else { "" },
             LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
         ));
