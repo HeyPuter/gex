@@ -521,7 +521,7 @@ pub extern "C" fn gex_code_changed(addr: u32, len: u32) {
     let (addr, len) = (addr as u64, len as u64);
     let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
     if end > start {
-        crate::with_host(|h| h.kernel.retired_code.push((start, end)));
+        crate::with_host(|h| h.kernel.mem.lock().log.retired_code.push((start, end)));
     }
     gex_kernel::note_code_change();
 }

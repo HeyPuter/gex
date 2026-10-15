@@ -579,10 +579,28 @@ in the scheduler pick after each wake of the global WAKE word: about
      reader and writer takes it for a leaf computation (`k.mem.lock()`),
      never across a trap; a copy (`fork`, a vfork child) is a copy of the
      map with its own lock and view, and `Mm::shared` is the same map for
-     a holder outside the kernel. Nothing is lock-free yet: every caller
-     still holds the kernel lock too. That is the next two pieces, the
-     mapping calls in the free class (L12b) and the shim's code
-     registration drained from the mm (L12c).
+     a holder outside the kernel.
+   - The mapping calls without the kernel lock (L12b): `mmap`, `munmap`,
+     `mprotect`, `brk`, `mremap`, `madvise` and `msync` are in the free
+     class (`syscalls::MapIo`, with i386's `mmap2` and old `mmap`). What
+     they note for the host moved from `Kernel` into the map, under its
+     lock (`mem::MapLog`: code mapped and retired, the pin and placement
+     armed by `openat`, where pins landed, shared file mappings); the pins
+     and the placement are process constants, published with the map in
+     the page's `sigs::Home`. A call that can take code away (`mmap`,
+     `munmap`, `mprotect`, `mremap`) is made and its code retired under
+     the JIT lock (`free_syscall`, `map_drain`): JIT then mm, so nothing
+     translates or runs the old code between the two and a freed address
+     is not mapped again with new code before its translations are gone.
+     `mremap` copies with the mm lock held, so another thread's mapping
+     cannot land in the range it vacates before its bytes are out. Still
+     under the kernel lock: the consumers of the mapped code
+     (`recompile_objects`, `elfprov::maps`, which take it themselves after
+     the call, L12c), and the NT layer's own mapping calls, whose retire is
+     a separate kernel-lock section after the call. Legs:
+     `free_mapping_calls_answer_as_the_kernel_does`,
+     `free_i386_mapping_calls_answer_as_the_kernel_does`; `mmap-threads`
+     (x86-64, i386, aarch64) in the page tier.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
@@ -635,7 +653,8 @@ in the scheduler pick after each wake of the global WAKE word: about
      directory writes, the coverage and slot getters) take it alone, with
      no KLock (`with_jit_only`). The miss's lift and install still go
      through `with_jit` (they read the thread table and the object
-     identities); the mapping calls (L12b) retire code under this lock.
+     identities); the mapping calls (L12b) are made and retire their code
+     under this lock.
      Legs: the page tier's translation programs (`retire-during-lift`,
      `smc-race`, `smc-threads`, `smc-direct-jump`, `page-cross-entry`)
      and the rest of the page tier with the order checked

@@ -1037,7 +1037,7 @@ fn run_program_with(
         None => (
             {
                 let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
-                k.pins = opts.pins.clone();
+                k.pins = std::sync::Arc::new(opts.pins.clone());
                 k
             },
             // `..Default::default()` for the rest: listing every field means a
@@ -1118,7 +1118,7 @@ fn run_program_with(
     if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
         if let Some(bytes) = kernel.read_file(path) {
             let maps = gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base());
-            kernel.new_code.extend(maps);
+            kernel.mem.lock().log.new_code.extend(maps);
         }
     }
     let tid = kernel.pid;
@@ -1447,7 +1447,8 @@ fn run_program_with(
     if opts.report_pins {
         let landed = {
             let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
-            k.pin_landed.clone()
+            let landed = k.mem.lock().log.pin_landed.clone();
+            landed
         };
         let mut wrong = 0;
         for (path, want, got) in &landed {
@@ -3739,14 +3740,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // would throw away the fresh translation.
             let retired: Vec<(u64, u64)> = caller
                 .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.retired_code));
+                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.retired_code));
             if !retired.is_empty() {
                 retire_translations(&mut caller, &retired)?;
             }
             recheck_units(&mut caller);
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
-                .with_kernel(|k| std::mem::take(&mut k.new_code));
+                .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.new_code));
             profile::note_mapped(caller.data_mut(), &mapped);
             // A library a stateful provider replaces (stream U): bound before
             // the loader can call into it.
@@ -5805,11 +5806,11 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// addresses in `translated` (so discovery does not skip them). Old slots are
 /// abandoned, not reused: replay safety (newest wins) needs a base to belong
 /// to one page for the whole run.
-/// Ranges made executable again (`Kernel::recheck_code`): the units' pages
+/// Ranges made executable again (`MapLog::recheck_code`): the units' pages
 /// there are compared with what they were built from; no translation is
 /// forgotten (the write that could have changed them retired them already).
 fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
-    let recheck = caller.as_context_mut().data_mut().with_kernel(|k| std::mem::take(&mut k.recheck_code));
+    let recheck = caller.as_context_mut().data_mut().with_kernel(|k| std::mem::take(&mut k.mem.lock().log.recheck_code));
     if recheck.is_empty() {
         return;
     }

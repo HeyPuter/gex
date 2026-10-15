@@ -635,23 +635,8 @@ pub struct Kernel {
     /// is the assignment, by guest path.
     ///
     /// Empty unless a closure build asked for it, and then honoured only for
-    /// the reservation described at `armed_pin`.
-    pub pins: std::collections::HashMap<String, u64>,
-    /// The base the next anonymous reservation should get, and for what.
-    ///
-    /// `ld.so` does not map an object in one call. It opens the file, reads
-    /// the header, reserves the whole span with an *anonymous* `PROT_NONE`
-    /// mapping, and only then maps the segments into it with `MAP_FIXED`. The
-    /// reservation is the one address gex chooses and the only one worth
-    /// pinning -- and being anonymous it carries no file to key on. So the
-    /// `openat` immediately before it is the signal, and this is what that
-    /// signal sets.
-    ///
-    /// The predicate has to include `PROT_NONE`: a real trace of glibc's
-    /// loader shows a 8 KiB `PROT_READ|WRITE` allocation of its own between
-    /// the `fstat` and the reservation, so "the next anonymous mapping" would
-    /// pin the wrong one.
-    pub armed_pin: Option<(String, u64)>,
+    /// the reservation described at `MapLog::armed_pin`.
+    pub pins: Arc<std::collections::HashMap<String, u64>>,
     /// Who decides where a shared object goes, when anybody does.
     ///
     /// [`Self::pins`] is the same idea decided ahead of time by a closure
@@ -659,14 +644,6 @@ pub struct Kernel {
     /// an object fixes its address and every later one is given the same,
     /// which is what makes a translated module worth sharing between them.
     pub place: Option<Arc<dyn ObjectPlace>>,
-    /// Which object the next anonymous reservation is for.
-    ///
-    /// The same signal [`Self::armed_pin`] uses and for the same reason: the
-    /// reservation carries no file, so the `openat` before it is what names
-    /// the object. Kept separate because a pin knows its address already and
-    /// this one has to ask, and can only ask once the reservation says how
-    /// long the object is.
-    pub armed_place: Option<String>,
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
@@ -689,40 +666,10 @@ pub struct Kernel {
     /// The canonical number of the syscall being handled (for the host's
     /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
     pub syscall_nr: u64,
-    /// Where each pinned object actually landed, for checking afterwards.
-    ///
-    /// A pin that silently does not take is the worst outcome available: the
-    /// module is built for one address and the code runs at another, and the
-    /// guest branches into whatever is there. Recorded so a mismatch can be
-    /// reported rather than executed.
-    pub pin_landed: Vec<(String, u64, u64)>,
-    /// File mappings whose writes are meant to reach the file.
-    pub shared_maps: SharedMaps,
     /// The working directories of threads that left the process's
     /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
     /// the length of each of that thread's system calls.
     pub thread_cwd: std::collections::HashMap<u64, String>,
-    /// Executable mappings made since the host last looked.
-    pub new_code: Vec<CodeMap>,
-    /// Executable ranges *unmapped* since the host last looked.
-    ///
-    /// A translation is only valid while the code it was made from is still
-    /// there. `dlclose` unmaps a library and a later `dlopen` maps a
-    /// different one over the same addresses, and without this the guest
-    /// branches into the previous library's translated code -- the dispatch
-    /// slot still answers for the page. Nothing reports an error; the guest
-    /// simply runs the wrong function. A long-running X server does exactly
-    /// this every time its last client disconnects and it resets.
-    pub retired_code: Vec<(u64, u64)>,
-    /// Ranges made executable again by `mprotect` (read+execute, no write):
-    /// the function tier compares its units' pages there (a loader that lifted
-    /// `.text` to fill an import table and put it back, `cgen::on_retire`).
-    /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
-    /// could have changed the code was retired when the page became writable,
-    /// and forgetting the dispatch pages here dropped the bridges of the units
-    /// and native modules on them for good (a native Wine DLL's `ud2` stub
-    /// then ran as code: SIGILL in Undertale's GL start).
-    pub recheck_code: Vec<(u64, u64)>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -1806,10 +1753,402 @@ pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, 
         Ok(0)
 }
 
+/// The memory map and what a mapping call needs beside it, none of it behind
+/// the kernel lock (docs/kernel-locking.md §3.5, L12b): `mmap`, `munmap`,
+/// `mprotect`, `brk`, `mremap`, `madvise` and `msync`, the same code for the
+/// full call and [`free_call`]. What they note for the host (code mapped and
+/// retired, pins, shared file mappings) is the map's own ([`MapLog`]).
+///
+/// [`MapLog`]: crate::mem::MapLog
+#[derive(Clone, Copy)]
+pub struct MapIo<'a> {
+    pub mem: &'a crate::mem::Mm,
+    /// For a file mapping's descriptor.
+    pub fds: &'a FdTable,
+    /// `Kernel::pins` and `Kernel::place`: constants once the process runs.
+    pub pins: &'a std::collections::HashMap<String, u64>,
+    pub place: Option<&'a Arc<dyn ObjectPlace>>,
+    /// The call's pc: a mapping the dynamic loader asks for stays below
+    /// 4 GiB, since it will hold code (docs/mem64.md).
+    pub pc: u64,
+}
+
+impl MapIo<'_> {
+    /// The mapping call `n` (canonical), or `None` for any other.
+    pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        Some(match n {
+            nr::BRK => {
+                // Zeroed, because Linux zeroes it and libc counts on that.
+                let (result, grew) = self.mem.lock().brk_grow(a[0]);
+                if let Some((from, to)) = grew {
+                    let _ = m.zero_dirty(from, (to - from) as usize);
+                }
+                Ok(result)
+            }
+            nr::MMAP => self.mmap(m, a),
+            nr::MUNMAP => {
+                let flushed = self.flush_shared(m, a[0], a[1]);
+                self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                self.retire_code(a[0], a[1]);
+                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
+            }
+            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
+            nr::MREMAP => self.mremap(m, a),
+            nr::MPROTECT => self.mprotect(a),
+            nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
+            _ => return None,
+        })
+    }
+
+    /// `mprotect`.
+    pub fn mprotect(&self, a: [u64; 6]) -> SysResult {
+        // Losing execute retires the translations as surely as
+        // unmapping does: `ld.so` applies RELRO by dropping write,
+        // but a JIT in the guest flips a page from executable back to
+        // writable precisely so it can put different code there.
+        // Making code writable is the other half (a patch, a
+        // detour), which x86 needs no cache flush to see.
+        if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
+            self.retire_code(a[0], a[1]);
+        }
+        let mut mm = self.mem.lock();
+        let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
+        // Executable again (a loader filling an import table in
+        // `.text`, a JIT done writing): what is there now is checked
+        // against the function tier's units (`cgen::on_retire`
+        // compares the pages; a page made non-executable for a while
+        // is not gone: `cgen::in_pe_image`). A check, not a retire
+        // (`MapLog::recheck_code`).
+        if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
+            let (start, end) = (
+                crate::mem::page_align_down(a[0]),
+                crate::mem::page_align_up(a[0].saturating_add(a[1])),
+            );
+            if end > start {
+                mm.log.recheck_code.push((start, end));
+                crate::note_code_change();
+            }
+        }
+        r
+    }
+
+    /// `mremap`. The map decides where; this moves the bytes.
+    pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        const MREMAP_MAYMOVE: u64 = 1;
+        let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        // The map's lock held through the copy: the old range is free in
+        // the map once it has moved, and another thread's mapping there
+        // must not land before its bytes are out.
+        let mut mm = self.mem.lock();
+        let (dst, moved) = mm.mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
+        if moved {
+            let keep = old_len.min(new_len) as usize;
+            let bytes = m.read(addr, keep)?.to_vec();
+            m.write(dst, &bytes)?;
+            // The grown tail at the new location is fresh anonymous memory,
+            // which Linux exposes as zero -- but `dst` may be a reused hole
+            // holding stale bytes, and only `keep` of them were overwritten.
+            if new_len > old_len {
+                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
+            }
+        } else if new_len > old_len {
+            // Growing in place must expose zeroes, not whatever the guest
+            // left behind the last time this range was mapped.
+            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
+        }
+        Ok(dst)
+    }
+
+    /// The pinned base for a path a closure build named, if there is one.
+    ///
+    /// Exact spelling first, then the file's name alone: `gexc` records the
+    /// path it walked in its sysroot while `ld.so` opens what `ld.so.cache`
+    /// gives it, and on Debian those differ by a symlinked prefix. The
+    /// name-only fallback is safe because a rootfs does not ship two libraries
+    /// of one name that a single program loads both of; the exact match still
+    /// wins.
+    pub fn pin_for(&self, path: &str) -> Option<u64> {
+        if self.pins.is_empty() {
+            return None;
+        }
+        if let Some(&base) = self.pins.get(path) {
+            return Some(base);
+        }
+        let want = path.rsplit('/').next()?;
+        self.pins
+            .iter()
+            .find(|(k, _)| k.rsplit('/').next() == Some(want))
+            .map(|(_, &v)| v)
+    }
+
+    /// `madvise`. Only `MADV_DONTNEED` does anything: on Linux it makes an
+    /// anonymous range read as zero on next access, and glibc's malloc frees
+    /// arena memory this way and then REUSES it trusting the zero. A no-op left
+    /// the reused pages holding stale bytes, so glibc read garbage -- a
+    /// deterministic corruption Qt hits (heavy glibc malloc/threads) and musl
+    /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
+    /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
+    /// the file, which the demand path already does, so it is left alone.
+    pub fn madvise(&self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
+        const MADV_DONTNEED: u32 = 4;
+        if advice == MADV_DONTNEED {
+            let end = addr.saturating_add(len);
+            let anon: Vec<(u64, u64)> = self
+                .mem
+                .lock()
+                .vmas()
+                .iter()
+                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
+                .map(|v| (v.start.max(addr), v.end.min(end)))
+                .collect();
+            for (lo, hi) in anon {
+                if hi > lo {
+                    m.zero_dirty(lo, (hi - lo) as usize)?;
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn mmap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let (addr, len, prot_bits, flags, fd, offset) =
+            (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        // A fixed mapping over code replaces it, as an unmap would (Wine's
+        // VirtualFree decommits by mapping over the range).
+        if flags & mflags::FIXED != 0 {
+            self.retire_code(addr, len);
+            // And a shared file mapping it replaces ends as an unmap ends
+            // it: written back, and no longer handed to the next mapper.
+            self.flush_shared(m, addr, len)?;
+            self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
+        }
+        if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
+            // A private file mapping is an eager copy, which is exactly
+            // correct and needs no page faults (PLAN §7.4).
+            let len_aligned = crate::mem::page_align_up(len);
+            let file = self.fds.get(fd)?;
+            let name = file.path.clone();
+            // A loader that maps an object's first segment straight from the
+            // file, spanning the whole object (glibc 2.35 and later), rather
+            // than reserving anonymous memory first: that mapping takes the
+            // pin armed when the object was opened, the same way.
+            let mut addr = addr;
+            let mut pinned = None;
+            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
+                let mut mm = self.mem.lock();
+                if let Some((path, base)) = mm.log.armed_pin.take() {
+                    if path.rsplit('/').next() == name.rsplit('/').next() {
+                        mm.log.armed_place = None;
+                        addr = base;
+                        pinned = Some((path, base));
+                    } else {
+                        mm.log.armed_pin = Some((path, base));
+                    }
+                }
+            }
+            // A second `MAP_SHARED` of the same open file must see the first
+            // one's writes, so hand back the same pages -- a Wayland client
+            // maps a buffer and sends the descriptor, and the next mapper must
+            // see the same pixels, not a zeroed copy. Not reference counted:
+            // unmapping one alias unmaps both, and nothing here unmaps early.
+            if flags & crate::mem::flags::SHARED != 0 {
+                // (or any part of one: a window into a mapping another
+                // view holds whole, as win32u maps the session's blocks)
+                let mm = self.mem.lock();
+                if let Some(existing) = mm.log.shared_maps.iter().find(|s| {
+                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
+                }) {
+                    return Ok(existing.start + (offset - existing.offset));
+                }
+            }
+            // The path and offset travel with the mapping. Two processes
+            // that map the same library at the same address then agree that
+            // the code is the same, which is what lets them share the
+            // dispatch slots it was translated into.
+            let start = self.mem.lock().mmap_from(
+                addr,
+                len_aligned,
+                prot_bits,
+                flags,
+                &name,
+                Some((name.clone(), offset)),
+            )?;
+            if let Some((path, base)) = pinned {
+                // Said as it happens: the end-of-run report is lost when the
+                // process is killed (a game run ends at its timeout).
+                if base != start {
+                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+                }
+                self.mem.lock().log.pin_landed.push((path, base, start));
+            }
+            // Straight into the mapping, as `read` does: through a host
+            // buffer it was a second copy of the file, and the buffer's own
+            // first touch, on every private file mapping (apt-get maps its
+            // two 44 MB package caches this way on every run).
+            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
+            // A shared mapping is written back at `msync` and `munmap` (where
+            // a program that never calls `msync` expects its changes to land).
+            // An executable file mapping is a shared library arriving: tell the
+            // host so the static recompiler gets the whole object at once.
+            if prot_bits & crate::mem::prot::EXEC != 0 {
+                crate::note_code_change();
+                self.mem.lock().log.new_code.push(CodeMap {
+                    start,
+                    end: start + len_aligned,
+                    path: name.clone(),
+                    offset,
+                });
+            }
+            if flags & crate::mem::flags::SHARED != 0 {
+                self.mem.lock().log.shared_maps.push(SharedMap {
+                    start,
+                    len: len_aligned,
+                    file,
+                    offset,
+                });
+            }
+            return Ok(start);
+        }
+        // The anonymous PROT_NONE reservation an ELF loader makes before it
+        // maps an object: hand it the pinned base and every `MAP_FIXED` that
+        // follows lands where the closure build assumed. Passed as a hint, so
+        // a collision is ignored and recorded in `pin_landed`, not forced.
+        let mut addr = addr;
+        let mut pinned = None;
+        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
+            let (pin, place) = {
+                let mut mm = self.mem.lock();
+                match mm.log.armed_pin.take() {
+                    Some(pin) => {
+                        mm.log.armed_place = None;
+                        (Some(pin), None)
+                    }
+                    None => (None, mm.log.armed_place.take()),
+                }
+            };
+            if let Some((path, base)) = pin {
+                addr = base;
+                pinned = Some((path, base));
+            } else if let Some(path) = place {
+                // The reservation is the first thing that says how long the
+                // object is, which is why the question is asked here and not
+                // at the `openat` that armed it.
+                if let Some(base) = self
+                    .place
+                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
+                {
+                    addr = base;
+                }
+            }
+        }
+        // The dynamic loader's reservation for an object (glibc maps an
+        // over-aligned library into anonymous PROT_NONE memory) will hold
+        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
+        // loader runs at INTERP_BASE (docs/mem64.md §3).
+        // What was known to be zero before the mapping (which forgets it).
+        let clean_before = self.mem.lock().clean_ranges().to_vec();
+        // Only what this mapping claims (another caller's claim may since
+        // have been written).
+        let _ = self.mem.lock().take_fresh();
+        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.pc);
+        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
+            self.mem.lock().mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
+        } else {
+            self.mem.lock().mmap(addr, len, prot_bits, flags, "")?
+        };
+        if let Some((path, base)) = pinned {
+            // Said as it happens: the end-of-run report is lost when the
+            // process is killed (a game run ends at its timeout).
+            if base != start {
+                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+            }
+            self.mem.lock().log.pin_landed.push((path, base, start));
+        }
+        // Anonymous memory is defined to read as zero. Pages that already
+        // are stay untouched, so a large reservation costs no memory, and
+        // ranges known to be zero (`MemoryMap::clean`) are not even read.
+        let end = start + crate::mem::page_align_up(len);
+        // Arena the mapping had to claim is zero already: reading it to make
+        // sure faulted in every page of it (the guest's own first write then
+        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
+        // the claim took past the mapping is free arena, still zero, and
+        // known clean for the next mapping into it.
+        let mut clean_before = clean_before;
+        let fresh = self.mem.lock().take_fresh();
+        if let Some((fs, fe)) = fresh {
+            let at = clean_before.partition_point(|&(s, _)| s < fs);
+            clean_before.insert(at, (fs, fe));
+            if end < fe {
+                self.mem.lock().mark_clean(end.max(fs), fe);
+            }
+        }
+        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
+            m.zero_dirty(a, (b - a) as usize)?;
+        }
+        if prot_bits & crate::mem::prot::WRITE == 0 {
+            self.mem.lock().mark_clean(start, end);
+        }
+        Ok(start)
+    }
+
+
+    /// Write a shared mapping's bytes back to the file behind it.
+    pub fn flush_shared(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        // Taken out of the map's lock: the writes are file I/O.
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            if mm.log.shared_maps.is_empty() {
+                return Ok(());
+            }
+            mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
+        };
+        for map in maps {
+            let from = map.start.max(lo);
+            let to = (map.start + map.len).min(hi);
+            // Only what the file holds: a shared mapping's page past the
+            // end of the file is not the file's (Linux never extends it).
+            let at = map.offset + (from - map.start);
+            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
+            let n = (to - from).min(size.saturating_sub(at));
+            if n == 0 {
+                continue;
+            }
+            let bytes = m.read(from, n as usize)?;
+            map.file.pwrite(at, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Note that `[addr, addr + len)` no longer holds the code it did.
+    ///
+    /// Only ranges that overlap an executable mapping are worth reporting:
+    /// unmapping the heap or a data file happens constantly and has no
+    /// translations behind it.
+    pub fn retire_code(&self, addr: u64, len: u64) {
+        let (start, end) = (
+            crate::mem::page_align_down(addr),
+            crate::mem::page_align_up(addr.saturating_add(len)),
+        );
+        if end <= start {
+            return;
+        }
+        let mut mm = self.mem.lock();
+        let executable = mm.vmas().iter().any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
+        if executable {
+            mm.log.retired_code.push((start, end));
+            crate::note_code_change();
+        }
+    }
+}
+
 /// What a call [`free_call`] answers needs of its process, none of it
 /// behind a kernel lock.
 pub struct Free<'a> {
     pub io: FdIo<'a>,
+    /// The memory map, for the mapping calls.
+    pub map: MapIo<'a>,
     /// The calling thread's signal state.
     pub signals: &'a Signals,
     pub procs: &'a ProcTable,
@@ -1846,6 +2185,11 @@ fn is_poll(n: u64) -> bool {
     matches!(n, nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2)
 }
 
+/// The mapping calls ([`MapIo`]), canonical.
+fn is_mapping(n: u64) -> bool {
+    matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
+}
+
 /// SIGKILL and SIGSTOP, which no mask blocks.
 const UNBLOCKABLE: u64 = (1 << (signal::sig::SIGKILL - 1)) | (1 << (signal::sig::SIGSTOP - 1));
 
@@ -1880,6 +2224,13 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::DUP3 => nr::DUP3,
             x::FCNTL | x::FCNTL64 => nr::FCNTL,
             x::FLOCK => nr::FLOCK,
+            x::BRK => nr::BRK,
+            x::MMAP | x::MMAP2 => nr::MMAP,
+            x::MUNMAP => nr::MUNMAP,
+            x::MPROTECT => nr::MPROTECT,
+            x::MREMAP => nr::MREMAP,
+            x::MADVISE => nr::MADVISE,
+            x::MSYNC => nr::MSYNC,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1910,6 +2261,13 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::DUP3 => nr::DUP3,
             x::FCNTL => nr::FCNTL,
             x::FLOCK => nr::FLOCK,
+            x::BRK => nr::BRK,
+            x::MMAP => nr::MMAP,
+            x::MUNMAP => nr::MUNMAP,
+            x::MPROTECT => nr::MPROTECT,
+            x::MREMAP => nr::MREMAP,
+            x::MADVISE => nr::MADVISE,
+            x::MSYNC => nr::MSYNC,
             _ => return None,
         }
     } else {
@@ -1917,7 +2275,8 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
             | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
             | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL | nr::CLOSE
-            | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK => raw,
+            | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK | nr::BRK | nr::MMAP | nr::MUNMAP
+            | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC => raw,
             _ => return None,
         }
     };
@@ -1940,9 +2299,11 @@ pub struct FreeCall {
 /// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
 /// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
 /// `sendmsg`, `recvmsg`, `ioctl`, and the descriptor table's own calls
-/// (`close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `flock`); the
-/// 32-bit ABI's `pread64`, `pwrite64`, `_llseek` and `fcntl64` too,
-/// translated as the full call translates them.
+/// (`close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `flock`), and
+/// the mapping calls (`mmap`, `munmap`, `mprotect`, `brk`, `mremap`,
+/// `madvise`, `msync`: [`MapIo`]); the 32-bit ABI's `pread64`, `pwrite64`,
+/// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
+/// call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1964,7 +2325,9 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) {
+    // A mapping call's first argument is an address (or, for the old
+    // `mmap`, a pointer to its arguments), never sign-extended.
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1996,10 +2359,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     let mut post = crate::i386::Post::None;
     if is_poll(n)
         || (compat
-            && matches!(
+            && (matches!(
                 n,
                 nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK | nr::DUP2 | nr::DUP3 | nr::FCNTL
-            ))
+            ) || is_mapping(n)))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -2040,6 +2403,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
         f.signals.process().collect(f.procs, f.pid, f.uid);
+        r
+    } else if is_mapping(n) {
+        let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
         r
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
@@ -3379,9 +3745,8 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             started: 0,
-            pins: std::collections::HashMap::new(),
+            pins: Default::default(),
             place: None,
-            armed_place: None,
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
@@ -3389,17 +3754,11 @@ impl Kernel {
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
-            armed_pin: None,
             compat: false,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
-            pin_landed: Vec::new(),
-            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
-            new_code: Vec::new(),
-            retired_code: Vec::new(),
-            recheck_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             rlimits: default_rlimits(),
@@ -3634,11 +3993,10 @@ impl Kernel {
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
-            pins: std::collections::HashMap::new(),
+            pins: Default::default(),
             // The placement outlives any one process: a child that maps the
             // same library must be given the same address its parent was.
             place: self.place.clone(),
-            armed_place: None,
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
@@ -3646,17 +4004,11 @@ impl Kernel {
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
-            armed_pin: None,
             compat: self.compat,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
-            pin_landed: Vec::new(),
-            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
-            new_code: Vec::new(),
-            retired_code: Vec::new(),
-            recheck_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             rlimits: self.rlimits,
@@ -4244,6 +4596,22 @@ impl Kernel {
         FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks }
     }
 
+    /// The mapping calls' part of this kernel ([`MapIo`]).
+    pub fn map_io(&self) -> MapIo<'_> {
+        MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc }
+    }
+
+    /// Note that `[addr, addr + len)` no longer holds the code it did
+    /// ([`MapIo::retire_code`]).
+    pub fn retire_code(&self, addr: u64, len: u64) {
+        self.map_io().retire_code(addr, len)
+    }
+
+    /// The pinned base for a path a closure build named ([`MapIo::pin_for`]).
+    pub fn pin_for(&self, path: &str) -> Option<u64> {
+        self.map_io().pin_for(path)
+    }
+
     /// The blocking half of a syscall, if it has one.
     ///
     /// Recognised before dispatch, because these are exactly the calls whose
@@ -4577,54 +4945,10 @@ impl Kernel {
             }
 
             // -- memory ------------------------------------------------------
-            nr::BRK => {
-                // Zeroed, because Linux zeroes it and libc counts on that.
-                let (result, grew) = self.mem.lock().brk_grow(a[0]);
-                if let Some((from, to)) = grew {
-                    let _ = m.zero_dirty(from, (to - from) as usize);
-                }
-                Ok(result)
-            }
-            nr::MMAP => self.sys_mmap(m, a),
-            nr::MUNMAP => {
-                let flushed = self.flush_shared(m, a[0], a[1]);
-                self.shared_maps
-                    .retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
-                self.retire_code(a[0], a[1]);
-                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
-            }
-            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
-            nr::MREMAP => self.sys_mremap(m, a),
-            nr::MPROTECT => {
-                // Losing execute retires the translations as surely as
-                // unmapping does: `ld.so` applies RELRO by dropping write,
-                // but a JIT in the guest flips a page from executable back to
-                // writable precisely so it can put different code there.
-                // Making code writable is the other half (a patch, a
-                // detour), which x86 needs no cache flush to see.
-                if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
-                    self.retire_code(a[0], a[1]);
-                }
-                let r = self.mem.lock().protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
-                // Executable again (a loader filling an import table in
-                // `.text`, a JIT done writing): what is there now is checked
-                // against the function tier's units (`cgen::on_retire`
-                // compares the pages; a page made non-executable for a while
-                // is not gone: `cgen::in_pe_image`). A check, not a retire
-                // (`recheck_code`).
-                if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
-                    let (start, end) = (
-                        crate::mem::page_align_down(a[0]),
-                        crate::mem::page_align_up(a[0].saturating_add(a[1])),
-                    );
-                    if end > start {
-                        self.recheck_code.push((start, end));
-                        crate::note_code_change();
-                    }
-                }
+            nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
+                let Some(r) = self.map_io().call(m, n, a) else { unreachable!() };
                 r
             }
-            nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 
             // -- process and time --------------------------------------------
             nr::UNAME => self.sys_uname(m, a[0]),
@@ -5497,7 +5821,7 @@ impl Kernel {
             // rather than after, because `open` moves `p` into the call and
             // the path is what identifies the object.
             if let Some(base) = self.pin_for(&p) {
-                self.armed_pin = Some((p.clone(), base));
+                self.mem.lock().log.armed_pin = Some((p.clone(), base));
             }
             // O_CREAT of "name/" that is not there: a slash names a
             // directory, which open does not create (EISDIR, as Linux).
@@ -5522,7 +5846,7 @@ impl Kernel {
             // exist -- `ld.so` probes several directories for every library
             // it loads -- leaves nothing armed.
             if self.place.is_some() && is_shared_object(&p) {
-                self.armed_place = Some(p.clone());
+                self.mem.lock().log.armed_place = Some(p.clone());
             }
             h
         };
@@ -6808,31 +7132,6 @@ impl Kernel {
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
-    /// Write a shared mapping's bytes back to the file behind it.
-    fn flush_shared(&mut self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
-        if self.shared_maps.is_empty() {
-            return Ok(());
-        }
-        let (lo, hi) = (addr, addr.saturating_add(len));
-        for map in self.shared_maps.iter() {
-            let from = map.start.max(lo);
-            let to = (map.start + map.len).min(hi);
-            if from >= to {
-                continue;
-            }
-            // Only what the file holds: a shared mapping's page past the
-            // end of the file is not the file's (Linux never extends it).
-            let at = map.offset + (from - map.start);
-            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
-            let n = (to - from).min(size.saturating_sub(at));
-            if n == 0 {
-                continue;
-            }
-            let bytes = m.read(from, n as usize)?;
-            map.file.pwrite(at, bytes)?;
-        }
-        Ok(())
-    }
 
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
     /// descriptor kept; the second names a path directly.
@@ -7052,257 +7351,6 @@ impl Kernel {
     }
 
     // -- memory --------------------------------------------------------------
-
-    /// `mremap`. The map decides where; this moves the bytes.
-    fn sys_mremap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        const MREMAP_MAYMOVE: u64 = 1;
-        let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
-        let (dst, moved) = self
-            .mem
-            .lock()
-            .mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
-        if moved {
-            let keep = old_len.min(new_len) as usize;
-            let bytes = m.read(addr, keep)?.to_vec();
-            m.write(dst, &bytes)?;
-            // The grown tail at the new location is fresh anonymous memory,
-            // which Linux exposes as zero -- but `dst` may be a reused hole
-            // holding stale bytes, and only `keep` of them were overwritten.
-            if new_len > old_len {
-                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
-            }
-        } else if new_len > old_len {
-            // Growing in place must expose zeroes, not whatever the guest
-            // left behind the last time this range was mapped.
-            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
-        }
-        Ok(dst)
-    }
-
-    /// The pinned base for a path a closure build named, if there is one.
-    ///
-    /// Exact spelling first, then the file's name alone: `gexc` records the
-    /// path it walked in its sysroot while `ld.so` opens what `ld.so.cache`
-    /// gives it, and on Debian those differ by a symlinked prefix. The
-    /// name-only fallback is safe because a rootfs does not ship two libraries
-    /// of one name that a single program loads both of; the exact match still
-    /// wins.
-    pub fn pin_for(&self, path: &str) -> Option<u64> {
-        if self.pins.is_empty() {
-            return None;
-        }
-        if let Some(&base) = self.pins.get(path) {
-            return Some(base);
-        }
-        let want = path.rsplit('/').next()?;
-        self.pins
-            .iter()
-            .find(|(k, _)| k.rsplit('/').next() == Some(want))
-            .map(|(_, &v)| v)
-    }
-
-    /// `madvise`. Only `MADV_DONTNEED` does anything: on Linux it makes an
-    /// anonymous range read as zero on next access, and glibc's malloc frees
-    /// arena memory this way and then REUSES it trusting the zero. A no-op left
-    /// the reused pages holding stale bytes, so glibc read garbage -- a
-    /// deterministic corruption Qt hits (heavy glibc malloc/threads) and musl
-    /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
-    /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
-    /// the file, which the demand path already does, so it is left alone.
-    fn sys_madvise(&mut self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
-        const MADV_DONTNEED: u32 = 4;
-        if advice == MADV_DONTNEED {
-            let end = addr.saturating_add(len);
-            let anon: Vec<(u64, u64)> = self
-                .mem
-                .lock()
-                .vmas()
-                .iter()
-                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
-                .map(|v| (v.start.max(addr), v.end.min(end)))
-                .collect();
-            for (lo, hi) in anon {
-                if hi > lo {
-                    m.zero_dirty(lo, (hi - lo) as usize)?;
-                }
-            }
-        }
-        Ok(0)
-    }
-
-    fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let (addr, len, prot_bits, flags, fd, offset) =
-            (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
-        // A fixed mapping over code replaces it, as an unmap would (Wine's
-        // VirtualFree decommits by mapping over the range).
-        if flags & mflags::FIXED != 0 {
-            self.retire_code(addr, len);
-            // And a shared file mapping it replaces ends as an unmap ends
-            // it: written back, and no longer handed to the next mapper.
-            if self.shared_maps.iter().any(|s| s.start < addr + len && s.start + s.len > addr) {
-                self.flush_shared(m, addr, len)?;
-                self.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
-            }
-        }
-        if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
-            // A private file mapping is an eager copy, which is exactly
-            // correct and needs no page faults (PLAN §7.4).
-            let len_aligned = crate::mem::page_align_up(len);
-            let file = self.fds.get(fd)?;
-            let name = file.path.clone();
-            // A loader that maps an object's first segment straight from the
-            // file, spanning the whole object (glibc 2.35 and later), rather
-            // than reserving anonymous memory first: that mapping takes the
-            // pin armed when the object was opened, the same way.
-            let mut addr = addr;
-            let mut pinned = None;
-            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
-                if let Some((path, base)) = self.armed_pin.take() {
-                    if path.rsplit('/').next() == name.rsplit('/').next() {
-                        self.armed_place = None;
-                        addr = base;
-                        pinned = Some((path, base));
-                    } else {
-                        self.armed_pin = Some((path, base));
-                    }
-                }
-            }
-            // A second `MAP_SHARED` of the same open file must see the first
-            // one's writes, so hand back the same pages -- a Wayland client
-            // maps a buffer and sends the descriptor, and the next mapper must
-            // see the same pixels, not a zeroed copy. Not reference counted:
-            // unmapping one alias unmaps both, and nothing here unmaps early.
-            if flags & crate::mem::flags::SHARED != 0 {
-                // (or any part of one: a window into a mapping another
-                // view holds whole, as win32u maps the session's blocks)
-                if let Some(existing) = self.shared_maps.iter().find(|s| {
-                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
-                }) {
-                    return Ok(existing.start + (offset - existing.offset));
-                }
-            }
-            // The path and offset travel with the mapping. Two processes
-            // that map the same library at the same address then agree that
-            // the code is the same, which is what lets them share the
-            // dispatch slots it was translated into.
-            let start = self.mem.lock().mmap_from(
-                addr,
-                len_aligned,
-                prot_bits,
-                flags,
-                &name,
-                Some((name.clone(), offset)),
-            )?;
-            if let Some((path, base)) = pinned {
-                // Said as it happens: the end-of-run report is lost when the
-                // process is killed (a game run ends at its timeout).
-                if base != start {
-                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
-                }
-                self.pin_landed.push((path, base, start));
-            }
-            // Straight into the mapping, as `read` does: through a host
-            // buffer it was a second copy of the file, and the buffer's own
-            // first touch, on every private file mapping (apt-get maps its
-            // two 44 MB package caches this way on every run).
-            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
-            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
-            // A shared mapping is written back at `msync` and `munmap` (where
-            // a program that never calls `msync` expects its changes to land).
-            // An executable file mapping is a shared library arriving: tell the
-            // host so the static recompiler gets the whole object at once.
-            if prot_bits & crate::mem::prot::EXEC != 0 {
-                crate::note_code_change();
-                self.new_code.push(CodeMap {
-                    start,
-                    end: start + len_aligned,
-                    path: name.clone(),
-                    offset,
-                });
-            }
-            if flags & crate::mem::flags::SHARED != 0 {
-                self.shared_maps.push(SharedMap {
-                    start,
-                    len: len_aligned,
-                    file,
-                    offset,
-                });
-            }
-            return Ok(start);
-        }
-        // The anonymous PROT_NONE reservation an ELF loader makes before it
-        // maps an object: hand it the pinned base and every `MAP_FIXED` that
-        // follows lands where the closure build assumed. Passed as a hint, so
-        // a collision is ignored and recorded in `pin_landed`, not forced.
-        let mut addr = addr;
-        let mut pinned = None;
-        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
-            if let Some((path, base)) = self.armed_pin.take() {
-                self.armed_place = None;
-                addr = base;
-                pinned = Some((path, base));
-            } else if let Some(path) = self.armed_place.take() {
-                // The reservation is the first thing that says how long the
-                // object is, which is why the question is asked here and not
-                // at the `openat` that armed it.
-                if let Some(base) = self
-                    .place
-                    .as_ref()
-                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
-                {
-                    addr = base;
-                }
-            }
-        }
-        // The dynamic loader's reservation for an object (glibc maps an
-        // over-aligned library into anonymous PROT_NONE memory) will hold
-        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
-        // loader runs at INTERP_BASE (docs/mem64.md §3).
-        // What was known to be zero before the mapping (which forgets it).
-        let clean_before = self.mem.lock().clean_ranges().to_vec();
-        // Only what this mapping claims (another caller's claim may since
-        // have been written).
-        let _ = self.mem.lock().take_fresh();
-        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
-        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
-            self.mem.lock().mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
-        } else {
-            self.mem.lock().mmap(addr, len, prot_bits, flags, "")?
-        };
-        if let Some((path, base)) = pinned {
-            // Said as it happens: the end-of-run report is lost when the
-            // process is killed (a game run ends at its timeout).
-            if base != start {
-                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
-            }
-            self.pin_landed.push((path, base, start));
-        }
-        // Anonymous memory is defined to read as zero. Pages that already
-        // are stay untouched, so a large reservation costs no memory, and
-        // ranges known to be zero (`MemoryMap::clean`) are not even read.
-        let end = start + crate::mem::page_align_up(len);
-        // Arena the mapping had to claim is zero already: reading it to make
-        // sure faulted in every page of it (the guest's own first write then
-        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
-        // the claim took past the mapping is free arena, still zero, and
-        // known clean for the next mapping into it.
-        let mut clean_before = clean_before;
-        let fresh = self.mem.lock().take_fresh();
-        if let Some((fs, fe)) = fresh {
-            let at = clean_before.partition_point(|&(s, _)| s < fs);
-            clean_before.insert(at, (fs, fe));
-            if end < fe {
-                self.mem.lock().mark_clean(end.max(fs), fe);
-            }
-        }
-        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
-        }
-        if prot_bits & crate::mem::prot::WRITE == 0 {
-            self.mem.lock().mark_clean(start, end);
-        }
-        Ok(start)
-    }
 
     // -- sessions, credentials and mounts --------------------------------------
 
@@ -7665,30 +7713,6 @@ impl Kernel {
         set.ctl_queue(op, fd, events, data, source)
     }
 
-    /// Note that `[addr, addr + len)` no longer holds the code it did.
-    ///
-    /// Only ranges that overlap an executable mapping are worth reporting:
-    /// unmapping the heap or a data file happens constantly and has no
-    /// translations behind it.
-    pub fn retire_code(&mut self, addr: u64, len: u64) {
-        let (start, end) = (
-            crate::mem::page_align_down(addr),
-            crate::mem::page_align_up(addr.saturating_add(len)),
-        );
-        if end <= start {
-            return;
-        }
-        let executable = self
-            .mem
-            .lock()
-            .vmas()
-            .iter()
-            .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
-        if executable {
-            self.retired_code.push((start, end));
-            crate::note_code_change();
-        }
-    }
 
     /// The anonymous shared file behind a descriptor, if it is one.
     fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
@@ -9448,7 +9472,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9626,7 +9650,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9687,7 +9711,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -10099,7 +10123,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -10176,7 +10200,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -10275,7 +10299,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -10341,7 +10365,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -10443,7 +10467,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -10460,6 +10484,134 @@ mod tests {
         ret(m, at) as u64
     }
 
+    /// The mapping calls through the lock-free path ([`MapIo`]) answer as
+    /// the full call does, and leave the same notes for the host: two
+    /// kernels, the same calls, one through each path.
+    #[test]
+    fn free_mapping_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::mem::{flags as mf, prot};
+        let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            // Above the runtime's regions, where a guest's mappings go.
+            let mut buf = vec![0u8; 0x0708_0000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let rw = (prot::READ | prot::WRITE) as u64;
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07000000, 0x4000, rw, anon, !0, 0]));
+            m.write(0x07000000, b"dirty").unwrap();
+            got.push(sys(&mut m, &mut k, nr::MADVISE, &[0x07000000, 0x1000, 4]));
+            got.push(m.read(0x07000000, 1).unwrap()[0] as i64);
+            got.push(sys(&mut m, &mut k, nr::MPROTECT, &[0x07001000, 0x1000, (prot::READ | prot::EXEC) as u64]));
+            got.push(sys(&mut m, &mut k, nr::MPROTECT, &[0x07001000, 0x1000, rw]));
+            got.push(sys(&mut m, &mut k, nr::MREMAP, &[0x07003000, 0x1000, 0x3000, 0]));
+            // A shared file mapping reaches the file at msync; an executable
+            // one is code for the host.
+            m.write(0x20000, b"/m\0").unwrap();
+            let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            m.write(0x21000, &[7u8; 0x2000]).unwrap();
+            got.push(sys(&mut m, &mut k, nr::PWRITE64, &[fd, 0x21000, 0x2000, 0]));
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07010000, 0x2000, rw, mf::SHARED | mf::FIXED, fd, 0]));
+            m.write(0x07010010, b"shared").unwrap();
+            got.push(sys(&mut m, &mut k, nr::MSYNC, &[0x07010000, 0x2000, 4]));
+            got.push(sys(&mut m, &mut k, nr::PREAD64, &[fd, 0x22000, 6, 0x10]));
+            got.push((m.read(0x22000, 6).unwrap() == b"shared") as i64);
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07014000, 0x1000, (prot::READ | prot::EXEC) as u64, mf::PRIVATE | mf::FIXED, fd, 0]));
+            got.push(sys(&mut m, &mut k, nr::MUNMAP, &[0x07010000, 0x2000]));
+            got.push(sys(&mut m, &mut k, nr::MUNMAP, &[0x07014000, 0x1000]));
+            let base = sys(&mut m, &mut k, nr::BRK, &[0]);
+            got.push(sys(&mut m, &mut k, nr::BRK, &[base as u64 + 0x2000]) - base);
+            let mm = k.mem.lock();
+            let log = &mm.log;
+            got.push(log.recheck_code.len() as i64);
+            got.extend(log.retired_code.iter().flat_map(|&(a, b)| [a as i64, b as i64]));
+            got.extend(log.new_code.iter().map(|c| c.start as i64));
+            got.push(log.shared_maps.len() as i64);
+            got.push(mm.vmas().len() as i64);
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert_eq!(g[0], 0x07000000);
+        assert_eq!((g[1], g[2]), (0, 0), "MADV_DONTNEED zeroes");
+        assert_eq!((g[3], g[4]), (0, 0));
+        assert_eq!((g[7], g[8], g[9], g[10]), (0x07010000, 0, 6, 1), "msync wrote the file");
+        assert_eq!((g[11], g[12], g[13]), (0x07014000, 0, 0));
+        assert_eq!(g[14], 0x2000);
+        assert_eq!(g[15], 1, "made executable again: a recheck");
+        assert_eq!(&g[16..20], &[0x07001000, 0x07002000, 0x07014000, 0x07015000], "retired: made writable, unmapped");
+        assert_eq!((g[20], g[21]), (0x07014000, 0), "code mapped; no shared mapping left");
+    }
+
+    /// The 32-bit ABI's mapping calls through the lock-free path: `mmap2`'s
+    /// page offset and `-1` descriptor, the old `mmap`'s argument block,
+    /// addresses above 2 GiB not sign-extended.
+    #[test]
+    fn free_i386_mapping_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::i386::raw;
+        use crate::mem::{flags as mf, prot};
+        let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
+        let rw = (prot::READ | prot::WRITE) as u64;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            k.compat = true;
+            let mut buf = vec![0u8; 0x0708_0000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: [u64; 6]| {
+                m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+                }
+                if lock_free {
+                    let call = free_class(m, at, true).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32 as i64
+            };
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, raw::MMAP2, [0x0700_0000, 0x2000, rw, anon, 0xffff_ffff, 0]));
+            // The old form: six words at a pointer.
+            for (i, v) in [0x0700_4000u32, 0x1000, rw as u32, anon as u32, 0xffff_ffff, 0].iter().enumerate() {
+                m.write_u32(0x30000 + 4 * i as u64, *v).unwrap();
+            }
+            got.push(sys(&mut m, &mut k, raw::MMAP, [0x30000, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::MPROTECT, [0x0700_1000, 0x1000, prot::READ as u64, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::MUNMAP, [0x0700_0000, 0x1000, 0, 0, 0, 0]));
+            let base = sys(&mut m, &mut k, raw::BRK, [0; 6]);
+            got.push(sys(&mut m, &mut k, raw::BRK, [base as u64 + 0x1000, 0, 0, 0, 0, 0]) - base);
+            got.push(k.mem.lock().vmas().len() as i64);
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(&seen[0][..5], &[0x0700_0000, 0x0700_4000, 0, 0, 0x1000]);
+    }
+
     #[test]
     fn free_i386_fd_table_calls_answer_as_the_kernel_does() {
         if gex_abi::PPC {
@@ -10474,7 +10626,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;

@@ -548,7 +548,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     if gex_kernel::CODE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) != 0 && gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
         let (retired, _mapped) = caller
             .data_mut()
-            .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
+            .with_kernel(|k| {
+                let mut mm = k.mem.lock();
+                (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.new_code))
+            });
         if !retired.is_empty() {
             retire_translations(caller, &retired)?;
         }

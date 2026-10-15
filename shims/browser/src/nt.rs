@@ -1163,18 +1163,20 @@ mod imp {
         // natively. NT images are never statically recompiled, so newly mapped
         // code needs nothing.
         with_host(|h| {
-            let retired = std::mem::take(&mut h.kernel.retired_code);
-            h.kernel.new_code.clear();
+            let (retired, recheck) = {
+                let mut mm = h.kernel.mem.lock();
+                mm.log.new_code.clear();
+                (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.recheck_code))
+            };
             if !retired.is_empty() {
                 note_retire(&retired);
-                crate::cgen::on_retire(&retired, &crate::gone_code(h, &retired));
+                crate::cgen::on_retire(&retired, &crate::gone_code(&h.kernel.mem, &retired));
                 if !NO_RETIRE.load(Ordering::Relaxed) {
                     retire(h, &retired);
                 }
             }
             // Made executable again: compared, not forgotten
-            // (`Kernel::recheck_code`).
-            let recheck = std::mem::take(&mut h.kernel.recheck_code);
+            // (`MapLog::recheck_code`).
             if !recheck.is_empty() {
                 crate::cgen::on_retire(&recheck, &[]);
             }
@@ -1327,7 +1329,7 @@ mod imp {
     }
 
     fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
-        crate::retire_code(h, ranges);
+        crate::retire_code(&mut h.jit, ranges);
     }
 
     /// Each thread's last NT calls and where they were made, for an execute

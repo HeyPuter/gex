@@ -267,6 +267,79 @@ pub struct MemoryMap {
     /// The span the last [`Self::extend_arena`] took, until the caller asks
     /// ([`Self::take_fresh`]): memory nothing has been in, so zero.
     fresh: Option<(u64, u64)>,
+    /// What the mapping calls leave for the host and for each other, under
+    /// the same lock as the map they describe ([`MapLog`]).
+    pub log: MapLog,
+}
+
+/// What a process's mapping calls note beside its map (docs/kernel-locking.md
+/// §3.5, L12b): kept with the map, under the mm lock, so a mapping call needs
+/// nothing else of its kernel and is made without the kernel lock.
+///
+/// A copy (a fork's, a vfork child's) starts empty: the parent's notes are
+/// the parent's host's to act on. An exec or a restore keeps it, as it keeps
+/// the view ([`MemoryMap::renew`]).
+#[derive(Debug, Default)]
+pub struct MapLog {
+    /// The base the next anonymous reservation should get, and for what.
+    ///
+    /// `ld.so` does not map an object in one call. It opens the file, reads
+    /// the header, reserves the whole span with an *anonymous* `PROT_NONE`
+    /// mapping, and only then maps the segments into it with `MAP_FIXED`. The
+    /// reservation is the one address gex chooses and the only one worth
+    /// pinning -- and being anonymous it carries no file to key on. So the
+    /// `openat` immediately before it is the signal, and this is what that
+    /// signal sets.
+    ///
+    /// The predicate has to include `PROT_NONE`: a real trace of glibc's
+    /// loader shows a 8 KiB `PROT_READ|WRITE` allocation of its own between
+    /// the `fstat` and the reservation, so "the next anonymous mapping" would
+    /// pin the wrong one.
+    pub armed_pin: Option<(String, u64)>,
+    /// Which object the next anonymous reservation is for (`Kernel::place`).
+    ///
+    /// The same signal [`Self::armed_pin`] uses and for the same reason: the
+    /// reservation carries no file, so the `openat` before it is what names
+    /// the object. Kept separate because a pin knows its address already and
+    /// this one has to ask, and can only ask once the reservation says how
+    /// long the object is.
+    pub armed_place: Option<String>,
+    /// Where each pinned object actually landed, for checking afterwards.
+    ///
+    /// A pin that silently does not take is the worst outcome available: the
+    /// module is built for one address and the code runs at another, and the
+    /// guest branches into whatever is there. Recorded so a mismatch can be
+    /// reported rather than executed.
+    pub pin_landed: Vec<(String, u64, u64)>,
+    /// File mappings whose writes are meant to reach the file.
+    pub shared_maps: crate::syscalls::SharedMaps,
+    /// Executable mappings made since the host last looked.
+    pub new_code: Vec<crate::syscalls::CodeMap>,
+    /// Executable ranges *unmapped* since the host last looked.
+    ///
+    /// A translation is only valid while the code it was made from is still
+    /// there. `dlclose` unmaps a library and a later `dlopen` maps a
+    /// different one over the same addresses, and without this the guest
+    /// branches into the previous library's translated code -- the dispatch
+    /// slot still answers for the page. Nothing reports an error; the guest
+    /// simply runs the wrong function. A long-running X server does exactly
+    /// this every time its last client disconnects and it resets.
+    pub retired_code: Vec<(u64, u64)>,
+    /// Ranges made executable again by `mprotect` (read+execute, no write):
+    /// the function tier compares its units' pages there (a loader that lifted
+    /// `.text` to fill an import table and put it back, `cgen::on_retire`).
+    /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
+    /// could have changed the code was retired when the page became writable,
+    /// and forgetting the dispatch pages here dropped the bridges of the units
+    /// and native modules on them for good (a native Wine DLL's `ud2` stub
+    /// then ran as code: SIGILL in Undertale's GL start).
+    pub recheck_code: Vec<(u64, u64)>,
+}
+
+impl Clone for MapLog {
+    fn clone(&self) -> MapLog {
+        MapLog::default()
+    }
 }
 
 /// The parts of `[start, end)` outside `clean` (sorted, disjoint), in order:
@@ -341,6 +414,7 @@ impl MemoryMap {
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
             clean: Vec::new(),
             fresh: None,
+            log: MapLog::default(),
         }
     }
 
@@ -350,6 +424,7 @@ impl MemoryMap {
     pub fn renew(&mut self, brk_start: u64) {
         let mut fresh = MemoryMap::new(brk_start);
         std::mem::swap(&mut fresh.view, &mut self.view);
+        std::mem::swap(&mut fresh.log, &mut self.log);
         *self = fresh;
         self.publish();
     }

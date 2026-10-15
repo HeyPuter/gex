@@ -13,7 +13,7 @@ use gex_kernel::proc::ProcTable;
 use gex_kernel::signal::{self, Delivery, ProcSig, Signals, ThreadSig};
 use gex_kernel::futex::FutexTable;
 use gex_kernel::mem::MapView;
-use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx};
+use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx, MapIo};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -39,6 +39,11 @@ pub(crate) struct Home {
     tty: Arc<gex_kernel::tty::TtyRef>,
     /// `flock`'s locks, released by the last `close` of a description.
     file_locks: Arc<gex_kernel::unix::FileLocks>,
+    /// The memory map itself (`Mm::shared`), for the mapping calls, with
+    /// the placement they ask (`Kernel::pins`, `Kernel::place`).
+    mm: gex_kernel::mem::Mm,
+    pins: Arc<std::collections::HashMap<String, u64>>,
+    place: Option<Arc<dyn gex_kernel::syscalls::ObjectPlace>>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -72,6 +77,16 @@ fn home_of(k: &Kernel) -> Home {
         vfs: Arc::clone(k.vfs.view()),
         tty: Arc::clone(&k.tty),
         file_locks: Arc::clone(&k.file_locks),
+        mm: k.mem.shared(),
+        pins: Arc::clone(&k.pins),
+        place: k.place.clone(),
+    }
+}
+
+impl Home {
+    /// The process's memory map, the kernel's own (`Mm::shared`).
+    pub(crate) fn mm(&self) -> &gex_kernel::mem::Mm {
+        &self.mm
     }
 }
 
@@ -203,7 +218,7 @@ pub(crate) fn restarts(class: signal::Restart) -> bool {
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
 /// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
 /// and its signal included, without the kernel.
-pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool) -> FreeOutcome {
+pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool, pc: u64) -> FreeOutcome {
     let home = home().expect("a syscall before its process was published");
     let view = view(home).expect("a syscall from a Worker with no thread bound");
     let fds = crate::fds_free().expect("a syscall before its descriptor table was published");
@@ -231,6 +246,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     };
     let f = Free {
         io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
+        map: MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc },
         signals: &view,
         procs: &home.procs,
         tty: &home.tty,

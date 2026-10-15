@@ -732,9 +732,13 @@ impl Buffers for PoolView<'_, '_> {
         // memory; the file's own bytes are what was there before it drew (zero).
         let map = self
             .kernel
+            .mem
+            .lock()
+            .log
             .shared_maps
             .iter()
-            .find(|m| Arc::ptr_eq(&m.file, file))?;
+            .find(|m| Arc::ptr_eq(&m.file, file))
+            .cloned()?;
         let len = size.min(map.len as usize);
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }

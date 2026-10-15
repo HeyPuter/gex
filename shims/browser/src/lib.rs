@@ -4830,10 +4830,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // (`?elfunits=ld-linux-x86-64.so.2`) is placed after the first syscall.
     if let (Some(path), Some(_)) = (&program.exe.interp, &program.interp) {
         if let Some(bytes) = read_file(path) {
-            kernel.new_code.extend(gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base()));
+            kernel.mem.lock().log.new_code.extend(gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base()));
         }
     }
-    kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
+    kernel.pins = Arc::new(std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect());
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
     kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
@@ -5089,10 +5089,9 @@ static PINS_SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// address -- but a pin that took is only worth a line when tracing.
 fn report_new_pins_in(h: &Host) {
     let said = PINS_SAID.load(std::sync::atomic::Ordering::Relaxed);
-    let fresh = if h.kernel.pin_landed.len() <= said {
-        Vec::new()
-    } else {
-        h.kernel.pin_landed[said..].to_vec()
+    let fresh = {
+        let mm = h.kernel.mem.lock();
+        mm.log.pin_landed.get(said..).map_or_else(Vec::new, <[_]>::to_vec)
     };
     if fresh.is_empty() {
         return;
@@ -5115,7 +5114,7 @@ fn report_new_pins_in(h: &Host) {
 /// runs code at the wrong address, so a mismatch is written loudly.
 #[no_mangle]
 pub extern "C" fn gex_pin_report() {
-    let landed = with_host(|h| h.kernel.pin_landed.clone());
+    let landed = with_host(|h| h.kernel.mem.lock().log.pin_landed.clone());
     for (path, want, got) in landed {
         let how = if want == got { "ok" } else { "MISPLACED" };
         trace_line(&format!("[gex] pin {how}: {path} wanted {want:#x}, landed {got:#x}\n"));
@@ -7105,7 +7104,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
     let mut mapped = Vec::new();
-    let stop = match free_syscall(ctx, pc) {
+    let stop = match free_syscall(ctx, pc, &mut mapped) {
     Some(stop) => stop,
     None => with_host(|h| {
         let stop = (|h: &mut Host| -> i32 {
@@ -7611,7 +7610,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // for recompiling, under this same lock: each was a lock take of its
         // own after every syscall.
         retire_unmapped_code_in(h);
-        mapped = std::mem::take(&mut h.kernel.new_code);
+        mapped = std::mem::take(&mut h.kernel.mem.lock().log.new_code);
         waitq::publish_timer();
         stop
     }),
@@ -11370,7 +11369,7 @@ fn finish_mine(signalled: bool) -> i32 {
 /// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included
 /// (docs/kernel-locking.md step 9); `None` for any other call, decided by
 /// its number before anything is done. `gex_syscall`'s stop value.
-fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
+fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Option<i32> {
     use gex_kernel::signal::Delivery;
     use gex_kernel::syscalls::{nr, FreeOutcome};
     let ctx_addr = ctx as u32 as u64;
@@ -11389,7 +11388,21 @@ fn free_syscall(ctx: i32, pc: i64) -> Option<i32> {
     let n = call.number();
     let [a0, a1, a2] = call.args();
     let slot = sys_note(n, a0, a1);
-    let outcome = sigs::free_call(&mut gm, ctx_addr, call, compat);
+    let outcome = if matches!(n, nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP) {
+        // A call that can take code away: made and its code retired under
+        // the JIT lock, so no thread runs or translates what it took away
+        // between the two, and an address it frees cannot be mapped again
+        // with new code until its translations are gone (as one kernel-lock
+        // section made them; docs/kernel-locking.md §4.3, L12b). Its mapped
+        // code is queued below, as the locked section's is.
+        with_jit_only(|_| {
+            let o = sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64);
+            *mapped = map_drain();
+            o
+        })
+    } else {
+        sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64)
+    };
     if n == nr::FUTEX {
         // Every futex this call woke, relayed to the shared per-address
         // counter, so a waiter parked in another Worker sees the wake.
@@ -14199,7 +14212,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     r.len()
                 ));
             }
-            retire_ranges(h, &r);
+            retire_ranges(&mut h.jit, &r);
         }
         // Come back at the address that missed, now that it will resolve.
         set_resume(pc);
@@ -14304,31 +14317,60 @@ fn fault_pc(pc: i64) -> i64 {
 /// the old library's blocks (Half-Life: SDL's libudev landing where an
 /// earlier library had been, entered in the middle of an instruction).
 fn retire_unmapped_code_in(h: &mut Host) {
-    let retired = std::mem::take(&mut h.kernel.retired_code);
+    let (retired, recheck) = {
+        let mut mm = h.kernel.mem.lock();
+        (std::mem::take(&mut mm.log.retired_code), std::mem::take(&mut mm.log.recheck_code))
+    };
+    retire_noted(&h.kernel.mem, &retired, &recheck);
+}
+
+/// What a mapping call made without the kernel lock (`free_syscall`) noted
+/// in the map's log: its retired code retired, as `retire_unmapped_code_in`
+/// does under the lock, and the code it mapped, for the caller to queue.
+/// The JIT lock for the retire, the mm lock for the log and the map: no
+/// kernel lock (docs/kernel-locking.md §4.3, L12b).
+fn map_drain() -> Vec<gex_kernel::CodeMap> {
+    let Some(home) = sigs::home() else { return Vec::new() };
+    let mm = home.mm();
+    let (retired, recheck, mapped) = {
+        let mut g = mm.lock();
+        let log = &mut g.log;
+        (
+            std::mem::take(&mut log.retired_code),
+            std::mem::take(&mut log.recheck_code),
+            std::mem::take(&mut log.new_code),
+        )
+    };
+    retire_noted(mm, &retired, &recheck);
+    mapped
+}
+
+/// Retire `retired` (code unmapped or made writable) and compare `recheck`
+/// (made executable again), whoever noted them.
+fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u64, u64)]) {
     if !retired.is_empty() {
-        crate::cgen::on_retire(&retired, &gone_code(h, &retired));
-        crate::fjit::on_retire(&retired);
-        retire_code(h, &retired);
+        crate::cgen::on_retire(retired, &gone_code(mm, retired));
+        crate::fjit::on_retire(retired);
+        with_jit_only(|j| retire_code(j, retired));
     }
     // Made executable again: the units' pages are compared, nothing is
-    // forgotten (`Kernel::recheck_code`).
-    let recheck = std::mem::take(&mut h.kernel.recheck_code);
+    // forgotten (`MapLog::recheck_code`).
     if !recheck.is_empty() {
-        crate::cgen::on_retire(&recheck, &[]);
+        crate::cgen::on_retire(recheck, &[]);
     }
 }
 
 /// The pages of `ranges` no longer mapped executable (an unmapped object,
 /// code made non-executable), merged into ranges: `cgen::on_retire` drops
 /// the units there whatever the bytes are.
-pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(crate) fn gone_code(mm: &gex_kernel::mem::Mm, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     use gex_kernel::mem::prot;
     let page = gex_abi::DISPATCH_PAGE;
     let mut out: Vec<(u64, u64)> = Vec::new();
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            let vma = h.kernel.mem.lock().vma_at(a).map(|v| v.prot);
+            let vma = mm.lock().vma_at(a).map(|v| v.prot);
             let exec = vma.is_some_and(|p| p & prot::EXEC != 0);
             // A PE image's page made non-executable for a while keeps its
             // unit (`cgen::in_pe_image`).
@@ -14347,12 +14389,12 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
 /// old slots are left behind, unreachable.
-pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
+pub(crate) fn retire_code(j: &mut Jit, ranges: &[(u64, u64)]) {
     use std::sync::atomic::Ordering;
-    // Inside the kernel, so it waits for a translation holding the lock; and a
+    // Under the JIT lock, so it waits for a translation in flight; and a
     // translation that may have read the old code retires these ranges again
     // once its unit is queued (`jitout::EPOCH`).
-    jit_in_held(&mut h.jit);
+    jit_in_held(j);
     if !ranges.is_empty() {
         let e = jitout::EPOCH.fetch_add(1, Ordering::Release).wrapping_add(1);
         let mut log = jitout::RETIRED.0.borrow_mut();
@@ -14364,7 +14406,7 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
         }
         drop(log);
     }
-    retire_ranges(h, ranges);
+    retire_ranges(j, ranges);
 }
 
 /// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
@@ -14387,23 +14429,23 @@ pub extern "C" fn gex_test_unpublished_retire(on: i32) {
 }
 
 /// `retire_code`'s work on the JIT state, without the bookkeeping.
-fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
+fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
     use std::sync::atomic::{AtomicU32, Ordering};
     for &(start, end) in ranges {
         if end <= start {
             continue;
         }
-        h.jit.translated.retain(|a| *a < start || *a >= end);
+        j.translated.retain(|a| *a < start || *a >= end);
         xlate_add(5, 1);
         for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 break;
             }
-            if h.jit.page_table.lookup(page).is_some() {
+            if j.page_table.lookup(page).is_some() {
                 xlate_add(4, 1);
             }
-            h.jit.page_table.forget(page);
-            h.jit.retired_pages.insert(page);
+            j.page_table.forget(page);
+            j.retired_pages.insert(page);
             let at = gex_abi::DISPATCH_DIR + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
@@ -14413,7 +14455,7 @@ fn retire_ranges(h: &mut Host, ranges: &[(u64, u64)]) {
             // that numbered pages and has not installed (or never will)
             // leaves them (tests/x86-programs/page-cross-entry.c).
             if TEST_UNPUBLISHED.load(Ordering::Relaxed) {
-                let _ = h.jit.page_table.base(page);
+                let _ = j.page_table.base(page);
             }
         }
     }
