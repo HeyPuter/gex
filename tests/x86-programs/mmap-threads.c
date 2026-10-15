@@ -66,7 +66,10 @@ static void *anon(void *arg) {
 static void *jit(void *arg) {
     long id = (long)arg;
     for (int i = 0; i < ROUNDS; i++) {
-        unsigned char *p = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        /* Executable from the start, as JITs map: in a 64-bit memory only
+         * code asked for at mmap is placed below 4 GiB (docs/mem64.md §3),
+         * where mprotect may make it executable again. */
+        unsigned char *p = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) { fail("jit mmap"); continue; }
         int32_t want = (int32_t)(id * 100000 + i);
         p[0] = 0xb8;

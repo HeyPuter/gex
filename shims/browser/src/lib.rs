@@ -14872,20 +14872,26 @@ fn note_intrinsics(addr: u64) {
         return;
     }
     let Some((path, start)) = with_host(|h| {
-        let mm = h.kernel.mem.lock();
-        let v = mm.vmas().iter().find(|v| {
-            addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0
-        })?;
-        let (path, _) = v.origin.as_ref()?;
+        // The map's lock given back before the JIT state is touched: the
+        // order is KLock, JIT, mm (docs/kernel-locking.md §4.3), and taking
+        // JIT under mm deadlocks against a thread taking them in order.
+        let (path, start) = {
+            let mm = h.kernel.mem.lock();
+            let v = mm.vmas().iter().find(|v| {
+                addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0
+            })?;
+            let (path, _) = v.origin.as_ref()?;
+            (path.clone(), v.start)
+        };
         // Retried rather than answered once, because the answer does not
         // exist yet the first time: `memcpy`'s slot is filled by the dynamic
         // linker, and a miss inside `ld.so` itself happens before that.
         // Bounded, so an object whose slots are never bound stops being
         // re-parsed.
-        if h.jit.intrinsics_scanned.get(path).copied().unwrap_or(0) >= 8 {
+        if h.jit.intrinsics_scanned.get(&path).copied().unwrap_or(0) >= 8 {
             return None;
         }
-        Some((path.clone(), v.start))
+        Some((path, start))
     }) else {
         return;
     };
