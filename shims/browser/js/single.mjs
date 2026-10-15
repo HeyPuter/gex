@@ -176,6 +176,9 @@ export function enableSingle() {
 /** Longest a run of fibers may keep the event loop from turning, in ms. */
 const SLICE_MS = 8;
 
+/** Under Node (see `#postTurn`). */
+const NODE = typeof process === 'object' && !!process.versions?.node && typeof setImmediate === 'function';
+
 class Waiter {
   constructor(resolve, futex, fiber) {
     this.resolve = resolve;
@@ -240,6 +243,18 @@ export class Sched {
   #postTurn() {
     if (this.#turnPosted) return;
     this.#turnPosted = true;
+    // Under Node, `setImmediate`, not the port: Node drains a port's
+    // messages in one go, those posted meanwhile included (up to a
+    // thousand), so a turn posted from a turn never let the loop round to
+    // anything else -- V8's own tasks among them. An async
+    // `WebAssembly.compile` of 1,195 bytes resolved after 8.1 s, a
+    // thousand 8 ms slices, and retire-during-lift's flipper (which
+    // compiles at every flip) took 17 s a round. `setImmediate` runs once
+    // per loop iteration, after the poll phase.
+    if (NODE) {
+      setImmediate(() => this.#onTurn());
+      return;
+    }
     // Held while posted: an unref'd port lets Node exit with the turn (and
     // every fiber waiting on it) still in the queue.
     this.#mc?.port1.ref?.();
