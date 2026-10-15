@@ -682,6 +682,9 @@ fn within(abs: &str, at: &str) -> bool {
 pub struct Vfs {
     ns: Namespace,
     view: NsCell,
+    /// The mount table `ns` holds: the view's [`VfsView::mounts`] count
+    /// when it was taken ([`Vfs::refresh`]).
+    mounts: u64,
     /// The process's working directory while a thread with an fs_struct
     /// of its own has its directory in `ns` for its call ([`Vfs::enter_cwd`]):
     /// what a publication shows.
@@ -691,18 +694,76 @@ pub struct Vfs {
 /// A [`Vfs`]'s namespace as other threads read it: replaced whole on every
 /// change, so a reader holds one consistent table and directory for as long
 /// as it likes (an `Arc`), and a lookup through it runs outside every lock.
+///
+/// It is the mount table's one writer: `mount` and `umount2` change it here,
+/// with or without the kernel lock, and the kernel's own copy follows it
+/// ([`Vfs::refresh`]).
 pub struct VfsView {
     cur: gex_atomic::rcu::Published<Arc<Namespace>>,
+    /// How many times the mount table has changed.
+    mounts: std::sync::atomic::AtomicU64,
 }
 
 impl VfsView {
     fn new(ns: &Namespace) -> VfsView {
-        VfsView { cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS) }
+        VfsView {
+            cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS),
+            mounts: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// The namespace as it stands.
     pub fn get(&self) -> Arc<Namespace> {
         self.cur.read(crate::sync::me() as usize, Arc::clone)
+    }
+
+    /// How many times the mount table has changed, now.
+    pub fn mounts(&self) -> u64 {
+        self.mounts.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mount `fs` at `at` (absolute, or relative to the published
+    /// directory), replacing what was mounted there.
+    pub fn mount(&self, at: &str, fs: Arc<dyn FileSystem>) {
+        self.change(|ns| {
+            ns.mount(at, fs);
+            true
+        });
+    }
+
+    /// Remove the mount at exactly `path` ([`Namespace::unmount`]).
+    pub fn unmount(&self, path: &str) -> bool {
+        self.change(|ns| ns.unmount(path))
+    }
+
+    /// Mount `fs` at `at` unless something is mounted there already:
+    /// whether it did.
+    pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
+        self.change(|ns| {
+            if ns.is_mount_point(at) {
+                return false;
+            }
+            ns.mount(at, fs());
+            true
+        })
+    }
+
+    /// A change `f` makes to the mount table, published if it says it made
+    /// one.
+    fn change(&self, f: impl FnOnce(&mut Namespace) -> bool) -> bool {
+        let changed = self.cur.write(|cur| {
+            let mut ns = Namespace::clone(cur);
+            if !f(&mut ns) {
+                return (None, false);
+            }
+            (Some(Arc::new(ns)), true)
+        });
+        // Counted once the new table is out: a copy taken after reading
+        // the count is never older than the count says (`Vfs::refresh`).
+        if changed {
+            self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        changed
     }
 }
 
@@ -713,7 +774,11 @@ struct NsCell(Arc<VfsView>);
 impl Clone for Vfs {
     fn clone(&self) -> Vfs {
         // A fork's copy: the calling thread's directory is the child's.
-        Vfs { ns: self.ns.clone(), view: NsCell(Arc::new(VfsView::new(&self.ns))), held: None }
+        // The mount table as published (another thread may have mounted
+        // since this copy's was taken), the directory as it is here.
+        let mut ns = Namespace::clone(&self.view.0.get());
+        ns.cwd.clone_from(&self.ns.cwd);
+        Vfs { view: NsCell(Arc::new(VfsView::new(&ns))), ns, mounts: 0, held: None }
     }
 }
 
@@ -728,7 +793,7 @@ impl Vfs {
     pub fn new() -> Vfs {
         let ns = Namespace::new();
         let view = NsCell(Arc::new(VfsView::new(&ns)));
-        Vfs { ns, view, held: None }
+        Vfs { ns, view, mounts: 0, held: None }
     }
 
     /// The published namespace, the same view for this table's whole life.
@@ -736,28 +801,42 @@ impl Vfs {
         &self.view.0
     }
 
-    /// Every build, the single-threaded page's too, which reads its
-    /// namespace the same way: a mount or a `chdir` is rare.
+    /// The process's directory, published: the mount table stays the
+    /// view's own. Every build, the single-threaded page's too, which reads
+    /// its namespace the same way: a `chdir` is rare.
     fn publish(&self) {
-        let mut ns = self.ns.clone();
-        if let Some(cwd) = &self.held {
+        let cwd = self.held.as_ref().unwrap_or(&self.ns.cwd);
+        self.view.0.cur.write(|cur| {
+            let mut ns = Namespace::clone(cur);
             ns.cwd.clone_from(cwd);
-        }
-        let ns = Arc::new(ns);
-        self.view.0.cur.write(|_| (Some(ns), ()));
+            (Some(Arc::new(ns)), ())
+        });
     }
 
+    /// Take the published mount table if it has changed since this copy's
+    /// was taken: a `mount` or `umount2` made without the kernel lock.
+    pub fn refresh(&mut self) {
+        let now = self.view.0.mounts();
+        if now == self.mounts {
+            return;
+        }
+        let ns = self.view.0.get();
+        self.ns.mounts.clone_from(&ns.mounts);
+        self.ns.others.clone_from(&ns.others);
+        self.mounts = now;
+    }
+
+    /// Mount `fs` at `at` ([`VfsView::mount`]).
     pub fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
-        self.ns.mount(at, fs);
-        self.publish();
+        self.view.0.mount(at, fs);
+        self.refresh();
     }
 
-    /// Remove the mount at exactly this path ([`Namespace::unmount`]).
+    /// Remove the mount at exactly this path ([`VfsView::unmount`]).
     pub fn unmount(&mut self, path: &str) -> bool {
-        let gone = self.ns.unmount(path);
-        if gone {
-            self.publish();
-        }
+        let at = normalize(path, &self.ns.cwd);
+        let gone = self.view.0.unmount(&at);
+        self.refresh();
         gone
     }
 

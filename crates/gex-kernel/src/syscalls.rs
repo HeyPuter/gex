@@ -3375,6 +3375,57 @@ impl PathIo<'_> {
         self.ns.chmod(&path, mode).map(|_| 0)
     }
 
+    /// `mount` or `umount2` ([`is_mount`]): the mount table, through its
+    /// published view, its one writer; the kernel's copy follows at its
+    /// next call ([`crate::vfs::Vfs::refresh`]).
+    pub fn mount_call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        if n == nr::UMOUNT2 {
+            let target = self.at_path(m, AT_FDCWD, a[0])?;
+            return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
+        }
+        let target = self.at_path(m, AT_FDCWD, a[1])?;
+        let fstype = if a[2] == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
+        };
+        // A remount or a bind of something already there changes nothing gex
+        // models, and reporting failure would stop an init script that is in
+        // fact fine.
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        if a[3] & (MS_REMOUNT | MS_BIND) != 0 {
+            return Ok(0);
+        }
+        match fstype.as_str() {
+            "tmpfs" | "ramfs" => {
+                self.view.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
+                Ok(0)
+            }
+            "devtmpfs" | "devfs" => {
+                self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
+                Ok(0)
+            }
+            // `/proc` needs a source of process state that only the host can
+            // build, so it cannot be created on demand -- but the host has
+            // already mounted one, and a second request for it is satisfied.
+            "proc" | "procfs" => {
+                if self.view.get().is_mount_point(&target) {
+                    Ok(0)
+                } else {
+                    Err(Errno::ENODEV)
+                }
+            }
+            // An empty `/sys` is what most programs want from sysfs: they
+            // probe for a path, do not find it, and take the other branch.
+            "sysfs" | "debugfs" | "cgroup" | "cgroup2" => {
+                self.view.mount_unless_there(&target, || Arc::new(crate::vfs::TmpFs::new()));
+                Ok(0)
+            }
+            _ => Err(Errno::ENODEV),
+        }
+    }
+
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
@@ -4631,6 +4682,12 @@ impl Creds {
 }
 
 /// The credential, session and process group calls: `get[e]uid`,
+/// `mount` and `umount2` (L22e): the namespace's mount table, which its
+/// published view ([`crate::vfs::VfsView`]) writes. Canonical.
+pub fn is_mount(n: u64) -> bool {
+    matches!(n, nr::MOUNT | nr::UMOUNT2)
+}
+
 /// The calls on the calling thread's own state alone (L22e):
 /// `set_tid_address`, the word in its [`crate::signal::ThreadSig`] its exit
 /// clears, and `unshare(CLONE_FS)`, a fs_struct of its own in the
@@ -5114,7 +5171,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             // The quiet calls, as the translation numbers them (several
             // numbers become the do-nothing one).
             r => match crate::i386::canonical_number(r) {
-                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) => c,
+                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) => c,
                 _ => return None,
             },
         }
@@ -5210,7 +5267,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
             r => match crate::x86::canonical_number(r) {
-                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) => c,
+                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) => c,
                 _ => return None,
             },
         }
@@ -5226,7 +5283,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
-            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) => raw,
+            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) => raw,
             _ => return None,
         }
     };
@@ -5280,7 +5337,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) && !is_thread_own(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) && !is_thread_own(n) && !is_mount(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -5318,7 +5375,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -5384,6 +5441,8 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         quiet_call(&f.io, f.procs, m, ctx_addr, n, a)
     } else if is_cred(n) {
         cred_call(f.creds, f.procs, f.pid, m, n, a)
+    } else if is_mount(n) {
+        f.path.mount_call(m, n, a)
     } else if is_thread_own(n) {
         thread_own_call(f.signals.thread(), f.thread_fs, &f.path.fs, ctx_addr, f.futex.tid as i32, n, a)
     } else if is_signal_call(n) {
@@ -7235,6 +7294,9 @@ impl Kernel {
         // runs: what its relative paths resolve against. The fs_struct
         // holds it (a `chdir` changes it there, `PathIo`).
         let me = self.ctx_addr;
+        // The mount table as it is now: a thread may have mounted or
+        // unmounted without the lock since this copy's was taken.
+        self.vfs.refresh();
         self.vfs.enter_cwd(self.fs_of(me).get());
         let out = self.syscall_inner(m, pc);
         self.vfs.leave_cwd();
@@ -8026,9 +8088,8 @@ impl Kernel {
             // -- credentials, sessions and process groups (L22c) ------------
             n if is_cred(n) => cred_call(&self.creds, &self.procs, self.pid, m, n, a),
 
-            // -- mounts ------------------------------------------------------
-            nr::MOUNT => self.sys_mount(m, a),
-            nr::UMOUNT2 => self.sys_umount(m, a[0]),
+            // -- mounts (L22e) ----------------------------------------------
+            n if is_mount(n) => self.path_io().mount_call(m, n, a),
 
             // -- sockets -----------------------------------------------------
             // The socket calls ([`NetIo`]), against the calling thread's
@@ -8274,16 +8335,6 @@ impl Kernel {
     }
 
     // -- path helpers --------------------------------------------------------
-
-    /// Resolve a `*at`-style `(dirfd, path)` pair to an absolute guest path.
-    fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
-        self.path_io().at_path(m, dirfd, path)
-    }
-
-    /// [`Self::at_path`] for a path already read.
-    fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        self.path_io().at_path_str(dirfd, p)
-    }
 
 
 
@@ -9171,61 +9222,6 @@ impl Kernel {
     /// `/dev` before the guest starts, so the common case is a request for
     /// something that is there -- which succeeds, because the guest's view
     /// afterwards is the one it asked for.
-    fn sys_mount(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let target = self.at_path(m, -100, a[1])?;
-        let fstype = if a[2] == 0 {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
-        };
-        // A remount or a bind of something already there changes nothing gex
-        // models, and reporting failure would stop an init script that is in
-        // fact fine.
-        const MS_REMOUNT: u64 = 32;
-        const MS_BIND: u64 = 4096;
-        if a[3] & (MS_REMOUNT | MS_BIND) != 0 {
-            return Ok(0);
-        }
-        match fstype.as_str() {
-            "tmpfs" | "ramfs" => {
-                self.vfs.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
-                Ok(0)
-            }
-            "devtmpfs" | "devfs" => {
-                self.vfs.mount(&target, Arc::new(crate::vfs::DevFs::new()));
-                Ok(0)
-            }
-            // `/proc` needs a source of process state that only the host can
-            // build, so it cannot be created on demand -- but the host has
-            // already mounted one, and a second request for it is satisfied.
-            "proc" | "procfs" => {
-                if self.vfs.is_mount_point(&target) {
-                    Ok(0)
-                } else {
-                    Err(Errno::ENODEV)
-                }
-            }
-            // An empty `/sys` is what most programs want from sysfs: they
-            // probe for a path, do not find it, and take the other branch.
-            "sysfs" | "debugfs" | "cgroup" | "cgroup2" => {
-                if !self.vfs.is_mount_point(&target) {
-                    self.vfs.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
-                }
-                Ok(0)
-            }
-            _ => Err(Errno::ENODEV),
-        }
-    }
-
-    fn sys_umount(&mut self, m: &mut GuestMem<'_>, target: u64) -> SysResult {
-        let target = self.at_path(m, -100, target)?;
-        if self.vfs.unmount(&target) {
-            Ok(0)
-        } else {
-            Err(Errno::EINVAL)
-        }
-    }
-
     // -- sockets ---------------------------------------------------------------
 
 
@@ -10880,6 +10876,95 @@ mod tests {
         // An exec forgets the word (it was in the old image).
         k.exec_signals(k.tid);
         assert_eq!(k.signals.thread().clear_child_tid(), 0);
+    }
+
+    /// `mount` and `umount2` (L22e) answer the same with and without the
+    /// kernel. The mount table's one writer is its published view: a mount
+    /// made without the lock is the kernel's at its next call, and mounts
+    /// made from several threads at once, beside the kernel's own and its
+    /// `chdir`s, are all kept.
+    #[test]
+    fn mounts_are_made_through_the_view() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            free_call(&f, m, at, call)
+        }
+        let (mnt, tmpfs, proc_, sysfs, none) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64, 0x31400u64);
+        m.write(mnt, b"/mnt\0").unwrap();
+        m.write(tmpfs, b"tmpfs\0").unwrap();
+        m.write(proc_, b"proc\0").unwrap();
+        m.write(sysfs, b"sysfs\0").unwrap();
+        m.write(none, b"none\0").unwrap();
+        let call = |k: &mut Kernel, m: &mut GuestMem<'_>, kernel: bool, n: u64, args: &[u64]| -> i64 {
+            set_args(m, at, n, args);
+            if kernel {
+                k.syscall(m, 0);
+            } else {
+                assert!(matches!(free(k, m, at), FreeOutcome::Done(Delivery::None)), "call {n} in the class");
+            }
+            ret(m, at)
+        };
+        for kernel in [false, true] {
+            // proc only where something is mounted already; an unknown type
+            // is ENODEV.
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, proc_, 0, 0]), -(Errno::ENODEV.0 as i64));
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, none, 0, 0]), -(Errno::ENODEV.0 as i64));
+            // A tmpfs: the view's at once, the kernel's at its next call.
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, tmpfs, 0, 0]), 0);
+            assert!(k.vfs.view().get().is_mount_point("/mnt"));
+            call(&mut k, &mut m, true, nr::GETPID, &[]);
+            assert!(k.vfs.is_mount_point("/mnt"), "the kernel's copy follows");
+            // And now proc there is satisfied, and sysfs keeps what is there.
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, proc_, 0, 0]), 0);
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, sysfs, 0, 0]), 0);
+            // Gone, then EINVAL: nothing is mounted there any more.
+            assert_eq!(call(&mut k, &mut m, kernel, nr::UMOUNT2, &[mnt, 0]), 0);
+            assert!(!k.vfs.view().get().is_mount_point("/mnt"));
+            assert_eq!(call(&mut k, &mut m, kernel, nr::UMOUNT2, &[mnt, 0]), -(Errno::EINVAL.0 as i64));
+            call(&mut k, &mut m, true, nr::GETPID, &[]);
+            assert!(!k.vfs.is_mount_point("/mnt"), "the kernel's copy follows");
+        }
+
+        // Four threads mount and unmount beside the kernel's own mounts
+        // and directory changes: nothing is lost.
+        let view = Arc::clone(k.vfs.view());
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let view = &view;
+                s.spawn(move || {
+                    for r in 0..50 {
+                        view.mount(&format!("/c{t}/{r}"), Arc::new(TmpFs::new()));
+                        if r % 2 == 1 {
+                            assert!(view.unmount(&format!("/c{t}/{r}")));
+                        }
+                    }
+                });
+            }
+            for r in 0..50 {
+                k.vfs.mount(&format!("/k{r}"), Arc::new(TmpFs::new()));
+                k.vfs.put_cwd(format!("/k{r}"));
+            }
+        });
+        k.vfs.refresh();
+        for ns in [&*view.get(), &*k.vfs] {
+            for t in 0..4 {
+                for r in 0..50 {
+                    assert_eq!(ns.is_mount_point(&format!("/c{t}/{r}")), r % 2 == 0, "/c{t}/{r}");
+                }
+            }
+            for r in 0..50 {
+                assert!(ns.is_mount_point(&format!("/k{r}")), "/k{r}");
+            }
+        }
+        assert_eq!(view.get().cwd, "/k49");
     }
 
     /// `rt_sigtimedwait` with none of its set pending waits (it had answered
