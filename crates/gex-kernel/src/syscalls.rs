@@ -21,7 +21,7 @@ use crate::pipe::Pipe;
 use crate::unix;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
-use crate::vfs::{FileType, ProcSource, Vfs};
+use crate::vfs::{FileType, Vfs};
 use crate::GuestMem;
 use gex_abi::{ctx, ctx_addr};
 use std::sync::{Arc, Mutex};
@@ -490,8 +490,8 @@ pub trait ObjectPlace: Send + Sync {
 
 /// One guest process's kernel state.
 pub struct Kernel {
-    pub fds: FdTable,
-    pub mem: MemoryMap,
+    pub fds: Arc<FdTable>,
+    pub mem: crate::mem::Mm,
     pub vfs: Vfs,
     /// Address of the running thread's context struct.
     pub ctx_addr: u64,
@@ -610,8 +610,6 @@ pub struct Kernel {
     pub resolver: Arc<net::Resolver>,
     /// The TCP ports guests listen on. Shared across `fork` like the resolver.
     pub ports: Arc<net::Ports>,
-    /// And for anonymous shared files, which have seals.
-    pub memfds: std::collections::HashMap<usize, Arc<unix::MemFd>>,
     /// Which unix socket answers to which path. Shared system-wide, because
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
@@ -637,23 +635,8 @@ pub struct Kernel {
     /// is the assignment, by guest path.
     ///
     /// Empty unless a closure build asked for it, and then honoured only for
-    /// the reservation described at `armed_pin`.
-    pub pins: std::collections::HashMap<String, u64>,
-    /// The base the next anonymous reservation should get, and for what.
-    ///
-    /// `ld.so` does not map an object in one call. It opens the file, reads
-    /// the header, reserves the whole span with an *anonymous* `PROT_NONE`
-    /// mapping, and only then maps the segments into it with `MAP_FIXED`. The
-    /// reservation is the one address gex chooses and the only one worth
-    /// pinning -- and being anonymous it carries no file to key on. So the
-    /// `openat` immediately before it is the signal, and this is what that
-    /// signal sets.
-    ///
-    /// The predicate has to include `PROT_NONE`: a real trace of glibc's
-    /// loader shows a 8 KiB `PROT_READ|WRITE` allocation of its own between
-    /// the `fstat` and the reservation, so "the next anonymous mapping" would
-    /// pin the wrong one.
-    pub armed_pin: Option<(String, u64)>,
+    /// the reservation described at `MapLog::armed_pin`.
+    pub pins: Arc<std::collections::HashMap<String, u64>>,
     /// Who decides where a shared object goes, when anybody does.
     ///
     /// [`Self::pins`] is the same idea decided ahead of time by a closure
@@ -661,14 +644,6 @@ pub struct Kernel {
     /// an object fixes its address and every later one is given the same,
     /// which is what makes a translated module worth sharing between them.
     pub place: Option<Arc<dyn ObjectPlace>>,
-    /// Which object the next anonymous reservation is for.
-    ///
-    /// The same signal [`Self::armed_pin`] uses and for the same reason: the
-    /// reservation carries no file, so the `openat` before it is what names
-    /// the object. Kept separate because a pin knows its address already and
-    /// this one has to ask, and can only ask once the reservation says how
-    /// long the object is.
-    pub armed_place: Option<String>,
     /// Every thread's own signal state but the running one's, which is in
     /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
     /// pending signals and alternate stacks are per thread, as on Linux.
@@ -691,40 +666,10 @@ pub struct Kernel {
     /// The canonical number of the syscall being handled (for the host's
     /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
     pub syscall_nr: u64,
-    /// Where each pinned object actually landed, for checking afterwards.
-    ///
-    /// A pin that silently does not take is the worst outcome available: the
-    /// module is built for one address and the code runs at another, and the
-    /// guest branches into whatever is there. Recorded so a mismatch can be
-    /// reported rather than executed.
-    pub pin_landed: Vec<(String, u64, u64)>,
-    /// File mappings whose writes are meant to reach the file.
-    pub shared_maps: SharedMaps,
     /// The working directories of threads that left the process's
     /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
     /// the length of each of that thread's system calls.
     pub thread_cwd: std::collections::HashMap<u64, String>,
-    /// Executable mappings made since the host last looked.
-    pub new_code: Vec<CodeMap>,
-    /// Executable ranges *unmapped* since the host last looked.
-    ///
-    /// A translation is only valid while the code it was made from is still
-    /// there. `dlclose` unmaps a library and a later `dlopen` maps a
-    /// different one over the same addresses, and without this the guest
-    /// branches into the previous library's translated code -- the dispatch
-    /// slot still answers for the page. Nothing reports an error; the guest
-    /// simply runs the wrong function. A long-running X server does exactly
-    /// this every time its last client disconnects and it resets.
-    pub retired_code: Vec<(u64, u64)>,
-    /// Ranges made executable again by `mprotect` (read+execute, no write):
-    /// the function tier compares its units' pages there (a loader that lifted
-    /// `.text` to fill an import table and put it back, `cgen::on_retire`).
-    /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
-    /// could have changed the code was retired when the page became writable,
-    /// and forgetting the dispatch pages here dropped the bridges of the units
-    /// and native modules on them for good (a native Wine DLL's `ud2` stub
-    /// then ran as code: SIGILL in Undertale's GL start).
-    pub recheck_code: Vec<(u64, u64)>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -837,6 +782,38 @@ pub fn share_monotonic_base(f: fn(u64) -> u64) {
     let _ = MONOTONIC_SHARED.set(f);
 }
 
+/// How much faster than real time the monotonic clocks run, as f64 bits
+/// (0: real time). For benchmarks only, off unless a host sets it
+/// ([`set_guest_clock`]).
+static CLOCK_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Seconds taken off the wall clock (CLOCK_REALTIME, gettimeofday, time) as
+/// the guest reads it: 0, or now less a fixed starting instant.
+static WALL_SHIFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The benchmark clocks, as pewasm's PEWASM_TIME_SCALE and PEWASM_FIXED_TIME
+/// make them (its src/x86/host.c): the monotonic clocks -- which Wine's
+/// QueryPerformanceCounter, GetTickCount and timeGetTime all come from --
+/// run `scale` times faster than real time, so a program that caps its own
+/// frame rate against them stops sleeping and runs as fast as it can; the
+/// wall clock runs at real time but `wall_shift` seconds behind, so it
+/// starts at a fixed date (pewasm: the fixed date plus the real time since
+/// start). Sleeps and timeouts stay real time, as in pewasm: Wine's
+/// NtDelayExecution counts on the wall clock, and a relative wait on the
+/// monotonic one waits its length in real time. Every process of a host
+/// must be given the same values (the browser's kernel hands them out).
+pub fn set_guest_clock(scale: f64, wall_shift: i64) {
+    use std::sync::atomic::Ordering;
+    let bits = if scale > 0.0 && scale != 1.0 { scale.to_bits() } else { 0 };
+    CLOCK_SCALE.store(bits, Ordering::Relaxed);
+    WALL_SHIFT.store(wall_shift, Ordering::Relaxed);
+}
+
+/// The wall clock as the guest reads it: see [`set_guest_clock`].
+fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
+    let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+    (secs.wrapping_sub(shift as u64), nanos)
+}
+
 /// A monotonic clock reading made from a wall clock reading: seconds since
 /// a shared boot instant, not since the epoch. Programs truncate monotonic
 /// milliseconds to 32 bits and compare them across processes -- X server
@@ -854,7 +831,7 @@ pub fn clock_ns(clock: ClockFn, clk: u64) -> u64 {
     let (secs, nanos) = match clk {
         2 | 3 => return 0,
         c if is_monotonic_clock(c) => monotonic_from(clock()),
-        _ => clock(),
+        _ => guest_wall(clock()),
     };
     secs * 1_000_000_000 + nanos as u64
 }
@@ -872,7 +849,13 @@ fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
             Err(other) => other,
         };
     }
-    (secs.saturating_sub(base), nanos)
+    let (secs, nanos) = (secs.saturating_sub(base), nanos);
+    let scale = CLOCK_SCALE.load(Ordering::Relaxed);
+    if scale == 0 {
+        return (secs, nanos);
+    }
+    let ns = ((secs as f64 * 1e9 + nanos as f64) * f64::from_bits(scale)) as u64;
+    (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
 /// Answer one of the calls that only read the clock -- `clock_gettime`,
@@ -980,7 +963,7 @@ pub fn clock_call(
                     ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
                 }
                 c if is_monotonic_clock(c) => monotonic_from(clock()),
-                _ => clock(),
+                _ => guest_wall(clock()),
             };
             buf != 0 && pair(m, buf, secs, nanos as u64, w32).is_ok()
         }
@@ -989,7 +972,7 @@ pub fn clock_call(
             if buf == 0 {
                 true
             } else {
-                let (secs, nanos) = clock();
+                let (secs, nanos) = guest_wall(clock());
                 pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
             }
         }
@@ -1031,6 +1014,9 @@ pub struct FdIo<'a> {
     /// (`SCM_RIGHTS` from another process), and its pid.
     pub ns: &'a crate::vfs::Namespace,
     pub pid: i32,
+    /// `flock`'s locks (`Kernel::file_locks`, shared with the process's
+    /// forks), released when a description goes.
+    pub file_locks: &'a Arc<unix::FileLocks>,
 }
 
 impl FdIo<'_> {
@@ -1739,6 +1725,13 @@ impl FdIo<'_> {
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3]),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
+            nr::CLOSE => self.close(a[0] as i32),
+            nr::CLOSE_RANGE => self.close_range(a[0], a[1], a[2]),
+            nr::DUP => self.dup(a[0] as i32),
+            nr::DUP2 => self.dup2(a[0] as i32, a[1] as i32),
+            nr::DUP3 => self.dup3(a[0] as i32, a[1] as i32, a[2]),
+            nr::FCNTL => self.fcntl_call(m, a[0] as i32, a[1], a[2]),
+            nr::FLOCK => self.flock(a[0] as i32, a[1]),
             _ => return None,
         })
     }
@@ -1798,10 +1791,402 @@ pub fn sigprocmask(signals: &Signals, m: &mut GuestMem<'_>, how: u32, set: u64, 
         Ok(0)
 }
 
+/// The memory map and what a mapping call needs beside it, none of it behind
+/// the kernel lock (docs/kernel-locking.md §3.5, L12b): `mmap`, `munmap`,
+/// `mprotect`, `brk`, `mremap`, `madvise` and `msync`, the same code for the
+/// full call and [`free_call`]. What they note for the host (code mapped and
+/// retired, pins, shared file mappings) is the map's own ([`MapLog`]).
+///
+/// [`MapLog`]: crate::mem::MapLog
+#[derive(Clone, Copy)]
+pub struct MapIo<'a> {
+    pub mem: &'a crate::mem::Mm,
+    /// For a file mapping's descriptor.
+    pub fds: &'a FdTable,
+    /// `Kernel::pins` and `Kernel::place`: constants once the process runs.
+    pub pins: &'a std::collections::HashMap<String, u64>,
+    pub place: Option<&'a Arc<dyn ObjectPlace>>,
+    /// The call's pc: a mapping the dynamic loader asks for stays below
+    /// 4 GiB, since it will hold code (docs/mem64.md).
+    pub pc: u64,
+}
+
+impl MapIo<'_> {
+    /// The mapping call `n` (canonical), or `None` for any other.
+    pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        Some(match n {
+            nr::BRK => {
+                // Zeroed, because Linux zeroes it and libc counts on that.
+                let (result, grew) = self.mem.lock().brk_grow(a[0]);
+                if let Some((from, to)) = grew {
+                    let _ = m.zero_dirty(from, (to - from) as usize);
+                }
+                Ok(result)
+            }
+            nr::MMAP => self.mmap(m, a),
+            nr::MUNMAP => {
+                let flushed = self.flush_shared(m, a[0], a[1]);
+                self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                self.retire_code(a[0], a[1]);
+                flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
+            }
+            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
+            nr::MREMAP => self.mremap(m, a),
+            nr::MPROTECT => self.mprotect(a),
+            nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
+            _ => return None,
+        })
+    }
+
+    /// `mprotect`.
+    pub fn mprotect(&self, a: [u64; 6]) -> SysResult {
+        // Losing execute retires the translations as surely as
+        // unmapping does: `ld.so` applies RELRO by dropping write,
+        // but a JIT in the guest flips a page from executable back to
+        // writable precisely so it can put different code there.
+        // Making code writable is the other half (a patch, a
+        // detour), which x86 needs no cache flush to see.
+        if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
+            self.retire_code(a[0], a[1]);
+        }
+        let mut mm = self.mem.lock();
+        let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
+        // Executable again (a loader filling an import table in
+        // `.text`, a JIT done writing): what is there now is checked
+        // against the function tier's units (`cgen::on_retire`
+        // compares the pages; a page made non-executable for a while
+        // is not gone: `cgen::in_pe_image`). A check, not a retire
+        // (`MapLog::recheck_code`).
+        if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
+            let (start, end) = (
+                crate::mem::page_align_down(a[0]),
+                crate::mem::page_align_up(a[0].saturating_add(a[1])),
+            );
+            if end > start {
+                mm.log.recheck_code.push((start, end));
+                crate::note_code_change();
+            }
+        }
+        r
+    }
+
+    /// `mremap`. The map decides where; this moves the bytes.
+    pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        const MREMAP_MAYMOVE: u64 = 1;
+        let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        // The map's lock held through the copy: the old range is free in
+        // the map once it has moved, and another thread's mapping there
+        // must not land before its bytes are out.
+        let mut mm = self.mem.lock();
+        let (dst, moved) = mm.mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
+        if moved {
+            let keep = old_len.min(new_len) as usize;
+            let bytes = m.read(addr, keep)?.to_vec();
+            m.write(dst, &bytes)?;
+            // The grown tail at the new location is fresh anonymous memory,
+            // which Linux exposes as zero -- but `dst` may be a reused hole
+            // holding stale bytes, and only `keep` of them were overwritten.
+            if new_len > old_len {
+                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
+            }
+        } else if new_len > old_len {
+            // Growing in place must expose zeroes, not whatever the guest
+            // left behind the last time this range was mapped.
+            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
+        }
+        Ok(dst)
+    }
+
+    /// The pinned base for a path a closure build named, if there is one.
+    ///
+    /// Exact spelling first, then the file's name alone: `gexc` records the
+    /// path it walked in its sysroot while `ld.so` opens what `ld.so.cache`
+    /// gives it, and on Debian those differ by a symlinked prefix. The
+    /// name-only fallback is safe because a rootfs does not ship two libraries
+    /// of one name that a single program loads both of; the exact match still
+    /// wins.
+    pub fn pin_for(&self, path: &str) -> Option<u64> {
+        if self.pins.is_empty() {
+            return None;
+        }
+        if let Some(&base) = self.pins.get(path) {
+            return Some(base);
+        }
+        let want = path.rsplit('/').next()?;
+        self.pins
+            .iter()
+            .find(|(k, _)| k.rsplit('/').next() == Some(want))
+            .map(|(_, &v)| v)
+    }
+
+    /// `madvise`. Only `MADV_DONTNEED` does anything: on Linux it makes an
+    /// anonymous range read as zero on next access, and glibc's malloc frees
+    /// arena memory this way and then REUSES it trusting the zero. A no-op left
+    /// the reused pages holding stale bytes, so glibc read garbage -- a
+    /// deterministic corruption Qt hits (heavy glibc malloc/threads) and musl
+    /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
+    /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
+    /// the file, which the demand path already does, so it is left alone.
+    pub fn madvise(&self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
+        const MADV_DONTNEED: u32 = 4;
+        if advice == MADV_DONTNEED {
+            let end = addr.saturating_add(len);
+            let anon: Vec<(u64, u64)> = self
+                .mem
+                .lock()
+                .vmas()
+                .iter()
+                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
+                .map(|v| (v.start.max(addr), v.end.min(end)))
+                .collect();
+            for (lo, hi) in anon {
+                if hi > lo {
+                    m.zero_dirty(lo, (hi - lo) as usize)?;
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn mmap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let (addr, len, prot_bits, flags, fd, offset) =
+            (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        // A fixed mapping over code replaces it, as an unmap would (Wine's
+        // VirtualFree decommits by mapping over the range).
+        if flags & mflags::FIXED != 0 {
+            self.retire_code(addr, len);
+            // And a shared file mapping it replaces ends as an unmap ends
+            // it: written back, and no longer handed to the next mapper.
+            self.flush_shared(m, addr, len)?;
+            self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
+        }
+        if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
+            // A private file mapping is an eager copy, which is exactly
+            // correct and needs no page faults (PLAN §7.4).
+            let len_aligned = crate::mem::page_align_up(len);
+            let file = self.fds.get(fd)?;
+            let name = file.path.clone();
+            // A loader that maps an object's first segment straight from the
+            // file, spanning the whole object (glibc 2.35 and later), rather
+            // than reserving anonymous memory first: that mapping takes the
+            // pin armed when the object was opened, the same way.
+            let mut addr = addr;
+            let mut pinned = None;
+            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
+                let mut mm = self.mem.lock();
+                if let Some((path, base)) = mm.log.armed_pin.take() {
+                    if path.rsplit('/').next() == name.rsplit('/').next() {
+                        mm.log.armed_place = None;
+                        addr = base;
+                        pinned = Some((path, base));
+                    } else {
+                        mm.log.armed_pin = Some((path, base));
+                    }
+                }
+            }
+            // A second `MAP_SHARED` of the same open file must see the first
+            // one's writes, so hand back the same pages -- a Wayland client
+            // maps a buffer and sends the descriptor, and the next mapper must
+            // see the same pixels, not a zeroed copy. Not reference counted:
+            // unmapping one alias unmaps both, and nothing here unmaps early.
+            if flags & crate::mem::flags::SHARED != 0 {
+                // (or any part of one: a window into a mapping another
+                // view holds whole, as win32u maps the session's blocks)
+                let mm = self.mem.lock();
+                if let Some(existing) = mm.log.shared_maps.iter().find(|s| {
+                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
+                }) {
+                    return Ok(existing.start + (offset - existing.offset));
+                }
+            }
+            // The path and offset travel with the mapping. Two processes
+            // that map the same library at the same address then agree that
+            // the code is the same, which is what lets them share the
+            // dispatch slots it was translated into.
+            let start = self.mem.lock().mmap_from(
+                addr,
+                len_aligned,
+                prot_bits,
+                flags,
+                &name,
+                Some((name.clone(), offset)),
+            )?;
+            if let Some((path, base)) = pinned {
+                // Said as it happens: the end-of-run report is lost when the
+                // process is killed (a game run ends at its timeout).
+                if base != start {
+                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+                }
+                self.mem.lock().log.pin_landed.push((path, base, start));
+            }
+            // Straight into the mapping, as `read` does: through a host
+            // buffer it was a second copy of the file, and the buffer's own
+            // first touch, on every private file mapping (apt-get maps its
+            // two 44 MB package caches this way on every run).
+            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
+            // A shared mapping is written back at `msync` and `munmap` (where
+            // a program that never calls `msync` expects its changes to land).
+            // An executable file mapping is a shared library arriving: tell the
+            // host so the static recompiler gets the whole object at once.
+            if prot_bits & crate::mem::prot::EXEC != 0 {
+                crate::note_code_change();
+                self.mem.lock().log.new_code.push(CodeMap {
+                    start,
+                    end: start + len_aligned,
+                    path: name.clone(),
+                    offset,
+                });
+            }
+            if flags & crate::mem::flags::SHARED != 0 {
+                self.mem.lock().log.shared_maps.push(SharedMap {
+                    start,
+                    len: len_aligned,
+                    file,
+                    offset,
+                });
+            }
+            return Ok(start);
+        }
+        // The anonymous PROT_NONE reservation an ELF loader makes before it
+        // maps an object: hand it the pinned base and every `MAP_FIXED` that
+        // follows lands where the closure build assumed. Passed as a hint, so
+        // a collision is ignored and recorded in `pin_landed`, not forced.
+        let mut addr = addr;
+        let mut pinned = None;
+        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
+            let (pin, place) = {
+                let mut mm = self.mem.lock();
+                match mm.log.armed_pin.take() {
+                    Some(pin) => {
+                        mm.log.armed_place = None;
+                        (Some(pin), None)
+                    }
+                    None => (None, mm.log.armed_place.take()),
+                }
+            };
+            if let Some((path, base)) = pin {
+                addr = base;
+                pinned = Some((path, base));
+            } else if let Some(path) = place {
+                // The reservation is the first thing that says how long the
+                // object is, which is why the question is asked here and not
+                // at the `openat` that armed it.
+                if let Some(base) = self
+                    .place
+                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
+                {
+                    addr = base;
+                }
+            }
+        }
+        // The dynamic loader's reservation for an object (glibc maps an
+        // over-aligned library into anonymous PROT_NONE memory) will hold
+        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
+        // loader runs at INTERP_BASE (docs/mem64.md §3).
+        // What was known to be zero before the mapping (which forgets it).
+        let clean_before = self.mem.lock().clean_ranges().to_vec();
+        // Only what this mapping claims (another caller's claim may since
+        // have been written).
+        let _ = self.mem.lock().take_fresh();
+        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.pc);
+        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
+            self.mem.lock().mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
+        } else {
+            self.mem.lock().mmap(addr, len, prot_bits, flags, "")?
+        };
+        if let Some((path, base)) = pinned {
+            // Said as it happens: the end-of-run report is lost when the
+            // process is killed (a game run ends at its timeout).
+            if base != start {
+                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+            }
+            self.mem.lock().log.pin_landed.push((path, base, start));
+        }
+        // Anonymous memory is defined to read as zero. Pages that already
+        // are stay untouched, so a large reservation costs no memory, and
+        // ranges known to be zero (`MemoryMap::clean`) are not even read.
+        let end = start + crate::mem::page_align_up(len);
+        // Arena the mapping had to claim is zero already: reading it to make
+        // sure faulted in every page of it (the guest's own first write then
+        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
+        // the claim took past the mapping is free arena, still zero, and
+        // known clean for the next mapping into it.
+        let mut clean_before = clean_before;
+        let fresh = self.mem.lock().take_fresh();
+        if let Some((fs, fe)) = fresh {
+            let at = clean_before.partition_point(|&(s, _)| s < fs);
+            clean_before.insert(at, (fs, fe));
+            if end < fe {
+                self.mem.lock().mark_clean(end.max(fs), fe);
+            }
+        }
+        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
+            m.zero_dirty(a, (b - a) as usize)?;
+        }
+        if prot_bits & crate::mem::prot::WRITE == 0 {
+            self.mem.lock().mark_clean(start, end);
+        }
+        Ok(start)
+    }
+
+
+    /// Write a shared mapping's bytes back to the file behind it.
+    pub fn flush_shared(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        // Taken out of the map's lock: the writes are file I/O.
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            if mm.log.shared_maps.is_empty() {
+                return Ok(());
+            }
+            mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
+        };
+        for map in maps {
+            let from = map.start.max(lo);
+            let to = (map.start + map.len).min(hi);
+            // Only what the file holds: a shared mapping's page past the
+            // end of the file is not the file's (Linux never extends it).
+            let at = map.offset + (from - map.start);
+            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
+            let n = (to - from).min(size.saturating_sub(at));
+            if n == 0 {
+                continue;
+            }
+            let bytes = m.read(from, n as usize)?;
+            map.file.pwrite(at, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Note that `[addr, addr + len)` no longer holds the code it did.
+    ///
+    /// Only ranges that overlap an executable mapping are worth reporting:
+    /// unmapping the heap or a data file happens constantly and has no
+    /// translations behind it.
+    pub fn retire_code(&self, addr: u64, len: u64) {
+        let (start, end) = (
+            crate::mem::page_align_down(addr),
+            crate::mem::page_align_up(addr.saturating_add(len)),
+        );
+        if end <= start {
+            return;
+        }
+        let mut mm = self.mem.lock();
+        let executable = mm.vmas().iter().any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
+        if executable {
+            mm.log.retired_code.push((start, end));
+            crate::note_code_change();
+        }
+    }
+}
+
 /// What a call [`free_call`] answers needs of its process, none of it
 /// behind a kernel lock.
 pub struct Free<'a> {
     pub io: FdIo<'a>,
+    /// The memory map, for the mapping calls.
+    pub map: MapIo<'a>,
     /// The calling thread's signal state.
     pub signals: &'a Signals,
     pub procs: &'a ProcTable,
@@ -1838,6 +2223,11 @@ fn is_poll(n: u64) -> bool {
     matches!(n, nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2)
 }
 
+/// The mapping calls ([`MapIo`]), canonical.
+fn is_mapping(n: u64) -> bool {
+    matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
+}
+
 /// SIGKILL and SIGSTOP, which no mask blocks.
 const UNBLOCKABLE: u64 = (1 << (signal::sig::SIGKILL - 1)) | (1 << (signal::sig::SIGSTOP - 1));
 
@@ -1865,6 +2255,20 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
             x::IOCTL => nr::IOCTL,
+            x::CLOSE => nr::CLOSE,
+            x::CLOSE_RANGE => nr::CLOSE_RANGE,
+            x::DUP => nr::DUP,
+            x::DUP2 => nr::DUP2,
+            x::DUP3 => nr::DUP3,
+            x::FCNTL | x::FCNTL64 => nr::FCNTL,
+            x::FLOCK => nr::FLOCK,
+            x::BRK => nr::BRK,
+            x::MMAP | x::MMAP2 => nr::MMAP,
+            x::MUNMAP => nr::MUNMAP,
+            x::MPROTECT => nr::MPROTECT,
+            x::MREMAP => nr::MREMAP,
+            x::MADVISE => nr::MADVISE,
+            x::MSYNC => nr::MSYNC,
             _ => return None,
         }
     } else if gex_abi::X86 {
@@ -1888,13 +2292,29 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMSG => nr::SENDMSG,
             x::RECVMSG => nr::RECVMSG,
             x::IOCTL => nr::IOCTL,
+            x::CLOSE => nr::CLOSE,
+            x::CLOSE_RANGE => nr::CLOSE_RANGE,
+            x::DUP => nr::DUP,
+            x::DUP2 => nr::DUP2,
+            x::DUP3 => nr::DUP3,
+            x::FCNTL => nr::FCNTL,
+            x::FLOCK => nr::FLOCK,
+            x::BRK => nr::BRK,
+            x::MMAP => nr::MMAP,
+            x::MUNMAP => nr::MUNMAP,
+            x::MPROTECT => nr::MPROTECT,
+            x::MREMAP => nr::MREMAP,
+            x::MADVISE => nr::MADVISE,
+            x::MSYNC => nr::MSYNC,
             _ => return None,
         }
     } else {
         match raw {
             nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK
             | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
-            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL => raw,
+            | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL | nr::CLOSE
+            | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK | nr::BRK | nr::MMAP | nr::MUNMAP
+            | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC => raw,
             _ => return None,
         }
     };
@@ -1916,8 +2336,12 @@ pub struct FreeCall {
 /// family (`poll`, `ppoll`, `select`, `pselect6`, `epoll_wait`,
 /// `epoll_pwait`, `epoll_pwait2`, in each ABI's forms), `futex` (every
 /// operation, and i386's `futex_time64`), `nanosleep`, `clock_nanosleep`,
-/// `sendmsg`, `recvmsg` and `ioctl`; the 32-bit ABI's `pread64`,
-/// `pwrite64` and `_llseek` too, translated as the full call translates them.
+/// `sendmsg`, `recvmsg`, `ioctl`, and the descriptor table's own calls
+/// (`close`, `close_range`, `dup`, `dup2`, `dup3`, `fcntl`, `flock`), and
+/// the mapping calls (`mmap`, `munmap`, `mprotect`, `brk`, `mremap`,
+/// `madvise`, `msync`: [`MapIo`]); the 32-bit ABI's `pread64`, `pwrite64`,
+/// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
+/// call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
         return None;
@@ -1939,7 +2363,9 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP) && !is_poll(n) {
+    // A mapping call's first argument is an address (or, for the old
+    // `mmap`, a pointer to its arguments), never sign-extended.
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -1969,7 +2395,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
     let mut post = crate::i386::Post::None;
-    if is_poll(n) || (compat && matches!(n, nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK)) {
+    if is_poll(n)
+        || (compat
+            && (matches!(
+                n,
+                nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::PREAD64 | nr::PWRITE64 | nr::LSEEK | nr::DUP2 | nr::DUP3 | nr::FCNTL
+            ) || is_mapping(n)))
+    {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
             post = p;
@@ -2009,6 +2441,9 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
         f.signals.process().collect(f.procs, f.pid, f.uid);
+        r
+    } else if is_mapping(n) {
+        let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
         r
     } else if n == nr::SENDMSG {
         f.io.sendmsg(m, a[0] as i32, a[1])
@@ -2176,8 +2611,10 @@ impl FutexCx<'_> {
         }
     }
 
+    /// The wall clock as the guest reads it ([`guest_wall`]): the clock an
+    /// absolute CLOCK_REALTIME deadline the guest names is on.
     fn now_nanos(&self) -> u128 {
-        let (secs, nanos) = (self.clock)();
+        let (secs, nanos) = guest_wall((self.clock)());
         secs as u128 * 1_000_000_000 + nanos as u128
     }
 
@@ -3317,8 +3754,8 @@ impl Kernel {
             );
         }
         Kernel {
-            fds,
-            mem: MemoryMap::new(brk_start),
+            fds: Arc::new(fds),
+            mem: crate::mem::Mm::new(MemoryMap::new(brk_start)),
             vfs: Vfs::new(),
             ctx_addr,
             pid: 1,
@@ -3348,9 +3785,8 @@ impl Kernel {
             retry_transfer: None,
             restore_sigmask: None,
             started: 0,
-            pins: std::collections::HashMap::new(),
+            pins: Default::default(),
             place: None,
-            armed_place: None,
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
@@ -3358,24 +3794,17 @@ impl Kernel {
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
-            armed_pin: None,
             compat: false,
             fd_activity: false,
             wasm32: false,
             sigreturn_legacy: false,
-            pin_landed: Vec::new(),
-            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
-            new_code: Vec::new(),
-            retired_code: Vec::new(),
-            recheck_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             rlimits: default_rlimits(),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             ports: Arc::new(net::Ports::new()),
-            memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             host_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
@@ -3568,7 +3997,7 @@ impl Kernel {
     /// parent's to reap.
     pub fn fork_kernel(&self) -> Kernel {
         Kernel {
-            fds: self.fds.clone(),
+            fds: Arc::new((*self.fds).clone()),
             mem: self.mem.clone(),
             vfs: self.vfs.clone(),
             ctx_addr: self.ctx_addr,
@@ -3604,11 +4033,10 @@ impl Kernel {
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
-            pins: std::collections::HashMap::new(),
+            pins: Default::default(),
             // The placement outlives any one process: a child that maps the
             // same library must be given the same address its parent was.
             place: self.place.clone(),
-            armed_place: None,
             syscall_pc: 0,
             block_restart: crate::signal::Restart::Never,
             block_pc: 0,
@@ -3616,24 +4044,17 @@ impl Kernel {
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
-            armed_pin: None,
             compat: self.compat,
             fd_activity: false,
             wasm32: self.wasm32,
             sigreturn_legacy: false,
-            pin_landed: Vec::new(),
-            shared_maps: SharedMaps::new(),
             thread_cwd: std::collections::HashMap::new(),
-            new_code: Vec::new(),
-            retired_code: Vec::new(),
-            recheck_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             rlimits: self.rlimits,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             ports: Arc::clone(&self.ports),
-            memfds: self.memfds.clone(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
@@ -4206,13 +4627,29 @@ impl Kernel {
     /// The park for a `FUTEX_LOCK_PI` that found the lock held (`sys_futex`
     /// set the waiters bit and answered `EAGAIN`).
     fn lock_pi_op(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
-        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
         futex_pi_park(&self.futex_cx(&mapped), m, a)
     }
 
     /// The descriptor half of this kernel ([`FdIo`]).
     pub fn fd_io(&self) -> FdIo<'_> {
-        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid }
+        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks }
+    }
+
+    /// The mapping calls' part of this kernel ([`MapIo`]).
+    pub fn map_io(&self) -> MapIo<'_> {
+        MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc }
+    }
+
+    /// Note that `[addr, addr + len)` no longer holds the code it did
+    /// ([`MapIo::retire_code`]).
+    pub fn retire_code(&self, addr: u64, len: u64) {
+        self.map_io().retire_code(addr, len)
+    }
+
+    /// The pinned base for a path a closure build named ([`MapIo::pin_for`]).
+    pub fn pin_for(&self, path: &str) -> Option<u64> {
+        self.map_io().pin_for(path)
     }
 
     /// The blocking half of a syscall, if it has one.
@@ -4307,7 +4744,7 @@ impl Kernel {
                 Some(op)
             }
             nr::FUTEX => {
-                let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+                let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
                 futex_block(&self.futex_cx(&mapped), m, a)
             }
             nr::WAIT4 => {
@@ -4471,11 +4908,7 @@ impl Kernel {
             // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
             // first field in every `struct flock` layout (i386's flock and
             // flock64, x86-64's, wasm32's).
-            nr::FCNTL if a[1] == 5 || a[1] == 36 => self.fds.get(a[0] as i32).and_then(|_| {
-                const F_UNLCK: u16 = 2;
-                m.write(a[2], &F_UNLCK.to_le_bytes()).map(|_| 0)
-            }),
-            nr::FCNTL => self.sys_fcntl(a[0] as i32, a[1], a[2]),
+            nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self
                 .fds
@@ -4552,54 +4985,10 @@ impl Kernel {
             }
 
             // -- memory ------------------------------------------------------
-            nr::BRK => {
-                // Zeroed, because Linux zeroes it and libc counts on that.
-                let (result, grew) = self.mem.brk_grow(a[0]);
-                if let Some((from, to)) = grew {
-                    let _ = m.zero_dirty(from, (to - from) as usize);
-                }
-                Ok(result)
-            }
-            nr::MMAP => self.sys_mmap(m, a),
-            nr::MUNMAP => {
-                let flushed = self.flush_shared(m, a[0], a[1]);
-                self.shared_maps
-                    .retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
-                self.retire_code(a[0], a[1]);
-                flushed.and_then(|_| self.mem.unmap(a[0], a[1])).map(|_| 0)
-            }
-            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
-            nr::MREMAP => self.sys_mremap(m, a),
-            nr::MPROTECT => {
-                // Losing execute retires the translations as surely as
-                // unmapping does: `ld.so` applies RELRO by dropping write,
-                // but a JIT in the guest flips a page from executable back to
-                // writable precisely so it can put different code there.
-                // Making code writable is the other half (a patch, a
-                // detour), which x86 needs no cache flush to see.
-                if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
-                    self.retire_code(a[0], a[1]);
-                }
-                let r = self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
-                // Executable again (a loader filling an import table in
-                // `.text`, a JIT done writing): what is there now is checked
-                // against the function tier's units (`cgen::on_retire`
-                // compares the pages; a page made non-executable for a while
-                // is not gone: `cgen::in_pe_image`). A check, not a retire
-                // (`recheck_code`).
-                if r.is_ok() && (a[2] as u32) & crate::mem::prot::EXEC != 0 && (a[2] as u32) & crate::mem::prot::WRITE == 0 {
-                    let (start, end) = (
-                        crate::mem::page_align_down(a[0]),
-                        crate::mem::page_align_up(a[0].saturating_add(a[1])),
-                    );
-                    if end > start {
-                        self.recheck_code.push((start, end));
-                        crate::note_code_change();
-                    }
-                }
+            nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
+                let Some(r) = self.map_io().call(m, n, a) else { unreachable!() };
                 r
             }
-            nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 
             // -- process and time --------------------------------------------
             nr::UNAME => self.sys_uname(m, a[0]),
@@ -4843,7 +5232,7 @@ impl Kernel {
     }
 
     fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let mapped = |addr: u64, len: u64| self.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end);
+        let mapped = |addr: u64, len: u64| self.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
         futex_call(&self.futex_cx(&mapped), m, a)
     }
 
@@ -4998,6 +5387,26 @@ impl Kernel {
     /// picks it up here. This is what makes `timeout`, job control and every
     /// supervisor work.
     pub fn collect_signals(&self) {
+        // `tgkill`s from other processes, each for one thread.
+        if self.procs.has_signals(self.pid) {
+            let mut other = false;
+            for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.uid };
+                if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
+                    self.signals.raise_from(signo, source);
+                } else if let Some(t) = self.thread_signals.get(&tid) {
+                    t.raise_from(signo, source);
+                    other = true;
+                }
+            }
+            // Another thread's, taken here: it may have woken for the send
+            // (`ProcTable::tkill`), found nothing yet and gone back to its
+            // wait, so it is woken again to see it (tests/gexcc
+            // tgkill-thread.c hung two runs in three in the page).
+            if other {
+                crate::wait::notify(self.procs.queue(self.pid));
+            }
+        }
         let inbox = self.signals.process().collect(&self.procs, self.pid, self.uid);
         if inbox != 0 && self.trace {
             eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
@@ -5472,7 +5881,7 @@ impl Kernel {
             // rather than after, because `open` moves `p` into the call and
             // the path is what identifies the object.
             if let Some(base) = self.pin_for(&p) {
-                self.armed_pin = Some((p.clone(), base));
+                self.mem.lock().log.armed_pin = Some((p.clone(), base));
             }
             // O_CREAT of "name/" that is not there: a slash names a
             // directory, which open does not create (EISDIR, as Linux).
@@ -5497,7 +5906,7 @@ impl Kernel {
             // exist -- `ld.so` probes several directories for every library
             // it loads -- leaves nothing armed.
             if self.place.is_some() && is_shared_object(&p) {
-                self.armed_place = Some(p.clone());
+                self.mem.lock().log.armed_place = Some(p.clone());
             }
             h
         };
@@ -5505,7 +5914,7 @@ impl Kernel {
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
         let file = match tmpfile_path {
-            Some(tp) => OpenFile::tmpfile(handle, tp, flags, readable, writable),
+            Some(tp) => OpenFile::tmpfile(handle, tp, self.vfs.view().get(), flags, readable, writable),
             None => OpenFile::new(handle, p, flags, readable, writable),
         };
         self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
@@ -5545,16 +5954,11 @@ impl Kernel {
     }
 
     fn sys_dup(&mut self, fd: i32) -> SysResult {
-        let file = self.fds.get(fd)?;
-        self.fds.insert(file, false)
+        self.fd_io().dup(fd)
     }
 
     fn sys_dup3(&mut self, old: i32, new: i32, flags: u64) -> SysResult {
-        if old == new {
-            return Err(Errno::EINVAL);
-        }
-        let file = self.fds.get(old)?;
-        self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
+        self.fd_io().dup3(old, new, flags)
     }
 
     /// `linkat`: a second name for a file that already exists.
@@ -5909,6 +6313,85 @@ impl Kernel {
     }
 
     fn sys_fcntl(&mut self, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        self.fd_io().fcntl(fd, cmd, arg)
+    }
+
+}
+
+/// The descriptor table's own calls: `close`, `close_range`, the `dup`
+/// family, `fcntl` and `flock`. No kernel lock (docs/kernel-locking.md,
+/// L10): the table publishes itself, `flock`'s locks and a memfd's seals
+/// lock themselves, and an `O_TMPFILE`'s name is dropped through the
+/// process's published namespace.
+impl FdIo<'_> {
+    pub fn dup(&self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        self.fds.insert(file, false)
+    }
+
+    pub fn dup3(&self, old: i32, new: i32, flags: u64) -> SysResult {
+        if old == new {
+            return Err(Errno::EINVAL);
+        }
+        let file = self.fds.get(old)?;
+        self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// `dup2`: `dup3` without flags, except that `dup2(fd, fd)` is a no-op
+    /// that still validates the descriptor, where `dup3` would refuse.
+    pub fn dup2(&self, old: i32, new: i32) -> SysResult {
+        if old == new {
+            self.fds.get(old)?;
+            return Ok(new as u64);
+        }
+        self.dup3(old, new, 0)
+    }
+
+    /// Close a descriptor. The description's `flock` lock and an
+    /// `O_TMPFILE`'s name go with the description itself (`OpenFile`'s
+    /// `Drop`): when its last descriptor closes here, or in another process
+    /// it was passed to, and no call still in flight holds it. `dup` and
+    /// `fork` share one description, so closing a copy releases nothing.
+    pub fn close(&self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        self.fds.close(fd)?;
+        let settle = file.undoes_on_last_close();
+        drop(file);
+        if settle {
+            self.fds.settle();
+        }
+        Ok(0)
+    }
+
+    /// `close_range`: shut every open descriptor in a span at once.
+    pub fn close_range(&self, first: u64, last: u64, flags: u64) -> SysResult {
+        // `CLOSE_RANGE_CLOEXEC` marks the span close-on-exec instead of closing
+        // it now; `CLOSE_RANGE_UNSHARE` asks for a private descriptor table
+        // first, which is a no-op here because a process already has its own.
+        const CLOSE_RANGE_CLOEXEC: u64 = 4;
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        self.fds
+            .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
+        self.fds.settle();
+        Ok(0)
+    }
+
+    /// `fcntl` as the call is made: F_GETLK and F_OFD_GETLK answer through
+    /// memory, nobody holding a lock (see [`FdIo::fcntl`]), so the answer is
+    /// l_type = F_UNLCK, which is the first field in every `struct flock`
+    /// layout (i386's flock and flock64, x86-64's, wasm32's).
+    pub fn fcntl_call(&self, m: &mut GuestMem<'_>, fd: i32, cmd: u64, arg: u64) -> SysResult {
+        if cmd == 5 || cmd == 36 {
+            self.fds.get(fd)?;
+            const F_UNLCK: u16 = 2;
+            return m.write(arg, &F_UNLCK.to_le_bytes()).map(|_| 0);
+        }
+        self.fcntl(fd, cmd, arg)
+    }
+
+    pub fn fcntl(&self, fd: i32, cmd: u64, arg: u64) -> SysResult {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;
@@ -5989,6 +6472,21 @@ impl Kernel {
         }
     }
 
+    /// The anonymous shared file behind a descriptor: `EINVAL` for any other.
+    pub fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_memfd().ok_or(Errno::EINVAL)
+    }
+
+    /// `flock`. The open file description owns the lock, and its address is
+    /// a stable name for it while it is open.
+    pub fn flock(&self, fd: i32, op: u64) -> SysResult {
+        let file = self.fds.get(fd)?;
+        let r = self.file_locks.flock(&file.path, file.lock_key(), op);
+        if r.is_ok() {
+            file.note_locks(self.file_locks);
+        }
+        r
+    }
 }
 
 impl FdIo<'_> {
@@ -6703,31 +7201,6 @@ impl Kernel {
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
-    /// Write a shared mapping's bytes back to the file behind it.
-    fn flush_shared(&mut self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
-        if self.shared_maps.is_empty() {
-            return Ok(());
-        }
-        let (lo, hi) = (addr, addr.saturating_add(len));
-        for map in self.shared_maps.iter() {
-            let from = map.start.max(lo);
-            let to = (map.start + map.len).min(hi);
-            if from >= to {
-                continue;
-            }
-            // Only what the file holds: a shared mapping's page past the
-            // end of the file is not the file's (Linux never extends it).
-            let at = map.offset + (from - map.start);
-            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
-            let n = (to - from).min(size.saturating_sub(at));
-            if n == 0 {
-                continue;
-            }
-            let bytes = m.read(from, n as usize)?;
-            map.file.pwrite(at, bytes)?;
-        }
-        Ok(())
-    }
 
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
     /// descriptor kept; the second names a path directly.
@@ -6887,8 +7360,13 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         if tgid != self.pid {
-            // Another process's thread: its process, as `kill` does.
-            return self.procs.kill(self.pid, tgid, signo).map(|_| 0);
+            // Another process's thread: that thread alone, collected by its
+            // process (`collect_signals`). A probe (`signo` 0) asks after
+            // the process only.
+            if signo == 0 {
+                return self.procs.kill(self.pid, tgid, 0).map(|_| 0);
+            }
+            return self.procs.tkill(self.pid, tgid, tid, signo).map(|_| 0);
         }
         let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
         if tid == self.tid {
@@ -6947,254 +7425,6 @@ impl Kernel {
     }
 
     // -- memory --------------------------------------------------------------
-
-    /// `mremap`. The map decides where; this moves the bytes.
-    fn sys_mremap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        const MREMAP_MAYMOVE: u64 = 1;
-        let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
-        let (dst, moved) = self
-            .mem
-            .mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
-        if moved {
-            let keep = old_len.min(new_len) as usize;
-            let bytes = m.read(addr, keep)?.to_vec();
-            m.write(dst, &bytes)?;
-            // The grown tail at the new location is fresh anonymous memory,
-            // which Linux exposes as zero -- but `dst` may be a reused hole
-            // holding stale bytes, and only `keep` of them were overwritten.
-            if new_len > old_len {
-                m.zero_dirty(dst + keep as u64, (new_len - keep as u64) as usize)?;
-            }
-        } else if new_len > old_len {
-            // Growing in place must expose zeroes, not whatever the guest
-            // left behind the last time this range was mapped.
-            m.zero_dirty(addr + old_len, (new_len - old_len) as usize)?;
-        }
-        Ok(dst)
-    }
-
-    /// The pinned base for a path a closure build named, if there is one.
-    ///
-    /// Exact spelling first, then the file's name alone: `gexc` records the
-    /// path it walked in its sysroot while `ld.so` opens what `ld.so.cache`
-    /// gives it, and on Debian those differ by a symlinked prefix. The
-    /// name-only fallback is safe because a rootfs does not ship two libraries
-    /// of one name that a single program loads both of; the exact match still
-    /// wins.
-    pub fn pin_for(&self, path: &str) -> Option<u64> {
-        if self.pins.is_empty() {
-            return None;
-        }
-        if let Some(&base) = self.pins.get(path) {
-            return Some(base);
-        }
-        let want = path.rsplit('/').next()?;
-        self.pins
-            .iter()
-            .find(|(k, _)| k.rsplit('/').next() == Some(want))
-            .map(|(_, &v)| v)
-    }
-
-    /// `madvise`. Only `MADV_DONTNEED` does anything: on Linux it makes an
-    /// anonymous range read as zero on next access, and glibc's malloc frees
-    /// arena memory this way and then REUSES it trusting the zero. A no-op left
-    /// the reused pages holding stale bytes, so glibc read garbage -- a
-    /// deterministic corruption Qt hits (heavy glibc malloc/threads) and musl
-    /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
-    /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
-    /// the file, which the demand path already does, so it is left alone.
-    fn sys_madvise(&mut self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
-        const MADV_DONTNEED: u32 = 4;
-        if advice == MADV_DONTNEED {
-            let end = addr.saturating_add(len);
-            let anon: Vec<(u64, u64)> = self
-                .mem
-                .vmas()
-                .iter()
-                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
-                .map(|v| (v.start.max(addr), v.end.min(end)))
-                .collect();
-            for (lo, hi) in anon {
-                if hi > lo {
-                    m.zero_dirty(lo, (hi - lo) as usize)?;
-                }
-            }
-        }
-        Ok(0)
-    }
-
-    fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let (addr, len, prot_bits, flags, fd, offset) =
-            (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
-        // A fixed mapping over code replaces it, as an unmap would (Wine's
-        // VirtualFree decommits by mapping over the range).
-        if flags & mflags::FIXED != 0 {
-            self.retire_code(addr, len);
-            // And a shared file mapping it replaces ends as an unmap ends
-            // it: written back, and no longer handed to the next mapper.
-            if self.shared_maps.iter().any(|s| s.start < addr + len && s.start + s.len > addr) {
-                self.flush_shared(m, addr, len)?;
-                self.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
-            }
-        }
-        if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
-            // A private file mapping is an eager copy, which is exactly
-            // correct and needs no page faults (PLAN §7.4).
-            let len_aligned = crate::mem::page_align_up(len);
-            let file = self.fds.get(fd)?;
-            let name = file.path.clone();
-            // A loader that maps an object's first segment straight from the
-            // file, spanning the whole object (glibc 2.35 and later), rather
-            // than reserving anonymous memory first: that mapping takes the
-            // pin armed when the object was opened, the same way.
-            let mut addr = addr;
-            let mut pinned = None;
-            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
-                if let Some((path, base)) = self.armed_pin.take() {
-                    if path.rsplit('/').next() == name.rsplit('/').next() {
-                        self.armed_place = None;
-                        addr = base;
-                        pinned = Some((path, base));
-                    } else {
-                        self.armed_pin = Some((path, base));
-                    }
-                }
-            }
-            // A second `MAP_SHARED` of the same open file must see the first
-            // one's writes, so hand back the same pages -- a Wayland client
-            // maps a buffer and sends the descriptor, and the next mapper must
-            // see the same pixels, not a zeroed copy. Not reference counted:
-            // unmapping one alias unmaps both, and nothing here unmaps early.
-            if flags & crate::mem::flags::SHARED != 0 {
-                // (or any part of one: a window into a mapping another
-                // view holds whole, as win32u maps the session's blocks)
-                if let Some(existing) = self.shared_maps.iter().find(|s| {
-                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
-                }) {
-                    return Ok(existing.start + (offset - existing.offset));
-                }
-            }
-            // The path and offset travel with the mapping. Two processes
-            // that map the same library at the same address then agree that
-            // the code is the same, which is what lets them share the
-            // dispatch slots it was translated into.
-            let start = self.mem.mmap_from(
-                addr,
-                len_aligned,
-                prot_bits,
-                flags,
-                &name,
-                Some((name.clone(), offset)),
-            )?;
-            if let Some((path, base)) = pinned {
-                // Said as it happens: the end-of-run report is lost when the
-                // process is killed (a game run ends at its timeout).
-                if base != start {
-                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
-                }
-                self.pin_landed.push((path, base, start));
-            }
-            // Straight into the mapping, as `read` does: through a host
-            // buffer it was a second copy of the file, and the buffer's own
-            // first touch, on every private file mapping (apt-get maps its
-            // two 44 MB package caches this way on every run).
-            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
-            m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
-            // A shared mapping is written back at `msync` and `munmap` (where
-            // a program that never calls `msync` expects its changes to land).
-            // An executable file mapping is a shared library arriving: tell the
-            // host so the static recompiler gets the whole object at once.
-            if prot_bits & crate::mem::prot::EXEC != 0 {
-                crate::note_code_change();
-                self.new_code.push(CodeMap {
-                    start,
-                    end: start + len_aligned,
-                    path: name.clone(),
-                    offset,
-                });
-            }
-            if flags & crate::mem::flags::SHARED != 0 {
-                self.shared_maps.push(SharedMap {
-                    start,
-                    len: len_aligned,
-                    file,
-                    offset,
-                });
-            }
-            return Ok(start);
-        }
-        // The anonymous PROT_NONE reservation an ELF loader makes before it
-        // maps an object: hand it the pinned base and every `MAP_FIXED` that
-        // follows lands where the closure build assumed. Passed as a hint, so
-        // a collision is ignored and recorded in `pin_landed`, not forced.
-        let mut addr = addr;
-        let mut pinned = None;
-        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
-            if let Some((path, base)) = self.armed_pin.take() {
-                self.armed_place = None;
-                addr = base;
-                pinned = Some((path, base));
-            } else if let Some(path) = self.armed_place.take() {
-                // The reservation is the first thing that says how long the
-                // object is, which is why the question is asked here and not
-                // at the `openat` that armed it.
-                if let Some(base) = self
-                    .place
-                    .as_ref()
-                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
-                {
-                    addr = base;
-                }
-            }
-        }
-        // The dynamic loader's reservation for an object (glibc maps an
-        // over-aligned library into anonymous PROT_NONE memory) will hold
-        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
-        // loader runs at INTERP_BASE (docs/mem64.md §3).
-        // What was known to be zero before the mapping (which forgets it).
-        let clean_before = self.mem.clean_ranges().to_vec();
-        // Only what this mapping claims (another caller's claim may since
-        // have been written).
-        let _ = self.mem.take_fresh();
-        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
-        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
-            self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
-        } else {
-            self.mem.mmap(addr, len, prot_bits, flags, "")?
-        };
-        if let Some((path, base)) = pinned {
-            // Said as it happens: the end-of-run report is lost when the
-            // process is killed (a game run ends at its timeout).
-            if base != start {
-                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
-            }
-            self.pin_landed.push((path, base, start));
-        }
-        // Anonymous memory is defined to read as zero. Pages that already
-        // are stay untouched, so a large reservation costs no memory, and
-        // ranges known to be zero (`MemoryMap::clean`) are not even read.
-        let end = start + crate::mem::page_align_up(len);
-        // Arena the mapping had to claim is zero already: reading it to make
-        // sure faulted in every page of it (the guest's own first write then
-        // faulted again), 340 MB of `apt-get`'s malloc mappings a run. What
-        // the claim took past the mapping is free arena, still zero, and
-        // known clean for the next mapping into it.
-        let mut clean_before = clean_before;
-        if let Some((fs, fe)) = self.mem.take_fresh() {
-            let at = clean_before.partition_point(|&(s, _)| s < fs);
-            clean_before.insert(at, (fs, fe));
-            if end < fe {
-                self.mem.mark_clean(end.max(fs), fe);
-            }
-        }
-        for (a, b) in crate::mem::dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
-        }
-        if prot_bits & crate::mem::prot::WRITE == 0 {
-            self.mem.mark_clean(start, end);
-        }
-        Ok(start)
-    }
 
     // -- sessions, credentials and mounts --------------------------------------
 
@@ -7482,42 +7712,14 @@ impl Kernel {
         Ok(())
     }
 
-    /// `close`, which also drops any advisory lock the description held.
-    ///
-    /// Only when this was the last descriptor onto it: `dup` and `fork` share
-    /// one description and one lock, so closing a copy releases nothing. And
-    /// the lock is keyed by the description's address, which is handed
-    /// straight back to the next open -- a stale one would belong to an
-    /// unrelated file.
+    /// `close` ([`FdIo::close`]).
     fn sys_close(&mut self, fd: i32) -> SysResult {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file) as *const () as usize;
-        self.fds.close(fd)?;
-        // One reference in the table is gone; `file` is the other. Anything
-        // above that is another descriptor.
-        if Arc::strong_count(&file) == 1 {
-            self.file_locks.release(key);
-            // Last descriptor to an O_TMPFILE: drop its name. If a `linkat` gave
-            // it another (the atomic-write idiom), that name keeps the inode.
-            if let Some(tp) = &file.unlink_on_close {
-                let _ = self.vfs.unlink(tp);
-            }
-        }
-        Ok(0)
+        self.fd_io().close(fd)
     }
 
     /// `close_range`: shut every open descriptor in a span at once.
     fn sys_close_range(&mut self, first: u64, last: u64, flags: u64) -> SysResult {
-        // `CLOSE_RANGE_CLOEXEC` marks the span close-on-exec instead of closing
-        // it now; `CLOSE_RANGE_UNSHARE` asks for a private descriptor table
-        // first, which is a no-op here because a process already has its own.
-        const CLOSE_RANGE_CLOEXEC: u64 = 4;
-        if first > last {
-            return Err(Errno::EINVAL);
-        }
-        self.fds
-            .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
-        Ok(0)
+        self.fd_io().close_range(first, last, flags)
     }
 
     /// `membarrier`: force a memory barrier across the process's threads.
@@ -7585,35 +7787,10 @@ impl Kernel {
         set.ctl_queue(op, fd, events, data, source)
     }
 
-    /// Note that `[addr, addr + len)` no longer holds the code it did.
-    ///
-    /// Only ranges that overlap an executable mapping are worth reporting:
-    /// unmapping the heap or a data file happens constantly and has no
-    /// translations behind it.
-    pub fn retire_code(&mut self, addr: u64, len: u64) {
-        let (start, end) = (
-            crate::mem::page_align_down(addr),
-            crate::mem::page_align_up(addr.saturating_add(len)),
-        );
-        if end <= start {
-            return;
-        }
-        let executable = self
-            .mem
-            .vmas()
-            .iter()
-            .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
-        if executable {
-            self.retired_code.push((start, end));
-            crate::note_code_change();
-        }
-    }
 
     /// The anonymous shared file behind a descriptor, if it is one.
     fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.memfds.get(&key).cloned().ok_or(Errno::EINVAL)
+        self.fd_io().memfd_of(fd)
     }
 
     /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
@@ -7643,9 +7820,7 @@ impl Kernel {
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
     fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
-        let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file) as *const () as usize;
-        self.file_locks.flock(&file.path, key, op)
+        self.fd_io().flock(fd, op)
     }
 
     fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
@@ -7653,12 +7828,9 @@ impl Kernel {
         let raw = m.read_cstr(name, 249)?;
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
-        let handle: Arc<dyn crate::vfs::FileHandle> = memfd.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
         let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
-        let fd = self.fds.insert(file, flags & MFD_CLOEXEC != 0)?;
-        self.memfds.insert(key, memfd);
-        Ok(fd)
+        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
 
     fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
@@ -8093,18 +8265,13 @@ impl Kernel {
 
     // -- process and time ----------------------------------------------------
 
-    /// `dup2`: `dup3` without flags, except that `dup2(fd, fd)` is a no-op
-    /// that still validates the descriptor, where `dup3` would refuse.
+    /// `dup2` ([`FdIo::dup2`]).
     fn sys_dup2(&mut self, old: i32, new: i32) -> SysResult {
-        if old == new {
-            self.fds.get(old)?;
-            return Ok(new as u64);
-        }
-        self.sys_dup3(old, new, 0)
+        self.fd_io().dup2(old, new)
     }
 
     fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
-        let (secs, _) = (self.clock)();
+        let (secs, _) = guest_wall((self.clock)());
         if tloc != 0 {
             m.write_u64(tloc, secs)?;
         }
@@ -8184,7 +8351,7 @@ impl Kernel {
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
             c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
-            _ => (self.clock)(),
+            _ => guest_wall((self.clock)()),
         };
         m.write_u64(buf, secs)?;
         m.write_u64(buf + 8, nanos as u64)?;
@@ -8204,7 +8371,7 @@ impl Kernel {
         if buf == 0 {
             return Ok(0);
         }
-        let (secs, nanos) = (self.clock)();
+        let (secs, nanos) = guest_wall((self.clock)());
         m.write_u64(buf, secs)?;
         m.write_u64(buf + 8, (nanos / 1000) as u64)?;
         Ok(0)
@@ -8212,6 +8379,13 @@ impl Kernel {
 
     fn sys_nanosleep(&mut self, m: &GuestMem<'_>, req: u64) -> SysResult {
         nanosleep_answer(m, req)
+    }
+
+    /// The wall clock in nanoseconds as the guest reads it: an absolute
+    /// CLOCK_REALTIME deadline the guest names is on this clock.
+    fn guest_now_nanos(&mut self) -> u128 {
+        let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        (self.now_nanos() as i128 - shift as i128 * 1_000_000_000).max(0) as u128
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since
@@ -8337,175 +8511,6 @@ impl Kernel {
     }
 }
 
-/// Live process state, exposed to `/proc`.
-///
-/// Held behind a lock so procfs can read it without borrowing the kernel,
-/// which would deadlock against the syscall that is currently running.
-#[derive(Default, Clone)]
-pub struct ProcState {
-    pub pid: i32,
-    pub ppid: i32,
-    pub pgid: i32,
-    pub sid: i32,
-    pub maps: String,
-    pub cmdline: Vec<u8>,
-    pub environ: Vec<u8>,
-    pub exe: String,
-    pub cwd: String,
-    pub fds: Vec<(i32, String)>,
-    /// Which version of the memory map `maps` was rendered from.
-    ///
-    /// Not part of what `/proc` serves -- it is how the rendering is avoided.
-    /// See `MemoryMap::generation`.
-    pub maps_generation: u64,
-    /// Which version of the descriptor table `fds` was listed from.
-    pub fds_generation: u64,
-    /// The process table, for `/proc`'s view of the other processes.
-    pub procs: Option<Arc<ProcTable>>,
-    /// The image whose name and command line the table was last told.
-    pub info_exe: Option<String>,
-    /// The system's pseudoterminals, for `stat`'s `tty_nr`.
-    pub ptys: Option<crate::pty::Remote>,
-}
-
-/// The session's controlling terminal: its pts number (the pair's id) and
-/// foreground group.
-fn tty_of(ptys: Option<crate::pty::Remote>, sid: i32) -> Option<(u32, i32)> {
-    let r = ptys?;
-    let id = (r.for_sid)(sid);
-    (id >= 0).then(|| (id as u32, (r.fg)(id)))
-}
-
-/// A `/proc` source backed by a snapshot the kernel refreshes.
-pub struct KernelProcSource(pub Arc<Mutex<ProcState>>);
-
-impl ProcSource for KernelProcSource {
-    fn pid(&self) -> i32 {
-        self.0.lock().unwrap().pid
-    }
-    fn maps(&self) -> String {
-        self.0.lock().unwrap().maps.clone()
-    }
-    fn cmdline(&self) -> Vec<u8> {
-        self.0.lock().unwrap().cmdline.clone()
-    }
-    fn environ(&self) -> Vec<u8> {
-        self.0.lock().unwrap().environ.clone()
-    }
-    fn exe(&self) -> String {
-        self.0.lock().unwrap().exe.clone()
-    }
-    fn cwd(&self) -> String {
-        self.0.lock().unwrap().cwd.clone()
-    }
-    fn fds(&self) -> Vec<(i32, String)> {
-        self.0.lock().unwrap().fds.clone()
-    }
-    fn stat(&self) -> String {
-        let s = self.0.lock().unwrap();
-        let comm: String = s.exe.rsplit('/').next().unwrap_or("gex").chars().take(15).collect();
-        let tty = tty_of(s.ptys, s.sid);
-        crate::vfs::procfs::stat_line(s.pid, &comm, 'R', s.ppid, s.pgid, s.sid, tty)
-    }
-    fn others(&self) -> Vec<crate::proc::ProcEntry> {
-        let procs = self.0.lock().unwrap().procs.clone();
-        procs.map(|p| p.entries()).unwrap_or_default()
-    }
-    fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
-        let ptys = self.0.lock().unwrap().ptys;
-        tty_of(ptys, sid)
-    }
-    fn status(&self) -> String {
-        let s = self.0.lock().unwrap();
-        format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t1\n",
-            s.exe.rsplit('/').next().unwrap_or("gex"),
-            s.pid,
-            s.pid,
-            s.ppid
-        )
-    }
-}
-
-impl Kernel {
-    /// Refresh the snapshot `/proc` reads from.
-    pub fn refresh_proc(&self, state: &Mutex<ProcState>) {
-        let mut s = state.lock().unwrap();
-        s.pid = self.pid;
-        s.ppid = self.procs.ppid(self.pid);
-        s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
-        s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
-        s.ptys = self.ptys;
-        if s.procs.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &self.procs)) {
-            s.procs = Some(Arc::clone(&self.procs));
-        }
-        // Only when the map has actually changed. Formatting the VMA tree is
-        // the single most expensive thing this function does -- half of all
-        // execution in a browser run of an X server, which polls in a tight
-        // loop with several hundred mappings live -- and between two `mmap`s
-        // it produces the identical string every time.
-        let generation = self.mem.generation();
-        if s.maps_generation != generation || s.maps.is_empty() {
-            s.maps = self.mem.proc_maps();
-            s.maps_generation = generation;
-        }
-        // Compared before cloning, for the same reason at a smaller scale:
-        // these are two allocations per syscall to arrive at the bytes that
-        // are already there.
-        if s.exe != self.exe_path {
-            s.exe = self.exe_path.clone();
-            // An exec: a new name and command line, for this process's /proc
-            // and for every other's.
-            s.cmdline.clear();
-        }
-        if s.cwd != self.vfs.cwd {
-            s.cwd.clone_from(&self.vfs.cwd);
-        }
-        let fds_generation = self.fds.generation();
-        if s.fds_generation != fds_generation || s.fds.is_empty() {
-            // A pty end under the name a program can open and `stat`, which is
-            // how `ttyname` and `ps` find it.
-            s.fds = self.fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect();
-            s.fds_generation = fds_generation;
-        }
-        // argv and envp never change, so they are built once.
-        if s.cmdline.is_empty() {
-            s.cmdline = self
-                .argv
-                .iter()
-                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-                .collect();
-            s.environ = self
-                .envp
-                .iter()
-                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-                .collect();
-        }
-        // Said to the process table once per image, for the other processes'
-        // `/proc/<pid>` (`ps`, `htop`): the name, then the command line.
-        if s.info_exe.as_deref() != Some(s.exe.as_str()) {
-            let name = s.exe.rsplit('/').next().unwrap_or("gex");
-            let mut info = Vec::with_capacity(name.len() + 1 + s.cmdline.len());
-            info.extend_from_slice(name.as_bytes());
-            info.push(b'\n');
-            info.extend_from_slice(&s.cmdline);
-            self.procs.set_info(self.pid, &info);
-            s.info_exe = Some(s.exe.clone());
-        }
-    }
-}
-
-/// Whether a syscall could resolve a path through the VFS, and so needs
-/// `/proc` to be up to date before it runs.
-///
-/// A `/proc` file's contents are captured when it is *opened*, so a `read` on
-/// an already-open one needs nothing. Refreshing the snapshot means formatting
-/// the whole VMA tree and listing every descriptor, which is far too expensive
-/// to do before a `clock_gettime`.
-///
-/// This is deliberately a list of what does *not* need it rather than what
-/// does: forgetting to exclude a syscall costs a little speed, while
-/// forgetting to include one would serve a stale `/proc`.
 /// Whether canonical syscall `n` can change another thread's descriptor
 /// readiness (or signal state): what a host parking threads on descriptors
 /// must wake them for. Over-approximate (any read or write, of any file);
@@ -8542,53 +8547,6 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::TKILL
             | nr::TGKILL
             | nr::TIMERFD_SETTIME
-    )
-}
-
-pub fn skips_proc_snapshot(n: u64) -> bool {
-    matches!(
-        n,
-        nr::CLOCK_GETTIME
-            | nr::CLOCK_GETRES
-            | nr::GETTIMEOFDAY
-            | nr::CLOCK_NANOSLEEP
-            | nr::NANOSLEEP
-            | nr::GETPID
-            | nr::GETPPID
-            | nr::GETTID
-            | nr::GETUID
-            | nr::GETEUID
-            | nr::GETGID
-            | nr::GETEGID
-            | nr::FUTEX
-            | nr::SCHED_YIELD
-            | nr::READ
-            | nr::WRITE
-            | nr::READV
-            | nr::WRITEV
-            | nr::PREAD64
-            | nr::PWRITE64
-            | nr::LSEEK
-            | nr::CLOSE
-            | nr::FCNTL
-            | nr::IOCTL
-            | nr::MMAP
-            | nr::MUNMAP
-            | nr::MREMAP
-            | nr::MPROTECT
-            | nr::MADVISE
-            | nr::BRK
-            | nr::RT_SIGPROCMASK
-            | nr::RT_SIGACTION
-            | nr::RT_SIGRETURN
-            | nr::SIGALTSTACK
-            | nr::SET_ROBUST_LIST
-            | nr::SET_TID_ADDRESS
-            | nr::TKILL
-            | nr::CLONE
-            | nr::CLONE3
-            | nr::EXIT
-            | nr::EXIT_GROUP
     )
 }
 
@@ -9128,7 +9086,7 @@ mod tests {
             let mem = vec![0u8; 0x40000];
             let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
             k.vfs.mount("/", Arc::new(TmpFs::new()));
-            k.fds = FdTable::new();
+            k.fds = Arc::new(FdTable::new());
             for (stream, name, r, w) in [
                 (Stream::In, "/dev/stdin", true, false),
                 (Stream::Out, "/dev/stdout", false, true),
@@ -9379,7 +9337,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -9387,7 +9345,7 @@ mod tests {
         // Not in the class: declined before anything is done.
         set_args(&mut m, at, nr::GETPID, &[]);
         assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::CLOSE, &[rfd]);
+        set_args(&mut m, at, nr::FSTAT, &[rfd, 0x22000]);
         assert!(free(&k, &mut m, at).is_none());
 
         // An empty pipe parks both ways, on the same stream.
@@ -9557,7 +9515,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9618,7 +9576,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -9631,7 +9589,7 @@ mod tests {
         k.syscall(&mut m, 0);
         assert_eq!(errno(&m), Errno::EFAULT.as_return() as i64);
         // Mapped: the view follows the map.
-        k.mem.insert(word, word + 0x1000, crate::mem::prot::READ | crate::mem::prot::WRITE, "futex");
+        k.mem.lock().insert(word, word + 0x1000, crate::mem::prot::READ | crate::mem::prot::WRITE, "futex");
         assert!(k.mem.view().mapped(word, 4));
         assert!(!k.mem.view().mapped(word + 0xffe, 4));
         m.write_u32(word, 7).unwrap();
@@ -9666,7 +9624,7 @@ mod tests {
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
         assert_eq!(errno(&m), Errno::EAGAIN.as_return() as i64);
         // Unmapped again: EFAULT.
-        k.mem.unmap(word, 0x1000).unwrap();
+        k.mem.lock().unmap(word, 0x1000).unwrap();
         assert!(!k.mem.view().mapped(word, 4));
         set_args(&mut m, at, nr::FUTEX, &[word, wait as u64, 7, 0]);
         assert!(matches!(free(&k, &mut m, at), FreeOutcome::Done(_)));
@@ -10030,7 +9988,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -10107,7 +10065,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -10206,7 +10164,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -10218,7 +10176,7 @@ mod tests {
         let r32 = |m: &GuestMem<'_>| m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
         use crate::i386::raw;
         for lock_free in [true, false] {
-            let mut call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+            let call = |m: &mut GuestMem<'_>, k: &mut Kernel| {
                 if lock_free {
                     assert!(matches!(free(k, m, at), FreeOutcome::Done(_)));
                 } else {
@@ -10251,6 +10209,328 @@ mod tests {
             assert_eq!(r32(&m), -(Errno::EBADF.0 as i32));
             assert_eq!(m.read_u64(0x22000).unwrap(), 77);
         }
+    }
+
+    #[test]
+    fn free_fd_table_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::unix::lock_op;
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        let open = |m: &mut GuestMem<'_>, k: &mut Kernel| {
+            set_args(m, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            k.syscall(m, 0);
+            ret(m, at) as u64
+        };
+        let fd = open(&mut m, &mut k);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_GETFD: u64 = 1;
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        const F_GETLK: u64 = 5;
+        const F_ADD_SEALS: u64 = 1033;
+        const F_GET_SEALS: u64 = 1034;
+        let ebadf = -(Errno::EBADF.0 as i64);
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let mut got = Vec::new();
+            let d1 = sys(&mut m, &mut k, nr::DUP, &[fd]);
+            got.push(d1);
+            got.push(sys(&mut m, &mut k, nr::DUP3, &[fd, 21, oflags::O_CLOEXEC]));
+            got.push(sys(&mut m, &mut k, nr::DUP3, &[fd, fd, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[21, F_GETFD]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_DUPFD_CLOEXEC, 30]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[30, F_GETFD]));
+            m.write_u64(0x25000, !0).unwrap();
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GETLK, 0x25000]));
+            got.push(m.read(0x25000, 2).unwrap()[0] as i64);
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, oflags::O_NONBLOCK]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[d1 as u64, F_GETFL]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_SETFL, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[fd, F_GET_SEALS]));
+            // A second description of the file contends for its lock until
+            // the first's last descriptor closes; a copy's close is not that.
+            let own = open(&mut m, &mut k);
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[own, lock_op::EX]));
+            let other = open(&mut m, &mut k);
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[d1 as u64]));
+            let copy = sys(&mut m, &mut k, nr::DUP, &[own]);
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[copy as u64]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[21]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[30]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[30]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[own]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::EX | lock_op::NB]));
+            got.push(sys(&mut m, &mut k, nr::FLOCK, &[other, lock_op::UN]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[40, 50, 0]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[5, 4, 0]));
+            // `other` closed by its range.
+            got.push(sys(&mut m, &mut k, nr::CLOSE_RANGE, &[other, other, 0]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[other, F_GETFD]));
+            // A memfd's seals, found from its descriptor.
+            m.write(0x26000, b"mem\0").unwrap();
+            let mfd = sys_locked(&mut m, &mut k, at, nr::MEMFD_CREATE, &[0x26000, 0]);
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[mfd, F_ADD_SEALS, 2]));
+            got.push(sys(&mut m, &mut k, nr::FCNTL, &[mfd, F_GET_SEALS]));
+            got.push(sys(&mut m, &mut k, nr::CLOSE, &[mfd]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert_eq!(g[1], 21);
+        assert_eq!(g[2], -(Errno::EINVAL.0 as i64));
+        assert_eq!((g[3], g[4], g[5]), (1, 30, 1));
+        assert_eq!((g[6], g[7]), (0, 2), "F_GETLK: F_UNLCK");
+        assert_eq!(g[9] as u64 & oflags::O_NONBLOCK, oflags::O_NONBLOCK, "a copy shares the flags");
+        assert_eq!(g[11], -(Errno::EINVAL.0 as i64), "no seals on a file");
+        assert_eq!((g[12], g[13]), (0, -(Errno::EWOULDBLOCK.0 as i64)));
+        assert_eq!(g[16], -(Errno::EWOULDBLOCK.0 as i64), "a copy's close keeps the lock");
+        assert_eq!((g[17], g[18], g[19], g[20]), (0, 0, ebadf, 0));
+        assert_eq!(g[21], 0, "the last close released it");
+        assert_eq!((g[22], g[23], g[24]), (0, 0, -(Errno::EINVAL.0 as i64)));
+        assert_eq!((g[25], g[26]), (0, ebadf), "closed by its range");
+        assert_eq!((g[27], g[28], g[29]), (0, 2, 0));
+    }
+
+    #[test]
+    fn a_tmpfile_name_goes_with_its_last_descriptor() {
+        // Closed through the lock-free path, which has no kernel: the name
+        // goes with the description (`OpenFile`'s `Drop`).
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_TMPFILE | oflags::O_RDWR, 0o600]);
+        assert!((fd as i64) >= 0, "O_TMPFILE: {}", fd as i64);
+        let name = k.fds.get(fd as i32).unwrap().path.clone();
+        let copy = sys_locked(&mut m, &mut k, at, nr::DUP, &[fd]);
+        let close = |m: &mut GuestMem<'_>, k: &Kernel, fd: u64| {
+            set_args(m, at, nr::CLOSE, &[fd]);
+            let call = free_class(m, at, false).expect("close is in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
+            ret(m, at)
+        };
+        assert_eq!(close(&mut m, &k, fd), 0);
+        assert!(k.vfs.metadata(&name).is_ok(), "a copy is still open");
+        assert_eq!(close(&mut m, &k, copy), 0);
+        assert!(k.vfs.metadata(&name).is_err(), "{name} outlived its last descriptor");
+    }
+
+    /// A call made through the kernel, its result.
+    fn sys_locked(m: &mut GuestMem<'_>, k: &mut Kernel, at: u64, n: u64, a: &[u64]) -> u64 {
+        set_args(m, at, n, a);
+        k.syscall(m, 0);
+        ret(m, at) as u64
+    }
+
+    /// The mapping calls through the lock-free path ([`MapIo`]) answer as
+    /// the full call does, and leave the same notes for the host: two
+    /// kernels, the same calls, one through each path.
+    #[test]
+    fn free_mapping_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::mem::{flags as mf, prot};
+        let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            // Above the runtime's regions, where a guest's mappings go.
+            let mut buf = vec![0u8; 0x0708_0000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let rw = (prot::READ | prot::WRITE) as u64;
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07000000, 0x4000, rw, anon, !0, 0]));
+            m.write(0x07000000, b"dirty").unwrap();
+            got.push(sys(&mut m, &mut k, nr::MADVISE, &[0x07000000, 0x1000, 4]));
+            got.push(m.read(0x07000000, 1).unwrap()[0] as i64);
+            got.push(sys(&mut m, &mut k, nr::MPROTECT, &[0x07001000, 0x1000, (prot::READ | prot::EXEC) as u64]));
+            got.push(sys(&mut m, &mut k, nr::MPROTECT, &[0x07001000, 0x1000, rw]));
+            got.push(sys(&mut m, &mut k, nr::MREMAP, &[0x07003000, 0x1000, 0x3000, 0]));
+            // A shared file mapping reaches the file at msync; an executable
+            // one is code for the host.
+            m.write(0x20000, b"/m\0").unwrap();
+            let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            m.write(0x21000, &[7u8; 0x2000]).unwrap();
+            got.push(sys(&mut m, &mut k, nr::PWRITE64, &[fd, 0x21000, 0x2000, 0]));
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07010000, 0x2000, rw, mf::SHARED | mf::FIXED, fd, 0]));
+            m.write(0x07010010, b"shared").unwrap();
+            got.push(sys(&mut m, &mut k, nr::MSYNC, &[0x07010000, 0x2000, 4]));
+            got.push(sys(&mut m, &mut k, nr::PREAD64, &[fd, 0x22000, 6, 0x10]));
+            got.push((m.read(0x22000, 6).unwrap() == b"shared") as i64);
+            got.push(sys(&mut m, &mut k, nr::MMAP, &[0x07014000, 0x1000, (prot::READ | prot::EXEC) as u64, mf::PRIVATE | mf::FIXED, fd, 0]));
+            got.push(sys(&mut m, &mut k, nr::MUNMAP, &[0x07010000, 0x2000]));
+            got.push(sys(&mut m, &mut k, nr::MUNMAP, &[0x07014000, 0x1000]));
+            let base = sys(&mut m, &mut k, nr::BRK, &[0]);
+            got.push(sys(&mut m, &mut k, nr::BRK, &[base as u64 + 0x2000]) - base);
+            let mm = k.mem.lock();
+            let log = &mm.log;
+            got.push(log.recheck_code.len() as i64);
+            got.extend(log.retired_code.iter().flat_map(|&(a, b)| [a as i64, b as i64]));
+            got.extend(log.new_code.iter().map(|c| c.start as i64));
+            got.push(log.shared_maps.len() as i64);
+            got.push(mm.vmas().len() as i64);
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let g = &seen[0];
+        assert_eq!(g[0], 0x07000000);
+        assert_eq!((g[1], g[2]), (0, 0), "MADV_DONTNEED zeroes");
+        assert_eq!((g[3], g[4]), (0, 0));
+        assert_eq!((g[7], g[8], g[9], g[10]), (0x07010000, 0, 6, 1), "msync wrote the file");
+        assert_eq!((g[11], g[12], g[13]), (0x07014000, 0, 0));
+        assert_eq!(g[14], 0x2000);
+        assert_eq!(g[15], 1, "made executable again: a recheck");
+        assert_eq!(&g[16..20], &[0x07001000, 0x07002000, 0x07014000, 0x07015000], "retired: made writable, unmapped");
+        assert_eq!((g[20], g[21]), (0x07014000, 0), "code mapped; no shared mapping left");
+    }
+
+    /// The 32-bit ABI's mapping calls through the lock-free path: `mmap2`'s
+    /// page offset and `-1` descriptor, the old `mmap`'s argument block,
+    /// addresses above 2 GiB not sign-extended.
+    #[test]
+    fn free_i386_mapping_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::i386::raw;
+        use crate::mem::{flags as mf, prot};
+        let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
+        let rw = (prot::READ | prot::WRITE) as u64;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            k.compat = true;
+            let mut buf = vec![0u8; 0x0708_0000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: [u64; 6]| {
+                m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+                }
+                if lock_free {
+                    let call = free_class(m, at, true).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32 as i64
+            };
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, raw::MMAP2, [0x0700_0000, 0x2000, rw, anon, 0xffff_ffff, 0]));
+            // The old form: six words at a pointer.
+            for (i, v) in [0x0700_4000u32, 0x1000, rw as u32, anon as u32, 0xffff_ffff, 0].iter().enumerate() {
+                m.write_u32(0x30000 + 4 * i as u64, *v).unwrap();
+            }
+            got.push(sys(&mut m, &mut k, raw::MMAP, [0x30000, 0, 0, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::MPROTECT, [0x0700_1000, 0x1000, prot::READ as u64, 0, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::MUNMAP, [0x0700_0000, 0x1000, 0, 0, 0, 0]));
+            let base = sys(&mut m, &mut k, raw::BRK, [0; 6]);
+            got.push(sys(&mut m, &mut k, raw::BRK, [base as u64 + 0x1000, 0, 0, 0, 0, 0]) - base);
+            got.push(k.mem.lock().vmas().len() as i64);
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(&seen[0][..5], &[0x0700_0000, 0x0700_4000, 0, 0, 0x1000]);
+    }
+
+    #[test]
+    fn free_i386_fd_table_calls_answer_as_the_kernel_does() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        m.write(0x20000, b"/f\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        k.compat = true;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, true).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, uid: k.uid, wasm32: false, futex, started: k.started };
+            free_call(&f, m, at, call)
+        }
+        use crate::i386::raw;
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: [u64; 3]| {
+                m.write_u64(at + ctx::x(0) as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + crate::i386::ARG_SLOTS[i] as u64, *v).unwrap();
+                }
+                if lock_free {
+                    assert!(matches!(free(k, m, at), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32
+            };
+            let mut got = Vec::new();
+            got.push(sys(&mut m, &mut k, raw::DUP2, [fd, 20, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP2, [fd, fd, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP3, [fd, 21, oflags::O_CLOEXEC]));
+            got.push(sys(&mut m, &mut k, raw::FCNTL64, [21, 1, 0]));
+            // F_GETLK64 (12) is the 32-bit ABI's F_GETLK.
+            m.write_u64(0x25000, !0).unwrap();
+            got.push(sys(&mut m, &mut k, raw::FCNTL64, [fd, 12, 0x25000]));
+            got.push(m.read(0x25000, 2).unwrap()[0] as i32);
+            got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 2, 0]));
+            got.push(sys(&mut m, &mut k, raw::FLOCK, [fd, 8, 0]));
+            got.push(sys(&mut m, &mut k, raw::CLOSE, [20, 0, 0]));
+            got.push(sys(&mut m, &mut k, raw::CLOSE, [20, 0, 0]));
+            // close_range's bounds are unsigned: ~0 is "to the end".
+            got.push(sys(&mut m, &mut k, raw::CLOSE_RANGE, [21, 0xffff_ffff, 0]));
+            got.push(sys(&mut m, &mut k, raw::FCNTL, [21, 1, 0]));
+            got.push(sys(&mut m, &mut k, raw::DUP, [0xffff_ffff, 0, 0]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let ebadf = -(Errno::EBADF.0 as i32);
+        assert_eq!(seen[0], vec![20, fd as i32, 21, 1, 0, 2, 0, 0, 0, ebadf, 0, ebadf, ebadf]);
     }
 
     #[test]

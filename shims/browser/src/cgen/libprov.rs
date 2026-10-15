@@ -119,9 +119,10 @@ fn installed(path: &str, file: &str) -> Option<String> {
     if let Some((_, r)) = lock(&AUTO_SEEN).iter().find(|(k, _)| *k == key) {
         return r.clone();
     }
-    let found = crate::with_host(|h| {
+    let found = (|| {
+        let h = crate::sigs::proc_home();
         let mut ehdr = [0u8; 20];
-        if h.kernel.read_file_at(path, 0, &mut ehdr) != Some(20) || ehdr[..4] != *b"\x7fELF" {
+        if h.read_file_at(path, 0, &mut ehdr) != Some(20) || ehdr[..4] != *b"\x7fELF" {
             return None;
         }
         let arch = match u16::from_le_bytes([ehdr[18], ehdr[19]]) {
@@ -132,8 +133,8 @@ fn installed(path: &str, file: &str) -> Option<String> {
         };
         let wasm = format!("{PROVIDER_DIR}/{arch}/{file}.wasm");
         let mut magic = [0u8; 4];
-        (h.kernel.read_file_at(&wasm, 0, &mut magic) == Some(4) && magic == *b"\0asm").then_some(wasm)
-    });
+        (h.read_file_at(&wasm, 0, &mut magic) == Some(4) && magic == *b"\0asm").then_some(wasm)
+    })();
     lock(&AUTO_SEEN).push((key, found.clone()));
     found
 }
@@ -181,14 +182,14 @@ pub(crate) fn note_stray(pc: u64) {
 fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::flags;
     let len = (size + 0xfff) & !0xfff;
-    crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    crate::sigs::proc_home().mm().lock().mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// A forked child's copy of the mapping [`alloc_low`] made in its parent
 /// (by name): the provider's data, heap and code page are the child's as
 /// the rest of its memory is.
 fn inherited(name: &str) -> Option<u64> {
-    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.name == name).map(|v| v.start))
+    crate::sigs::proc_home().mm().lock().vmas().iter().find(|v| v.name == name).map(|v| v.start)
 }
 
 /// The process the state above is for: a forked child's shim starts with
@@ -210,16 +211,7 @@ pub(crate) fn rescan_if_new() -> Option<usize> {
     lock(&LIBS).clear();
     lock(&REPLACED).clear();
     THREAD_ENTRY.store(0, Ordering::Release);
-    let mapped: Vec<gex_kernel::CodeMap> = crate::with_host(|h| {
-        use gex_kernel::mem::prot;
-        h.kernel
-            .mem
-            .vmas()
-            .iter()
-            .filter(|v| v.prot & prot::EXEC != 0)
-            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
-            .collect()
-    });
+    let mapped = crate::sigs::proc_home().code_maps();
     maps(&mapped)
 }
 
@@ -251,7 +243,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
 }
 
 fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, String> {
-    let bytes = crate::with_host(|h| h.kernel.read_file(&m.path)).ok_or("cannot read the library")?;
+    let bytes = crate::sigs::proc_home().read_file(&m.path).ok_or("cannot read the library")?;
     let image = gex_ld::elf::load(&bytes, 0).map_err(|e| format!("{e:?}"))?;
     let text = image.segments.iter().find(|s| s.executable).ok_or("no executable segment")?;
     let bias = m.start.wrapping_sub(text.vaddr & !0xfff);
@@ -260,7 +252,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
     }
     let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
     lock(&REPLACED).push((lo.wrapping_add(bias), hi.wrapping_add(bias)));
-    let wasm = crate::with_host(|h| h.kernel.read_file(wasm_path)).ok_or_else(|| format!("cannot read its provider module {wasm_path}"))?;
+    let wasm = crate::sigs::proc_home().read_file(wasm_path).ok_or_else(|| format!("cannot read its provider module {wasm_path}"))?;
     let slots = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
     let slot = |n: &str| slots.iter().position(|s| s.as_deref() == Some(n)).map(|k| k as u32);
     let missing = slot("gexp__missing").ok_or("no gexp__missing in its module's table")?;
@@ -560,9 +552,9 @@ static OBJ_SYMS: Mutex<Option<HashMap<String, Arc<ObjSyms>>>> = Mutex::new(None)
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
     let name = String::from_utf8_lossy(crate::guest_bytes().get(ptr as usize..(ptr + len) as usize).unwrap_or(&[])).into_owned();
-    let maps: Vec<(u64, String)> = crate::with_host(|h| {
-        h.kernel.mem.vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
-    });
+    let maps: Vec<(u64, String)> = {
+        crate::sigs::proc_home().mm().lock().vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
+    };
     let mut seen = std::collections::HashSet::new();
     for (start, path) in maps {
         if !seen.insert(path.clone()) {
@@ -572,7 +564,7 @@ pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
         let syms = match cached {
             Some(s) => s,
             None => {
-                let Some(bytes) = crate::with_host(|h| h.kernel.read_file(&path)) else { continue };
+                let Some(bytes) = crate::sigs::proc_home().read_file(&path) else { continue };
                 let Ok(image) = gex_ld::elf::load(&bytes, 0) else { continue };
                 let Some(text) = image.segments.iter().find(|s| s.executable) else { continue };
                 let map = image.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value != 0).map(|y| (y.name.clone(), y.value)).collect();
@@ -591,7 +583,7 @@ pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
 /// `gex.provider_guest_stack_end(sp)`: the end of the mapping holding `sp`.
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_stack_end(sp: u64) -> u64 {
-    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end))
+    crate::sigs::proc_home().mm().lock().vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)
 }
 
 /// `gex.provider_abi(which)`: constants of gex's ABI a provider calling
@@ -1003,7 +995,7 @@ pub(crate) fn elf_unit_maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         if !list.iter().any(|n| n == "all" || n == file) {
             continue;
         }
-        let Some(bytes) = crate::with_host(|h| h.kernel.read_file(&m.path)) else { continue };
+        let Some(bytes) = crate::sigs::proc_home().read_file(&m.path) else { continue };
         let Some(base) = elf_bias(&bytes, m.start, m.offset) else { continue };
         if lock(&ELF_PLACED).iter().any(|(p, b, _)| *p == m.path && *b == base) {
             continue;

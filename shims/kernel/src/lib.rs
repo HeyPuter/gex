@@ -1668,6 +1668,26 @@ pub extern "C" fn k_signal_seq() -> i32 {
     gex_kernel::proc::signal_seq() as i32
 }
 
+/// `tgkill` to a thread of another process: left for that thread alone, for
+/// its process to collect. Returns 0 or a negative errno.
+#[no_mangle]
+pub extern "C" fn k_tkill(caller: i32, pid: i32, tid: i32, signo: u32) -> i32 {
+    if signo != 0 {
+        note_kill(caller, pid, signo);
+    }
+    match procs().tkill(caller, pid, tid, signo) {
+        Ok(()) => 0,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// One thread-directed signal for `pid`'s thread `tid` (0: any thread),
+/// packed (`ProcTable::take_thread_signals`), or zero.
+#[no_mangle]
+pub extern "C" fn k_take_thread_signal(pid: i32, tid: i32) -> i64 {
+    procs().take_thread_signal_packed(pid, tid)
+}
+
 /// Signal every process in a group, naming the group positively. `k_kill`
 /// cannot reach group 1: target -1 means "every process", so the group a shell
 /// running as pid 1 is in has no negative spelling.
@@ -3082,6 +3102,27 @@ pub extern "C" fn k_boot_secs(want: u32) -> u32 {
     use std::sync::atomic::Ordering;
     match BOOT_SECS.compare_exchange(0, want.max(1), Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => want.max(1),
+        Err(had) => had,
+    }
+}
+
+/// The benchmark clocks every process reads (gex-kernel `set_guest_clock`):
+/// the monotonic clocks' speed in thousandths (high half) and the seconds
+/// the wall clock is set back (low half, signed); 0 for real time.
+static GUEST_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the benchmark clocks if no one has (`scale_milli` 0: only asks) and
+/// returns what they are, packed as [`GUEST_CLOCK`]. The page's first
+/// process sets them, before any guest code reads a clock.
+#[no_mangle]
+pub extern "C" fn k_guest_clock(scale_milli: u32, wall_shift: i32) -> u64 {
+    use std::sync::atomic::Ordering;
+    let want = (scale_milli as u64) << 32 | wall_shift as u32 as u64;
+    if scale_milli == 0 {
+        return GUEST_CLOCK.load(Ordering::Acquire);
+    }
+    match GUEST_CLOCK.compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => want,
         Err(had) => had,
     }
 }

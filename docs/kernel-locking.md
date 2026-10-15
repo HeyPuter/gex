@@ -346,6 +346,45 @@ trap does not unwind, so a guard held across it never drops.
 - **Cost:** two relaxed stores and one acquire load per syscall.
 - **Natively,** the same code runs with `std`.
 
+### 4.3 Lock order
+
+Three locks nest. Every path takes them in this order, and gives none back
+out of order:
+
+    KLock (rank 1)  ->  JIT state (rank 2)  ->  memory map (rank 3)
+
+- **KLock,** the rest of the old kernel lock (`with_host`): outermost.
+- **The JIT state** (`JIT` in shims/browser/src/lib.rs, step L13): the page
+  table, translated set, intrinsics, registry and pending queue of a
+  process, in a box of its own. A kernel call takes it on its first touch
+  of `Host::jit` (`JitHere`) and gives it back just before KLock
+  (`KLock`'s release; the end of an SP `with_host`). What touches only the
+  JIT state takes it alone, with no KLock (`with_jit_only`); its closure
+  may not enter the kernel. The translator still takes the page table,
+  translated set and intrinsics out (`jitout`) and lifts holding neither
+  lock; a waiter for them outside the kernel waits with the JIT lock given
+  back.
+- **The memory map** (`Mm`, step L12a): innermost. Nothing is taken under
+  it; a path that holds an `Mm` guard and then needs the JIT state drops
+  the guard first.
+- **Leaf locks** (a pipe's, a futex shard's, the descriptor table's, the
+  epoch lists) take nothing under them and are not ranked.
+
+**The check:** `gex_kernel::sync::rank` numbers the three, and
+`sync::rank_take` panics in a debug build (`debug_assertions`, or the
+`lock-ranks` feature) when a thread takes a ranked lock while holding one
+of the same or a higher rank: an order broken, or a re-entry that would
+hang. KLock calls it at its
+outermost take; `sync::Mutex::ranked` locks call it in `lock()`. A
+deadlock between two Workers then shows as a panic on one, naming the
+ranks it held. `check_trap_out` clears the record with the held count.
+Release builds skip it unless built with the `lock-ranks` feature
+(`GEX_LOCK_RANKS=1 shims/browser/build.sh`): the page shim cannot be built
+with debug assertions whole, since core's own checks reject its slices of
+guest memory at address 0. Tests: `ranked_locks_nest_in_rank_order`,
+`a_ranked_lock_under_a_higher_one_panics`,
+`a_ranked_lock_taken_again_panics_rather_than_hangs` (gex-kernel sync).
+
 ## 5. Order of landing, each step with its gate leg
 
 Every step lands alone, in a gate round. The gate runs:
@@ -488,6 +527,28 @@ in the scheduler pick after each wake of the global WAKE word: about
      `pread64` 20 in pid 2). Legs: the i386 builds of
      `close-while-reading`, `kernel-contend` and `ioctl-threads`, page
      tier and SP; `free_i386_positioned_calls_answer_as_the_kernel_does`.
+   - The descriptor table's own calls (L10): `close`, `close_range`,
+     `dup`, `dup2`, `dup3`, `fcntl` (i386's `fcntl64` too) and `flock`
+     are in the free class, as `FdIo` methods the kernel's calls use too.
+     The table publishes itself and the `flock` table locks itself. What
+     the kernel lock had been making safe was the "last descriptor" test
+     (`Arc::strong_count == 1` after the close). Without the lock it is
+     wrong both ways: two threads closing the last two copies at once each
+     still hold one, and a replaced copy of the table holds one until its
+     readers move on. So the lock and an `O_TMPFILE`'s name now go when
+     the description itself does (`OpenFile`'s `Drop`, Linux's last
+     `fput`). A `close` of such a description waits for the table's
+     replaced copies (`FdTable::settle`, `Published::settle`), so the lock
+     is gone when the call returns. For that, `Published` now retires a
+     replaced value under its writers' mutex, and counts the values being
+     dropped. A memfd is found from its handle (`FileHandle::as_memfd`),
+     not a per-kernel map. Legs: `fdtable-threads` (the dup family, flags
+     and close racing on one table while a writer feeds a pipe through
+     copies; flock released by the last close and not before) in the page
+     tier, x86-64 and i386, and SP;
+     `free_fd_table_calls_answer_as_the_kernel_does`, its i386 twin,
+     `a_tmpfile_name_goes_with_its_last_descriptor`, and gex-atomic's
+     `settle_drops_every_value_replaced_before_it`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:
@@ -512,6 +573,74 @@ in the scheduler pick after each wake of the global WAKE word: about
 7. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
    published VMA snapshot for readers (dispatch_miss, faults,
    /proc/self/maps).
+   - The mm lock (L12a): `Kernel::mem` is an `Mm`, the process's
+     `MemoryMap` behind its own `gex_kernel::sync::Mutex`, with the
+     published view (`MapView`) beside it, read without the lock. Every
+     reader and writer takes it for a leaf computation (`k.mem.lock()`),
+     never across a trap; a copy (`fork`, a vfork child) is a copy of the
+     map with its own lock and view, and `Mm::shared` is the same map for
+     a holder outside the kernel.
+   - The mapping calls without the kernel lock (L12b): `mmap`, `munmap`,
+     `mprotect`, `brk`, `mremap`, `madvise` and `msync` are in the free
+     class (`syscalls::MapIo`, with i386's `mmap2` and old `mmap`). What
+     they note for the host moved from `Kernel` into the map, under its
+     lock (`mem::MapLog`: code mapped and retired, the pin and placement
+     armed by `openat`, where pins landed, shared file mappings); the pins
+     and the placement are process constants, published with the map in
+     the page's `sigs::Home`. A call that can take code away (`mmap`,
+     `munmap`, `mprotect`, `mremap`) is made and its code retired under
+     the JIT lock (`free_syscall`, `map_drain`): JIT then mm, so nothing
+     translates or runs the old code between the two and a freed address
+     is not mapped again with new code before its translations are gone.
+     `mremap` copies with the mm lock held, so another thread's mapping
+     cannot land in the range it vacates before its bytes are out.
+     The log is drained only under the JIT lock, held until what was taken
+     is retired (`take_logged`), and every call that makes code executable
+     drains it before it returns: the free path's, the locked path's
+     (`retire_unmapped_code_in`) and the NT layer's (its calls still run
+     under the kernel lock, their drain a section after the call). So
+     whichever path unmapped code, a thread that maps new code at that
+     address either retires the old translations itself or waits for whoever
+     took them to finish; none runs the old code there. `mprotect` merges
+     the neighbours it makes alike again, as Linux does, so a range made
+     read-only and writable again is one mapping for `mremap`. Still under
+     the kernel lock: the NT layer's mapping calls themselves. Legs:
+     `free_mapping_calls_answer_as_the_kernel_does`,
+     `free_i386_mapping_calls_answer_as_the_kernel_does`,
+     `protect_back_merges_and_mremap_takes_the_whole`; `mmap-threads`
+     (x86-64, i386, aarch64) in the page tier; W3 `vmreuse` (NT
+     VirtualAlloc/VirtualProtect/VirtualFree with code at reused
+     addresses, from four threads).
+   - The mapped-code drains without the kernel lock (L12c): what runs after
+     a call that mapped code -- the recompile queue (`recompile_objects`,
+     and `maybe_recompile_at` on a miss) under the JIT lock alone
+     (`with_jit_only`); export providers, replaced libraries and units
+     (`elfprov::maps`, `libprov::maps`, `elf_unit_maps`, the forked child's
+     `rescan_if_new`, `gex_libprov_guest_sym`/`guest_stack_end`, the
+     provider's own low mappings) and the intrinsics scan (`note_intrinsics`)
+     read files through the process's published namespace and the map
+     through `Mm::shared`, both in `sigs::Home` (`Home::read_file`,
+     `Home::code_maps`, `sigs::proc_home`). `note_intrinsics` had taken the
+     JIT lock under mm (against §4.3; fixed on its own first). Still under
+     the kernel lock: `recompile_object`, the bulk translator, which shares
+     the miss path's slot and identity bookkeeping. Leg: `codemap-threads`
+     (x86-64, i386; page tier, also with `GEX_ELF_UNITS=all` and
+     `GEX_RECOMPILE_OBJECTS=1`): copies of the program mapped executable
+     from a file and called from three threads while two churn anonymous
+     mappings.
+   - `/proc` without a refresh (L14a): the page refreshed a snapshot of the
+     process (`ProcState`: the map rendered, the descriptors listed, the
+     image) under the lock before every syscall that might open a `/proc`
+     file. `/proc/self` now reads the process's own published state live
+     (`proclive::ProcCell`): the map through `Mm::shared`, the descriptor
+     table (now an `Arc<FdTable>` in `Kernel`) through its published copy,
+     the directory through the published namespace and the relations
+     through the process table. The image (name, argv, environment) is
+     published at a process's start, a vfork child's start and an exec
+     (`Kernel::publish_proc`). An exec that kept the program's path left the
+     old command line in `/proc/self/cmdline`; the image is now compared by
+     argv. Leg: `proc-threads` (x86-64, i386, aarch64; page tier and SP)
+     and `proc_reads_the_process_live`.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
@@ -540,6 +669,36 @@ in the scheduler pick after each wake of the global WAKE word: about
      second in Noita's process, 16 in each Wine process's). Legs:
      `the_shared_map_view_follows_the_list`; the Noita page and the core
      gate's browser and gears legs, which pump.
+   - The miss path before a translation (L11, §3.6's first part): no
+     lock.
+     - A handler's return through `SIGRETURN_TRAMPOLINE` (every handler
+       on aarch64, where musl sets no restorer) restores the frame
+       through the thread's own signal state (`sigs::sigreturn`).
+     - The x86 check that a branch target is executable reads the map's
+       published view (`MapView::prot_at`; the map itself in SP).
+     - The fill's record of the spans it asked about and the pages nobody
+       could fill has its own lock (`FILL_ASKED`, `gex_kernel::sync::Mutex`).
+     A miss a module already in the process answers (a fill) took the
+     lock twice, and now takes none. A miss that translates still takes
+     it in `with_jit` (§3.6's lift and install), as do the wild-branch
+     report and the eject stop, which end the process. Legs: the page
+     tier's signal programs (`signal-storm`, `thread-signals`,
+     `sa-restart`, `pwait-sigmask`) built for aarch64 as well as x86.
+   - The JIT state's own lock (L13, §4.3): the page table, translated
+     set, intrinsics, registry and pending queue left `Host` for a
+     per-process box (`JIT`), ranked between KLock and the mm. Kernel
+     calls take it on first touch and give it back before KLock; the 24
+     `with_jit` callers that touch nothing else (a fill's directory
+     catch-up, the self-modifying-code retire, the unit and closure
+     directory writes, the coverage and slot getters) take it alone, with
+     no KLock (`with_jit_only`). The miss's lift and install still go
+     through `with_jit` (they read the thread table and the object
+     identities); the mapping calls (L12b) are made and retire their code
+     under this lock.
+     Legs: the page tier's translation programs (`retire-during-lift`,
+     `smc-race`, `smc-threads`, `smc-direct-jump`, `page-cross-entry`)
+     and the rest of the page tier with the order checked
+     (`GEX_LOCK_RANKS=1`).
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

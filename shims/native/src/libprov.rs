@@ -192,7 +192,7 @@ fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     use gex_kernel::mem::prot;
     let len = (size + 0xfff) & !0xfff;
     state
-        .with_kernel(|k| k.mem.mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .with_kernel(|k| k.mem.lock().mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
@@ -209,7 +209,7 @@ pub(crate) fn alloc_above_code(state: &mut HostState, size: u64, name: &str) -> 
     let mut at = (0x1_0000_0000u64.saturating_sub(len + STEP)) & !0xffff;
     while at >= FLOOR {
         let r = state.with_kernel(|k| {
-            k.mem.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, name)
+            k.mem.lock().mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, name)
         });
         if let Ok(a) = r {
             return Ok(a);
@@ -234,7 +234,7 @@ fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
     }
     use gex_kernel::mem::prot;
     state
-        .with_kernel(|k| k.mem.mmap_low(0, CODE_PAGE, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .with_kernel(|k| k.mem.lock().mmap_low(0, CODE_PAGE, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
@@ -578,7 +578,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         caller.data_mut().with_kernel(|k| {
             let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
             if end > start {
-                k.retired_code.push((start, end));
+                k.mem.lock().log.retired_code.push((start, end));
             }
         });
         gex_kernel::note_code_change();
@@ -772,7 +772,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     // stack top, for scanning it).
     linker.func_wrap(IMPORT_MODULE, "provider_guest_stack_end", |mut caller: Caller<'_, HostState>, sp: i64| -> i64 {
         let sp = sp as u64;
-        caller.data_mut().with_kernel(|k| k.mem.vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)) as i64
+        caller.data_mut().with_kernel(|k| k.mem.lock().vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)) as i64
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_code_page", |_caller: Caller<'_, HostState>| -> i64 {
         THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
@@ -786,7 +786,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
 /// Linux libraries already given their provider: (path, load bias).
 static ELF_INSTALLED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
-/// After a Linux syscall that mapped executable code (`Kernel::new_code`):
+/// After a Linux syscall that mapped executable code (`MapLog::new_code`):
 /// a shared object one of this process's stateful providers serves gets
 /// its exports bound to the provider, before anything can call them
 /// (docs/unity-dotnet.md: Unity's `libmonobdwgc-2.0.so`). The library's
@@ -856,7 +856,7 @@ static OBJ_SYMS: Mutex<Option<std::collections::HashMap<String, Arc<ObjSyms>>>> 
 /// address first.
 fn guest_sym(state: &mut HostState, name: &str) -> Option<u64> {
     let maps: Vec<(u64, String)> = state.with_kernel(|k| {
-        k.mem.vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
+        k.mem.lock().vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
     });
     let mut seen = std::collections::HashSet::new();
     for (start, path) in maps {

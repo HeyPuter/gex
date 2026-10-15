@@ -18,7 +18,6 @@
 use super::{FileHandle, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
 use std::sync::Mutex;
-use std::time::Instant;
 
 /// Which node a handle was opened as.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -71,8 +70,9 @@ struct Stream {
     channels: u32,
     /// Bytes written and not yet played.
     queued: u64,
-    /// When `queued` was last brought up to date.
-    at: Instant,
+    /// When `queued` was last brought up to date, in nanoseconds of the
+    /// host's clock (`tmpfs::now_ns`: the browser has no `std::time`).
+    at: u64,
 }
 
 impl Stream {
@@ -88,8 +88,8 @@ impl Stream {
 
     /// Play what the time since the last look has played.
     fn drain(&mut self) {
-        let now = Instant::now();
-        let ns = now.duration_since(self.at).as_nanos() as u64;
+        let now = super::tmpfs::now_ns();
+        let ns = now.saturating_sub(self.at);
         let played = (ns as u128 * self.bytes_per_second() as u128 / 1_000_000_000) as u64;
         if played > 0 || self.queued == 0 {
             self.queued = self.queued.saturating_sub(played);
@@ -109,7 +109,7 @@ impl OssHandle {
     pub fn new(node: OssNode) -> OssHandle {
         OssHandle {
             node,
-            stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: Instant::now() }),
+            stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: super::tmpfs::now_ns() }),
         }
     }
 }
@@ -298,7 +298,7 @@ impl FileHandle for OssHandle {
             SNDCTL_DSP_RESET | SNDCTL_DSP_SYNC => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
                 s.queued = 0;
-                s.at = Instant::now();
+                s.at = super::tmpfs::now_ns();
                 Ok(0)
             }
             _ => return None,
@@ -310,6 +310,7 @@ impl FileHandle for OssHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn the_buffer_drains_with_the_clock() {

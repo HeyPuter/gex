@@ -10,7 +10,7 @@ use crate::errno::{Errno, SysResult};
 use crate::pipe::Pipe;
 use crate::vfs::{DirEntry, FileHandle, FileType, Metadata};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A shared open-file description.
 #[derive(Debug)]
@@ -38,9 +38,42 @@ pub struct OpenFile {
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
     /// AT_SYMLINK_FOLLOW)` idiom -- how QSaveFile, and thus every Qt/KDE app,
-    /// materialises an atomic write -- can find it. Cleaned up here so it does
-    /// not linger visibly in the directory.
-    pub unlink_on_close: Option<String>,
+    /// materialises an atomic write -- can find it. Cleaned up when the
+    /// description goes (`Drop`) so it does not linger visibly in the
+    /// directory.
+    pub unlink_on_close: Option<TmpName>,
+    /// The `flock` table this description has taken a lock in, if any: its
+    /// lock goes when the description does (`Drop`), as Linux's last `fput`
+    /// releases it. Not when a descriptor's `close` counts what is left:
+    /// without a kernel lock two threads closing the last two copies at
+    /// once each still hold one, and a descriptor table's replaced copies
+    /// hold one until their readers move on.
+    locks: OnceLock<Arc<crate::unix::FileLocks>>,
+}
+
+/// An `O_TMPFILE`'s name, and the namespace it was made in.
+pub struct TmpName {
+    pub path: String,
+    ns: Arc<crate::vfs::Namespace>,
+}
+
+impl std::fmt::Debug for TmpName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TmpName").field(&self.path).finish()
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let Some(locks) = self.locks.get() {
+            locks.release(self as *const OpenFile as usize);
+        }
+        // If a `linkat` gave it another name (the atomic-write idiom), that
+        // name keeps the inode.
+        if let Some(t) = &self.unlink_on_close {
+            let _ = t.ns.unlink(&t.path);
+        }
+    }
 }
 
 impl OpenFile {
@@ -62,6 +95,7 @@ impl OpenFile {
             readable,
             writable,
             unlink_on_close: None,
+            locks: OnceLock::new(),
         })
     }
 
@@ -70,6 +104,7 @@ impl OpenFile {
     pub fn tmpfile(
         handle: Arc<dyn FileHandle>,
         path: String,
+        ns: Arc<crate::vfs::Namespace>,
         flags: u64,
         readable: bool,
         writable: bool,
@@ -78,7 +113,8 @@ impl OpenFile {
             handle,
             offset: AtomicU64::new(0),
             flags: AtomicU64::new(flags),
-            unlink_on_close: Some(path.clone()),
+            unlink_on_close: Some(TmpName { path: path.clone(), ns }),
+            locks: OnceLock::new(),
             path,
             pos: Mutex::new(()),
             dir_pos: AtomicUsize::new(0),
@@ -86,6 +122,23 @@ impl OpenFile {
             readable,
             writable,
         })
+    }
+
+    /// Its `flock` key, the description's address: a stable name while it
+    /// lives, and released before it is reused (`Drop`).
+    pub fn lock_key(self: &Arc<Self>) -> usize {
+        Arc::as_ptr(self) as usize
+    }
+
+    /// Note the `flock` table it has a lock in, for its `Drop` to release.
+    pub fn note_locks(&self, locks: &Arc<crate::unix::FileLocks>) {
+        let _ = self.locks.get_or_init(|| Arc::clone(locks));
+    }
+
+    /// Whether its going undoes something (a lock, a temporary name), which
+    /// a `close` waits to see done ([`FdTable::settle`]).
+    pub fn undoes_on_last_close(&self) -> bool {
+        self.locks.get().is_some() || self.unlink_on_close.is_some()
     }
 
     pub fn flags(&self) -> u64 {
@@ -445,6 +498,14 @@ impl FdTable {
             }
             Ok::<_, ()>(())
         });
+    }
+
+    /// Wait until no replaced copy of the table outlives this call: what
+    /// the copies held that nothing else does is dropped by then. A
+    /// `close` whose description undoes something when it goes calls it,
+    /// so the lock or name is gone when the call returns, as on Linux.
+    pub fn settle(&self) {
+        self.cur.settle();
     }
 
     pub fn close(&self, fd: i32) -> Result<(), Errno> {

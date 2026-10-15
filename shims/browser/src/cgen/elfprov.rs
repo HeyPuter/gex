@@ -83,16 +83,7 @@ fn rescan_if_new() -> bool {
     }
     lock(&BOUND).clear();
     queue(|q| q.clear());
-    let mapped: Vec<gex_kernel::CodeMap> = crate::with_host(|h| {
-        use gex_kernel::mem::prot;
-        h.kernel
-            .mem
-            .vmas()
-            .iter()
-            .filter(|v| v.prot & prot::EXEC != 0)
-            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
-            .collect()
-    });
+    let mapped = crate::sigs::proc_home().code_maps();
     maps(&mapped)
 }
 
@@ -124,7 +115,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         if provs.is_empty() {
             continue;
         }
-        let Some(bytes) = crate::with_host(|h| h.kernel.read_file(&m.path)) else { continue };
+        let Some(bytes) = crate::sigs::proc_home().read_file(&m.path) else { continue };
         let Ok(image) = gex_ld::elf::load(&bytes, 0) else { continue };
         let Some(text) = image.segments.iter().find(|s| s.executable) else { continue };
         let bias = m.start.wrapping_sub(text.vaddr & !0xfff);
@@ -303,7 +294,7 @@ pub(crate) fn rebridge(pc: u64) -> bool {
     // child's directory is rebuilt from what it can honour, which leaves the
     // page its parent numbered for these bridges at the miss stub.
     let page = pc / gex_abi::DISPATCH_PAGE;
-    if let Some(base) = crate::with_jit(|h| h.jit.page_table.lookup(page)) {
+    if let Some(base) = crate::with_jit_only(|j| j.page_table.lookup(page)) {
         super::write_dirs(vec![(page, base)]);
     }
     lock(&REBRIDGE).extend(regs);

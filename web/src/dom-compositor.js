@@ -90,8 +90,11 @@ const MOD_CONTROL = 4;
 const MOD_MOD1 = 8;
 const MOD_MOD4 = 64;
 
-/** Browser mouse buttons (0 left, 1 middle, 2 right) to Linux `BTN_*` codes. */
-const BTN = { 0: 0x110, 1: 0x112, 2: 0x111 };
+/** Browser mouse buttons (0 left, 1 middle, 2 right, 3 back, 4 forward) to
+ *  Linux `BTN_*` codes. A button not here is not sent: it is no left click. */
+const BTN = { 0: 0x110, 1: 0x112, 2: 0x111, 3: 0x113, 4: 0x114 };
+/** The same buttons' bits in a pointer event's `buttons`. */
+const BIT = { 0: 1, 1: 4, 2: 2, 3: 8, 4: 16 };
 
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
 
@@ -741,10 +744,25 @@ export class DomDesktop {
       this.#pointerOver = null;
       sendEvent(this.#channel, win.block, EV_POINTER_CLEAR, 0, 0, 0, 0, win.client, 0);
     });
+    // The buttons this window has been told are down. A pointer's first
+    // button is its `pointerdown` and its last one's release its `pointerup`;
+    // a button pressed or released while another is held (a right click
+    // during a left drag) is neither, only a `pointermove` that names it
+    // (`button` >= 0, `buttons` the state after).
+    const held = new Set();
+    const button = (e, pressed, p) => {
+      const code = BTN[e.button];
+      if (code === undefined || held.has(code) === pressed) return;
+      if (pressed) held.add(code);
+      else held.delete(code);
+      sendEvent(this.#channel, win.block, EV_BUTTON, code, pressed ? 1 : 0,
+                p.t, 0, win.client, win.surface);
+    };
     c.addEventListener('pointermove', (e) => {
       const p = at(e);
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
+      if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
       const p = at(e);
@@ -754,14 +772,19 @@ export class DomDesktop {
       try { c.setPointerCapture?.(e.pointerId); } catch { /* no capture */ }
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
-      sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 1,
-                p.t, 0, win.client, win.surface);
+      button(e, true, p);
     });
     c.addEventListener('pointerup', (e) => {
       const p = at(e);
       try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
-      sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 0,
-                p.t, 0, win.client, win.surface);
+      button(e, false, p);
+    });
+    // The browser took the pointer (a touch turned into a scroll, the page
+    // lost it): whatever is down is up, or the client keeps a drag going.
+    c.addEventListener('pointercancel', (e) => {
+      const t = Math.round(e.timeStamp);
+      for (const code of held) sendEvent(this.#channel, win.block, EV_BUTTON, code, 0, t, 0, win.client, win.surface);
+      held.clear();
     });
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -798,13 +821,28 @@ export class DomDesktop {
     };
     const down = (e) => onKey(e, true);
     const up = (e) => onKey(e, false);
+    // The mouse's buttons are the guest's, not the browser's: no context
+    // menu over the desktop (it opens on the right button's press on Linux
+    // and macOS, and takes the release with it: the client never sees the
+    // button come up), no autoscroll on the middle one, no history step on
+    // back and forward. The pointer events above still go to the client.
+    const ctx = (e) => e.preventDefault();
+    const mouse = (e) => { if (e.button === 1 || e.button === 3 || e.button === 4) e.preventDefault(); };
     this.#mount.addEventListener('keydown', down);
     this.#mount.addEventListener('keyup', up);
+    this.#mount.addEventListener('contextmenu', ctx);
+    this.#mount.addEventListener('mousedown', mouse);
+    this.#mount.addEventListener('mouseup', mouse);
+    this.#mount.addEventListener('auxclick', mouse);
     // A desktop takes the keyboard, so it has to be focusable.
     if (!this.#mount.hasAttribute('tabindex')) this.#mount.tabIndex = 0;
     this.#detach = () => {
       this.#mount.removeEventListener('keydown', down);
       this.#mount.removeEventListener('keyup', up);
+      this.#mount.removeEventListener('contextmenu', ctx);
+      this.#mount.removeEventListener('mousedown', mouse);
+      this.#mount.removeEventListener('mouseup', mouse);
+      this.#mount.removeEventListener('auxclick', mouse);
     };
   }
 

@@ -280,7 +280,7 @@ fn alloc_in(p: &Process, k: &mut Kernel, size: u64, name: &str, top_down: bool) 
     let mut stl = p.st.lock().unwrap();
     let b = stl.vm.find_free((size + GRANULE - 1) & !(GRANULE - 1), top_down, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?;
     stl.vm.reserve(b, size, page_prot::READWRITE, true, Kind::Private, name);
-    stl.vm.mirror(&mut k.mem, b, b + size);
+    stl.vm.mirror(&mut k.mem.lock(), b, b + size);
     Ok(b)
 }
 
@@ -318,15 +318,15 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
 
     // Fixed pages: the wait words and the trampolines (docs/nt-layer.md §1.2).
     mem[WAIT_WORDS as usize..WAIT_WORDS_END as usize].fill(0);
-    k.mem.insert(WAIT_WORDS, WAIT_WORDS_END, prot::READ | prot::WRITE, "[nt-data]");
+    k.mem.lock().insert(WAIT_WORDS, WAIT_WORDS_END, prot::READ | prot::WRITE, "[nt-data]");
     mem[TRAMPOLINES as usize..TRAMPOLINES_END as usize].copy_from_slice(&trampoline_page());
-    k.mem.insert(TRAMPOLINES, TRAMPOLINES_END, prot::READ | prot::EXEC, "[nt-trampolines]");
+    k.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, prot::READ | prot::EXEC, "[nt-trampolines]");
 
     // KUSER_SHARED_DATA, carved out of the allocator's range.
     {
         let mut stl = p.st.lock().unwrap();
         stl.vm.reserve(USD, PAGE, page_prot::READONLY, true, Kind::Private, "[kuser_shared_data]");
-        stl.vm.mirror(&mut k.mem, USD, USD + PAGE);
+        stl.vm.mirror(&mut k.mem.lock(), USD, USD + PAGE);
     }
     super::sysinfo::init_usd(mem, abi, &p.clocks);
 
@@ -393,7 +393,7 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
         let mut stl = p.st.lock().unwrap();
         let b = stl.vm.find_free((size + GRANULE - 1) & !(GRANULE - 1), false, vm::ALLOC_HIGH).ok_or("no room for the API set schema")?;
         stl.vm.reserve(b, size, page_prot::READONLY, true, Kind::Mapped, "[apiset]");
-        stl.vm.mirror(&mut k.mem, b, b + size);
+        stl.vm.mirror(&mut k.mem.lock(), b, b + size);
         b
     };
     g.write(apiset_base, &apiset_bytes).map_err(st_err("writing the API set schema"))?;

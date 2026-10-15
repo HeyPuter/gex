@@ -58,6 +58,7 @@ pub mod syscalls;
 pub mod timerfd;
 pub mod tty;
 pub mod vfs;
+pub mod proclive;
 pub mod wait;
 pub mod unix;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
@@ -70,9 +71,10 @@ pub mod ppc;
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
 pub use syscalls::{
-    clock_ns, share_monotonic_base, skips_proc_snapshot, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
-    KernelProcSource, ProcState, SyscallOutcome, ThreadState,
+    clock_ns, set_guest_clock, share_monotonic_base, system_clock, BlockOp, Child, ChildHandle, ClockFn, CodeMap, Kernel,
+    SyscallOutcome, ThreadState,
 };
+pub use proclive::{KernelProcSource, ProcCell};
 
 /// Guest linear memory, addressed exactly as the guest addresses it.
 ///

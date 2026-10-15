@@ -1162,22 +1162,27 @@ mod imp {
         // rewrites its machine code in place) loses its translations, as
         // natively. NT images are never statically recompiled, so newly mapped
         // code needs nothing.
+        // Taken and retired under the JIT lock (`crate::take_logged`): a
+        // thread whose own mapping call, NT or Linux, locked or not, reuses
+        // an address this call freed retires it first itself or waits here.
         with_host(|h| {
-            let retired = std::mem::take(&mut h.kernel.retired_code);
-            h.kernel.new_code.clear();
-            if !retired.is_empty() {
-                note_retire(&retired);
-                crate::cgen::on_retire(&retired, &crate::gone_code(h, &retired));
-                if !NO_RETIRE.load(Ordering::Relaxed) {
-                    retire(h, &retired);
+            let mm = &h.kernel.mem;
+            crate::with_jit_only(|j| {
+                let (retired, recheck, _) = crate::take_logged(mm, false);
+                mm.lock().log.new_code.clear();
+                if !retired.is_empty() {
+                    note_retire(&retired);
+                    crate::cgen::on_retire(&retired, &crate::gone_code(mm, &retired));
+                    if !NO_RETIRE.load(Ordering::Relaxed) {
+                        crate::retire_code(j, &retired);
+                    }
                 }
-            }
-            // Made executable again: compared, not forgotten
-            // (`Kernel::recheck_code`).
-            let recheck = std::mem::take(&mut h.kernel.recheck_code);
-            if !recheck.is_empty() {
-                crate::cgen::on_retire(&recheck, &[]);
-            }
+                // Made executable again: compared, not forgotten
+                // (`MapLog::recheck_code`).
+                if !recheck.is_empty() {
+                    crate::cgen::on_retire(&recheck, &[]);
+                }
+            });
         });
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {
@@ -1324,10 +1329,6 @@ mod imp {
         let Some(p) = PROCESS.get() else { return };
         let s: Vec<String> = ranges.iter().map(|&(a, b)| format!("{}..{b:#x}", p.describe_addr(a))).collect();
         warn_line(&format!("gex-nt: retiring {}\n", s.join(" ")));
-    }
-
-    fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
-        crate::retire_code(h, ranges);
     }
 
     /// Each thread's last NT calls and where they were made, for an execute
@@ -1624,6 +1625,7 @@ mod imp {
             let linux = with_host(|h| {
                 h.kernel
                     .mem
+                    .lock()
                     .vmas()
                     .iter()
                     .find(|v| pc >= v.start && pc < v.end)

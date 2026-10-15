@@ -833,7 +833,7 @@ pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i3
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
 pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
-    crate::with_jit(|h| {
+    crate::with_jit_only(|j| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         // Every page the entries are on, numbered here or before: the
         // install writes their directory entries. Only the fresh ones used to
@@ -847,9 +847,9 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 continue;
             }
-            let base = match h.jit.page_table.lookup(page) {
+            let base = match j.page_table.lookup(page) {
                 Some(b) => b,
-                None => h.jit.page_table.base(page),
+                None => j.page_table.base(page),
             };
             pages.insert(page, base);
             let t = gex_abi::dispatch_entry_table(base) as u32;
@@ -869,8 +869,8 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
                 regs.extend_from_slice(&[t, slot]);
             }
         }
-        h.jit.translated.extend(addrs.iter().copied());
-        (regs, pages.into_iter().collect(), h.jit.page_table.slots())
+        j.translated.extend(addrs.iter().copied());
+        (regs, pages.into_iter().collect(), j.page_table.slots())
     })
 }
 
@@ -1043,8 +1043,8 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     let len = (size + 0xfff) & !0xfff;
     // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
     let (start, dirty) = crate::with_host(|h| {
-        let clean = h.kernel.mem.clean_ranges().to_vec();
-        let start = h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
+        let clean = h.kernel.mem.lock().clean_ranges().to_vec();
+        let start = h.kernel.mem.lock().mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
         Ok::<_, gex_kernel::Errno>((start, gex_kernel::mem::dirty_parts(&clean, start, start + len)))
     })
     .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
@@ -1240,10 +1240,10 @@ pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
 }
 
 pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
-    crate::with_jit(|h| {
+    crate::with_jit_only(|j| {
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (page, base) in dirs {
-            if h.jit.page_table.lookup(page) == Some(base) {
+            if j.page_table.lookup(page) == Some(base) {
                 crate::dense::note_entry(base);
                 let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
             }
@@ -1398,6 +1398,10 @@ pub extern "C" fn gex_ftab_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let addr = addr as u64;
+    // Filler no function has (`STRAY_PC`): the fallback's.
+    if addr == STRAY_PC {
+        return gex_abi::ftab::FALLBACK as i32;
+    }
     let mem = crate::guest_bytes();
     let hit = ftab(|m| {
         let f = m.get(addr)?;
@@ -1465,6 +1469,12 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     let c = ctx as u32 as u64;
     let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
     let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
+    // A native caller's `run_until` after a stray return to its pad
+    // (`native_return_stray`): the guest's registers as they were there,
+    // and the call is done.
+    if t == STRAY_PC && stray_restore(c) {
+        return gex_abi::ftab::RET_PREDICTED;
+    }
     // A jump out of an exception dispatched nested: back to the frames it
     // was raised under (nt::exc_escape), the dispatch's loop ends.
     if crate::nt::exc_escape(ctx, t) {
@@ -1478,7 +1488,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         // A branch to memory nothing executable is mapped at: the guest's
         // access violation, as natively (34c3e45b).
         let wild = crate::with_host(|h| {
-            !h.kernel.mem.vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
+            !h.kernel.mem.lock().vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
         });
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
@@ -1710,6 +1720,107 @@ thread_local! {
     /// This Worker's last finished call-outs: (target, return, sp wanted,
     /// depth, result, sp after), for the wild-branch diagnostic.
     static CALLOUT_RING: std::cell::RefCell<Vec<(u64, u64, u64, u32, i32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A guest return to native Wine's return pad (gex-kernel's
+/// `tramp::NATIVE_RETURN_PAD`, int3 filler) that no call-out of this Worker
+/// waits for (`returned` said no), with call-outs open: the guest went on
+/// past them to a native caller's return. That caller called a function
+/// body directly (gexrt `__gexw_guest_call`), and the body is still inside
+/// one of these call-outs: an exception the callee raised was handled in
+/// the body's own function, whose code then ran on tier-1 and returned. The
+/// call-outs leave (JS's nested loops, `#callOutSteps`), the bodies leave
+/// with them, and the native caller's `run_until` finds the guest at its
+/// return. Without call-outs open nothing is waiting there: it stays a
+/// breakpoint.
+///
+/// The bodies leaving write back what they held in locals, which is stale
+/// now: the guest's registers at the pad (the callee's EAX and EDX, the
+/// callee-saved ones it put back) are kept here (`stray_keep`), and the
+/// native caller's `run_until` is sent to [`STRAY_PC`], whose fallback puts
+/// them back and ends there as the predicted return (`gex_ftab_fallback`).
+///
+/// A body between two call-outs that leaves sends tier-1 on at
+/// [`STRAY_PC`] inside the outer one: that is the same stray, still on its
+/// way to the native caller.
+///
+/// Keeps the registers (for a return to the pad) and says whether the
+/// caller is to trap to JS's loop with the guest resuming at `pc`.
+pub(crate) fn native_return_stray(pc: u64, ctx: u64) -> bool {
+    if STRAY_TRAP.load(Ordering::Relaxed) || CALLOUTS.with(|c| c.borrow().is_empty()) {
+        return false;
+    }
+    if pc == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD {
+        stray_keep(ctx);
+        return true;
+    }
+    pc == STRAY_PC && STRAY.with(|s| s.borrow().is_some())
+}
+
+/// `?straytrap=1` (`gex_set_stray_trap`): a return to the pad past open
+/// call-outs stays the "breakpoint" it was before [`native_return_stray`],
+/// for a bisect that looks for the run that reaches it.
+static STRAY_TRAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_stray_trap(on: i32) {
+    STRAY_TRAP.store(on != 0, Ordering::Relaxed);
+}
+
+/// Where a native caller's `run_until` goes after a stray return to its pad
+/// ([`native_return_stray`]): the pad's int3 filler, which no function or
+/// block has. Its fallback restores the registers kept at the pad and
+/// returns as the pad.
+pub const STRAY_PC: u64 = gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD + 1;
+
+/// The context's words kept at a stray return to the pad: the registers
+/// (`ctx` from 0 to `ctx::PC`) and the flags word.
+const STRAY_WORDS: usize = gex_abi::ctx::PC / 8;
+
+thread_local! {
+    /// [`native_return_stray`]'s kept registers, until the native caller's
+    /// `run_until` reaches [`STRAY_PC`].
+    static STRAY: std::cell::RefCell<Option<Vec<u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keep the guest's registers at a stray return to the pad (thread
+/// context `ctx`).
+fn stray_keep(ctx: u64) {
+    let gm = GuestMem::new(crate::guest_bytes());
+    let mut v: Vec<u64> = (0..STRAY_WORDS as u64).map(|i| gm.read_u64(ctx + 8 * i).unwrap_or(0)).collect();
+    v.push(gm.read_u64(ctx + gex_abi::ctx::NZCV as u64).unwrap_or(0));
+    STRAY.with(|s| *s.borrow_mut() = Some(v));
+}
+
+/// Whether a stray return to the pad was just kept (`native_return_stray`):
+/// what tells JS's call-out loop that its resume at the pad is one (a resume
+/// there for any other reason, a catch-up, misses again and comes here).
+/// `take` 1: forget it as well (the call-out waiting for the pad itself
+/// took the return).
+#[no_mangle]
+pub extern "C" fn gex_callout_stray(take: i32) -> i32 {
+    STRAY.with(|s| {
+        let mut s = s.borrow_mut();
+        let had = s.is_some();
+        if take != 0 {
+            *s = None;
+        }
+        had as i32
+    })
+}
+
+/// The kept registers back into `ctx` (a native caller's `run_until` at
+/// [`STRAY_PC`]); whether there were any.
+fn stray_restore(ctx: u64) -> bool {
+    // (One thread per Worker: the context it was kept from is this one.)
+    let Some(v) = STRAY.with(|s| s.borrow_mut().take()) else { return false };
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    for (i, w) in v[..STRAY_WORDS].iter().enumerate() {
+        let _ = gm.write_u64(ctx + 8 * i as u64, *w);
+    }
+    let _ = gm.write_u64(ctx + gex_abi::ctx::NZCV as u64, v[STRAY_WORDS]);
+    let _ = gm.write_u64(ctx + gex_abi::ctx::PC as u64, gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD);
+    true
 }
 
 /// [`CALLOUT_RING`], for a diagnostic.

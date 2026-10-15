@@ -53,6 +53,11 @@ pub struct Remote {
     pub take_kill_signals: extern "C" fn(pid: i32, taken: u64) -> u64,
     pub kill_sender: extern "C" fn(pid: i32, signo: u32) -> i32,
     pub has_signals: extern "C" fn(pid: i32) -> i32,
+    /// `tgkill` to a thread of another process (see [`ProcTable::tkill`]).
+    pub tkill: extern "C" fn(caller: i32, pid: i32, tid: i32, signo: u32) -> i32,
+    /// One thread-directed signal for `pid`, packed as
+    /// [`ProcTable::take_thread_signals`] unpacks it, or zero if none.
+    pub take_thread_signal: extern "C" fn(pid: i32, tid: i32) -> i64,
     pub ppid: extern "C" fn(pid: i32) -> i32,
     pub pgid: extern "C" fn(caller: i32, of: i32) -> i32,
     pub sid: extern "C" fn(caller: i32, of: i32) -> i32,
@@ -164,6 +169,11 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// Signals `tgkill` sent to one thread of this process from another
+    /// process: (tid, signo, sender), in the order sent. Thread ids are the
+    /// process's own, so the table cannot check one; a thread that is gone
+    /// by collection time drops its signal. Under the table's lock.
+    to_threads: Vec<(i32, u32, i32)>,
     /// The process's own wait queue (`crate::wait`), on which each of its
     /// threads keeps its wait slot registered for as long as it runs: a
     /// signal for the process, a child's exit or a halt notifies it.
@@ -239,6 +249,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
                 }],
@@ -273,6 +284,7 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
         });
@@ -593,6 +605,69 @@ impl ProcTable {
         Ok(hits.len())
     }
 
+    /// `tgkill(pid, tid, signo)` from another process: for that thread
+    /// alone, as Linux delivers it. A Wine server's `SIGUSR1` for a system
+    /// APC has to reach the thread that queued the async; sent to the whole
+    /// process it wakes whichever thread is free, and the one parked in a
+    /// wait never fetches its APC.
+    pub fn tkill(&self, caller: i32, pid: i32, tid: i32, signo: u32) -> Result<(), Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.tkill)(caller, pid, tid, signo)).map(|_| ());
+        }
+        if signo > 64 || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut t = self.lock();
+        let p = t.procs.iter_mut().find(|p| p.pid == pid).ok_or(Errno::ESRCH)?;
+        if signo > 0 {
+            p.to_threads.push((tid, signo, caller));
+            // As `kill`: move the sequence the lock-free askers watch, and
+            // end the target's waits so the thread collects it.
+            SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            p.queue.notify();
+        }
+        Ok(())
+    }
+
+    /// Take the thread-directed signals sent to `pid`'s thread `tid`, or
+    /// (`tid` 0) to any of its threads: (tid, signo, sender). A page's Worker
+    /// takes its own thread's without the kernel lock (shims/browser sigs.rs),
+    /// as it has no other thread's signal state; the kernel takes them all.
+    pub fn take_thread_signals(&self, pid: i32, tid: i32) -> Vec<(i32, u32, i32)> {
+        if let Some(r) = self.remote {
+            let mut out = Vec::new();
+            loop {
+                let v = (r.take_thread_signal)(pid, tid);
+                if v == 0 {
+                    return out;
+                }
+                out.push(unpack_thread_signal(v));
+            }
+        }
+        match self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) if tid == 0 => std::mem::take(&mut p.to_threads),
+            Some(p) => {
+                let (mine, rest) = std::mem::take(&mut p.to_threads).into_iter().partition(|s| s.0 == tid);
+                p.to_threads = rest;
+                mine
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// One of [`ProcTable::take_thread_signals`], packed for a remote call.
+    pub fn take_thread_signal_packed(&self, pid: i32, tid: i32) -> i64 {
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return 0 };
+        match p.to_threads.iter().position(|s| tid == 0 || s.0 == tid) {
+            Some(i) => {
+                let (tid, signo, from) = p.to_threads.remove(i);
+                ((tid as i64) << 32) | (((from as i64) & 0xff_ffff) << 8) | signo as i64
+            }
+            _ => 0,
+        }
+    }
+
     /// Take everything sent to `pid` since the last call.
     pub fn take_signals(&self, pid: i32) -> u64 {
         if let Some(r) = self.remote {
@@ -663,7 +738,7 @@ impl ProcTable {
             .procs
             .iter()
             .find(|p| p.pid == pid)
-            .is_some_and(|p| p.pending.load(Ordering::Acquire) != 0)
+            .is_some_and(|p| p.pending.load(Ordering::Acquire) != 0 || !p.to_threads.is_empty())
     }
 
     /// Stop the machine. Every process exits with `code` at its next syscall.
@@ -762,6 +837,10 @@ impl ProcTable {
         let pid = (packed >> 32) as i32;
         (pid > 0).then(|| (pid, packed as u32 as i32))
     }
+}
+
+fn unpack_thread_signal(v: i64) -> (i32, u32, i32) {
+    ((v >> 32) as i32, (v & 0xff) as u32, ((v >> 8) & 0xff_ffff) as i32)
 }
 
 /// A remote call's `i32`: negative is a negated errno, as the kernel's own

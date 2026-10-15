@@ -257,7 +257,7 @@ static PROC_CX: Mutex<Option<Arc<ProcCx>>> = Mutex::new(None);
 /// Publish `kernel`'s process for the pump ([`ProcCx`]).
 pub fn publish_process(kernel: &Kernel) {
     let cx = Arc::new(ProcCx {
-        maps: Arc::clone(kernel.shared_maps.view()),
+        maps: Arc::clone(kernel.mem.lock().log.shared_maps.view()),
         exe_path: kernel.exe_path.clone(),
         x_server: is_x_server(kernel),
         unix_remote: kernel.unix_remote,

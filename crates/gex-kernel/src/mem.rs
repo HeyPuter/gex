@@ -64,6 +64,18 @@ pub struct Vma {
 }
 
 impl Vma {
+    /// Whether `next`, which starts where this ends, is the same mapping
+    /// continued: the same protection and name, and its file offsets (if
+    /// any) carrying on from this one's.
+    fn joins(&self, next: &Vma) -> bool {
+        let continues = |a: &Option<(String, u64)>, b: &Option<(String, u64)>| match (a, b) {
+            (None, None) => true,
+            (Some((x, o)), Some((y, p))) => x == y && o + (self.end - self.start) == *p,
+            _ => false,
+        };
+        self.prot == next.prot && self.name == next.name && continues(&self.origin, &next.origin) && continues(&self.code, &next.code)
+    }
+
     /// A piece of this mapping, with the origin offset moved to match.
     fn slice(&self, start: u64, end: u64, prot: u32) -> Vma {
         Vma {
@@ -128,6 +140,15 @@ impl MapView {
             r[..i].last().is_some_and(|&(_, e, _)| end <= e)
         })
     }
+
+    /// The protection of the mapping holding `addr`, as
+    /// [`MemoryMap::vma_at`] would say; `None` where nothing is mapped.
+    pub fn prot_at(&self, addr: u64) -> Option<u32> {
+        self.cur.read(crate::sync::me() as usize, |r| {
+            let i = r.partition_point(|&(s, _, _)| s <= addr);
+            r[..i].last().filter(|&&(_, e, _)| addr < e).map(|&(_, _, p)| p)
+        })
+    }
 }
 
 /// A map's view, which a copy of the map does not share: a forked child's
@@ -145,6 +166,60 @@ impl Clone for ViewCell {
 impl std::fmt::Debug for ViewCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MapView")
+    }
+}
+
+/// A process's memory map behind its own lock, the process's mm lock
+/// (docs/kernel-locking.md §3.5): what a mapping call changes and every
+/// reader that needs more than the published view ([`MapView`]) looks at.
+/// Held for a leaf computation only, never across a trap back to JS.
+///
+/// A copy is a copy of the map, as a fork's or a vfork child's is: its own
+/// lock and its own view. [`Mm::shared`] is the same map, for a holder of
+/// the process's state outside its kernel.
+pub struct Mm {
+    map: std::sync::Arc<crate::sync::Mutex<MemoryMap>>,
+    /// The map's published view, the same one for the map's life (`renew`
+    /// keeps it): read without the lock.
+    view: std::sync::Arc<MapView>,
+}
+
+impl Mm {
+    pub fn new(map: MemoryMap) -> Mm {
+        let view = std::sync::Arc::clone(map.view());
+        Mm { map: std::sync::Arc::new(crate::sync::Mutex::ranked(map, crate::sync::rank::MM)), view }
+    }
+
+    pub fn lock(&self) -> crate::sync::MutexGuard<'_, MemoryMap> {
+        self.map.lock()
+    }
+
+    /// The same map, not a copy.
+    pub fn shared(&self) -> Mm {
+        Mm { map: std::sync::Arc::clone(&self.map), view: std::sync::Arc::clone(&self.view) }
+    }
+
+    /// The map's published view.
+    pub fn view(&self) -> &std::sync::Arc<MapView> {
+        &self.view
+    }
+
+    /// Whether `other` is this same map (one [`Mm::shared`] the other).
+    pub fn same(&self, other: &Mm) -> bool {
+        std::sync::Arc::ptr_eq(&self.map, &other.map)
+    }
+}
+
+impl Clone for Mm {
+    fn clone(&self) -> Mm {
+        let map = self.lock().clone();
+        Mm::new(map)
+    }
+}
+
+impl std::fmt::Debug for Mm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mm")
     }
 }
 
@@ -209,6 +284,79 @@ pub struct MemoryMap {
     /// The span the last [`Self::extend_arena`] took, until the caller asks
     /// ([`Self::take_fresh`]): memory nothing has been in, so zero.
     fresh: Option<(u64, u64)>,
+    /// What the mapping calls leave for the host and for each other, under
+    /// the same lock as the map they describe ([`MapLog`]).
+    pub log: MapLog,
+}
+
+/// What a process's mapping calls note beside its map (docs/kernel-locking.md
+/// §3.5, L12b): kept with the map, under the mm lock, so a mapping call needs
+/// nothing else of its kernel and is made without the kernel lock.
+///
+/// A copy (a fork's, a vfork child's) starts empty: the parent's notes are
+/// the parent's host's to act on. An exec or a restore keeps it, as it keeps
+/// the view ([`MemoryMap::renew`]).
+#[derive(Debug, Default)]
+pub struct MapLog {
+    /// The base the next anonymous reservation should get, and for what.
+    ///
+    /// `ld.so` does not map an object in one call. It opens the file, reads
+    /// the header, reserves the whole span with an *anonymous* `PROT_NONE`
+    /// mapping, and only then maps the segments into it with `MAP_FIXED`. The
+    /// reservation is the one address gex chooses and the only one worth
+    /// pinning -- and being anonymous it carries no file to key on. So the
+    /// `openat` immediately before it is the signal, and this is what that
+    /// signal sets.
+    ///
+    /// The predicate has to include `PROT_NONE`: a real trace of glibc's
+    /// loader shows a 8 KiB `PROT_READ|WRITE` allocation of its own between
+    /// the `fstat` and the reservation, so "the next anonymous mapping" would
+    /// pin the wrong one.
+    pub armed_pin: Option<(String, u64)>,
+    /// Which object the next anonymous reservation is for (`Kernel::place`).
+    ///
+    /// The same signal [`Self::armed_pin`] uses and for the same reason: the
+    /// reservation carries no file, so the `openat` before it is what names
+    /// the object. Kept separate because a pin knows its address already and
+    /// this one has to ask, and can only ask once the reservation says how
+    /// long the object is.
+    pub armed_place: Option<String>,
+    /// Where each pinned object actually landed, for checking afterwards.
+    ///
+    /// A pin that silently does not take is the worst outcome available: the
+    /// module is built for one address and the code runs at another, and the
+    /// guest branches into whatever is there. Recorded so a mismatch can be
+    /// reported rather than executed.
+    pub pin_landed: Vec<(String, u64, u64)>,
+    /// File mappings whose writes are meant to reach the file.
+    pub shared_maps: crate::syscalls::SharedMaps,
+    /// Executable mappings made since the host last looked.
+    pub new_code: Vec<crate::syscalls::CodeMap>,
+    /// Executable ranges *unmapped* since the host last looked.
+    ///
+    /// A translation is only valid while the code it was made from is still
+    /// there. `dlclose` unmaps a library and a later `dlopen` maps a
+    /// different one over the same addresses, and without this the guest
+    /// branches into the previous library's translated code -- the dispatch
+    /// slot still answers for the page. Nothing reports an error; the guest
+    /// simply runs the wrong function. A long-running X server does exactly
+    /// this every time its last client disconnects and it resets.
+    pub retired_code: Vec<(u64, u64)>,
+    /// Ranges made executable again by `mprotect` (read+execute, no write):
+    /// the function tier compares its units' pages there (a loader that lifted
+    /// `.text` to fill an import table and put it back, `cgen::on_retire`).
+    /// Unlike [`Self::retired_code`], nothing is forgotten: the write that
+    /// could have changed the code was retired when the page became writable,
+    /// and forgetting the dispatch pages here dropped the bridges of the units
+    /// and native modules on them for good (a native Wine DLL's `ud2` stub
+    /// then ran as code: SIGILL in Undertale's GL start).
+    pub recheck_code: Vec<(u64, u64)>,
+}
+
+impl Clone for MapLog {
+    fn clone(&self) -> MapLog {
+        MapLog::default()
+    }
 }
 
 /// The parts of `[start, end)` outside `clean` (sorted, disjoint), in order:
@@ -283,6 +431,7 @@ impl MemoryMap {
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
             clean: Vec::new(),
             fresh: None,
+            log: MapLog::default(),
         }
     }
 
@@ -292,6 +441,7 @@ impl MemoryMap {
     pub fn renew(&mut self, brk_start: u64) {
         let mut fresh = MemoryMap::new(brk_start);
         std::mem::swap(&mut fresh.view, &mut self.view);
+        std::mem::swap(&mut fresh.log, &mut self.log);
         *self = fresh;
         self.publish();
     }
@@ -1160,7 +1310,21 @@ impl MemoryMap {
             }
         }
         out.sort_by_key(|v| v.start);
-        self.vmas = out;
+        // Neighbours the change made alike again are one mapping again, as
+        // Linux merges them: a range made read-only and back is whole, so a
+        // later `mremap` of it, which must name one mapping, finds one.
+        // Only at the boundaries this call touched.
+        let mut merged: Vec<Vma> = Vec::with_capacity(out.len());
+        for v in out {
+            if let Some(last) = merged.last_mut() {
+                if last.end == v.start && (addr..=end).contains(&v.start) && last.joins(&v) {
+                    last.end = v.end;
+                    continue;
+                }
+            }
+            merged.push(v);
+        }
+        self.vmas = merged;
         if touched {
             Ok(())
         } else {
@@ -1611,6 +1775,24 @@ mod tests {
         assert!(m.check_access(a + 0x1000, 0x1000, prot::EXEC));
         assert!(!m.check_access(a, 0x1000, prot::EXEC));
         assert!(!m.check_access(a + 0x2000, 0x1000, prot::EXEC));
+    }
+
+    /// A range made read-only and writable again is one mapping again, as
+    /// Linux merges it, so `mremap` of the whole of it works; neighbours
+    /// that differ stay apart.
+    #[test]
+    fn protect_back_merges_and_mremap_takes_the_whole() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let rw = prot::READ | prot::WRITE;
+        let a = m.mmap(0, 0x4000, rw, flags::ANONYMOUS, "x").unwrap();
+        m.protect(a + 0x1000, 0x1000, prot::READ).unwrap();
+        assert_eq!(m.vmas().len(), 3);
+        m.protect(a + 0x1000, 0x1000, rw).unwrap();
+        assert_eq!(m.vmas().iter().filter(|v| v.start >= a && v.end <= a + 0x4000).count(), 1);
+        assert!(m.mremap(a, 0x4000, 0x8000, true).is_ok());
+        let b = m.mmap(0, 0x2000, rw, flags::ANONYMOUS, "y").unwrap();
+        m.protect(b, 0x1000, prot::READ).unwrap();
+        assert_eq!(m.vmas().iter().filter(|v| v.start >= b && v.end <= b + 0x2000).count(), 2);
     }
 
     #[test]

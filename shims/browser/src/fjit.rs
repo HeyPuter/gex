@@ -250,10 +250,10 @@ fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
     if have != 0 {
         return have;
     }
-    crate::with_jit(|h| match h.jit.page_table.lookup(page) {
+    crate::with_jit_only(|j| match j.page_table.lookup(page) {
         Some(b) => b,
         None => {
-            let b = h.jit.page_table.base(page);
+            let b = j.page_table.base(page);
             fresh.push((page, b));
             b
         }
@@ -303,7 +303,7 @@ fn loads(elf: &[u8]) -> Vec<(u64, u64, u64)> {
 /// it instead; the function's real entry still gets translated.
 fn mid_function(addr: u64) -> bool {
     let Some((path, off, start)) = crate::with_host(|h| {
-        h.kernel.mem.vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)))
+        h.kernel.mem.lock().vmas().iter().find(|v| addr >= v.start && addr < v.end).and_then(|v| v.code.clone().map(|(p, o)| (p, o, v.start)))
     }) else {
         return false;
     };
@@ -379,7 +379,7 @@ static SEEDED: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
     let maps: Vec<(u64, String, u64)> = crate::with_host(|h| {
         use gex_kernel::mem::prot;
-        h.kernel.mem.vmas().iter().filter(|v| v.prot & prot::EXEC != 0).filter_map(|v| v.code.clone().map(|(p, o)| (v.start, p, o))).collect()
+        h.kernel.mem.lock().vmas().iter().filter(|v| v.prot & prot::EXEC != 0).filter_map(|v| v.code.clone().map(|(p, o)| (v.start, p, o))).collect()
     });
     for (start, path, off) in maps {
         if lock(&SEEDED).iter().any(|(p, lo, hi)| *p == path && start >= *lo && start < *hi) {
@@ -431,7 +431,8 @@ fn translate_root(addr: u64) -> Option<u32> {
     seed_mapped(jit);
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
         use gex_kernel::mem::prot;
-        let v = h.kernel.mem.vmas();
+        let mm = h.kernel.mem.lock();
+        let v = mm.vmas();
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),

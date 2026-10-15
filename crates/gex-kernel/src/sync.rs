@@ -23,6 +23,12 @@
 //! - **no poisoning:** a native panic in one thread does not make the state
 //!   unreadable to the rest. The page aborts on panic anyway.
 //!
+//! - **a rank** for the locks that nest ([`rank`]): a thread may take a
+//!   ranked lock only while every ranked lock it holds ranks lower, checked
+//!   in debug builds and with the `lock-ranks` feature ([`rank_take`]), so
+//!   a change that would deadlock two Workers in the page fails at once on
+//!   one.
+//!
 //! [`Epochs`] is the reclamation scheme of §4.2: readers announce an epoch,
 //! and a writer frees what it retired once every reader has moved past it.
 
@@ -34,6 +40,45 @@ thread_local! {
     static HELD: Cell<u32> = const { Cell::new(0) };
     /// This thread's id for [`Mutex::holder`]; 0 until the host sets one.
     static ME: Cell<u32> = const { Cell::new(0) };
+    /// The ranks of the ranked locks this thread holds, one bit each.
+    static RANKS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether the order is checked: a debug build, or the `lock-ranks` feature.
+const RANKED: bool = cfg!(any(debug_assertions, feature = "lock-ranks"));
+
+/// The order the nesting locks are taken in (docs/kernel-locking.md §4.3):
+/// a lower rank first. The kernel lock (`KLock`, the page shim's) is
+/// outermost; the JIT state's lock may be taken under it; the memory map's
+/// under either. Leaf locks (a pipe's, a futex shard's, a descriptor
+/// table's) take nothing under them and are not ranked.
+pub mod rank {
+    pub const KERNEL: u8 = 1;
+    pub const JIT: u8 = 2;
+    pub const MM: u8 = 3;
+}
+
+/// About to take a lock of rank `r`: in a debug build (or with
+/// `lock-ranks`), a panic if this thread already holds one of rank `r` or
+/// above (a re-entry, or the order of [`rank`] broken), before it can block.
+pub fn rank_take(r: u8) {
+    if RANKED && r != 0 {
+        let held = RANKS.with(|c| c.get());
+        if held >> r != 0 {
+            panic!(
+                "gex: lock order: taking rank {r} while holding ranks {:?} (docs/kernel-locking.md §4.3)",
+                (1..32).filter(|i| held & (1 << i) != 0).collect::<Vec<_>>()
+            );
+        }
+        RANKS.with(|c| c.set(held | 1 << r));
+    }
+}
+
+/// A lock of rank `r` given back ([`rank_take`]).
+pub fn rank_give(r: u8) {
+    if RANKED && r != 0 {
+        RANKS.with(|c| c.set(c.get() & !(1 << r)));
+    }
 }
 
 /// Name this thread for the holder records (the page: its Worker number + 1,
@@ -56,6 +101,7 @@ pub fn check_trap_out() -> Result<(), u32> {
         return Ok(());
     }
     HELD.with(|h| h.set(0));
+    RANKS.with(|r| r.set(0));
     Err(n)
 }
 
@@ -77,17 +123,26 @@ pub fn me() -> u32 {
 pub struct Mutex<T> {
     inner: std::sync::Mutex<T>,
     holder: AtomicU32,
+    /// Its [`rank`], 0 for a leaf lock.
+    rank: u8,
 }
 
 impl<T> Mutex<T> {
     pub const fn new(v: T) -> Self {
+        Mutex::ranked(v, 0)
+    }
+
+    /// A lock that nests, taken in the order of [`rank`].
+    pub const fn ranked(v: T, rank: u8) -> Self {
         Mutex {
             inner: std::sync::Mutex::new(v),
             holder: AtomicU32::new(0),
+            rank,
         }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        rank_take(self.rank);
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.holder.store(me(), Ordering::Relaxed);
         took();
@@ -100,6 +155,11 @@ impl<T> Mutex<T> {
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
+        // Taken without waiting, so out of order is no deadlock: noted, not
+        // checked.
+        if RANKED && self.rank != 0 {
+            RANKS.with(|c| c.set(c.get() | 1 << self.rank));
+        }
         self.holder.store(me(), Ordering::Relaxed);
         took();
         Some(MutexGuard { g, lock: self })
@@ -128,6 +188,7 @@ pub struct MutexGuard<'a, T> {
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.holder.store(0, Ordering::Relaxed);
+        rank_give(self.lock.rank);
         gave();
     }
 }
@@ -344,6 +405,44 @@ mod tests {
         }
         assert_eq!(*m.lock(), 40_000);
         assert_eq!(m.holder(), 0);
+    }
+
+    #[test]
+    fn ranked_locks_nest_in_rank_order() {
+        let outer = Mutex::ranked((), rank::JIT);
+        let inner = Mutex::ranked((), rank::MM);
+        let leaf = Mutex::new(());
+        {
+            let _a = outer.lock();
+            let _b = inner.lock();
+            let _c = leaf.lock();
+        }
+        // Given back: the inner one alone, then the outer again.
+        drop(inner.lock());
+        drop(outer.lock());
+    }
+
+    #[test]
+    // The order is checked only where `RANKED` is on: a release build without
+    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
+    #[should_panic(expected = "lock order")]
+    fn a_ranked_lock_under_a_higher_one_panics() {
+        let jit = Mutex::ranked((), rank::JIT);
+        let mm = Mutex::ranked((), rank::MM);
+        let _m = mm.lock();
+        let _j = jit.lock();
+    }
+
+    #[test]
+    // The order is checked only where `RANKED` is on: a release build without
+    // `lock-ranks` (the gate's cargo test) would fail the first and hang the second.
+    #[cfg_attr(not(any(debug_assertions, feature = "lock-ranks")), ignore)]
+    #[should_panic(expected = "lock order")]
+    fn a_ranked_lock_taken_again_panics_rather_than_hangs() {
+        let mm = Mutex::ranked((), rank::MM);
+        let _a = mm.lock();
+        let _b = mm.lock();
     }
 
     #[test]
