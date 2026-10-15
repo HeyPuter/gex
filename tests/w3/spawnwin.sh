@@ -24,9 +24,16 @@ rm -rf "$w"; mkdir -p "$w"
 i686-w64-mingw32-gcc -O1 -o "$w/spawnwin.exe" "$here/spawnwin.c" -mwindows -Wl,--subsystem,console || exit 1
 want="spawnwin ok $n"
 pass=0 fail=0
-verdict() { # NAME LOG
+verdict() { # NAME LOG STATUS
 	if grep -q "^$want" "$2"; then pass=$((pass + 1)); echo "ok   $1"
-	else fail=$((fail + 1)); echo "FAIL $1"; grep -v '^\[host\]\|gex-console-error' "$2" | tail -8 | sed 's/^/  /'; fi
+	else
+		fail=$((fail + 1))
+		case $3 in 124|137) why="timed out after ${TMO:-300} s" ;; *) why="exit $3" ;; esac
+		# How far it got (spawnwin says each step), then the log's tail
+		# without Wine's notes about optional Wayland protocols.
+		echo "FAIL $1: $why; last step: $(grep -a '^spawnwin' "$2" | tail -1)"
+		grep -av '^\[host\]\|gex-console-error\|waylanddrv:wayland_process_init\|err:cursor:wayland_pointer' "$2" | tail -8 | sed 's/^/  /'
+	fi
 }
 # PREFIX's copy NAME, drawing through winewayland.drv.
 pfx() {
@@ -44,7 +51,7 @@ if [ -x "$gexc" ]; then
 		--env WINEPREFIX="$w/pfx-native" --env WINEDEBUG=err+all,fixme-all \
 		--env XDG_RUNTIME_DIR="$w/xdg" --env WAYLAND_DISPLAY=wayland-0 \
 		"$dist/lib/wine/i386-unix/wine" 'C:\spawnwin.exe' "$n") > "$w/native.log" 2>&1
-	verdict native "$w/native.log"
+	verdict native "$w/native.log" $?
 else
 	echo "skip native: no $gexc"
 fi
@@ -59,6 +66,6 @@ mkdir -p "$w/t"
 	--env XDG_RUNTIME_DIR=/tmp --env WAYLAND_DISPLAY=wayland-0 \
 	--cwd /t --argv0 /w3/lib/wine/i386-unix/wine web/public/gex/seed.x86.shared.wasm \
 	"$dist/lib/wine/i386-unix/wine" /t/spawnwin.exe "$n") > "$w/page.log" 2>&1
-verdict page "$w/page.log"
+verdict page "$w/page.log" $?
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
