@@ -203,6 +203,11 @@ impl Mm {
     pub fn view(&self) -> &std::sync::Arc<MapView> {
         &self.view
     }
+
+    /// Whether `other` is this same map (one [`Mm::shared`] the other).
+    pub fn same(&self, other: &Mm) -> bool {
+        std::sync::Arc::ptr_eq(&self.map, &other.map)
+    }
 }
 
 impl Clone for Mm {

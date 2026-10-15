@@ -77,7 +77,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # (note_intrinsics) took the JIT lock under the map's, against the lock
 # order (L13). The drains after each mapping (providers, units, the
 # recompile queue) run without the kernel lock (L12c).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads"}
+# proc-threads: /proc/self read while other threads map, unmap, open and
+# close; cmdline in a forked child and after execve; a child's stat (L14a:
+# /proc reads the process's published state, no refresh under the lock).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -112,7 +115,7 @@ for src in "$HERE"/*.c; do
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
-        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
+        { [ $name = exec-signals ] || [ $name = exec-futex ] || [ $name = spawn-threads ] || [ $name = proc-threads ]; } && pageopts="--file /bin/$name=$bin --argv0 /bin/$name"
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then

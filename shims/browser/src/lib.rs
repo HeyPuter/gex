@@ -1561,9 +1561,7 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
 /// gets a null `FILE*`, and the next `fgets` calls through it -- surfacing as a
 /// dispatch miss at pc=0 with nothing to blame the filesystem.
 fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
-    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
-        std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
-    ));
+    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource::new());
     kernel.vfs.mount(
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
@@ -3248,7 +3246,7 @@ fn set_host(host: Host) {
         let fds = h
             .borrow_mut()
             .as_mut()
-            .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable);
+            .map_or(std::ptr::null_mut(), |h| Arc::as_ptr(&h.kernel.fds) as *mut gex_kernel::file::FdTable);
         FDS.store(fds, std::sync::atomic::Ordering::Release);
         if let Some(h) = h.borrow_mut().as_mut() {
             publish_process(h);
@@ -3271,7 +3269,7 @@ fn set_host(host: Host) {
     let fds = unsafe {
         (*core::ptr::addr_of_mut!(HOST))
             .as_mut()
-            .map_or(std::ptr::null_mut(), |h| &mut h.kernel.fds as *mut gex_kernel::file::FdTable)
+            .map_or(std::ptr::null_mut(), |h| Arc::as_ptr(&h.kernel.fds) as *mut gex_kernel::file::FdTable)
     };
     FDS.store(fds, std::sync::atomic::Ordering::Release);
     // SAFETY: as above.
@@ -3287,6 +3285,7 @@ fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
     sigs::publish(&h.kernel);
     wl::publish_process(&h.kernel);
+    h.kernel.publish_proc(&h.proc_state.0);
     publish_runs(h);
     bind_mine(h, 0);
 }
@@ -3346,6 +3345,7 @@ pub(crate) fn all_futex_blocked() -> bool {
 fn publish_vfork_child(h: &mut Host) {
     sigs::publish_here(Some(&h.kernel));
     vfork::set_fds_here(&h.kernel.fds);
+    h.kernel.publish_proc(&h.proc_state.0);
     bind_mine(h, 0);
 }
 
@@ -4864,9 +4864,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // `/proc`: a program that cannot open `/proc/self/maps` gets a null
     // `FILE*` and faults at pc=0, blaming nothing.
     root.add_dir("/proc");
-    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
-        std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
-    ));
+    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource::new());
     kernel.vfs.mount(
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
@@ -7159,10 +7157,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         } else {
             nr
         };
-        if !gex_kernel::skips_proc_snapshot(canonical) {
-            let st = Arc::clone(&h.proc_state);
-            h.kernel.refresh_proc(&st.0);
-        }
         // The dynamic linker jumped to gex's stub entry: keep what it built and
         // carry on at the program's real entry, registers as the linker left
         // them (nothing writes a return value for this one).
@@ -8929,7 +8923,7 @@ pub extern "C" fn gex_adopt_child(
         with_host(|h| {
             std::mem::forget(std::mem::replace(
                 &mut h.kernel.fds,
-                gex_kernel::file::FdTable::new(),
+                Arc::new(gex_kernel::file::FdTable::new()),
             ));
         });
     }
@@ -9321,8 +9315,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
-    // The program the compositor's pump asks about (`wl::ProcCx`).
+    // The program the compositor's pump asks about (`wl::ProcCx`), and the
+    // image `/proc` shows.
     wl::publish_process(&h.kernel);
+    h.kernel.publish_proc(&h.proc_state.0);
     if let Some(p) = program.as_ref() {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());

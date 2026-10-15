@@ -21,7 +21,7 @@ use crate::pipe::Pipe;
 use crate::unix;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
-use crate::vfs::{FileType, ProcSource, Vfs};
+use crate::vfs::{FileType, Vfs};
 use crate::GuestMem;
 use gex_abi::{ctx, ctx_addr};
 use std::sync::{Arc, Mutex};
@@ -490,7 +490,7 @@ pub trait ObjectPlace: Send + Sync {
 
 /// One guest process's kernel state.
 pub struct Kernel {
-    pub fds: FdTable,
+    pub fds: Arc<FdTable>,
     pub mem: crate::mem::Mm,
     pub vfs: Vfs,
     /// Address of the running thread's context struct.
@@ -3714,7 +3714,7 @@ impl Kernel {
             );
         }
         Kernel {
-            fds,
+            fds: Arc::new(fds),
             mem: crate::mem::Mm::new(MemoryMap::new(brk_start)),
             vfs: Vfs::new(),
             ctx_addr,
@@ -3957,7 +3957,7 @@ impl Kernel {
     /// parent's to reap.
     pub fn fork_kernel(&self) -> Kernel {
         Kernel {
-            fds: self.fds.clone(),
+            fds: Arc::new((*self.fds).clone()),
             mem: self.mem.clone(),
             vfs: self.vfs.clone(),
             ctx_addr: self.ctx_addr,
@@ -8430,175 +8430,6 @@ impl Kernel {
     }
 }
 
-/// Live process state, exposed to `/proc`.
-///
-/// Held behind a lock so procfs can read it without borrowing the kernel,
-/// which would deadlock against the syscall that is currently running.
-#[derive(Default, Clone)]
-pub struct ProcState {
-    pub pid: i32,
-    pub ppid: i32,
-    pub pgid: i32,
-    pub sid: i32,
-    pub maps: String,
-    pub cmdline: Vec<u8>,
-    pub environ: Vec<u8>,
-    pub exe: String,
-    pub cwd: String,
-    pub fds: Vec<(i32, String)>,
-    /// Which version of the memory map `maps` was rendered from.
-    ///
-    /// Not part of what `/proc` serves -- it is how the rendering is avoided.
-    /// See `MemoryMap::generation`.
-    pub maps_generation: u64,
-    /// Which version of the descriptor table `fds` was listed from.
-    pub fds_generation: u64,
-    /// The process table, for `/proc`'s view of the other processes.
-    pub procs: Option<Arc<ProcTable>>,
-    /// The image whose name and command line the table was last told.
-    pub info_exe: Option<String>,
-    /// The system's pseudoterminals, for `stat`'s `tty_nr`.
-    pub ptys: Option<crate::pty::Remote>,
-}
-
-/// The session's controlling terminal: its pts number (the pair's id) and
-/// foreground group.
-fn tty_of(ptys: Option<crate::pty::Remote>, sid: i32) -> Option<(u32, i32)> {
-    let r = ptys?;
-    let id = (r.for_sid)(sid);
-    (id >= 0).then(|| (id as u32, (r.fg)(id)))
-}
-
-/// A `/proc` source backed by a snapshot the kernel refreshes.
-pub struct KernelProcSource(pub Arc<Mutex<ProcState>>);
-
-impl ProcSource for KernelProcSource {
-    fn pid(&self) -> i32 {
-        self.0.lock().unwrap().pid
-    }
-    fn maps(&self) -> String {
-        self.0.lock().unwrap().maps.clone()
-    }
-    fn cmdline(&self) -> Vec<u8> {
-        self.0.lock().unwrap().cmdline.clone()
-    }
-    fn environ(&self) -> Vec<u8> {
-        self.0.lock().unwrap().environ.clone()
-    }
-    fn exe(&self) -> String {
-        self.0.lock().unwrap().exe.clone()
-    }
-    fn cwd(&self) -> String {
-        self.0.lock().unwrap().cwd.clone()
-    }
-    fn fds(&self) -> Vec<(i32, String)> {
-        self.0.lock().unwrap().fds.clone()
-    }
-    fn stat(&self) -> String {
-        let s = self.0.lock().unwrap();
-        let comm: String = s.exe.rsplit('/').next().unwrap_or("gex").chars().take(15).collect();
-        let tty = tty_of(s.ptys, s.sid);
-        crate::vfs::procfs::stat_line(s.pid, &comm, 'R', s.ppid, s.pgid, s.sid, tty)
-    }
-    fn others(&self) -> Vec<crate::proc::ProcEntry> {
-        let procs = self.0.lock().unwrap().procs.clone();
-        procs.map(|p| p.entries()).unwrap_or_default()
-    }
-    fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
-        let ptys = self.0.lock().unwrap().ptys;
-        tty_of(ptys, sid)
-    }
-    fn status(&self) -> String {
-        let s = self.0.lock().unwrap();
-        format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t1\n",
-            s.exe.rsplit('/').next().unwrap_or("gex"),
-            s.pid,
-            s.pid,
-            s.ppid
-        )
-    }
-}
-
-impl Kernel {
-    /// Refresh the snapshot `/proc` reads from.
-    pub fn refresh_proc(&self, state: &Mutex<ProcState>) {
-        let mut s = state.lock().unwrap();
-        s.pid = self.pid;
-        s.ppid = self.procs.ppid(self.pid);
-        s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
-        s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
-        s.ptys = self.ptys;
-        if s.procs.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &self.procs)) {
-            s.procs = Some(Arc::clone(&self.procs));
-        }
-        // Only when the map has actually changed. Formatting the VMA tree is
-        // the single most expensive thing this function does -- half of all
-        // execution in a browser run of an X server, which polls in a tight
-        // loop with several hundred mappings live -- and between two `mmap`s
-        // it produces the identical string every time.
-        let generation = self.mem.lock().generation();
-        if s.maps_generation != generation || s.maps.is_empty() {
-            s.maps = self.mem.lock().proc_maps();
-            s.maps_generation = generation;
-        }
-        // Compared before cloning, for the same reason at a smaller scale:
-        // these are two allocations per syscall to arrive at the bytes that
-        // are already there.
-        if s.exe != self.exe_path {
-            s.exe = self.exe_path.clone();
-            // An exec: a new name and command line, for this process's /proc
-            // and for every other's.
-            s.cmdline.clear();
-        }
-        if s.cwd != self.vfs.cwd {
-            s.cwd.clone_from(&self.vfs.cwd);
-        }
-        let fds_generation = self.fds.generation();
-        if s.fds_generation != fds_generation || s.fds.is_empty() {
-            // A pty end under the name a program can open and `stat`, which is
-            // how `ttyname` and `ps` find it.
-            s.fds = self.fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect();
-            s.fds_generation = fds_generation;
-        }
-        // argv and envp never change, so they are built once.
-        if s.cmdline.is_empty() {
-            s.cmdline = self
-                .argv
-                .iter()
-                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-                .collect();
-            s.environ = self
-                .envp
-                .iter()
-                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-                .collect();
-        }
-        // Said to the process table once per image, for the other processes'
-        // `/proc/<pid>` (`ps`, `htop`): the name, then the command line.
-        if s.info_exe.as_deref() != Some(s.exe.as_str()) {
-            let name = s.exe.rsplit('/').next().unwrap_or("gex");
-            let mut info = Vec::with_capacity(name.len() + 1 + s.cmdline.len());
-            info.extend_from_slice(name.as_bytes());
-            info.push(b'\n');
-            info.extend_from_slice(&s.cmdline);
-            self.procs.set_info(self.pid, &info);
-            s.info_exe = Some(s.exe.clone());
-        }
-    }
-}
-
-/// Whether a syscall could resolve a path through the VFS, and so needs
-/// `/proc` to be up to date before it runs.
-///
-/// A `/proc` file's contents are captured when it is *opened*, so a `read` on
-/// an already-open one needs nothing. Refreshing the snapshot means formatting
-/// the whole VMA tree and listing every descriptor, which is far too expensive
-/// to do before a `clock_gettime`.
-///
-/// This is deliberately a list of what does *not* need it rather than what
-/// does: forgetting to exclude a syscall costs a little speed, while
-/// forgetting to include one would serve a stale `/proc`.
 /// Whether canonical syscall `n` can change another thread's descriptor
 /// readiness (or signal state): what a host parking threads on descriptors
 /// must wake them for. Over-approximate (any read or write, of any file);
@@ -8635,53 +8466,6 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::TKILL
             | nr::TGKILL
             | nr::TIMERFD_SETTIME
-    )
-}
-
-pub fn skips_proc_snapshot(n: u64) -> bool {
-    matches!(
-        n,
-        nr::CLOCK_GETTIME
-            | nr::CLOCK_GETRES
-            | nr::GETTIMEOFDAY
-            | nr::CLOCK_NANOSLEEP
-            | nr::NANOSLEEP
-            | nr::GETPID
-            | nr::GETPPID
-            | nr::GETTID
-            | nr::GETUID
-            | nr::GETEUID
-            | nr::GETGID
-            | nr::GETEGID
-            | nr::FUTEX
-            | nr::SCHED_YIELD
-            | nr::READ
-            | nr::WRITE
-            | nr::READV
-            | nr::WRITEV
-            | nr::PREAD64
-            | nr::PWRITE64
-            | nr::LSEEK
-            | nr::CLOSE
-            | nr::FCNTL
-            | nr::IOCTL
-            | nr::MMAP
-            | nr::MUNMAP
-            | nr::MREMAP
-            | nr::MPROTECT
-            | nr::MADVISE
-            | nr::BRK
-            | nr::RT_SIGPROCMASK
-            | nr::RT_SIGACTION
-            | nr::RT_SIGRETURN
-            | nr::SIGALTSTACK
-            | nr::SET_ROBUST_LIST
-            | nr::SET_TID_ADDRESS
-            | nr::TKILL
-            | nr::CLONE
-            | nr::CLONE3
-            | nr::EXIT
-            | nr::EXIT_GROUP
     )
 }
 
@@ -9221,7 +9005,7 @@ mod tests {
             let mem = vec![0u8; 0x40000];
             let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
             k.vfs.mount("/", Arc::new(TmpFs::new()));
-            k.fds = FdTable::new();
+            k.fds = Arc::new(FdTable::new());
             for (stream, name, r, w) in [
                 (Stream::In, "/dev/stdin", true, false),
                 (Stream::Out, "/dev/stdout", false, true),

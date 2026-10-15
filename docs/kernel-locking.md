@@ -628,6 +628,19 @@ in the scheduler pick after each wake of the global WAKE word: about
      `GEX_RECOMPILE_OBJECTS=1`): copies of the program mapped executable
      from a file and called from three threads while two churn anonymous
      mappings.
+   - `/proc` without a refresh (L14a): the page refreshed a snapshot of the
+     process (`ProcState`: the map rendered, the descriptors listed, the
+     image) under the lock before every syscall that might open a `/proc`
+     file. `/proc/self` now reads the process's own published state live
+     (`proclive::ProcCell`): the map through `Mm::shared`, the descriptor
+     table (now an `Arc<FdTable>` in `Kernel`) through its published copy,
+     the directory through the published namespace and the relations
+     through the process table. The image (name, argv, environment) is
+     published at a process's start, a vfork child's start and an exec
+     (`Kernel::publish_proc`). An exec that kept the program's path left the
+     old command line in `/proc/self/cmdline`; the image is now compared by
+     argv. Leg: `proc-threads` (x86-64, i386, aarch64; page tier and SP)
+     and `proc_reads_the_process_live`.
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
