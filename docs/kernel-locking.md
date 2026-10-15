@@ -482,6 +482,13 @@ trap does not unwind, so a guard held across it never drops.
   computations.
 - **Debug check:** a per-Worker held-lock count is checked at every
   trap-out site, and is non-zero only on a bug.
+- **The shim's scopes:** `trap` checks its own the same way
+  (`check_scopes_at_trap`): the kernel lock or the `HOST` borrow, the JIT
+  state's lock, a GL submit's deferral. It ends the ones it can end itself:
+  `IN_SYSCALL` and the clock's scope (`NowScope`), whose reading, left
+  open, froze the clock for every timed wait after a stack handoff. Scopes
+  that JS sets back when it catches a trap (call-out depth, a provider's
+  guest calls, NT exception levels) are not touched.
 - **Process end:** a trap that ends the process still releases nothing.
   That is fine, as today.
 
