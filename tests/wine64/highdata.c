@@ -59,6 +59,25 @@ int main(void)
     check((ULONG_PTR)GetModuleHandleA(NULL) < CODE_LIMIT && (ULONG_PTR)GetModuleHandleA("ntdll.dll") < CODE_LIMIT
           && (ULONG_PTR)GetModuleHandleA("kernel32.dll") < CODE_LIMIT, "images below 2 GiB");
 
+    /* the kernel side's addresses past 2 GiB: a file written from and read
+     * into a top-down buffer (the very top of the space) */
+    char *top = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+    int io = 0;
+    if (top && (ULONG_PTR)top >= CODE_LIMIT)
+    {
+        HANDLE f = CreateFileA("highdata.tmp", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        DWORD done = 0;
+        for (int i = 0; i < 0x8000; i++) top[i] = (char)(i * 7);
+        if (f != INVALID_HANDLE_VALUE && WriteFile(f, top, 0x8000, &done, NULL) && done == 0x8000
+            && SetFilePointer(f, 0, NULL, FILE_BEGIN) == 0 && ReadFile(f, top + 0x8000, 0x8000, &done, NULL)
+            && done == 0x8000 && !memcmp(top, top + 0x8000, 0x8000))
+            io = 1;
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    check(io, "a file written from and read into a top-down buffer above 2 GiB");
+    if (top) VirtualFree(top, 0, MEM_RELEASE);
+
     /* a JIT's way: write data, then make it code */
     void *hi = NULL;
     for (int i = 0; i < n; i++) if ((ULONG_PTR)blocks[i] >= CODE_LIMIT) { hi = blocks[i]; break; }

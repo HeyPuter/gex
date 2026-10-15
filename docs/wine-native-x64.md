@@ -207,7 +207,12 @@ works with the system clang 22 (`scratch/W64/spike-llp64`, about 60 lines).
   it; an image whose base is above it is relocated, as any image whose base
   is taken. A page above it made executable later (a JIT's data turned to
   code) is refused with `STATUS_INVALID_PAGE_PROTECTION` and an `err:virtual`
-  line naming the range, never moved. Data without an address is found by
+  line naming the range, never moved. **Known gap:** data lands above
+  2 GiB when allocated `MEM_TOP_DOWN` or once the low 2 GiB fill up, and a
+  JIT that writes first and protects after (`VirtualAlloc(PAGE_READWRITE)`
+  then `VirtualProtect(PAGE_EXECUTE_READ)`: LuaJIT's mcode) is refused there.
+  A `PAGE_EXECUTE*` reservation is placed low, so its later commit is fine;
+  a `PAGE_NOACCESS` one committed as executable is not, if it landed high. Data without an address is found by
   address (`map_free_area`): gex places a mapping without one below its
   code space only. `tests/wine64/highdata.c` allocates 2.5 GiB and checks
   all of it. Growing the directory to 4 GiB instead doubles it to 4 MiB,
