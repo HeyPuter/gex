@@ -195,6 +195,11 @@ class DomWindow {
     this.#desktop.focus(this);
   }
 
+  /** Whether this window has the keyboard. */
+  get focused() {
+    return this.#desktop.focused === this;
+  }
+
   /** Copy this window's OpenGL frame in, from wherever the renderer put it.
    *
    * `source` is the renderer's own canvas with this window's frame in its
@@ -204,6 +209,7 @@ class DomWindow {
    * resize. */
   showGl(source, w, h) {
     if (w <= 0 || h <= 0) return;
+    this.paints++;
     const ctx = this.#context();
     ctx.drawImage(source, 0, 0, w, h,
                   0, 0, this.canvas.width, this.canvas.height);
@@ -668,6 +674,11 @@ export class DomDesktop {
       return;
     }
     sendEvent(this.#channel, win.block, EV_CLOSE, 0, 0, 0, 0, win.client, win.surface);
+  }
+
+  /** The window with the keyboard, or null. */
+  get focused() {
+    return this.#focus ?? null;
   }
 
   focus(win) {

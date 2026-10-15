@@ -17,15 +17,17 @@
 // the scene compositor (titles, the surface list, a content hash).
 
 import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_CURSOR } from './dom-compositor.js';
-import { domGlass } from './dom-glass.js';
+import { domGlass, domGlassScene } from './dom-glass.js';
 
 /** Lay `desktop`'s windows out in `mount` (a positioned element). */
 export function bareDesktop(desktop, mount) {
   const placed = new Map(); // key -> { x, y }
   let z = 1;
   let cascade = 0;
-  // Windows with glass (`gex_glass_v1`): their panes and frames (dom-glass.js).
+  // Windows with glass (`gex_glass_v1`): their panes and frames (dom-glass.js),
+  // the glass DWM's own where the page has WebGPU.
   const glassOf = new Map();
+  const glassScene = globalThis.navigator?.gpu ? domGlassScene(desktop, mount) : null;
   const keyOfParent = (win) => `${win.token}:${win.client}:${win.parent}`;
   // A window its client places (`gex_window_placement_v1`: every Win32
   // window under Wine) has real coordinates: Wine centres a dialog on its
@@ -120,7 +122,7 @@ export function bareDesktop(desktop, mount) {
     // Glass comes and goes with the client's say (DwmExtendFrameIntoClientArea,
     // a frame Wine leaves to DWM): made when it first has some.
     const glassChanged = () => {
-      if (win.glass && !glassOf.has(win)) glassOf.set(win, domGlass(win, mount));
+      if (win.glass && !glassOf.has(win)) glassOf.set(win, domGlass(win, mount, glassScene));
       glassOf.get(win)?.sync();
     };
     win.onglass = glassChanged;
