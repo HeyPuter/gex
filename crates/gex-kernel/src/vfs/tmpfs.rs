@@ -213,6 +213,13 @@ pub(crate) fn now() -> i64 {
     (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))().0 as i64
 }
 
+/// The same clock in nanoseconds, for a device that paces itself by it
+/// (`oss`): `std::time` panics in the browser.
+pub(crate) fn now_ns() -> u64 {
+    let (secs, nanos) = (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))();
+    secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
+}
+
 #[derive(Debug)]
 enum Node {
     File(Arc<FileNode>),
