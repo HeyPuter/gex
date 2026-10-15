@@ -13,6 +13,7 @@
 //! range or not 4-aligned, as the futex syscalls require.
 
 pub mod rcu;
+pub mod threads;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

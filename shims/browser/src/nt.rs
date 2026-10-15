@@ -127,13 +127,13 @@ mod stub {
 mod imp {
     use crate::{
         backfill_registry, cur, exit_process, grow_memory_to, guest_bytes, set_resume, set_resume_ctx,
-        set_resume_none, stage_thread, trap, warn_line, with_host, KLock, Thread, Waiting, ARENA_NEXT, HOST,
+        set_resume_none, stage_thread, trap, warn_line, with_host, KLock, ThreadSlot, Waiting, ARENA_NEXT, HOST,
     };
     use gex_abi::ctx;
     use gex_kernel::nt;
     use gex_kernel::{GuestMem, Kernel, ThreadState};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     #[link(wasm_import_module = "gex_env")]
     extern "C" {
@@ -1268,8 +1268,7 @@ mod imp {
                 with_host(|h| {
                     // A Worker of its own, as a Linux clone gets: the entry
                     // is this process's, the thread runs elsewhere.
-                    h.threads.push(Thread::new(ThreadState { ctx_addr: child, tid: gex_tid }, start, Waiting::Elsewhere));
-                    crate::publish_runs(h);
+                    h.threads.push(gex_tid, child, Mutex::new(crate::Run::new(start, Waiting::Elsewhere)));
                     if !h.jit.ever_threaded {
                         backfill_registry(h);
                         h.jit.ever_threaded = true;

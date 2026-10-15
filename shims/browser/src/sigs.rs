@@ -68,6 +68,8 @@ pub(crate) struct Home {
     unix_remote: Option<gex_kernel::unix::Remote>,
     socket_names: Arc<gex_kernel::unix::SocketNames>,
     host_names: Arc<gex_kernel::unix::SocketNames>,
+    /// Its threads, their contexts and run states (`Host::threads`, L23).
+    table: Arc<crate::Threads>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -85,11 +87,11 @@ thread_local! {
 }
 
 /// Publish `k`'s process as this memory's (`set_host`).
-pub(crate) fn publish(k: &Kernel) {
-    HOME.store(Box::into_raw(Box::new(home_of(k))), Ordering::Release);
+pub(crate) fn publish(k: &Kernel, table: &Arc<crate::Threads>) {
+    HOME.store(Box::into_raw(Box::new(home_of(k, table))), Ordering::Release);
 }
 
-fn home_of(k: &Kernel) -> Home {
+fn home_of(k: &Kernel, table: &Arc<crate::Threads>) -> Home {
     Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
@@ -116,6 +118,7 @@ fn home_of(k: &Kernel) -> Home {
         unix_remote: k.unix_remote,
         socket_names: Arc::clone(&k.socket_names),
         host_names: Arc::clone(&k.host_names),
+        table: Arc::clone(table),
     }
 }
 
@@ -132,6 +135,11 @@ impl Home {
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Its threads (`Host::threads`), which lock themselves.
+    pub(crate) fn table(&self) -> &crate::Threads {
+        &self.table
     }
 
     /// Its user and group ids, which lock themselves.
@@ -214,8 +222,8 @@ thread_local! {
 
 /// Publish a vfork child's process for this Worker alone, or (`None`) go
 /// back to the memory's (vfork.rs).
-pub(crate) fn publish_here(k: Option<&Kernel>) {
-    let new = k.map_or(std::ptr::null_mut(), |k| Box::into_raw(Box::new(home_of(k))));
+pub(crate) fn publish_here(k: Option<(&Kernel, &Arc<crate::Threads>)>) {
+    let new = k.map_or(std::ptr::null_mut(), |(k, table)| Box::into_raw(Box::new(home_of(k, table))));
     let old = HERE.with(|c| c.replace(new));
     if !old.is_null() {
         // SAFETY: made above by an earlier call, and only this Worker reads
