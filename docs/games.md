@@ -623,6 +623,21 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   steps: a real GPU (edger) to separate slowness from the compositor
   starving, and letting the compositor repaint between GL batches.
 
+### Dicey Dungeons on 64-bit native Wine (W64, 2026-10-15)
+
+Haxe/Lime (Starling) with SDL's GL, x64. Native (gexc on gooner, `--gl`,
+host llvmpipe) on a W64 dist with the native PE core (`W64_NATIVE`) and
+gex-gl LP64 (docs/wine-native-x64.md, W64.4), run from the game's own
+directory: Steam fails to activate and the game carries on, its GL
+context comes up, and the first run's language screen is drawn about 130 s
+after the first frame (load average about 90). tests/games/dicey-w64.wl
+clicks PLAY on it and the title menu follows (PLAY, BONUS EPISODES,
+CREDITS, QUIT). A script's positions are on Wine's toplevel surface, which
+includes the window frame (client area at (4, 30)), and its clock should
+start after the game's window is up: a Wine prefix update can show
+wineboot's window first, and that takes the early events. Next: the page
+(W64.5).
+
 ### Resume (stream G)
 
 Gate branch merge/games2-gate (PE loader fixes, gex-steam for Windows,
