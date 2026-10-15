@@ -5678,6 +5678,15 @@ impl Kernel {
         Ok(bytes.len() as u64)
     }
 
+    /// [`Self::stat_from`], owned by the process's own ids, as `statx`
+    /// reports them: a program that stats its files and compares the owner
+    /// with `getuid` (Wine's prefix check) sees itself. Before, `stat` and
+    /// `fstat` said root, so only 32-bit programs (whose libc stats through
+    /// `statx`) passed.
+    fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
+        Stat { uid: self.uid, gid: self.gid, ..Self::stat_from(md) }
+    }
+
     fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
             ino: md.ino,
@@ -5772,7 +5781,7 @@ impl Kernel {
 
     fn sys_fstat(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let md = self.fds.get(fd)?.metadata()?;
-        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
+        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -5795,7 +5804,7 @@ impl Kernel {
             self.vfs.metadata(&p)
         };
         let md = md?;
-        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
+        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
