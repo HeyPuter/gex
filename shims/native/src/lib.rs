@@ -1301,7 +1301,10 @@ fn run_program_with(
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
     if nt_setup.is_none() {
-        if wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
+        // W3's i386 Wine and W64's x86-64 Wine (FLAG_GUEST_X86_64) alike:
+        // Windows' fixed addresses left free, and the trampoline page (its
+        // x86-64 entries and the native return pad serve W64)
+        if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
             store.data_mut().with_kernel(|k| k.mem.set_mmap_top(0x7ffe_0000));
             // The NT layer's trampoline page, which native Wine's gexrt
             // sends the guest to (jmp eax after NATIVE_LEFT, the vtable

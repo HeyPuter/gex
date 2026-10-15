@@ -460,18 +460,22 @@ function slotsNeeded(meta) {
 const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
 
 function isW3Program(elf) {
-  if (!(elf instanceof Uint8Array) || elf.length < 52 || elf[0] !== 0x7f || elf[4] !== 1) return false;
+  // ELF32 (W3, i386 Wine) or ELF64 (W64, x86-64 Wine: wasm-elf.py --elf64)
+  if (!(elf instanceof Uint8Array) || elf.length < 64 || elf[0] !== 0x7f || (elf[4] !== 1 && elf[4] !== 2)) return false;
+  const e64 = elf[4] === 2;
   const dv = new DataView(elf.buffer, elf.byteOffset, elf.byteLength);
-  const at = dv.getUint32(24, true) - 0x40;
-  const phoff = dv.getUint32(28, true), phent = dv.getUint16(42, true), phnum = dv.getUint16(44, true);
+  const w = (o) => (e64 ? Number(dv.getBigUint64(o, true)) : dv.getUint32(o, true));
+  const at = w(24) - 0x40;
+  const phoff = w(e64 ? 32 : 28), phent = dv.getUint16(e64 ? 54 : 42, true), phnum = dv.getUint16(e64 ? 56 : 44, true);
   for (let i = 0; i < phnum; i++) {
     const p = phoff + i * phent;
-    if (p + 32 > elf.length || dv.getUint32(p, true) !== 1) continue;
-    const off = dv.getUint32(p + 4, true), vaddr = dv.getUint32(p + 8, true), filesz = dv.getUint32(p + 16, true);
+    if (p + (e64 ? 56 : 32) > elf.length || dv.getUint32(p, true) !== 1) continue;
+    const off = w(p + (e64 ? 8 : 4)), vaddr = w(p + (e64 ? 16 : 8)), filesz = w(p + (e64 ? 32 : 16));
     if (at < vaddr || at + 40 > vaddr + filesz) continue;
     const h = off + (at - vaddr);
     const magic = String.fromCharCode(...elf.subarray(h, h + 7));
-    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 1) !== 0;
+    // FLAG_GUEST_I386 (1) or FLAG_GUEST_X86_64 (2): Windows' address space
+    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 3) !== 0;
   }
   return false;
 }
@@ -3627,8 +3631,12 @@ export class Gex {
     // One built for wasm64 and lowered to this 32-bit memory (an LP64 wasm
     // library under an aarch64 program, docs/gexcc.md §7.8): its globals
     // stay i64, with an i32 copy of the table base for its element segment.
-    const lowered = libprov && !m64();
+    // A wasm32 program built LP64 for wasm64 and lowered the same way (W64,
+    // docs/wine-native-x64.md), told apart by its __memory_base import's type.
+    const progLowered = wasmprog && !!e.gex_cgen_pmod_lowered?.(prov);
+    const lowered = (libprov || progLowered) && !m64();
     const w64 = m64() || lowered;
+    if (wasmprog) this.#wasmprogWide = m64() || progLowered;
     // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
     // (`wasm:`), not its path: the page keeps those for every process
     // (host.mjs), so a program run again, by any process, is not compiled
@@ -4365,8 +4373,13 @@ export class Gex {
    *  program and its shared libraries share (one C stack per thread). */
   #wasmprogSp = null;
   #wasmprogStack() {
-    return (this.#wasmprogSp ??= new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0));
+    // i64 in a 64-bit memory's process and for a lowered (LP64) program
+    const wide = m64() || this.#wasmprogWide;
+    if (this.#wasmprogSp && (typeof this.#wasmprogSp.value === 'bigint') !== wide) this.#wasmprogSp = null;
+    return (this.#wasmprogSp ??= new WebAssembly.Global(wide ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, wide ? 0n : 0));
   }
+  /** This Worker's program has an i64 stack pointer (`#cgenInstall`). */
+  #wasmprogWide = false;
 
   /** This Worker's asyncify state and data globals, which a program's
    *  modules built with relocatable asyncify share. */
@@ -6433,7 +6446,7 @@ export class Gex {
     const cur = spG.value;
     const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
     const low = Math.min(Number(cur) >>> 0, esp);
-    spG.value = m64() ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
+    spG.value = typeof cur === 'bigint' ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
     try {
       f(ctx, code | 0, Number(BigInt.asUintN(32, addr)) | 0, kind | 0);
     } finally {

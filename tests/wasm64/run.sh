@@ -46,4 +46,17 @@ for src in "$HERE/lp64.c" "$HERE/../wasm32/signals.c" "$HERE/../wasm32/threads.c
         fail=1
     fi
 done
+# The --gex-guest-x86-64 flag (header flag 2): Windows' address space.
+want='anonymous mapping below the USD: 1
+USD and the page after it free: 1'
+if "$ROOT/tools/wine-wasm/wcc64" -O2 -Wl,--gex-guest-x86-64 -o "$WORK/winspace" "$HERE/winspace.c"; then
+    got=$(cd "$WORK" && timeout 120 "$GEXC" run --cwd "$WORK" ./winspace 2>"$WORK/winspace.err")
+    if [ "$got" = "$want" ]; then
+        echo "ok   wasm64/winspace (guest x86-64 flag)"
+    else
+        echo "FAIL wasm64/winspace (guest x86-64 flag)"; printf '%s\n' "$got" | sed 's/^/  got: /'; fail=1
+    fi
+else
+    echo "FAIL winspace: wcc64"; fail=1
+fi
 exit $fail

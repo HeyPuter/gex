@@ -44,6 +44,13 @@ pub(crate) fn is_wasm32(program: &Program) -> bool {
 /// Header flag (offset 36): the program runs i386 code (Wine, W3), so the
 /// process translates i386 and leaves Windows' fixed addresses free.
 pub const FLAG_GUEST_I386: u32 = 1;
+/// Header flag: the program runs x86-64 code (64-bit native Wine, W64:
+/// docs/wine-native-x64.md). It shares W3's address space and trampoline
+/// page ([`FLAG_WINDOWS_SPACE`]), never its i386 decoding.
+pub const FLAG_GUEST_X86_64: u32 = 2;
+/// The flags whose process leaves Windows' fixed addresses free and gets
+/// the trampoline page.
+pub const FLAG_WINDOWS_SPACE: u32 = FLAG_GUEST_I386 | FLAG_GUEST_X86_64;
 
 /// The header's flags, 0 for a program without them (or not wasm32).
 pub(crate) fn flags(program: &Program) -> u32 {
