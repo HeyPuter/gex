@@ -2868,6 +2868,10 @@ enum Waiting {
     Net(Option<u64>),
     /// In `sigsuspend`: only a signal ends it (`thread_ready`'s first test).
     Signal,
+    /// In `rt_sigtimedwait` (`BlockOp::SigWait`, which says for which
+    /// signals): until one of its set is pending, until this deadline, or a
+    /// signal outside the set ends it.
+    SigWait(Option<u64>),
     /// Waiting to take a priority-inheritance lock held by another thread:
     /// until its futex is woken (`gen`, as `Futex::wake_gen`), the lock word
     /// shows no owner, or `deadline`.
@@ -7473,6 +7477,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                             Waiting::Signal
                         }
                     }
+                    // `rt_sigtimedwait`, woken as `sigsuspend` is, or by its
+                    // deadline; made again when it ends with one of its set
+                    // pending (`finish_parked`), which takes it.
+                    gex_kernel::BlockOp::SigWait { timeout, .. } => {
+                        Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
+                    }
                 };
                 // A new wait: whatever this Worker's thread was registered
                 // for is over.
@@ -7482,6 +7492,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // kernel (`finish_wait`). A call the kernel would redo once
                 // its wait is over is made again instead.
                 let k = &mut h.kernel;
+                // The kernel's own finish for a wait it parked; here the call
+                // is made again instead (`finish_parked`).
+                k.retry_sigwait = None;
                 let owed = Owed {
                     restore_sigmask: k.restore_sigmask.take(),
                     write_blocked: std::mem::take(&mut k.write_blocked),
@@ -10799,6 +10812,14 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
         },
         Waiting::Accept(socket) => socket.poll_readable(),
         Waiting::Signal => false,
+        // One of the set pending: the thread's own, or the process's (what
+        // other processes sent is collected before this is asked,
+        // `sigs::ready`).
+        Waiting::SigWait(deadline) => {
+            deadline.is_some_and(|d| now >= d)
+                || matches!(blocked_on, Some(gex_kernel::BlockOp::SigWait { set, thread, process, .. })
+                    if (thread.pending() | process.shared()) & set != 0)
+        }
         Waiting::Pi { addr, gen, deadline } => {
             deadline.is_some_and(|d| now >= d)
                 || (unsafe { k_present() } != 0 && unsafe { k_futex_gen(*addr) } != *gen)
@@ -10904,6 +10925,7 @@ fn waiting_name(w: &Waiting) -> &'static str {
         Waiting::Net(Some(_)) => "net+timeout",
         Waiting::Net(None) => "net",
         Waiting::Signal => "sigsuspend",
+        Waiting::SigWait(_) => "sigtimedwait",
         Waiting::Pi { .. } => "pi-lock",
         Waiting::Exited => "exited",
     }
@@ -11340,7 +11362,7 @@ fn how_ended(r: &Run, now: u64, signalled: bool) -> (bool, bool) {
         // test therefore handed ETIMEDOUT to every such untimed
         // glibc lock wait, which glibc correctly treats as a fatal
         // futex result. Only an expired deadline is a timeout.
-        Waiting::Futex { deadline, .. } => deadline.is_some_and(|at| now >= at),
+        Waiting::Futex { deadline, .. } | Waiting::SigWait(deadline) => deadline.is_some_and(|at| now >= at),
         _ => false,
     };
     // Woken by the signal and not by the wait: ask the same
@@ -11542,6 +11564,10 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
                 Waiting::Signal
             }
         }
+        // `rt_sigtimedwait`, as the kernel's park.
+        gex_kernel::BlockOp::SigWait { timeout, .. } => {
+            Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
+        }
         _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket or a signal"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
@@ -11608,6 +11634,7 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
                 | Waiting::Sleep(_)
                 | Waiting::Child
                 | Waiting::Signal
+                | Waiting::SigWait(_)
                 | Waiting::Exited
                 | Waiting::Elsewhere
         );
@@ -11958,6 +11985,16 @@ fn finish_parked(
         }
         // `sigsuspend` only ever ends one way, whether or not a handler ran.
         gex_kernel::BlockOp::SigSuspend { .. } => Err(Errno::EINTR),
+        // `rt_sigtimedwait`: one of its set pending is taken by the call
+        // made again (with its `siginfo_t`); none, at the deadline, is
+        // `EAGAIN`; none before it (another thread took it) waits again.
+        gex_kernel::BlockOp::SigWait { set, thread, process, .. } => {
+            if (thread.pending() | process.shared()) & set == 0 && timed_out {
+                Err(Errno::EAGAIN)
+            } else {
+                Err(PI_RETRY)
+            }
+        }
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,

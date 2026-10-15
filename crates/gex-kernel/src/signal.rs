@@ -716,18 +716,27 @@ impl Signals {
         }
     }
 
-    /// Take the lowest-numbered pending signal in `set`, blocked or not.
+    /// Take the lowest-numbered pending signal in `set`, blocked or not,
+    /// with who sent it ([`Signals::claim`]: the thread's own first).
     ///
     /// `sigwaitinfo` is used precisely on signals the caller has blocked, so
     /// this deliberately ignores the mask [`Signals::next_deliverable`] respects.
-    pub fn take_pending_in(&self, set: u64) -> Option<u32> {
-        let ready = self.pending_raw() & set;
-        if ready == 0 {
-            return None;
+    /// It claims rather than clearing and then asking for the sender: cleared
+    /// first, a thread-directed signal's sender was looked for on the
+    /// process's set, and a `tgkill` taken by `sigtimedwait` said `SI_KERNEL`.
+    pub fn claim_in(&self, set: u64) -> Option<(u32, Option<Source>)> {
+        loop {
+            let ready = self.pending_raw() & set;
+            if ready == 0 {
+                return None;
+            }
+            let signal = ready.trailing_zeros() + 1;
+            // Another thread took it between the look and the claim: the
+            // next one, if any.
+            if let Some(source) = self.claim(signal) {
+                return Some((signal, source));
+            }
         }
-        let signal = ready.trailing_zeros() + 1;
-        self.clear_pending(signal);
-        Some(signal)
     }
 
     /// Everything raised, deliverable or not. For diagnostics only.

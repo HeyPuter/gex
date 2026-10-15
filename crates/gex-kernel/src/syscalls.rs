@@ -324,6 +324,20 @@ pub enum BlockOp {
     /// [`Kernel::finish_blocking`] does before the call returns `EINTR` --
     /// the only thing it ever returns.
     SigSuspend { restore_mask: u64 },
+    /// `rt_sigtimedwait` with none of `set` pending: wait until one of them
+    /// is, for at most `timeout`. The host answers `Ok(0)` when one is
+    /// pending (the call is then made again, which takes it with its
+    /// `siginfo_t`), `EAGAIN` when the time is up, `EINTR` when a signal
+    /// outside the set is delivered. The thread's and the process's pending
+    /// sets travel with it, so asking takes no kernel lock; a signal another
+    /// process sends reaches the process's set when the waiter's host
+    /// collects it, as it does to ask whether a signal ends any wait.
+    SigWait {
+        set: u64,
+        timeout: Option<std::time::Duration>,
+        thread: Arc<crate::signal::ThreadSig>,
+        process: Arc<crate::signal::ProcSig>,
+    },
     /// A `read` on a stream with nothing in it yet: a terminal nobody has
     /// typed at, a socket with nothing arrived.
     ///
@@ -441,6 +455,8 @@ impl BlockOp {
         match self {
             BlockOp::FutexWait { deadline: None, .. } => Restart::SaRestart,
             BlockOp::FutexWait { .. } | BlockOp::Sleep(_) | BlockOp::SigSuspend { .. } | BlockOp::Poll { .. } => Restart::Never,
+            // signal(7): never restarted, whatever SA_RESTART says.
+            BlockOp::SigWait { .. } => Restart::Never,
             BlockOp::FutexLockPi { .. } => Restart::Always,
             // `connect` is not in signal(7)'s list: an interrupted connect
             // goes on in the background and says `EINTR`.
@@ -570,6 +586,9 @@ pub struct Kernel {
     pub retry_transfer: Option<(u64, [u64; 6])>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
+    /// An `rt_sigtimedwait` that waited (`BlockOp::SigWait`): its arguments,
+    /// to take the signal with once one of its set is pending.
+    pub retry_sigwait: Option<[u64; 6]>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
     /// enters with `int 0x80`, and its numbering and structures are the i386
     /// ones (see `crate::i386`). Set at exec from the image's class,
@@ -4691,15 +4710,20 @@ pub fn is_signal_call(n: u64) -> bool {
     matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN)
 }
 
-/// `rt_sigtimedwait`, as it is answered here: a signal of `set` already
-/// pending is taken, with its `siginfo_t`; none is `EAGAIN` at once,
-/// whatever the timeout. For the kernel's arm and [`free_call`] alike.
+/// `rt_sigtimedwait`'s answer now: a signal of `set` already pending is
+/// taken, with its `siginfo_t`; none is `EAGAIN`. A call with none pending
+/// and time to wait parks first ([`sigwait_park`]) and comes here once one
+/// is. For the kernel's arm and [`free_call`] alike.
 pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u64; 6]) -> SysResult {
     let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
-    let Some(signal) = signals.take_pending_in(set) else { return Err(Errno::EAGAIN) };
+    // The timeout is read and checked before anything is taken, as Linux
+    // does (the time64 layout: i386's and ppc's arrive widened).
+    if a[2] != 0 {
+        sigwait_timeout(m, a[2])?;
+    }
+    let Some((signal, source)) = signals.claim_in(set) else { return Err(Errno::EAGAIN) };
     // A `siginfo_t`: si_signo, si_errno, si_code, then the sender for one a
     // process sent (the union is 8-aligned in the 64-bit layout).
-    let source = signals.take_source(signal);
     if a[1] != 0 {
         m.zero(a[1], 128)?;
         m.write_u32(a[1], signal)?;
@@ -4714,6 +4738,36 @@ pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u
         }
     }
     Ok(signal as u64)
+}
+
+/// `rt_sigtimedwait`'s timeout at `at`: `EFAULT` unreadable, `EINVAL` not a
+/// time.
+fn sigwait_timeout(m: &GuestMem<'_>, at: u64) -> Result<std::time::Duration, Errno> {
+    let secs = m.read_u64(at)? as i64;
+    let nanos = m.read_u64(at + 8)?;
+    if secs < 0 || nanos >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(std::time::Duration::new(secs as u64, nanos as u32))
+}
+
+/// Whether `rt_sigtimedwait` waits: none of its set pending and time to wait
+/// (no timeout, or one that is not zero). `None` answers now
+/// ([`sigtimedwait`]: the signal, `EAGAIN`, or the error a bad argument
+/// is). For the kernel's blocking path and [`free_call`] alike.
+pub fn sigwait_park(signals: &Signals, m: &GuestMem<'_>, a: [u64; 6]) -> Option<BlockOp> {
+    let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0]).ok()? };
+    let timeout = if a[2] == 0 { None } else { Some(sigwait_timeout(m, a[2]).ok()?) };
+    // An empty set waits too: for the time, or for a signal to interrupt it.
+    if signals.pending_raw() & set != 0 || timeout == Some(std::time::Duration::ZERO) {
+        return None;
+    }
+    Some(BlockOp::SigWait {
+        set,
+        timeout,
+        thread: Arc::clone(signals.thread()),
+        process: Arc::clone(signals.process()),
+    })
 }
 
 /// `rt_sigsuspend`'s start: the mask the caller asks for, in place, and the
@@ -5318,7 +5372,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 Ok(restore_mask) => return FreeOutcome::Blocking(BlockOp::SigSuspend { restore_mask }, Some(restore_mask)),
                 Err(_) => Err(Errno::EFAULT),
             },
-            nr::RT_SIGTIMEDWAIT => sigtimedwait(f.signals, m, compat, a),
+            nr::RT_SIGTIMEDWAIT => match sigwait_park(f.signals, m, a) {
+                // The host waits; its `Ok(0)` makes the call again, which
+                // takes the signal ([`BlockOp::SigWait`]).
+                Some(op) => return FreeOutcome::Blocking(op, None),
+                None => sigtimedwait(f.signals, m, compat, a),
+            },
             _ => {
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 kill_call(&to, n, a)
@@ -6487,6 +6546,7 @@ pub struct PendingCall {
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
+    pub retry_sigwait: Option<[u64; 6]>,
     /// The parked call's restart class and its syscall's return pc
     /// ([`Kernel::finish_blocking`]).
     pub block_restart: crate::signal::Restart,
@@ -6555,6 +6615,7 @@ impl Kernel {
             retry_recvmsg: self.retry_recvmsg.take(),
             retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
+            retry_sigwait: self.retry_sigwait.take(),
             block_restart: std::mem::take(&mut self.block_restart),
             block_pc: std::mem::take(&mut self.block_pc),
         };
@@ -6567,6 +6628,7 @@ impl Kernel {
         self.retry_recvmsg = call.retry_recvmsg;
         self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
+        self.retry_sigwait = call.retry_sigwait;
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
@@ -6698,6 +6760,7 @@ impl Kernel {
             retry_recvmsg: None,
             retry_transfer: None,
             restore_sigmask: None,
+            retry_sigwait: None,
             started: 0,
             pins: Default::default(),
             place: None,
@@ -6992,6 +7055,7 @@ impl Kernel {
             retry_recvmsg: None,
             retry_transfer: None,
             restore_sigmask: None,
+            retry_sigwait: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             pins: Default::default(),
@@ -7686,6 +7750,14 @@ impl Kernel {
                 self.restore_sigmask = Some(restore_mask);
                 Some(BlockOp::SigSuspend { restore_mask })
             }
+            // `rt_sigtimedwait` with nothing of its set pending waits for one
+            // (it had answered `EAGAIN` at once, whatever the timeout); the
+            // signal is taken in `finish_blocking`.
+            nr::RT_SIGTIMEDWAIT => {
+                let op = sigwait_park(&self.signals, m, a)?;
+                self.retry_sigwait = Some(a);
+                Some(op)
+            }
             nr::CONNECT => {
                 let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
                 let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
@@ -7799,6 +7871,10 @@ impl Kernel {
         };
         let r = match self.retry_transfer.take() {
             Some((n, a)) if r.is_ok() => self.fd_io().transfer_syscall(m, n, &a),
+            _ => r,
+        };
+        let r = match self.retry_sigwait.take() {
+            Some(a) if r.is_ok() => sigtimedwait(&self.signals, m, self.compat, a),
             _ => r,
         };
         // A wait a signal ended that Linux would restart (signal(7)): the
@@ -9142,9 +9218,6 @@ impl Kernel {
         }
     }
 
-    /// `rt_sigtimedwait`, for a signal already pending. The blocking case is
-    /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
-    /// every caller seen so far (draining blocked signals, not sleeping).
     // -- sockets ---------------------------------------------------------------
 
 
@@ -10672,16 +10745,18 @@ mod tests {
         assert_eq!(other.pending(), 1 << (SIGUSR2 - 1));
         assert_eq!(k.signals.thread().pending() & (1 << (SIGUSR2 - 1)), 0);
 
-        // rt_sigtimedwait: nothing pending is EAGAIN both ways; a blocked
-        // signal the process sent itself is taken, with its sender, the
-        // same both ways.
+        // rt_sigtimedwait: nothing pending with a zero timeout is EAGAIN
+        // both ways; a blocked signal the process sent itself is taken,
+        // with its sender, the same both ways.
         let set_at = 0x31000u64;
         let info_at = 0x31100u64;
+        let zero_at = 0x31200u64;
         m.write_u64(set_at, 1 << (SIGUSR2 - 1)).unwrap();
+        m.zero(zero_at, 16).unwrap();
         k.signals.set_blocked(1 << (SIGUSR2 - 1));
         let mut answers = Vec::new();
         for kernel in [true, false] {
-            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, zero_at, 8]);
             if kernel {
                 k.syscall(&mut m, 0);
             } else {
@@ -10716,6 +10791,91 @@ mod tests {
         set_args(&mut m, at, nr::RT_SIGSUSPEND, &[0x7fff_ffff_0000, 8]);
         assert!(done(free(&k, &mut m, at)));
         assert_eq!(ret(&m, at), -(Errno::EFAULT.0 as i64));
+    }
+
+    /// `rt_sigtimedwait` with none of its set pending waits (it had answered
+    /// `EAGAIN` at once, whatever the timeout): it parks on `SigWait`, with
+    /// and without the lock, and the kernel's finish takes the signal that
+    /// ended the wait, or passes on the host's `EAGAIN` (time up) and
+    /// `EINTR`. A bad timeout is `EINVAL` before anything is taken.
+    #[test]
+    fn sigtimedwait_waits_for_its_set() {
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        const SIGUSR1: u64 = 10;
+        let bit = 1u64 << (SIGUSR1 - 1);
+        let (set_at, info_at, ts_at, bad_at) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64);
+        m.write_u64(set_at, bit).unwrap();
+        m.write_u64(ts_at, 2).unwrap();
+        m.write_u64(ts_at + 8, 500).unwrap();
+        m.write_u64(bad_at, 0).unwrap();
+        m.write_u64(bad_at + 8, 1_000_000_000).unwrap();
+        k.signals.set_blocked(bit);
+        let pid = k.pid as u64;
+
+        // Without the lock: a park on its set, with the timeout.
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        let call = free_class(&m, at, false).expect("in the class");
+        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io() };
+        match free_call(&f, &mut m, at, call) {
+            FreeOutcome::Blocking(BlockOp::SigWait { set, timeout, .. }, None) => {
+                assert_eq!(set, bit);
+                assert_eq!(timeout, Some(std::time::Duration::new(2, 500)));
+            }
+            _ => panic!("rt_sigtimedwait did not park"),
+        }
+
+        // With it: the same park; the signal raised meanwhile is what the
+        // host saw, and the finish takes it with its siginfo_t.
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, 0, 8]);
+        let op = match k.syscall(&mut m, 0) {
+            SyscallOutcome::Blocking(op) => op,
+            _ => panic!("rt_sigtimedwait did not park under the lock"),
+        };
+        let BlockOp::SigWait { set, timeout: None, thread, process } = op else { panic!("not SigWait: {op:?}") };
+        assert_eq!((thread.pending() | process.shared()) & set, 0);
+        k.signals.raise(SIGUSR1 as u32);
+        assert_ne!((thread.pending() | process.shared()) & set, 0, "the waiter sees it without the kernel");
+        m.zero(info_at, 128).unwrap();
+        k.finish_blocking(&mut m, Ok(0));
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        assert_eq!(m.read_u32(info_at).unwrap(), SIGUSR1 as u32);
+        assert_eq!(k.signals.pending_raw() & bit, 0, "taken");
+
+        // Time up and interrupted: the host's answer is the call's.
+        for (host, want) in [(Errno::EAGAIN, Errno::EAGAIN), (Errno::EINTR, Errno::EINTR)] {
+            set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+            assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Blocking(BlockOp::SigWait { .. })));
+            k.finish_blocking(&mut m, Err(host));
+            assert_eq!(ret(&m, at), -(want.0 as i64));
+        }
+
+        // A tgkill to the waiting thread itself: taken with its sender
+        // (SI_TKILL), not SI_KERNEL (its sender was looked for on the
+        // process's set once the thread's pending bit was cleared).
+        set_args(&mut m, at, nr::TGKILL, &[pid, k.tid as u64, SIGUSR1]);
+        k.syscall(&mut m, 0);
+        m.zero(info_at, 128).unwrap();
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        assert_eq!(m.read_u32(info_at + 8).unwrap() as i32, signal::SI_TKILL);
+        assert_eq!(m.read_u32(info_at + if gex_abi::PPC { 12 } else { 16 }).unwrap(), k.pid as u32);
+
+        // Pending already: answered at once, no park. A bad timeout: EINVAL.
+        set_args(&mut m, at, nr::KILL, &[pid, SIGUSR1]);
+        k.syscall(&mut m, 0);
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue | SyscallOutcome::Resume(_)));
+        assert_eq!(ret(&m, at), SIGUSR1 as i64);
+        set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, bad_at, 8]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
     }
 
     #[test]

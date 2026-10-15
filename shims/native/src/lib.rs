@@ -1804,6 +1804,32 @@ fn perform_block(
             }
             ready::wait(seen, std::time::Duration::from_millis(1));
         },
+        // `rt_sigtimedwait`: until one of `set` is pending (then the kernel
+        // takes it, `finish_blocking`), the time is up (`EAGAIN`), or a
+        // signal outside the set is delivered (`EINTR`). `interrupted`
+        // collects what other processes sent first, so it is asked first.
+        BlockOp::SigWait { set, timeout, thread, process } => {
+            let start = std::time::Instant::now();
+            loop {
+                let seen = ready::seq();
+                service(data);
+                let intr = interrupted();
+                if (thread.pending() | process.shared()) & set != 0 {
+                    return Ok(0);
+                }
+                if intr {
+                    return Err(Errno::EINTR);
+                }
+                let left = match timeout {
+                    Some(t) => match time_left(t, start.elapsed()) {
+                        Some(left) => left,
+                        None => return Err(Errno::EAGAIN),
+                    },
+                    None => std::time::Duration::from_millis(1),
+                };
+                ready::wait(seen, left.min(std::time::Duration::from_millis(1)));
+            }
+        }
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
