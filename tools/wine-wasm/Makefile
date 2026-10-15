@@ -6,6 +6,8 @@
 #   make -C tools/wine-wasm prefix     a ready-to-run prefix, Wayland graphics (games)
 #   make -C tools/wine-wasm prefix-null  the same with the null driver (tests)
 #   make -C tools/wine-wasm paths      print where they are (KEY=path lines)
+#   make -C tools/wine-wasm build      the configured wasm32 build tree alone
+#                                      (W3_BUILD: W64's wineserver, w64-dist.sh)
 #   tools/wine-wasm/run.sh EXE [args]  run a Windows program on them (run.sh -h)
 #
 # Every output lives in W3_CACHE under a directory named by what it is built
@@ -84,13 +86,14 @@ INSTALLED := $(C)/pfx-installed-$(DIST_KEY)
 PREFIX := $(C)/pfx-$(DIST_KEY)-wayland
 PREFIX_NULL := $(C)/pfx-$(DIST_KEY)-null
 
-.PHONY: all dist prefix prefix-null paths src sysroot deps
+.PHONY: all dist prefix prefix-null paths src sysroot deps build
 all: dist prefix
 dist: $(DIST)/.done
 prefix: $(PREFIX)/.done
 prefix-null: $(PREFIX_NULL)/.done
 sysroot: $(SYSROOT)/.done
 deps: $(DEPS)/.done
+build: $(BUILD)/.done-$(WINE_ID)
 src: $(WINE_SRC)/.w3-src
 
 paths:

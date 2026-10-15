@@ -13,9 +13,11 @@ WCC=$root/tools/wine-wasm/wcc64
 mkdir -p "$OUT"
 "$WCC" -O2 -D_WIN32 -fno-stack-protector -c "$here/abi.c" -o "$OUT/abi.o"
 "$WCC" -O2 -D_WIN32 -fno-stack-protector -I"$WINE/include" -I"$WINE/include/msvcrt" -c "$WINE/libs/gexrt/wasm64.c" -o "$OUT/gexrt64.o"
+# the runtime of clang's wasm SjLj lowering (gexrt's longjmp), as libgexrt.a has it
+"$WCC" -O2 -D_WIN32 -fno-stack-protector -I"$WINE/include" -I"$WINE/include/msvcrt" -c "$WINE/libs/gexrt/wasm32_sjlj.c" -o "$OUT/gexrt64_sjlj.o"
 "$TOOLS/tools/winebuild/winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$WCC -D_WIN32" \
     --dll -E "$here/abi.spec" -F abi.dll -o "$OUT/abi.spec.o" "$OUT/abi.o"
-"$WCC" -shared -o "$OUT/abi.dll.so" "$OUT/abi.spec.o" "$OUT/abi.o" "$OUT/gexrt64.o" \
+"$WCC" -shared -o "$OUT/abi.dll.so" "$OUT/abi.spec.o" "$OUT/abi.o" "$OUT/gexrt64.o" "$OUT/gexrt64_sjlj.o" \
     -Wl,@"$OUT/abi.spec.o.rsp"
 "$TOOLS/tools/winebuild/winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$WCC -D_WIN32" \
     --dll --fake-module --wasm-module "$OUT/abi.dll.so" -E "$here/abi.spec" -F abi.dll -o "$OUT/abi.dll"

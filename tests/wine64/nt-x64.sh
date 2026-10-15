@@ -17,6 +17,8 @@
 # W64_TOOLS (w64-dist.sh's: a native build of the fork's tools) and W64_SRC
 # (the Wine tree) add the native PE side's entry-adapter case, `dll`
 # (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
+# NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
+# native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -28,6 +30,18 @@ wine=$dist/lib/wine/x86_64-unix/wine
 bin=$root/tests/nt/bin/x64
 w=${WORK:-$(mktemp -d)}
 mkdir -p "$w"
+tag=W64
+if [ -n "${NTDLL:-}" ]; then
+	# DIST with that ntdll: the Unix side copied (the loader finds the PE
+	# DLLs beside itself), links to the other DLLs
+	[ -f "$NTDLL" ] || { echo "no ntdll at $NTDLL" >&2; exit 2; }
+	o=$w/dist; rm -rf "$o"; mkdir -p "$o/lib/wine/x86_64-windows"
+	cp -a "$dist/lib/wine/x86_64-unix" "$o/lib/wine/"
+	ln -s "$dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
+	for f in "$dist"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
+	rm "$o/lib/wine/x86_64-windows/ntdll.dll"; cp "$NTDLL" "$o/lib/wine/x86_64-windows/ntdll.dll"
+	dist=$o; wine=$dist/lib/wine/x86_64-unix/wine; tag="W64 native ntdll"
+fi
 nl=$'\n'
 allok="(ok [^$nl]*$nl)+0 failures"
 pass=0 fail=0
@@ -44,9 +58,9 @@ check() {
 	code=${out##*exit=}
 	out=${out%$'\n'exit=*}; out=${out%exit=*}; out=${out//$'\r'/}
 	if [ "$code" = "$want_code" ] && [[ "$out" =~ ^${want_out}$ ]]; then
-		pass=$((pass + 1)); echo "ok   x64/$name (W64)"
+		pass=$((pass + 1)); echo "ok   x64/$name ($tag)"
 	else
-		fail=$((fail + 1)); echo "FAIL x64/$name (W64): exit $code (want $want_code)"
+		fail=$((fail + 1)); echo "FAIL x64/$name ($tag): exit $code (want $want_code)"
 		echo "  stdout: $(printf %q "$out" | cut -c1-400)"
 		grep -v '^\[host\]' "$w/$name.err" | tail -8 | sed 's/^/  stderr: /'
 	fi
@@ -68,7 +82,7 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	# the refusal says why, in Wine's log
 	case " ${CASES:-highdata} " in *" highdata "*)
 		grep -q "made executable above gex's code space" "$w/highdata.err" ||
-			{ fail=$((fail + 1)); echo "FAIL x64/highdata (W64): no log line for the refused protection"; } ;;
+			{ fail=$((fail + 1)); echo "FAIL x64/highdata ($tag): no log line for the refused protection"; } ;;
 	esac
 else
 	fail=$((fail + 1)); echo "FAIL x64/highdata (W64): x86_64-w64-mingw32-gcc"
