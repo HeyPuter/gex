@@ -19,6 +19,13 @@ B=$(realpath "$1") F=$(realpath "$2") D=$(realpath -m "$3") P=$(realpath -m "$4"
 x86=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 CORE="ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll vcruntime140.dll msvcp140.dll concrt140.dll win32u.dll user32.dll gdi32.dll"
 PROGRAMS=${W3_PROGRAMS:-explorer.exe winewayland.drv opengl32.dll wineboot.exe services.exe winedevice.exe plugplay.exe rundll32.exe svchost.exe rpcss.exe conhost.exe}
+# Every module built (wine-build.sh's make is -k): one that failed stops
+# the stage here, by name.
+for m in $CORE $PROGRAMS; do
+  n=${m%.*}
+  [ -f "$B/dlls/$n/$m.so" ] || [ -f "$B/dlls/$m/$m.so" ] || [ -f "$B/programs/$n/$m.so" ] ||
+    { echo "w3/stage: $m was not built (no $m.so in $B; see $B/make.log)" >&2; exit 1; }
+done
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/w3-stage.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
 TMPDIR=$tmp "$T/stage-native.sh" "$B" "$F" "$P" $CORE $PROGRAMS
 (cd "$P/drive_c/windows" && rm -rf system32 && mv syswow64 system32)
