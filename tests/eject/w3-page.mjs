@@ -12,6 +12,8 @@
 //      "gl": gex/gex-wgpu-replay.*);
 //   2. served (cross-origin isolated) and opened at its launcher, a toplevel
 //      titled RE (default "Untitled - Paint") appears;
+//   2b. start()'s progress says which programs and images the start-up
+//      reached (`boot`, `log`: the runtime's structured notes);
 //   3. with "compositor" off, what draws it is the page's bare desktop
 //      (`describe().compositor === 'none'`), and the window has pixels;
 //   4. no service worker: the site ships no sw.js, none is registered, and
@@ -205,6 +207,16 @@ if (!check(!!d?.titles?.some((t) => titleRe.test(t)), `a window titled /${titleR
   check(hit > 0 && hit >= 2 * miss, `the units are the runtime's: ${hit} image(s) hit a unit, ${miss} missed`);
 }
 
+// 2b. The start-up's status, structured (app.js progress `boot` and `log`,
+// from the runtime's own notes, not its console): at the window, processes
+// have installed the build's units, an .exe among them, and the log says so.
+{
+  const pr = JSON.parse((await ev('JSON.stringify(globalThis.__nt?.progress ?? null)')) ?? 'null');
+  const b = pr?.boot;
+  const started = (pr?.log ?? []).filter((l) => l.kind === 'program').map((l) => l.text);
+  check(b && b.units.total > 0 && b.units.done > 0 && b.programs.done > 0 && started.length > 0,
+    `the start-up's status: ${b?.units.done ?? 0} of ${b?.units.total ?? 0} images and ${b?.programs.done ?? 0} of ${b?.programs.total ?? 0} programs reached, the latest ${b?.program ?? 'none'} (log: ${started.slice(-4).join('; ') || 'nothing started'})`);
+}
 // 3. Drawn by the page itself when the compositor is out.
 if (off.includes('compositor')) {
   check(d.compositor === 'none', `drawn without the scene compositor (describe().compositor ${d.compositor})`);

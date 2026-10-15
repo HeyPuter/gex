@@ -5124,7 +5124,10 @@ export class Gex {
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
     console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
-    if (/\.exe$/i.test(path)) console.warn(`[gex-record] process ${path} :: ${this.cmdline}`);
+    const program = /\.exe$/i.test(path) ? this.cmdline : undefined;
+    if (program !== undefined) console.warn(`[gex-record] process ${path} :: ${program}`);
+    // The same, structured, for the page's start-up status (fetch-note.mjs).
+    this.#env.noteUnit?.({ key, path, hit: !!got, program });
     if (!got) {
       if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
       this.#cgenProviders(u);
@@ -5188,6 +5191,7 @@ export class Gex {
       for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
       return;
     }
+    for (const m of ms) this.#env.noteUnit?.({ key: m.key, path: m.path, hit: true, program: /\.exe$/i.test(m.path) ? this.cmdline : undefined });
     const us = new Uint32Array(ms.map((m) => m.u));
     const kb = new TextEncoder().encode(grp.key);
     const up = e.gex_alloc(Math.max(8, us.byteLength)) >>> 0;

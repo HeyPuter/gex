@@ -66,7 +66,7 @@ function forkTransfer(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { noteFetch } from './fetch-note.mjs';
+import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
@@ -408,6 +408,10 @@ async function handle(msg) {
     // directory under Node (GEX_CGEN_CACHE's layout), or `msg.cgen.url`, read
     // with a synchronous request -- allowed in a Worker, and what lets the
     // nested callback loop install one too. Null when there is none.
+    // An image's unit is in (or the image has none): the page's status.
+    noteUnit(status) {
+      noteStatus({ kind: 'unit', ...status });
+    }
     loadUnit(key) {
       // The entries now; the module's bytes only if this Worker compiles it
       // (most get the Module from a sibling: see `Gex#cgenModule`). Fetching
