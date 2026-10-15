@@ -16,16 +16,22 @@ use crate::mem::Mm;
 use crate::proc::ProcTable;
 use crate::syscalls::Kernel;
 use crate::vfs::{ProcSource, VfsView};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// The handles a process's `/proc` reads, and its image.
+///
+/// The descriptor table and the namespace are held weakly. The namespace
+/// mounts this process's `/proc`, whose source holds this: strong handles
+/// made a cycle, so an ended process's descriptor table was never dropped
+/// and its pipes and sockets never closed (native W3: the wineserver never
+/// saw a client go, and the process that waited for it hung).
 struct Live {
     pid: i32,
     procs: Arc<ProcTable>,
     ptys: Option<crate::pty::Remote>,
     mm: Mm,
-    fds: Arc<FdTable>,
-    vfs: Arc<VfsView>,
+    fds: Weak<FdTable>,
+    vfs: Weak<VfsView>,
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
@@ -91,14 +97,15 @@ impl ProcSource for KernelProcSource {
         self.0.get().map(|l| l.exe.clone()).unwrap_or_default()
     }
     fn cwd(&self) -> String {
-        self.0.get().map_or_else(|| "/".to_string(), |l| l.vfs.get().cwd.clone())
+        self.0.get().and_then(|l| l.vfs.upgrade()).map_or_else(|| "/".to_string(), |v| v.get().cwd.clone())
     }
     fn fds(&self) -> Vec<(i32, String)> {
         // A pty end under the name a program can open and `stat`, which is
         // how `ttyname` and `ps` find it.
         self.0
             .get()
-            .map(|l| l.fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect())
+            .and_then(|l| l.fds.upgrade())
+            .map(|fds| fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect())
             .unwrap_or_default()
     }
     fn stat(&self) -> String {
@@ -155,8 +162,11 @@ impl Kernel {
             o.pid == self.pid
                 && o.exe == self.exe_path
                 && Arc::ptr_eq(&o.procs, &self.procs)
-                && Arc::ptr_eq(&o.fds, &self.fds)
-                && Arc::ptr_eq(&o.vfs, self.vfs.view())
+                // (A dead handle's address may be reused: only a live one matches.)
+                && o.fds.strong_count() > 0
+                && o.vfs.strong_count() > 0
+                && std::ptr::eq(o.fds.as_ptr(), Arc::as_ptr(&self.fds))
+                && std::ptr::eq(o.vfs.as_ptr(), Arc::as_ptr(self.vfs.view()))
                 && o.mm.same(&self.mem)
                 && o.ptys.is_some() == self.ptys.is_some()
                 && o.argv == self.argv
@@ -170,8 +180,8 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ptys: self.ptys,
             mm: self.mem.shared(),
-            fds: Arc::clone(&self.fds),
-            vfs: Arc::clone(self.vfs.view()),
+            fds: Arc::downgrade(&self.fds),
+            vfs: Arc::downgrade(self.vfs.view()),
             exe: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -220,5 +230,22 @@ mod tests {
         assert_eq!(src.cmdline(), b"a\0one\0");
         k.publish_proc(&src.0);
         assert_eq!(src.cmdline(), b"a\0two\0");
+    }
+
+    /// A process that mounts its own `/proc` (as every gex process does)
+    /// and ends lets go of its descriptors: the source must not keep the
+    /// table or the namespace alive through the mount that holds it.
+    #[test]
+    fn an_ended_process_drops_its_descriptors() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        k.vfs.mkdir("/proc", 0o755).unwrap();
+        let cell = Arc::new(ProcCell::default());
+        k.vfs.mount("/proc", Arc::new(crate::vfs::ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&cell))))));
+        k.publish_proc(&cell);
+        let fds = Arc::downgrade(&k.fds);
+        drop(cell);
+        drop(k);
+        assert!(fds.upgrade().is_none(), "the descriptor table outlived its process");
     }
 }
