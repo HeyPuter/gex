@@ -192,6 +192,16 @@ fn gather(home: &Home) {
     };
     if SEQ_SEEN.with(|c| c.replace(seq)) != seq {
         home.sig.collect(&home.procs, home.pid, home.uid);
+        // Another process's `tgkill` to this Worker's thread: its own, so
+        // taken here (the kernel's `collect_signals` takes the rest, and
+        // drops those for threads gone).
+        MINE.with(|m| {
+            if let Some((tid, t)) = m.borrow().as_ref() {
+                for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.uid });
+                }
+            }
+        });
     }
     if home.sig.timers_armed() {
         let (secs, nanos) = (home.clock)();

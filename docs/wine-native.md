@@ -1418,6 +1418,45 @@ through one `server_wait` for the APC.
   Measured: server requests per second before and after, and the frame
   numbers.
 
+**W3.6 built and parked; the page's process start (2026-10-11 to 10-14).**
+These are on gex `w3/next` (local), parked while Wine speed work is paused
+(2026-10-14: Noita on gex is ahead of pewasm).
+- **ntsync** (2817d4b3): the design above, built. `tests/gexcc/ntsync.c`
+  passes 22/22 natively and in the page (x86 and aarch64). Wine needs no
+  source change, only `HAVE_LINUX_NTSYNC_H` in the W3 build's config.h and
+  `linux/ntsync.h` in the sysroot. In the page it made no measurable
+  difference: `cmd /c echo` 23.0-25.0 s on against 21.8-23.6 s off;
+  Undertale (frames 1300-1600, the regressed base) 7.9 fps on against
+  7.4-7.6 off.
+- **Process start in the page** (`wine cmd /c echo`, run-node on gooner,
+  diagnostic; per Wine process, before and after):
+
+  | Step | Before | After | Fix |
+  |---|---|---|---|
+  | fork image | 519 MiB, 740-1000 ms | 40-77 MiB, 46-171 ms | fork leaves known-zero ranges out (8e5ec399) |
+  | adopt to child exec | 1.3-1.55 s | 0.26-0.38 s | the same |
+  | mmap_init | 280-600 ms, ~900 failing mmaps | 3-13 ms, 21 | `[gex]` lines in /proc/self/maps and the clean carry (f729275f) |
+
+  `GEX_TIME_INSTALL=1` (0d070135) times each program's install per
+  Worker: about 60 ms of exec-to-loader-main, mostly hashing its 5.7 MiB.
+- **tgkill to another process's thread** (landed on its own; it was found
+  under ntsync but is a bug without it). `sys_tgkill` turned a target in
+  another process into a process-wide `kill`, so whichever thread reached a
+  syscall boundary first took the signal. The Wine server sends SIGUSR1 to
+  the thread that queued an async so it fetches its system APC; with that
+  thread parked in a wait, a busier sibling took it, and services.exe's
+  `ConnectNamedPipe` for plugplay never completed (then wineboot's boot
+  event timed out after 300 s). The process table now keeps a per-process
+  inbox of (tid, signo, sender): the kernel's `collect_signals` raises each
+  on its thread, and a page Worker takes its own thread's lock-free
+  (shims/browser sigs.rs). gex tids are per process, so a thread gone by
+  collection drops its signal. Test: `tests/gexcc/tgkill-thread.c`.
+- **Native x86 gexc lives in target/x86.** `target/release/gexc` is the
+  default (aarch64) build, and shims/browser/build.sh rebuilds it that way;
+  an x86 gexc left there is replaced, and W3 then fails with sechost.dll's
+  DllMain raising c000001d (the first x86 PE code). Build with
+  `cargo build --release -p gexc --features gexc/x86 --target-dir target/x86`.
+
 **W3.1 progress (2026-10-06, merge/w3 + fork `wasm32-w3`):**
 - **Fault delivery (done natively):** `gex.fault_hook(idx)`; a memory
   access past the guest memory under a call-out, an illegal instruction,
