@@ -621,11 +621,11 @@ in the scheduler pick after each wake of the global WAKE word: about
      read files through the process's published namespace and the map
      through `Mm::shared`, both in `sigs::Home` (`Home::read_file`,
      `Home::code_maps`, `sigs::proc_home`). `note_intrinsics` had taken the
-     JIT lock under mm (against §4.3; fixed on its own first). Still under
-     the kernel lock: `recompile_object`, the bulk translator, which shares
-     the miss path's slot and identity bookkeeping. Leg: `codemap-threads`
-     (x86-64, i386; page tier, also with `GEX_ELF_UNITS=all` and
-     `GEX_RECOMPILE_OBJECTS=1`): copies of the program mapped executable
+     JIT lock under mm (against §4.3; fixed on its own first).
+     `recompile_object`, the bulk translator, followed in L16 (item 9).
+     Leg: `codemap-threads` (x86-64, i386; page tier, also with
+     `GEX_ELF_UNITS=all` and `GEX_RECOMPILE_OBJECTS=1`): copies of the
+     program mapped executable
      from a file and called from three threads while two churn anonymous
      mappings.
    - `/proc` without a refresh (L14a): the page refreshed a snapshot of the
@@ -810,6 +810,32 @@ in the scheduler pick after each wake of the global WAKE word: about
      `smc-race`, `smc-threads`, `smc-direct-jump`, `page-cross-entry`)
      and the rest of the page tier with the order checked
      (`GEX_LOCK_RANKS=1`).
+   - The miss's lift and install without the kernel lock (L16, the rest of
+     §3.6's write half): what a translation reads of its process besides
+     the JIT state -- the map, the namespace (object identities and names)
+     and the pid -- comes from the published `Home` (`Px`, `with_px`), and
+     the rest is the JIT state under its own lock (`with_jit_only`). The
+     closure and serve maps the miss consults (`IMAGE_PAGES`,
+     `CLOSURE_OWNER`, `LIB_PROGRAM`, `IMAGE_TABLE`, `CLOSURE_TABLE`,
+     `LIB_LAZY`, `IMAGE_HIGH`, `CLOSURE_DIRS`, `LAZY_OWNER`, `LIVE_BASE`,
+     `SERVED_PAGE`) moved under the JIT lock with it, writers
+     (`gex_add_closure_module`, `gex_add_lazy_module`, `gex_claim_page`,
+     `do_exec`) and readers (`gex_closure_owner(_at)`, `gex_page_table`,
+     `gex_lib_lazy`, `gex_claim_floor`, `gex_lazy_owner`) alike; as do the
+     install (`gex_jit_installed`) and the pending-queue getters.
+     `recompile_object` takes the JIT state out as a miss does (`jitout`)
+     rather than lifting from a copy and writing the copy back over what a
+     sibling's miss installed meanwhile, and like the miss drops its result
+     on an exec or a retire the log no longer covers, and retires again
+     what was retired during its lift; its seeds read the object through
+     the published namespace. `with_jit`, the kernel-lock form, had no
+     caller left and is gone. Still under the kernel lock on the miss path:
+     the wild-branch report, the eject stop and a miss with nothing to
+     translate, which end the process; the function JIT's file reads
+     (fjit.rs). Legs: `lift-threads` (page tier, gexc): four threads lift
+     fresh chains of code at once and unmap them while two make kernel
+     calls; the translation programs above; `codemap-threads` with
+     `GEX_RECOMPILE_OBJECTS=1`.
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

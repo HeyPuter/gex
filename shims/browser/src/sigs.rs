@@ -102,6 +102,15 @@ impl Home {
         &self.mm
     }
 
+    /// Its namespace as published now.
+    pub(crate) fn ns(&self) -> Arc<gex_kernel::vfs::Namespace> {
+        self.vfs.get()
+    }
+
+    pub(crate) fn pid(&self) -> i32 {
+        self.pid
+    }
+
     /// Up to `out.len()` bytes of `path` from `offset`, through the
     /// published namespace (no kernel lock); bytes filled.
     pub(crate) fn read_file_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Option<usize> {
