@@ -1624,6 +1624,7 @@ mod imp {
             let linux = with_host(|h| {
                 h.kernel
                     .mem
+                    .lock()
                     .vmas()
                     .iter()
                     .find(|v| pc >= v.start && pc < v.end)

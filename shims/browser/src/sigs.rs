@@ -37,6 +37,8 @@ pub(crate) struct Home {
     vfs: Arc<gex_kernel::vfs::VfsView>,
     /// Its terminal, for `ioctl`.
     tty: Arc<gex_kernel::tty::TtyRef>,
+    /// `flock`'s locks, released by the last `close` of a description.
+    file_locks: Arc<gex_kernel::unix::FileLocks>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -69,6 +71,7 @@ fn home_of(k: &Kernel) -> Home {
         map: Arc::clone(k.mem.view()),
         vfs: Arc::clone(k.vfs.view()),
         tty: Arc::clone(&k.tty),
+        file_locks: Arc::clone(&k.file_locks),
     }
 }
 
@@ -210,7 +213,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     // build, which keeps no view and has nobody inside the kernel now.
     #[cfg(not(feature = "shared-memory"))]
     let by_kernel = |addr: u64, len: u64| {
-        crate::with_host(|h| h.kernel.mem.vma_at(addr).is_some_and(|v| addr + len <= v.end))
+        crate::with_host(|h| h.kernel.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end))
     };
     let ns = home.vfs.get();
     let futex = FutexCx {
@@ -227,7 +230,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         clock: home.clock,
     };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks },
         signals: &view,
         procs: &home.procs,
         tty: &home.tty,
@@ -238,6 +241,31 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         started: crate::clock_started(),
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
+}
+
+/// Return from a signal handler for this Worker's thread, whose context is
+/// at `ctx_addr`: the frame's context and mask back (`signal::sigreturn`).
+/// The pc to go on at. No kernel lock: the thread's signal state is its own.
+pub(crate) fn sigreturn(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, gex_kernel::Errno> {
+    let home = home().ok_or(gex_kernel::Errno::EFAULT)?;
+    let view = view(home).ok_or(gex_kernel::Errno::EFAULT)?;
+    let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
+    signal::sigreturn(&view, gm, ctx_addr, compat, false)
+}
+
+/// Whether `pc` is in an executable mapping of this process: the map's
+/// published view where other Workers may be changing the map; the map
+/// itself in the single-threaded build, which keeps no view and has nobody
+/// inside the kernel now.
+pub(crate) fn executable(pc: u64) -> bool {
+    #[cfg(feature = "shared-memory")]
+    {
+        home().and_then(|h| h.map.prot_at(pc)).is_some_and(|p| p & gex_kernel::mem::prot::EXEC != 0)
+    }
+    #[cfg(not(feature = "shared-memory"))]
+    {
+        crate::with_host(|h| h.kernel.mem.lock().vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
+    }
 }
 
 /// How long until this process's next interval timer fires, by its own

@@ -856,6 +856,10 @@ impl MemFd {
 }
 
 impl FileHandle for MemFd {
+    fn as_memfd(self: Arc<Self>) -> Option<Arc<MemFd>> {
+        Some(self)
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let data = self.data.lock().unwrap();
         let start = (offset as usize).min(data.len());

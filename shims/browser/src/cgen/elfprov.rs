@@ -87,6 +87,7 @@ fn rescan_if_new() -> bool {
         use gex_kernel::mem::prot;
         h.kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)

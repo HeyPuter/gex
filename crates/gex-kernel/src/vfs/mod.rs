@@ -279,6 +279,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as an anonymous shared file (`memfd_create`), when it is
+    /// one: its seals and `fallocate`.
+    fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
+        None
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

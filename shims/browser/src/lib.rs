@@ -492,7 +492,7 @@ static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map:
 fn refresh_ident_snapshot(h: &Host) {
     use std::hash::Hash;
     let mut snap = Vec::new();
-    for v in h.kernel.mem.vmas().iter() {
+    for v in h.kernel.mem.lock().vmas().iter() {
         if v.prot & gex_kernel::mem::prot::WRITE != 0 {
             continue;
         }
@@ -4377,7 +4377,7 @@ pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
 /// which parts are real. Paired with [`gex_vma_at`]: count first, then ask.
 #[no_mangle]
 pub extern "C" fn gex_vma_count() -> i32 {
-    with_host(|h| h.kernel.mem.vmas().len() as i32)
+    with_host(|h| h.kernel.mem.lock().vmas().len() as i32)
 }
 
 /// The whole memory map as bytes, for a child to rebuild from. Each region's
@@ -4391,7 +4391,8 @@ pub extern "C" fn gex_vma_count() -> i32 {
 /// A zero `code_len` means no code identity. `origin` is deliberately absent:
 /// it is a claim about *this* process's mappings, not something to inherit.
 fn vma_blob(h: &Host) -> Vec<u8> {
-    let vmas = h.kernel.mem.vmas();
+    let mm = h.kernel.mem.lock();
+    let vmas = mm.vmas();
     let mut out = Vec::with_capacity(64 * vmas.len());
     out.extend_from_slice(&(vmas.len() as u32).to_le_bytes());
     for v in vmas {
@@ -4471,7 +4472,7 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 Some((id, off))
             };
             ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
-            h.kernel.mem.adopt(start, end, prot, &name, code);
+            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
         }
         0
     })
@@ -4493,10 +4494,9 @@ static ADOPTED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[no_mangle]
 pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
     with_host(|h| {
-        let Some(v) = h.kernel.mem.vmas().get(i.max(0) as usize) else {
+        let Some((start, end, prot)) = h.kernel.mem.lock().vmas().get(i.max(0) as usize).map(|v| (v.start, v.end, v.prot as u64)) else {
             return -1;
         };
-        let (start, end, prot) = (v.start, v.end, v.prot as u64);
         let dst = shim_slice_mut(out, 24);
         dst[0..8].copy_from_slice(&start.to_le_bytes());
         dst[8..16].copy_from_slice(&end.to_le_bytes());
@@ -4726,7 +4726,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
-    kernel.mem.grows_on_demand(arena_grow, arena_back);
+    kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     // The table every process shares, when the host has wired one up. This
     // process is the first, so it keeps the pid the kernel gave it -- the
     // global table's `INIT_PID` is the same 1.
@@ -4804,7 +4804,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             let w = IMAGE_PROGRAM.0.borrow();
             (!w.is_empty()).then(|| w.clone())
         });
-        kernel.mem.insert_loaded(
+        kernel.mem.lock().insert_loaded(
             seg.vaddr,
             seg.vaddr + seg.mem_size,
             p,
@@ -4889,7 +4889,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     );
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
-    kernel.mem.insert(
+    kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
@@ -5497,6 +5497,7 @@ static IMAGE_PAGES: SingleThreaded<std::collections::BTreeMap<u64, Vec<usize>>> 
 fn current_image_program(h: &Host) -> Option<String> {
     h.kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
@@ -5715,6 +5716,7 @@ fn image_pages_are_ours(h: &Host) -> bool {
     match h
         .kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
@@ -6115,10 +6117,24 @@ thread_local! {
     static FILL_WANTED: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
 }
 
-/// Pages already asked about, so one nobody can fill is asked once and then
-/// takes the ordinary path rather than asking forever.
-static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
-    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
+/// The fill's memory of what it asked, under its own lock: misses on every
+/// Worker of the process ask and answer at once (a lock-free `RefCell` here
+/// raced the trees' structure and smashed a live stack).
+struct FillAsked {
+    /// Spans already asked about, so one nobody can fill is asked once and
+    /// then takes the ordinary path rather than asking forever.
+    asked: std::collections::BTreeSet<u64>,
+    /// Pages asked about that nobody could fill. Not permanent: the covering
+    /// module may just not be installed in this process yet (the ordinary
+    /// case for a forked child), so `gex_fill_possible` forgives these when
+    /// a module arrives.
+    failed: std::collections::BTreeSet<u64>,
+}
+
+static FILL_ASKED: gex_kernel::sync::Mutex<FillAsked> = gex_kernel::sync::Mutex::new(FillAsked {
+    asked: std::collections::BTreeSet::new(),
+    failed: std::collections::BTreeSet::new(),
+});
 
 /// Whether the host is holding any module unwritten. Without it the miss path
 /// traps into JS for a fill on the first miss of every page whose base it has,
@@ -6127,11 +6143,6 @@ static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
 static FILL_POSSIBLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Pages asked about that nobody could fill. Not permanent: the covering module
-/// may just not be installed in this process yet (the ordinary case for a
-/// forked child), so `gex_fill_possible` forgives these when a module arrives.
-static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
-    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
 /// Pages already served whole from the shared store for a fault, so a second
 /// fault on one is not served again. A served batch covers whatever the process
@@ -6173,22 +6184,17 @@ thread_local! {
 pub extern "C" fn gex_fill_possible(on: i32) {
     FILL_POSSIBLE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
     if on != 0 {
-        // Under KLOCK: these two `SingleThreaded<RefCell<BTreeSet>>` are mutated
-        // by `gex_dispatch_miss` on other Workers at the same time; a lock-free
-        // `borrow_mut` here races the tree structure. See the note at the miss.
-        with_host(|_| {
-            let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
-            let mut asked = FILL_ASKED.0.borrow_mut();
-            let spans = gex_abi::SLOTS_PER_PAGE as u64
-                / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
-            for page in failed {
-                // Every span of it: the module that has just arrived may cover
-                // parts of the page this one could not.
-                for i in 0..spans {
-                    asked.remove(&(page * spans + i));
-                }
+        let mut f = FILL_ASKED.lock();
+        let failed = std::mem::take(&mut f.failed);
+        let spans = gex_abi::SLOTS_PER_PAGE as u64
+            / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        for page in failed {
+            // Every span of it: the module that has just arrived may cover
+            // parts of the page this one could not.
+            for i in 0..spans {
+                f.asked.remove(&(page * spans + i));
             }
-        });
+        }
     }
 }
 
@@ -6247,8 +6253,7 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
 pub extern "C" fn gex_fill_done(ok: i32) {
     let page = FILL_PENDING.with(|c| c.replace(-1));
     if ok == 0 && page >= 0 {
-        // Under KLOCK: shared with the miss path's `FILL_ASKED`/`FILL_FAILED`.
-        with_host(|_| FILL_FAILED.0.borrow_mut().insert(page as u64));
+        FILL_ASKED.lock().failed.insert(page as u64);
     }
     FILL_WANTED.with(|c| c.set(-1));
 }
@@ -7993,7 +7998,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, 
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    FORK[5].store(h.kernel.mem.brk_current(), std::sync::atomic::Ordering::Relaxed);
+    FORK[5].store(h.kernel.mem.lock().brk_current(), std::sync::atomic::Ordering::Relaxed);
     // Only the forking thread's Worker may claim it (`gex_fork_pending`).
     FORK_BY.store(cur() as u64 + 1, std::sync::atomic::Ordering::Relaxed);
     // Last, because it is what the host tests: the rest must be readable by
@@ -8899,9 +8904,9 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // did not copy `IDENTITY` here is not root and every forked `dpkg` refuses.
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
-    kernel.mem.grows_on_demand(arena_grow, arena_back);
+    kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     if nt::windows_space() != 0 {
-        w3_address_space(&mut kernel.mem, nt::windows_space());
+        w3_address_space(&mut kernel.mem.lock(), nt::windows_space());
     }
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
@@ -9042,6 +9047,7 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
     with_host(|h| {
         h.kernel
             .mem
+            .lock()
             .insert(start as u64, end as u64, prot as u32, "[forked]");
     });
 }
@@ -9150,10 +9156,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // so anything not deliberately cleared stays, and the next program maps its
     // libraries at the same addresses -- finding the old program's *relocated*
     // copy, whose `.got.plt` sends a call through the PLT into unmapped memory.
-    let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
+    let old: Vec<(u64, u64)> = h.kernel.mem.lock().vmas().iter().map(|v| (v.start, v.end)).collect();
     let old_code: Vec<(u64, u64)> = h
         .kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
@@ -9163,7 +9170,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // in a forked child everything it inherited below `ADOPTED_TOP` (its shim
     // never allocates there; see `arena_take`) -- less anything the runtime
     // owns, by the memory map's own record.
-    let mut dead: Vec<(u64, u64)> = h.kernel.mem.arena_spans().to_vec();
+    let mut dead: Vec<(u64, u64)> = h.kernel.mem.lock().arena_spans().to_vec();
     let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
     if inherited > gex_abi::ARENA_BOTTOM {
         dead.push((gex_abi::ARENA_BOTTOM, inherited));
@@ -9173,9 +9180,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         .map(|&(lo, hi)| memmap::guest_only(lo.max(gex_abi::ARENA_BOTTOM), hi.min(gex_abi::MMAP_TOP)))
         .collect::<Option<Vec<_>>>()
         .map(|v| v.into_iter().flatten().collect());
-    h.kernel.mem.renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
+    h.kernel.mem.lock().renew(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
-    h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    h.kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     // Old code the new program may put something else at: what lies in the
     // donated arena. Code elsewhere (ld.so at its fixed base) can only come
     // back as the same object at the same place, and keeps its translations
@@ -9194,7 +9201,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         None => Vec::new(),
     };
     if let Some(dead) = dead {
-        h.kernel.mem.donate_arena(&dead);
+        h.kernel.mem.lock().donate_arena(&dead);
     }
     // Everything keyed by a code address there forgets it.
     cgen::on_exec(&reused);
@@ -9278,7 +9285,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         // cannot be re-read and a snapshot carries its bytes. It does get a code
         // identity -- this program's segment at this address -- which lets two
         // processes share a translation instead of each re-lifting its own text.
-        h.kernel.mem.insert_loaded(
+        h.kernel.mem.lock().insert_loaded(
             seg.vaddr,
             seg.vaddr + seg.mem_size,
             prot,
@@ -9352,7 +9359,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     gex_kernel::zero_dirty_bytes(&mut data[stack_lo..gex_abi::STACK_TOP as usize]);
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
-    h.kernel.mem.insert(
+    h.kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
@@ -9370,8 +9377,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // span, which is only safe while the fill's answer is reachable -- and
     // clearing the directory above made it unreachable, so a stale mark would
     // strand every block on the page on the translator for the process's life.
-    FILL_ASKED.0.borrow_mut().clear();
-    FILL_FAILED.0.borrow_mut().clear();
+    {
+        let mut f = FILL_ASKED.lock();
+        f.asked.clear();
+        f.failed.clear();
+    }
     SERVED_PAGE.0.borrow_mut().clear();
     // And the bases blocks were installed under: the page table starts over
     // below, and a page of the new program has nothing installed yet.
@@ -9725,7 +9735,7 @@ fn snap_arm(kernel: &mut Kernel, key: u64, exe: &gex_ld::Image, interp_base: u64
     let data = guest_bytes();
     let at = SNAP_STUB as usize;
     data[at..at + SNAP_STUB_CODE.len()].copy_from_slice(SNAP_STUB_CODE);
-    kernel.mem.insert_loaded(
+    kernel.mem.lock().insert_loaded(
         SNAP_STUB,
         SNAP_STUB + 4096,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC,
@@ -9791,7 +9801,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     for v in [phdr, phent, phnum, interp_base] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&h.kernel.mem.brk_current().to_le_bytes());
+    out.extend_from_slice(&h.kernel.mem.lock().brk_current().to_le_bytes());
     {
         let gm = GuestMem::new(guest_bytes());
         for i in 0..31u8 {
@@ -9811,6 +9821,7 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
     let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, Option<(String, u64)>)> = h
         .kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .filter(|v| v.name != "[stack]" && v.start != SNAP_STUB)
@@ -9915,8 +9926,8 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     let tpidr = snap_read_u64(raw, &mut p)?;
     let n = snap_read_u32(raw, &mut p)?;
 
-    h.kernel.mem.renew(brk);
-    h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    h.kernel.mem.lock().renew(brk);
+    h.kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
     // One read per file, not per mapping: a library is four mappings (text,
     // rodata, relro, data), and re-reading `libc.so.6` for each is wasteful.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -9954,7 +9965,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             gex_kernel::zero_dirty_bytes(&mut data[a..b]);
             let take = (b - a).min(bytes.len().saturating_sub(off as usize));
             data[a..a + take].copy_from_slice(&bytes[off as usize..off as usize + take]);
-            h.kernel.mem.insert_from(start, end, prot, &name, Some((path, off)));
+            h.kernel.mem.lock().insert_from(start, end, prot, &name, Some((path, off)));
         } else {
             let len = snap_read_u32(raw, &mut p)? as usize;
             let pages = len.div_ceil(4096);
@@ -9985,7 +9996,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
                     data[da..db].copy_from_slice(&payload[..db - da]);
                 }
             }
-            h.kernel.mem.adopt(start, end, prot, &name, code);
+            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
             ms_copy += now_ns() - began;
             n_copy += end - start;
         }
@@ -10094,12 +10105,8 @@ thread_local! {
 /// over libc, each a module somebody already built.
 fn object_identity(h: &Host, addr: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let v = h
-        .kernel
-        .mem
-        .vmas()
-        .iter()
-        .find(|v| addr >= v.start && addr < v.end)?;
+    let mm = h.kernel.mem.lock();
+    let v = mm.vmas().iter().find(|v| addr >= v.start && addr < v.end)?;
     if v.prot & gex_kernel::mem::prot::WRITE != 0 {
         return None;
     }
@@ -10448,12 +10455,8 @@ pub extern "C" fn gex_xcache_restore() -> i32 {
 
 fn page_identity(h: &Host, page: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    let v = h
-        .kernel
-        .mem
-        .vmas()
-        .iter()
-        .find(|v| page >= v.start && page < v.end)?;
+    let mm = h.kernel.mem.lock();
+    let v = mm.vmas().iter().find(|v| page >= v.start && page < v.end)?;
     // The two reasons a page has no identity, counted apart: a writable mapping
     // (the guest could have changed it) versus one the loader declined to name.
     if v.prot & gex_kernel::mem::prot::WRITE != 0 {
@@ -10729,6 +10732,7 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
                 let foff = h
                     .kernel
                     .mem
+                    .lock()
                     .vmas()
                     .iter()
                     .find(|v| live >= v.start && live < v.end)
@@ -10825,7 +10829,7 @@ fn report_idle(why: u8) {
                     .read_u64(t.kstate.ctx_addr + ctx::PC as u64)
                     .unwrap_or(0);
                 if cpc != r.pc {
-                    let where_ = k.mem.vmas().iter()
+                    let where_ = k.mem.lock().vmas().iter()
                         .find(|v| cpc >= v.start && cpc < v.end)
                         .map(|v| format!(" in {} +{:#x}", v.name, cpc - v.start))
                         .unwrap_or_default();
@@ -11167,6 +11171,7 @@ fn report_deadlock() {
                     pc,
                     h.kernel
                         .mem
+                        .lock()
                         .vmas()
                         .iter()
                         .find(|v| pc >= v.start && pc < v.end)
@@ -12094,6 +12099,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     let vma = with_host(|h| {
         h.kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
@@ -12223,6 +12229,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                 let object = |a: u64| {
                     h.kernel
                         .mem
+                        .lock()
                         .vmas()
                         .iter()
                         .find(|v| a >= v.start && a < v.end)
@@ -12293,6 +12300,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             let object = |a: u64| {
                 h.kernel
                     .mem
+                    .lock()
                     .vmas()
                     .iter()
                     .find(|v| a >= v.start && a < v.end)
@@ -12321,6 +12329,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         let object = |a: u64| {
             h.kernel
                 .mem
+                .lock()
                 .vmas()
                 .iter()
                 .find(|v| a >= v.start && a < v.end)
@@ -12737,6 +12746,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                 let name = |addr: u64| {
                     h.kernel
                         .mem
+                        .lock()
                         .vmas()
                         .iter()
                         .find(|v| addr >= v.start && addr < v.end)
@@ -12751,6 +12761,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                 let whose = h
                     .kernel
                     .mem
+                    .lock()
                     .vmas()
                     .iter()
                     .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
@@ -13146,40 +13157,33 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A signal handler returning: with no `sa_restorer` the kernel puts
     // `SIGRETURN_TRAMPOLINE` in x30, an address with nothing translated at it,
     // so the handler's `ret` arrives here -- the whole mechanism.
+    // No kernel lock: the thread's signal state and run state are its own.
     if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
-        let resumed = with_host(|h| {
-            let mut gm = GuestMem::new(guest_bytes());
-            let kstate = h.threads[cur()].kstate.clone();
-            h.kernel.enter_thread(&kstate);
-            let r = h.kernel.sigreturn(&mut gm);
-            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
-            match r {
-                Ok(target) => {
-                    if tracing() {
-                        trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
-                    }
-                    h.threads[cur()].run().pc = target;
-                    set_resume(target);
-                    set_resume_ctx(kstate.ctx_addr);
-                    true
+        let mut gm = GuestMem::new(guest_bytes());
+        let ctx_addr = my_ctx();
+        match sigs::sigreturn(&mut gm, ctx_addr) {
+            Ok(target) => {
+                if tracing() {
+                    trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
                 }
-                Err(_) => {
-                    warn_line("gex: corrupt signal frame on sigreturn\n");
-                    set_exit(h, 128 + 11);
-                    false
+                if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                    run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
                 }
+                set_resume(target);
+                set_resume_ctx(ctx_addr);
             }
-        });
-        let _ = resumed;
+            Err(_) => {
+                warn_line("gex: corrupt signal frame on sigreturn\n");
+                with_host(|h| set_exit(h, 128 + 11));
+            }
+        }
         trap();
     }
     // A branch to memory nothing executable is mapped at: a bad return
     // address or function pointer. Said before any slot arithmetic, because a
     // wild `pc` makes a wild directory index, and a shim trap on that reads as
     // a runtime bug where the guest's own crash is the story.
-    let wild = gex_abi::X86 && with_host(|h| {
-        !h.kernel.mem.vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
-    });
+    let wild = gex_abi::X86 && !sigs::executable(pc);
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
     }
@@ -13269,14 +13273,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
-        // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
-        // with a Worker per thread this is entered concurrently. Two threads
-        // missing at once (the main thread and a dbus/gsettings worker, both
-        // faulting in glib/gobject closure pages) would `borrow_mut` and rebalance
-        // the tree simultaneously -- a data race that stores through a freed/moved
-        // node into unrelated linear memory, smashing a live stack. See
-        // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
-        let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
+        // Under the fill's own lock (`FILL_ASKED`): two threads missing at
+        // once (the main thread and a dbus/gsettings worker, both faulting in
+        // glib/gobject closure pages) ask together.
+        let fresh = FILL_ASKED.lock().asked.insert(key);
         if fresh {
             miss_way(pc, 10);
             FILL_FROM.with(|c| c.set(from));
@@ -13337,7 +13337,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             for i in 0..4096u64 {
                 let Ok(v) = gm.read_u32(sp + 4 * i) else { break };
                 let v = v as u64;
-                let in_image = h.kernel.mem.vmas().iter().any(|m| m.prot & gex_kernel::mem::prot::EXEC != 0 && !m.name.is_empty() && v >= m.start + 6 && v < m.end);
+                let in_image = h.kernel.mem.lock().vmas().iter().any(|m| m.prot & gex_kernel::mem::prot::EXEC != 0 && !m.name.is_empty() && v >= m.start + 6 && v < m.end);
                 if !in_image || cands.contains(&v) {
                     continue;
                 }
@@ -13415,7 +13415,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
-            if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
+            if FILL_ASKED.lock().asked.contains(&key) { 2 } else { 3 }
         };
         LIFT_WHY[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Keep the addresses of `why == 2` (a span the fill already answered):
@@ -13467,6 +13467,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let exec: Vec<(u64, u64)> = h
             .kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
@@ -13817,6 +13818,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         gex_xlate::set_volatile_ranges(
             h.kernel
                 .mem
+                .lock()
                 .vmas()
                 .iter()
                 .filter(|v| {
@@ -14153,7 +14155,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             trace_line(&format!(
                 "gex: running {:?}, {} vmas, last syscall {}, ctx pc={:#x}\n",
                 h.kernel.exe_path,
-                h.kernel.mem.vmas().len(),
+                h.kernel.mem.lock().vmas().len(),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
                 gm.read_u64(c + ctx::PC as u64).unwrap_or(0),
             ));
@@ -14246,11 +14248,11 @@ pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            let vma = h.kernel.mem.vma_at(a);
-            let exec = vma.is_some_and(|v| v.prot & prot::EXEC != 0);
+            let vma = h.kernel.mem.lock().vma_at(a).map(|v| v.prot);
+            let exec = vma.is_some_and(|p| p & prot::EXEC != 0);
             // A PE image's page made non-executable for a while keeps its
             // unit (`cgen::in_pe_image`).
-            let dormant = vma.is_some_and(|v| v.prot != 0) && crate::cgen::in_pe_image(a);
+            let dormant = vma.is_some_and(|p| p != 0) && crate::cgen::in_pe_image(a);
             if !exec && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
@@ -14542,6 +14544,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         let exec: Vec<(u64, u64)> = h
             .kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
@@ -14708,8 +14711,8 @@ pub extern "C" fn gex_set_intrinsic_mask(mask: u32) {
 #[no_mangle]
 pub extern "C" fn gex_vma_reloadable(i: u32) -> i32 {
     with_host(|h| {
-        let vmas = h.kernel.mem.vmas();
-        let Some(v) = vmas.get(i as usize) else {
+        let mm = h.kernel.mem.lock();
+        let Some(v) = mm.vmas().get(i as usize) else {
             return 0;
         };
         let writable = v.prot & gex_kernel::mem::prot::WRITE != 0;
@@ -14728,7 +14731,8 @@ fn note_intrinsics(addr: u64) {
         return;
     }
     let Some((path, start)) = with_host(|h| {
-        let v = h.kernel.mem.vmas().iter().find(|v| {
+        let mm = h.kernel.mem.lock();
+        let v = mm.vmas().iter().find(|v| {
             addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0
         })?;
         let (path, _) = v.origin.as_ref()?;
@@ -14954,6 +14958,7 @@ pub(crate) fn object_file_off(a: u64) -> (String, u64) {
     with_host(|h| {
         h.kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .find(|v| a >= v.start && a < v.end)
@@ -14975,6 +14980,7 @@ pub(crate) fn object_off_str(a: u64) -> String {
 pub(crate) fn object_off_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .find(|v| a >= v.start && a < v.end)
@@ -14989,6 +14995,7 @@ pub(crate) fn object_off_at(h: &Host, a: u64) -> String {
 fn object_name_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem
+        .lock()
         .vmas()
         .iter()
         .find(|v| a >= v.start && a < v.end)
@@ -15012,12 +15019,8 @@ fn object_name_at(h: &Host, a: u64) -> String {
 /// Which object's executable mapping a guest address falls in, if any.
 fn executable_object_at(a: u64) -> Option<String> {
     with_host(|h| {
-        let v = h
-            .kernel
-            .mem
-            .vmas()
-            .iter()
-            .find(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)?;
+        let mm = h.kernel.mem.lock();
+        let v = mm.vmas().iter().find(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)?;
         v.origin.as_ref().map(|(p, _)| p.clone())
     })
 }
@@ -15177,6 +15180,7 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
     let name = with_host_free(|h| {
         h.kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .find(|v| (addr as u64) >= v.start && (addr as u64) < v.end)
@@ -15572,7 +15576,7 @@ pub extern "C" fn gex_dump_state() {
         // into nothing, which on Linux is `SIGSEGV` and here is a trap that
         // takes the Worker with it.
         let where_is = |a: u64| -> String {
-            match h.kernel.mem.vmas().iter().find(|v| a >= v.start && a < v.end) {
+            match h.kernel.mem.lock().vmas().iter().find(|v| a >= v.start && a < v.end) {
                 Some(v) => format!("{:#x}..{:#x} {}", v.start, v.end, v.name),
                 None => "UNMAPPED".to_string(),
             }

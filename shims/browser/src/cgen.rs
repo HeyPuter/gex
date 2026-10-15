@@ -1043,8 +1043,8 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     let len = (size + 0xfff) & !0xfff;
     // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
     let (start, dirty) = crate::with_host(|h| {
-        let clean = h.kernel.mem.clean_ranges().to_vec();
-        let start = h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
+        let clean = h.kernel.mem.lock().clean_ranges().to_vec();
+        let start = h.kernel.mem.lock().mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
         Ok::<_, gex_kernel::Errno>((start, gex_kernel::mem::dirty_parts(&clean, start, start + len)))
     })
     .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
@@ -1478,7 +1478,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         // A branch to memory nothing executable is mapped at: the guest's
         // access violation, as natively (34c3e45b).
         let wild = crate::with_host(|h| {
-            !h.kernel.mem.vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
+            !h.kernel.mem.lock().vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
         });
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);

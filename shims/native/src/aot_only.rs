@@ -141,7 +141,7 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i
     // A branch to memory that is not executable is the guest's own fault
     // (DEP: an access violation, ExceptionInformation[0] = 8), delivered as
     // the translator's miss path delivers it. Not a gap in the build.
-    if caller.data().nt.is_some() && !caller.data_mut().with_kernel(|k| k.mem.check_access(target, 1, prot::EXEC)) {
+    if caller.data().nt.is_some() && !caller.data_mut().with_kernel(|k| k.mem.lock().check_access(target, 1, prot::EXEC)) {
         return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
     }
     Err(missing(caller, target, "a call or jump"))
@@ -153,7 +153,7 @@ pub(crate) fn missing(caller: &mut Caller<'_, HostState>, addr: u64, how: &str) 
         Some(p) => p.describe_addr(addr),
         None => format!("{addr:#x}"),
     };
-    let exec = caller.data_mut().with_kernel(|k| k.mem.check_access(addr, 1, prot::EXEC));
+    let exec = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::EXEC));
     let why = if !exec {
         "which is not executable"
     } else if !what.contains('(') {

@@ -488,6 +488,28 @@ in the scheduler pick after each wake of the global WAKE word: about
      `pread64` 20 in pid 2). Legs: the i386 builds of
      `close-while-reading`, `kernel-contend` and `ioctl-threads`, page
      tier and SP; `free_i386_positioned_calls_answer_as_the_kernel_does`.
+   - The descriptor table's own calls (L10): `close`, `close_range`,
+     `dup`, `dup2`, `dup3`, `fcntl` (i386's `fcntl64` too) and `flock`
+     are in the free class, as `FdIo` methods the kernel's calls use too.
+     The table publishes itself and the `flock` table locks itself. What
+     the kernel lock had been making safe was the "last descriptor" test
+     (`Arc::strong_count == 1` after the close). Without the lock it is
+     wrong both ways: two threads closing the last two copies at once each
+     still hold one, and a replaced copy of the table holds one until its
+     readers move on. So the lock and an `O_TMPFILE`'s name now go when
+     the description itself does (`OpenFile`'s `Drop`, Linux's last
+     `fput`). A `close` of such a description waits for the table's
+     replaced copies (`FdTable::settle`, `Published::settle`), so the lock
+     is gone when the call returns. For that, `Published` now retires a
+     replaced value under its writers' mutex, and counts the values being
+     dropped. A memfd is found from its handle (`FileHandle::as_memfd`),
+     not a per-kernel map. Legs: `fdtable-threads` (the dup family, flags
+     and close racing on one table while a writer feeds a pipe through
+     copies; flock released by the last close and not before) in the page
+     tier, x86-64 and i386, and SP;
+     `free_fd_table_calls_answer_as_the_kernel_does`, its i386 twin,
+     `a_tmpfile_name_goes_with_its_last_descriptor`, and gex-atomic's
+     `settle_drops_every_value_replaced_before_it`.
 4. **Futexes: lock deleted (§3.2), L1.** `FutexTable` sharded, 256
    shards with their own locks; the PI count and bit under one table
    lock; `futex` answered in the free class with no fallback. Legs:
@@ -512,6 +534,16 @@ in the scheduler pick after each wake of the global WAKE word: about
 7. **Memory map: lock deleted (§3.5).** mm mutex for writers and a
    published VMA snapshot for readers (dispatch_miss, faults,
    /proc/self/maps).
+   - The mm lock (L12a): `Kernel::mem` is an `Mm`, the process's
+     `MemoryMap` behind its own `gex_kernel::sync::Mutex`, with the
+     published view (`MapView`) beside it, read without the lock. Every
+     reader and writer takes it for a leaf computation (`k.mem.lock()`),
+     never across a trap; a copy (`fork`, a vfork child) is a copy of the
+     map with its own lock and view, and `Mm::shared` is the same map for
+     a holder outside the kernel. Nothing is lock-free yet: every caller
+     still holds the kernel lock too. That is the next two pieces, the
+     mapping calls in the free class (L12b) and the shim's code
+     registration drained from the mm (L12c).
 8. **Signals and the thread table: lock deleted (§3.7, §3.8).**
    - The scheduler's turn (L7): `schedule` takes no lock. Every turn is
      `pick_mine` on the thread's own run state, the first turn of a
@@ -540,6 +572,21 @@ in the scheduler pick after each wake of the global WAKE word: about
      second in Noita's process, 16 in each Wine process's). Legs:
      `the_shared_map_view_follows_the_list`; the Noita page and the core
      gate's browser and gears legs, which pump.
+   - The miss path before a translation (L11, §3.6's first part): no
+     lock.
+     - A handler's return through `SIGRETURN_TRAMPOLINE` (every handler
+       on aarch64, where musl sets no restorer) restores the frame
+       through the thread's own signal state (`sigs::sigreturn`).
+     - The x86 check that a branch target is executable reads the map's
+       published view (`MapView::prot_at`; the map itself in SP).
+     - The fill's record of the spans it asked about and the pages nobody
+       could fill has its own lock (`FILL_ASKED`, `gex_kernel::sync::Mutex`).
+     A miss a module already in the process answers (a fill) took the
+     lock twice, and now takes none. A miss that translates still takes
+     it in `with_jit` (§3.6's lift and install), as do the wild-branch
+     report and the eject stop, which end the process. Legs: the page
+     tier's signal programs (`signal-storm`, `thread-signals`,
+     `sa-restart`, `pwait-sigmask`) built for aarch64 as well as x86.
 10. **Native: `Mutex<Kernel>` gone (§3.11).**
 
 

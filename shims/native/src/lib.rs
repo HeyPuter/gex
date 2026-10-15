@@ -1024,7 +1024,7 @@ fn run_program_with(
         }) => {
             // The address space is new, so the map of it starts empty. Every
             // other part of the kernel is what exec is defined to keep.
-            k.mem.renew(image.brk);
+            k.mem.lock().renew(image.brk);
             k.ctx_addr = ctx_addr;
             // `exec_program` already named the file it loaded, as a guest path;
             // argv[0] (all `exe_path` has here) may be a bare `wc`.
@@ -1198,7 +1198,7 @@ fn run_program_with(
     // or made writable (`MemoryMap::clean`).
     {
         let top = memory.bytes().len() as u64;
-        store.data_mut().with_kernel(|k| k.mem.mark_clean(gex_abi::RESERVED_END, top));
+        store.data_mut().with_kernel(|k| k.mem.lock().mark_clean(gex_abi::RESERVED_END, top));
     }
     if let Some(dev) = crate::gl::DEVICE.get() {
         dev.set_memory(memory.clone());
@@ -1305,7 +1305,7 @@ fn run_program_with(
         // Windows' fixed addresses left free, and the trampoline page (its
         // x86-64 entries and the native return pad serve W64)
         if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
-            store.data_mut().with_kernel(|k| k.mem.set_mmap_top(0x7ffe_0000));
+            store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
             // The NT layer's trampoline page, which native Wine's gexrt
             // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
             // wrappers): the same bytes at the same address.
@@ -1315,7 +1315,7 @@ fn run_program_with(
                 dst.copy_from_slice(&page);
             }
             store.data_mut().with_kernel(|k| {
-                k.mem.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
+                k.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
             });
         }
         wasmprog::install(&mut store, &memory, program)?;
@@ -1434,7 +1434,8 @@ fn run_program_with(
         // than printing as `?`.
         let vmas = {
             let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
-            k.mem.vmas().to_vec()
+            let v = k.mem.lock().vmas().to_vec();
+            v
         };
         s.report_mapped(&vmas, opts.sysroot.as_deref().and_then(|p| p.to_str()), 20);
         s.append_out(&s.counts.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1972,7 +1973,7 @@ fn run_thread_loop(
                         if let Some(memory) = store.data().memory.clone() {
                             let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
                             eprintln!("gex: thread {} context pc {at:#x}", store.data().thread.tid);
-                            let maps = store.data_mut().with_kernel(|k| k.mem.proc_maps());
+                            let maps = store.data_mut().with_kernel(|k| k.mem.lock().proc_maps());
                             // GEX_TRACE_SEGV=2: the whole map, to place the registers.
                             if std::env::var("GEX_TRACE_SEGV").as_deref() == Ok("2") {
                                 eprintln!("gex: guest maps:\n{maps}");
@@ -2003,7 +2004,7 @@ fn run_thread_loop(
                                 }
                             }
                             // And the registers and the return addresses on the stack, as GEX_DUMP_ABORT prints them.
-                            let vmas = store.data_mut().with_kernel(|k| k.mem.vmas().to_vec());
+                            let vmas = store.data_mut().with_kernel(|k| k.mem.lock().vmas().to_vec());
                             let tid = store.data().thread.tid;
                             let mut gm = GuestMem::new(memory.bytes());
                             dump_guest(&mut gm, ctx_addr, tid, &vmas);
@@ -2180,10 +2181,12 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         // What the parent has mapped, less what it is known to hold only
         // zeros (its reservations): the child's memory is zero already.
-        let regions: Vec<(u64, u64)> =
-            k.mem.vmas().iter().flat_map(|v| k.mem.dirty_parts(v.start, v.end)).collect();
+        let regions: Vec<(u64, u64)> = {
+            let mm = k.mem.lock();
+            mm.vmas().iter().flat_map(|v| mm.dirty_parts(v.start, v.end)).collect()
+        };
         if std::env::var_os("GEX_FORK_VMAS").is_some() {
-            for v in k.mem.vmas().iter().filter(|v| v.end - v.start >= 16 << 20) {
+            for v in k.mem.lock().vmas().iter().filter(|v| v.end - v.start >= 16 << 20) {
                 eprintln!("gex: fork vma {:#x}..{:#x} {} MiB prot {} {:?} code {}", v.start, v.end, (v.end - v.start) >> 20, v.prot, v.name, v.code.is_some());
             }
         }
@@ -3427,6 +3430,7 @@ fn place_image(
         }
         store.data_mut().with_kernel(|k| {
             k.mem
+                .lock()
                 .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]")
         });
     }
@@ -3451,7 +3455,7 @@ fn place_image(
 
     let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
     store.data_mut().with_kernel(|k| {
-        k.mem.insert(
+        k.mem.lock().insert(
             stack_low,
             gex_abi::STACK_TOP,
             prot::READ | prot::WRITE,
@@ -3622,7 +3626,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 {
                     let ctx_addr = state.thread.ctx_addr;
                     let tid = state.thread.tid;
-                    let vmas = state.with_kernel(|k| k.mem.vmas().to_vec());
+                    let vmas = state.with_kernel(|k| k.mem.lock().vmas().to_vec());
                     eprintln!("gex: GEX_DUMP_AT: thread {tid} at syscall {nr}");
                     dump_guest(&mut gm, ctx_addr, tid, &vmas);
                     if let Some(bt) = &dump_bt {
@@ -3652,7 +3656,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if signo == Ok(6) {
                     let ctx_addr = state.thread.ctx_addr;
                     let tid = state.thread.tid;
-                    let vmas = state.with_kernel(|k| k.mem.vmas().to_vec());
+                    let vmas = state.with_kernel(|k| k.mem.lock().vmas().to_vec());
                     dump_guest(&mut gm, ctx_addr, tid, &vmas);
                 }
             }
@@ -4688,7 +4692,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // data reports SIGSEGV rather than running whatever bytes are there.
     if !caller
         .data_mut()
-        .with_kernel(|k| k.mem.check_access(pc, gex_abi::INST_ALIGN, prot::EXEC))
+        .with_kernel(|k| k.mem.lock().check_access(pc, gex_abi::INST_ALIGN, prot::EXEC))
     {
         return Ok(false);
     }
@@ -4710,6 +4714,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     };
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)
@@ -4722,6 +4727,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     if gex_abi::X86 {
     let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0)
@@ -4750,7 +4756,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
         let (name, start) = caller
             .data_mut()
-            .with_kernel(|k| k.mem.vma_at(pc).map(|v| (v.name.clone(), v.start)).unwrap_or_default());
+            .with_kernel(|k| k.mem.lock().vma_at(pc).map(|v| (v.name.clone(), v.start)).unwrap_or_default());
         eprintln!(
             "[miss] pc={pc:#x} blocks={} wasm={} KiB in {name} (+{:#x})",
             stats.blocks,
@@ -4880,7 +4886,7 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
     let sources = sh.remiss[&pc].1;
     let (n_units, stale) = (sh.registry.len(), sh.stale_blocks);
     drop(sh);
-    let writable = caller.data_mut().with_kernel(|k| k.mem.check_access(pc, 1, prot::WRITE));
+    let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(pc, 1, prot::WRITE));
     eprintln!(
         "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}",
         (units.first(), units.last())
@@ -5774,11 +5780,11 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     for &(start, end) in ranges {
         let mut a = start / page * page;
         while a < end {
-            let vma = k.mem.vma_at(a);
+            let vma = k.mem.lock().vma_at(a).map(|v| v.prot);
             // A PE image's page made non-executable for a while keeps its
             // unit (`nt_cgen::in_pe_image`).
-            let dormant = vma.is_some_and(|v| v.prot != 0) && nt_cgen::in_pe_image(a);
-            if !vma.is_some_and(|v| v.prot & prot::EXEC != 0) && !dormant {
+            let dormant = vma.is_some_and(|p| p != 0) && nt_cgen::in_pe_image(a);
+            if !vma.is_some_and(|p| p & prot::EXEC != 0) && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
                     _ => out.push((a, a + page)),
@@ -5988,6 +5994,7 @@ fn recompile_object(
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let exec_ranges: Vec<(u64, u64)> = caller.as_context_mut().data_mut().with_kernel(|k| {
         k.mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)

@@ -181,14 +181,14 @@ pub(crate) fn note_stray(pc: u64) {
 fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::flags;
     let len = (size + 0xfff) & !0xfff;
-    crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    crate::with_host(|h| h.kernel.mem.lock().mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// A forked child's copy of the mapping [`alloc_low`] made in its parent
 /// (by name): the provider's data, heap and code page are the child's as
 /// the rest of its memory is.
 fn inherited(name: &str) -> Option<u64> {
-    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.name == name).map(|v| v.start))
+    crate::with_host(|h| h.kernel.mem.lock().vmas().iter().find(|v| v.name == name).map(|v| v.start))
 }
 
 /// The process the state above is for: a forked child's shim starts with
@@ -214,6 +214,7 @@ pub(crate) fn rescan_if_new() -> Option<usize> {
         use gex_kernel::mem::prot;
         h.kernel
             .mem
+            .lock()
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)
@@ -561,7 +562,7 @@ static OBJ_SYMS: Mutex<Option<HashMap<String, Arc<ObjSyms>>>> = Mutex::new(None)
 pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
     let name = String::from_utf8_lossy(crate::guest_bytes().get(ptr as usize..(ptr + len) as usize).unwrap_or(&[])).into_owned();
     let maps: Vec<(u64, String)> = crate::with_host(|h| {
-        h.kernel.mem.vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
+        h.kernel.mem.lock().vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
     });
     let mut seen = std::collections::HashSet::new();
     for (start, path) in maps {
@@ -591,7 +592,7 @@ pub extern "C" fn gex_libprov_guest_sym(ptr: u64, len: u64) -> u64 {
 /// `gex.provider_guest_stack_end(sp)`: the end of the mapping holding `sp`.
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_stack_end(sp: u64) -> u64 {
-    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end))
+    crate::with_host(|h| h.kernel.mem.lock().vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end))
 }
 
 /// `gex.provider_abi(which)`: constants of gex's ABI a provider calling
