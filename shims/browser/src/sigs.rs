@@ -56,6 +56,14 @@ pub(crate) struct Home {
     /// for `prlimit64` (L17).
     pipes: Option<gex_kernel::pipe::Remote>,
     rlimits: Arc<gex_kernel::syscalls::Rlimits>,
+    /// For the socket calls (L18): the network, the resolver and the ports,
+    /// the global kernel's sockets, and the socket name tables.
+    net: Option<Arc<dyn gex_kernel::net::NetStack>>,
+    resolver: Arc<gex_kernel::net::Resolver>,
+    ports: Arc<gex_kernel::net::Ports>,
+    unix_remote: Option<gex_kernel::unix::Remote>,
+    socket_names: Arc<gex_kernel::unix::SocketNames>,
+    host_names: Arc<gex_kernel::unix::SocketNames>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -99,6 +107,12 @@ fn home_of(k: &Kernel) -> Home {
         proc_fs: Arc::clone(&k.proc_fs),
         pipes: k.pipes,
         rlimits: Arc::clone(&k.rlimits),
+        net: k.net.clone(),
+        resolver: Arc::clone(&k.resolver),
+        ports: Arc::clone(&k.ports),
+        unix_remote: k.unix_remote,
+        socket_names: Arc::clone(&k.socket_names),
+        host_names: Arc::clone(&k.host_names),
     }
 }
 
@@ -313,11 +327,9 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     gather(home);
     // Whether a futex word is mapped: the map's published view where other
     // Workers may be changing the map; the map itself in the single-threaded
-    // build, which keeps no view and has nobody inside the kernel now.
+    // build, which keeps no view.
     #[cfg(not(feature = "shared-memory"))]
-    let by_kernel = |addr: u64, len: u64| {
-        crate::with_host(|h| h.kernel.mem.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end))
-    };
+    let by_kernel = |addr: u64, len: u64| home.mm.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
     let ns = home.vfs.get();
     let futex = FutexCx {
         table: &home.futexes,
@@ -361,6 +373,14 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         futex,
         started: crate::clock_started(),
         rlimits: &home.rlimits,
+        net: syscalls::NetIo {
+            net: home.net.as_ref(),
+            resolver: &home.resolver,
+            ports: &home.ports,
+            unix_remote: home.unix_remote,
+            socket_names: &home.socket_names,
+            host_names: &home.host_names,
+        },
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
 }
@@ -377,8 +397,7 @@ pub(crate) fn sigreturn(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, gex
 
 /// Whether `pc` is in an executable mapping of this process: the map's
 /// published view where other Workers may be changing the map; the map
-/// itself in the single-threaded build, which keeps no view and has nobody
-/// inside the kernel now.
+/// itself in the single-threaded build, which keeps no view.
 pub(crate) fn executable(pc: u64) -> bool {
     #[cfg(feature = "shared-memory")]
     {
@@ -386,7 +405,7 @@ pub(crate) fn executable(pc: u64) -> bool {
     }
     #[cfg(not(feature = "shared-memory"))]
     {
-        crate::with_host(|h| h.kernel.mem.lock().vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
+        home().is_some_and(|h| h.mm.lock().vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0))
     }
 }
 

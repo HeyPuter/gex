@@ -247,7 +247,7 @@ fn quote_arg(a: &str) -> String {
 }
 
 fn read_file(k: &Kernel, path: &str) -> Result<Vec<u8>, String> {
-    super::file::read_guest_file(k, path).map_err(|e| format!("reading {path}: {e:?}"))
+    super::file::read_guest_file(&k.vfs, path).map_err(|e| format!("reading {path}: {e:?}"))
 }
 
 fn st_err(what: &str) -> impl Fn(Status) -> String + '_ {
@@ -257,8 +257,8 @@ fn st_err(what: &str) -> impl Fn(Status) -> String + '_ {
 /// Reserve and commit a fresh private read-write region of the process's
 /// address space from the NT allocator, for a host-side owner (an export
 /// provider's data, stacks and heap): named `name`, bottom-up first fit.
-pub fn alloc_private(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Result<u64, String> {
-    alloc(p, k, size, name).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
+pub fn alloc_private(p: &Process, mm: &crate::mem::Mm, size: u64, name: &str) -> Result<u64, String> {
+    alloc_in(p, mm, size, name, false).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
 }
 
 /// [`alloc_private`] from the top of the address space down: for the host's
@@ -266,21 +266,21 @@ pub fn alloc_private(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Resu
 /// heap), which then do not move what the program maps after them -- a DLL
 /// mapped bottom-up lands where it would without them, at the base its unit
 /// was built for.
-pub fn alloc_private_top(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Result<u64, String> {
-    alloc_in(p, k, size, name, true).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
+pub fn alloc_private_top(p: &Process, mm: &crate::mem::Mm, size: u64, name: &str) -> Result<u64, String> {
+    alloc_in(p, mm, size, name, true).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
 }
 
 /// Reserve and commit a fresh private region from the NT allocator.
-fn alloc(p: &Process, k: &mut Kernel, size: u64, name: &str) -> R<u64> {
-    alloc_in(p, k, size, name, false)
+fn alloc(p: &Process, k: &Kernel, size: u64, name: &str) -> R<u64> {
+    alloc_in(p, &k.mem, size, name, false)
 }
 
-fn alloc_in(p: &Process, k: &mut Kernel, size: u64, name: &str, top_down: bool) -> R<u64> {
+fn alloc_in(p: &Process, mm: &crate::mem::Mm, size: u64, name: &str, top_down: bool) -> R<u64> {
     let size = (size + PAGE - 1) & !(PAGE - 1);
     let mut stl = p.st.lock().unwrap();
     let b = stl.vm.find_free((size + GRANULE - 1) & !(GRANULE - 1), top_down, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?;
     stl.vm.reserve(b, size, page_prot::READWRITE, true, Kind::Private, name);
-    stl.vm.mirror(&mut k.mem.lock(), b, b + size);
+    stl.vm.mirror(&mut mm.lock(), b, b + size);
     Ok(b)
 }
 

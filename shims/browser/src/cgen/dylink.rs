@@ -53,7 +53,7 @@ static ADOPT: Mutex<Option<String>> = Mutex::new(None);
 static REGISTRY: Mutex<Option<(Vec<usize>, usize)>> = Mutex::new(None);
 
 fn read(path: &str) -> Option<Vec<u8>> {
-    crate::with_host(|h| h.kernel.read_file(path))
+    crate::sigs::proc_home().read_file(path)
 }
 
 fn find_needed(p: &mut DyProc, from: usize) -> Result<Vec<Vec<u8>>, String> {
@@ -159,7 +159,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
             CURRENT_BASE.store(m.table_base, Ordering::Relaxed);
         }
     }
-    if std::env::var_os("GEX_WASM_TRACE").is_some() || crate::with_host(|h| h.kernel.trace) {
+    if std::env::var_os("GEX_WASM_TRACE").is_some() || crate::tracing() {
         for &i in &order {
             let m = &p.link.mods[i];
             crate::warn_line(&format!("gex: wasm32 module {}: data {:#x}+{:#x}, table {}\n", m.path, m.memory_base, m.info.mem_size, m.table_base));

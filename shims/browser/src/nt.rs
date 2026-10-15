@@ -1165,8 +1165,8 @@ mod imp {
         // Taken and retired under the JIT lock (`crate::take_logged`): a
         // thread whose own mapping call, NT or Linux, locked or not, reuses
         // an address this call freed retires it first itself or waits here.
-        with_host(|h| {
-            let mm = &h.kernel.mem;
+        {
+            let mm = crate::sigs::proc_home().mm();
             crate::with_jit_only(|j| {
                 let (retired, recheck, _) = crate::take_logged(mm, false);
                 mm.lock().log.new_code.clear();
@@ -1183,7 +1183,7 @@ mod imp {
                     crate::cgen::on_retire(&recheck, &[]);
                 }
             });
-        });
+        }
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {
             nt::Outcome::Continue => {
@@ -1622,16 +1622,14 @@ mod imp {
                     None => "no NT region".into(),
                 }
             };
-            let linux = with_host(|h| {
-                h.kernel
-                    .mem
-                    .lock()
-                    .vmas()
-                    .iter()
-                    .find(|v| pc >= v.start && pc < v.end)
-                    .map(|v| format!("{:#x}-{:#x} prot {:#x} {}", v.start, v.end, v.prot, v.name))
-                    .unwrap_or_else(|| "no Linux mapping".into())
-            });
+            let linux = crate::sigs::proc_home()
+                .mm()
+                .lock()
+                .vmas()
+                .iter()
+                .find(|v| pc >= v.start && pc < v.end)
+                .map(|v| format!("{:#x}-{:#x} prot {:#x} {}", v.start, v.end, v.prot, v.name))
+                .unwrap_or_else(|| "no Linux mapping".into());
             // Who branched there: the block the last indirect branch left,
             // and the stack (i386: the return address of a call is on top).
             let gm = GuestMem::new(guest_bytes());

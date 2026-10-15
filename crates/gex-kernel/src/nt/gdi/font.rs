@@ -153,7 +153,7 @@ fn faces(c: &Call<'_>) -> &'static [Face] {
         let mut all = Vec::new();
         for f in FILES {
             let path = format!("{}/drive_c/windows/Fonts/{f}", c.p.cfg.prefix);
-            if let Ok(d) = crate::nt::file::read_guest_file(&k, &path) {
+            if let Ok(d) = crate::nt::file::read_guest_file(&k.vfs, &path) {
                 all.extend(parse_fon(&d, f));
             }
         }

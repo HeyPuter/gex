@@ -1043,7 +1043,7 @@ fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
 /// Guest pages from the NT allocator, for a stateful provider.
 fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
     let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
-    crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+    gex_kernel::nt::boot::alloc_private(p, crate::sigs::proc_home().mm(), size, name)
 }
 
 /// Guest pages in a Linux process (an ELF provider's data and stack): an
@@ -1052,11 +1052,14 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
     let len = (size + 0xfff) & !0xfff;
     // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
-    let (start, dirty) = crate::with_host(|h| {
-        let clean = h.kernel.mem.lock().clean_ranges().to_vec();
-        let start = h.kernel.mem.lock().mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
+    // The map's own lock, held across both: the clean ranges are those
+    // the mapping is placed against.
+    let (start, dirty) = (|| {
+        let mut mm = crate::sigs::proc_home().mm().lock();
+        let clean = mm.clean_ranges().to_vec();
+        let start = mm.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)?;
         Ok::<_, gex_kernel::Errno>((start, gex_kernel::mem::dirty_parts(&clean, start, start + len)))
-    })
+    })()
     .map_err(|e| format!("mapping {name}: errno {}", e.0))?;
     // Read as zero, as the kernel's anonymous `mmap` makes it: the range may
     // hold what a forked parent left there before this process's `execve`
@@ -1075,7 +1078,7 @@ fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
 /// the program maps after them.
 fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
     let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
-    crate::with_host(|h| gex_kernel::nt::boot::alloc_private_top(p, &mut h.kernel, size, name))
+    gex_kernel::nt::boot::alloc_private_top(p, crate::sigs::proc_home().mm(), size, name)
 }
 
 /// A built-in stateful provider's data (its `dylink.0` size, aligned).
@@ -1497,9 +1500,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if crate::aot() {
         // A branch to memory nothing executable is mapped at: the guest's
         // access violation, as natively (34c3e45b).
-        let wild = crate::with_host(|h| {
-            !h.kernel.mem.lock().vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
-        });
+        let wild = !crate::sigs::executable(t);
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
         }

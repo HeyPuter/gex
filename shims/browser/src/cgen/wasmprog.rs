@@ -161,10 +161,11 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // mappings land and Wine's reservations succeed. Not above the
         // guest's slice (`GUEST_LIMIT`, just under 2 GiB).
         let lo = crate::nt::split_windows_space().map_err(|e| format!("W3: {e}"))?;
-        crate::with_host(|h| {
-            crate::w3_address_space(&mut h.kernel.mem.lock(), lo);
-            h.kernel.mem.lock().insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
-        });
+        {
+            let mut mm = crate::sigs::proc_home().mm().lock();
+            crate::w3_address_space(&mut mm, lo);
+            mm.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
+        }
     }
     let wasm = mem.get(wasm_at as usize..(wasm_at + wasm_len) as usize).ok_or("module outside memory")?.to_vec();
     // Parsed once for everything below. Three parses and a name for every
@@ -343,7 +344,7 @@ fn file_id(path: &str) -> Option<(&str, u64, i64, u64)> {
     if path.is_empty() || unsafe { crate::k_present() } == 0 {
         return None;
     }
-    let m = crate::with_host(|h| h.kernel.vfs.metadata(path)).ok()?;
+    let m = crate::sigs::proc_home().ns().metadata(path).ok()?;
     Some((path, m.ino, m.mtime, m.size))
 }
 
