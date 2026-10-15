@@ -26,7 +26,9 @@ compile_cmd() { # SRC_PATH OBJ_REL -> the build's compile command for it
 }
 tmpl=$(compile_cmd "$WF/server/atom.c" server/atom.o)
 [ -n "$tmpl" ] || { echo "link-wineserver: no compile command for server/atom.o in $B" >&2; exit 1; }
-srcs="$(sed -n '/^server\/wineserver:/,/^\t/p' Makefile | grep -o "server/[a-z_0-9]*\.o" | sort -u | sed 's#server/##; s#\.o$##') door"
+# door.c: in the server's sources since Wine's Makefile.in names it, added
+# for trees configured before that.
+srcs=$( { sed -n '/^server\/wineserver:/,/^\t/p' Makefile | grep -o "server/[a-z_0-9]*\.o" | sed 's#server/##; s#\.o$##'; echo door; } | sort -u)
 objs=""; rm -f "$O/.fail"
 for b in $srcs; do
 	o=$O/$b.o; objs="$objs $o"; src=$F/server/$b.c

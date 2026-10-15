@@ -1217,6 +1217,89 @@ Chromium timing is still to do. What it took, in start order:
     wayland_keyboard_init failed with "Failed to parse default Xkb
     ruleset".
 
+### 3.18 Building and running W3 from gex (2026-10-14)
+
+W3 builds from gex alone, from pins in `tools/wine-wasm/w3.pins`:
+
+- the Wine fork (MercuryWorkshop/wine-wasm) at one commit;
+- the musl fork at one commit;
+- the host Wine version whose i386 DLLs are staged (`tools/nt-stage-wine.sh`);
+- the Unix libraries' tarballs, each with a SHA-256: FreeType, wayland,
+  libxml2, libxkbcommon, and the meson wheel that builds libxkbcommon.
+
+```
+make -C tools/wine-wasm              # the dist and the game-ready prefix
+make -C tools/wine-wasm prefix-null  # the prefix for tests (null display driver)
+make -s -C tools/wine-wasm paths     # W3_DIST=..., W3_PREFIX=..., W3_UNITS=...
+tools/wine-wasm/run.sh EXE [ARGS]    # natively under gexc
+tools/wine-wasm/run.sh --page TREE EXE [ARGS]   # in the page, on a bench box
+```
+
+Every output goes in `W3_CACHE` (default `~/.cache/gex-w3`), in a directory
+named after what it is built from:
+
+| Output | Built from | Named by |
+|---|---|---|
+| sysroot | musl and libgex | the musl commit and a hash of gex's sysroot inputs |
+| Unix libraries | the sysroot | the sysroot's name and a hash of the pins and their build script |
+| Wine's tools and wasm32 tree | the Wine commit | the Wine commit, or for `WINE_DIR` its path; a stamp holds the tree hash, so a changed tree makes incrementally |
+| dist | all of the above | the Wine id, the libraries' key, a hash of `guest/gl`, and a hash of these scripts |
+| bare, installed and ready prefixes | the dist | the dist's key |
+
+A rerun redoes only what changed. With nothing changed, `make` takes about
+0.05 s.
+
+Sources come from bare mirrors in `W3_CACHE/mirror`. A mirror is fetched
+only when a pinned commit is missing from it (`W3_SEED` names a local clone
+to fetch from first). The source is exported with `git archive`, so a
+rebuild never makes a fresh clone. `WINE_DIR=path` builds a local Wine
+worktree instead of the pin, with no fetch. Its dist is keyed by its tree
+hash, uncommitted changes included.
+
+The prefix install runs `wineboot -u` under the x86 gexc (`GEXC`). It fails
+unless the registry gets the crypto providers and wineboot exits 0. `ready`
+then applies `page-prefix.sh` and sets the display driver (wayland or null)
+with EmulateModeset.
+
+**`run.sh`, native.** The program runs in its own directory on a copy of the
+prefix (`--keep DIR` keeps one), with `GEX_W3_UNITS=all` and one unit cache
+(`W3_CACHE/units`). `--build-units` builds the missing units in the
+background for the next run.
+
+**`run.sh --page TREE`.** TREE must be a page-ready tree: x86 shims, Mesa,
+and `web/node_modules`. The page gets two bundles:
+
+- the dist at `/w3`, made once per dist;
+- the prefix at `/pfx`, the host's xkb data at `/usr`, and EXE's directory
+  at `/g`.
+
+`run.sh` syncs a run tree and the unit cache to the bench box with
+`bench.sh`, and `w3/page-run.mjs` drives the page there. The page builds no
+units. `--build-units` builds the ones the run named afterwards
+(`w3/units.sh`).
+
+**Where the sandbox's build is (2026-10-14).** The sandbox uses
+`W3_CACHE=~/gex-sandbox/cache/w3`, which holds the mirrors and every keyed
+output. Get the current paths with:
+
+```
+W3_CACHE=~/gex-sandbox/cache/w3 make -s -C tools/wine-wasm paths
+```
+
+For the pin b57ea7f7d69 (key `b57ea7f7d694-93c5dfda327a-b19555f3cd-85636b9b-ccc072e29a-937c60cc`)
+they are:
+
+- `cache/w3/dist-KEY` (W3_DIST);
+- `cache/w3/pfx-KEY-wayland` (W3_PREFIX, games);
+- `cache/w3/pfx-KEY-null` (W3_PREFIX_NULL, tests);
+- `cache/w3/units` (W3_UNITS).
+
+These directories are read-only inputs: copy a prefix before you run in it,
+as `run.sh` does. A key changes whenever an input changes, so take paths
+from `make paths`, never from this list. The gate's W3 legs
+(`scratch/K/gate-w3legs/run.sh`) build and use them; `FROZEN=1` keeps the
+older frozen inputs.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
