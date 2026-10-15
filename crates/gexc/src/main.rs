@@ -171,6 +171,9 @@ usage:
                                    needs it built ahead (GEX_CGEN_GUARD=1)
   gexc cgen-image --providers      every export provider's module, into
                                    GEX_CGEN_CACHE (the browser cannot build them)
+  gexc cgen-image --inputs         a hash of everything a unit key takes besides
+                                   its image: a cache of units built by a gexc
+                                   that printed another one has no hits here
   gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
@@ -2512,6 +2515,12 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
+            // Print what every unit key takes besides its image
+            // (`image::inputs_id`): a changed id means every unit is rebuilt.
+            "--inputs" => {
+                println!("{}", gex_cgen::image::inputs_id());
+                return Ok(());
+            }
             other => path = Some(other.to_string()),
         }
         i += 1;

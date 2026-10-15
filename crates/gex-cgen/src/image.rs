@@ -58,6 +58,21 @@ pub fn image_key(image: &gex_ld::Image) -> String {
     gex_key::unit_key(image, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
 }
 
+/// Everything [`image_key`] takes besides the image (the format, the unit
+/// and recovery inputs, the flavour), hashed: two gexc builds give every
+/// image the same key exactly when they print the same id. `gexc cgen-image
+/// --inputs` prints it, for a cache of frozen units that must be rebuilt
+/// when a gex change moves the keys (tests/games/noita-page-leg.sh).
+pub fn inputs_id() -> String {
+    let mut h = gex_key::sha256::Sha256::new();
+    h.update(FORMAT.as_bytes());
+    h.update(b"\0");
+    h.update(unit_inputs().as_bytes());
+    h.update(&UNIT_ABI_VERSION.to_le_bytes());
+    h.update(RECOVERY_INPUTS.as_bytes());
+    gex_key::sha256::hex(&h.finish())[..16].to_string()
+}
+
 /// [`UNIT_INPUTS`] and a hash of [`abi_fingerprint`]: everything that
 /// decides a unit from a recovery.
 fn unit_inputs() -> String {
