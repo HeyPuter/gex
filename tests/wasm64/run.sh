@@ -59,4 +59,17 @@ if "$ROOT/tools/wine-wasm/wcc64" -O2 -Wl,--gex-guest-x86-64 -o "$WORK/winspace" 
 else
     echo "FAIL winspace: wcc64"; fail=1
 fi
+# More address space than wasm32 has: refused, and not learned as a program
+# that needs a 64-bit memory (gexc's mem64 record, docs/mem64.md §5).
+if "$ROOT/tools/wine-wasm/wcc64" -O2 -o "$WORK/bigmap" "$HERE/bigmap.c"; then
+    rm -rf "$WORK/xdg"
+    got=$(cd "$WORK" && XDG_CACHE_HOME="$WORK/xdg" timeout 120 "$GEXC" run --cwd "$WORK" ./bigmap 2>"$WORK/bigmap.err")
+    if [ "$got" = "6 GiB of mappings refused: 1" ] && ! [ -d "$WORK/xdg/gex/mem64" ] && ! grep -q "needs more than 4 GiB" "$WORK/bigmap.err"; then
+        echo "ok   wasm64/bigmap (no 64-bit memory learned)"
+    else
+        echo "FAIL wasm64/bigmap"; printf '%s\n' "$got" | sed 's/^/  got: /'; sed 's/^/  stderr: /' "$WORK/bigmap.err" | head -5; fail=1
+    fi
+else
+    echo "FAIL bigmap: wcc64"; fail=1
+fi
 exit $fail

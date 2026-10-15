@@ -5379,6 +5379,15 @@ pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::
 /// guest state with PC at the fault, the hook leaves the state to go on
 /// from (ntdll.so: KiUserExceptionDispatcher's), and the call-out the guest
 /// ran under resumes there, the native frames under it intact.
+///
+/// The hook must read the guest registers out of the context before it
+/// makes any Linux system call: a native program's libc (musl's gex arch)
+/// makes its own system calls through that same context, so the first one
+/// overwrites the number and argument registers and puts its result in
+/// the first (x86-64: RAX, RDI, RSI, RDX, R10, R8, R9, RSP restored after;
+/// i386: EAX, EBX, ECX, EDX, ESI, EDI, EBP and ESP).
+/// A hook that resumes the guest writes the whole state back (Wine's
+/// signal_wasm64.c: ctx_to_frame first, frame_to_ctx last).
 static FAULT_HOOKS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 fn fault_hook_of(state: &HostState) -> Option<u32> {
@@ -5684,6 +5693,9 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         // the context last had it (the block's start, at best).
         if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
             let at = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
+            if std::env::var_os("GEX_TRACE_OOB").is_some() {
+                eprintln!("gex: memory out of bounds at guest pc {at:#x}: {e:?}");
+            }
             if deliver_guest_fault(caller, fault_code::ACCESS_VIOLATION, at, 0)? {
                 pc = caller.data_mut().resume_at.take().unwrap_or(at);
                 refresh_callouts(&mut *caller)?;
