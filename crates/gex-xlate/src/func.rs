@@ -1160,12 +1160,42 @@ pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds),
         }
     }
     // Every relocated word that points into code is a code pointer
-    // something takes: a function, a jump-table case, a handler.
+    // something takes: a function, a jump-table case, a handler -- unless
+    // what it points at is a pointer itself. The operand of `call [slot]`
+    // is relocated as well, and Microsoft's linker keeps such slots in
+    // `.text` (the IAT, and shell32.dll's lazily bound wrappers: `[slot]
+    // [nops][stub]`). An address holding a relocated word, or inside an
+    // import slot, is data: taken for a start, the slot's bytes decoded
+    // straight into the stub after it and made that an interior block of a
+    // function at the slot, so the stub had no function of its own and
+    // every call through the slot left the unit (the Win7 shell's hottest
+    // call-outs).
+    let held: std::collections::HashSet<u64> = pe
+        .relocs
+        .iter()
+        .filter(|r| r.kind != gex_ld::pe::rel::ABSOLUTE)
+        .map(|r| base + r.rva as u64)
+        .collect();
+    let mut slots: Vec<(u64, u64)> = pe
+        .imports
+        .iter()
+        .flat_map(|d| d.symbols.iter())
+        .chain(pe.delay_imports.iter().flat_map(|d| d.symbols.iter()))
+        .map(|s| (base + s.iat_rva as u64, base + s.iat_rva as u64 + ptr as u64))
+        .collect();
+    slots.sort_unstable();
+    let in_slot = |a: u64| {
+        let i = slots.partition_point(|r| r.1 <= a);
+        slots.get(i).is_some_and(|r| r.0 <= a)
+    };
     for r in &pe.relocs {
         if r.kind == gex_ld::pe::rel::ABSOLUTE {
             continue;
         }
         if let Some(t) = word(base + r.rva as u64) {
+            if held.contains(&t) || in_slot(t) {
+                continue;
+            }
             starts.push((t, Source::PeReloc));
         }
     }
@@ -1608,9 +1638,13 @@ fn guessed_cases(functions: &BTreeMap<u64, Function>) -> HashSet<u64> {
 /// function of its own; it does not stop that start from being promoted
 /// (Win7's uiribbon.dll: the vtable functions such tails reach were blocks
 /// of the tail and nobody's entry, called a few thousand times at start-up
-/// through the function table's fallback).
+/// through the function table's fallback). Read-only memory too: a `jmp
+/// [slot]` with no index through a pointer kept in `.text` is a tail call
+/// all the same (shell32.dll's lazily bound wrappers: the stub the slot
+/// holds was a block of every function that tail-jumps through it, and
+/// every call through the slot left the unit).
 fn one_case_guess(t: &gex_ir::func::JumpTable) -> bool {
-    t.count == 1 && t.entry_bytes == 0 && !t.complete
+    t.count == 1 && t.entry_bytes == 0
 }
 
 /// Whether an uncovered weak start is worth a function of its own: its

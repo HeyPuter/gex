@@ -366,3 +366,22 @@ fn a_virtual_tail_s_callee_after_a_vtable_in_text_is_a_function() {
     let found: Vec<u64> = prog.functions.keys().copied().collect();
     assert!(found.contains(&0x401010), "get_b not a function: {found:x?}");
 }
+
+/// `tests/pe/ptext32.exe` (see `tests/pe/build.sh`): a function pointer in
+/// `.text` with its target right after it, called through (`call *_slot`).
+/// The call's relocated operand is the slot's address, which is data: taken
+/// for a start, its bytes decoded straight into the stub and made it an
+/// interior block of a function at the slot, so the stub had no function of
+/// its own and every call through the slot left the unit (shell32.dll's
+/// lazily bound wrappers, the Win7 shell's hottest call-outs).
+#[test]
+fn a_pointer_slot_in_text_is_not_a_function_and_its_target_is() {
+    let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/ptext32.exe")).unwrap();
+    let pe = gex_ld::pe::parse(&bytes).unwrap();
+    let (img, extra) = gex_xlate::func::pe_input(&pe, pe.preferred_base).unwrap();
+    let prog = recover_pe(&img, &extra, &RecoverOptions::default());
+    let found: Vec<u64> = prog.functions.keys().copied().collect();
+    let (slot, stub) = (0x401000, 0x401009);
+    assert!(!found.contains(&slot), "the slot {slot:#x} is a function: {found:x?}");
+    assert!(found.contains(&stub), "the stub {stub:#x} is not a function: {found:x?}");
+}
