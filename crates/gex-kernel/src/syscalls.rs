@@ -11435,6 +11435,11 @@ mod tests {
                 // x86-64 has the child's tid word before the TLS.
                 let args = if gex_abi::X86 { [flags, stack, ptid, ctid, 0] } else { [flags, stack, ptid, 0, ctid] };
                 set_args(&mut m, main.ctx_addr, nr::CLONE, &args);
+                // x86-64's `fork` and `vfork` are `clone` canonically too,
+                // and `set_args` picks the highest: its own `clone` here.
+                if gex_abi::X86 {
+                    m.write_u64(main.ctx_addr + ctx::SYSCALL_NR as u64, crate::x86::raw::CLONE).unwrap();
+                }
             }
             let made = if kernel {
                 match k.syscall(&mut m, 0) {
@@ -11460,6 +11465,9 @@ mod tests {
         // A missing stack, both ways.
         for kernel in [true, false] {
             set_args(&mut m, main.ctx_addr, nr::CLONE, &[flags, 0, 0, 0, 0]);
+            if gex_abi::X86 {
+                m.write_u64(main.ctx_addr + ctx::SYSCALL_NR as u64, crate::x86::raw::CLONE).unwrap();
+            }
             if kernel {
                 k.syscall(&mut m, 0);
             } else {
