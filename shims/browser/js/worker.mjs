@@ -795,6 +795,7 @@ async function handle(msg) {
       } catch (e) { console.error(`[cov] dump failed: ${e.message}`); }
     };
     let count = 0;
+    const stubLog = !!globalThis.process?.env?.GEX_WL_STUB_LOG;
     gex.useWl({
       publish(memory, ptr, n) {
         count++;
@@ -815,7 +816,11 @@ async function handle(msg) {
           });
         }
         const windows = recs.filter((s) => s.role === wlb.ROLE_TOPLEVEL && s.w > 0);
-        if (count === 1 || count % 60 === 0) {
+        // GEX_WL_STUB_LOG: every publish, on the guest's clock (hostNowNs's
+        // base), for tests/browser-wl-unmap.sh.
+        if (stubLog) {
+          console.error(`[wlstub] publish t=${(performance.timeOrigin + performance.now()).toFixed(1)} surfaces=${recs.length} windows=${windows.length}`);
+        } else if (count === 1 || count % 60 === 0) {
           console.error(
             `[wlstub] publish #${count}: ${recs.length} surfaces, ${windows.length} windows`
             + windows.map((w) => ` ${w.w}x${w.h}`).join(''),

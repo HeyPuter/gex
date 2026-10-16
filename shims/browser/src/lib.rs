@@ -11958,6 +11958,14 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         r.owed = Owed { restore_sigmask, write_blocked, reissue };
     }
     waitq::begin_turn();
+    // The compositor first, as the locked turn pumps it (`schedule`): this is
+    // the turn a Wayland client's wait makes after it wrote a request, and
+    // `schedule` skips the pump for a first turn made here. Without it the
+    // request sat in the socket until some thread of the process next took a
+    // full turn: a destroyed menu stayed drawn, and took clicks, for 2-10 s
+    // (X's B2), and a lone client blocked on its first reply never got one
+    // (tests/browser-wl-unmap.sh).
+    pump_compositor();
     let pick = pick_mine(&run);
     FIRST_PICK.with(|c| *c.borrow_mut() = Some(pick));
     3
