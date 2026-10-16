@@ -1670,12 +1670,17 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
                 note_provided(memory, p.base + rva as u64, format!("{dll}!{e}"));
             }
         }
-        eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
+        if crate::log_on() {
+            eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
+        }
     }
     // A native wasm32 Wine DLL (stream W): its module, at its skeleton's
     // exports (`wasmdll`).
     if let Some(n) = crate::wasmdll::install(&p.pe, &p.path, p.base, state, shared, engine, memory)? {
-        eprintln!("gex-nt: native wasm32 module for {}: {n} entries", p.path);
+        crate::note_library(&p.path);
+        if crate::log_on() {
+            eprintln!("gex-nt: native wasm32 module for {}: {n} entries", p.path);
+        }
     }
     // Stateful providers (`libprov`: an ejected project's), after the
     // built-in ones, so they win where both bind an export.
@@ -1696,6 +1701,10 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
 }
 
 fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
+    // Once per image per process: debug output (GEX_LOG).
+    if !crate::log_on() {
+        return;
+    }
     eprintln!(
         "gex-nt: function tier for {} at {:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
         p.path,
@@ -1846,13 +1855,16 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
-        eprintln!(
-            "gex-elf: function tier for {} at {base:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
-            m.path,
-            entries.iter().filter(|&&a| a != 0).count(),
-            cwasm.len() >> 20,
-            t0.elapsed().as_secs_f64()
-        );
+        // Once per object per process: debug output (GEX_LOG).
+        if crate::log_on() {
+            eprintln!(
+                "gex-elf: function tier for {} at {base:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
+                m.path,
+                entries.iter().filter(|&&a| a != 0).count(),
+                cwasm.len() >> 20,
+                t0.elapsed().as_secs_f64()
+            );
+        }
     }
     Ok(())
 }

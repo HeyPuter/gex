@@ -49,13 +49,14 @@ done
 page() { # LOG [env...]
 	local log=$1; shift
 	rm -rf "$w/pfx-page" "$w/t"; cp -a "$prefix" "$w/pfx-page"; mkdir -p "$w/t"
-	(cd "$root" && env GEX_ARCH=x86 GEX_SHARED=1 GEX_CGEN_CACHE="$w/units" "$@" timeout -k 10 "${TMO:-300}" node --max-old-space-size=8192 \
+	(cd "$root" && env GEX_ARCH=x86 GEX_SHARED=1 GEX_LOG=unit GEX_CGEN_CACHE="$w/units" "$@" timeout -k 10 "${TMO:-300}" node --max-old-space-size=8192 \
 		shims/browser/js/run-node.mjs --cgen-prefer --dir /w3="$dist" --dir /pfx="$w/pfx-page" --dir /t="$w/t" \
 		--file "/t/strayret.exe=$w/strayret.exe" --env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all \
 		--cwd /t --argv0 /w3/lib/wine/i386-unix/wine web/public/gex/seed.x86.shared.wasm \
 		"$dist/lib/wine/i386-unix/wine" /t/strayret.exe) > "$log" 2>&1
 }
 page "$w/page.log"
+# (GEX_LOG=unit: the unit's "function tier for" line is debug output.)
 if grep -q 'function tier for .*/strayret.exe' "$w/page.log"; then verdict page "$w/page.log" '^strayret ok [1-9]'
 else fail=$((fail + 1)); echo "FAIL page: strayret.exe ran without its unit"; grep -i 'strayret.exe' "$w/page.log" | head -3 | sed 's/^/  /'; fi
 page "$w/page-trap.log" GEX_STRAY_TRAP=1

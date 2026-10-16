@@ -12,6 +12,8 @@
 #
 # Needs `GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh`.
 set -u
+# The lines checked below ("function tier for", "replaced by") are debug output.
+export GEX_LOG=${GEX_LOG:-1}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 gexc=$(realpath "${1:-$root/target/x86/release/gexc}")
