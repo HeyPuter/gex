@@ -195,6 +195,9 @@ const units = { hit: new Set(), miss: new Set() };
     const s = p.sessionId;
     await browser.send('Runtime.enable', {}, s).catch(() => {});
     await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, s).catch(() => {});
+    // The `[gex-record]` lines are debug output (shims/browser/js/log.mjs): asked for in
+    // every target before it runs (a Worker sees neither the page's globals nor its query).
+    await browser.send('Runtime.evaluate', { expression: "globalThis.GEX_LOG ??= 'record'" }, s).catch(() => {});
     await browser.send('Runtime.runIfWaitingForDebugger', {}, s).catch(() => {});
   });
   await browser.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, page);

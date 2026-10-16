@@ -15,6 +15,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { loadRuntime, fetchBytes, runProgram } from './runtime.js';
 import { untar } from './tar.js';
 import { unzstd } from './zfetch.js';
+import { logOn } from '@gex/log.mjs';
 
 const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
@@ -204,7 +205,7 @@ function install(item, cat, onProgress) {
       });
     });
     installed.add(item.id);
-    console.log(`[desktop] ${item.id}: ${r.files} files, ${kib(r.bytes)} from ${kib(r.compressed)}; ` +
+    if (logOn('debug')) console.log(`[desktop] ${item.id}: ${r.files} files, ${kib(r.bytes)} from ${kib(r.compressed)}; ` +
       `fetch ${r.fetchMs} ms, decode ${r.decodeMs} ms, write ${r.writeMs} ms`);
     globalThis.gexDesktop.installs = { ...(globalThis.gexDesktop.installs ?? {}), [item.id]: r };
     return r;
@@ -403,7 +404,7 @@ async function boot() {
       $('apps').classList.add('on');
       status('');
       globalThis.gexDesktop.ready = true;
-      console.log(`[desktop] up: ${JSON.stringify(marks)}`);
+      if (logOn('debug')) console.log(`[desktop] up: ${JSON.stringify(marks)}`);
       // The `auto` items (the core tools) come in behind the desktop, so the
       // xterm's shell has `ls` a moment later without the base carrying it.
       if (!q.has('noauto')) {
@@ -500,7 +501,7 @@ if (q.get('diag')) {
     lastHeld = held;
     const n = comp?.counters?.() ?? {};
     box.textContent = `drawn ${n.frames ?? '-'}  held ${held} (${heldChanges} changes)  ${c.width}x${c.height} dpr ${devicePixelRatio}`;
-    if (quiet && ticks++ % 4 === 0) console.log(`[diag] ${box.textContent}`);
+    if (quiet && ticks++ % 4 === 0 && logOn('debug')) console.log(`[diag] ${box.textContent}`);
   }, 500);
 }
 

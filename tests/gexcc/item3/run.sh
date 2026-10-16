@@ -21,6 +21,8 @@
 # libz, libzstd, libsqlite3 and usr/bin/sqlite3); SH (a wasm32 sh, default
 # the native-debian tree's dash); WORK.
 set -u
+# The lines checked below ("function tier for", "replaced by") are debug output.
+export GEX_LOG=${GEX_LOG:-1}
 GEXC=${1:?usage: run.sh GEXC}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)

@@ -9326,6 +9326,22 @@ thread_local! {
     pub(crate) static EXEC_FRESH: Cell<bool> = const { Cell::new(false) };
 }
 
+/// One of the few lines gex says by default (shims/browser/js/log.mjs): a
+/// process starting, with the file it runs and its arguments.
+fn note_exec(path: &str, argv: &[String]) {
+    let mut args: String = argv.iter().skip(1).map(|a| format!(" {a}")).collect();
+    if args.len() > 200 {
+        let mut cut = 200;
+        while !args.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        args.truncate(cut);
+        args.push_str("...");
+    }
+    let pid = MY_PID.load(std::sync::atomic::Ordering::Relaxed);
+    warn_line(&format!("[gex-info] pid {pid}: exec {path}{args}\n"));
+}
+
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
     // A sibling's translation in flight is of the program this replaces.
@@ -9353,6 +9369,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             Err(_) => return 0,
         }
     };
+    note_exec(path, argv);
     // Record, when this is the first process to run the program and there is
     // a linker to catch.
     let hook = if program.as_ref().and_then(|p| p.interp.as_ref()).is_some() && snapshots_on() {

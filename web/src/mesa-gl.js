@@ -14,6 +14,7 @@ import { requestGexDevice } from './gpu-device.js';
 import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';
 import { assetUrl, pageParams } from './page-env.js';
+import { logOn } from '@gex/log.mjs';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -288,7 +289,8 @@ export class MesaGlDevice {
         // starts its pthread workers from this rather than `import.meta.url`.
         mainScriptUrlOrBlob: new URL(url, location.href).href,
         locateFile: (file) => new URL(file, new URL(url, location.href)).href,
-        print: (line) => console.log('[mesa-gl]', line),
+        // Mesa's stdout is its chatter; its stderr (below) stays.
+        print: (line) => logOn('debug') && console.log('[mesa-gl]', line),
         printErr: quietReports((line) => console.warn('[mesa-gl]', line)),
       });
 
@@ -341,7 +343,7 @@ export class MesaGlDevice {
       m.HEAPU8.set(new Uint8Array(bytes), at);
       const n = m._gex_wgsl_cache_load(at, bytes.byteLength);
       m._free(at);
-      console.log(`[mesa-gl] shader cache: ${n < 0 ? 'refused (another build)' : `${n} translations`} from ${from}`);
+      if (logOn('debug')) console.log(`[mesa-gl] shader cache: ${n < 0 ? 'refused (another build)' : `${n} translations`} from ${from}`);
     };
     try {
       const r = await fetch(new URL('gex-wgsl-cache.bin', glue));
