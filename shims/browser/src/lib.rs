@@ -3362,6 +3362,40 @@ fn set_host(host: Host) {
     }
 }
 
+/// The host of a process this Worker alone has: a fork child's or an exec
+/// child's, between its adoption and its first guest instruction (F, L25c),
+/// before any other Worker of it exists. Its fields are written directly,
+/// with no lock: nothing else can reach them yet (docs/kernel-locking.md
+/// §3.12 F).
+fn with_own_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    #[cfg(not(feature = "shared-memory"))]
+    let r = HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: an adoption before its process")));
+    // SAFETY: the process has one Worker, this one, and it is not inside
+    // any other call into the shim (an adoption is its own export).
+    #[cfg(feature = "shared-memory")]
+    let r = f(unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut() }.expect("gex: an adoption before its process"));
+    debug_assert!(sigs::home().is_none_or(|h| h.table().len() == 1), "an own host with more than one thread");
+    r
+}
+
+/// Forget the host a fork's copy of its parent's memory holds, dropping
+/// nothing of it: its descriptors, sockets and ends are the parent's, and
+/// each closes its end in the global kernel when it drops (how a process
+/// leaving by a trap still releases them), charged to whichever pid this
+/// Worker answers as. That is what killed a terminal's session: the shell's
+/// slave end went with the copy, the master read end of file, and the whole
+/// foreground group took a SIGHUP one command in. The copy is leaked, into
+/// memory that is this process's own image anyway. No lock: the copy is
+/// this Worker's alone.
+fn forget_copied_host() {
+    #[cfg(not(feature = "shared-memory"))]
+    let old = HOST.with(|h| h.borrow_mut().take());
+    // SAFETY: as `with_own_host`.
+    #[cfg(feature = "shared-memory")]
+    let old = unsafe { (*core::ptr::addr_of_mut!(HOST)).take() };
+    std::mem::forget(old);
+}
+
 /// What a new process's Workers read without the kernel lock: its signal
 /// state (`sigs`), with its one thread as the one this Worker runs, and
 /// whether it is a wasm32 program (`WASM32`).
@@ -4515,7 +4549,9 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
         return -1;
     }
     let count = u32at(&mut p);
-    with_host(|h| {
+    // The map locks itself (no kernel lock, L25c).
+    let mm = sigs::proc_home().mm();
+    {
         for _ in 0..count {
             if p + 24 > raw.len() {
                 return -1;
@@ -4539,10 +4575,10 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 Some((id, off))
             };
             ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
-            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
+            mm.lock().adopt(start, end, prot, &name, code);
         }
         0
-    })
+    }
 }
 
 /// The highest address this process inherited a mapping at, or zero if it
@@ -8248,7 +8284,12 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
 /// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
 fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
-    let n = with_host(|h| {
+    // No kernel lock (L25c): the names resolve in the process's published
+    // namespace, and the descriptor table locks itself.
+    let home = sigs::proc_home();
+    let ns = home.ns();
+    let fds = fds_free().expect("gex: descriptors adopted before their process");
+    let n = {
         let mut n = 0;
         for line in text.lines() {
             let mut parts = line.splitn(5, ' ');
@@ -8265,7 +8306,7 @@ fn adopt_fds_text(text: &str) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = match rebuild_carried(&h.kernel.vfs, path, flags, offset) {
+            let file = match rebuild_carried(&ns, path, flags, offset) {
                 Ok(f) => f,
                 Err(e) => {
                     // Never quietly: a missing descriptor is an `EBADF` at
@@ -8274,12 +8315,12 @@ fn adopt_fds_text(text: &str) -> i32 {
                     continue;
                 }
             };
-            if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
+            if fds.install(fd, file, cloexec != 0).is_ok() {
                 n += 1;
             }
         }
         n
-    });
+    };
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = None);
     n
 }
@@ -8871,15 +8912,24 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     let Some(i) = table.position(tid) else {
         return 0;
     };
-    let t = &table[i];
-    t.run().waiting = Waiting::Runnable;
+    table[i].run().waiting = Waiting::Runnable;
     CURRENT.with(|c| c.set(i));
-    MY_CTX.with(|c| c.set(t.ctx_addr()));
-    MY_TID.with(|c| c.set(tid));
-    MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
-    sigs::bind_free(home, tid);
-    let pc = t.run().pc;
+    bind_free(i);
+    let pc = table[i].run().pc;
     pc as i64
+}
+
+/// [`bind_mine`] with no kernel lock (L25b, L25c): thread `i` of this
+/// Worker's process, from its thread table and its signal states.
+pub(crate) fn bind_free(i: usize) {
+    let Some(home) = sigs::home() else { return };
+    if let Some(t) = home.table().get(i) {
+        let tid = t.tid();
+        MY_CTX.with(|c| c.set(t.ctx_addr()));
+        MY_TID.with(|c| c.set(tid));
+        MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
+        sigs::bind_free(home, tid);
+    }
 }
 
 /// Kept so a host built against the older shape still links; the claim in
@@ -8914,12 +8964,7 @@ pub extern "C" fn gex_adopt_child(
     // opened for it by `stage_fork_fds`, so the copy is leaked rather than
     // dropped -- into memory that is this process's own image anyway.
     if gex_has_host() != 0 {
-        with_host(|h| {
-            std::mem::forget(std::mem::replace(
-                &mut h.kernel.fds,
-                Arc::new(gex_kernel::file::FdTable::new()),
-            ));
-        });
+        forget_copied_host();
     }
     // The slot maps the copied low region names are the parent's.
     dense::child();
@@ -9101,12 +9146,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
 /// child's own image.
 #[no_mangle]
 pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
-    with_host(|h| {
-        h.kernel
-            .mem
-            .lock()
-            .insert(start as u64, end as u64, prot as u32, "[forked]");
-    });
+    // The map locks itself (no kernel lock, L25c).
+    sigs::proc_home().mm().lock().insert(start as u64, end as u64, prot as u32, "[forked]");
 }
 
 /// End the running process. Always returns 2: this Worker ran one process and
@@ -12314,10 +12355,10 @@ pub extern "C" fn gex_compat() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
     // Once per process, at a child's adoption in its own Worker, before any
-    // of its threads run: the process is this Worker's alone. A thread's
-    // Worker never calls it (what it sets is shared); the adoption's own
-    // lock goes with the rest of adoption (L25).
-    with_host(|h| {
+    // of its threads run: the process is this Worker's alone, and its
+    // fields are written directly (L25c). A thread's Worker never calls it
+    // (what it sets is shared).
+    with_own_host(|h| {
         h.kernel.compat = on != 0;
         // A child's process starts now.
         if h.kernel.started == 0 {
@@ -12330,17 +12371,21 @@ pub extern "C" fn gex_set_compat(on: i32) {
     // an AArch64 build is another slot (its i386-ABI processes are wasm32
     // programs: posix_spawn's child starts on that stack).
     if on != 0 && !gex_abi::X86 && !gex_abi::PPC {
-        with_host(|h| {
-            let mut gm = GuestMem::new(guest_bytes());
-            let c = h.kernel.ctx_addr;
-            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
-            if sp != 0 {
-                let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
-                let _ = gm.write_u64(c + ctx::SP as u64, 0);
-            }
-        });
+        compat_stack(my_ctx());
     }
     gex_xlate::set_compat(on != 0);
+}
+
+/// An adopted i386-ABI child's stack, from `ctx::SP` (where its adoption
+/// put it) to `esp` (`ctx::sp_slot`), which on an AArch64 build is another
+/// slot: its context at `c`, its own.
+pub(crate) fn compat_stack(c: u64) {
+    let mut gm = GuestMem::new(guest_bytes());
+    let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+    if sp != 0 {
+        let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
+        let _ = gm.write_u64(c + ctx::SP as u64, 0);
+    }
 }
 
 #[no_mangle]
