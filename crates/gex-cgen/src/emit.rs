@@ -721,6 +721,30 @@ impl<'a> Emitter<'a> {
                 format!("GEX_P({a} + (uint64_t){offset}ll)")
             };
         }
+        // W3 with KUSER_SHARED_DATA folded (tier-1's `emit_address`): a
+        // constant in Windows' page names W3's, and every other address is
+        // checked against the old page (`gex_k`), whose failure is the named
+        // fault, an access violation.
+        if gex_abi::kuser_fold() {
+            let pc = self.block.start;
+            if let Some(c) = self.value_const[addr.0 as usize] {
+                let ea = c.wrapping_add(offset as u64);
+                if let Some(f) = gex_abi::fold_kuser(ea) {
+                    gex_ir::note_kuser_fold();
+                    return format!("GEX_P(0x{f:x}u)");
+                }
+                if ea < gex_abi::KUSER_GUARD {
+                    return format!("GEX_P(0x{ea:x}u)");
+                }
+                return format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, 0x{ea:x}ull))");
+            }
+            let a = self.v(addr);
+            return if offset == 0 {
+                format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, (uint64_t)({a})))")
+            } else {
+                format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, (uint64_t)({a}) + (uint64_t){offset}ll))")
+            };
+        }
         // An i386 base-plus-displacement address (`value_disp`): the
         // displacement rides on the guarded base, as tier-1's static offset
         // does. Only a sum past 2^32 (which the guest would wrap to low
@@ -771,6 +795,9 @@ impl<'a> Emitter<'a> {
     fn bulk_address(&self, v: &str) -> String {
         if gex_abi::mem64() {
             return format!("(uint64_t)({v})");
+        }
+        if gex_abi::kuser_fold() {
+            return format!("gex_k(ctx, 0x{:x}ull, (uint64_t)({v}))", self.block.start);
         }
         if no_guard() || self.unguarded() {
             format!("(uint32_t)({v})")

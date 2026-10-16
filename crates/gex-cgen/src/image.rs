@@ -88,6 +88,9 @@ fn unit_inputs() -> String {
     let base = if unguarded() { format!("{base}:unguarded") } else { base };
     let base = if narrow_stores() { base } else { format!("{base}:widest") };
     let base = if icall_count() { format!("{base}:icallcount") } else { base };
+    // W3's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units read
+    // the page where W3's Wine maps it and check every other address.
+    let base = if gex_abi::kuser_fold() { format!("{base}:w3kuser") } else { base };
     // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {
@@ -156,6 +159,11 @@ pub fn abi_fingerprint() -> String {
         ("INST_ALIGN", gex_abi::INST_ALIGN),
         ("DISPATCH_PAGE", gex_abi::DISPATCH_PAGE),
         ("SYSCALL_INST_BYTES", gex_abi::SYSCALL_INST_BYTES),
+        // W3's KUSER_SHARED_DATA fold (`gex_abi::fold_kuser`, `:w3kuser` units).
+        ("KUSER_WINDOWS", gex_abi::KUSER_WINDOWS),
+        ("KUSER_WINDOWS_END", gex_abi::KUSER_WINDOWS_END),
+        ("W3_KUSER", gex_abi::W3_KUSER),
+        ("KUSER_GUARD", gex_abi::KUSER_GUARD),
         ("ctx::SP", ctx::SP as u64),
         ("ctx::PC", ctx::PC as u64),
         ("ctx::NZCV", ctx::NZCV as u64),

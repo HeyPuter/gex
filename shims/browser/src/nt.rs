@@ -100,6 +100,8 @@ mod stub {
         false
     }
 
+    pub(crate) fn w3_kuser() {}
+
     pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
         Err("a Windows address space needs the shared-memory build".into())
     }
@@ -317,6 +319,21 @@ mod imp {
     /// split's line being page-aligned), only "Windows lives here".
     pub(crate) const W3_COMPACT_LO: u64 = 1;
 
+    /// With [`W3_COMPACT_LO`]: this W3 Wine maps KUSER_SHARED_DATA at
+    /// `gex_abi::W3_KUSER` (its header's `FLAG_KUSER_W3`), so a forked child
+    /// folds as its parent did.
+    const W3_KUSER_BIT: u64 = 2;
+
+    /// This process's Wine has KUSER_SHARED_DATA at W3's address: fold
+    /// Windows' constant addresses to it in everything translated from now
+    /// on, and fault by name on any other access to the old page and above
+    /// (`gex_abi::KUSER_GUARD`).
+    pub(crate) fn w3_kuser() {
+        gex_abi::set_kuser_fold(true);
+        gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
+        WINDOWS_LO.fetch_or(W3_KUSER_BIT, Ordering::Relaxed);
+    }
+
     /// Whether this process's Windows address space is W3's compact one
     /// (no split; see [`w3_windows_space`]).
     static W3_COMPACT: AtomicBool = AtomicBool::new(false);
@@ -339,10 +356,13 @@ mod imp {
     /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
         nt::set_log(log);
-        if lo == W3_COMPACT_LO {
+        if lo & !W3_KUSER_BIT == W3_COMPACT_LO {
             W3_COMPACT.store(true, Ordering::Relaxed);
             WINDOWS_LO.store(W3_COMPACT_LO, Ordering::Relaxed);
             keep_exe_slot();
+            if lo & W3_KUSER_BIT != 0 {
+                w3_kuser();
+            }
             return Ok(());
         }
         if !grow_memory_to(NT_HEAP_BASE) {

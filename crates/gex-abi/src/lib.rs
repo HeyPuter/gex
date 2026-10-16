@@ -873,6 +873,15 @@ pub mod imports {
     /// would fault at the next x87 instruction), so the host fails loudly.
     pub const BRK_X87_EXCEPTION: i32 = -7;
 
+    /// Not a `brk`: an access at or above [`super::KUSER_GUARD`] while
+    /// KUSER_SHARED_DATA folding is on (W3): a run-time pointer into
+    /// Windows' old KUSER page, which the translator could not fold. `pc`
+    /// is [`super::kuser_miss_pack`]'s (block pc and address). The host says
+    /// "KUSER access not folded at pc X (module+off)" and raises an access
+    /// violation (Wine's handler, through the fault hook); it does not
+    /// return. The fix is a fold in the translator, not an emulation.
+    pub const BRK_KUSER_UNFOLDED: i32 = -8;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";
@@ -1007,6 +1016,65 @@ pub mod cache_op {
 /// field would otherwise write into silently (gex has no page protection).
 /// Checked where an access already goes through host code or a slow path.
 pub const GUEST_FLOOR: u64 = DISPATCH_DIR_END;
+
+/// KUSER_SHARED_DATA where Windows has it, a page every process maps
+/// read-only and much i386 code reads by constant (tick counts, the
+/// interrupt time, the OS version).
+pub const KUSER_WINDOWS: u64 = 0x7ffe_0000;
+
+/// One past the structure's page.
+pub const KUSER_WINDOWS_END: u64 = KUSER_WINDOWS + 0x1000;
+
+/// Where W3's Wine maps KUSER_SHARED_DATA instead (wasm32): the top of the
+/// low space it reserves below the wasm32 program's stack (`STACK_TOP -
+/// STACK_SIZE`), so that a W3 process's memory need not reach 2 GiB. Wine's
+/// `include/wine/kuser.h` says the same address (its ntdll checks it against
+/// `GEX_W3_KUSER`). i386 code's constant accesses to [`KUSER_WINDOWS`] are
+/// folded to it ([`fold_kuser`]); any other access to the old page faults.
+pub const W3_KUSER: u64 = 0x04ff_0000;
+
+static KUSER_FOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Fold KUSER_SHARED_DATA's constant addresses in everything translated from
+/// now on (a W3 host, or `gexc cgen-image` for W3 units). In the unit key.
+pub fn set_kuser_fold(on: bool) {
+    KUSER_FOLD.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether constant KUSER_SHARED_DATA addresses are folded ([`set_kuser_fold`]).
+pub fn kuser_fold() -> bool {
+    KUSER_FOLD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A constant effective address in Windows' KUSER_SHARED_DATA page, moved to
+/// W3's ([`W3_KUSER`]) when folding is on; `None` for any other address.
+pub fn fold_kuser(ea: u64) -> Option<u64> {
+    (kuser_fold() && (KUSER_WINDOWS..KUSER_WINDOWS_END).contains(&ea)).then(|| ea - KUSER_WINDOWS + W3_KUSER)
+}
+
+/// With folding on, the bounds guard's limit (tier-1 and gex-cgen): an
+/// access at or above it is one the translator did not fold -- a pointer
+/// into the old page computed at run time -- and becomes
+/// [`imports::BRK_KUSER_UNFOLDED`]: a named diagnostic and an access
+/// violation, never a read of whatever is mapped there and never a bare
+/// trap. Nothing of a W3 process is mapped this high (its `mmap` top).
+pub const KUSER_GUARD: u64 = KUSER_WINDOWS;
+
+/// [`imports::BRK_KUSER_UNFOLDED`]'s `pc` argument: the block's guest pc in
+/// the low half, the effective address's low 32 bits in the high half (an
+/// i386 guest's pcs and addresses are both 32-bit).
+pub fn kuser_miss_pack(pc: u64, ea: u64) -> i64 {
+    ((pc & 0xffff_ffff) | (ea << 32)) as i64
+}
+
+/// [`kuser_miss_pack`] undone: `(pc, address)`.
+pub fn kuser_miss_unpack(arg: i64) -> (u64, u64) {
+    let a = arg as u64;
+    (a & 0xffff_ffff, a >> 32)
+}
+
+const _: () = assert!(W3_KUSER + 0x1_0000 <= STACK_TOP - STACK_SIZE);
+const _: () = assert!(W3_KUSER % 0x1_0000 == 0);
 
 /// Size in bytes zeroed by one `dc zva`, and the value reported by
 /// `DCZID_EL0`. 64 bytes is what every mainstream aarch64 core reports.

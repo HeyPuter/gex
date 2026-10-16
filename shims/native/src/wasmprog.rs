@@ -51,6 +51,10 @@ pub const FLAG_GUEST_X86_64: u32 = 2;
 /// The flags whose process leaves Windows' fixed addresses free and gets
 /// the trampoline page.
 pub const FLAG_WINDOWS_SPACE: u32 = FLAG_GUEST_I386 | FLAG_GUEST_X86_64;
+/// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
+/// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
+/// the process folds Windows' constant addresses there.
+pub const FLAG_KUSER_W3: u32 = 4;
 
 /// The header's flags, 0 for a program without them (or not wasm32).
 pub(crate) fn flags(program: &Program) -> u32 {

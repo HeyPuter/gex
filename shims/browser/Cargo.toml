@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 gex-abi.workspace = true
+gex-ir.workspace = true
 gex-kernel.workspace = true
 gex-atomic.workspace = true
 wasm-encoder = "0.219.2"

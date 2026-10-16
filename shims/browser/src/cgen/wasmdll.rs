@@ -335,11 +335,13 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
         let n = file.read_at(0, &mut head).unwrap_or(0) as usize;
         head.truncate(n);
         if let Some((size, false)) = pe_head(&head) {
+            crate::note_w3_image(base, size, &path);
             super::w3_defer_unread(&path, base, size, file);
             return -1;
         }
     }
     let Some(pe) = super::read_pe(&*file) else { return -1 };
+    crate::note_w3_image(base, pe.image_size as u64, &path);
     if !is_skeleton(&pe) {
         // An i386 image (the program's, a game's DLL): its function-tier
         // unit, when units are on; -3 tells JS to serve it.

@@ -100,6 +100,17 @@ for arch in x64 x86; do
     check $arch/lownull-aligned 0 "$allok" "$b/lownull.exe" aligned
     [ $arch = x64 ] && check $arch/lownull-cmpxchg16b 0 "$allok" "$b/lownull.exe" cmpxchg16b
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
+    # KUSER_SHARED_DATA by constant address (the tick count, the interrupt
+    # time, the OS version; absolute, with a base, with an index). Under W3
+    # the page is at gex_abi::W3_KUSER and the translator folds these; a
+    # pointer into Windows' page computed at run time is then an access
+    # violation gex names ("KUSER access not folded"), never a read or a hang.
+    check $arch/kuser 0 "$allok" "$b/kuser.exe" const
+    if [ -n "${GEX_NT_W3:-}" ]; then
+        check $arch/kuser-pointer 0 "ok pointer read at 0x7ffe026c: exception 0xc0000005, read 0, address 0x7ffe026c${nl}0 failures" "$b/kuser.exe" pointer
+    else
+        check $arch/kuser-pointer 3 "read [0-9]+ at 0x7ffe026c" "$b/kuser.exe" pointer
+    fi
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/suspend 0 "$allok" "$b/suspend.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"

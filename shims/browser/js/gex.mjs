@@ -4831,6 +4831,9 @@ export class Gex {
       // process's start and written by the first boot's fill (§6.2).
       usd_copy: (dst, size) => this.#usdMove(dst >>> 0, size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(src >>> 0, size >>> 0, true),
+      // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
+      // address against it at start): 0x7ffe0000 from a shim without the fold.
+      kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,

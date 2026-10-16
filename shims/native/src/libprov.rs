@@ -549,6 +549,11 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
     })?;
+    // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
+    // address against it at start; the browser's `gex_kuser_address`).
+    linker.func_wrap(IMPORT_MODULE, "kuser_address", || -> i32 {
+        (if gex_abi::kuser_fold() { gex_abi::W3_KUSER } else { gex_abi::KUSER_WINDOWS }) as i32
+    })?;
     linker.func_wrap(IMPORT_MODULE, "session_seq", |off: i32| -> i64 { crate::door::session_seq(off as u32) })?;
     // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
     // Wine's PE module bound at its exports, as the NT layer's image map
@@ -560,6 +565,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::note_library(&path);
         let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&path)) else { return Ok(()) };
         let Ok(pe) = gex_ld::pe::parse(&bytes) else { return Ok(()) };
+        crate::note_w3_image(base, pe.image_size as u64, &path);
         let (shared, engine) = {
             let Some(jit) = caller.data().jit.as_ref() else { return Ok(()) };
             (Arc::clone(&jit.shared), jit.engine.clone())

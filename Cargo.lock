@@ -571,6 +571,7 @@ dependencies = [
  "gex-cgen",
  "gex-dylink",
  "gex-emit",
+ "gex-ir",
  "gex-kernel",
  "gex-key",
  "gex-ld",

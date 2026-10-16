@@ -15,6 +15,30 @@ pub mod text;
 
 use std::fmt;
 
+thread_local! {
+    static KUSER_FOLDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one access moved from Windows' KUSER_SHARED_DATA address to W3's
+/// (`gex_abi::fold_kuser`), by the lifter or an emitter, on this thread.
+pub fn note_kuser_fold() {
+    KUSER_FOLDS.with(|c| c.set(c.get() + 1));
+    KUSER_FOLDS_ALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+static KUSER_FOLDS_ALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Every fold this process counted, on any thread (a build's summary).
+pub fn kuser_folds_total() -> u64 {
+    KUSER_FOLDS_ALL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The folds this thread counted since the last call: a host takes them
+/// after each translation and books them to the module it translated.
+pub fn take_kuser_folds() -> u64 {
+    KUSER_FOLDS.with(|c| c.replace(0))
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Value(pub u32);
 

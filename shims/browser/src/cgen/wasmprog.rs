@@ -65,6 +65,10 @@ const FLAG_GUEST_I386: u32 = 1;
 /// Header flag: the program runs x86-64 code (64-bit native Wine, W64). It
 /// shares W3's address-space split and trampoline page.
 const FLAG_GUEST_X86_64: u32 = 2;
+/// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
+/// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
+/// the process folds Windows' constant addresses there (`nt::w3_kuser`).
+const FLAG_KUSER_W3: u32 = 4;
 
 /// The running program's header has [`FLAG_GUEST_X86_64`] (W64), set at
 /// every publish (a fork's child has its parent's, in its copy of memory).
@@ -177,6 +181,9 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
         let lo = crate::nt::w3_windows_space();
+        if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
+            crate::nt::w3_kuser();
+        }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
             crate::w3_address_space(&mut mm, lo);
