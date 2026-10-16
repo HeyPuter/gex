@@ -173,12 +173,10 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
             dst.copy_from_slice(&page);
         }
-        // The address space split as the NT layer splits it (nt.rs): the
-        // memory grown to 2 GiB, the shim's heap above it, and what the
-        // host left below it the process's own arena, where the Unix side's
-        // mappings land and Wine's reservations succeed. Not above the
-        // guest's slice (`GUEST_LIMIT`, just under 2 GiB).
-        let lo = crate::nt::split_windows_space().map_err(|e| format!("W3: {e}"))?;
+        // W3's compact address space (`nt::w3_windows_space`): nothing
+        // grown up front; Wine's views come from the arena bottom-up, shared
+        // with the shim's heap, so the memory reaches only as high as used.
+        let lo = crate::nt::w3_windows_space();
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
             crate::w3_address_space(&mut mm, lo);

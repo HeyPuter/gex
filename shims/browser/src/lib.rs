@@ -2676,8 +2676,27 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     if end > GUEST_LIMIT {
         return None;
     }
-    if !grow_memory_to(end) {
+    // W3's compact space: KUSER_SHARED_DATA's island at 0x7ffe0000 takes the
+    // memory to 2 GiB, the guard's limit, as the split did -- the 64 KiB
+    // above it (Windows' no-access region) a fault there, not a trap past
+    // the end of the memory.
+    let grow_to = if nt::w3_compact() && end > 0x7f00_0000 { end.max(0x8000_0000) } else { end };
+    if !grow_memory_to(grow_to) {
         return None;
+    }
+    // W3's compact space: a mapping wholly above the cursor (KUSER_SHARED_DATA
+    // at 0x7ffe0000, an image at its base) is an island the cursor steps over
+    // when it gets there, not a jump that leaves everything below it unused --
+    // for the shim's heap too, whose ceiling is 2 GiB. The kernel keeps the
+    // island as arena of its own.
+    // One inside an island already (the executables' slot, an inherited
+    // region) is the guest's as it stands.
+    let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
+    if nt::w3_compact()
+        && (memmap::within_island(start, end)
+            || cur != 0 && start >= cur && memmap::claim_island(start, end, &ARENA_NEXT, "guest fixed mapping above the arena"))
+    {
+        return Some(start);
     }
     let prev = ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > prev {
@@ -8628,13 +8647,17 @@ pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     mem.set_mmap_top(lo);
 }
 
-/// The kernel's half of W3's address-space split (see
-/// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
-/// for there, what the host left below 2 GiB the process's own arena, and the
-/// i386 code kept off the shim's heap above it.
+/// The kernel's half of a W3 process's address space: no mapping above
+/// KUSER_SHARED_DATA unless asked for there, and the i386 code kept off
+/// whatever is above 2 GiB. With the NT layer's split (`lo` its line), what
+/// the host left below 2 GiB is the process's own arena; with W3's compact
+/// space (`nt::w3_windows_space`) the arena grows on demand, shared with
+/// the shim's heap, as for any process.
 pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     mem.set_mmap_top(0x7ffe_0000);
-    mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    if !nt::w3_compact() {
+        mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    }
     // And the low space a wasm32 program leaves free, between the dispatch
     // directory and its stack (its image and break are above, in the
     // placement window): where a Windows executable's 0x400000 is.
@@ -8656,13 +8679,9 @@ pub extern "C" fn gex_windows_space() -> u32 {
 /// space starts, or 0 on failure.
 #[no_mangle]
 pub extern "C" fn gex_split_windows_space() -> u32 {
-    match nt::split_windows_space() {
-        Ok(lo) => lo as u32,
-        Err(e) => {
-            warn_line(&format!("gex: W3: {e}\n"));
-            0
-        }
-    }
+    // W3 no longer splits (see `nt::w3_windows_space`); the name is the JS
+    // side's.
+    nt::w3_windows_space() as u32
 }
 
 /// A forked child of a W3 process: the split, first thing after

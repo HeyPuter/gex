@@ -92,6 +92,14 @@ mod stub {
         0
     }
 
+    pub(crate) fn w3_windows_space() -> u64 {
+        0
+    }
+
+    pub(crate) fn w3_compact() -> bool {
+        false
+    }
+
     pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
         Err("a Windows address space needs the shared-memory build".into())
     }
@@ -132,7 +140,7 @@ mod imp {
     use gex_abi::ctx;
     use gex_kernel::nt;
     use gex_kernel::{GuestMem, Kernel};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     #[link(wasm_import_module = "gex_env")]
@@ -239,15 +247,16 @@ mod imp {
         warn_line(&format!("{s}\n"));
     }
 
-    /// A Windows process's address space (the NT layer's, and native Wine's
-    /// under W3): everything below 2 GiB is Windows', so the memory is grown
-    /// to all of it now -- KUSER_SHARED_DATA at 0x7ffe0000, the PEB and TEBs
-    /// top-down reach its top at once -- rather than allocation by
-    /// allocation. The shim's own stack and data sit at fixed addresses
-    /// inside it, and so does whatever its heap has taken so far: those stay
-    /// the shim's for good, and from here on the heap climbs above 2 GiB,
-    /// where no Windows address is. Returns where the space the host left
-    /// starts (it ends at 2 GiB).
+    /// The NT layer's Windows address space: everything below 2 GiB is
+    /// Windows', so the memory is grown to all of it now -- KUSER_SHARED_DATA
+    /// at 0x7ffe0000, the PEB and TEBs top-down reach its top at once --
+    /// rather than allocation by allocation. The shim's own stack and data
+    /// sit at fixed addresses inside it, and so does whatever its heap has
+    /// taken so far: those stay the shim's for good, and from here on the
+    /// heap climbs above 2 GiB, where no Windows address is. Returns where
+    /// the space the host left starts (it ends at 2 GiB).
+    ///
+    /// Native Wine (W3) does not take this: see [`w3_windows_space`].
     pub(crate) fn split_windows_space() -> Result<u64, String> {
         nt::set_log(log);
         // Split already (an `execve` in a W3 process, or a fork's child):
@@ -268,6 +277,54 @@ mod imp {
         Ok(host_hi)
     }
 
+    /// A native Wine process (W3): marked as Windows-hosting, and nothing
+    /// grown or claimed. Wine's own allocator takes its views from the
+    /// kernel's arena bottom-up, through the same cursor as the shim's heap,
+    /// as any Linux process's mappings do, so the memory reaches only as
+    /// high as the process uses (each wasm memory counts its whole size
+    /// towards the tab's data segment, RLIMIT_DATA, whether touched or not).
+    /// What Windows pins high (KUSER_SHARED_DATA, an image at its preferred
+    /// base) still grows it, when it is mapped. Returns the arena's floor,
+    /// [`W3_COMPACT_LO`], which only says "W3" to the kernel and to a forked
+    /// child.
+    pub(crate) fn w3_windows_space() -> u64 {
+        nt::set_log(log);
+        let lo = WINDOWS_LO.load(Ordering::Relaxed);
+        if lo != 0 {
+            return lo;
+        }
+        W3_COMPACT.store(true, Ordering::Relaxed);
+        WINDOWS_LO.store(W3_COMPACT_LO, Ordering::Relaxed);
+        keep_exe_slot();
+        W3_COMPACT_LO
+    }
+
+    /// Where Windows executables want to be that the arena would reach:
+    /// 0x10000000, Wine's own services, svchost, explorer, rundll32 and
+    /// wineboot, and MSVC's default DLL base. Kept out of the arena's way
+    /// (an island; it grows nothing until mapped or passed), as Wine's
+    /// reservation keeps 0x10000-0x05000000 for those at 0x400000 and
+    /// 0x01000000. A relocated native-wasm skeleton executable did not run
+    /// (wineboot at 0x320000: a table call into a provider never installed).
+    fn keep_exe_slot() {
+        // Not if the heap is there already (then executables relocate).
+        crate::memmap::claim_island(EXE_SLOT, EXE_SLOT + EXE_SLOT_SIZE, &crate::ARENA_NEXT, "Windows executables' slot (0x10000000)");
+    }
+    const EXE_SLOT: u64 = 0x1000_0000;
+    const EXE_SLOT_SIZE: u64 = 16 << 20;
+
+    /// What a W3 process's `windows_space` says: no line (1 is never one, a
+    /// split's line being page-aligned), only "Windows lives here".
+    pub(crate) const W3_COMPACT_LO: u64 = 1;
+
+    /// Whether this process's Windows address space is W3's compact one
+    /// (no split; see [`w3_windows_space`]).
+    static W3_COMPACT: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn w3_compact() -> bool {
+        W3_COMPACT.load(Ordering::Relaxed)
+    }
+
     /// Where this process's Windows address space starts, or 0 when it has
     /// none. A fork hands it to the child (`gex_windows_space`).
     static WINDOWS_LO: AtomicU64 = AtomicU64::new(0);
@@ -276,12 +333,18 @@ mod imp {
         WINDOWS_LO.load(Ordering::Relaxed)
     }
 
-    /// A forked child's half of [`split_windows_space`]: the same split, at
-    /// the parent's line, before the child's heap takes its first span --
-    /// a fresh instance's heap would otherwise start above the inherited
-    /// image, which in a Windows process is the top of the 2 GiB.
+    /// A forked child's half of the parent's split, before the child's heap
+    /// takes its first span: the NT layer's split at the parent's line, or
+    /// W3's compact space (the child's memory already covers what the
+    /// parent's image used).
     pub(crate) fn adopt_windows_space(lo: u64) -> Result<(), String> {
         nt::set_log(log);
+        if lo == W3_COMPACT_LO {
+            W3_COMPACT.store(true, Ordering::Relaxed);
+            WINDOWS_LO.store(W3_COMPACT_LO, Ordering::Relaxed);
+            keep_exe_slot();
+            return Ok(());
+        }
         if !grow_memory_to(NT_HEAP_BASE) {
             return Err("the engine will not grow this memory to 2 GiB".into());
         }
