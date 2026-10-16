@@ -3793,11 +3793,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // are per thread, and the kernel's loaded state may be another
                 // thread's by the time this asks.
                 let waiting_tid = caller.data().thread.tid;
+                // And the process ending (`stopping`: an exec from another
+                // thread, an `exit_group`): the wait gives up with EINTR and
+                // the guest's retry stops at the syscall entry's check. The
+                // ender's `wake_everything` misses a thread that passed that
+                // check but had not yet queued on the futex: the old main
+                // thread of tests/wasm32/execthreads.c, in `pthread_join` on
+                // the exec'ing thread's tid word, which never changes, slept
+                // on and the process never ended (1 run in 15-200 hung).
+                let stopping = caller.data().spawn.as_ref().map(|s| Arc::clone(&s.stopping));
                 let interrupted = move || {
-                    kernel_for_signals
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .signal_pending_for(waiting_tid)
+                    stopping.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire))
+                        || kernel_for_signals
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .signal_pending_for(waiting_tid)
                 };
                 // Blocked in the kernel counts as stopped for a provider's
                 // collection; the thread parks on its way out if one runs.
