@@ -3011,8 +3011,8 @@ thread_local! {
 }
 
 /// The JIT state, taking its lock for this thread if it does not hold it.
-/// Whoever takes it here gives it back with `jit_give` (`KLock`'s release,
-/// the end of an SP `with_host`, `with_jit_only`).
+/// Whoever takes it here gives it back with `jit_give` (`ExecLock`'s release,
+/// the end of an SP `with_exec_lock`, `with_jit_only`).
 fn jit_held() -> *mut Jit {
     JIT_HELD.with(|g| {
         let mut g = g.borrow_mut();
@@ -3292,7 +3292,7 @@ fn install_panic_hook() {
             //
             // `write` is a *syscall*: it takes the kernel. Almost every panic
             // worth reading happens with the kernel already taken -- that is
-            // what `with_host` panics about -- so the hook took the borrow a
+            // what `with_exec_lock` panics about -- so the hook took the borrow a
             // second time, panicked inside the panic, and the run ended as a
             // bare `unreachable` with nothing said. Which is how
             // `apt-get update` reported only
@@ -3346,7 +3346,7 @@ fn set_host(host: Host) {
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
     *jitout::BOX.0.borrow_mut() = None;
-    // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
+    // SAFETY: see `with_exec_lock` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
     // The new process's descriptor table (`FDS`).
     // SAFETY: as above; the table stays in place until the next `set_host`.
@@ -3461,12 +3461,12 @@ pub extern "C" fn gex_has_host() -> i32 {
     }
     #[cfg(feature = "shared-memory")]
     {
-        // SAFETY: a read of an `Option`'s discriminant; see `with_host`.
+        // SAFETY: a read of an `Option`'s discriminant; see `with_exec_lock`.
         unsafe { (*core::ptr::addr_of!(HOST)).is_some() as i32 }
     }
 }
 
-/// Where the call currently inside `with_host` came from.
+/// Where the call currently inside `with_exec_lock` came from.
 ///
 /// Re-entering the kernel is the failure this shim is most prone to and the
 /// hardest to place: the panic says "already borrowed" and names the borrow
@@ -3754,7 +3754,7 @@ fn sys_recent() -> String {
     out
 }
 
-/// The last few `with_host` call sites, oldest first: a re-entrancy's
+/// The last few `with_exec_lock` call sites, oldest first: a re-entrancy's
 /// interesting part is the path, not just who holds the kernel.
 static RING: [std::sync::atomic::AtomicUsize; 6] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
@@ -3794,7 +3794,7 @@ fn holder() -> String {
 
 #[cfg(not(feature = "shared-memory"))]
 #[track_caller]
-fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+fn with_exec_lock<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     let here = std::panic::Location::caller();
     if let Some(child) = vfork::host_here() {
@@ -3829,25 +3829,25 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     })
 }
 
-/// The same, under the kernel lock. Re-entrancy is a real hazard -- a host call
-/// that asks the guest to write can come back through here, a deadlock under a
-/// spinlock -- but every such path already had to avoid it.
+/// The same, under the exec lock ([`ExecLock`]). Re-entrancy is a real hazard
+/// -- a host call that asks the guest to write can come back through here, a
+/// deadlock under a spinlock -- but every such path already had to avoid it.
 #[cfg(feature = "shared-memory")]
 #[track_caller]
-fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+fn with_exec_lock<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     // A plain static borrowed in place, neither locked-across-`f` nor moved.
-    // The shim traps out of `with_host` as ordinary control flow (that is how
+    // The shim traps out of `with_exec_lock` as ordinary control flow (that is how
     // the stack goes back to JS) and a trap does not unwind, so a guard held
     // across `f` would never drop; moving the `Host` out and back copies it
     // twice per syscall, indistinguishable from a hang. The static is shared
     // between Workers for free (the shim's data is in the guest's
     // `SharedArrayBuffer` memory).
     //
-    // SAFETY: `KLock` makes one Worker inside the kernel at a time true rather
+    // SAFETY: `ExecLock` makes one Worker inside the kernel at a time true rather
     // than hoped for; taken here, given back before return; any non-return path
     // out of `f` is a trap that ends the process.
-    let _guard = KLock::take();
+    let _guard = ExecLock::take();
     // A vfork child running in this Worker has a process of its own
     // (vfork.rs); the lock still, for the translation state it shares.
     if let Some(child) = vfork::host_here() {
@@ -4067,7 +4067,7 @@ thread_local! {
     static WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// This instance holds a `gex_worker_init` slot.
     static CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// This Worker's kernel-lock recursion depth: a re-entrant `with_host`
+    /// This Worker's kernel-lock recursion depth: a re-entrant `with_exec_lock`
     /// (the panic handler writing to fd 2) would otherwise self-deadlock.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -4089,7 +4089,7 @@ pub extern "C" fn gex_set_worker(id: u32) {
 static KLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Who holds the kernel lock right now: 0 = nobody, else the holder's Worker id
-/// plus one. For deadlock diagnosis -- a Worker spinning in `KLock::take` while
+/// plus one. For deadlock diagnosis -- a Worker spinning in `ExecLock::take` while
 /// this stays non-zero and unchanged is blocked on whoever holds it.
 fn klock_holder() -> u32 {
     #[cfg(feature = "shared-memory")]
@@ -4102,22 +4102,28 @@ pub extern "C" fn gex_klock_holder() -> u32 {
     klock_holder()
 }
 
-/// The kernel lock, held for one call into `with_host`.
+/// The exec lock, held for one call into `with_exec_lock`: what is left of the
+/// kernel lock (docs/kernel-locking.md §3.12). Only the process calls take it
+/// -- `execve`, and `clone`, `clone3`, `fork` and `vfork` making a process,
+/// and the dynamic linker's `SNAP_SYSCALL` that keeps a linked image -- which
+/// replace, copy or record the whole `Host` (its image, its memory map, its JIT
+/// state): it keeps a fork from copying a process an exec is replacing, as
+/// Linux's `exec_update_lock` does. Every other call is the free path's.
 ///
 /// A `memory.atomic.wait32` rather than a spin, to not burn a core on a
 /// foreground tab. Blocking is legal here because every guest thread runs in a
 /// Worker; only the page's main thread may not block.
 #[cfg(feature = "shared-memory")]
-struct KLock;
+struct ExecLock;
 
 #[cfg(feature = "shared-memory")]
-impl KLock {
-    fn take() -> KLock {
+impl ExecLock {
+    fn take() -> ExecLock {
         let me = WORKER.with(|w| w.get()) + 1;
         if DEPTH.with(|d| d.get()) > 0 {
             // Already ours. Counted rather than taken again.
             DEPTH.with(|d| d.set(d.get() + 1));
-            return KLock;
+            return ExecLock;
         }
         // Outermost of the locks that nest: not under the JIT state's or
         // the memory map's (docs/kernel-locking.md §4.3).
@@ -4162,12 +4168,12 @@ impl KLock {
             }
         }
         DEPTH.with(|d| d.set(1));
-        KLock
+        ExecLock
     }
 }
 
 #[cfg(feature = "shared-memory")]
-impl Drop for KLock {
+impl Drop for ExecLock {
     fn drop(&mut self) {
         let d = DEPTH.with(|d| d.get());
         DEPTH.with(|c| c.set(d.saturating_sub(1)));
@@ -4185,7 +4191,7 @@ impl Drop for KLock {
     }
 }
 
-/// The JIT's own state while a translation runs outside `KLock`
+/// The JIT's own state while a translation runs outside `ExecLock`
 /// (docs/kernel-locking.md, step 5).
 ///
 /// A dispatch miss lifts with the kernel lock let go: the translator takes the
@@ -6048,7 +6054,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     let had = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
     if had != entry {
         // With the pid, to tell one process renumbering from several numbering
-        // independently. `my_pid` reads a static: this runs inside `with_host`
+        // independently. `my_pid` reads a static: this runs inside `with_exec_lock`
         // closures and must not borrow.
         warn_line(&format!(
             "[gex] pid {} dir page {page}: {:#x} -> {:#x} by {who}\n",
@@ -6698,7 +6704,7 @@ static mut SYSLOG: [(u64, u64, u64, u64); SYSLOG_N] = [(0, 0, 0, 0); SYSLOG_N];
 static mut SYSLOG_AT: usize = 0;
 
 /// The ring, oldest first, as `name(arg0, arg1) = ret` lines. Without
-/// `with_host`: read from inside the guest's own write, which already holds it.
+/// `with_exec_lock`: read from inside the guest's own write, which already holds it.
 #[no_mangle]
 pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     let mut text = String::new();
@@ -7091,7 +7097,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     let mut mapped = Vec::new();
     let stop = match free_syscall(ctx, pc, &mut mapped) {
     Some(stop) => stop,
-    None => with_host(|h| {
+    None => with_exec_lock(|h| {
         let stop = (|h: &mut Host| -> i32 {
         // Whether the kernel this call is about to run against is still
         // intact; whose process this is, for the calls that name it (set
@@ -8615,8 +8621,8 @@ fn set_resume_ctx(v: u64) {
 
 /// Where the running thread's register context is, without asking the kernel.
 ///
-/// Every question the crash reporter asks used to go through `with_host`, and
-/// a crash inside a `with_host` closure leaves the kernel borrowed -- so each
+/// Every question the crash reporter asks used to go through `with_exec_lock`, and
+/// a crash inside a `with_exec_lock` closure leaves the kernel borrowed -- so each
 /// question panicked on the leaked borrow instead of answering, and the
 /// report arrived with no pc at all:
 ///
@@ -8814,7 +8820,7 @@ fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     // to 0) before staging the next; the claim is quick (the clone syscall
     // returns straight to the JS that reads it), so this spins rarely and
     // briefly. Bounded only to turn a never-claimed slot into a loud message
-    // rather than a silent hang under `KLock`.
+    // rather than a silent hang under `ExecLock`.
     // Without the kernel lock two Workers may stage at once: the slot is
     // taken for writing by a swap from 0 to `STAGING`, which the claim
     // (`gex_thread_pending`) passes over.
@@ -11197,7 +11203,7 @@ fn schedule() -> i32 {
         // a request then blocks on the reply, so it must run here, the one
         // place every thread passes through on its way to waiting. Needs the
         // kernel (to find a buffer's shared mapping) and guest memory (the
-        // pixels), so it pumps inside `with_host`; the device is a
+        // pixels), so it pumps inside `with_exec_lock`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
         let pick = match FIRST_PICK.with(|c| c.take()) {
             Some(pick) => pick,
@@ -11434,6 +11440,12 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
     let ctx_addr = ctx as u32 as u64;
     let mut gm = GuestMem::new(guest_bytes());
     let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1;
+    // The dynamic linker's jump to gex's stub entry, at a process's start
+    // (`SNAP_SYSCALL`): what it built is kept as an exec's image is made,
+    // under the exec lock.
+    if gm.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(0) == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
+        return None;
+    }
     let call = gex_kernel::syscalls::free_class(&gm, ctx_addr, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
@@ -12214,7 +12226,7 @@ thread_local! {
 
 /// Did the shim mean to give the stack back? Clears the flag.
 ///
-/// Not `with_host`: this is asked on the way out of a trap, which is exactly
+/// Not `with_exec_lock`: this is asked on the way out of a trap, which is exactly
 /// when the kernel may still be borrowed by whatever trapped.
 #[no_mangle]
 pub extern "C" fn gex_handoff() -> i32 {
@@ -14974,7 +14986,7 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 /// Note the library functions in whichever object `addr` falls in, so the
 /// translator can serve them itself.
 ///
-/// Called before either path translates anything, and outside `with_host`
+/// Called before either path translates anything, and outside `with_exec_lock`
 /// because reading the object takes the host itself.
 /// Whether a dispatch miss may translate. Off for an ejected project built
 /// without a JIT fallback. See `gex_dispatch_miss`.
@@ -15063,7 +15075,7 @@ fn note_intrinsics(addr: u64) {
     if compat_abi() {
         return;
     }
-    // The map first, the JIT state after it and not under it (KLock, JIT,
+    // The map first, the JIT state after it and not under it (ExecLock, JIT,
     // mm: docs/kernel-locking.md §4.3), neither under the kernel lock.
     let Some((path, start)) = ({
         let mm = sigs::proc_home().mm().lock();
@@ -15447,7 +15459,7 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
 #[no_mangle]
 pub extern "C" fn gex_current_ctx() -> i64 {
     // The remembered address first, then the kernel: this is a crash reporter's
-    // question, and a trap leaves the kernel borrowed, so `with_host` would
+    // question, and a trap leaves the kernel borrowed, so `with_exec_lock` would
     // panic on top of the crash and describe the reporter instead of the fault.
     let at = ctx_addr_get();
     if at != 0 {
@@ -16106,7 +16118,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn gex_exited() -> i32 {
-    // Deliberately not `with_host`: this is asked on the way out of a trap,
+    // Deliberately not `with_exec_lock`: this is asked on the way out of a trap,
     // which is exactly when the kernel may still be borrowed by whatever
     // trapped.
     exited() as i32
@@ -16464,7 +16476,7 @@ static mut HOT_N: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
 
 /// The hottest back edges, as `pc count` lines, most first.
 ///
-/// Without `with_host`: read from inside the guest's own `write`, which already
+/// Without `with_exec_lock`: read from inside the guest's own `write`, which already
 /// holds it. Addresses are left raw (symbolising needs the VMA list and lock);
 /// `gex_object_at` resolves them when the caller is somewhere safe.
 #[no_mangle]

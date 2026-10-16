@@ -10823,7 +10823,7 @@ mod tests {
     #[test]
     fn only_the_process_calls_take_the_locked_path() {
         let (mut locked, mut wrong) = (Vec::new(), Vec::new());
-        for n in 0..=470u64 {
+        for n in (0..=470u64).chain(nr::DUP2..=nr::NOOP_OK) {
             // The ABI's own spelling of `n`; a number it has none for is
             // not one of its calls.
             let spelled = if gex_abi::X86 {

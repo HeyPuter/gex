@@ -21,7 +21,7 @@
 //!      process: a `Host` built as a forked child's Worker builds one
 //!      (`child_host`: its pid, descriptors, working directory, signal
 //!      state, one thread), with the parent's memory map and translation
-//!      state (the process's one `JIT`). `with_host` serves this Worker that host
+//!      state (the process's one `JIT`). `with_exec_lock` serves this Worker that host
 //!      while the child runs; what is read without the kernel (the pid, the
 //!      exit flag, the descriptor table, the signal state) is this Worker's
 //!      too. The parent's process stays in place for its other Workers.
@@ -57,7 +57,7 @@ thread_local! {
     /// The pid of the vfork child running in this Worker; 0 for none. Set
     /// from before its kernel is built until after it is dropped.
     static PID: Cell<i32> = const { Cell::new(0) };
-    /// Its `Host`, which `with_host` serves this Worker while it runs.
+    /// Its `Host`, which `with_exec_lock` serves this Worker while it runs.
     static CHILD: Cell<*mut Host> = const { Cell::new(std::ptr::null_mut()) };
     /// Its descriptor table, for what reads one without the kernel.
     static FDS: Cell<*const gex_kernel::file::FdTable> = const { Cell::new(std::ptr::null()) };
@@ -97,7 +97,7 @@ pub(crate) fn pid_here() -> Option<i32> {
     (pid != 0).then_some(pid)
 }
 
-/// The child's `Host`, while it runs here (`with_host`).
+/// The child's `Host`, while it runs here (`with_exec_lock`).
 pub(crate) fn host_here() -> Option<*mut Host> {
     let p = CHILD.with(|c| c.get());
     (!p.is_null()).then_some(p)
