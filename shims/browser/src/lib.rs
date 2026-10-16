@@ -12472,6 +12472,35 @@ pub extern "C" fn gex_fma_calls() -> i64 {
     FMA_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed) as i64
 }
 
+/// NTSTATUS codes a guest fault hook is given (shims/native's `fault_code`).
+mod fault_code {
+    pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    pub const BREAKPOINT: u32 = 0x8000_0003;
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+    pub const INT_OVERFLOW: u32 = 0xc000_0095;
+}
+
+/// A fault for the process's guest fault hook (Wine's ntdll.so), as
+/// shims/native's `deliver_guest_fault`: the context's PC set to `pc` (where
+/// the hook sees the fault, after an int3 for a breakpoint), the fault
+/// staged for the host (`gex_fault_take`), and out to it. Returns only
+/// when the process has no hook.
+fn hook_fault(pc: u64, code: u32, addr: u64) {
+    if cgen::fault_hook() == 0 {
+        return;
+    }
+    with_host(|h| {
+        let mut gm = GuestMem::new(guest_bytes());
+        let c = h.threads[cur()].kstate.ctx_addr;
+        let _ = gm.write_u64(c + ctx::PC as u64, pc);
+        cgen::fault_stage(code, addr, 0);
+        set_resume(pc);
+        set_resume_ctx(c);
+    });
+    trap();
+}
+
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // Whole-image units mark a fault they can go on after
@@ -12480,6 +12509,12 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
+    // A process with a guest fault hook (Wine's ntdll.so): the hook takes
+    // the illegal instruction, as shims/native's `deliver_guest_fault` does.
+    // 64-bit native Wine's system and Unix calls are a ud2 at a fixed
+    // address (signal_wasm64.c's W64_SYSCALL_ENTRY), which the hook runs and
+    // steps over.
+    hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64);
     // Which process and what is mapped there: with a Worker per process the
     // console interleaves them all.
     let vma = named_mm()
@@ -12600,6 +12635,24 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // the program may handle (`int3`, #DE, `hlt`).
     if nt::active() && raw != gex_abi::imports::BRK_TRAP_PC {
         nt::fault(_ctx, gex_kernel::nt::Fault::from_brk(raw), pc as u64);
+    }
+    // A process with a guest fault hook (Wine's ntdll.so) handles its own
+    // processor exceptions, as natively (shims/native's brk import): a
+    // divide error, a general-protection fault, and int3 (seen after the
+    // instruction, as hardware leaves it). A diagnostic breakpoint, a bad
+    // stack pointer and an unmasked x87 exception are gex's own.
+    {
+        use gex_abi::imports as i;
+        let pc = pc as u64;
+        if raw == i::BRK_DIVIDE_BY_ZERO {
+            hook_fault(pc, fault_code::INT_DIVIDE_BY_ZERO, 0);
+        } else if raw == i::BRK_DIVIDE_OVERFLOW {
+            hook_fault(pc, fault_code::INT_OVERFLOW, 0);
+        } else if raw == i::BRK_GENERAL_PROTECTION {
+            hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff);
+        } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
+            hook_fault(pc + 1, fault_code::BREAKPOINT, pc);
+        }
     }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
     // registers (x30 names the caller) and RETURN so the block runs on. Pointed

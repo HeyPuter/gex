@@ -518,7 +518,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         crate::host(crate::door::publish(&mut caller, area as u32))
     })?;
     linker.func_wrap(IMPORT_MODULE, "door_call", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
-        crate::host(crate::door::call(&mut caller, req as u32, pid, tid))
+        crate::host(crate::door::call(&mut caller, req as u32, pid, tid, false))
+    })?;
+    // A 64-bit client's (W64's lowered LP64 ntdll.so): the same call, the
+    // request's gather list at LP64 offsets (`door::req_layout`).
+    linker.func_wrap(IMPORT_MODULE, "door_call_lp64", |mut caller: Caller<'_, HostState>, req: i32, pid: i32, tid: i32| -> wasmtime::Result<i32> {
+        crate::host(crate::door::call(&mut caller, req as u32, pid, tid, true))
     })?;
     // Natively every process sees the door once published (one host
     // process): never missing.

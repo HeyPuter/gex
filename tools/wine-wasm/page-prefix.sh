@@ -3,7 +3,9 @@
 # installed W3 prefix (wineboot -u leaves system32's programs and drivers
 # and the registry), with the W3 session (w3-session.reg, or the files
 # named) applied offline and the install marked current for DIST's
-# wine.inf, so wineboot --init does not update it again in the page.
+# wine.inf, so wineboot --init does not update it again in the page. W64's
+# win64 prefix (w64-dist.sh's) makes its template the same way
+# (docs/wine-native-x64.md, W64.5).
 #
 #   tools/wine-wasm/page-prefix.sh INSTALLED_PFX DIST OUT [FILE.reg...]
 #
@@ -29,7 +31,9 @@ if [ -n "${GRAPHICS:-}" ]; then
     if [ -f "$out/user.reg" ] && grep -q '^"Graphics"=' "$out/user.reg"; then
         sed -i "s/^\"Graphics\"=.*/\"Graphics\"=\"$GRAPHICS\"/" "$out/user.reg"
     else
-        printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win32\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' "$GRAPHICS" >> "$out/user.reg"
+        # the prefix's own architecture (win32 for W3, win64 for W64)
+        arch=$(sed -n 's/^#arch=//p' "$out/system.reg" | head -1)
+        printf 'WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=%s\n\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="%s"\n' "${arch:-win32}" "$GRAPHICS" >> "$out/user.reg"
     fi
 fi
 echo "$out: $(du -sh "$out" | cut -f1)"

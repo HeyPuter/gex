@@ -3922,7 +3922,14 @@ export class Gex {
           // that never returns for a thread's loop), and reports each image
           // it maps (natively for unit placement; the page's units path
           // takes it once `gex_image_mapped` exists).
-          call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          // In the single-thread build on a stack that may suspend, as the
+          // function tier's call_out: W64's system calls are faults served
+          // inside this loop (`#callOutSteps`), and they block.
+          call_out: single.on
+            ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
+              ? this.#callOut(ctx >>> 0, target, ret, spWant)
+              : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
+            : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
           image_mapped: (base, fd) => {
             const number = e.gex_image_mapped?.(base, fd) ?? -1;
             if (number === -1) return;
@@ -4724,7 +4731,10 @@ export class Gex {
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, name) | 0,
       // Door calls into the wineserver (docs/wineserver-kernel.md).
       door_publish: (area) => this.#doorPublish(area >>> 0),
-      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid),
+      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, false),
+      // A 64-bit client's (W64's lowered LP64 ntdll.so): the request's
+      // gather list at LP64 offsets (`#doorRun`, shims/native's door::req_layout).
+      door_call_lp64: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, true),
       // A Worker the door was broadcast to while it ran (it takes no
       // messages): Wine runs its program again as a child, which starts with
       // the door (loader.c `wineserver_relaunch`). None in the SP build.
@@ -4998,11 +5008,11 @@ export class Gex {
    *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
    *  it stays optimised: every server request of a W3 process comes here
    *  (docs/wine-overhead.md). */
-  #doorCall(req, pid, tid) {
-    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid);
+  #doorCall(req, pid, tid, lp64) {
+    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid, lp64);
     const d = this.#door;
     if (!d || single.on) return 1;
-    return this.#doorRun(d, req, pid, tid, null);
+    return this.#doorRun(d, req, pid, tid, null, lp64);
   }
 
   /** GEX_DOOR_STATS, read once per Worker (a page sets it before it starts). */
@@ -5039,18 +5049,23 @@ export class Gex {
     return v && end <= v.len ? v : this.#doorView();
   }
 
-  /** One door call under the door lock (`st`: the statistics, or null). */
-  #doorRun(d, req, pid, tid, st) {
+  /** One door call under the door lock (`st`: the statistics, or null).
+   *  The client's `struct __server_request_info`, past its 64-byte union:
+   *  data_count, reply_data and data[] (pointer, size) at 64, 68 and 72 in
+   *  8-byte entries (ILP32), or at 64, 72 and 80 in 16-byte ones (`lp64`,
+   *  pointers below 4 GiB). */
+  #doorRun(d, req, pid, tid, st, lp64) {
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
-    let g = this.#doorGuest(req + 136);
+    let g = this.#doorGuest(req + (lp64 ? 160 : 136));
     const cdv = g.dv;
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
-    const replyData = cdv.getUint32(req + 68, true);
+    const replyData = cdv.getUint32(req + (lp64 ? 72 : 68), true);
+    const data0 = lp64 ? 80 : 72, entry = lp64 ? 16 : 8;
     const a = d.area;
     // The door buffer's place and size never change: read once per door.
     let buf = d.kBuf, bufSize = d.kBufSize;
@@ -5084,7 +5099,9 @@ export class Gex {
       } else u8.set(g.u8.subarray(req, req + 64), buf);
       let at = buf + 64;
       for (let k = 0; k < count; k++) {
-        const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
+        const e0 = req + data0 + entry * k;
+        if (e0 + entry > g.u8.length) g = this.#doorGuest(e0 + entry);
+        const ptr = g.dv.getUint32(e0, true), size = g.dv.getUint32(e0 + entry / 2, true);
         if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
         u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
@@ -5153,14 +5170,14 @@ export class Gex {
 
   /** `#doorCall` with GEX_DOOR_STATS: the same call, timed, and a report
    *  every GEX_DOOR_STATS ms (default 10 s) or 50,000 calls. */
-  #doorCallStats(req, pid, tid) {
+  #doorCallStats(req, pid, tid, lp64) {
     const d = this.#door;
     const st = this.#doorStats;
     if (!d || single.on) {
       if (!(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
       return 1;
     }
-    const r = this.#doorRun(d, req, pid, tid, st);
+    const r = this.#doorRun(d, req, pid, tid, st, lp64);
     const { i32, dv } = this.#doorView();
     const a = d.area;
     const now = performance.now();
@@ -5502,6 +5519,9 @@ export class Gex {
     // When the last trap came out, for GEX_NT_STATS' time split: what the
     // glue costs between a trap and the guest again.
     let trappedAt = 0;
+    // A fault for the process's hook, taken at the last trap (`#faultTake`):
+    // called at the next entry.
+    let hook = null;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
     for (;;) {
@@ -5526,6 +5546,19 @@ export class Gex {
           );
         }
         this.#shim.exports.gex_callout_leave_ok?.(0);
+        // The fault hook first (staged at the last trap): the guest goes on
+        // where it leaves the context.
+        if (hook) {
+          const h = hook;
+          hook = null;
+          try {
+            if (single.on) await this.#promisingOf(h.f)(ctx, h.code, h.addr, h.kind);
+            else h.f(ctx, h.code, h.addr, h.kind);
+          } finally {
+            h.spG.value = h.cur;
+          }
+          pc = this.#faultPc(ctx);
+        }
         // The single-thread build enters on a stack of the guest's own
         // (JSPI), which a blocking call suspends; see single.mjs.
         if (single.on) {
@@ -5788,8 +5821,11 @@ export class Gex {
         await this.#drainThread();
         this.#where = 'resume';
         // A guest fault the shim staged for the process's hook (W3): run
-        // it, and go on where it left the context.
-        const faulted = this.#deliverFault(ctx);
+        // at the next entry, inside the trap handling below, since the hook
+        // can end the thread or the process as any guest code can (W64:
+        // every system call is one, signal_wasm64.c's `ud2` entry, and a
+        // thread the server stops dies inside it).
+        const ft = this.#faultTake(ctx);
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -5797,11 +5833,13 @@ export class Gex {
         // read as bugs anywhere but here.
         const next = e.gex_exited?.() ? 0n : e.gex_resume_pc();
         if (next !== 0n) {
-          pc = faulted ?? next;
+          pc = next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
+          hook = ft;
           continue;
         }
+        if (ft) ft.spG.value = ft.cur;
         // `exit_group` marks every guest thread exited and deliberately leaves
         // no resume PC. Do not inspect the wait state that thread had before
         // the exit: a network/futex flag can still be set, and waiting on it
@@ -6619,7 +6657,18 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const faulted = this.#deliverFault(ctx);
+          // The fault hook as one of this loop's steps: on a stack that may
+          // suspend in the single-thread build (`#driveAsync`).
+          let faulted = null;
+          const ft = this.#faultTake(ctx);
+          if (ft) {
+            try {
+              yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+            } finally {
+              ft.spG.value = ft.cur;
+            }
+            faulted = this.#faultPc(ctx);
+          }
           const resumed = e.gex_resume_pc();
           const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
@@ -6689,6 +6738,25 @@ export class Gex {
    * dispatcher. Returns where the guest goes on, or null with none staged.
    */
   #deliverFault(ctx) {
+    const t = this.#faultTake(ctx);
+    if (!t) return null;
+    try {
+      t.f(ctx, t.code, t.addr, t.kind);
+    } finally {
+      t.spG.value = t.cur;
+    }
+    return this.#faultPc(ctx);
+  }
+
+  /** Where the hook left the context. */
+  #faultPc(ctx) {
+    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+  }
+
+  /** The staged fault, taken, and the stack made ready for the hook: { f,
+   *  code, addr, kind, spG, cur } (the caller calls `f(ctx, code, addr,
+   *  kind)` and puts `spG` back to `cur`), or null with none staged. */
+  #faultTake(ctx) {
     const e = this.#shim.exports;
     if (!e.gex_fault_take) return null;
     const buf = e.gex_alloc(16) >>> 0;
@@ -6712,12 +6780,7 @@ export class Gex {
     const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
     const low = Math.min(Number(cur) >>> 0, esp);
     spG.value = typeof cur === 'bigint' ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
-    try {
-      f(ctx, code | 0, Number(BigInt.asUintN(32, addr)) | 0, kind | 0);
-    } finally {
-      spG.value = cur;
-    }
-    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+    return { f, code: code | 0, addr: Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }
 
   /**
