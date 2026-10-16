@@ -506,7 +506,12 @@ export class DomDesktop {
         this.#attach(win);
         if (s.role === ROLE_CURSOR) this.#cursor = win;
         else this.onwindow?.(win);
-        if (s.role === ROLE_TOPLEVEL) this.focus(win);
+        // Not a placed one: its client says when it has the keyboard
+        // (`activate`), as in the scene compositor. Win7's Start menu shows
+        // the user's picture as a placed toplevel of its own; it took the
+        // keyboard on appearing, search hid it, and with the focus gone every
+        // key after the first was dropped.
+        if (s.role === ROLE_TOPLEVEL && !s.placed) this.focus(win);
       }
       this.#update(win, s);
     }
