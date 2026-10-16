@@ -4119,6 +4119,26 @@ pub extern "C" fn gex_note_inherited(end: u64) {
     }
 }
 
+/// [`gex_note_inherited`] with the region's start. In W3's compact space
+/// (`nt::w3_compact`, set by `gex_adopt_windows_space` just before) an
+/// inherited region in the arena is an island the child's cursor steps
+/// over, not a floor: the parent's fixed mappings reach 2 GiB
+/// (KUSER_SHARED_DATA), so a floor above them left the child's heap no room,
+/// and everything between them is the parent's heap, which the child never
+/// reads.
+#[no_mangle]
+pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
+    if nt::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= nt::arena_ceiling() {
+        let start = start.max(gex_abi::ARENA_BOTTOM);
+        if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
+            && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
+        {
+            return;
+        }
+    }
+    gex_note_inherited(end);
+}
+
 /// Give this instance's slot back (`gex_worker_init`): the last call the
 /// Worker makes into this instance, once its run is over or it trapped. The
 /// next instance to claim the slot runs on the same stack, so nothing of
