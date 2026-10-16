@@ -59,6 +59,10 @@ for dll in "$@"; do
     # an empty one, so its skeleton is still a DLL with DllMain as entry)
     if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
     if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
+    # a GUI program (-mwindows) says so in its skeleton too: Windows gives a
+    # console program a console window of its own, so rundll32 or explorer
+    # started from Windows 7's shell opened a black console beside it
+    if [ ! -f "$spec" ] && grep -q -- '-mwindows' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem windows); fi
     # shellcheck disable=SC2046
     "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
         --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)

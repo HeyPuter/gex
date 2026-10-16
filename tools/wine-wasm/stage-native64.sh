@@ -36,6 +36,8 @@ for dll in "$@"; do
     spec=$src/${dir#$build/}/$name.spec
     if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
     if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
+    # a GUI program's skeleton says so (stage-native.sh)
+    if [ ! -f "$spec" ] && grep -q -- '-mwindows' "$src/${dir#$build/}/Makefile.in" 2>/dev/null; then kind+=(--subsystem windows); fi
     # shellcheck disable=SC2046
     "$winebuild" -w -b wasm64-unknown-linux-musl --cc-cmd="$here/wcc64 -D_WIN32" "${kind[@]}" --fake-module \
         --wasm-shared winepe.wasm -F "$dll" -o "$out/$dll" $(ls "$dir"/*.res 2>/dev/null)
