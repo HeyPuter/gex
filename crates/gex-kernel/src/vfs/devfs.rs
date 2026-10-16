@@ -335,18 +335,42 @@ impl FileHandle for DevDir {
 ///
 /// Deterministic by default so record/replay stays possible (PLAN §11); a
 /// host that wants real entropy replaces the `/dev/random` backend.
+/// `/dev/urandom` and `getrandom`'s bytes: splitmix64 over a per-thread
+/// state. The state was a constant xorshift seed in every thread, so every
+/// thread (each guest thread is a host thread, a Worker in the page) read
+/// the same sequence: two of services.exe's RPC threads made the same
+/// context-handle UUIDs, a client got another service's handle back and a
+/// driver's start never reported (a 120 s stall in the Windows shell's
+/// boot), and every process's TLS keys came from one sequence. Now each
+/// thread's state starts from the clock, the thread's id and a counter
+/// shared by the threads of this kernel, and every read mixes that counter
+/// in again. Not a cryptographic generator: the host's entropy is not
+/// reachable from here.
 fn fill_random(buf: &mut [u8]) {
     use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = const { Cell::new(0x9e37_79b9_7f4a_7c15) };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
+    static SHARED: AtomicU64 = AtomicU64::new(0);
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0) };
+    }
+    let n = SHARED.fetch_add(1, Ordering::Relaxed);
     STATE.with(|s| {
         let mut x = s.get();
+        if x == 0 {
+            let local = 0u8;
+            x = mix(super::tmpfs::now_ns() ^ mix(crate::sync::me() as u64 ^ (n << 32))
+                ^ mix(&local as *const u8 as u64)) | 1;
+        }
+        x ^= mix(n.wrapping_mul(GOLDEN));
         for chunk in buf.chunks_mut(8) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let bytes = x.to_le_bytes();
+            x = x.wrapping_add(GOLDEN);
+            let bytes = mix(x).to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
         s.set(x);
@@ -356,6 +380,21 @@ fn fill_random(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_differs_between_threads() {
+        let read = || {
+            let mut b = [0u8; 32];
+            fill_random(&mut b);
+            b
+        };
+        let a = read();
+        let b = std::thread::spawn(read).join().unwrap();
+        let c = std::thread::spawn(read).join().unwrap();
+        assert_ne!(a, b, "two threads read the same bytes");
+        assert_ne!(b, c, "two threads read the same bytes");
+        assert_ne!(read(), a, "one thread read the same bytes twice");
+    }
 
     #[test]
     fn device_numbers_are_real_and_distinct() {
