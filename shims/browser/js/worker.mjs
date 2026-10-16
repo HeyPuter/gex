@@ -30,12 +30,18 @@ async function channel() {
     };
   }
   const { parentPort } = await import('node:worker_threads');
+  let handler = null;
   return {
     post: (m, transfer) =>
       transfer && transfer.length
         ? parentPort.postMessage(m, transfer)
         : parentPort.postMessage(m),
-    on: (f) => parentPort.on('message', f),
+    // One listener, whose handler a given-back Worker's next process
+    // replaces, as `onmessage` is replaced in a browser.
+    on: (f) => {
+      if (!handler) parentPort.on('message', (m) => handler(m));
+      handler = f;
+    },
   };
 }
 
@@ -68,7 +74,7 @@ function forkTransfer(child) {
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { setFill, fillFile } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
-import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
+import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
@@ -91,10 +97,62 @@ if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.
   console.debug = sync;
 }
 
+// What a process leaves in this realm besides `workerMain`'s state, which the
+// next process on this Worker must not see (`reset`): its timers, and the
+// globals its start message set. Not in the single-thread build, whose
+// Workers are fibers of one realm and are never given back.
+const timers = new Set();
+const realmGlobals = new Set(Object.getOwnPropertyNames(globalThis));
+if (!single.on) {
+  for (const [make, clear, once] of [['setTimeout', 'clearTimeout', true], ['setInterval', 'clearInterval', false]]) {
+    const mk = globalThis[make];
+    const cl = globalThis[clear];
+    if (typeof mk !== 'function' || typeof cl !== 'function') continue;
+    globalThis[make] = function (f, ...rest) {
+      let id;
+      const g = once && typeof f === 'function' ? function (...a) { timers.delete(id); return f.apply(this, a); } : f;
+      id = mk.call(globalThis, g, ...rest);
+      timers.add(id);
+      return id;
+    };
+    globalThis[clear] = function (id) {
+      timers.delete(id);
+      return cl.call(globalThis, id);
+    };
+  }
+}
+/** This realm as a new Worker has it, before the next process: every timer
+ *  the last one left stopped, every global it set gone. The console's
+ *  marking (`__gexMarkedConsole`) stays, since `console.error` keeps it. */
+function resetRealm() {
+  for (const id of timers) {
+    clearTimeout(id);
+    clearInterval(id);
+  }
+  timers.clear();
+  for (const k of Object.getOwnPropertyNames(globalThis)) {
+    if (realmGlobals.has(k) || k === '__gexMarkedConsole') continue;
+    try { delete globalThis[k]; } catch {}
+  }
+}
+
 // Everything below is one Worker's: its port, its process, its state. A
 // function rather than module scope so the single-thread build (single.mjs)
 // can run many of these in one realm, one per fiber; a real Worker runs one.
-async function workerMain(port) {
+//
+// And so a Worker can be given back (`reset`, host.mjs `#giveBack`): a
+// process that exited cleanly leaves this function's state behind, and the
+// next process starts on a new call of it, in a realm whose JS is compiled
+// and warm. `carry` is what outlives a process: the page's modules, given
+// while it waited in the pool. Messages the old call still posts are dropped.
+async function workerMain(rawPort, carry = null) {
+const life = { on: true };
+const port = {
+  post: (m, transfer) => {
+    if (life.on) rawPort.post(m, transfer);
+  },
+  on: rawPort.on,
+};
 
 
 // This Worker's runtime, once its start message builds it. Module-scope so a
@@ -103,7 +161,9 @@ let workerGex = null;
 /// The page's modules, given while this Worker waited in the host's pool
 /// (`pooledModules`): its runtime starts with them, and the start message
 /// carries only those it lacks.
-const pooled = new Map();
+const pooled = carry?.pooled ?? new Map();
+/// Which process this is of the ones this Worker has run, from 1.
+const runs = (carry?.runs ?? 0) + 1;
 /// The bridges every process of a page sets up (GL, Wayland, network), as
 /// modules once loaded. Imported while this Worker waits in the host's pool
 /// (the end of this function), and used from here without an `await import`
@@ -118,7 +178,7 @@ const bridgeImports = {
 const bridges = {};
 const bridge = (k) => bridges[k] ?? bridgeImports[k]().then((m) => (bridges[k] = m));
 /// This Worker's runtime made ahead of its process (`preattach`, host.mjs):
-/// a promise of `{ gex, shared, stack }`, or null. Used by an exec'd
+/// a promise of `{ gex, shared, stack, mem64 }`, or null. Used by an exec'd
 /// posix_spawn child, which runs on a fresh memory; anything else leaves it.
 let preattached = null;
 /// Whether this process's memory can go to the next fork child when it exits
@@ -143,6 +203,17 @@ let winsize = () => {};
 // rejected promise nobody holds, and a Worker that rejects on the way in looks
 // exactly like one that is busy.
 port.on((msg) => {
+  // Given back to the pool: this process's state stays here, unreachable,
+  // and the next one starts on a new call (see `workerMain`).
+  if (msg?.kind === 'reset') {
+    life.on = false;
+    resetRealm();
+    workerMain(rawPort, { pooled, runs }).catch((e) => {
+      console.error('gex: a given-back worker could not start again:', e?.stack ?? e);
+      rawPort.post({ kind: 'threw', message: String(e?.message ?? e) });
+    });
+    return;
+  }
   handle(msg).catch((e) => {
     const what = e?.stack ?? e?.message ?? String(e);
     if (typeof console !== 'undefined') console.error('gex: worker failed:', what);
@@ -268,6 +339,12 @@ async function handle(msg) {
   if (msg?.kind === 'preattach') {
     const shared = !!msg.shared;
     const stack = msg.kernelStack;
+    // The memory's index type is the process's, and the host says which: a
+    // wasm64 shim imports an i64 memory. Decided here, before the memory is
+    // made, since no start message has said it yet (it was left i32, and
+    // every m64 Worker's runtime failed to instantiate).
+    const mem64 = !!msg.mem64;
+    if (mem64) globalThis.GEX_MEM64 = 1;
     preattached = (async () => {
       const gex = new Gex(new Env(), {
         kernel: { ...msg.kernel, stackTop: stack },
@@ -275,7 +352,7 @@ async function handle(msg) {
         modules: pooled,
       });
       await gex.preattach(msg.shim, msg.guest);
-      return { gex, shared, stack };
+      return { gex, shared, stack, mem64 };
     })().catch((err) => {
       console.error(`[gex] a pooled Worker could not prepare a runtime: ${err?.message ?? err}`);
       return null;
@@ -449,8 +526,12 @@ async function handle(msg) {
     // What the process reached (an image's unit, a native module): the
     // page's start-up status (fetch-note.mjs).
     noteStatus(status) {
+      // The process's own .exe, once its main image is in: said with each unit
+      // fetch, so the page can name the program the code is for.
+      if (status?.program !== undefined) this.owner = String(status.path ?? '').split(/[\\/]/).pop();
       noteStatus(status);
     }
+    owner = '';
     loadUnit(key) {
       // The entries now; the module's bytes only if this Worker compiles it
       // (most get the Module from a sibling: see `Gex#cgenModule`). Fetching
@@ -491,7 +572,7 @@ async function handle(msg) {
         x.setRequestHeader('Range', `bytes=${off}-${off + len - 1}`);
         // Said to the page, as a unit's own files are: a cold cluster is
         // code the program is waiting for.
-        const done = noteFetch(`unit:${rel}`, len);
+        const done = noteFetch(`unit:${rel}`, len, this.owner);
         try {
           x.send();
         } finally {
@@ -530,7 +611,7 @@ async function handle(msg) {
         const x = new XMLHttpRequest();
         x.open('GET', `${c.url}/${rel}`, false);
         x.responseType = 'arraybuffer';
-        const done = noteFetch(`unit:${rel}`);
+        const done = noteFetch(`unit:${rel}`, 0, this.owner);
         try {
           x.send();
         } finally {
@@ -588,8 +669,22 @@ async function handle(msg) {
   // of its own as that one does, on the same kernel stack.
   const pre = preattached && msg.kind === 'adopt' && msg.child?.exec && !msg.memory
     && !msg.recycledMemory && !msg.moduleStore ? await preattached : null;
+  // Made for an exec'd child and taken by something else: its memory is
+  // dropped unused, and stays committed until this Worker's isolate collects
+  // (host.mjs `#preattach`; tests/browser-spawn.sh counts these).
+  if (preattached && !pre) vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: a runtime made ahead was left unused (${msg.kind})`);
   preattached = null;
-  const gex = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+  // A runtime made in the pool that does not fit the process it was made
+  // for is a host bug, not a choice: said, and the process gets a new one.
+  const fits = pre && pre.shared === !!msg.shared && pre.stack === msg.kernelStack
+    && pre.mem64 === !!msg.mem64;
+  if (pre && !fits) {
+    console.error(`[gex] pid ${msg.child?.pid}: the pooled runtime does not fit its process `
+      + `(shared ${pre.shared}/${!!msg.shared}, stack ${pre.stack}/${msg.kernelStack}, mem64 ${pre.mem64}/${!!msg.mem64}); a new one is made`);
+  }
+  // Back to the process's own type, should the pool's have been the other.
+  if (pre && pre.mem64 && !msg.mem64) delete globalThis.GEX_MEM64;
+  const gex = fits
     ? pre.gex
     : new Gex(new WorkerEnv(), {
       kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
@@ -792,15 +887,25 @@ async function handle(msg) {
     }
     gex.useNetwork(net);
   }
+  // A Worker given back after an earlier process (tests/browser-reuse.sh
+  // counts these).
+  if (runs > 1 && msg.kind !== 'thread') {
+    vforkTrace(`[pool] pid ${msg.child?.pid ?? msg.pid ?? '?'}: given-back worker, its process ${runs}`);
+  }
   try {
     let entry;
     // A process enters on its first thread (where `run` starts); a thread has
     // registers of its own.
     let ctx;
+    // A thread the process lost before this Worker could adopt it.
+    let gone = false;
+    // A thread's: how many `execve`s its process had made when it came up.
+    let execGen = 0;
     if (msg.kind === 'thread') {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
-      ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      ({ entry, ctx, gone } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      execGen = gex.shim.exports.gex_exec_gen?.() ?? 0;
       _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
       narrate(`[worker] pid ${msg.child?.pid}: adopt arrived`);
@@ -959,7 +1064,17 @@ async function handle(msg) {
     // an abandoned process stack.
     globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
     const runStarted = performance.now();
-    const status = await gex.run(entry, ctx);
+    const status = gone ? 0 : await gex.run(entry, ctx);
+    // This Worker's thread went with the old program when another thread
+    // called `execve`: the process runs on in that thread's Worker, so this
+    // one ends as a thread does, never as the process.
+    //
+    // And the other way round: a thread Worker whose thread made that
+    // `execve` (or one since) carries the process now, and ends it as its
+    // process Worker would have.
+    const carries = msg.kind === 'thread' && !gone && !ex.gex_thread_gone?.()
+      && (ex.gex_exec_gen?.() ?? 0) !== execGen;
+    const thread = (msg.kind === 'thread' && !carries) || !!ex.gex_thread_gone?.();
     const guestMillis = Math.round(performance.now() - runStarted);
     if (msg.exitTrace && status !== 0) {
       // Who sent the last signal anywhere (the global kernel's record): a
@@ -988,20 +1103,22 @@ async function handle(msg) {
     // joining it. A thread's own exit already woke its joiner's futex; a thread
     // that faults is handled by the Worker's error path and never reaches here.
     // `?fjit=`: what the function JIT did, and how often its lock was held.
-    if (msg.kind !== 'thread') ex.gex_fjit_report?.();
-    if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
+    if (!thread) ex.gex_fjit_report?.();
+    if (!thread) ex.gex_process_gone?.(134);
     // `?xcache=`: what this process added to the store, kept for the next load
     // (docs/gexcc.md §8). After the exit is published, so a parent's wait does
     // not wait for it.
     const xcache = msg.xcache ?? msg.opts?.xcache ?? msg.child?.opts?.xcache;
     const xcacheMin = msg.xcacheMin ?? msg.opts?.xcacheMin ?? msg.child?.opts?.xcacheMin;
-    if (msg.kind !== 'thread' && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
+    if (!thread && xcache) await gex.xcacheSave?.(xcache, xcacheMin ?? 1 << 20);
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
     const exitMsg = {
       kind: 'exit',
       status,
+      threadGone: thread && msg.kind !== 'thread' ? true : undefined,
+      carries: carries || undefined,
       guestMillis,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
@@ -1093,9 +1210,19 @@ async function handle(msg) {
     // This process's memory, zeroed, for the host to give the next fork child
     // (`Gex#recycleMemory`): its pages are touched, which a fresh memory's are
     // not. After the kernel has the process gone, so no parent waits on it.
-    if (recyclable && msg.kind !== 'thread' && !msg.child?.exec) {
+    if (recyclable && !thread && !msg.child?.exec) {
       exitMsg.recycle = gex.recycleMemory?.() ?? undefined;
     }
+    // Whether this Worker can go back to the pool for another process
+    // (host.mjs `#giveBack`): only a process that exited by `exit` (a status
+    // under 128; a signal death is 128 and up), in this Worker alone (no
+    // thread, nothing else holding its memory), on no connection of this
+    // realm's own (Node's sockets, a Wisp WebSocket). The single-thread
+    // build's fibers are never given back.
+    exitMsg.workerRuns = runs;
+    exitMsg.giveBack = !single.on && !thread && !carries && !gone && recyclable
+      && (msg.kind === 'adopt' || msg.kind === 'run')
+      && status >= 0 && status < 128 && !msg.network && !msg.wispUrl;
     port.post(exitMsg);
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the
@@ -1190,7 +1317,7 @@ port.post({ kind: 'ready' });
 if (typeof self !== 'undefined') {
   for (const k of Object.keys(bridgeImports)) bridge(k).catch(() => {});
 }
-if (handed) handle(handed);
+if (handed && !carry) handle(handed);
 }
 
 // A real Worker runs itself; the single-thread build registers the function

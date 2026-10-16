@@ -18,6 +18,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Every step said as it happens, a whole line per write (unbuffered, msvcrt
+ * writes a line in pieces, which the page's stderr can split): a run that
+ * stops says where. */
+#define say(...) (printf(__VA_ARGS__), fflush(stdout))
+
 static HANDLE go, done;
 static volatile LONG woken;
 
@@ -74,6 +79,7 @@ int main(int argc, char **argv)
 
     if (argc > 1 && !strcmp(argv[1], "child")) return 7;
     n = argc > 1 ? atoi(argv[1]) : 4;
+    say("spawnwin: start, %d rounds\n", n);
 
     wc.lpfnWndProc = wndproc;
     wc.hInstance = GetModuleHandleA(NULL);
@@ -81,6 +87,7 @@ int main(int argc, char **argv)
     wc.lpszClassName = "spawnwin";
     if (!RegisterClassA(&wc)) { printf("RegisterClass failed %lu\n", GetLastError()); return 1; }
     if (!window(0)) { printf("first window failed %lu\n", GetLastError()); return 1; }
+    say("spawnwin: first window up\n");
 
     go = CreateEventA(NULL, FALSE, FALSE, NULL);
     done = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -94,6 +101,7 @@ int main(int argc, char **argv)
         PROCESS_INFORMATION pi;
         DWORD code = 0;
 
+        say("spawnwin: round %d: spawning\n", i);
         if (!CreateProcessA(self, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
         {
             printf("CreateProcess %d failed %lu\n", i, GetLastError());
@@ -104,15 +112,16 @@ int main(int argc, char **argv)
             printf("child %d: exit %lu\n", i, code);
             return 1;
         }
+        say("spawnwin: round %d: child exited 7\n", i);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         /* The parent's Wayland client after the spawn: a new window, shown. */
         if (!window(i)) { printf("window %d failed %lu\n", i, GetLastError()); return 1; }
+        say("spawnwin: round %d: window up\n", i);
         SetEvent(go);
         if (WaitForSingleObject(done, 60000)) { printf("thread did not answer %d\n", i); return 1; }
     }
     if (woken != n) { printf("woken %ld of %d\n", woken, n); return 1; }
-    printf("spawnwin ok %d\n", n);
-    fflush(stdout);
+    say("spawnwin ok %d\n", n);
     ExitProcess(0);
 }

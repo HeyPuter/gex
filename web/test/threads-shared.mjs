@@ -32,16 +32,21 @@ for (const p of [SHIM, SEED]) {
   }
 }
 
+// tests/integration/programs/threads-shared.c: it clones a thread first,
+// since only a threaded process keeps what it translates for a Worker that
+// joins it (`Jit::ever_threaded`), then runs code it has not run before.
 const [elfPath] = process.argv.slice(2);
 if (!elfPath || !existsSync(elfPath)) {
-  console.log('skip threads-shared: give it a static aarch64 program');
+  console.log('skip threads-shared: give it tests/integration/programs/threads-shared.c, built static for aarch64');
   process.exit(0);
 }
 
-const PAGES = 0xffff0000 / 65536;
 // The process's address space. One memory, two Workers -- that is the whole
-// definition of a thread here.
-const memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared: true });
+// definition of a thread here. Made as the runtime makes a process's (gex.mjs:
+// 112 MiB to start, growing to 4 GiB less a page): made whole at 4 GiB, its
+// heap arena had nowhere to grow (at 0xffff0000, above its ceiling) and the
+// shim's stack slots were never set up.
+const memory = new WebAssembly.Memory({ initial: 0x07000000 / 65536, maximum: 0xffff0000 / 65536, shared: true });
 
 const shim = new Uint8Array(readFileSync(SHIM));
 const seed = new Uint8Array(readFileSync(SEED));
@@ -55,8 +60,12 @@ const WORKER = `
       parentPort.postMessage({ kind: 'out', text: new TextDecoder().decode(bytes.slice()) });
     }
     now() { return BigInt(Date.now()) * 1000000n; }
+    // The thread the program clones. Nothing runs it (it would only exit);
+    // its record carries the process's module store, which the second
+    // Worker joins as a thread's Worker does.
+    spawnThread(t) { parentPort.postMessage({ kind: 'thread', tid: t.tid, moduleStore: t.moduleStore }); }
   }
-  const gex = new Gex(new E(), { memory: workerData.memory });
+  const gex = new Gex(new E(), { memory: workerData.memory, moduleStore: workerData.moduleStore ?? null });
   let entry = null;
   parentPort.on('message', async (m) => {
     try {
@@ -79,8 +88,12 @@ const WORKER = `
         // Running translates blocks and installs them into *this* Worker's
         // dispatch tables. A thread joining afterwards has none of them.
         const status = await gex.run(entry);
+        // The shim's registry of translated modules: \`installedModules\`
+        // counts those a Worker installed by catching up, which a Worker
+        // that translated them itself never does.
+        const registry = gex.shim?.exports?.gex_module_count?.();
         parentPort.postMessage({
-          kind: 'ran', status, modules: gex.installedModules,
+          kind: 'ran', status, modules: registry === undefined ? gex.installedModules : registry >>> 0,
         });
       } else if (m.kind === 'modules') {
         parentPort.postMessage({ kind: 'modules', n: gex.installedModules });
@@ -95,11 +108,13 @@ const WORKER = `
   parentPort.postMessage({ kind: 'ready' });
 `;
 
-function spawn() {
+let thread = null;
+
+function spawn(moduleStore) {
   return new Promise((resolve) => {
     const w = new Worker(WORKER, {
       eval: true,
-      workerData: { shim, seed, elf, memory },
+      workerData: { shim, seed, elf, memory, moduleStore },
     });
     const pending = [];
     const api = {
@@ -115,6 +130,10 @@ function spawn() {
       if (m.kind === 'ready') return resolve(api);
       if (m.kind === 'out') {
         api.out += m.text;
+        return;
+      }
+      if (m.kind === 'thread') {
+        thread = m;
         return;
       }
       if (m.kind === 'threw') {
@@ -140,13 +159,23 @@ await a.ask({ kind: 'poke', at: 0x900000, bytes: marker }, 'poked');
 
 // Run it, which is what fills the first Worker's dispatch tables.
 const ran = await a.ask({ kind: 'run' }, 'ran');
+if (ran.status !== 0 || !/^threads-shared \d+$/m.test(a.out)) {
+  console.log(`FAIL threads-shared: the program exited ${ran.status}: ${JSON.stringify(a.out)}`);
+  process.exit(1);
+}
+if (!thread) {
+  console.log('FAIL threads-shared: the program cloned no thread');
+  process.exit(1);
+}
+// A threaded process keeps what it translated: a registry with nothing in it
+// means the replay below checks nothing.
 if (!ran.modules) {
-  console.log('FAIL threads-shared: the first Worker translated nothing, so there is nothing to replay');
+  console.log('FAIL threads-shared: the threaded process kept no translated modules for a joining Worker');
   process.exit(1);
 }
 
 // 1 and 2: a second Worker on the same memory, seeing what the first wrote.
-const b = await spawn();
+const b = await spawn(thread.moduleStore);
 await b.ask({ kind: 'attach' }, 'attached');
 const seen = await b.ask({ kind: 'peek', at: 0x900000, len: marker.length }, 'peeked');
 const text = new TextDecoder().decode(new Uint8Array(seen.bytes));

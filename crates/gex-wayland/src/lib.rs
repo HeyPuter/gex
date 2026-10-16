@@ -1664,7 +1664,15 @@ impl Client {
             // Not a placed one: its client says when it has the keyboard
             // (`activate`), and Wine takes a keyboard enter as "make this the
             // foreground window" -- every repaint of a taskbar would.
-            if matches!(state.role, Role::Toplevel | Role::Popup) && !state.placement.placed {
+            //
+            // And only when the window maps (its first buffer, or the first
+            // after an unmap), or when no window has the keyboard: a window
+            // that loses it repaints itself as inactive, and following that
+            // repaint handed the keyboard back, so two of Wine's windows
+            // passed it between them for ever, each repaint making the other
+            // repaint (tests/w3/spawnwin.sh's native leg, older winewayland).
+            let maps = state.committed_buffer.is_none() || self.focus_surface.is_none();
+            if matches!(state.role, Role::Toplevel | Role::Popup) && !state.placement.placed && maps {
                 self.focus_surface = Some(surface);
                 self.ensure_keyboard_enter();
             }

@@ -144,6 +144,10 @@ for arch in x64 x86; do
     fi
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
+    # A section mapped several times in one process, at the same offset and
+    # inside, unmapped in turn. W3 only (the legacy NT layer loses the
+    # section's pages once every view is unmapped).
+    [ -n "${GEX_NT_W3:-}" ] && check $arch/secalias 0 "$allok" "$b/secalias.exe"
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll
     # with its header as linked.
     check $arch/fixedbase 0 "$allok" "$b/fixedbase.exe"

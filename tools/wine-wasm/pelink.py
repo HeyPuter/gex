@@ -16,7 +16,13 @@ written by winegcc and winebuild for wasm32. This:
   3. links them all with the shared runtime (libs/gexrt) into OUT.wasm, a
      position-independent module whose data exports are exported (globals
      holding their offsets) for gex to point the skeletons at.
-Whatever stays undefined is listed (OUT.wasm.undefined) and left an import."""
+Whatever stays undefined is listed (OUT.wasm.undefined) and left an import.
+
+A wasm64 build tree (HOST_ARCH = wasm64, or --wasm64 before the arguments:
+W64's LLP64 PE side, docs/wine-native-x64.md) links with wasm-ld -mwasm64,
+compiles its generated C with wcc64 -D_WIN32, takes compiler-rt from
+GEX_WASM64_SYSROOT and lowers the module to wasm32 (--memory64-lowering), as
+wcc64 does a DLL's own side module."""
 import os
 import re
 import subprocess
@@ -27,6 +33,15 @@ here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
 DELAY = {}  # module -> its delay imports (pelink's main)
 SRC = None  # the Wine source tree (pelink's main)
+W64 = False  # a wasm64 (LLP64) build: wcc64, lowered (pelink's main)
+
+
+def cc(*args):
+    """The compiler for pelink's generated C: wcc, or for wasm64 wcc64 with
+    Windows x64's data model (all of it is PE-side code there)."""
+    if W64:
+        return [os.path.join(here, 'wcc64'), '-D_WIN32'] + [a for a in args if a != '-D_WIN32']
+    return [os.path.join(here, 'wcc')] + list(args)
 
 
 def enc_leb(v):
@@ -123,6 +138,10 @@ def spec_functions(spec):
 
 
 def main():
+    global W64
+    if sys.argv[1] == '--wasm64':
+        W64 = True
+        del sys.argv[1]
     if sys.argv[1] == '--gexrt':
         # explicit inputs (tests)
         args = sys.argv[1:]
@@ -143,6 +162,7 @@ def main():
     build, src, out = sys.argv[1:4]
     global SRC
     SRC = src
+    W64 = W64 or makefile_var(os.path.join(build, 'Makefile'), 'HOST_ARCH') == ['wasm64']
     only = set(sys.argv[4:])
     # An IMPORTS entry names an import library, which is the module's base
     # name unless its Makefile says otherwise (IMPORTLIB = ntoskrnl for
@@ -192,6 +212,9 @@ def main():
             DELAY[mod] = [modname(i.lstrip('-')) for i in makefile_var(mk, 'DELAYIMPORTS')]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
+    if W64 and only - {d[0] for d in dlls}:
+        # (W64 names its set, stage-native64.sh: each one is wanted)
+        sys.exit('no objects for ' + ' '.join(sorted(only - {d[0] for d in dlls})) + ' (make their wasm64-windows DLLs first)')
     # every DLL the build has an export list for, native or not: what an
     # import the linked DLLs leave undefined is found in (guest imports)
     others = {}
@@ -392,7 +415,7 @@ def link(dlls, out, gexrt, others=None):
                     body = f'return ({ctype[hr]}){call};'
                 f.write(f'{ctype[hr]} f{k}({params}) {{ {body} }}\n')
         obj = os.path.join(tmp, 'forwards.o')
-        subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-c', '-o', obj, src])
+        subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
         objs.append(obj)
 
     # Imports from DLLs that stay i386 code (msvcrt's user32 and advapi32
@@ -429,7 +452,8 @@ def link(dlls, out, gexrt, others=None):
                         stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
-                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] else ''
+                    # (x64 has one convention)
+                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] and not W64 else ''
                     r, ps = sig.split(':')
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
@@ -448,7 +472,7 @@ def link(dlls, out, gexrt, others=None):
                     f.write(f'    (void *)g{k},\n')
                 f.write('};\n')
             obj = os.path.join(tmp, 'guestimports.o')
-            subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
+            subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
             objs.append(obj)
             print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o, _ in stubs}))})')
 
@@ -477,7 +501,7 @@ def link(dlls, out, gexrt, others=None):
                     '        if (!*a && !*b) return gexw_imports[i + 1];\n'
                     '    }\n    return 0;\n}\n')
         obj = os.path.join(tmp, 'moduleimports.o')
-        subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
+        subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
         objs.append(obj)
 
     rsp = os.path.join(tmp, 'exports.rsp')
@@ -487,13 +511,16 @@ def link(dlls, out, gexrt, others=None):
         # gexrt's bounds of the entry-thunk pairs (gexw_entries)
         f.write('--export-if-defined=__gexw_entries\n')
         f.write('--export-if-defined=__gexw_entries_decl\n')
-    cmd = ['wasm-ld', '--experimental-pic', '-shared', '--shared-memory', '--import-memory',
-           '--max-memory=4294967296', '--unresolved-symbols=import-dynamic', '-o', out,
+    cmd = ['wasm-ld'] + (['-mwasm64'] if W64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
+           '--import-memory', '--max-memory=4294967296', '--unresolved-symbols=import-dynamic', '-o', out,
            f'@{rsp}'] + objs + [gexrt]
     # compiler-rt's builtins (__multi3 and the like), from the toolchain's
-    # sysroot (tools/wine-wasm/build-sysroot.sh)
-    if os.environ.get('GEX_WASM_SYSROOT'):
-        cmd.append(os.path.join(os.environ['GEX_WASM_SYSROOT'], 'lib', 'libclang_rt.builtins-wasm32.a'))
+    # sysroot (tools/wine-wasm/build-sysroot.sh, build-sysroot64.sh)
+    sysroot = os.environ.get('GEX_WASM64_SYSROOT' if W64 else 'GEX_WASM_SYSROOT')
+    if sysroot:
+        cmd.append(os.path.join(sysroot, 'lib', 'libclang_rt.builtins-%s.a' % ('wasm64' if W64 else 'wasm32')))
+    elif W64:
+        sys.exit('pelink: set GEX_WASM64_SYSROOT')
     subprocess.check_call(cmd)
     # What nothing defines (an export whose code is i386 assembly, say): a
     # stub that traps, so one gap does not keep the module from
@@ -525,7 +552,7 @@ def link(dlls, out, gexrt, others=None):
                 f.write(f'{ctype[r]} x{k}({params}) __asm__("{n}");\n')
                 f.write(f'{ctype[r]} x{k}({params}) {{ __builtin_trap(); }}\n')
         obj = os.path.join(tmp, 'gaps.o')
-        subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-c', '-o', obj, src])
+        subprocess.check_call(cc('-O2', '-c', '-o', obj, src))
         cmd.insert(cmd.index(gexrt), obj)
         subprocess.check_call(cmd)
         print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
@@ -534,9 +561,16 @@ def link(dlls, out, gexrt, others=None):
     # includes winebuild's glue, where an adapter of msvcrt's _setjmp calls
     # a function clang lowers as setjmp. gex runs the standard instructions
     # only, so the module is translated, as wcc's own links are.
-    opt = os.path.join(os.environ.get('GEX_WASM_SYSROOT', ''), 'binaryen', 'bin', 'wasm-opt')
+    opt = os.path.join(sysroot or '', 'binaryen', 'bin', 'wasm-opt')
     opt = os.environ.get('GEX_WASM_OPT') or opt
-    if os.path.exists(opt):
+    if W64:
+        # lowered to wasm32 (wcc64's side modules: the one place an address
+        # becomes a memory index), optimised as they are
+        subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
+                               '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
+                               '--enable-exception-handling', '--enable-reference-types', '--enable-memory64',
+                               '--memory64-lowering', '-O2', '-o', out])
+    elif os.path.exists(opt):
         subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
                                '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
                                '--enable-exception-handling', '--enable-reference-types',

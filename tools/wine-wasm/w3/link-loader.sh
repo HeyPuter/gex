@@ -4,7 +4,8 @@
 # docs/wine-native.md §3.12): each library's objects compiled again with its
 # __wine_unix_call_funcs (and names it shares with another) renamed apart,
 # and a registry (dlreg.py) that musl's dlopen/dlsym answer from. The
-# libraries: crypt32, ws2_32, msv1_0, dnsapi, nsiproxy, win32u (+ FreeType),
+# libraries: crypt32, ws2_32, msv1_0, dnsapi, nsiproxy, secur32 (+ GnuTLS, when
+# the tree has it), win32u (+ FreeType),
 # winewayland.drv (+ libwayland, xkbcommon), opengl32 (+ gex-gl's EGL),
 # wineoss.drv (OSSv4, against gex-kernel's /dev/dsp).
 #
@@ -49,13 +50,24 @@ for c in $(grep -o "dlls/ntdll/unix/[a-z_0-9]*\.o" Makefile | sort -u | grep -v 
   objs="$objs $B/$c"
 done
 reg=""
-for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy; do
+tls=""; [ "${W3_TLS:-1}" != 0 ] && grep -q "define SONAME_LIBGNUTLS" include/config.h && tls="secur32:secur32"
+for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy $tls; do
   dir=${spec%%:*}; lib=${spec##*:}; mkdir -p "$O/$lib"
   for c in $(sed -n "/^dlls\/$dir\/$lib.so:/,/^\t/p" Makefile | grep -o "dlls/$dir/[a-z_0-9]*\.o" | sort -u); do
     b=$(basename "$c" .o); compile "dlls/$dir/$b.c" "$c" "$O/$lib/$b.o" "-D__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
   done
   reg="$reg $lib.so:data:__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
 done
+# GnuTLS (DEPS), when the tree was configured with it: crypt32 and secur32's
+# schannel dlopen libgnutls.so.30 and look up each function they use.
+tlslibs=""
+if [ -n "$tls" ]; then
+  for f in $(grep -ohE 'LOAD_FUNCPTR\( *gnutls_[A-Za-z0-9_]+|dlsym\( *libgnutls_handle, *"gnutls_[A-Za-z0-9_]+"' \
+      "$F/dlls/crypt32/unixlib.c" "$F/dlls/secur32/schannel_gnutls.c" | sed -E 's/.*[("] *(gnutls_[A-Za-z0-9_]+)"?$/\1/' | sort -u); do
+    reg="$reg libgnutls.so.30:func:$f"
+  done
+  tlslibs="$I/lib/libgnutls.a $I/lib/libhogweed.a $I/lib/libnettle.a"
+fi
 # win32u.so: its syscalls register at __wine_unix_lib_init; the names it
 # shares with wineserver and ntdll.so renamed apart. FreeType through dlopen.
 w32defs="-D__wine_unix_lib_init=win32u___wine_unix_lib_init"
@@ -110,5 +122,9 @@ wait
 python3 "$T/dlreg.py" ntdll.so:func:__wine_main $reg > "$O/reg.c"
 mkdir -p "$DIST/lib/wine/i386-unix"
 "$T/wcc" -O1 -Wl,--gex-guest-i386 -o "$DIST/lib/wine/i386-unix/wine" "$B/loader/main.o" "$O/reg.c" $objs \
-  "$I/lib/libfreetype.a" $wllibs "$GL_O" || { echo "link-loader: link failed" >&2; exit 1; }
+  "$I/lib/libfreetype.a" $wllibs $tlslibs "$GL_O" || { echo "link-loader: link failed" >&2; exit 1; }
+# crypt32's root store: the first of its known locations, Mozilla's bundle
+# (w3.pins CACERT). Natively the host's /etc is the guest's; the page's
+# bundle copies DIST/etc into its own /etc.
+if [ -n "$tls" ]; then mkdir -p "$DIST/etc/ssl/certs" && cp -f "$I/ca-certificates.crt" "$DIST/etc/ssl/certs/"; fi
 echo "w3/link-loader: $DIST/lib/wine/i386-unix/wine"

@@ -56,6 +56,8 @@ const PIECES = {
  *   cwd, exe   the working directory and program (a path in the bundle)
  *   mtimes     give the guest the bundle's file times
  *   persist    false, or {dir, db}: a guest directory kept in IndexedDB
+ *   wisp       a Wisp proxy's URL (ws:// or wss://, ending in a slash): the
+ *              guest's network (its TCP and DNS go over it); none by default
  *   strace     true (every process) or a pid: narrate system calls
  *   trapstack  a trap's wasm frames
  *   debug      more runtime switches, {name: value}, as gex's test page's
@@ -169,7 +171,8 @@ function progressMeter(state, onProgress) {
      *  inflight}, or null when none is: kind 'file' (a lazy file: name its
      *  file name, done/total its bytes read so far and its size) or 'code'
      *  (a unit of translated code: name the module it is for, '' if not
-     *  known; done the bytes in, total 0). */
+     *  known; done the bytes in, total 0); `owner` the .exe of the process
+     *  that fetched it, '' if not known yet. */
     watchFetches(lazyNames, unitNames) {
       if (typeof BroadcastChannel !== 'function') return;
       const ch = new BroadcastChannel('gex-fetch');
@@ -177,6 +180,11 @@ function progressMeter(state, onProgress) {
       const files = new Map(); // key -> { name, done, total }
       // The build's units, and which of them a process has installed.
       const base = (path) => String(path ?? '').split(/[\\/]/).pop();
+      // A unit fetch as said to the user: the module, and the program it is for.
+      const codeFor = (f) => {
+        if (f.name && f.owner && f.name.toLowerCase() !== f.owner.toLowerCase()) return `code for ${f.name} (${f.owner})`;
+        return `code for ${f.name || f.owner || 'the program'}`;
+      };
       const shipped = new Map(Object.entries(unitNames));
       const isExe = (name) => /\.exe$/i.test(name);
       p.boot.units.total = shipped.size;
@@ -241,17 +249,22 @@ function progressMeter(state, onProgress) {
         let kind = 'file';
         let total = 0;
         if (m.what.startsWith('unit:')) {
-          const unit = m.what.slice('unit:'.length).split('/')[0];
+          const rel = m.what.slice('unit:'.length);
+          const unit = rel.split('/')[0];
           kind = 'code';
-          name = unitNames[unit] || '';
+          // A native module (a Wine builtin) is `providers/<name>-<fingerprint>.wasm`.
+          name = unit === 'providers' ? rel.slice('providers/'.length).replace(/-[0-9a-f]+\.wasm$/i, '') : unitNames[unit] || '';
         } else {
           try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
         }
-        const f = files.get(key) ?? { kind, name, done: 0, total };
-        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching code for ${name || 'the program'}` : `Fetching ${name}`);
+        // The fetching process's .exe (fetch-note.mjs), '' before its main image is in.
+        const owner = typeof m.owner === 'string' ? m.owner : '';
+        const f = files.get(key) ?? { kind, name, owner, done: 0, total };
+        if (!f.owner && owner) f.owner = owner;
+        if (!files.has(key)) log('fetch', kind === 'code' ? `Fetching ${codeFor(f)}` : `Fetching ${name}`);
         files.set(key, f);
         if (m.phase === 'start') {
           live.set(m.id, { key });
@@ -417,10 +430,12 @@ async function begin(opts, base, at, state, meter) {
   }
   const preloading = preList ? preloadUnits(preList, fetcher, at) : Promise.resolve(null);
   // The runtime's wasm, compressed in the pack when the site packed it
-  // (plain, the shim alone was 6.6 MB of Paint's download).
+  // (plain, the shim alone was 6.6 MB of Paint's download), and fetched now,
+  // first, when it did not: a module left for pid 1 to fetch (the 2 KB seed,
+  // which packing does not shrink) waited 90 ms behind the bundle and the fill.
   const runtime = Promise.all(Object.entries(runtimeUrls()).map(async ([k, url]) =>
-    [k, (await packedEntry(url, fetcher)) ? await fetchShared(url, fetcher) : null]))
-    .then((kv) => primeRuntime(Object.fromEntries(kv.filter(([, v]) => v))));
+    [k, await fetchShared(url, fetcher, { priority: 'high' })]))
+    .then((kv) => primeRuntime(Object.fromEntries(kv)));
   const trees = [];
   const buffers = [];
   for (const url of b.tar) {
@@ -509,34 +524,47 @@ async function begin(opts, base, at, state, meter) {
     // Worker started before takes the bytes from the fill itself
     // (worker.mjs `loadFile`).
     const late = fl.files.filter(([p]) => p.startsWith('unit:'));
-    let li = 0, lateN = 0;
+    let lateN = 0;
     const add = (entry) => {
       if (!preModules) return;
       // Before `closed`, which a Worker reads as the end of the list.
       const c = preModules.findIndex(([k]) => k === 'closed');
       preModules.splice(c < 0 ? preModules.length : c, 0, entry);
-      if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
     };
-    const takeLate = (n) => {
-      for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
-        const [name, off, size] = late[li];
-        const rel = name.slice('unit:'.length);
-        const bytes = new Uint8Array(buf, off, size).slice();
-        if (rel.endsWith('/c.wasm')) {
-          WebAssembly.compile(bytes).then((m) => add([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m]),
-            (e) => say(`[app] late unit ${rel}: ${e}\n`));
-        } else {
-          const s = new Uint8Array(new SharedArrayBuffer(size));
-          s.set(bytes);
-          add([`file:${rel}`, s]);
-        }
+    // Downloaded, decoded into `buf` and its late units compiled in a Worker
+    // (fill-worker.js): on this thread the decode held pid 1's start-up,
+    // whose every await waited behind a chunk (running to pid 1 ready took
+    // 110-160 ms beside it, 53-69 ms before the fill).
+    const z = await packedEntry(at(fl.url), fetcher);
+    const fw = new Worker(new URL('./fill-worker.js', import.meta.url), { type: 'module' });
+    const failed = (e) => {
+      Atomics.store(counter, 0, -1);
+      Atomics.notify(counter, 0);
+      say(`[app] the fill failed: ${e}\n`);
+      fw.terminate();
+    };
+    fw.onerror = (e) => failed(e.message ?? e);
+    fw.onmessage = ({ data: m }) => {
+      if (m.kind === 'bytes') {
+        state.downloaded = (state.downloaded ?? 0) + m.n;
+      } else if (m.kind === 'late') {
+        if (m.error) say(`[app] late unit ${m.error}\n`);
+        else add(m.entry);
+        if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
+      } else if (m.kind === 'done') {
+        mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+        // Its late units may still be compiling: it ends with the page.
+      } else if (m.kind === 'failed') {
+        failed(m.error);
       }
     };
-    fetchPacked(at(fl.url), { ...(await packedEntry(at(fl.url), fetcher)) }, true, { ...fetcher, meter: null }, {
-      into: buf,
-      progress: (n) => { Atomics.store(counter, 0, n); Atomics.notify(counter, 0); takeLate(n); },
-    }).then(() => mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`))
-      .catch((e) => { Atomics.store(counter, 0, -1); Atomics.notify(counter, 0); say(`[app] the fill failed: ${e}\n`); });
+    if (!z) failed(`${fl.url} is not in the pack`);
+    else {
+      const u = new URL(at(fl.url));
+      u.search = z.build ? `v=${z.build}` : '';
+      u.pathname += '.zst';
+      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late });
+    }
   }
   state.phase = 'running';
   mark('running');
@@ -563,7 +591,15 @@ async function begin(opts, base, at, state, meter) {
   meter.phase('boot');
   meter.watchFetches(lazyNames, b.unitNames ?? {});
   const killed = new Promise((r) => { settle = r; });
+  // The guest's network: a Wisp proxy the page names (runtime.js serves it
+  // to every Worker). With none, the guest's sockets reach nothing.
+  let network = null;
+  if (opts.wisp) {
+    const { WispNetwork } = await import('./net.js');
+    network = new WispNetwork(String(opts.wisp), (e) => say(`[net] ${e}\n`));
+  }
   const run = runProgram(term, {
+    network,
     elf: exeBytes,
     files,
     dirs: tree.dirs,
@@ -836,10 +872,10 @@ function zstdLoader(src) {
  * a clone would copy it, and a SharedArrayBuffer stays resident for the
  * session. The Worker frees it once loaded.
  */
-async function fetchShared(url, f, { shared = false } = {}) {
+async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   const z = await packedEntry(url, f);
-  if (z) return fetchPacked(url, z, shared, f);
-  const res = await fetch(url, { cache: 'no-cache' });
+  if (z) return fetchPacked(url, z, shared, f, { priority });
+  const res = await fetch(url, { cache: 'no-cache', priority });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length'));
   if (!total) throw new Error(`${url}: no content-length`);
@@ -860,11 +896,11 @@ async function fetchShared(url, f, { shared = false } = {}) {
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null } = {}) {
+async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null, priority = 'auto' } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
-  const res = await fetch(u.href);
+  const res = await fetch(u.href, { priority });
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
   // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
@@ -911,7 +947,8 @@ async function preloadUnits(list, f, at) {
           // Every unit in one archive (web/eject-site.mjs): its modules
           // compiled, its other files shared, and `closed`: the Workers
           // ask the host for no unit file the archive does not hold.
-          const t = untar((await fetchShared(href, f)).buffer);
+          const tar = (await fetchShared(href, f)).buffer;
+          const t = untar(tar);
           const mods = [];
           for (const [p, bytes] of Object.entries(t.files)) {
             const rel = p.replace(/^\/+/, '');
@@ -928,6 +965,11 @@ async function preloadUnits(list, f, at) {
             out.push([`file:${rel}`, s]);
           }
           out.push(...await Promise.all(mods), ['closed', true]);
+          // Everything in it is compiled (V8 keeps its own copy of each
+          // module's bytes) or copied out: the archive itself goes now. Left
+          // to the collector it stayed until the next full collection, the
+          // shell's 361 MiB for minutes.
+          if (!(typeof SharedArrayBuffer === 'function' && tar instanceof SharedArrayBuffer)) tar.transfer?.(0);
           continue;
         }
         if (name.startsWith('file:')) {

@@ -3734,6 +3734,22 @@ impl MapIo<'_> {
             // buffer it was a second copy of the file, and the buffer's own
             // first touch, on every private file mapping (apt-get maps its
             // two 44 MB package caches this way on every run).
+            // The file as this process's shared mappings of it hold it: their
+            // writes reach the file only at `msync` and `munmap`, and a new
+            // mapping (a private copy, or a shared one only partly inside
+            // theirs) is read from the file. Written back first.
+            let behind: Vec<(u64, u64)> = self
+                .mem
+                .lock()
+                .log
+                .shared_maps
+                .iter()
+                .filter(|s| Arc::ptr_eq(&s.file, &file) && s.offset < offset + len_aligned && offset < s.offset + s.len)
+                .map(|s| (s.start, s.len))
+                .collect();
+            for (at, n) in behind {
+                self.flush_shared(m, at, n)?;
+            }
             let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
@@ -7313,7 +7329,19 @@ impl Kernel {
         m: &GuestMem<'_>,
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
-        let (path, argv, envp) = self.read_exec_args(m, a)?;
+        let (mut path, argv, envp) = self.read_exec_args(m, a)?;
+        // `/proc/self/exe` and its kind name this process's files, which the
+        // exec replaces before the loader reads its program's segments: the
+        // file they name now, not the link.
+        for _ in 0..4 {
+            if !path.starts_with("/proc/") {
+                break;
+            }
+            match self.vfs.read_link(&path) {
+                Ok(to) if to.starts_with('/') => path = to,
+                _ => break,
+            }
+        }
         let (path, argv) = self.resolve_interpreter(path, argv)?;
         // Its head only: the loader reads the whole file once it is past the
         // point of no return (apt's methods are one 14 MB program, read
@@ -13597,6 +13625,37 @@ mod tests {
         let n = g.len();
         assert_eq!(&g[n - 27..n - 10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
         assert_eq!(&g[n - 10..], &[0, 0, 0x1234, 0, 0, 1, 0, 1, 0, 7]);
+    }
+
+    /// A file mapped shared and written, then mapped again: a second shared
+    /// mapping is the first's pages, and a private one (Wine's write-copy
+    /// and read-only section views) copies what the shared one holds, not
+    /// the file as it was before the writes.
+    #[test]
+    fn a_new_mapping_reads_what_a_shared_one_wrote() {
+        if gex_abi::PPC {
+            return;
+        }
+        use crate::mem::{flags as mf, prot};
+        let (_, mut k) = setup();
+        let mut buf = vec![0u8; 0x0708_0000];
+        let at = k.ctx_addr;
+        let mut m = GuestMem::new(&mut buf);
+        let rw = (prot::READ | prot::WRITE) as u64;
+        m.write(0x20000, b"/s\0").unwrap();
+        let fd = sys_locked(&mut m, &mut k, at, nr::OPENAT, &[(-100i64) as u64, 0x20000, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+        m.write(0x21000, &[1u8; 0x2000]).unwrap();
+        assert_eq!(sys_locked(&mut m, &mut k, at, nr::PWRITE64, &[fd, 0x21000, 0x2000, 0]), 0x2000);
+        let a = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07010000, 0x2000, rw, mf::SHARED | mf::FIXED, fd, 0]);
+        assert_eq!(a, 0x07010000);
+        m.write(0x07011004, b"new").unwrap();
+        let b = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0, 0x1000, prot::READ as u64, mf::SHARED, fd, 0x1000]);
+        assert_eq!(b, 0x07011000, "a second shared mapping is the first's pages");
+        let c = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07020000, 0x2000, rw, mf::PRIVATE | mf::FIXED, fd, 0]);
+        assert_eq!(c, 0x07020000);
+        assert_eq!(m.read(0x07021004, 3).unwrap(), b"new", "the private copy has the shared mapping's writes");
+        m.write(0x07021004, b"own").unwrap();
+        assert_eq!(m.read(0x07011004, 3).unwrap(), b"new", "and its own writes stay its own");
     }
 
     /// The mapping calls through the lock-free path ([`MapIo`]) answer as

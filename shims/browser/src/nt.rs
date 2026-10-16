@@ -1235,7 +1235,7 @@ mod imp {
                 // A Worker of its own, as a Linux clone gets: the entry is
                 // this process's, the thread runs elsewhere. No kernel lock:
                 // the thread table and the JIT state lock themselves (L25b).
-                crate::sigs::proc_home().table().push(gex_tid, child, Mutex::new(crate::Run::new(start, Waiting::Elsewhere)));
+                crate::sigs::proc_home().table().push(gex_tid, child, crate::ThreadCell::new(crate::Run::new(start, Waiting::Elsewhere)));
                 crate::with_jit_only(|j| {
                     if !j.ever_threaded {
                         backfill_registry(j);

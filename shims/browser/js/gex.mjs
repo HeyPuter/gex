@@ -422,6 +422,25 @@ const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
+/** The spans of a map blob (`vma_blob` in the shim: u32 count, then per
+ *  region u64 start, u64 end, u32 prot, a name and a code identity). */
+function vmaRegions(blob) {
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const out = [];
+  let p = 4;
+  for (let i = dv.getUint32(0, true); i > 0 && p + 24 <= blob.length; i--) {
+    const start = Number(dv.getBigUint64(p, true));
+    const end = Number(dv.getBigUint64(p + 8, true));
+    const prot = dv.getUint32(p + 16, true);
+    p += 20;
+    p += 4 + dv.getUint32(p, true);
+    const code = dv.getUint32(p, true);
+    p += 4 + code + 8;
+    out.push({ start, end, prot });
+  }
+  return out;
+}
+
 /**
  * A cheap content hash for whether two copies of a region agree. FNV-1a over
  * words, not bytes: only ever answers same-or-different.
@@ -741,7 +760,7 @@ class ProviderThrow extends Error {
  *  (GEX_VFORK_TRACE, `?vforktrace=1`): to the console, or appended to the
  *  file it names under Node (a Worker's console output is lost when the run
  *  ends first). */
-function vforkTrace(line) {
+export function vforkTrace(line) {
   const to = globalThis.GEX_VFORK_TRACE || globalThis.process?.env?.GEX_VFORK_TRACE;
   if (!to) return;
   if (typeof to === 'string' && to.includes('/') && globalThis.process?.getBuiltinModule) {
@@ -2242,14 +2261,17 @@ export class Gex {
       return zeros;
     });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
-    const scratch = e.gex_alloc(24) >>> 0;
-    const dv = new DataView(this.#memory.buffer);
-    const n = e.gex_vma_count();
-    for (let i = 0; i < n; i++) {
-      if (e.gex_vma_at(i, scratch) !== 0) continue;
-      const start = Number(dv.getBigUint64(scratch, true));
-      const end = Number(dv.getBigUint64(scratch + 8, true));
-      const prot = Number(dv.getBigUint64(scratch + 16, true));
+    // The map read once, as the blob the child rebuilds its map from
+    // (`#vmaBlob`), and the regions copied are that blob's: read a region at
+    // a time (`gex_vma_count`, then `gex_vma_at`), other threads mapping and
+    // unmapping meanwhile shifted the indexes, and the image missed regions
+    // and named others twice. A missed thread stack above 4 GiB left the
+    // child's memory short of it, and musl's fork in the child faulted
+    // walking the thread list there (fork-maps-threads).
+    const blob = this.#vmaBlob();
+    this.#forkVmaBlob = blob;
+    const regions = blob ? vmaRegions(blob) : this.#vmaRegionsEach();
+    for (const { start, end, prot } of regions) {
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
       if (end > start) {
@@ -2258,7 +2280,6 @@ export class Gex {
         r.zeros = runs(start, end);
       }
     }
-    e.gex_free?.(scratch, 24);
     if (runsCap) e.gex_free?.(runsAt, runsCap * 8);
     if (staging) this.#stageImage(out);
     // A checksum per region, so the child can say whether what it runs on is
@@ -2271,6 +2292,9 @@ export class Gex {
       // `gex_vma_reloadable`: read-only library text is identical to its file.
       let again = 0;
       if (e.gex_vma_reloadable) {
+        const n = e.gex_vma_count();
+        const scratch = e.gex_alloc(24) >>> 0;
+        const dv = new DataView(this.#memory.buffer);
         for (let i = 0; i < n; i++) {
           if (e.gex_vma_at(i, scratch) !== 0) continue;
           if (!e.gex_vma_reloadable(i)) continue;
@@ -2278,6 +2302,7 @@ export class Gex {
           const b = Number(dv.getBigUint64(scratch + 8, true));
           if (b > a) again += b - a;
         }
+        e.gex_free?.(scratch, 24);
       }
       console.error(
         `[gex] fork image: ${out.length} regions, ${(bytes / 1048576).toFixed(1)} MiB, `
@@ -2285,6 +2310,29 @@ export class Gex {
         + `${Math.round(performance.now() - t0)}ms to copy`,
       );
     }
+    return out;
+  }
+
+  /// The map `#processImage` read for the fork being built: the child gets
+  /// these bytes, so its map is the one its image was copied by.
+  #forkVmaBlob = null;
+
+  /** The map a region at a time, for a shim with no blob. */
+  #vmaRegionsEach() {
+    const e = this.#shim.exports;
+    const scratch = e.gex_alloc(24) >>> 0;
+    const out = [];
+    const n = e.gex_vma_count();
+    for (let i = 0; i < n; i++) {
+      if (e.gex_vma_at(i, scratch) !== 0) continue;
+      const dv = new DataView(this.#memory.buffer);
+      out.push({
+        start: Number(dv.getBigUint64(scratch, true)),
+        end: Number(dv.getBigUint64(scratch + 8, true)),
+        prot: Number(dv.getBigUint64(scratch + 16, true)),
+      });
+    }
+    e.gex_free?.(scratch, 24);
     return out;
   }
 
@@ -2297,14 +2345,18 @@ export class Gex {
   #vmaBlob() {
     const e = this.#shim.exports;
     if (!e.gex_vma_blob_len || !e.gex_vma_blob_read) return null;
-    const len = e.gex_vma_blob_len() >>> 0;
-    if (!len) return null;
-    const buf = e.gex_alloc(len) >>> 0;
+    // One read of the map, into room to spare: other threads map and unmap
+    // between a length asked and a read, and a blob read against a stale
+    // length was refused (the image then fell back to reading the map a
+    // region at a time). Asked again with more room while it does not fit.
+    let cap = (e.gex_vma_blob_len() >>> 0) * 2 + 4096;
     let blob = null;
-    if (e.gex_vma_blob_read(buf, len) === len) {
-      blob = new Uint8Array(this.#memory.buffer, buf, len).slice();
+    for (let tries = 0; tries < 8 && !blob; tries++, cap *= 2) {
+      const buf = e.gex_alloc(cap) >>> 0;
+      const got = e.gex_vma_blob_read(buf, cap) >>> 0;
+      if (got) blob = new Uint8Array(this.#memory.buffer, buf, got).slice();
+      e.gex_free?.(buf, cap);
     }
-    e.gex_free?.(buf, len);
     return blob;
   }
 
@@ -2628,7 +2680,11 @@ export class Gex {
    */
   async #adoptExec(shimWasm, guestWasm, child, opts) {
     this.#windowsSpace = 0;
+    const pooled = this.#preattached;
     await this.attach(shimWasm, guestWasm);
+    // Whether the exec started on the runtime its Worker made in the pool
+    // (tests/browser-spawn.sh counts these).
+    vforkTrace(`[pool] pid ${child.pid}: ${pooled ? 'pooled runtime' : 'new runtime'}`);
     const e = this.#shim.exports;
     this.#setMetadata(guestWasm);
     const o = child.opts ?? {};
@@ -3074,7 +3130,9 @@ export class Gex {
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
-    if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    // Gone before its Worker came up: the process exec'd (the other threads go
+    // with the old program) or ended. Nothing to run, and nothing wrong.
+    if (!entry) return { entry: 0n, ctx: Number(thread.ctx), gone: true };
     if (thread.procOpts) this.#opts = thread.procOpts;
     // Nothing of the process's to set: its ABI, start time and decode mode
     // (`gex_set_compat`) are process constants in the shared memory, set
@@ -3299,7 +3357,7 @@ export class Gex {
       imageStage: this.#imageStage,
       // The map, separately from the bytes: names and code identities the child
       // needs to recognise a page as belonging to an already-translated library.
-      vmaBlob: this.#vmaBlob(),
+      vmaBlob: this.#forkVmaBlob,
       // Every slot this process has claimed -- not the highest any module needed.
       // The directory is written when a page is *claimed*, not when its module
       // installs, so the max over inherited modules misses a page claimed after
@@ -3784,7 +3842,9 @@ export class Gex {
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
     const pcopy = () => new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, plen).slice();
     let pbytes = null, pkey = null;
-    if (wasmprog && e.gex_cgen_pmod_wasm_key) {
+    // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
+    // and hashes in one mspaint boot.
+    if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
       if (!this.#sharedModules.has(pkey)) pbytes = pcopy();
@@ -3864,7 +3924,14 @@ export class Gex {
           // that never returns for a thread's loop), and reports each image
           // it maps (natively for unit placement; the page's units path
           // takes it once `gex_image_mapped` exists).
-          call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+          // In the single-thread build on a stack that may suspend, as the
+          // function tier's call_out: W64's system calls are faults served
+          // inside this loop (`#callOutSteps`), and they block.
+          call_out: single.on
+            ? new WebAssembly.Suspending((ctx, target, ret, spWant) => (this.#hardNested()
+              ? this.#callOut(ctx >>> 0, target, ret, spWant)
+              : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
+            : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
           image_mapped: (base, fd) => {
             const number = e.gex_image_mapped?.(base, fd) ?? -1;
             if (number === -1) return;
@@ -4666,7 +4733,10 @@ export class Gex {
       dlsym: (h, name) => e.gex_wasmprog_dlsym(h, name) | 0,
       // Door calls into the wineserver (docs/wineserver-kernel.md).
       door_publish: (area) => this.#doorPublish(area >>> 0),
-      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid),
+      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, false),
+      // A 64-bit client's (W64's lowered LP64 ntdll.so): the request's
+      // gather list at LP64 offsets (`#doorRun`, shims/native's door::req_layout).
+      door_call_lp64: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, true),
       // A Worker the door was broadcast to while it ran (it takes no
       // messages): Wine runs its program again as a child, which starts with
       // the door (loader.c `wineserver_relaunch`). None in the SP build.
@@ -4940,11 +5010,11 @@ export class Gex {
    *  small and free of the statistics (`#doorCallStats`, GEX_DOOR_STATS), so
    *  it stays optimised: every server request of a W3 process comes here
    *  (docs/wine-overhead.md). */
-  #doorCall(req, pid, tid) {
-    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid);
+  #doorCall(req, pid, tid, lp64) {
+    if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid, lp64);
     const d = this.#door;
     if (!d || single.on) return 1;
-    return this.#doorRun(d, req, pid, tid, null);
+    return this.#doorRun(d, req, pid, tid, null, lp64);
   }
 
   /** GEX_DOOR_STATS, read once per Worker (a page sets it before it starts). */
@@ -4981,18 +5051,23 @@ export class Gex {
     return v && end <= v.len ? v : this.#doorView();
   }
 
-  /** One door call under the door lock (`st`: the statistics, or null). */
-  #doorRun(d, req, pid, tid, st) {
+  /** One door call under the door lock (`st`: the statistics, or null).
+   *  The client's `struct __server_request_info`, past its 64-byte union:
+   *  data_count, reply_data and data[] (pointer, size) at 64, 68 and 72 in
+   *  8-byte entries (ILP32), or at 64, 72 and 80 in 16-byte ones (`lp64`,
+   *  pointers below 4 GiB). */
+  #doorRun(d, req, pid, tid, st, lp64) {
     const T = st ? performance.now() : 0;
     // The request's header is in the door buffer once copied in: its 64
     // bytes are the scratch an in-place wakeup is written from (#doorWake).
     this.#doorScratch = req;
-    let g = this.#doorGuest(req + 136);
+    let g = this.#doorGuest(req + (lp64 ? 160 : 136));
     const cdv = g.dv;
     const reqSize = cdv.getUint32(req + 4, true);
     const replyMax = cdv.getUint32(req + 8, true);
     const count = Math.min(cdv.getUint32(req + 64, true), 16);
-    const replyData = cdv.getUint32(req + 68, true);
+    const replyData = cdv.getUint32(req + (lp64 ? 72 : 68), true);
+    const data0 = lp64 ? 80 : 72, entry = lp64 ? 16 : 8;
     const a = d.area;
     // The door buffer's place and size never change: read once per door.
     let buf = d.kBuf, bufSize = d.kBufSize;
@@ -5026,7 +5101,9 @@ export class Gex {
       } else u8.set(g.u8.subarray(req, req + 64), buf);
       let at = buf + 64;
       for (let k = 0; k < count; k++) {
-        const ptr = cdv.getUint32(req + 72 + 8 * k, true), size = cdv.getUint32(req + 76 + 8 * k, true);
+        const e0 = req + data0 + entry * k;
+        if (e0 + entry > g.u8.length) g = this.#doorGuest(e0 + entry);
+        const ptr = g.dv.getUint32(e0, true), size = g.dv.getUint32(e0 + entry / 2, true);
         if (ptr + size > g.u8.length) g = this.#doorGuest(ptr + size);
         u8.set(g.u8.subarray(ptr, ptr + size), at);
         at += size;
@@ -5095,14 +5172,14 @@ export class Gex {
 
   /** `#doorCall` with GEX_DOOR_STATS: the same call, timed, and a report
    *  every GEX_DOOR_STATS ms (default 10 s) or 50,000 calls. */
-  #doorCallStats(req, pid, tid) {
+  #doorCallStats(req, pid, tid, lp64) {
     const d = this.#door;
     const st = this.#doorStats;
     if (!d || single.on) {
       if (!(st.nodoor++ & 0x3fff)) console.error(`[gex-door] pid ${pid} tid ${tid}: no door here (${st.nodoor} calls)`);
       return 1;
     }
-    const r = this.#doorRun(d, req, pid, tid, st);
+    const r = this.#doorRun(d, req, pid, tid, st, lp64);
     const { i32, dv } = this.#doorView();
     const a = d.area;
     const now = performance.now();
@@ -5444,6 +5521,9 @@ export class Gex {
     // When the last trap came out, for GEX_NT_STATS' time split: what the
     // glue costs between a trap and the guest again.
     let trappedAt = 0;
+    // A fault for the process's hook, taken at the last trap (`#faultTake`):
+    // called at the next entry.
+    let hook = null;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
     for (;;) {
@@ -5468,6 +5548,19 @@ export class Gex {
           );
         }
         this.#shim.exports.gex_callout_leave_ok?.(0);
+        // The fault hook first (staged at the last trap): the guest goes on
+        // where it leaves the context.
+        if (hook) {
+          const h = hook;
+          hook = null;
+          try {
+            if (single.on) await this.#promisingOf(h.f)(ctx, h.code, h.addr, h.kind);
+            else h.f(ctx, h.code, h.addr, h.kind);
+          } finally {
+            h.spG.value = h.cur;
+          }
+          pc = this.#faultPc(ctx);
+        }
         // The single-thread build enters on a stack of the guest's own
         // (JSPI), which a blocking call suspends; see single.mjs.
         if (single.on) {
@@ -5730,8 +5823,11 @@ export class Gex {
         await this.#drainThread();
         this.#where = 'resume';
         // A guest fault the shim staged for the process's hook (W3): run
-        // it, and go on where it left the context.
-        const faulted = this.#deliverFault(ctx);
+        // at the next entry, inside the trap handling below, since the hook
+        // can end the thread or the process as any guest code can (W64:
+        // every system call is one, signal_wasm64.c's `ud2` entry, and a
+        // thread the server stops dies inside it).
+        const ft = this.#faultTake(ctx);
         // A process that has exited is not resumed, whatever the shim left in
         // the resume slot. The shim clears it in `exit_process` now, and this
         // is the same rule stated on the side that acts on it: re-entering a
@@ -5739,11 +5835,13 @@ export class Gex {
         // read as bugs anywhere but here.
         const next = e.gex_exited?.() ? 0n : e.gex_resume_pc();
         if (next !== 0n) {
-          pc = faulted ?? next;
+          pc = next;
           const nextCtx = e.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
+          hook = ft;
           continue;
         }
+        if (ft) ft.spG.value = ft.cur;
         // `exit_group` marks every guest thread exited and deliberately leaves
         // no resume PC. Do not inspect the wait state that thread had before
         // the exit: a network/futex flag can still be set, and waiting on it
@@ -6287,18 +6385,22 @@ export class Gex {
   #watchStub = null;
 
   /** The function a watched table entry holds: it tells JS (`hit`) and
-   *  traps, so the nested loop in `#callOut` sees why. */
+   *  traps, so the nested loop in `#callOut` sees why -- or, when `hit`
+   *  says so (the awaited return of the innermost call-out, only tail calls
+   *  since its `enter`), returns, which leaves that `enter` without a trap
+   *  (each NT user-mode callback's end: a trap cost more than the callback). */
   #watch() {
     if (this.#watchStub) return this.#watchStub;
-    // (module (type (func (param i32))) (import "w" "hit" (func (type 0)))
-    //   (func (export "c") (type 0) local.get 0 call 0 unreachable))
+    // (module (type (func (param i32))) (type (func (param i32) (result i32)))
+    //   (import "w" "hit" (func (type 1)))
+    //   (func (export "c") (type 0) local.get 0 call 0 if return end unreachable))
     const bytes = new Uint8Array([
       0, 97, 115, 109, 1, 0, 0, 0,
-      1, 5, 1, 96, 1, 127, 0,
-      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 0,
+      1, 10, 2, 96, 1, 127, 0, 96, 1, 127, 1, 127,
+      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 1,
       3, 2, 1, 0,
       7, 5, 1, 1, 99, 0, 1,
-      10, 9, 1, 7, 0, 32, 0, 16, 0, 0, 11,
+      10, 13, 1, 11, 0, 32, 0, 16, 0, 4, 64, 15, 11, 0, 11,
     ]);
     const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { w: { hit: (ctx) => this.#watchHit(ctx >>> 0) } });
     this.#watchStub = inst.exports.c;
@@ -6326,12 +6428,15 @@ export class Gex {
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
       this.#calloutSignal = { kind: 'return', i };
-      return;
+      // The innermost call-out's return with only tail calls since its
+      // loop's `enter`: the stub returns, and that `enter` with it.
+      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(i + 1) ? 1 : 0;
     }
     const ref = this.#shim.exports.gex_dispatch_ref(target);
     const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
     const w = this.#callouts.find((c) => c.w && c.w.table === table && c.w.index === index)?.w;
     this.#calloutSignal = { kind: 'bypass', f: w?.old ?? null };
+    return 0;
   }
 
   /** The table `table` of `gex_dispatch_ref` names. */
@@ -6485,6 +6590,14 @@ export class Gex {
             e.gex_callout_leave_ok?.(me + 1);
             yield ['enter', ctx, pc];
           }
+          // A watched return with only tail calls since this `enter`
+          // returns instead of trapping (`#watchHit`).
+          const ret = this.#calloutSignal;
+          if (ret?.kind === 'return') {
+            this.#calloutSignal = null;
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
+            return ret.i === me ? 1 : 0;
+          }
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
           const hit = e.gex_callout_hit?.() ?? -1;
@@ -6561,7 +6674,18 @@ export class Gex {
           this.#catchUpSync();
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
-          const faulted = this.#deliverFault(ctx);
+          // The fault hook as one of this loop's steps: on a stack that may
+          // suspend in the single-thread build (`#driveAsync`).
+          let faulted = null;
+          const ft = this.#faultTake(ctx);
+          if (ft) {
+            try {
+              yield ['call', ft.f, ctx, ft.code, ft.addr, ft.kind];
+            } finally {
+              ft.spG.value = ft.cur;
+            }
+            faulted = this.#faultPc(ctx);
+          }
           const resumed = e.gex_resume_pc();
           const nextPc = faulted ?? resumed;
           // Nowhere to resume (the thread ended, or waits): the run loop's
@@ -6631,6 +6755,25 @@ export class Gex {
    * dispatcher. Returns where the guest goes on, or null with none staged.
    */
   #deliverFault(ctx) {
+    const t = this.#faultTake(ctx);
+    if (!t) return null;
+    try {
+      t.f(ctx, t.code, t.addr, t.kind);
+    } finally {
+      t.spG.value = t.cur;
+    }
+    return this.#faultPc(ctx);
+  }
+
+  /** Where the hook left the context. */
+  #faultPc(ctx) {
+    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+  }
+
+  /** The staged fault, taken, and the stack made ready for the hook: { f,
+   *  code, addr, kind, spG, cur } (the caller calls `f(ctx, code, addr,
+   *  kind)` and puts `spG` back to `cur`), or null with none staged. */
+  #faultTake(ctx) {
     const e = this.#shim.exports;
     if (!e.gex_fault_take) return null;
     const buf = e.gex_alloc(16) >>> 0;
@@ -6654,12 +6797,7 @@ export class Gex {
     const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
     const low = Math.min(Number(cur) >>> 0, esp);
     spG.value = typeof cur === 'bigint' ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
-    try {
-      f(ctx, code | 0, Number(BigInt.asUintN(32, addr)) | 0, kind | 0);
-    } finally {
-      spG.value = cur;
-    }
-    return BigInt.asUintN(64, new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_PC, true));
+    return { f, code: code | 0, addr: Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }
 
   /**

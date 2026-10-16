@@ -83,7 +83,9 @@ int main(void) {
     MultiByteToWideChar(CP_ACP, 0, adapter, -1, oa.DeviceName, 32);
     CHECK("D3DKMTOpenAdapterFromGdiDisplayName", open && open(&oa) == 0 && oa.hAdapter != 0);
     static DWORD pixels[16 * 8];
-    CREATEDC cd = {.pMemory = pixels, .Format = 21 /* A8R8G8B8 */, .Width = 16, .Height = 8, .Pitch = 64, .hDeviceDc = NULL};
+    /* (a device DC is required: Wine's win32u, like Windows, refuses NULL) */
+    HDC dev = CreateCompatibleDC(NULL);
+    CREATEDC cd = {.pMemory = pixels, .Format = 21 /* A8R8G8B8 */, .Width = 16, .Height = 8, .Pitch = 64, .hDeviceDc = dev};
     CHECK("D3DKMTCreateDCFromMemory", create && create(&cd) == 0 && cd.hDc && cd.hBitmap);
     if (cd.hDc) {
         RECT r = {2, 1, 4, 3};
@@ -95,6 +97,7 @@ int main(void) {
         DESTROYDC ds = {cd.hDc, cd.hBitmap};
         CHECK("D3DKMTDestroyDCFromMemory", destroy(&ds) == 0);
     }
+    DeleteDC(dev);
     CLOSEADAPTER ca = {oa.hAdapter};
     CHECK("D3DKMTCloseAdapter", close_ && close_(&ca) == 0);
 

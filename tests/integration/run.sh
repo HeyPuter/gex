@@ -787,10 +787,9 @@ compare "background" "$WORK/background"
 compare "signal-while-blocked" "$WORK/sigblocked"
 
 # A syscall that parks while another process runs, and is woken by a timeout
-# after the process that displaced it has gone. Browser-only, deliberately:
-# the shape needs the host to have nothing at all to run, and the native
-# adapter ends the whole run when its first process exits, so the child's
-# output never appears there at all. See the program's own comment.
+# from the host while its parent waits for it. Browser-only: it was written
+# for the snapshot switcher, whose shape no longer exists. See the program's
+# own comment.
 if [ -n "$NODE" ] && [ -x "$WORK/park" ]; then
     out=$(timeout 120 "$NODE" "$HERE/../../shims/browser/js/run-node.mjs" \
               "$HERE/../../web/public/gex/seed.wasm" "$WORK/park" 2>&1 || true)
@@ -1120,8 +1119,12 @@ fi
 # each Worker gets its own TLS block, so a thread-local kernel is a silent
 # fork and every file one thread opened would be missing from the other.
 if [ -n "$NODE" ] && [ -f target/wasm32-unknown-unknown/release/gex_browser.shared.wasm ] \
-    && [ -f web/public/gex/seed.shared.wasm ] && [ -x "$WORK/flags" ]; then
-    out=$("$NODE" web/test/threads-shared.mjs "$WORK/flags" 2>&1 || true)
+    && [ -f web/public/gex/seed.shared.wasm ]; then
+    # A program that clones first: only a threaded process keeps its
+    # translations for a joining Worker to replay. The shim's note of the
+    # clone goes to stderr, kept apart from the verdict.
+    "$CC" -static -O2 -o "$WORK/threads-shared" "$HERE/programs/threads-shared.c"
+    out=$("$NODE" web/test/threads-shared.mjs "$WORK/threads-shared" 2>"$WORK/threads-shared.err" || true)
     case "$out" in
         ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
         skip*) echo "$out" | head -1 ;;

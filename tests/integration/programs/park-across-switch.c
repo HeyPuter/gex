@@ -62,18 +62,16 @@ int main(void) {
         _exit(n == 0 ? 0 : 1);
     }
 
-    /* And then the parent *leaves*, rather than waiting. That is what makes
-     * the host swap the child back in with nothing else to run -- the moment
-     * the defect lived in. A parent that waits keeps a runnable thread
-     * around, the host never idles, and the bug does not appear at all: the
-     * first version of this test did that and passed against the broken
-     * runtime.
-     *
-     * It also means this is a browser-runtime test and not a comparison. The
-     * native adapter ends the whole run when its first process exits, so the
-     * child's lines never appear there.
-     */
-    (void)kid;
-    put("parent: leaving\n");
-    return 0;
+    /* The parent used to *leave* here rather than wait, so that the
+     * snapshot switcher swapped the child back in with nothing else to run
+     * -- the moment the defect lived in. The switcher is gone: every process
+     * has its own Worker and memory, and the host (host.mjs `start`) stops
+     * a run's other processes when pid 1 exits, so a child outliving its
+     * parent never ran again and the test could only fail. The parent now
+     * waits: the child still parks in `epoll_wait`, is still woken by its
+     * timeout from the host, and its return value is still checked. */
+    put("parent: waiting\n");
+    int status = 0;
+    waitpid(kid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }

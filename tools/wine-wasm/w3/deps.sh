@@ -6,7 +6,9 @@
 #   ffi_call libwayland makes, all-i32 arguments), gex-gl's EGL headers and
 #   pkg-config file (the library itself, guest/gl/gexgl.c, is compiled by the
 #   Makefile: it changes with gex), and OSSv4's sys/soundcard.h (w3/oss,
-#   for wineoss.drv).
+#   for wineoss.drv), GnuTLS over nettle (crypt32's and secur32's schannel,
+#   through dlopen of libgnutls.so.30) and Mozilla's CA bundle
+#   (OUT/install/ca-certificates.crt, staged into the dist).
 #
 #   w3/deps.sh OUT DL
 #
@@ -18,7 +20,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 WCC=$here/../wcc
 out=$(realpath -m "$1") dl=$(realpath -m "$2")
 J=${W3_JOBS:-12}
-for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON; do
+for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT; do
   u=${p}_URL s=${p}_SHA256; "$here/dl.sh" "${!u}" "${!s}" "$dl"
 done
 rm -rf "$out" && mkdir -p "$out/install/lib/pkgconfig" "$out/install/include" "$out/host" "$out/build" "$out/src"
@@ -104,6 +106,28 @@ mkdir -p "$I/egl/include"
 cp -r /usr/include/EGL /usr/include/KHR "$I/egl/include/"
 printf 'Name: egl\nDescription: gex-gl EGL (wasm32, static: guest/gl/gexgl.c)\nVersion: 1.5\nCflags: -I%s\nLibs: %s\n' \
   "$I/egl/include" "${W3_GL_O:?W3_GL_O}" > "$I/lib/pkgconfig/egl.pc"
+
+# nettle with mini-gmp (hogweed's bignums without GMP), then GnuTLS over it
+# with its included libtasn1 and libunistring: no p11-kit, idn, TPM or
+# compression, no tools. Its default trust store is the path crypt32 reads.
+tar xf "$dl/nettle-$NETTLE_VERSION.tar.gz"
+(cd nettle-$NETTLE_VERSION &&
+  ./configure --host=wasm32-unknown-linux-musl --prefix="$I" --libdir="$I/lib" --enable-static --disable-shared \
+    --enable-mini-gmp --disable-assembler --disable-fat --disable-documentation --disable-openssl \
+    CC="$WCC" CFLAGS=-O2 > "$out/nettle-configure.log" 2>&1 &&
+  make -j"$J" > "$out/nettle-make.log" 2>&1 && make install > "$out/nettle-install.log" 2>&1)
+tar xf "$dl/gnutls-$GNUTLS_VERSION.tar.xz"
+(cd gnutls-$GNUTLS_VERSION &&
+  PKG_CONFIG_LIBDIR=$I/lib/pkgconfig ./configure --host=wasm32-unknown-linux-musl --prefix="$I" --enable-static --disable-shared \
+    --with-nettle-mini --with-included-libtasn1 --with-included-unistring --without-p11-kit --without-idn \
+    --without-tpm --without-tpm2 --without-trousers-lib --without-brotli --without-zstd --without-zlib --without-leancrypto \
+    --disable-doc --disable-tools --disable-tests --disable-cxx --disable-nls --disable-hardware-acceleration \
+    --disable-padlock --disable-libdane --disable-guile --disable-ktls \
+    --with-default-trust-store-file=/etc/ssl/certs/ca-certificates.crt \
+    CC="$WCC" CFLAGS=-O2 > "$out/gnutls-configure.log" 2>&1 &&
+  make -j"$J" > "$out/gnutls-make.log" 2>&1 && make install > "$out/gnutls-install.log" 2>&1)
+[ -f "$I/lib/libgnutls.a" ] || { echo "w3/deps: GnuTLS failed ($out/gnutls-*.log)" >&2; exit 1; }
+cp "$dl/$(basename "$CACERT_URL")" "$I/ca-certificates.crt"
 
 # OSSv4's header for wineoss.drv (configure finds none in the sysroot).
 mkdir -p "$I/oss/sys" && cp "$here/oss/sys/soundcard.h" "$I/oss/sys/"

@@ -521,7 +521,8 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
     const more = f.inflight > 1 ? ` (+${f.inflight - 1})` : '';
     const of = f.total >= 1e6 ? `${mb(f.done)} of ${mb(f.total)} MB`
       : `${Math.round(f.done / 1e3)} of ${Math.max(1, Math.round(f.total / 1e3))} KB`;
-    const what = f.kind === 'code' ? `code for ${f.name || 'the program'}` : f.name;
+    const code = f.name && f.owner && f.name.toLowerCase() !== f.owner.toLowerCase() ? `${f.name} (${f.owner})` : f.name || f.owner || 'the program';
+    const what = f.kind === 'code' ? `code for ${code}` : f.name;
     line.textContent = `Loading ${what}${f.total ? ` \u2014 ${of}` : ''}${more}`;
     line.classList.add('on');
   };
@@ -551,7 +552,11 @@ pub const SHELL_HTML: &str = r#"<!doctype html>
   };
 
   try {
-    const app = await start({ container: document.body, onProgress: progress });
+    // The guest's network over a Wisp proxy: gex's default (as its desktop
+    // page), or ?wisp=wss://…/; an empty ?wisp= leaves the guest offline.
+    const q = new URLSearchParams(location.search);
+    const wisp = q.has('wisp') ? q.get('wisp') : 'wss://anura.pro/';
+    const app = await start({ container: document.body, onProgress: progress, ...(wisp ? { wisp } : {}) });
     // A library that says nothing of its progress: no loading screen to keep.
     if (!app.state?.progress) hide();
     // The desktop follows the window (a resize, a zoom): 'fit' again,

@@ -93,4 +93,8 @@ else
   rm -rf "$OUT/sysroot/binaryen"
   ln -sfn "$cache" "$OUT/sysroot/binaryen"
 fi
+# Wine's PE side (wcc64 -D_WIN32): the LLP64 plugin, its llp64.h, and the
+# ICALL pass (its Win64 mode)
+"$HERE/llp64/build.sh" "$OUT/sysroot/lib"
+"$HERE/icall/build.sh" "$OUT/sysroot/lib"
 echo "sysroot: $OUT/sysroot"

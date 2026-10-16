@@ -1677,6 +1677,16 @@ pub extern "C" fn gex_callout_leave_ok(v: u32) {
     LEAVE_OK.with(|c| c.set(v));
 }
 
+/// Whether JS's call-out loop `v - 1` is the last to have called `enter`
+/// with no other loop since (`gex_callout_leave_ok(v)`): a watched return
+/// of that call-out, reached with only tail calls since, may leave its
+/// `enter` by returning instead of trapping (`#watchHit`), as a miss does
+/// (`may_leave`).
+#[no_mangle]
+pub extern "C" fn gex_callout_may_return(v: u32) -> i32 {
+    (v != 0 && LEAVE_OK.with(|c| c.get()) == v && !exp_trap_callouts()) as i32
+}
+
 /// After `returned`: the call-out found is the innermost and its loop's
 /// `enter` is the innermost JS frame, so only tail calls lie between it and
 /// the miss and a return reaches it.

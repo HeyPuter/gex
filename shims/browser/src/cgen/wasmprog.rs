@@ -85,6 +85,13 @@ pub(crate) fn stage(program: Option<&gex_ld::Program>) {
     *lock(&STAGED) = program.filter(|p| is_wasm32(p)).map(|p| (p.exe.entry, true, None));
 }
 
+/// [`stage`] for an exec, which places its program from the files and knows
+/// whether it is a wasm32 one by the placed bytes: its entry if so.
+pub(crate) fn stage_entry(entry: Option<u64>) {
+    CURRENT.store(0, Ordering::Relaxed);
+    *lock(&STAGED) = entry.map(|e| (e, true, None));
+}
+
 /// A fork's child of a wasm32 program at `entry`: the same module, over the
 /// parent's data.
 #[no_mangle]
@@ -311,29 +318,37 @@ pub(super) fn content_key(b: &[u8]) -> (u64, u64) {
     (a, c)
 }
 
-/// Lane `lane` (0 or 1) of wasm32 program `number`'s content key, or 0 when
-/// it is not one.
+/// Lane `lane` (0 or 1) of wasm32 program `number`'s content key, or of
+/// Wine's PE module's, or 0 when it is neither.
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_key(number: u32, lane: u32) -> u64 {
     let mut g = lock(&PROGS);
-    let Some(p) = g.iter_mut().find(|p| p.number == number) else { return 0 };
-    let k = match p.key {
-        Some(k) => k,
+    let k = match g.iter_mut().find(|p| p.number == number) {
+        Some(p) => *p.key.get_or_insert_with(|| file_key(&p.path, &p.wasm)),
         None => {
-            let id = file_id(&p.path);
-            let len = p.wasm.len() as u32;
-            let k = id.as_ref().and_then(|id| known_key(id, len)).unwrap_or_else(|| {
-                let k = content_key(&p.wasm);
-                if let Some(id) = &id {
-                    note_key(id, len, k);
-                }
-                k
-            });
-            p.key = Some(k);
-            k
+            drop(g);
+            match super::wasmdll::wasm_key(number) {
+                Some(k) => k,
+                None => return 0,
+            }
         }
     };
     if lane == 0 { k.0 } else { k.1 }
+}
+
+/// The content key of `wasm`, the bytes of file `path`: from the system-wide
+/// cache when some process already made it for the same file, else made and
+/// noted there.
+pub(super) fn file_key(path: &str, wasm: &[u8]) -> (u64, u64) {
+    let id = file_id(path);
+    let len = wasm.len() as u32;
+    id.as_ref().and_then(|id| known_key(id, len)).unwrap_or_else(|| {
+        let k = content_key(wasm);
+        if let Some(id) = &id {
+            note_key(id, len, k);
+        }
+        k
+    })
 }
 
 /// Which file a program's bytes are from, as the system-wide key cache names

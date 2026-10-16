@@ -10,7 +10,14 @@ container gexc runs (wasm-elf.py --elf64). The module stays beside it as
 OUT.wasm (OUT.64.wasm is the module before lowering).
 
 -Wl,--gex-guest-x86-64 marks a program that runs x86-64 Windows code (the
-W64 loader). No fork (programs spawn by clone/vfork), no -shared yet.
+W64 loader). No fork (programs spawn by clone/vfork).
+
+Wine's PE side (-D_WIN32, docs/wine-native-x64.md §1.2) compiles with
+Windows x64's data model (the GexLLP64 plugin and its llp64.h,
+-mms-bitfields, -fshort-wchar) and the ICALL pass (GexIcall, its Win64
+mode), both from the sysroot's lib (build-sysroot64.sh). `-shared` links
+a position-independent side module (a DLL's code) and lowers it, `-r` one
+relocatable object of the inputs (pelink.py).
 
 -mgex-memory64 builds the memory64 flavour (docs/wine-native-x64.md §0.1):
 GEX_MEMORY64 defined, the module left unlowered (no runtime runs it yet;
@@ -35,6 +42,14 @@ mem64 = '-mgex-memory64' in args
 if mem64:
     args = [a for a in args if a != '-mgex-memory64']
     CC += ['-DGEX_MEMORY64=1']
+if '-D_WIN32' in args:
+    lib = os.path.join(sysroot, 'lib')
+    # not the sysroot's LP64 libc headers: Wine's (include/msvcrt) and clang's
+    CC = CC[:1] + flags['WASM64_CFLAGS'].split() + (['-DGEX_MEMORY64=1'] if mem64 else [])
+    CC += ['-nostdlibinc', '-fplugin=' + os.path.join(lib, 'GexLLP64.so'), '-include', os.path.join(lib, 'llp64.h'),
+           '-mms-bitfields', '-fshort-wchar']
+    if not os.environ.get('GEX_WASM_NO_ICALL'):
+        CC += ['-fpass-plugin=' + os.path.join(lib, 'GexIcall.so')]
 if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
        for a in args) or not args:
     os.execvp(CC[0], CC + args)
@@ -42,14 +57,17 @@ if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith((
 out = 'a.out'
 srcs, ld_in, ld_flags, cflags = [], [], [], []
 guest = False
+shared = relocatable = False
 i = 0
 while i < len(args):
     a = args[i]
     if a == '-o':
         out = args[i + 1]; i += 2; continue
-    if a in ('-shared', '-r'):
-        sys.exit('wcc64: %s is not supported yet' % a)
-    if a.startswith('-Wl,'):
+    if a == '-shared':
+        shared = True
+    elif a == '-r':
+        relocatable = True
+    elif a.startswith('-Wl,'):
         parts = [x for x in a[4:].split(',') if x]
         guest = guest or '--gex-guest-x86-64' in parts
         ld_flags += [x for x in parts if x not in ('--start-group', '--end-group', '--gex-guest-x86-64')]
@@ -60,7 +78,7 @@ while i < len(args):
             ld_in.append(a)
     elif a.endswith(('.c', '.cc', '.cpp', '.s', '.S')) and not a.startswith('-'):
         srcs.append(a)
-    elif a.endswith(('.o', '.a')) and not a.startswith('-'):
+    elif a.endswith(('.o', '.a', '.so', '.lo')) and not a.startswith('-'):
         ld_in.append(a)
     elif a in ('-pthread', '-rdynamic', '-static', '-pie', '-no-pie', '-fPIE', '-fpie'):
         pass
@@ -81,6 +99,26 @@ for k, s in enumerate(srcs):
     objs.append(o)
 
 lib = sysroot + '/lib'
+opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
+feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types',
+         '--enable-memory64']
+if relocatable:
+    # one relocatable object of the inputs (an archive's members only as
+    # referenced): a DLL for pelink.py, lowered with the whole PE module
+    cmd = ['wasm-ld', '-mwasm64', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
+    sys.exit(subprocess.call(cmd))
+if shared:
+    # a side module (a DLL's code behind its skeleton), lowered in place
+    w64 = out + '.64.wasm'
+    cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import-memory',
+           '--max-memory=' + ('17179869184' if mem64 else '4294967296'), '-L' + lib, '-shared', '--no-entry',
+           '-o', w64] + objs + ld_in + ld_flags + [lib + '/libclang_rt.builtins-wasm64.a']
+    r = subprocess.call(cmd)
+    if r:
+        sys.exit(r)
+    r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + ['-O2', '-o', out])
+    sys.exit(r and 'wcc64: wasm-opt failed on ' + w64)
 w64 = out + '.64.wasm'
 wasm = out + '.wasm'
 # libgex before libc: its setjmp runtime, dlopen registry and signal frames.
@@ -90,10 +128,6 @@ cmd = ['wasm-ld', '-mwasm64', '--experimental-pic', '--shared-memory', '--import
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)
-opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
-feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
-         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types',
-         '--enable-memory64']
 # Names kept (-g): gex binds the entries by name.
 r = subprocess.call([opt, w64, '-g', '--strip-dwarf'] + feats + ([] if mem64 else ['--memory64-lowering']) + ['-O2', '-o', wasm])
 if r:

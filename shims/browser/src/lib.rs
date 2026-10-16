@@ -2887,12 +2887,12 @@ enum Waiting {
 /// A process's threads (docs/kernel-locking.md §3.7, L23): each one's tid,
 /// context and run state, added and read from any Worker without the kernel
 /// lock. A thread's index is its own for its life (`cur()`).
-pub(crate) type Threads = gex_atomic::threads::ThreadTable<Mutex<Run>>;
+pub(crate) type Threads = gex_atomic::threads::ThreadTable<ThreadCell>;
 
 /// A process's table with its one thread.
 fn threads_of(t: ThreadState, pc: u64, waiting: Waiting) -> Arc<Threads> {
     let table = Arc::new(Threads::default());
-    table.push(t.tid, t.ctx_addr, Mutex::new(Run::new(pc, waiting)));
+    table.push(t.tid, t.ctx_addr, ThreadCell::new(Run::new(pc, waiting)));
     table
 }
 
@@ -2902,15 +2902,54 @@ pub(crate) trait ThreadSlot {
     /// Where it stands: its own Worker's, which changes it without the
     /// kernel lock (docs/kernel-locking.md §3.7).
     fn run(&self) -> std::sync::MutexGuard<'_, Run>;
+    /// Its [`ThreadCell::gone`].
+    fn gone(&self) -> &std::sync::atomic::AtomicBool;
+    /// Its [`ThreadCell::halted`].
+    fn halted(&self) -> &std::sync::atomic::AtomicBool;
 }
 
-impl ThreadSlot for gex_atomic::threads::Slot<Mutex<Run>> {
+impl ThreadSlot for gex_atomic::threads::Slot<ThreadCell> {
     fn kstate(&self) -> ThreadState {
         ThreadState::new(self.ctx_addr(), self.tid())
     }
 
     fn run(&self) -> std::sync::MutexGuard<'_, Run> {
-        self.state().lock().unwrap_or_else(|e| e.into_inner())
+        self.state().run.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+
+    fn gone(&self) -> &std::sync::atomic::AtomicBool {
+        &self.state().gone
+    }
+
+    fn halted(&self) -> &std::sync::atomic::AtomicBool {
+        &self.state().halted
+    }
+}
+
+/// A slot's state in [`Threads`]: the thread's run, behind its own lock,
+/// and the two flags an `execve` from another thread sets and reads without
+/// it (Linux's de_thread).
+pub(crate) struct ThreadCell {
+    run: Mutex<Run>,
+    /// Set when another thread's `execve` took the process from under this
+    /// one: the thread has gone with the old program, while the process goes
+    /// on. Its Worker reads it through [`thread_gone`].
+    gone: std::sync::atomic::AtomicBool,
+    /// Set by the thread itself once it is `gone` and has stopped: it runs
+    /// no more guest code. An `execve` from another thread waits for this
+    /// before it replaces the image (`exec_waits`), as Linux's de_thread
+    /// waits for the other threads to die.
+    halted: std::sync::atomic::AtomicBool,
+}
+
+impl ThreadCell {
+    fn new(run: Run) -> ThreadCell {
+        ThreadCell { run: Mutex::new(run), gone: Default::default(), halted: Default::default() }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Run>> {
+        self.run.lock()
     }
 }
 
@@ -3193,6 +3232,9 @@ struct Host {
     /// Every guest thread, the running one included.
     threads: Arc<Threads>,
     jit: JitHere,
+    /// When an `execve` from a threaded process began waiting for its other
+    /// threads to stop (`exec_waits`).
+    exec_waited_since: Option<u64>,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
@@ -5045,6 +5087,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             proc_state,
             threads: threads_of(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable),
             jit: JitHere,
+            exec_waited_since: None,
         magic_tail: HOST_MAGIC,
     });
     entry
@@ -7095,10 +7138,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A GL submit is taken under the lock and done after it (gl.rs).
     gl::DEFER.with(|d| d.set(true));
     let mut mapped = Vec::new();
-    let stop = match free_syscall(ctx, pc, &mut mapped) {
+    // Another thread's `execve` took the process from this one: not even a
+    // lock-free call runs, since the memory it would touch is about to be the
+    // new program's (`exec_waits`).
+    let gone_now = thread_gone();
+    if gone_now {
+        stop_gone();
+    }
+    let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped) } {
     Some(stop) => stop,
     None => with_exec_lock(|h| {
         let stop = (|h: &mut Host| -> i32 {
+        // Another thread's `execve` took the process from this one: the
+        // thread table is the new program's, and this thread is not in it.
+        if thread_gone() {
+            stop_gone();
+            return 3;
+        }
         // Whether the kernel this call is about to run against is still
         // intact; whose process this is, for the calls that name it (set
         // here so it cannot be missed); and whether a pinned library landed
@@ -7477,7 +7533,24 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 vfork::stage_exec(h, &path, &argv, &envp);
                 1
             }
+            // Not for a wasm32 program, whose call cannot be made again from
+            // its instruction: its threads have no translated code to run
+            // over the new image, and stop at their next call (`do_exec`).
+            SyscallOutcome::Exec { path, argv, envp } if !frames_stay() && exec_waits(h) => {
+                // The other threads are told to go and this one waits a
+                // moment and makes the call again, until they have.
+                let _ = (path, argv, envp);
+                let mut r = h.threads[cur()].run();
+                r.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
+                r.waiting = Waiting::Sleep(turn_now() + EXEC_WAIT_STEP_NS);
+                r.blocked_on = Some(gex_kernel::BlockOp::Sleep(std::time::Duration::from_nanos(EXEC_WAIT_STEP_NS)));
+                r.owed = Owed { reissue: true, ..Owed::default() };
+                drop(r);
+                waitq::leave();
+                3
+            }
             SyscallOutcome::Exec { path, argv, envp } => {
+                h.exec_waited_since = None;
                 let entry = do_exec(h, &path, &argv, &envp);
                 if entry == 0 {
                     // The kernel checked the path before saying `Exec`, so a
@@ -8727,7 +8800,34 @@ thread_local! {
     static MY_TID: Cell<i32> = const { Cell::new(0) };
     /// And its run state ([`Run`]), which this Worker changes without the
     /// kernel lock.
-    static MY_RUN: RefCell<Option<Arc<Mutex<Run>>>> = const { RefCell::new(None) };
+    /// It is the thread's slot state, so its `gone` and `halted` with it.
+    static MY_RUN: RefCell<Option<Arc<ThreadCell>>> = const { RefCell::new(None) };
+}
+
+/// Whether this Worker's thread went with its old program when another
+/// thread of the process called `execve`. Its index into the thread table
+/// (`cur()`) means nothing any more: the table is the new program's.
+pub(crate) fn thread_gone() -> bool {
+    MY_RUN.with(|c| c.borrow().as_ref().is_some_and(|t| t.gone.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// This Worker's thread, found [`thread_gone`], stops: it is exited, runs no
+/// more guest code, and says so to the `execve` waiting for it
+/// ([`ThreadCell::halted`]). Nowhere to resume.
+pub(crate) fn stop_gone() {
+    if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+        run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+        run.halted.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    set_resume_none();
+    set_resume_ctx_none();
+}
+
+/// [`thread_gone`], for the host: a process Worker whose thread is gone must
+/// not end the process, which runs on in another Worker.
+#[no_mangle]
+pub extern "C" fn gex_thread_gone() -> i32 {
+    thread_gone() as i32
 }
 
 /// [`MY_CTX`].
@@ -8781,7 +8881,7 @@ fn thread_made(tid: i32, ctx_addr: u64, syscall_pc: u64) -> i32 {
     // `live_threads` are all counted here -- but the thread runs on another
     // stack, and `Elsewhere` is the state that says "not me". Without it two
     // Workers would run the same context.
-    sigs::proc_home().table().push(tid, ctx_addr, Mutex::new(Run::new(start, Waiting::Elsewhere)));
+    sigs::proc_home().table().push(tid, ctx_addr, ThreadCell::new(Run::new(start, Waiting::Elsewhere)));
     // From here the process has a second Worker, so translated modules must
     // be kept for it to catch up. Until now they were not (see
     // `gex_jit_installed`) -- so on this first edge, take back into the
@@ -8921,6 +9021,12 @@ pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     let Some(i) = table.position(tid) else {
         return 0;
     };
+    // Gone before it ever ran: another thread's `execve` is replacing the
+    // program it was made for.
+    if table[i].gone().load(std::sync::atomic::Ordering::SeqCst) {
+        table[i].halted().store(true, std::sync::atomic::Ordering::SeqCst);
+        return 0;
+    }
     table[i].run().waiting = Waiting::Runnable;
     CURRENT.with(|c| c.set(i));
     bind_free(i);
@@ -9033,6 +9139,13 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
 /// posix_spawn's child in its parent's (`vfork`). Its working directory,
 /// program and signal state are what was staged (`gex_set_cwd`,
 /// `gex_set_child_exe`, `gex_set_child_state`).
+/// The context slots up to and including the one at `ctx`: where a process
+/// running on `ctx` numbers its next clone's.
+fn ctx_slots_below(ctx: u64) -> u32 {
+    let stride = (ctx::SIZE as u64 + 63) & !63;
+    (ctx.saturating_sub(gex_abi::ctx_addr(0)) / stride) as u32 + 1
+}
+
 fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> Host {
     let ctx_addr = ctx_addr as u64;
     {
@@ -9086,6 +9199,12 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
+    // Contexts above the main thread's: its context is the one the parent
+    // forked from, slot N when the forking thread was not the first, and clones
+    // numbered from 1 reached N and drove two threads through one context (the
+    // Win7 shell's COM factory child of explorer: its fifth thread ran on the
+    // main thread's registers).
+    kernel.next_ctx_slot.fetch_max(ctx_slots_below(ctx_addr), std::sync::atomic::Ordering::AcqRel);
     // The process's start, unless this is a vfork child's kernel: the
     // memory's other Workers are its parent's threads (vfork.rs).
     if vfork::pid_here().is_none() {
@@ -9145,6 +9264,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         // across, and in this design they were never in this Worker anyway.
         threads: threads_of(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable),
         jit: JitHere,
+        exec_waited_since: None,
         magic_tail: HOST_MAGIC,
     }
 }
@@ -9263,15 +9383,16 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // space, and it goes back byte for byte.
     let key = snap_key(path, envp);
     let linked = snap_lookup(key);
-    let program = if linked.is_some() {
-        None
+    // Headers only: each segment is read from its file straight into place
+    // below, once the old image is gone. Reading the whole executable and its
+    // interpreter into the heap, parsing their symbols and dynamic tables and
+    // then copying every segment again was most of an exec's own cost.
+    let (program, ranges) = if linked.is_some() {
+        (None, Vec::new())
     } else {
-        let Some(bytes) = h.kernel.read_file(path) else {
-            return 0;
-        };
-        let read = |p: &str| h.kernel.read_file(p);
-        match gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &read) {
-            Ok(p) => Some(p),
+        let read_at = |p: &str, off: u64, out: &mut [u8]| h.kernel.read_file_at(p, off, out);
+        match gex_ld::plan_program(path, gex_abi::PIE_BASE, INTERP_BASE, &read_at) {
+            Ok((p, r)) => (Some(p), r),
             Err(_) => return 0,
         }
     };
@@ -9395,20 +9516,27 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     WASM32.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
-    h.kernel.next_ctx_slot.store(1, std::sync::atomic::Ordering::Release);
+    // Clones above the context this program goes on, which is the exec'ing
+    // thread's: not slot 0 after an exec from a second thread.
+    let here = if ctx_addr_get() != 0 { ctx_addr_get() } else { h.kernel.ctx_addr };
+    h.kernel.next_ctx_slot.store(ctx_slots_below(here).max(1), std::sync::atomic::Ordering::Release);
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
-    for (seg, from) in program.iter().flat_map(|p| p.placements()) {
+    for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
-        if b > data.len() {
+        let len = len as usize;
+        if b > data.len() || a + len > data.len() {
             return 0;
         }
         if !fresh {
             gex_kernel::zero_dirty_bytes(&mut data[a..b]);
         }
-        data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        // From the file into place: the one copy.
+        if h.kernel.read_file_at(from.unwrap_or(path), off, &mut data[a..a + len]) != Some(len) {
+            return 0;
+        }
         let mut prot = 0;
         if seg.readable {
             prot |= gex_kernel::mem::prot::READ;
@@ -9433,6 +9561,15 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         );
     }
 
+    // A wasm32 program is published before it runs: its magic, read where
+    // it now is.
+    cgen::wasmprog::stage_entry(program.as_ref().map(|p| p.exe.entry).filter(|&entry| {
+        let at = entry.wrapping_sub(0x40) as usize;
+        data.get(at..at + 8) == Some(&cgen::wasmprog::MAGIC[..])
+            && program.iter().flat_map(|p| p.exe.segments.iter()).any(|s| {
+                (at as u64) >= s.vaddr && (at as u64) + 8 <= s.vaddr + s.mem_size
+            })
+    }));
     // The recorded address space, when there is one. It replaces the map
     // this function just built, because the map is part of what was
     // recorded.
@@ -9643,8 +9780,23 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     write_u64(data, c + ctx::MON_SIZE, 0);
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
-    h.threads.reset(h.kernel.pid, ctx_addr, Mutex::new(Run::new(entry, Waiting::Runnable)));
+    // Every other thread goes with the old program (Linux's de_thread): its
+    // Worker, parked or running, sees `gone` and ends, without the process.
+    let me = cur();
+    let others = h.threads.len() > 1;
+    for (i, t) in h.threads.iter() {
+        if i != me {
+            t.gone().store(true, std::sync::atomic::Ordering::Release);
+            let mut r = t.run();
+            r.waiting = Waiting::Exited;
+            r.blocked_on = None;
+        }
+    }
+    h.threads.reset(h.kernel.pid, ctx_addr, ThreadCell::new(Run::new(entry, Waiting::Runnable)));
     set_current(h, 0);
+    if others {
+        waitq::wake_process();
+    }
     if let (Some(p), None) = (&program, &restored) {
         if hook != 0 {
             snap_arm(&mut h.kernel, key, &p.exe, p.interp_base());
@@ -9654,6 +9806,63 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         link_state(4);
     }
     entry
+}
+
+/// How long an `execve` waits between looks at its other threads, and how
+/// long it waits for them in all before it replaces the image anyway.
+const EXEC_WAIT_STEP_NS: u64 = 1_000_000;
+const EXEC_WAIT_MAX_NS: u64 = 2_000_000_000;
+
+/// Whether an `execve` from a threaded process has to wait before it
+/// replaces the image (Linux's de_thread): each other thread is told to go
+/// (`gone`); one parked in a call is exited where it parked, and woken, and
+/// ends there without running guest code again; one not yet in its Worker
+/// will not be adopted. One that may be running guest code is waited for:
+/// it stops at its next safepoint, dispatch miss or call ([`stop_gone`]),
+/// before the image under it changes. A thread that never gets there (lost
+/// in a host call) is given up on after `EXEC_WAIT_MAX_NS`.
+fn exec_waits(h: &mut Host) -> bool {
+    if h.threads.len() < 2 {
+        return false;
+    }
+    let me = cur();
+    let mut running = false;
+    let mut woke = false;
+    for (i, t) in h.threads.iter() {
+        if i == me {
+            continue;
+        }
+        t.gone().store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut r = t.run();
+        match r.waiting {
+            Waiting::Exited => {}
+            // Running, as far as anyone can tell: its Worker says when not.
+            Waiting::Runnable => running |= !t.halted().load(std::sync::atomic::Ordering::SeqCst),
+            // Not adopted yet (`gex_adopt_thread` refuses it now), or parked.
+            _ => {
+                woke |= !matches!(r.waiting, Waiting::Elsewhere);
+                r.waiting = Waiting::Exited;
+                r.blocked_on = None;
+            }
+        }
+    }
+    if woke {
+        waitq::wake_process();
+    }
+    if !running {
+        return false;
+    }
+    let now = turn_now();
+    let since = *h.exec_waited_since.get_or_insert(now);
+    if now.saturating_sub(since) >= EXEC_WAIT_MAX_NS {
+        warn_line(&format!(
+            "[gex] pid {}: execve went ahead after {} ms with a thread still running",
+            h.kernel.pid,
+            (now - since) / 1_000_000
+        ));
+        return false;
+    }
+    true
 }
 
 /// What identifies the code at `page`, when anything does.
@@ -10675,6 +10884,13 @@ pub(crate) fn stale_now() {
     TURN_NOW.with(|c| c.set(0));
 }
 
+/// No [`NowScope`] is open any more: a trap left the frames that held them
+/// (`trap`), and their `Drop` never runs.
+fn end_now_scopes() {
+    NOW_SCOPED.with(|s| s.set(false));
+    stale_now();
+}
+
 /// A pass whose clock questions share one reading ([`turn_now`]). Nested
 /// scopes start their own reading; the outer one reads again after.
 pub(crate) struct NowScope(bool);
@@ -11637,7 +11853,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
 /// and what the call owes was taken from the kernel when it parked
 /// (docs/kernel-locking.md §3.7). The first turn of a class call's park
 /// ([`park_free`]) and every turn with no registered wait to ask.
-fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
+fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
     loop {
         let sig = sigs::ready();
         let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
@@ -12117,6 +12333,17 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
+    // The JIT state's lock is the one guard kept where a trap can reach it
+    // (`JIT_HELD`, this Worker's TLS): a bug to be holding it here, said, and
+    // given back by its own `Drop`, so that the lock, its rank and the held
+    // count below agree. Left, the count was zeroed while the guard stayed.
+    if jit_holds() {
+        warn_line(&format!(
+            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}; given back (docs/kernel-locking.md §4.1)\n",
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ));
+        jit_give();
+    }
     // A kernel lock guard alive here never drops: a trap does not unwind, so
     // the lock would stay taken for good (docs/kernel-locking.md §4.1). Lock
     // regions are leaf computations; one that reaches a trap is a bug.
@@ -12134,7 +12361,45 @@ fn trap() -> ! {
     // reported itself as being inside syscall 221, and that sent the hunt for
     // the demo site's crash into `do_exec` twice.
     IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Nor in a pass of the clock (`NowScope`), whose `Drop` this skips as
+    // well: left set, every later clock question on this Worker got the
+    // reading the trapping syscall took, and a timed `poll` or `epoll_wait`
+    // whose stack went back to the page never reached its deadline.
+    end_now_scopes();
+    check_scopes_at_trap();
     warch::unreachable()
+}
+
+/// The shim's own scopes, checked where it traps out, as the kernel's lock
+/// guards are (`check_trap_out`, docs/kernel-locking.md §4.1). None may be
+/// open here: a trap runs no `Drop`, so each would stay open on this Worker
+/// for good.
+///
+/// - the kernel: `KLock` in the shared build, which every other Worker
+///   would then wait on, or the `HOST` borrow in the plain one, which would
+///   make the next call panic as a re-entry;
+/// - a GL submit's deferral (`gl::DEFER`), under which a submit waits for
+///   the end of a syscall that has already gone.
+///
+/// Scopes that do outlive a trap are left alone: the ones JS sets back
+/// when it catches one (`CB_DEPTH`, `GUEST_CALLS`, the call-out stack, the
+/// NT layer's exception levels), and the ones a trap hands to the next
+/// entry (`NATIVE_LEFT`, `NO_LEAVE`, the resume point). Those this shim
+/// can end itself, `trap` ends.
+fn check_scopes_at_trap() {
+    #[cfg(feature = "shared-memory")]
+    let kernel = DEPTH.with(|d| d.get()) > 0;
+    #[cfg(not(feature = "shared-memory"))]
+    let kernel = HOST.with(|h| h.try_borrow_mut().is_err());
+    let defer = gl::DEFER.with(|d| d.get());
+    if kernel || defer {
+        warn_line(&format!(
+            "[gex] BUG: trapped out to JS with{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
+            if kernel { " the kernel" } else { "" },
+            if defer { " a GL deferral" } else { "" },
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ));
+    }
 }
 
 /// Which of the shim's own entry points is running, for a report that cannot
@@ -12330,6 +12595,34 @@ pub extern "C" fn gex_fma_calls() -> i64 {
     FMA_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed) as i64
 }
 
+/// NTSTATUS codes a guest fault hook is given (shims/native's `fault_code`).
+mod fault_code {
+    pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    pub const BREAKPOINT: u32 = 0x8000_0003;
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+    pub const INT_OVERFLOW: u32 = 0xc000_0095;
+}
+
+/// A fault for the process's guest fault hook (Wine's ntdll.so), as
+/// shims/native's `deliver_guest_fault`: the context's PC set to `pc` (where
+/// the hook sees the fault, after an int3 for a breakpoint), the fault
+/// staged for the host (`gex_fault_take`), and out to it. Returns only
+/// when the process has no hook.
+fn hook_fault(pc: u64, code: u32, addr: u64) {
+    if cgen::fault_hook() == 0 {
+        return;
+    }
+    // No lock: the context is this Worker's thread's own (`my_ctx`).
+    let mut gm = GuestMem::new(guest_bytes());
+    let c = my_ctx();
+    let _ = gm.write_u64(c + ctx::PC as u64, pc);
+    cgen::fault_stage(code, addr, 0);
+    set_resume(pc);
+    set_resume_ctx(c);
+    trap();
+}
+
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     // Whole-image units mark a fault they can go on after
@@ -12338,6 +12631,12 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
+    // A process with a guest fault hook (Wine's ntdll.so): the hook takes
+    // the illegal instruction, as shims/native's `deliver_guest_fault` does.
+    // 64-bit native Wine's system and Unix calls are a ud2 at a fixed
+    // address (signal_wasm64.c's W64_SYSCALL_ENTRY), which the hook runs and
+    // steps over.
+    hook_fault(pc as u64, fault_code::ILLEGAL_INSTRUCTION, pc as u64);
     // Which process and what is mapped there: with a Worker per process the
     // console interleaves them all.
     let vma = named_mm()
@@ -12466,6 +12765,24 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // the program may handle (`int3`, #DE, `hlt`).
     if nt::active() && raw != gex_abi::imports::BRK_TRAP_PC {
         nt::fault(_ctx, gex_kernel::nt::Fault::from_brk(raw), pc as u64);
+    }
+    // A process with a guest fault hook (Wine's ntdll.so) handles its own
+    // processor exceptions, as natively (shims/native's brk import): a
+    // divide error, a general-protection fault, and int3 (seen after the
+    // instruction, as hardware leaves it). A diagnostic breakpoint, a bad
+    // stack pointer and an unmasked x87 exception are gex's own.
+    {
+        use gex_abi::imports as i;
+        let pc = pc as u64;
+        if raw == i::BRK_DIVIDE_BY_ZERO {
+            hook_fault(pc, fault_code::INT_DIVIDE_BY_ZERO, 0);
+        } else if raw == i::BRK_DIVIDE_OVERFLOW {
+            hook_fault(pc, fault_code::INT_OVERFLOW, 0);
+        } else if raw == i::BRK_GENERAL_PROTECTION {
+            hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff);
+        } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
+            hook_fault(pc + 1, fault_code::BREAKPOINT, pc);
+        }
     }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
     // registers (x30 names the caller) and RETURN so the block runs on. Pointed
@@ -12912,6 +13229,13 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         set_resume_none();
         trap();
     }
+    // A thread another thread's `execve` took the process from, still
+    // running the old program's code (a loop that makes no syscall): it goes
+    // here, as on Linux it would at once.
+    if thread_gone() {
+        stop_gone();
+        trap();
+    }
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.
     {
@@ -13279,6 +13603,14 @@ pub extern "C" fn gex_my_pid() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
+    // A thread another thread's `execve` took the process from, which got
+    // here before a safepoint or syscall stopped it: the code it was running
+    // is gone, and the new program's memory is under this address. It goes,
+    // as at a safepoint, rather than translating whatever is there now.
+    if thread_gone() {
+        stop_gone();
+        trap();
+    }
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
     miss_count(0);
@@ -16143,8 +16475,12 @@ static EXITED: std::sync::atomic::AtomicBool =
 
 /// Whether this Worker's process has exited: its vfork child's, while one
 /// runs here (vfork.rs), whose exit is not the parent's.
+///
+/// A Worker whose thread another thread's `execve` took away answers yes as
+/// well: the process it ran is over for it, and every way out of the guest
+/// that asks this ends the Worker without ending the process.
 pub(crate) fn exited() -> bool {
-    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed))
+    vfork::exited_here().unwrap_or_else(|| EXITED.load(std::sync::atomic::Ordering::Relaxed) || thread_gone())
 }
 
 /// Record the exit [`exited`] answers.

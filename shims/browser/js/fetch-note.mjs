@@ -12,11 +12,12 @@ channel?.unref?.();
 let next = 0;
 
 /** A fetch starts: `what` (a URL or a unit cache path), `bytes` expected (0
- *  if not known). Returns the end call: `done(bytesGot)`, which says it once. */
-export function noteFetch(what, bytes = 0) {
+ *  if not known), `owner` the fetching process's .exe ('' if not known yet).
+ *  Returns the end call: `done(bytesGot)`, which says it once. */
+export function noteFetch(what, bytes = 0, owner = '') {
   if (!channel) return () => {};
   const id = `${globalThis.name ?? ''}:${next++}:${Math.random().toString(36).slice(2, 8)}`;
-  try { channel.postMessage({ id, what, bytes, phase: 'start' }); } catch {}
+  try { channel.postMessage({ id, what, bytes, owner, phase: 'start' }); } catch {}
   let ended = false;
   return (got = 0) => {
     if (ended) return;

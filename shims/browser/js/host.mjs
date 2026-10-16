@@ -62,6 +62,18 @@ const POOLED = Symbol('gex.pooled');
 /// A pooled Worker's global-kernel stack slice, taken when it was sent
 /// `preattach` (keyed `pool:N` until a process or thread takes the Worker).
 const STACK_KEY = Symbol('gex.stackKey');
+/// A pooled Worker has said `ready` (its handler is on): it can be sent
+/// `preattach`.
+const READY = Symbol('gex.ready');
+/// A process Worker's listeners (`#spawn`), taken off when it is given back.
+const LISTENING = Symbol('gex.listening');
+/// How many processes a Worker has run after its first (`#giveBack`).
+const REUSES = Symbol('gex.reuses');
+/** How many processes one Worker runs before it is ended anyway, so a leak
+ *  in a realm that is given back cannot grow without end; and how many
+ *  given-back Workers the pool keeps beyond the new ones it is topped up to. */
+const REUSE_MAX = 256;
+const GIVEN_BACK_MAX = 2;
 /** How many exited processes' memories are kept for fork children, and how
  *  many bytes they may hold together: memory the page held anyway while
  *  those processes ran, not more. */
@@ -169,6 +181,13 @@ export class ProcessHost {
    * of a process is in it, so a Worker taken for anything else drops it.
    * About what a fresh process's memory holds before it runs: the shim's
    * data and the Worker's shim stack.
+   *
+   * One pooled Worker at a time has it (`#preattachOne`), and only an exec'd
+   * child is given that one (`#takeWorker`): its memory is grown to 177 MiB
+   * at once, and a Worker taken for a thread or a fork dropped it unfreed --
+   * the Worker then sits in wasm or a wait, its isolate never collects, and
+   * the dropped memory stays in the renderer's VmData (Paint: 24 of them
+   * alive at its window, 4.15 GiB; the Win7 shell: 58, 10 GiB).
    */
   #preattach(w) {
     if (!this.#kernel || !this.#stacks || !this.#extra?.shared || w[STACK_KEY]) return;
@@ -187,9 +206,19 @@ export class ProcessHost {
       kernel: this.#kernel,
       kernelStack: stack,
       shared: true,
+      // The process memory's index type, which every Worker of this host
+      // makes or joins the same way (`?mem64=1`, run-node's GEX_MEM64).
+      mem64: !!this.#extra?.mem64,
     }));
   }
   #poolSeq = 0;
+
+  /** A runtime made ahead in one pooled Worker, unless one already has it. */
+  #preattachOne() {
+    if (this.#warm.some((w) => w[STACK_KEY] !== undefined)) return;
+    const w = this.#warm.find((x) => x[READY]);
+    if (w) this.#preattach(w);
+  }
 
   /** The kernel stack slice for the Worker `w` starting `key`: the one it
    *  was given in the pool (`#preattach`), now `key`'s, or a new one. */
@@ -213,6 +242,12 @@ export class ProcessHost {
   }
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
+  /** A process whose first Worker's thread went with the old program when
+   *  another thread called `execve` (Linux's de_thread): the process runs on,
+   *  and ends, in that thread's Worker. Per pid, whichever of the two exits
+   *  arrives first waits here for the other: `{ resolve }` from the first
+   *  Worker, `{ status }` from the thread Worker that carried it. */
+  #carried = new Map();
   #threads = 0;
   // The global kernel's per-Worker stacks, as the first Worker reported them.
   // Each Worker's kernel instance has its own `__stack_pointer` global, all
@@ -340,17 +375,20 @@ export class ProcessHost {
     // When this process was asked for, to measure the gap before it runs.
     this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
-      const w = this.#takeWorker();
+      const w = this.#takeWorker(msg.kind === 'adopt' && !!msg.child?.exec);
       this.#workers.set(pid, w);
       if (pid === 1) this.#first = w;
-      w.addEventListener?.('message', (e) => this.#onMessage(pid, w, e.data, resolve, reject));
-      w.on?.('message', (m) => this.#onMessage(pid, w, m, resolve, reject));
+      const onEvent = (e) => this.#onMessage(pid, w, e.data, resolve, reject);
+      const onMsg = (m) => this.#onMessage(pid, w, m, resolve, reject);
+      w.addEventListener?.('message', onEvent);
+      w.on?.('message', onMsg);
       const fail = (e) => {
         this.#workers.delete(pid);
         reject(e instanceof Error ? e : new Error(e?.message ?? String(e)));
       };
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
+      w[LISTENING] = { onEvent, onMsg, fail };
       this.#pending.set(pid, { ...msg, pid });
       // `#pending` pins the whole fork record (image bytes included) until the
       // child reports ready. A child that never starts leaves ~19 MB pinned.
@@ -383,11 +421,16 @@ export class ProcessHost {
    * A Worker, from the pool if one is warm. Tops up after the take, so the
    * Worker started now serves the next process, not this one.
    */
-  #takeWorker() {
-    const w = this.#warm.shift();
+  #takeWorker(exec = false) {
+    // An exec'd child takes the Worker with a runtime made ahead, anything
+    // else one without (`#preattach`), whichever comes first otherwise.
+    let i = this.#warm.findIndex((x) => (x[STACK_KEY] !== undefined) === exec);
+    if (i < 0 && this.#warm.length) i = 0;
+    const w = i < 0 ? null : this.#warm.splice(i, 1)[0];
     if (w) this.#warmUsed++;
     const got = w ?? this.#makeWorker();
     this.#topUp();
+    this.#preattachOne();
     return got;
   }
 
@@ -403,34 +446,74 @@ export class ProcessHost {
     if (this.#warm.length >= this.#warmWanted) return;
     try {
       const w = this.#makeWorker();
-      // Buffer whatever it says before `#spawn` attaches its listener: a
-      // pooled Worker announces itself while still sitting in the array, and
-      // that message would otherwise be delivered to nobody and dropped.
-      const early = [];
-      const buf = (e) => {
-        const m = e && e.data !== undefined ? e.data : e;
-        early.push(m);
-        // Listening now (`ready` is posted once its handler is on).
-        if (m?.kind === 'ready' && !w[POOLED]) {
-          this.#poolModules(w);
-          this.#preattach(w);
-        }
-        // Still pooled (not taken, the host not stopped): start the next.
-        if (m?.kind === 'ready' && this.#warm.includes(w)) this.#topUp();
-      };
-      w.addEventListener?.('message', buf);
-      w.on?.('message', buf);
-      w[EARLY] = { early, buf };
-      this.#warm.push(w);
+      this.#pool(w, false);
       this.#warmMade++;
     } catch {
       // Cannot make another Worker: the next `#takeWorker` makes one itself.
     }
   }
 
+  /** Into the pool: a new Worker at the back, a given-back one at the front
+   *  (its JS is compiled and warm, so the next process takes it first). */
+  #pool(w, givenBack) {
+    // Buffer whatever it says before `#spawn` attaches its listener: a
+    // pooled Worker announces itself while still sitting in the array, and
+    // that message would otherwise be delivered to nobody and dropped. A
+    // given-back Worker's last process may still say something on its way
+    // out: nothing before its next `ready` is kept.
+    const early = [];
+    let readied = !givenBack;
+    // A given-back Worker is ready again once it has reset.
+    w[READY] = false;
+    const buf = (e) => {
+      const m = e && e.data !== undefined ? e.data : e;
+      if (m?.kind === 'ready') readied = true;
+      if (!readied) return;
+      early.push(m);
+      // Listening now (`ready` is posted once its handler is on).
+      if (m?.kind === 'ready') {
+        w[READY] = true;
+        if (!w[POOLED]) this.#poolModules(w);
+        if (this.#warm.includes(w)) this.#preattachOne();
+      }
+      // Still pooled (not taken, the host not stopped): start the next.
+      if (m?.kind === 'ready' && !givenBack && this.#warm.includes(w)) this.#topUp();
+    };
+    w.addEventListener?.('message', buf);
+    w.on?.('message', buf);
+    w[EARLY] = { early, buf };
+    if (givenBack) this.#warm.unshift(w);
+    else this.#warm.push(w);
+  }
+
+  /**
+   * A Worker whose process exited cleanly, back into the pool for the next
+   * process rather than ended: a new Worker compiles and warms the runtime's
+   * JS on every process's way in and out. The Worker resets its realm
+   * (worker.mjs `reset`) and makes a new runtime on a new memory, as a new
+   * one does. False when it is not wanted (the pool is full, the Worker has
+   * run `REUSE_MAX` processes), and then it is ended as before.
+   */
+  #giveBack(w) {
+    const n = (w[REUSES] ?? 0) + 1;
+    const l = w[LISTENING];
+    if (!l || n > REUSE_MAX || this.#warm.length >= this.#warmWanted + GIVEN_BACK_MAX) return false;
+    delete w[LISTENING];
+    w.removeEventListener?.('message', l.onEvent);
+    w.off?.('message', l.onMsg);
+    w.removeEventListener?.('error', l.fail);
+    w.off?.('error', l.fail);
+    w[REUSES] = n;
+    this.#reused++;
+    this.#pool(w, true);
+    w.postMessage({ kind: 'reset' });
+    return true;
+  }
+  #reused = 0;
+
   /// How the pool is doing, for the per-run line.
   get warmStats() {
-    return { made: this.#warmMade, used: this.#warmUsed, idle: this.#warm.length };
+    return { made: this.#warmMade, used: this.#warmUsed, idle: this.#warm.length, reused: this.#reused };
   }
 
   /// Send a Worker the closure metadata only -- which library owns which
@@ -530,8 +613,9 @@ export class ProcessHost {
     return Atomics.load(i32, a) !== 0 && i32[a + 30] === Number(parts[0]) && i32[a + 29] === Number(parts[parts.length - 1]);
   }
 
-  /** A Worker has ended: stop it, and put its kernel stack back. */
-  #release(key, w) {
+  /** A Worker has ended: stop it, and put its kernel stack back. `reuse`:
+   *  its process exited cleanly, and it may go back to the pool instead. */
+  #release(key, w, reuse = false) {
     // Not inside a door call: a Worker stopped there would leave the door
     // lock held and the server's pump waiting for it forever (a process the
     // server kills from inside its own request, as `terminate_process`
@@ -559,10 +643,10 @@ export class ProcessHost {
       setTimeout(again, 1);
       return;
     }
-    this.#releaseNow(key, w);
+    this.#releaseNow(key, w, reuse);
   }
 
-  #releaseNow(key, w) {
+  #releaseNow(key, w, reuse = false) {
     this.#workers.delete(key);
     // The last Worker of a process gone: drop its shared-module cache so a long
     // page does not accumulate every process's compiled modules forever.
@@ -575,6 +659,7 @@ export class ProcessHost {
       this.#stackOf.delete(key);
       this.#stacksFree.push(slice);
     }
+    if (reuse && this.#giveBack(w)) return;
     w.terminate();
   }
 
@@ -689,6 +774,8 @@ export class ProcessHost {
         break;
       case 'kernelStacks':
         this.#stacks = m;
+        // A pooled Worker that was ready before the stacks were known.
+        this.#preattachOne();
         break;
       case 'output': {
         this.#onOutput(m.fd, m.text, pid, m);
@@ -883,6 +970,33 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        if (m.threadGone) {
+          // Not the process's end: it goes on in another Worker.
+          const c = this.#carried.get(pid);
+          this.#release(pid, w);
+          if (c && 'status' in c) {
+            this.#carried.delete(pid);
+            resolve(c.status);
+          } else {
+            this.#carried.set(pid, { resolve });
+          }
+          break;
+        }
+        if (m.carries) {
+          // A thread Worker that took its process over by `execve`: its exit
+          // is the process's, owed to whoever waits on the first Worker.
+          const proc = Number(String(pid).split(':')[0]);
+          const c = this.#carried.get(proc);
+          this.#onExit(m, proc);
+          this.#release(pid, w);
+          if (c?.resolve) {
+            this.#carried.delete(proc);
+            c.resolve(m.status);
+          } else {
+            this.#carried.set(proc, { status: m.status });
+          }
+          break;
+        }
         if (m.recycle instanceof WebAssembly.Memory) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
           this.#onOutput(
@@ -930,6 +1044,8 @@ export class ProcessHost {
               // A posix_spawn child that ran in its parent's Worker, in its
               // memory, until its exec: no copy, and this long to the exec.
               (m.vforkMs !== undefined ? `, forked in place (${m.vforkMs.toFixed(1)}ms to exec, nothing copied)` : '') +
+              // A Worker given back after an earlier process (`#giveBack`).
+              (m.workerRuns > 1 ? `, on a given-back worker (its process ${m.workerRuns})` : '') +
               (m.forkCopied
                 ? `, fork copied ${Math.round(m.forkCopied / 1048576)} MiB`
                   + (m.forkZeros ? ` (${Math.round(m.forkZeros / 1048576)} MiB of it zero, left alone)` : '')
@@ -994,7 +1110,7 @@ export class ProcessHost {
         }
         // Before the release: releasing terminates the Worker.
         this.#onExit(m, pid);
-        this.#release(pid, w);
+        this.#release(pid, w, !!m.giveBack);
         resolve(m.status);
         break;
       case 'threw':

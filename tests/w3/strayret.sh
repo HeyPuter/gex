@@ -59,6 +59,8 @@ page "$w/page.log"
 if grep -q 'function tier for .*/strayret.exe' "$w/page.log"; then verdict page "$w/page.log" '^strayret ok [1-9]'
 else fail=$((fail + 1)); echo "FAIL page: strayret.exe ran without its unit"; grep -i 'strayret.exe' "$w/page.log" | head -3 | sed 's/^/  /'; fi
 page "$w/page-trap.log" GEX_STRAY_TRAP=1
-verdict "page, GEX_STRAY_TRAP=1 reaches the breakpoint" "$w/page-trap.log" 'breakpoint'
+# The breakpoint at the pad (0x3ffff1) is Wine's unhandled 0x80000003 there,
+# whether or not winedbg then manages to attach and name it.
+verdict "page, GEX_STRAY_TRAP=1 reaches the breakpoint" "$w/page-trap.log" 'breakpoint\|exception 0x80000003 .*at address 003FFFF1'
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

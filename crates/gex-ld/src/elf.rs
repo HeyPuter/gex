@@ -440,16 +440,36 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parse and place an aarch64 ELF image.
-///
-/// `pie_base` is the load bias used for `ET_DYN` images; `ET_EXEC` images are
-/// placed at their own `p_vaddr`s.
-pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
-    // The PowerPC guest is big-endian throughout; every other one is little.
-    let r = Reader {
-        data,
-        be: gex_abi::BIG_ENDIAN,
-    };
+/// What an ELF file's headers say, before any segment's bytes are read:
+/// everything [`load`] and [`plan`] share.
+struct Headers {
+    class32: bool,
+    pie: bool,
+    bias: u64,
+    entry: u64,
+    e_phoff: usize,
+    e_shoff: usize,
+    e_phentsize: usize,
+    e_phnum: usize,
+    e_shentsize: usize,
+    e_shnum: usize,
+    /// Each `PT_LOAD`, in order: the segment with no bytes yet, and the file
+    /// range its bytes come from, as `(offset, length)`.
+    loads: Vec<(Segment, (usize, usize))>,
+    brk: u64,
+    text_lo: u64,
+    text_hi: u64,
+    phdr_vaddr: u64,
+    dynamic: Option<(u64, u64)>,
+    /// `PT_INTERP`'s file range: the string is read by the caller, since a
+    /// planner holds only the head of the file.
+    interp: Option<(usize, usize)>,
+    tls: Option<(u64, u64, u64, u64)>,
+}
+
+/// Read and check the ELF and program headers in `r`.
+fn headers(r: &Reader, pie_base: u64) -> Result<Headers, LoadError> {
+    let data = r.data;
     if data.len() < 64 {
         return Err(LoadError::TooShort);
     }
@@ -463,8 +483,8 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     // A 32-bit i386 image runs in the same process model as everything
     // else, on the i386 ABI: on the x86-64 guest any i386 program, in
     // compatibility mode; on the AArch64 guest only a native wasm32 program
-    // (an i386 container around a wasm module, checked below), which has no
-    // i386 code to translate. The PowerPC guest is 32-bit only.
+    // (an i386 container around a wasm module, checked by the caller), which
+    // has no i386 code to translate. The PowerPC guest is 32-bit only.
     let class32 = match r.u8(4)? {
         ELFCLASS64 if !gex_abi::PPC => false,
         ELFCLASS32 => true,
@@ -513,15 +533,26 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         )
     };
 
-    let mut segments = Vec::new();
-    let mut brk = 0u64;
-    let mut text_lo = u64::MAX;
-    let mut text_hi = 0u64;
-    let mut phdr_vaddr = 0u64;
-    let mut dynamic: Option<(u64, u64)> = None;
-    let mut interp: Option<String> = None;
-    let mut tls = None;
-    let mut min_vaddr = u64::MAX;
+    let mut h = Headers {
+        class32,
+        pie,
+        bias,
+        entry: e_entry + bias,
+        e_phoff,
+        e_shoff,
+        e_phentsize,
+        e_phnum,
+        e_shentsize,
+        e_shnum,
+        loads: Vec::new(),
+        brk: 0,
+        text_lo: u64::MAX,
+        text_hi: 0,
+        phdr_vaddr: 0,
+        dynamic: None,
+        interp: None,
+        tls: None,
+    };
 
     for i in 0..e_phnum {
         let off = e_phoff + i * e_phentsize;
@@ -549,9 +580,9 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         };
 
         match p_type {
-            PT_INTERP => interp = Some(r.cstr(p_offset)),
-            PT_DYNAMIC => dynamic = Some((p_vaddr + bias, p_memsz)),
-            PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, p_align)),
+            PT_INTERP => h.interp = Some((p_offset, p_filesz as usize)),
+            PT_DYNAMIC => h.dynamic = Some((p_vaddr + bias, p_memsz)),
+            PT_TLS => h.tls = Some((p_vaddr + bias, p_filesz, p_memsz, p_align)),
             PT_LOAD => {
                 let vaddr = p_vaddr + bias;
                 if vaddr.checked_add(p_memsz).is_none() || vaddr + p_memsz >= gex_abi::GUEST_LIMIT {
@@ -573,66 +604,161 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
                         size: p_memsz,
                     });
                 }
-                min_vaddr = min_vaddr.min(vaddr);
-                let bytes = r.slice(p_offset, p_filesz as usize)?.to_vec();
                 let executable = p_flags & PF_X != 0;
                 if executable {
-                    text_lo = text_lo.min(vaddr);
-                    text_hi = text_hi.max(vaddr + p_memsz);
+                    h.text_lo = h.text_lo.min(vaddr);
+                    h.text_hi = h.text_hi.max(vaddr + p_memsz);
                 }
-                brk = brk.max(vaddr + p_memsz);
-                segments.push(Segment {
-                    vaddr,
-                    bytes,
-                    mem_size: p_memsz,
-                    readable: p_flags & PF_R != 0,
-                    writable: p_flags & PF_W != 0,
-                    executable,
-                });
+                h.brk = h.brk.max(vaddr + p_memsz);
+                h.loads.push((
+                    Segment {
+                        vaddr,
+                        bytes: Vec::new(),
+                        mem_size: p_memsz,
+                        readable: p_flags & PF_R != 0,
+                        writable: p_flags & PF_W != 0,
+                        executable,
+                    },
+                    (p_offset, p_filesz as usize),
+                ));
                 // The program headers are conventionally inside the first
                 // PT_LOAD; locate them by file offset.
                 if (p_offset as u64) <= e_phoff as u64
                     && (e_phoff as u64) < p_offset as u64 + p_filesz
                 {
-                    phdr_vaddr = vaddr + (e_phoff as u64 - p_offset as u64);
+                    h.phdr_vaddr = vaddr + (e_phoff as u64 - p_offset as u64);
                 }
             }
             _ => {}
         }
     }
 
-    if segments.is_empty() {
+    if h.loads.is_empty() {
         return Err(LoadError::Malformed("no PT_LOAD segments"));
     }
-    if text_lo == u64::MAX {
+    if h.text_lo == u64::MAX {
         return Err(LoadError::Malformed("no executable segment"));
     }
+    Ok(h)
+}
 
-    let mut image = Image {
-        bias,
-        class32,
-        entry: e_entry + bias,
-        segments,
-        phdr_vaddr,
-        phentsize: e_phentsize as u64,
-        phnum: e_phnum as u64,
-        // brk starts on the next page boundary above the image.
-        brk: (brk + 0xfff) & !0xfff,
-        text_range: (text_lo, text_hi),
-        tls,
-        symbols: Vec::new(),
-        named_relocs: Vec::new(),
-        relocs: Vec::new(),
-        init_array: Vec::new(),
-        dynsyms: Vec::new(),
-        irelative: Vec::new(),
-        code: Vec::new(),
-        pie,
-        interp,
-        soname: None,
-        needed: Vec::new(),
-        runpath: Vec::new(),
+impl Headers {
+    /// The image these headers describe, its segments as given.
+    fn image(&self, segments: Vec<Segment>, interp: Option<String>) -> Image {
+        Image {
+            bias: self.bias,
+            class32: self.class32,
+            entry: self.entry,
+            segments,
+            phdr_vaddr: self.phdr_vaddr,
+            phentsize: self.e_phentsize as u64,
+            phnum: self.e_phnum as u64,
+            // brk starts on the next page boundary above the image.
+            brk: (self.brk + 0xfff) & !0xfff,
+            text_range: (self.text_lo, self.text_hi),
+            tls: self.tls,
+            symbols: Vec::new(),
+            named_relocs: Vec::new(),
+            relocs: Vec::new(),
+            init_array: Vec::new(),
+            dynsyms: Vec::new(),
+            irelative: Vec::new(),
+            code: Vec::new(),
+            pie: self.pie,
+            interp,
+            soname: None,
+            needed: Vec::new(),
+            runpath: Vec::new(),
+        }
+    }
+}
+
+/// Where each of an image's segments comes from in its file, as
+/// `(offset, length)`, in [`Image::segments`] order: [`plan`]'s answer.
+pub type FileRanges = Vec<(u64, u64)>;
+
+/// What `execve` needs of an ELF file, and only that: its program headers,
+/// read through `read_at` (fill the buffer from a file offset, answering how
+/// many bytes it read). The segments come back with no bytes, each paired
+/// with the file range they are to be read from -- straight into guest
+/// memory, by the caller -- so the file is never read whole and nothing is
+/// copied twice. Nothing past the program headers is parsed either: no
+/// sections, symbols or dynamic table, which a process's own loader reads.
+/// And no relocation is applied, as on Linux: `ld.so` and a static PIE
+/// relocate themselves.
+pub fn plan(
+    read_at: &dyn Fn(u64, &mut [u8]) -> Option<usize>,
+    pie_base: u64,
+) -> Result<(Image, FileRanges), LoadError> {
+    let read = |off: u64, len: usize| -> Result<Vec<u8>, LoadError> {
+        let mut v = vec![0u8; len];
+        let n = read_at(off, &mut v).ok_or(LoadError::TooShort)?;
+        v.truncate(n);
+        Ok(v)
     };
+    // The headers are almost always in the first page; a file whose program
+    // headers lie further in is read again, that far.
+    let mut head = read(0, 4096)?;
+    let need = {
+        let r = Reader { data: &head, be: gex_abi::BIG_ENDIAN };
+        let class32 = r.u8(4)? == ELFCLASS32;
+        let (phoff, phentsize, phnum) = if class32 {
+            (r.u32(28)? as usize, r.u16(42)? as usize, r.u16(44)? as usize)
+        } else {
+            (r.u64(32)? as usize, r.u16(54)? as usize, r.u16(56)? as usize)
+        };
+        phoff.saturating_add(phentsize.saturating_mul(phnum))
+    };
+    if need > head.len() && need <= 1 << 20 {
+        head = read(0, need)?;
+    }
+    let r = Reader { data: &head, be: gex_abi::BIG_ENDIAN };
+    let h = headers(&r, pie_base)?;
+    let interp = match h.interp {
+        Some((off, len)) => {
+            let b = read(off as u64, len.min(4096))?;
+            let end = b.iter().position(|c| *c == 0).unwrap_or(b.len());
+            Some(String::from_utf8_lossy(&b[..end]).into_owned())
+        }
+        None => None,
+    };
+    let ranges = h.loads.iter().map(|(_, (o, l))| (*o as u64, *l as u64)).collect::<FileRanges>();
+    let image = h.image(h.loads.iter().map(|(s, _)| s.clone()).collect(), interp);
+    // An i386 image on a guest that runs no i386 code is only acceptable as
+    // a native wasm32 program's container: its magic, 0x40 below the entry.
+    if image.class32 && !gex_abi::X86 && !gex_abi::PPC {
+        let at = image.entry.wrapping_sub(0x40);
+        let magic = image.segments.iter().zip(&ranges).find_map(|(s, (o, l))| {
+            (at >= s.vaddr && at + 8 <= s.vaddr + l).then(|| read(o + (at - s.vaddr), 8).ok())?
+        });
+        if magic.as_deref() != Some(&WASM32_MAGIC[..]) {
+            return Err(LoadError::NotAarch64);
+        }
+    }
+    Ok((image, ranges))
+}
+
+/// Parse and place an aarch64 ELF image.
+///
+/// `pie_base` is the load bias used for `ET_DYN` images; `ET_EXEC` images are
+/// placed at their own `p_vaddr`s.
+pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
+    // The PowerPC guest is big-endian throughout; every other one is little.
+    let r = Reader {
+        data,
+        be: gex_abi::BIG_ENDIAN,
+    };
+    let h = headers(&r, pie_base)?;
+    let interp = h.interp.map(|(off, _)| r.cstr(off));
+    let mut segments = Vec::with_capacity(h.loads.len());
+    for (seg, (off, len)) in &h.loads {
+        let mut seg = seg.clone();
+        seg.bytes = r.slice(*off, *len)?.to_vec();
+        segments.push(seg);
+    }
+    let (class32, bias, dynamic) = (h.class32, h.bias, h.dynamic);
+    let (e_shoff, e_shentsize, e_shnum) = (h.e_shoff, h.e_shentsize, h.e_shnum);
+    let mut image = h.image(segments, interp);
 
     if class32 && !gex_abi::X86 && !gex_abi::PPC && !image.is_wasm32() {
         return Err(LoadError::NotAarch64);

@@ -53,13 +53,19 @@ const seed = new Uint8Array(await readFile(SEED));
 // The global kernel, if built: the process table and filesystem every process
 // shares. Without it a forked child has no place in the table and no root to
 // `execve` out of.
+//
+// One per run: a kernel is one page's, and its host hands its Workers their
+// stack slices. Two hosts on one kernel memory both started a pid 1 on the
+// kernel's default stack at once, and one trapped in the other's frames
+// (memory access out of bounds in `wait::new_queue`, about 1 run in 9).
 const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.plain.wasm');
-const kernel = (await exists(KERNEL))
-  ? {
-      module: await WebAssembly.compile(new Uint8Array(await readFile(KERNEL))),
-      memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
-    }
+const kernelModule = (await exists(KERNEL))
+  ? await WebAssembly.compile(new Uint8Array(await readFile(KERNEL)))
   : null;
+const newKernel = () => kernelModule && {
+  module: kernelModule,
+  memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+};
 
 /** Everything under `dir`, as the guest's filesystem. */
 async function bundle(dir) {
@@ -85,7 +91,7 @@ function runInWorker(elfPath, elf, args) {
     makeWorker: () => new Worker(WORKER),
     shim,
     guest: seed,
-    kernel,
+    kernel: newKernel(),
     onOutput: (fd, text) => {
       output += text;
     },
