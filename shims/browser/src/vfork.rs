@@ -387,7 +387,7 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
             warn_line(&format!("gex: {path}: the program could not be loaded\n"));
-            exit_process(h, 127);
+            exit_process(127);
             return 0;
         }
         entry

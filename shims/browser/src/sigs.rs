@@ -70,6 +70,8 @@ pub(crate) struct Home {
     host_names: Arc<gex_kernel::unix::SocketNames>,
     /// Its threads, their contexts and run states (`Host::threads`, L23).
     table: Arc<crate::Threads>,
+    /// How it ended, decided once (L24).
+    exit: crate::ExitState,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -119,6 +121,7 @@ fn home_of(k: &Kernel, table: &Arc<crate::Threads>) -> Home {
         socket_names: Arc::clone(&k.socket_names),
         host_names: Arc::clone(&k.host_names),
         table: Arc::clone(table),
+        exit: crate::ExitState::new(),
     }
 }
 
@@ -140,6 +143,11 @@ impl Home {
     /// Its threads (`Host::threads`), which lock themselves.
     pub(crate) fn table(&self) -> &crate::Threads {
         &self.table
+    }
+
+    /// How it ended (`exit_process`), which needs no lock.
+    pub(crate) fn exit(&self) -> &crate::ExitState {
+        &self.exit
     }
 
     /// Its user and group ids, which lock themselves.

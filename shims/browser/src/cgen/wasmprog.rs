@@ -124,7 +124,7 @@ pub extern "C" fn gex_wasmprog_serve() -> i32 {
         Ok(n) => n as i32,
         Err(e) => {
             crate::warn_line(&format!("gex: wasm32 program: {e}\n"));
-            crate::with_host(|h| crate::exit_process(h, 127));
+            crate::exit_process(127);
             -1
         }
     }

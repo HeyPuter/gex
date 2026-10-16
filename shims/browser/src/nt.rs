@@ -1256,10 +1256,11 @@ mod imp {
                     }
                     end_process(p.exit_code.load(Ordering::Acquire));
                 }
-                with_host(|h| {
-                    h.threads[cur()].run().waiting = Waiting::Exited;
-                    crate::end_if_all_exited(h);
-                });
+                // No kernel lock: the thread table and the end lock themselves.
+                if let Some(home) = crate::sigs::home() {
+                    home.table()[cur()].run().waiting = Waiting::Exited;
+                }
+                crate::end_if_all_exited();
                 set_resume_none();
                 set_resume_ctx_none_and_trap();
             }
@@ -1571,9 +1572,7 @@ mod imp {
                 crate::fjit::counts()
             ));
         }
-        with_host(|h| {
-            exit_process(h, (code & 0xff) as i32);
-        });
+        exit_process((code & 0xff) as i32);
         trap()
     }
 
@@ -1585,9 +1584,7 @@ mod imp {
             warn_line(&format!(
                 "gex-nt: an unmasked x87 exception at {pc:#x}: gex does not deliver x87 exceptions; ending the process\n"
             ));
-            with_host(|h| {
-                exit_process(h, 128 + 8);
-            });
+            exit_process(128 + 8);
             trap();
         };
         let ctx_addr = ctx as u32 as u64;

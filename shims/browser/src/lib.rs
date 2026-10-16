@@ -3192,7 +3192,6 @@ struct Host {
     proc_state: Arc<gex_kernel::KernelProcSource>,
     /// Every guest thread, the running one included.
     threads: Arc<Threads>,
-    exit: Option<i32>,
     jit: JitHere,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
@@ -5054,7 +5053,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             root,
             proc_state,
             threads: threads_of(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable),
-            exit: None,
             jit: JitHere,
         magic_tail: HOST_MAGIC,
     });
@@ -7294,7 +7292,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 set_resume(target);
                 1
             }
-            SyscallOutcome::Exit(code) => exit_process(h, code),
+            SyscallOutcome::Exit(code) => exit_process(code),
             // A signal with no handler kills the *process*, not the run.
             // Setting the run's exit here is what ended `apt update`: apt
             // stops its http method with `kill(pid, SIGINT)` -- ordinary
@@ -7303,7 +7301,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             // Negative for "died of a signal"; see `exit_process`.
             SyscallOutcome::Killed { signal, .. } => {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                killed(h, signal as i32, at)
+                killed(signal as i32, at)
             }
             SyscallOutcome::SpawnThread { ctx_addr, tid } => {
                 // The kernel has already written the child's context; it
@@ -7344,7 +7342,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
-                end_if_all_exited(h);
+                end_if_all_exited();
                 // Nowhere to resume this thread. A resume left from before
                 // (a call-out's return, `cgen::returned`, which a call-out
                 // that was not the one returned to leaves set) would be
@@ -7541,7 +7539,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 }
             }
             _ => {
-                set_exit(h, 128 + 31);
+                set_exit(128 + 31);
                 2
             }
         }
@@ -9112,7 +9110,6 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         // The child is one thread: `fork` does not carry the parent's others
         // across, and in this design they were never in this Worker anyway.
         threads: threads_of(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable),
-        exit: None,
         jit: JitHere,
         magic_tail: HOST_MAGIC,
     }
@@ -9138,26 +9135,51 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
 /// `code` is an exit status, or the negated signal number for a signal death --
 /// `wait4` reports the two differently (`code << 8` vs the bare signal), and
 /// carrying the sign keeps them apart without widening the status path.
-fn exit_process(h: &mut Host, code: i32) -> i32 {
+fn exit_process(code: i32) -> i32 {
+    // One thread ends the process; any other that gets here meanwhile (a
+    // second `exit_group`, the last thread's `exit`, a fault) only stops.
+    // No kernel lock: what the end touches locks itself.
+    if let Some(home) = sigs::home() {
+        if home.exit().claim() {
+            end_process_once(home, code);
+        }
+    } else {
+        set_exited(true);
+    }
+    // And nowhere to resume, said explicitly: the host re-enters the guest when
+    // `gex_resume_pc` is set, so a resume left over from an earlier parked call
+    // would send a just-exited process back into its own code with an emptied
+    // descriptor table.
+    set_resume_none();
+    set_resume_ctx_none();
+    2
+}
+
+/// The end [`exit_process`] claimed for its caller, run once per process.
+fn end_process_once(home: &sigs::Home, code: i32) {
     // Every thread marked `Exited`, because the scheduler ends a Worker only
     // when all threads are: a thread left `Runnable` gets picked again and
     // re-entered with its kernel state already released, so the guest keeps
     // making syscalls after it is gone.
-    for (_, t) in h.threads.iter() {
+    for (_, t) in home.table().iter() {
         let mut r = t.run();
         r.waiting = Waiting::Exited;
         r.blocked_on = None;
     }
     // See `gex_exited`: tells a program that finished from one that abandoned
-    // the wasm stack with no status set.
+    // the wasm stack with no status set. From here every other thread's next
+    // call, and the end of its park, is its end (`free_syscall`, `finish_mine`).
     set_exited(true);
     waitq::wake_process();
-    let pid = h.kernel.pid;
+    let pid = home.pid();
     // Descriptors go first and explicitly: a trap out of wasm does not unwind,
     // so nothing is dropped, and a pipe end between two Workers lives in the
     // global kernel and only learns of a close from `Drop` -- otherwise the
-    // reader waits forever for an EOF nobody sends.
-    h.kernel.fds.close_all();
+    // reader waits forever for an EOF nobody sends. A thread still inside a
+    // call on one keeps its description until the call ends.
+    if let Some(fds) = fds_free() {
+        fds.close_all();
+    }
     // And anything the table did not account for: a guest leaving by a trap
     // rather than `exit_group` never reaches the line above (see
     // `k_pipe_forget`).
@@ -9174,21 +9196,15 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             }
         }
     }
-    publish_exit(h, pid, code);
+    // The status last, so a parent's `wait4` finds the descriptors closed.
+    publish_exit(pid, code);
     // Nothing to hand the stack to: other processes are other Workers already
     // running, and the parent's `wait4` finds the status in the shared table.
     if tracing() {
         trace_line(&format!("[proc] exit {pid} with {code}\n"));
     }
-    // And nowhere to resume, said explicitly: the host re-enters the guest when
-    // `gex_resume_pc` is set, so a resume left over from an earlier parked call
-    // would send a just-exited process back into its own code with an emptied
-    // descriptor table.
-    set_resume_none();
-    set_resume_ctx_none();
     // A shell reports a signal death as 128 + the signal, and so does this.
-    set_exit(h, if code < 0 { 128 - code } else { code });
-    2
+    set_exit(if code < 0 { 128 - code } else { code });
 }
 
 /// `execve`: replace this process's image with another program's. Everything
@@ -10808,7 +10824,7 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
     let resume = resume().unwrap_or(0);
     // Whether this process is over: the run loop checks it first, so a finished
     // process takes the waiting branch however runnable its threads look.
-    let over = with_host_free(|h| h.exit.is_some()).unwrap_or(false);
+    let over = sigs::home().is_some_and(|h| h.exit().over());
     let text = with_host_free(|h| {
         let mut s = format!(
             "pid {} worker-runs-t{} paused={why:#x} resume={resume:#x} exited={over}:",
@@ -11284,7 +11300,7 @@ fn report_deadlock() {
     }).unwrap_or_default();
     trace_line("gex: every thread is blocked on a futex\n");
     trace_line(&who);
-    with_host(|h| set_exit(h, 128 + 31));
+    set_exit(128 + 31);
 }
 
 /// The compositor's work, when it has any, before a scheduler turn: a
@@ -11300,11 +11316,10 @@ fn pump_compositor() {
 /// Every thread gone ends this process, all this Worker has; the status is
 /// in the shared table for whoever waits. Asked where a thread exits, under
 /// that call's take: the last one out ends it.
-pub(crate) fn end_if_all_exited(h: &mut Host) {
-    if h.threads.iter().all(|(_, t)| matches!(t.run().waiting, Waiting::Exited)) {
-        let code = h.exit.take().unwrap_or(0);
-        exit_process(h, code);
-        h.exit.get_or_insert(code);
+pub(crate) fn end_if_all_exited() {
+    let Some(home) = sigs::home() else { return };
+    if home.table().iter().all(|(_, t)| matches!(t.run().waiting, Waiting::Exited)) {
+        exit_process(home.exit().status().unwrap_or(0));
     }
 }
 
@@ -11627,7 +11642,8 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
 
 /// A signal with no handler kills this *process*, not the run (`exit_process`),
 /// its thread at `at`: said loudly, unless another process ended it on purpose.
-fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
+fn killed(signal: i32, at: u64) -> i32 {
+    let Some(home) = sigs::home() else { return exit_process(-signal) };
     // Loudly, and whatever the tracing settings.
     //
     // A guest that dies of a signal used to leave nothing at all
@@ -11661,7 +11677,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
     // Ended on purpose by another process (SIGINT, SIGKILL or
     // SIGTERM it sent this one): one quiet line, not the report.
     // apt ends every method this way after a clean run.
-    let pid = h.kernel.pid;
+    let pid = home.pid();
     if matches!(sent, Some((caller, target, signo))
         if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
             && caller != pid && (target == pid || target == -pid || target == 0))
@@ -11671,7 +11687,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
     warn_line(&format!(
         "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
          last calls:{}\n  address space:{}\n  futexes:{}",
-        h.kernel.pid,
+        pid,
         signal,
         last_stderr(),
         // Every thread, not only the one that died. Two threads
@@ -11679,7 +11695,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
         // everything downstream of that looks like corruption
         // somewhere else entirely -- which is the shape #126 has.
         // Cheap to rule in or out, and never recorded before.
-        h.threads
+        home.table()
             .iter()
             .map(|(i, t)| {
                 let r = t.run();
@@ -11697,7 +11713,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
         ftx_recent(),
     ));
     }
-    exit_process(h, -(signal as i32))
+    exit_process(-signal)
 }
 
 /// End this Worker's process (`exit_process`), from outside the kernel: a
@@ -11705,10 +11721,10 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
 /// halted machine. With `killed_at`, the thread's pc, a signal's death is
 /// reported as a syscall's is ([`killed`]). The stop value (2).
 fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
-    with_host(|h| match killed_at {
-        Some(at) if code < 0 => killed(h, -code, at),
-        _ => exit_process(h, code),
-    })
+    match killed_at {
+        Some(at) if code < 0 => killed(-code, at),
+        _ => exit_process(code),
+    }
 }
 
 /// How a parked call ended for its thread.
@@ -12172,7 +12188,7 @@ pub extern "C" fn gex_resume_ctx() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn gex_exit_code() -> i32 {
-    with_host(|h| h.exit.unwrap_or(0))
+    exit_status().unwrap_or(0)
 }
 
 fn write_u64(data: &mut [u8], off: usize, v: u64) {
@@ -12267,7 +12283,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
         raw as u32,
         pc
     ));
-    with_host(|h| set_exit(h, 128 + 4));
+    set_exit(128 + 4);
     trap();
 }
 /// `log2` of the guest bytes one dispatch slot spans (`gex_abi::DISPATCH_SHIFT`).
@@ -12432,14 +12448,14 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" },
             pc
         ));
-        with_host(|h| set_exit(h, 128 + 8));
+        set_exit(128 + 8);
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
     // SIGSEGV on Linux, fatal here.
     if raw == gex_abi::imports::BRK_GENERAL_PROTECTION {
         trace_line(&format!("gex: general protection fault at pc={pc:#x} (SIGSEGV)\n"));
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
         trap();
     }
     // An x87 exception the control word unmasks: gex does not deliver
@@ -12448,7 +12464,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         trace_line(&format!(
             "gex: unmasked x87 floating-point exception at pc={pc:#x}; gex does not deliver x87 exceptions (SIGFPE)\n"
         ));
-        with_host(|h| set_exit(h, 128 + 8));
+        set_exit(128 + 8);
         trap();
     }
     // The stack-pointer check borrows this import rather than adding one, so an
@@ -12479,7 +12495,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             )
         });
         trace_line(&line);
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
         trap();
     }
     // A bare `brk` is almost always glibc's `abort()` (the trap it ends on when
@@ -12519,7 +12535,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         )
     });
     trace_line(&line);
-    with_host(|h| set_exit(h, 128 + 5));
+    set_exit(128 + 5);
     trap();
 }
 #[no_mangle]
@@ -12559,7 +12575,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
             "gex: {} at pc={pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
             if reg == gex_kernel::ppc::SYSREG_MFFS_STRICT { "mffs under GEX_FP_STRICT" } else { "non-default FP rounding mode" },
         ));
-        with_host(|h| set_exit(h, 128 + 4));
+        set_exit(128 + 4);
         trap();
     }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
@@ -12600,7 +12616,7 @@ fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
     if nt::active() {
         nt::fault(ctx, gex_kernel::nt::Fault::LowWrite(addr), pc);
     }
-    with_host(|h| set_exit(h, 128 + 11));
+    set_exit(128 + 11);
     trap();
 }
 
@@ -13349,7 +13365,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
             Err(_) => {
                 warn_line("gex: corrupt signal frame on sigreturn\n");
-                with_host(|h| set_exit(h, 128 + 11));
+                set_exit(128 + 11);
             }
         }
         trap();
@@ -13428,7 +13444,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
                 ));
             }
-            set_exit(h, 128 + 11);
+            set_exit(128 + 11);
         });
         trap();
     }
@@ -13552,7 +13568,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             for chunk in chain.chunks(16) {
                 warn_line(&format!("gex-eject:   {}\n", chunk.join(" ")));
             }
-            set_exit(h, 128 + 11);
+            set_exit(128 + 11);
         });
         trap();
     }
@@ -14317,7 +14333,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             ));
         });
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
     }
     trap();
 }
@@ -15899,33 +15915,33 @@ pub extern "C" fn gex_dump_state() {
 /// lets the Worker call it unconditionally on its way out.
 #[no_mangle]
 pub extern "C" fn gex_abandon(code: i32) {
-    if gex_has_host() == 0 {
+    // No kernel lock: the end is claimed as `exit_process` claims it, and a
+    // process already ending (or with a status) is left to that.
+    let Some(home) = sigs::home() else { return };
+    if home.exit().status().is_some() || !home.exit().claim() {
         return;
     }
-    with_host(|h| {
-        let pid = h.kernel.pid;
-        if h.exit.is_some() {
-            return;
+    let pid = home.pid();
+    trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+    // The descriptors, on the same terms as `exit_process`: a status alone
+    // ends a `wait4` and nothing else. A parent reading a dead child's pipe
+    // -- which is every `$(...)`, and every apt method -- is not waiting on
+    // the status, it is waiting for the end of file that only the last close
+    // of the write end produces. Without this the pipe keeps a writer that
+    // no longer exists and the parent's `read` never returns: the run wedges
+    // one process further along than the one that died, which is the shape
+    // that made a lifter fault in a forked child look like a hang in `apt`.
+    if let Some(fds) = fds_free() {
+        fds.close_all();
+    }
+    // SAFETY: takes a scalar and borrows nothing here.
+    unsafe {
+        if k_present() != 0 {
+            k_pipe_forget(pid);
+            k_pty_forget(pid);
         }
-        trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
-        // The descriptors, on the same terms as `exit_process`: a status alone
-        // ends a `wait4` and nothing else. A parent reading a dead child's pipe
-        // -- which is every `$(...)`, and every apt method -- is not waiting on
-        // the status, it is waiting for the end of file that only the last close
-        // of the write end produces. Without this the pipe keeps a writer that
-        // no longer exists and the parent's `read` never returns: the run wedges
-        // one process further along than the one that died, which is the shape
-        // that made a lifter fault in a forked child look like a hang in `apt`.
-        h.kernel.fds.close_all();
-        // SAFETY: takes a scalar and borrows nothing here.
-        unsafe {
-            if k_present() != 0 {
-                k_pipe_forget(pid);
-                k_pty_forget(pid);
-            }
-        }
-        publish_exit(h, pid, code);
-    });
+    }
+    publish_exit(pid, code);
 }
 
 /// Make this process's exit visible to its parent (`wait4`, `waitid`,
@@ -15934,17 +15950,69 @@ pub extern "C" fn gex_abandon(code: i32) {
 /// messages, which nothing orders against another Worker's), so a parent that
 /// waited for this process could otherwise print before this process's last
 /// output did.
-fn publish_exit(h: &mut Host, pid: i32, status: i32) {
+fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
-    h.kernel.procs.exit(pid, status);
+    if let Some(home) = sigs::home() {
+        home.procs().exit(pid, status);
+    }
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
-fn set_exit(h: &mut Host, code: i32) {
-    h.exit = Some(code);
+fn set_exit(code: i32) {
+    if let Some(home) = sigs::home() {
+        home.exit().record(code);
+    }
     set_exited(true);
     waitq::wake_process();
+}
+
+/// How a process ended, decided once and read with no lock (L24): the
+/// status the Worker reports (`gex_exit_code`), and whether a thread has
+/// claimed the end (`exit_process`). One per process, in its `Home`.
+pub(crate) struct ExitState {
+    /// The status, or [`ExitState::NONE`].
+    status: std::sync::atomic::AtomicI64,
+    /// Whether the end has been claimed: its teardown runs once.
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl ExitState {
+    const NONE: i64 = i64::MIN;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            status: std::sync::atomic::AtomicI64::new(Self::NONE),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The status recorded, if any.
+    pub(crate) fn status(&self) -> Option<i32> {
+        let v = self.status.load(std::sync::atomic::Ordering::Acquire);
+        (v != Self::NONE).then_some(v as i32)
+    }
+
+    /// Record the status (the latest recorded is the one reported).
+    pub(crate) fn record(&self, code: i32) {
+        self.status.store(code as i64, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Claim the end: true for exactly one caller.
+    pub(crate) fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Whether the end is claimed, or a status recorded: someone is ending,
+    /// or has ended, the process.
+    pub(crate) fn over(&self) -> bool {
+        self.claimed.load(std::sync::atomic::Ordering::Acquire) || self.status().is_some()
+    }
+}
+
+/// This process's [`ExitState`]'s status, if it has one.
+fn exit_status() -> Option<i32> {
+    sigs::home().and_then(|h| h.exit().status())
 }
 
 /// Record that this process is gone, for one that crashed without saying so: a
@@ -15965,11 +16033,9 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         // already recorded the exit; the remote process table accepts this
         // idempotently and, crucially, wakes the parent's wait4.
         let pid = my_pid();
-        with_host(|h| {
-            if h.exit.is_none() {
-                publish_exit(h, pid, status);
-            }
-        });
+        if !sigs::home().is_some_and(|h| h.exit().over()) {
+            publish_exit(pid, status);
+        }
         return 0;
     }
     set_exited(true);
@@ -15984,7 +16050,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
             0
         }
     };
-    with_host(|h| publish_exit(h, pid, status));
+    publish_exit(pid, status);
     warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
     ));

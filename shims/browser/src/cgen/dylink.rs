@@ -262,7 +262,7 @@ pub extern "C" fn gex_wasmprog_ready() -> i32 {
     let r = lock(&DYPROC).as_ref().map(|p| p.link.write_registry(crate::guest_bytes(), &order, libc));
     if let Some(Err(e)) = r {
         crate::warn_line(&format!("gex: wasm32 program: {e:#}\n"));
-        crate::with_host(|h| crate::exit_process(h, 127));
+        crate::exit_process(127);
         return -1;
     }
     0
