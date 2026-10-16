@@ -364,6 +364,8 @@ const host = new ProcessHost({
     unitCache: process.env.GEX_UNIT_CACHE === '0' ? undefined : 1,
     // GEX_SHARE_TRACE=1: how compiled modules are shared, host side too.
     shareTrace: process.env.GEX_SHARE_TRACE ? 1 : undefined,
+    // GEX_LOG=1: gex's debug output (log.mjs); Workers see the environment too.
+    log: process.env.GEX_LOG || undefined,
     fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
     // GEX_XCACHE=name (with GEX_XCACHE_DIR): the translation cache across
     // runs (docs/gexcc.md §8), saved under that name.

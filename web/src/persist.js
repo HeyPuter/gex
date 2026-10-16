@@ -12,6 +12,7 @@
 // next snapshot fixes it (pewasm's syncfs has the same window).
 
 import { openDb, readAll } from './persist-db.js';
+import { logOn } from '@gex/log.mjs';
 
 export async function restore(dbName, root) {
   try {
@@ -41,7 +42,7 @@ export function persist(dbName, root, spec, { every = 30000, onSync = null } = {
     if ('synced' in m) {
       busy = false;
       if (m.error) console.warn(`[persist] snapshot failed: ${m.error}`);
-      else if (m.wrote || m.removed) console.log(`[persist] stored ${m.wrote} file(s) (${m.bytes} bytes), removed ${m.removed}; ${m.files} under ${root}`);
+      else if ((m.wrote || m.removed) && logOn('debug')) console.log(`[persist] stored ${m.wrote} file(s) (${m.bytes} bytes), removed ${m.removed}; ${m.files} under ${root}`);
       onSync?.(m);
       waiters.get(m.synced)?.(m);
       waiters.delete(m.synced);

@@ -822,6 +822,7 @@ fn run_program_with(
     inherited: Option<Inherited>,
     nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
+    let fresh_process = inherited.is_none();
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
     // decoded in compatibility mode, and the kernel below speaks its ABI.
@@ -1117,6 +1118,10 @@ fn run_program_with(
             let maps = gex_kernel::CodeMap::of_placed(path, &bytes, program.interp_base());
             kernel.mem.lock().log.new_code.extend(maps);
         }
+    }
+    // The first program (an exec says its own, `exec_program`).
+    if fresh_process {
+        note_exec(kernel.pid, opts.args.first().map_or("(program)", |a| a.as_str()), &opts.args);
     }
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
@@ -2634,6 +2639,39 @@ fn host_exec(req: &ExecRequest, kernel: &Kernel) -> Result<Option<Exit>> {
 
 /// Load and run the program `execve` asked for, keeping the process.
 #[allow(clippy::too_many_arguments)]
+/// `GEX_LOG` set (to anything but `0`): gex's debug narration, which is off
+/// by default. By default gex says only a process starting, a library loaded
+/// for the first time in this run, and what went wrong.
+pub(crate) fn log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_LOG").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// One of the default lines: a process starting, the file it runs and its
+/// arguments (the page says the same, shims/browser `note_exec`).
+fn note_exec(pid: i32, path: &str, argv: &[String]) {
+    let mut args: String = argv.iter().skip(1).map(|a| format!(" {a}")).collect();
+    if args.len() > 200 {
+        let mut cut = 200;
+        while !args.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        args.truncate(cut);
+        args.push_str("...");
+    }
+    eprintln!("[gex] pid {pid}: exec {path}{args}");
+}
+
+/// One of the default lines: a library (a Wine DLL, a wasm32 module) loaded
+/// for the first time in this gexc, once rather than once per process.
+pub(crate) fn note_library(path: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(path.to_string()) {
+        eprintln!("[gex] loaded {path}");
+    }
+}
+
 fn exec_program(
     req: ExecRequest,
     opts: &RunOptions,
@@ -2660,6 +2698,7 @@ fn exec_program(
         &|p| kernel.read_file(p),
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
+    note_exec(kernel.pid, &req.path, &req.argv);
     // What the translators knew of the old image is about addresses the new
     // one holds now.
     let mut xlate = xlate.clone();
@@ -3811,6 +3850,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.mem.lock().log.new_code));
             profile::note_mapped(caller.data_mut(), &mapped);
+            // Shared objects only: Wine maps its server's shared memory
+            // (`/tmp/.wine-*/tmpmap-*`) executable too.
+            for m in &mapped {
+                let name = m.path.rsplit('/').next().unwrap_or("");
+                if m.path.starts_with('/') && (name.ends_with(".so") || name.contains(".so.")) {
+                    note_library(&m.path);
+                }
+            }
             // A library a stateful provider replaces (stream U): bound before
             // the loader can call into it.
             libprov::on_linux_maps(&mut caller, &mapped)?;

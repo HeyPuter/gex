@@ -6,6 +6,7 @@
 // waiting on.
 
 import { client } from '@mercuryworkshop/wisp-js/client';
+import { logOn } from '@gex/log.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -166,13 +167,14 @@ export class WispNetwork {
       if (!s.firstRecv) {
         s.firstRecv = now;
         const waited = s.firstSend ? (now - s.firstSend) / 1000 : -1;
-        console.info(
+        // Per-stream timing: debug output (GEX_LOG, `?log=1`).
+        if (logOn('debug')) console.info(
           `[wisp] stream ${id}: first reply at ${(now / 1000).toFixed(1)}s, `
           + `${waited.toFixed(1)}s after the request`,
         );
       }
       if (meter.last && now - meter.last > 1000) {
-        console.info(
+        if (logOn('debug')) console.info(
           `[wisp] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
           + `after ${meter.n} messages and `
           + `${(meter.bytes / 1048576).toFixed(1)} MiB`,
@@ -221,7 +223,7 @@ export class WispNetwork {
     // drains.
     s.sends = (s.sends ?? 0) + 1;
     if (!s.firstSend) s.firstSend = performance.now();
-    console.info(
+    if (logOn('debug')) console.info(
       `[wisp] stream ${id}: send ${s.sends}, ${bytes.length} bytes at `
       + `${(performance.now() / 1000).toFixed(1)}s`,
     );

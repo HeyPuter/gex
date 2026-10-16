@@ -552,6 +552,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "image_mapped", |mut caller: Caller<'_, HostState>, base: i32, fd: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let base = base as u32 as u64;
         let Some(path) = caller.data_mut().with_kernel(|k| k.fds.get(fd).ok().map(|f| f.path.clone())) else { return Ok(()) };
+        crate::note_library(&path);
         let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&path)) else { return Ok(()) };
         let Ok(pe) = gex_ld::pe::parse(&bytes) else { return Ok(()) };
         let (shared, engine) = {

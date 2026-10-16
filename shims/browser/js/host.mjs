@@ -10,6 +10,8 @@
 // Narration under node goes to stderr: node's console.debug is stdout, the
 // guest's own output there. In a page it stays on the debug console.
 function narrate(text) {
+  // Debug output, off unless GEX_LOG (`?log=1`) asks for it (log.mjs).
+  if (!logOn('debug')) return;
   const stderr = typeof process !== 'undefined' ? process.stderr : null;
   if (stderr?.write) stderr.write(`${text}\n`);
   else console.debug(text);
@@ -22,6 +24,38 @@ function narrate(text) {
  * scraping, which fails open. See task 146.
  */
 import { single } from './single.mjs';
+import { logOn } from './log.mjs';
+
+/** A line gex says by default (log.mjs): to stderr under Node, else the
+ *  console's info level. */
+function inform(text) {
+  const fs = typeof process !== 'undefined' ? process.getBuiltinModule?.('fs') : null;
+  if (fs?.writeSync) {
+    try { fs.writeSync(2, `${text}\n`); return; } catch {}
+  }
+  console.info(text);
+}
+
+// A library or image loaded for the first time this session, said once
+// rather than once per process (each Wine process maps the same dozen DLLs).
+// Every Worker says what it installs on the 'gex-fetch' channel
+// (fetch-note.mjs `noteStatus`); this side keeps the set.
+const libsSeen = new Set();
+let libChannel = null;
+function watchLibraries() {
+  if (libChannel || typeof BroadcastChannel !== 'function') return;
+  libChannel = new BroadcastChannel('gex-fetch');
+  // Under Node an open channel keeps the event loop alive.
+  libChannel.unref?.();
+  libChannel.onmessage = (ev) => {
+    const st = ev.data?.status;
+    if (!st || (st.kind !== 'module' && st.kind !== 'unit') || !st.path) return;
+    const path = String(st.path).replace(/^wasm(dll|prog):/, '');
+    if (libsSeen.has(path)) return;
+    libsSeen.add(path);
+    inform(`[gex] loaded ${path}${st.kind === 'unit' ? (st.hit ? ' (with its unit)' : ' (no unit)') : ''}`);
+  };
+}
 
 function crashed(what) {
   try {
@@ -305,6 +339,11 @@ export class ProcessHost {
    * when it exits -- a page done with a program is done with its daemons.
    */
   async start({ elf, files = {}, args = [], opts = {}, transfer = [] }) {
+    watchLibraries();
+    // One of the few default lines: what pid 1 runs. Its execs say their own
+    // (the shim's `do_exec`).
+    const what = [opts.argv0, ...args].filter((a) => typeof a === 'string' && a).join(' ');
+    inform(`[gex] pid 1: start ${what.length > 200 ? `${what.slice(0, 200)}...` : what || '(program)'}`);
     const status = await this.#spawn(1, {
       kind: 'run',
       elf,
@@ -689,7 +728,7 @@ export class ProcessHost {
         // The wineserver's door (docs/wineserver-kernel.md): every Worker of
         // the session, now and later, gets the server's memory and module.
         this.#door = m.door;
-        console.error(`[host] wineserver pid ${m.door?.pid} published its door`);
+        narrate(`[host] wineserver pid ${m.door?.pid} published its door`);
         for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
         break;
       }
@@ -932,7 +971,7 @@ export class ProcessHost {
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, guarded so the Node harness
         // (which prints its own) does not double up.
-        if (typeof window !== 'undefined' && m.millis !== undefined) {
+        if (typeof window !== 'undefined' && m.millis !== undefined && logOn('debug')) {
           // How long the process existed, against what it can account for.
           const lived = this.#asked.has(pid)
             ? Math.round(performance.now() - this.#asked.get(pid))

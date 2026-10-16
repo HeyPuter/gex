@@ -13,6 +13,8 @@
 # Needs ~/toolchains/aarch64-linux-musl-cross (GEX_TOOLCHAIN) and the shared
 # browser build in web/public/gex (shims/browser/build.sh with GEX_SHARED=1).
 set -u
+# The lines checked below ("function tier for", "replaced by") are debug output.
+export GEX_LOG=${GEX_LOG:-1}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 gexc=$(realpath "${1:-$root/target/release/gexc}")

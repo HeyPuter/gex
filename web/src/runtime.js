@@ -999,6 +999,9 @@ async function runProgramHere(
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,
+      // `?log=1` (or `?log=record,...`): gex's debug output, off by default
+      // (shims/browser/js/log.mjs); every Worker is handed it.
+      log: (globalThis.GEX_LOG ??= flag('log') || undefined) || undefined,
       preModules: preModules ?? undefined,
       // `?forkskip=N`, in `extra` because the process that acts on it is a
       // forked child, not the page's own.

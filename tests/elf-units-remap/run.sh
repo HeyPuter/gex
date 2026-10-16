@@ -9,6 +9,8 @@
 #
 #   tests/elf-units-remap/run.sh [gexc]      (needs gcc; host glibc as the guest's)
 set -u
+# The lines checked below ("function tier for", "replaced by") are debug output.
+export GEX_LOG=${GEX_LOG:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 W=${WORK:-$(mktemp -d)}

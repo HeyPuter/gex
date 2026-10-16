@@ -70,6 +70,7 @@ import { setFill, fillFile } from './lazy-fetch.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
+import { setLog } from './log.mjs';
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -215,6 +216,8 @@ function closureModules(n) {
 }
 
 async function handle(msg) {
+  // GEX_LOG from the page (`extra.log`): a Worker sees neither its globals nor its query.
+  setLog(msg?.log);
   if (msg?.kind === 'closureMeta') {
     // Registration only: which library owns which page. The compiled module
     // for each is asked for when a branch lands in it.

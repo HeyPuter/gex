@@ -14,6 +14,7 @@ const GUEST_BYTES = 0xffff0000;
 import { lazyFetch } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
+import { logOn } from "./log.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -305,7 +306,8 @@ const FILL_AT = 'gexfillat';
 // The shim's debug channel. A heartbeat line gets this isolate's own memory
 // figures appended at node (GEX_MEMSTATS): a Worker's wasm memories and heap,
 // which the main thread's `process.memoryUsage()` cannot see.
-function debugLine(text) {
+function debugLine(text, traced = false) {
+  if (!traced && !logOn('debug')) return;
   if (typeof process !== 'undefined' && process.env?.GEX_MEMSTATS && text.startsWith('[beat]')) {
     try {
       const m = process.memoryUsage();
@@ -317,13 +319,20 @@ function debugLine(text) {
       }
     } catch {}
   }
-  narrate(text);
+  narrateAlways(text);
 }
 
 // Narration under node goes to stderr: node's console.debug is stdout, which
 // is the guest's own output there (an ejected program's, a test's compared
 // output). In a page it stays on the debug console.
 export function narrate(text) {
+  // Debug output, off unless GEX_LOG (`?log=1`) asks for it (log.mjs).
+  if (!logOn('debug')) return;
+  narrateAlways(text);
+}
+
+/** `narrate` whatever GEX_LOG says: a `--strace` the run asked for. */
+function narrateAlways(text) {
   // Synchronously where there is a file descriptor to write to. A node
   // Worker's `process.stderr` is flushed by its event loop. A Worker parked
   // in wasm on its wait slot until its process ends never turns that loop, so
@@ -778,6 +787,8 @@ export class Gex {
   // Worker, not per process: tables belong to an instance, so every thread
   // starts empty however much the process has translated.
   #installed = 0;
+  // This process narrates its syscalls (`?strace=1`): the shim's debug lines are wanted.
+  #traced = false;
   // What compiling and instantiating shared modules costs. See
   // `#installModuleInner`.
   #installMs = 0;
@@ -1350,10 +1361,12 @@ export class Gex {
         },
         // The shim's own narration, to the console -- never to the guest's
         // output, which shares fd 2 with a terminal a person is reading.
-        debug: (ptr, len) => debugLine(
+        // Off unless GEX_LOG asks, or this process is traced (`--strace`).
+        debug: (ptr, len) => (this.#traced || logOn('debug')) && debugLine(
           utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
+          this.#traced,
         ),
         warn: (ptr, len) => {
           const text = utf8(
@@ -1364,6 +1377,20 @@ export class Gex {
           if (text.startsWith('[gex-note] ')) {
             console.warn(text.slice(11));
             return;
+          }
+          // `[gex-info] `: one of the few things said by default (a process
+          // starting, log.mjs): information, not a warning.
+          if (text.startsWith('[gex-info] ')) {
+            console.info(`[gex] ${text.slice(11)}`);
+            return;
+          }
+          // The shim's own per-library line, said once per session instead
+          // (the host's `loaded` line, from `noteStatus`).
+          // Said to the host, which says it the first time in the session.
+          const dll = /^gex-nt: native wasm32 module for (\S+): /.exec(text);
+          if (dll) {
+            this.#env.noteStatus?.({ kind: 'module', path: dll[1] });
+            if (!logOn('debug')) return;
           }
           // `[gex-stack]`: the shim wants to be told who called it (the wasm
           // frames are named).
@@ -1567,7 +1594,7 @@ export class Gex {
       xlateReport: opts.xlateReport, discoverSkip: opts.discoverSkip, t1Fold: opts.t1Fold,
     };
     syncSlotShift(this.#shim.exports);
-    if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    if (opts.strace) { this.#shim.exports.gex_set_trace(1); this.#traced = true; }
     // An ejected project without a JIT fallback: a miss on code its build
     // never saw fails loudly instead of translating.
     if (opts.jit === false) {
@@ -2440,7 +2467,11 @@ export class Gex {
         const text = utf8(this.#bytes().slice(p, p + n));
         // Only when it has stopped changing: a wedged process repeats the same
         // wait forever, which is the signal; a busy one churns through them.
-        if (text === last) narrate(`[gex] quiet: ${text}${single.on ? ` js=${this.#where}/installs=${this.#installs}/pending=${e.gex_jit_pending_len() >>> 0}` : ''}`);
+        // Debug output: an idle process (a shell at its prompt, Wine's
+        // services) is as quiet as a wedged one.
+        if (text === last) {
+          narrate(`[gex] quiet: ${text}${single.on ? ` js=${this.#where}/installs=${this.#installs}/pending=${e.gex_jit_pending_len() >>> 0}` : ''}`);
+        }
         last = text;
       }
       e.gex_free?.(p, 512);
@@ -2709,7 +2740,7 @@ export class Gex {
   #childOpts(e, o, pid) {
     // `?strace=1` narrates every process; `?stracepid=N` only that one, which
     // is what a run that must stay alive can afford.
-    if (o.strace || (o.stracePid && o.stracePid === pid)) e.gex_set_trace(1);
+    if (o.strace || (o.stracePid && o.stracePid === pid)) { e.gex_set_trace(1); this.#traced = true; }
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
@@ -3854,7 +3885,7 @@ export class Gex {
     // native wasm32 modules a session ran.
     if (wasmdll) {
       const file = this.#cgenStr(e.gex_cgen_pmod_file, prov);
-      console.warn(`[gex-record] module ${file} ${pkey.slice(5)}`);
+      if (logOn('record')) console.warn(`[gex-record] module ${file} ${pkey.slice(5)}`);
       // The same, structured: a native module (a Wine builtin), a process's
       // program when it is an .exe (fetch-note.mjs).
       const path = file.replace(/^wasm(dll|prog):/, '');
@@ -5352,9 +5383,9 @@ export class Gex {
     const got = this.#env.loadUnit?.(key) ?? null;
     // For gex-eject's W3 recorder: which image each unit is, and which images
     // had none; and which program this process is, at its main image.
-    console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
+    if (logOn('record')) console.warn(`[gex-record] unit ${key} ${got ? 'hit' : 'miss'} ${path}`);
     const program = /\.exe$/i.test(path) ? this.cmdline : undefined;
-    if (program !== undefined) console.warn(`[gex-record] process ${path} :: ${program}`);
+    if (program !== undefined && logOn('record')) console.warn(`[gex-record] process ${path} :: ${program}`);
     // The same, structured, for the page's start-up status (fetch-note.mjs).
     this.#env.noteStatus?.({ kind: 'unit', key, path, hit: !!got, program });
     if (!got) {
@@ -5365,11 +5396,11 @@ export class Gex {
     if (this.#cgenPublish(u, key, path, got) === 1) {
       // Another thread of this process took the same wanted unit first and
       // publishes it (and its providers and region entries); installed here.
-      console.error(`gex-nt: function tier for ${path}: placed by another thread`);
+      if (logOn('unit')) console.error(`gex-nt: function tier for ${path}: placed by another thread`);
       return;
     }
     this.#cgenProviders(u);
-    console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    if (logOn('unit')) console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     this.#cgenRegions(u, path);
   }
 
