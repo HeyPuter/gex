@@ -185,8 +185,14 @@ if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/wineway
 			check glwindow 0 "shown${nl}frames [0-9]+${nl}bye" glwindow.exe 3
 	fi
 fi
-# W64.1b: data above 2 GiB, code below it (highdata.c)
-if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
+# W64.1b: data above 2 GiB, code below it (highdata.c). Not in the page:
+# there the shim's heap is the upper 2 GiB of the process's memory, and the
+# guest gets just under 2 GiB (GUEST_LIMIT 0x7fff0000; about 1975 MiB
+# allocates). It needs the memory64 page (W64.7).
+if [ -n "$page" ]; then
+	case " ${CASES:-highdata} " in *" highdata "*)
+		echo "skip x64/highdata ($tag): the page's guest has under 2 GiB until W64.7" ;; esac
+elif x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 	check highdata 0 "$allok" "$w/highdata.exe"
 	# the refusal says why, in Wine's log
 	case " ${CASES:-highdata} " in *" highdata "*)

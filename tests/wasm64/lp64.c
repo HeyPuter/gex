@@ -10,7 +10,10 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <linux/futex.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -54,6 +57,17 @@ int main(void)
 	 * statx): Wine refuses a prefix it does not own */
 	struct stat ps;
 	printf("pipe owned by getuid %d\n", fstat(p[0], &ps) == 0 && ps.st_uid == getuid() && ps.st_gid == getgid());
+	/* int arguments through variadic syscall(): on wasm64 each takes 4 bytes
+	 * unless widened at the call (musl wasm64's unistd.h), and futex read
+	 * the timeout pointer as its value (Wine's SRW/condition-variable spin) */
+	int word = 5;
+	struct timespec ms = { 0, 1000000 };
+	long r1 = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 5, &ms, 0, 0);
+	int e1 = errno;
+	long r2 = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 6, &ms, 0, 0);
+	int e2 = errno;
+	printf("futex int args: same value %s, other value %s\n", r1 == -1 && e1 == ETIMEDOUT ? "timed out" : "wrong",
+	       r2 == -1 && e2 == EAGAIN ? "EAGAIN" : "wrong");
 	long big = 1L << 40;
 	printf("long arithmetic %ld\n", big / 3);
 	return 0;
