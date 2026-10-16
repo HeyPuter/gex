@@ -493,27 +493,25 @@ Lock sites in shims/browser/src: 54 on L23, 31 after L24, 16 after L24b,
 14 after L25b, 4 after L25c, 3 after L26, 1 after L25f (the definitions
 not counted).
 
-Branches, each commit with its tests:
+Branch `l/l25` (scratch/L/wt-l25), on `l/klock-l12` (ed94bf6a), one
+commit per step with its tests:
 
-- `l/l23`: L22e's `adoptThread` compat (6ec7edf4) and L23, the thread
-  table (33fbca4c). Battery green (x86-programs 206, SP, a64, wasm32, w3
-  vmreuse and hookpage, k legs, NT 47).
-- `l/l24` (in scratch/L/wt-l22e): L24, process end as a once (023181a8;
-  battery green on its builds, `exit-threads.c` added); L24b, the
-  diagnostics and image reads through `Home` and `ProcCell` (dbda41c4);
-  L25a, exit, exit_group, wait4 and reboot on the free path (758850dc).
-- `l/l25` (in scratch/L/wt-l25), on `l/l24`:
-  - L25b (52610378): a thread's clone and clone3 on the free path
-    (`ThreadMaker`), `gex_adopt_thread` lock-free;
-  - L25c (6ab6be24): adoption and vfork without the lock
-    (`with_own_host`: a process has one owner until it is published);
-  - L26 (0e7bea0f): NT's `lock_kernel` gone (`nt::NtKernel`);
-  - L25d (9a965996): a wasm32 program's install;
-  - L25e (3a4b7ba4, 937a4d59): ppc32's calls, clocks and ids on the free
-    path, with a twin-kernel ppc32 comparison test;
-  - L25f (a01ec204): an unknown call answered ENOSYS, a clock or id call
-    answered, on the free path; the census tests;
-  - L25g (64978f6b): the exec lock.
+- 6ec7edf4: L22e, `adoptThread` sets nothing of its process's.
+- 33fbca4c: L23, the thread table (`ThreadTable`).
+- 023181a8: L24, process end as a once (`exit-threads.c`); c8649a6c: an
+  exit code asked during an end waits for the end's status (the kernel
+  lock used to make it wait; main-thread-exit read 0 under load).
+- dbda41c4: L24b, the crash reports and image reads through `Home`.
+- 758850dc: L25a, exit, exit_group, wait4 and reboot on the free path.
+- 52610378: L25b, a thread's clone and clone3 (`ThreadMaker`).
+- 6ab6be24: L25c, adoption and vfork (`with_own_host`).
+- 0e7bea0f: L26, NT's `lock_kernel` gone (`nt::NtKernel`).
+- 9a965996: L25d, a wasm32 program's install.
+- 3a4b7ba4, 937a4d59, b4d5ecac: L25e, ppc32's calls, clocks, ids and
+  dup2 on the free path; 4ffda597, its twin-kernel comparison test.
+- a01ec204: L25f, an unknown call answered ENOSYS, a clock or id call
+  answered, on the free path; a4556b16, 5900b0e8, the census tests.
+- 64978f6b: L25g, the exec lock.
 
 Left:
 
