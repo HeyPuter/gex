@@ -627,7 +627,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             // loop would unwind every wasm frame, which under the function
             // table means every caller resumes at an interior address.
             let cx = state.spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
-            super::start_guest_thread(cx, ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 })?;
+            super::start_guest_thread(cx, ThreadState { ctx_addr: child, tid: gex_tid })?;
             Ok(())
         }
         // The result is with the thread; unwinding here ends the innermost

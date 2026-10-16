@@ -404,6 +404,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
             socket_names: &home.socket_names,
             host_names: &home.host_names,
         },
+        thread_fs: &home.thread_fs,
     };
     syscalls::free_call(&f, gm, ctx_addr, call)
 }

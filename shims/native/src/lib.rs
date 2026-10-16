@@ -509,9 +509,7 @@ impl HostState {
         let shared = Arc::clone(&self.kernel);
         let mut k = shared.lock().unwrap_or_else(|e| e.into_inner());
         k.enter_thread(&self.thread);
-        let r = f(&mut k);
-        k.leave_thread(&mut self.thread);
-        r
+        f(&mut k)
     }
 }
 
@@ -3893,18 +3891,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     );
                     Err(StopExecution.into())
                 }
-                SyscallOutcome::SpawnThread {
-                    ctx_addr,
-                    tid,
-                    clear_child_tid,
-                } => {
+                SyscallOutcome::SpawnThread { ctx_addr, tid } => {
                     // Started here, and the caller carries on (the child
                     // gets a store of its own; nothing of this one is
                     // borrowed). Leaving for the run loop would unwind every
                     // wasm frame, which under the function table means every
                     // caller resumes at an interior address.
                     let cx = state.spawn.clone().ok_or_else(|| anyhow!("clone with no spawn context"))?;
-                    start_guest_thread(cx, ThreadState { ctx_addr, tid, clear_child_tid })?;
+                    start_guest_thread(cx, ThreadState { ctx_addr, tid })?;
                     Ok(())
                 }
                 SyscallOutcome::Blocking(_) => {

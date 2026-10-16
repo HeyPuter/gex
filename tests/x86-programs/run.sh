@@ -136,6 +136,14 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # sigwait-threads: sigwaitinfo and sigtimedwait that wait, taking SIGUSR1s
 # sent by tgkill, by kill to two waiters, and by a child; a timeout that
 # says EAGAIN after its time, and a wait a handled signal interrupts.
+# tid-threads: pthreads that name a word of their own with set_tid_address
+# while others are made and joined; each named word is cleared and woken by
+# its thread's exit, the rest are left alone (L22e: the calls on a thread's
+# own state without the kernel lock).
+# mount-threads: four threads mount, fill and unmount tmpfs's of their own
+# while one thread's mount is filled and unmounted by another (L22e: mount
+# and umount2 without the kernel lock, through the namespace's published
+# view). Natively it needs an unprivileged user namespace (unshare -rm).
 # fork-maps-threads (native tiers only for now): forks while other threads
 # map, protect and unmap memory and files (L19: a fork's image, code names
 # and the translator's file reads come from the published map, not the
@@ -146,7 +154,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # poll-timeout: poll, ppoll, select and epoll_wait ended only by their
 # 100 ms deadline, after the stack went back to the page (the clock scope a
 # trap left open froze the clock, and they never returned).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

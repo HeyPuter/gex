@@ -7221,7 +7221,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     ));
                 }
             }
-            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
             h.threads[cur()].run().pc = entry;
             set_resume(entry);
             set_resume_ctx(kstate.ctx_addr);
@@ -7305,7 +7304,6 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
             stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
-        h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
@@ -7352,11 +7350,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 killed(h, signal as i32, at)
             }
-            SyscallOutcome::SpawnThread {
-                ctx_addr,
-                tid,
-                clear_child_tid,
-            } => {
+            SyscallOutcome::SpawnThread { ctx_addr, tid } => {
                 // The kernel has already written the child's context; it
                 // starts at the pc that context carries.
                 let start = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
@@ -7368,7 +7362,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // that says "not me". Without it two Workers would run the
                 // same context.
                 h.threads.push(Thread::new(
-                    ThreadState { ctx_addr, tid, clear_child_tid },
+                    ThreadState { ctx_addr, tid },
                     start,
                     Waiting::Elsewhere,
                 ));

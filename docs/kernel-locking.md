@@ -465,6 +465,77 @@ three at a time.
 After L26 the `HOST` static and `KLock` are deleted. The native
 `Mutex<Kernel>` (§3.11) goes last.
 
+#### Where this stands (2026-10-15, stream L parked)
+
+Done, on branch `l/klock-l12`. Each item is one commit with its tests:
+
+- L19 to L22d, the oflags fix and the integration-suite fix.
+- Blocking `rt_sigtimedwait` (3b2bc50c).
+- L22e:
+  - `set_tid_address` and `unshare` (2329d077). The word a thread's exit
+    clears is in its `ThreadSig`; `leave_thread` is gone.
+  - `mount` and `umount2` (9477b881). `VfsView` is the mount table's
+    one writer, and `Vfs::refresh` brings the kernel's copy up to date at
+    each locked call.
+
+After L22e the browser's locked syscall path (group A) carries only the
+lifecycle calls: clone, clone3, execve, exit, exit_group, wait4 and
+reboot. Those are L25.
+
+Written but not handed over, on branch `l/parked` (on top of 9477b881):
+
+- 7c9233e4: `adoptThread` no longer calls `gex_set_compat` (group G's
+  last two sites). What it set is process-wide, in the shared memory.
+  Only a child's adoption calls it now, once per process. Built and
+  type-checked; not yet run through the battery.
+- b48fb20a, L23 (group D): `Host::threads` becomes
+  `gex_atomic::threads::ThreadTable`. Slots are in chunks that never move,
+  claimed with one atomic add and published by storing the run state
+  last. The table is also held in `Home`. The censuses, the deadlock
+  report, `gex_dump_threads`, `gex_ctx_exited` and `all_futex_blocked`
+  read it without the lock. `RUNS`, `publish_runs` and `Thread` are gone.
+  Its unit test is in gex-atomic. It type-checks on the SP and MP builds
+  (a64 and x86), but none of its builds or page tests have run. Before
+  handing it over: build, run the threaded page programs (x86 m64, SP,
+  a64), and run the w3 page legs.
+
+What is left, in order:
+
+- L24 (E, process end): exit as a once. A CAS on the exit status, then
+  `halt_code` checked at free-path entry and at the end of a park.
+  Teardown runs as the RCU writer of the descriptor table, and the
+  status is published last. Sites: `set_exit`, `exit_process`,
+  `gex_process_gone`, `exit_here`, `gex_abandon`, `gex_exit_code`, and
+  `end_if_all_exited`, which still takes the lock at a thread's exit
+  (Linux and NT).
+- L25 (lifecycle and F): clone, clone3, execve, exit, exit_group, wait4
+  and reboot off the locked path, and the adoptions with them:
+  - `gex_adopt_thread`, whose `set_current` and `bind_mine` reach
+    `sigs::bind(&mut Kernel)`;
+  - `gex_adopt_child` and the child's `gex_set_compat`;
+  - `gex_vfork_*`.
+  A process has a single owner until it is published.
+- L26 (H, NT): `lock_kernel`'s 16 callers become accessors.
+- Then delete `HOST`, `with_host`, `with_host_free` and `KLock`, and last
+  the native `Mutex<Kernel>` (§3.11).
+
+How each subsystem has been checked:
+
+- Kernel tests on a64, x86 and ppc.
+- A `*-threads.c` program in tests/x86-programs, compared with native
+  under gexc (x86-64, i386, a64), in the m64 page, in SP x86 and in the
+  a64 page.
+- The x86-programs suite, wasm32, vmreuse, the w3 and k legs, and NT.
+
+Pitfalls these tests ran into:
+
+- musl's `clone()` refuses `CLONE_THREAD`.
+- musl releases its thread-list lock through the word the clone named. A
+  thread that moves its word with `set_tid_address` must end with a raw
+  `exit` and never be joined.
+- A mount test needs a user and mount namespace when run natively.
+- A loaded host needs waits of about 30 s.
+
 ## 4. Mechanisms specific to the page
 
 ### 4.0 One lock type, three builds
