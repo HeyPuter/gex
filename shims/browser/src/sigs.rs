@@ -72,6 +72,9 @@ pub(crate) struct Home {
     table: Arc<crate::Threads>,
     /// Its live thread count (`Kernel::live_threads`), for `exit` (L25a).
     live: Arc<std::sync::atomic::AtomicU32>,
+    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
+    /// `clone` (L25b).
+    slots: Arc<std::sync::atomic::AtomicU32>,
     /// How it ended, decided once (L24).
     exit: crate::ExitState,
     /// Its image, command line and environment as `/proc` shows them
@@ -127,6 +130,7 @@ fn home_of(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proc
         host_names: Arc::clone(&k.host_names),
         table: Arc::clone(table),
         live: Arc::clone(&k.live_threads),
+        slots: Arc::clone(&k.next_ctx_slot),
         exit: crate::ExitState::new(),
         image: Arc::clone(image),
     }
@@ -285,6 +289,21 @@ pub(crate) fn bind(k: &mut Kernel, tid: i32) {
     });
 }
 
+/// Make thread `tid`, one the process already has, this Worker's, with no
+/// kernel lock (a thread's adoption, L25b): its signal state from the
+/// process's table, where its `clone` put it; a thread made otherwise (an
+/// NT thread) gets one of its own, blocking nothing.
+pub(crate) fn bind_free(home: &Home, tid: i32) {
+    MINE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.as_ref().is_some_and(|(t, _)| *t == tid) {
+            return;
+        }
+        let own = home.threads.get_or_insert_with(tid, || Arc::new(ThreadSig::new_thread(0)));
+        *m = Some((tid, own));
+    });
+}
+
 /// Bring in what other processes have sent this one, when anyone has sent
 /// anything since this Worker last looked, and what its timers have raised.
 fn gather(home: &Home) {
@@ -427,6 +446,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         signals: &view,
         procs: &home.procs,
         live: &home.live,
+        slots: &home.slots,
         tty: &home.tty,
         pid: home.pid,
         creds: &home.creds,

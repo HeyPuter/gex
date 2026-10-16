@@ -7253,43 +7253,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 killed(signal as i32, at)
             }
-            SyscallOutcome::SpawnThread { ctx_addr, tid } => {
-                // The kernel has already written the child's context; it
-                // starts at the pc that context carries.
-                let start = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
-                // A Worker of its own. Always: a thread is a Worker here.
-                //
-                // The table entry is still this process's -- `join`, the
-                // futexes and `live_threads` are all counted here -- but the
-                // thread runs on another stack, and `Elsewhere` is the state
-                // that says "not me". Without it two Workers would run the
-                // same context.
-                h.threads.push(tid, ctx_addr, Mutex::new(Run::new(start, Waiting::Elsewhere)));
-                // From here the process has a second Worker, so translated
-                // modules must be kept for it to catch up. Until now they were
-                // not (see `gex_jit_installed`) -- so on this first edge, take
-                // back into the registry everything already installed, or a
-                // joining thread traps in the low startup pages the main Worker
-                // lifted before this clone (see `backfill_registry`).
-                if !h.jit.ever_threaded {
-                    backfill_registry(h);
-                    h.jit.ever_threaded = true;
-                    regview::set_threaded(true);
-                }
-                stage_thread(tid, ctx_addr, start);
-                if frames_stay() {
-                    // A wasm32 program's frames cannot be left: the call
-                    // returns, and `#wasmprogSyscall` starts the thread.
-                    WASM32_STAGED.with(|c| c.set(true));
-                    return 0;
-                }
-                // The stack goes back so the host can see the record and
-                // start the Worker, exactly as a `fork` does. The parent
-                // resumes where it was: `clone` returns the tid to it.
-                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
-                set_resume_ctx(h.threads[cur()].ctx_addr());
-                1
-            }
+            SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
                 end_if_all_exited();
@@ -8735,6 +8699,9 @@ pub(crate) fn my_tid() -> i32 {
 static THREAD: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// `THREAD[0]` while a stage writes the other two words (`stage_thread`).
+const STAGING: u64 = u64::MAX;
+
 // A thread is a Worker. There is no second shape.
 //
 // There used to be a `THREAD_WORKERS` switch and, behind it, a scheduler that
@@ -8749,6 +8716,50 @@ static THREAD: [std::sync::atomic::AtomicU64; 3] =
 // cannot start it. That is a loud failure rather than a quiet one, which is
 // the trade -- see `gex_thread_stage` and the host's side of it.
 
+/// A thread `clone` has made, by either path (L25b): into the thread table,
+/// staged for the host to give a Worker of its own, and the creator on
+/// after its `clone` (whose answer, the tid, is in its context). No kernel
+/// lock: the table claims a slot with an atomic add, the registry backfill
+/// is the JIT state's, and the stage is claimed by a swap. The stop value.
+fn thread_made(tid: i32, ctx_addr: u64, syscall_pc: u64) -> i32 {
+    // The kernel has already written the child's context; it starts at the
+    // pc that context carries.
+    let start = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    // A Worker of its own. Always: a thread is a Worker here.
+    //
+    // The table entry is still this process's -- `join`, the futexes and
+    // `live_threads` are all counted here -- but the thread runs on another
+    // stack, and `Elsewhere` is the state that says "not me". Without it two
+    // Workers would run the same context.
+    sigs::proc_home().table().push(tid, ctx_addr, Mutex::new(Run::new(start, Waiting::Elsewhere)));
+    // From here the process has a second Worker, so translated modules must
+    // be kept for it to catch up. Until now they were not (see
+    // `gex_jit_installed`) -- so on this first edge, take back into the
+    // registry everything already installed, or a joining thread traps in
+    // the low startup pages the main Worker lifted before this clone (see
+    // `backfill_registry`).
+    with_jit_only(|j| {
+        if !j.ever_threaded {
+            backfill_registry(j);
+            j.ever_threaded = true;
+            regview::set_threaded(true);
+        }
+    });
+    stage_thread(tid, ctx_addr, start);
+    if frames_stay() {
+        // A wasm32 program's frames cannot be left: the call returns, and
+        // `#wasmprogSyscall` starts the thread.
+        WASM32_STAGED.with(|c| c.set(true));
+        return 0;
+    }
+    // The stack goes back so the host can see the record and start the
+    // Worker, exactly as a `fork` does. The creator resumes where it was:
+    // `clone` returns the tid to it.
+    set_resume(syscall_pc + gex_abi::SYSCALL_INST_BYTES);
+    set_resume_ctx(my_ctx());
+    1
+}
+
 fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     // One slot, shared by every Worker. A second clone must not overwrite a
     // triple the claiming Worker has not finished reading: `gex_thread_pending`
@@ -8760,13 +8771,19 @@ fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     // returns straight to the JS that reads it), so this spins rarely and
     // briefly. Bounded only to turn a never-claimed slot into a loud message
     // rather than a silent hang under `KLock`.
+    // Without the kernel lock two Workers may stage at once: the slot is
+    // taken for writing by a swap from 0 to `STAGING`, which the claim
+    // (`gex_thread_pending`) passes over.
     let mut spins: u64 = 0;
-    while THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0 {
+    while THREAD[0]
+        .compare_exchange_weak(0, STAGING, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+        .is_err()
+    {
         core::hint::spin_loop();
         spins += 1;
         if spins == 1 << 30 {
             warn_line("gex: stage_thread: prior thread slot never claimed\n");
-            break;
+            spins = 0;
         }
     }
     THREAD[1].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
@@ -8794,6 +8811,11 @@ pub extern "C" fn gex_thread_pending() -> i32 {
         let tid = THREAD[0].load(std::sync::atomic::Ordering::Acquire);
         if tid == 0 {
             return 0;
+        }
+        // Being staged: a moment.
+        if tid == STAGING {
+            core::hint::spin_loop();
+            continue;
         }
         // Read the context words BEFORE claiming, then claim with a
         // compare-and-swap that also proves the tid did not change while they
@@ -8842,14 +8864,22 @@ pub extern "C" fn gex_thread_taken() {}
 #[no_mangle]
 pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     phase(9);
-    with_host(|h| {
-        let Some(i) = h.threads.position(tid) else {
-            return 0;
-        };
-        h.threads[i].run().waiting = Waiting::Runnable;
-        set_current(h, i);
-        h.threads[i].run().pc as i64
-    })
+    // No kernel lock (L25b): the thread table and the signal states lock
+    // themselves, and the binding is this Worker's own.
+    let Some(home) = sigs::home() else { return 0 };
+    let table = home.table();
+    let Some(i) = table.position(tid) else {
+        return 0;
+    };
+    let t = &table[i];
+    t.run().waiting = Waiting::Runnable;
+    CURRENT.with(|c| c.set(i));
+    MY_CTX.with(|c| c.set(t.ctx_addr()));
+    MY_TID.with(|c| c.set(tid));
+    MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
+    sigs::bind_free(home, tid);
+    let pc = t.run().pc;
+    pc as i64
 }
 
 /// Kept so a host built against the older shape still links; the claim in
@@ -9315,7 +9345,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     WASM32.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
-    h.kernel.next_ctx_slot = 1;
+    h.kernel.next_ctx_slot.store(1, std::sync::atomic::Ordering::Release);
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
@@ -10328,11 +10358,11 @@ fn shared_modules_of_object(
 /// impossible because the registry is empty until this runs -- the keep was
 /// gated off -- and every later module is a fresh id pushed by
 /// `gex_jit_installed`.
-fn backfill_registry(h: &mut Host) {
+fn backfill_registry(j: &mut Jit) {
     if unsafe { k_present() } == 0 {
         return;
     }
-    let ids: Vec<u32> = h.jit.installed_mods.iter().copied().collect();
+    let ids: Vec<u32> = j.installed_mods.iter().copied().collect();
     for id in ids {
         // SAFETY: `k_mod_len` sizes the buffer the `k_mod_read` below fills;
         // the kernel refuses rather than overruns when the two disagree.
@@ -10348,19 +10378,19 @@ fn backfill_registry(h: &mut Host) {
         let mut range = (0, 0);
         if dense::on() {
             if let Some(at) = gex_emit::dense::locate(&wasm) {
-                let Some(&base) = h.jit.dense_base.get(&id) else { continue };
+                let Some(&base) = j.dense_base.get(&id) else { continue };
                 gex_emit::dense::set_base(&mut wasm, &at, base);
                 range = (base, gex_emit::dense::section(&wasm, &at).map_or(0, |s| s.entries.len() as u32));
             }
         }
-        h.jit.registry_dense.push(range);
+        j.registry_dense.push(range);
         wasm.shrink_to_fit();
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        h.jit.registry_sums.push(chunk_sums(&wasm));
-        regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
-        h.jit.registry.push(wasm);
-        h.jit.registry_ext.push(None);
+        j.registry_sums.push(chunk_sums(&wasm));
+        regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
+        j.registry.push(wasm);
+        j.registry_ext.push(None);
     }
 }
 
@@ -11447,6 +11477,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             set_resume_ctx_none();
             3
         }
+        FreeOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
         FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
         // A wasm32 program's sigreturn put back a call its handler
         // interrupted: that call, made now as a syscall of its own (without

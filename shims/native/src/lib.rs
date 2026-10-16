@@ -1030,7 +1030,7 @@ fn run_program_with(
             k.argv = opts.args.clone();
             k.envp = opts.env.clone();
             k.live_threads.store(1, std::sync::atomic::Ordering::Release);
-            k.next_ctx_slot = 1;
+            k.next_ctx_slot.store(1, std::sync::atomic::Ordering::Release);
             (k, ps)
         }
         None => (

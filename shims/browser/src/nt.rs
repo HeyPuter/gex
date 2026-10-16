@@ -1266,16 +1266,17 @@ mod imp {
             }
             nt::Outcome::SpawnThread { ctx_addr: child, gex_tid } => {
                 let start = GuestMem::new(guest_bytes()).read_u64(child + ctx::PC as u64).unwrap_or(0);
-                with_host(|h| {
-                    // A Worker of its own, as a Linux clone gets: the entry
-                    // is this process's, the thread runs elsewhere.
-                    h.threads.push(gex_tid, child, Mutex::new(crate::Run::new(start, Waiting::Elsewhere)));
-                    if !h.jit.ever_threaded {
-                        backfill_registry(h);
-                        h.jit.ever_threaded = true;
+                // A Worker of its own, as a Linux clone gets: the entry is
+                // this process's, the thread runs elsewhere. No kernel lock:
+                // the thread table and the JIT state lock themselves (L25b).
+                crate::sigs::proc_home().table().push(gex_tid, child, Mutex::new(crate::Run::new(start, Waiting::Elsewhere)));
+                crate::with_jit_only(|j| {
+                    if !j.ever_threaded {
+                        backfill_registry(j);
+                        j.ever_threaded = true;
                     }
-                    stage_thread(gex_tid, child, start);
                 });
+                stage_thread(gex_tid, child, start);
                 if crate::aot() {
                     crate::cgen::drain();
                     // SAFETY: a host import without arguments.

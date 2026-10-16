@@ -747,8 +747,7 @@ pub fn create_thread_state(
         Some(s) => s,
         None => {
             let t = k.procs.new_tid(k.pid);
-            let s = k.next_ctx_slot;
-            k.next_ctx_slot += 1;
+            let s = k.next_ctx_slot.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             (s, t)
         }
     };

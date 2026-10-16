@@ -531,7 +531,8 @@ pub struct Kernel {
     /// PLAN §14.
     pub unimplemented: Vec<u64>,
     /// Next free register-context slot. Slot 0 is the initial thread's.
-    pub next_ctx_slot: u32,
+    /// Shared with the free path (`Free::slots`), which makes threads there.
+    pub next_ctx_slot: Arc<std::sync::atomic::AtomicU32>,
     /// Threads that have been created and not yet exited, including this one.
     /// Shared with the free path (`Free::live`), which ends a thread there.
     pub live_threads: Arc<std::sync::atomic::AtomicU32>,
@@ -4477,6 +4478,9 @@ pub struct Free<'a> {
     pub procs: &'a Arc<ProcTable>,
     /// The process's live thread count (`Kernel::live_threads`), for `exit`.
     pub live: &'a std::sync::atomic::AtomicU32,
+    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
+    /// `clone`.
+    pub slots: &'a std::sync::atomic::AtomicU32,
     /// The terminal (`Kernel::tty`, the same one for the process's life),
     /// for `ioctl`.
     pub tty: &'a crate::tty::TtyRef,
@@ -4517,6 +4521,10 @@ pub enum FreeOutcome {
     /// `exit` from one of several threads: its thread is over, the rest go
     /// on (as [`SyscallOutcome::ThreadExit`]).
     ThreadExit,
+    /// `clone` made a thread, its context written (the creator's answer,
+    /// the tid, is in the caller's), for the host to run (as
+    /// [`SyscallOutcome::SpawnThread`]).
+    SpawnThread { ctx_addr: u64, tid: i32 },
     /// A wasm32 program's `rt_sigreturn` put back a call its handler
     /// interrupted, to be made again now from the restored context, as a
     /// syscall of its own (`restart_call`).
@@ -4777,6 +4785,128 @@ fn reboot_halts(cmd: u64) -> Option<&'static str> {
 /// a list this process owns, so a child reparented here when its own parent
 /// died is one this `wait4` can collect. That is what makes pid 1 able to do
 /// its job.
+/// `clone` and `clone3` that make a thread (`CLONE_THREAD`), L25b: what
+/// they touch locks itself (the context slots and live count are atomics,
+/// the thread ids the process table's, the fs_structs and signal states
+/// their tables'). Canonical. A `clone` that makes a process is the host's
+/// (a second address space), decided by its flags ([`thread_clone_flags`]).
+pub fn is_thread_clone(n: u64) -> bool {
+    matches!(n, nr::CLONE | nr::CLONE3)
+}
+
+/// The flags of the `clone` or `clone3` with arguments `a`, if it makes a
+/// thread (`CLONE_THREAD`).
+fn thread_clone_flags(m: &GuestMem<'_>, n: u64, a: &[u64; 6]) -> Option<u64> {
+    let flags = if n == nr::CLONE3 { m.read_u64(a[0]).ok()? } else { a[0] };
+    (flags & clone_flags::THREAD != 0).then_some(flags)
+}
+
+/// `clone3`'s `struct clone_args` at `c`, as `clone`'s arguments
+/// (`[flags, sp, parent_tid, tls, child_tid, 0]`). Its `stack` is the
+/// allocation base and `stack_size` its length, but the thread starts on
+/// the top (the SP, which grows down). An i386 caller's `tls` is a `struct
+/// user_desc *`, as for its `clone` (`crate::i386`): the base is its second
+/// word.
+fn clone3_args(m: &GuestMem<'_>, c: u64, compat: bool) -> Result<[u64; 6], Errno> {
+    // flags@0, child_tid@16, parent_tid@24, stack@40, stack_size@48,
+    // tls@56 (aligned u64s).
+    let w = |o: u64| m.read_u64(c + o).map_err(|_| Errno::EFAULT);
+    let (flags, child_tid, parent_tid, stack, stack_size, tls) = (w(0)?, w(16)?, w(24)?, w(40)?, w(48)?, w(56)?);
+    let tls = if compat && !gex_abi::PPC && flags & clone_flags::SETTLS != 0 && tls != 0 {
+        m.read_u32(tls + 4).map(|b| b as u64).unwrap_or(0)
+    } else {
+        tls
+    };
+    Ok([flags, stack.wrapping_add(stack_size), parent_tid, tls, child_tid, 0])
+}
+
+/// What making a thread needs of its process (L25b), the same for the
+/// kernel's `clone` and the free path's.
+pub struct ThreadMaker<'a> {
+    pub procs: &'a ProcTable,
+    pub pid: i32,
+    pub compat: bool,
+    /// The next free register-context slot (`Kernel::next_ctx_slot`).
+    pub slots: &'a std::sync::atomic::AtomicU32,
+    /// The live thread count (`Kernel::live_threads`).
+    pub live: &'a std::sync::atomic::AtomicU32,
+    pub thread_fs: &'a ThreadFs,
+    pub threads: &'a crate::signal::ThreadSigs,
+    /// The creator's signal mask, which the new thread starts with.
+    pub blocked: u64,
+    /// The creator's fs_struct.
+    pub fs: &'a Arc<FsCwd>,
+}
+
+impl ThreadMaker<'_> {
+    /// Make a thread for `clone(a)` (`CLONE_THREAD`) called from the context
+    /// at `parent`: its context a copy of the caller's with the child's
+    /// answer (0), stack, tid and TLS, its id, its fs_struct and its own
+    /// signal state.
+    pub fn make(&self, m: &mut GuestMem<'_>, parent: u64, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
+        use std::sync::atomic::Ordering;
+        let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
+        if flags & clone_flags::THREAD == 0 {
+            return Err(Errno::ENOSYS);
+        }
+        if child_stack == 0 {
+            return Err(Errno::EINVAL);
+        }
+        // Contexts live in the reserved region below the guest's own memory;
+        // running out of slots is a hard limit, not something to paper over.
+        // A slot is claimed with one atomic add; one past the limit is
+        // never handed out.
+        let slot = self.slots.fetch_add(1, Ordering::AcqRel);
+        let child = ctx_addr(slot);
+        if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
+            self.slots.fetch_sub(1, Ordering::AcqRel);
+            return Err(Errno::EAGAIN);
+        }
+        // Numbered with the processes (`ProcTable::new_tid`).
+        let tid = self.procs.new_tid(self.pid);
+        for off in (0..ctx::SIZE).step_by(8) {
+            let v = m.read_u64(parent + off as u64)?;
+            m.write_u64(child + off as u64, v)?;
+        }
+        set_result(m, child, 0)?;
+        m.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
+        m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
+        m.write_u64(child + ctx::TID as u64, tid as u64)?;
+        if flags & clone_flags::SETTLS != 0 {
+            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
+            // one's base into %fs.
+            // PowerPC's thread pointer is r2.
+            let slot = if gex_abi::PPC {
+                ctx::x(2)
+            } else if self.compat {
+                ctx::TPIDRRO
+            } else {
+                ctx::TPIDR
+            };
+            m.write_u64(child + slot as u64, tls)?;
+        }
+        if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
+            m.write_u32(parent_tid, tid as u32)?;
+        }
+        if flags & clone_flags::CHILD_SETTID != 0 && child_tid != 0 {
+            m.write_u32(child_tid, tid as u32)?;
+        }
+        self.live.fetch_add(1, Ordering::AcqRel);
+        // Its fs_struct: its creator's with `CLONE_FS` (every pthread), a
+        // copy of it without.
+        let fs = if flags & clone_flags::FS != 0 { self.thread_fs.of(parent) } else { Some(Arc::new(self.fs.copy())) };
+        self.thread_fs.set(child, fs);
+        // The new thread's own state: its creator's mask, nothing pending,
+        // and with `CLONE_CHILD_CLEARTID` the word its exit clears.
+        let own = crate::signal::ThreadSig::new_thread(self.blocked);
+        if flags & clone_flags::CHILD_CLEARTID != 0 {
+            own.set_clear_child_tid(child_tid);
+        }
+        self.threads.insert(tid, Arc::new(own));
+        Ok(SpawnRequest { ctx_addr: child, tid })
+    }
+}
+
 fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
     BlockOp::WaitChild {
         // Nothing to hand out when the table is elsewhere; the host asks it
@@ -5265,7 +5395,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             // The quiet calls, as the translation numbers them (several
             // numbers become the do-nothing one).
             r => match crate::i386::canonical_number(r) {
-                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) || is_lifecycle_end(c) => c,
+                c if is_quiet(c, true) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) || is_lifecycle_end(c) || is_thread_clone(c) => c,
                 _ => return None,
             },
         }
@@ -5361,7 +5491,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::SENDMMSG => nr::SENDMMSG,
             x::RECVMMSG => nr::RECVMMSG,
             r => match crate::x86::canonical_number(r) {
-                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) || is_lifecycle_end(c) => c,
+                c if is_quiet(c, false) || is_fd_object(c) || is_cred(c) || is_signal_call(c) || is_thread_own(c) || is_mount(c) || is_lifecycle_end(c) || is_thread_clone(c) => c,
                 _ => return None,
             },
         }
@@ -5377,7 +5507,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             n if is_own_state(n) && n != nr::ALARM => raw,
             n if is_fd_misc(n) => raw,
             n if is_socket_call(n) => raw,
-            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) || is_lifecycle_end(n) => raw,
+            n if is_quiet(n, false) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) || is_lifecycle_end(n) || is_thread_clone(n) => raw,
             _ => return None,
         }
     };
@@ -5426,12 +5556,27 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
             m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0)
         };
     }
+    // A `clone` that makes a process (no `CLONE_THREAD`) is the host's, and
+    // so are `fork` and `vfork`, which are `clone` canonically: only the
+    // ABI's own `clone` and `clone3` carry their flags in the first argument.
+    if is_thread_clone(n) {
+        let (clone, clone3) = if compat {
+            (crate::i386::raw::CLONE, crate::i386::raw::CLONE3)
+        } else if gex_abi::X86 {
+            (crate::x86::raw::CLONE, crate::x86::raw::CLONE3)
+        } else {
+            (nr::CLONE, nr::CLONE3)
+        };
+        if (raw != clone && raw != clone3) || thread_clone_flags(m, n, &a).is_none() {
+            return None;
+        }
+    }
     // The poll family's arguments are the ABI's own until `free_call`
     // translates them (into the thread's scratch, which needs the memory
     // writable).
     // A mapping call's first argument is an address (or, for the old
     // `mmap`, a pointer to its arguments), never sign-extended.
-    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) && !is_thread_own(n) && !is_mount(n) && !is_lifecycle_end(n) {
+    if compat && !matches!(n, nr::RT_SIGPROCMASK | nr::FUTEX | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::CLOSE_RANGE) && !is_poll(n) && !is_mapping(n) && !is_path(n) && !is_own_state(n) && !is_fd_misc(n) && !is_quiet(n, true) && !is_fd_object(n) && !is_cred(n) && !is_signal_call(n) && !is_thread_own(n) && !is_mount(n) && !is_lifecycle_end(n) && !is_thread_clone(n) {
         a[0] = crate::i386::sext(a[0]);
     }
     Some(FreeCall { n, raw, a })
@@ -5469,7 +5614,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             ) || is_mapping(n)))
         // The path calls' older forms (`open`, `stat`, `access`, ...) as the
         // `*at` ones, a 32-bit ABI's descriptor sign-extended.
-        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) || is_lifecycle_end(n)) && (compat || gex_abi::X86))
+        || ((is_path(n) || is_own_state(n) || is_fd_misc(n) || is_quiet(n, compat) || is_fd_object(n) || is_cred(n) || is_signal_call(n) || is_thread_own(n) || is_mount(n) || is_lifecycle_end(n) || is_thread_clone(n)) && (compat || gex_abi::X86))
     {
         let t = if compat {
             let (t, p) = crate::i386::translate(raw, &mut a, m, ctx_addr + ctx::COMPAT_SCRATCH as u64, ctx_addr);
@@ -5537,6 +5682,26 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         cred_call(f.creds, f.procs, f.pid, m, n, a)
     } else if is_mount(n) {
         f.path.mount_call(m, n, a)
+    } else if is_thread_clone(n) {
+        let ca = if n == nr::CLONE3 { clone3_args(m, a[0], compat) } else { Ok(a) };
+        let maker = ThreadMaker {
+            procs: f.procs,
+            pid: f.pid,
+            compat,
+            slots: f.slots,
+            live: f.live,
+            thread_fs: f.thread_fs,
+            threads: f.threads,
+            blocked: f.signals.blocked(),
+            fs: &f.path.fs,
+        };
+        match ca.and_then(|ca| maker.make(m, ctx_addr, ca)) {
+            Ok(req) => {
+                let _ = set_result(m, ctx_addr, req.tid as u64);
+                return FreeOutcome::SpawnThread { ctx_addr: req.ctx_addr, tid: req.tid };
+            }
+            Err(e) => Err(e),
+        }
     } else if is_lifecycle_end(n) {
         match n {
             nr::EXIT_GROUP => return FreeOutcome::Exit((a[0] & 0xff) as i32),
@@ -6946,7 +7111,7 @@ impl Kernel {
             futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
-            next_ctx_slot: 1,
+            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             procs: Arc::new(ProcTable::new()),
             pipes: None,
@@ -7238,7 +7403,7 @@ impl Kernel {
             // Futexes live in the address space, and the child has its own.
             futexes: Arc::new(FutexTable::new()),
             unimplemented: Vec::new(),
-            next_ctx_slot: self.next_ctx_slot,
+            next_ctx_slot: Arc::new(std::sync::atomic::AtomicU32::new(self.next_ctx_slot.load(std::sync::atomic::Ordering::Acquire))),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             // The table is the system's, not the process's.
             procs: Arc::clone(&self.procs),
@@ -7309,70 +7474,24 @@ impl Kernel {
     /// A `clone` without `CLONE_THREAD` never reaches here; the new-process
     /// case is handled in `syscall`.
     fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
-        let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
-        if flags & clone_flags::THREAD == 0 {
-            return Err(Errno::ENOSYS);
-        }
-        if child_stack == 0 {
-            return Err(Errno::EINVAL);
-        }
+        let fs = self.fs_of(self.ctx_addr);
+        self.thread_maker(&fs).make(m, self.ctx_addr, a)
+    }
 
-        let slot = self.next_ctx_slot;
-        let child = ctx_addr(slot);
-        // Contexts live in the reserved region below the guest's own memory;
-        // running out of slots is a hard limit, not something to paper over.
-        if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
-            return Err(Errno::EAGAIN);
+    /// What making a thread of this process needs ([`ThreadMaker`]), for a
+    /// creator whose fs_struct is `fs`.
+    fn thread_maker<'a>(&'a self, fs: &'a Arc<FsCwd>) -> ThreadMaker<'a> {
+        ThreadMaker {
+            procs: &self.procs,
+            pid: self.pid,
+            compat: self.compat,
+            slots: &self.next_ctx_slot,
+            live: &self.live_threads,
+            thread_fs: &self.thread_fs,
+            threads: &self.thread_signals,
+            blocked: self.signals.blocked(),
+            fs,
         }
-        self.next_ctx_slot += 1;
-        // Numbered with the processes (`ProcTable::new_tid`).
-        let tid = self.procs.new_tid(self.pid);
-
-        let parent = self.ctx_addr;
-        for off in (0..ctx::SIZE).step_by(8) {
-            let v = m.read_u64(parent + off as u64)?;
-            m.write_u64(child + off as u64, v)?;
-        }
-        set_result(m, child, 0)?;
-        m.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
-        m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
-        m.write_u64(child + ctx::TID as u64, tid as u64)?;
-        if flags & clone_flags::SETTLS != 0 {
-            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
-            // one's base into %fs.
-            // PowerPC's thread pointer is r2.
-            let slot = if gex_abi::PPC {
-                ctx::x(2)
-            } else if self.compat {
-                ctx::TPIDRRO
-            } else {
-                ctx::TPIDR
-            };
-            m.write_u64(child + slot as u64, tls)?;
-        }
-        if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
-            m.write_u32(parent_tid, tid as u32)?;
-        }
-        if flags & clone_flags::CHILD_SETTID != 0 && child_tid != 0 {
-            m.write_u32(child_tid, tid as u32)?;
-        }
-        self.live_threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // Its fs_struct: its creator's with `CLONE_FS` (every pthread), a
-        // copy of it without.
-        let fs = if flags & clone_flags::FS != 0 {
-            self.thread_fs.of(parent)
-        } else {
-            Some(Arc::new(self.fs_of(parent).copy()))
-        };
-        self.thread_fs.set(child, fs);
-        // The new thread's own state: its creator's mask, nothing pending,
-        // and with `CLONE_CHILD_CLEARTID` the word its exit clears.
-        let own = crate::signal::ThreadSig::new_thread(self.signals.blocked());
-        if flags & clone_flags::CHILD_CLEARTID != 0 {
-            own.set_clear_child_tid(child_tid);
-        }
-        self.thread_signals.insert(tid, Arc::new(own));
-        Ok(SpawnRequest { ctx_addr: child, tid })
     }
 
 
@@ -7565,35 +7684,14 @@ impl Kernel {
         // length, but `clone`/our thread setup want the *top* (the SP, which
         // grows down), so hand on `stack + stack_size`.
         if n == nr::CLONE3 {
-            let c = a[0];
-            // struct clone_args: flags@0, child_tid@16, parent_tid@24,
-            // stack@40, stack_size@48, tls@56 (aligned u64s).
-            let fields = (|| {
-                Some((
-                    m.read_u64(c).ok()?,
-                    m.read_u64(c + 16).ok()?,
-                    m.read_u64(c + 24).ok()?,
-                    m.read_u64(c + 40).ok()?,
-                    m.read_u64(c + 48).ok()?,
-                    m.read_u64(c + 56).ok()?,
-                ))
-            })();
-            let (flags, child_tid, parent_tid, stack, stack_size, tls) = match fields {
-                Some(t) => t,
-                None => {
-                    let _ =
-                        set_result(m, self.ctx_addr, Errno::EFAULT.as_return());
+            let ca = match clone3_args(m, a[0], self.compat) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     return SyscallOutcome::Continue;
                 }
             };
-            let sp = stack.wrapping_add(stack_size);
-            // An i386 caller's `tls` is a `struct user_desc *`, as for its
-            // `clone` (`crate::i386`): the base is its second word.
-            let tls = if self.compat && !gex_abi::PPC && flags & clone_flags::SETTLS != 0 && tls != 0 {
-                m.read_u32(tls + 4).map(|b| b as u64).unwrap_or(0)
-            } else {
-                tls
-            };
+            let (flags, sp, tls) = (ca[0], ca[1], ca[3]);
             if flags & clone_flags::THREAD == 0 {
                 let pid = self.procs.spawn(self.pid);
                 let _ = set_result(m, self.ctx_addr, pid as u64);
@@ -7604,7 +7702,6 @@ impl Kernel {
                     vfork: flags & (clone_flags::VM | clone_flags::VFORK) == clone_flags::VM | clone_flags::VFORK,
                 };
             }
-            let ca = [flags, sp, parent_tid, tls, child_tid, 0];
             return match self.sys_clone(m, ca) {
                 Ok(req) => {
                     let _ = set_result(m, self.ctx_addr, req.tid as u64);
@@ -10522,7 +10619,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10631,7 +10728,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10702,7 +10799,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10790,7 +10887,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -10891,7 +10988,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let (word, word2, ctid) = (0x31000u64, 0x31010u64, 0x31020u64);
@@ -10973,7 +11070,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let ctid = 0x31020u64;
@@ -11031,6 +11128,90 @@ mod tests {
         assert_eq!(k.procs.halt_code(), Some(0));
     }
 
+    /// `clone` and `clone3` that make a thread (L25b) answer the same with
+    /// and without the kernel: the creator gets the tid, the child a copy of
+    /// its context answering 0 on its own stack, its own slot, id and signal
+    /// state (with the word its exit clears), and the count goes up. A
+    /// `clone` that makes a process is not the free path's; a missing stack
+    /// is EINVAL both ways.
+    #[test]
+    fn thread_clone_calls_answer_as_the_kernel_does() {
+        use std::sync::atomic::Ordering::SeqCst;
+        if gex_abi::PPC {
+            return;
+        }
+        let (mut buf, mut k) = setup();
+        let main = ThreadState::new(k.ctx_addr, k.tid);
+        k.enter_thread(&main);
+        let mut m = GuestMem::new(&mut buf);
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
+            let call = free_class(m, at, false).expect("in the class");
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            free_call(&f, m, at, call)
+        }
+        let flags = clone_flags::VM | clone_flags::FS | clone_flags::THREAD | clone_flags::CHILD_CLEARTID | clone_flags::PARENT_SETTID;
+        let (ptid, ctid, args3) = (0x31000u64, 0x31010u64, 0x31100u64);
+        let mut seen = Vec::new();
+        for (i, (kernel, three)) in [(true, false), (false, false), (true, true), (false, true)].into_iter().enumerate() {
+            let stack = 0x40000 + 0x1000 * i as u64;
+            if three {
+                // struct clone_args: flags, pidfd, child_tid, parent_tid,
+                // exit_signal, stack (the base), stack_size, tls.
+                for (o, v) in [(0u64, flags), (8, 0), (16, ctid), (24, ptid), (32, 0), (40, stack - 0x800), (48, 0x800), (56, 0)] {
+                    m.write_u64(args3 + o, v).unwrap();
+                }
+                set_args(&mut m, main.ctx_addr, nr::CLONE3, &[args3, 88]);
+            } else {
+                // x86-64 has the child's tid word before the TLS.
+                let args = if gex_abi::X86 { [flags, stack, ptid, ctid, 0] } else { [flags, stack, ptid, 0, ctid] };
+                set_args(&mut m, main.ctx_addr, nr::CLONE, &args);
+            }
+            let made = if kernel {
+                match k.syscall(&mut m, 0) {
+                    SyscallOutcome::SpawnThread { ctx_addr, tid } => (ctx_addr, tid),
+                    _ => panic!("clone {i}: no thread"),
+                }
+            } else {
+                match free(&k, &mut m, main.ctx_addr) {
+                    FreeOutcome::SpawnThread { ctx_addr, tid } => (ctx_addr, tid),
+                    _ => panic!("clone {i}: no thread"),
+                }
+            };
+            let (child, tid) = made;
+            assert_eq!(ret(&m, main.ctx_addr), tid as i64, "clone {i}: the creator's answer");
+            assert_eq!(ret(&m, child), 0, "clone {i}: the child's answer");
+            assert_eq!(m.read_u64(child + ctx::sp_slot(false) as u64).unwrap(), stack, "clone {i}: its stack");
+            assert_eq!(m.read_u32(ptid).unwrap(), tid as u32, "clone {i}: PARENT_SETTID");
+            assert_eq!(k.thread_signals.get(tid).expect("its own state").clear_child_tid(), ctid);
+            assert!(!seen.iter().any(|&(c, t)| c == child || t == tid), "clone {i}: a slot and id of its own");
+            seen.push((child, tid));
+            assert_eq!(k.live_threads.load(SeqCst), 2 + i as u32);
+        }
+        // A missing stack, both ways.
+        for kernel in [true, false] {
+            set_args(&mut m, main.ctx_addr, nr::CLONE, &[flags, 0, 0, 0, 0]);
+            if kernel {
+                k.syscall(&mut m, 0);
+            } else {
+                assert!(matches!(free(&k, &mut m, main.ctx_addr), FreeOutcome::Done(Delivery::None)));
+            }
+            assert_eq!(ret(&m, main.ctx_addr), -(Errno::EINVAL.0 as i64));
+        }
+        // A process is the host's, and so is a fork whose argument
+        // registers happen to hold CLONE_THREAD.
+        set_args(&mut m, main.ctx_addr, nr::CLONE, &[17, 0, 0, 0, 0]);
+        assert!(free_class(&m, main.ctx_addr, false).is_none());
+        if gex_abi::X86 {
+            m.write_u64(main.ctx_addr + ctx::SYSCALL_NR as u64, crate::x86::raw::FORK).unwrap();
+            m.write_u64(main.ctx_addr + ctx::SYSCALL_ARGS[0] as u64, flags).unwrap();
+            assert!(free_class(&m, main.ctx_addr, false).is_none());
+        }
+        m.write_u64(args3, 0).unwrap();
+        set_args(&mut m, main.ctx_addr, nr::CLONE3, &[args3, 88]);
+        assert!(free_class(&m, main.ctx_addr, false).is_none());
+    }
+
     /// `mount` and `umount2` (L22e) answer the same with and without the
     /// kernel. The mount table's one writer is its published view: a mount
     /// made without the lock is the kernel's at its next call, and mounts
@@ -11047,7 +11228,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let (mnt, tmpfs, proc_, sysfs, none) = (0x31000u64, 0x31100u64, 0x31200u64, 0x31300u64, 0x31400u64);
@@ -11148,7 +11329,7 @@ mod tests {
         set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
         let call = free_class(&m, at, false).expect("in the class");
         let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
         match free_call(&f, &mut m, at, call) {
             FreeOutcome::Blocking(BlockOp::SigWait { set, timeout, .. }, None) => {
                 assert_eq!(set, bit);
@@ -11217,7 +11398,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 3]| {
@@ -11314,7 +11495,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -11422,7 +11603,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -11545,7 +11726,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -11643,7 +11824,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
@@ -11821,7 +12002,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let r = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -11882,7 +12063,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let errno = |m: &GuestMem<'_>| ret(m, at) as i64;
@@ -12294,7 +12475,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
@@ -12371,7 +12552,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         set_args(&mut m, at, nr::PIPE2, &[0x20010, 0]);
@@ -12469,7 +12650,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -12551,7 +12732,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         let set32 = |m: &mut GuestMem<'_>, n: u64, a: [u64; 5]| {
@@ -12617,7 +12798,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -12719,7 +12900,7 @@ mod tests {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
         };
@@ -12756,7 +12937,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12821,7 +13002,7 @@ mod tests {
                 match free_class(m, at, false) {
                     Some(call) if lock_free => {
                         let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                        let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                         assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                     }
                     _ => {
@@ -12878,7 +13059,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -12989,7 +13170,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -13065,7 +13246,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -13172,7 +13353,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -13253,7 +13434,7 @@ mod tests {
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
                     let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
                     k.syscall(m, 0);
@@ -13292,7 +13473,7 @@ mod tests {
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
             let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
-            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
         use crate::i386::raw;
