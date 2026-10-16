@@ -6383,18 +6383,22 @@ export class Gex {
   #watchStub = null;
 
   /** The function a watched table entry holds: it tells JS (`hit`) and
-   *  traps, so the nested loop in `#callOut` sees why. */
+   *  traps, so the nested loop in `#callOut` sees why -- or, when `hit`
+   *  says so (the awaited return of the innermost call-out, only tail calls
+   *  since its `enter`), returns, which leaves that `enter` without a trap
+   *  (each NT user-mode callback's end: a trap cost more than the callback). */
   #watch() {
     if (this.#watchStub) return this.#watchStub;
-    // (module (type (func (param i32))) (import "w" "hit" (func (type 0)))
-    //   (func (export "c") (type 0) local.get 0 call 0 unreachable))
+    // (module (type (func (param i32))) (type (func (param i32) (result i32)))
+    //   (import "w" "hit" (func (type 1)))
+    //   (func (export "c") (type 0) local.get 0 call 0 if return end unreachable))
     const bytes = new Uint8Array([
       0, 97, 115, 109, 1, 0, 0, 0,
-      1, 5, 1, 96, 1, 127, 0,
-      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 0,
+      1, 10, 2, 96, 1, 127, 0, 96, 1, 127, 1, 127,
+      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 1,
       3, 2, 1, 0,
       7, 5, 1, 1, 99, 0, 1,
-      10, 9, 1, 7, 0, 32, 0, 16, 0, 0, 11,
+      10, 13, 1, 11, 0, 32, 0, 16, 0, 4, 64, 15, 11, 0, 11,
     ]);
     const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { w: { hit: (ctx) => this.#watchHit(ctx >>> 0) } });
     this.#watchStub = inst.exports.c;
@@ -6422,12 +6426,15 @@ export class Gex {
     dv.setBigUint64(ctx + CTX_PC, target, true);
     if (i >= 0) {
       this.#calloutSignal = { kind: 'return', i };
-      return;
+      // The innermost call-out's return with only tail calls since its
+      // loop's `enter`: the stub returns, and that `enter` with it.
+      return i === this.#callouts.length - 1 && this.#shim.exports.gex_callout_may_return?.(i + 1) ? 1 : 0;
     }
     const ref = this.#shim.exports.gex_dispatch_ref(target);
     const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
     const w = this.#callouts.find((c) => c.w && c.w.table === table && c.w.index === index)?.w;
     this.#calloutSignal = { kind: 'bypass', f: w?.old ?? null };
+    return 0;
   }
 
   /** The table `table` of `gex_dispatch_ref` names. */
@@ -6580,6 +6587,14 @@ export class Gex {
           } else {
             e.gex_callout_leave_ok?.(me + 1);
             yield ['enter', ctx, pc];
+          }
+          // A watched return with only tail calls since this `enter`
+          // returns instead of trapping (`#watchHit`).
+          const ret = this.#calloutSignal;
+          if (ret?.kind === 'return') {
+            this.#calloutSignal = null;
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: watched return ${ret.i} (no trap)`);
+            return ret.i === me ? 1 : 0;
           }
           // A miss at a call-out's return with only tail calls since this
           // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
