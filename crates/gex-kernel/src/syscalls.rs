@@ -10806,6 +10806,43 @@ mod tests {
         assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{names:?}");
     }
 
+    /// [`only_the_process_calls_take_the_locked_path`] for an i386 process
+    /// (W3's Wine), in its own numbering: each raw number with zero
+    /// arguments.
+    #[test]
+    fn only_the_i386_process_calls_take_the_locked_path() {
+        if !gex_abi::X86 {
+            return;
+        }
+        let mut locked = Vec::new();
+        for raw in 0..=460u64 {
+            let (mut buf, mut k) = setup();
+            k.compat = true;
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            m.write_u64(at + ctx::x(0) as u64, raw).unwrap();
+            for slot in crate::i386::ARG_SLOTS {
+                m.write_u64(at + slot as u64, 0).unwrap();
+            }
+            if free_class(&m, at, true).is_some() {
+                continue;
+            }
+            let ids = Idents { pid: k.pid as u32, ppid: 1, tid: k.tid as u32 };
+            let mut scratch = m.read(0, 0x40000).unwrap().to_vec();
+            let mut sm = GuestMem::new(&mut scratch);
+            if clock_call(&mut sm, at, true, k.clock, 1) || ident_call(&mut sm, at, true, &ids, &k.creds) {
+                continue;
+            }
+            let out = k.syscall(&mut m, 0);
+            let r = m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+            if !(matches!(out, SyscallOutcome::Continue) && r == -(Errno::ENOSYS.0)) {
+                locked.push(raw);
+            }
+        }
+        use crate::i386::raw as x;
+        assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::CLONE3], "{locked:?}");
+    }
+
     /// A ppc32 process's calls (L25e): each made by the full call in one
     /// kernel and by the free path in a twin, from the same memory, answer
     /// alike: the same result and the same memory after. Raw ppc32 numbers
