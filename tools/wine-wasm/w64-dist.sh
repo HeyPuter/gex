@@ -14,13 +14,16 @@
 #               a native x86_64 Unix side, used only to make the prefix)
 #   pfx64-P     a win64 prefix (wineboot -i, native, no display)
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (w64-deps.sh:
-#               FreeType, libwayland, libxml2, xkbcommon, EGL headers; W64.4)
+#               FreeType, libwayland, libxml2, xkbcommon, EGL headers; W64.4;
+#               GnuTLS over nettle and Mozilla's CA bundle, as W3's)
 #   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
 #               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
-#               EGL, guest/gl/gexgl.c; W64.4) in the loader
+#               EGL, guest/gl/gexgl.c; W64.4) and secur32 (+ GnuTLS) in
+#               the loader; W64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over W3_BUILD)
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
-#               share/wine
+#               share/wine, and etc/ssl/certs/ca-certificates.crt (crypt32's
+#               root store; natively the host's /etc is the guest's)
 #   ntdll64-K-S the native PE ntdll (W64.2), made in b64-K-S
 #   pen64-K-N   the native PE core (W64.2): W64_NATIVE_DLLS (default ntdll,
 #               kernelbase, kernel32, msvcrt, ucrtbase, and winewayland.drv,
@@ -76,6 +79,7 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 	"$here"/ffi64/*; } | sha256sum | cut -c1-10)
 S=$( { echo "$DH"; cat "$here"/link-w64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc; } | sha256sum | cut -c1-10)
+TLS=${W64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
 without="--without-x --without-freetype --without-gstreamer --without-pulse --without-alsa --without-cups
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus
   --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-sdl --without-oss
@@ -120,12 +124,14 @@ DEPS=$C/deps64-$DH
 
 b64_build() {
 	# FreeType, Wayland and gex-gl's EGL from deps64 (the sonames: dlreg's names)
+	# and GnuTLS (crypt32's and schannel's, unless W64_TLS=0)
 	local o=${without//--without-wayland/}; o=${o//--without-freetype/}; o=${o//--without-opengl/}
+	[ "$TLS" = 0 ] || o="${o//--without-gnutls/} --with-gnutls"
 	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
 		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
 		CC="$here/wcc64" CXX="$here/wcc64++" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
-		ac_cv_lib_soname_EGL=libEGL.so.1
+		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
 	mkdir -p out
 	W64_DEPS=$DEPS/install JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
 }
@@ -147,6 +153,8 @@ dist_make() {
 	# win32u's FreeType reads them, as W3's w3/stage.sh stages them)
 	mkdir -p share/wine/fonts && cp -f "$W"/fonts/*.ttf share/wine/fonts/
 	ln -sfn ../../share "$d/lib/wine/share"
+	# crypt32's root store, the first of its known locations
+	if [ "$TLS" != 0 ]; then mkdir -p etc/ssl/certs && cp -f "$DEPS/install/ca-certificates.crt" etc/ssl/certs/; fi
 }
 log "install ($K, $S)"; step dist64-$K-$S dist_make
 

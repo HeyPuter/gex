@@ -464,8 +464,8 @@ section-alias fix af2068f56c1, cherry-picked).
   300 s, door or not.
 - job_wine64_page can now take sync too:
   `CASES="hello_args sync crtmem apc tls cxx exitproc seh seh-traps"`,
-  and a leg on the native PE core (w64/page-dicey): the same with
-  `NATIVE=$W64_NATIVE`.
+  and an MP leg on the native PE core (w64/page-dicey): the same with
+  `NATIVE=$W64_NATIVE` (not SP, below).
 - Branches: w64/sync-varargs (the livelock and highdata), then
   w64/page-dicey on it (the native PE core in the page, Dicey Dungeons).
   Both need musl-w64 d18ccf68 and Wine 4743fd9760e.
@@ -558,13 +558,33 @@ Still open for the game: Wine's `try_map_free_area` reports for
 GPU (screenshots there came out black for Retrocycles; the compositor
 readback above does not depend on Chrome's screenshot).
 
-**Also queued.** W's TLS pins for w64-deps.sh: gex w/w3-tls afe68fd5
-(w3.pins, w3/deps.sh). They are nettle 3.10.1 with mini-gmp, GnuTLS
-3.8.9, and the curl CA bundle at DIST/etc/ssl/certs. Wine's configure
-gets `ac_cv_lib_soname_gnutls=libgnutls.so.30`, the loader gets
-secur32, and dlreg needs the 70 names, minus the `gnutls_handle` false
-match. Later: the opengl32 id fast path, and a W3 build tree that does
-not depend on the worktree it was configured from.
+**Done: TLS (W's pins in W64)** (branch w64/tls, on w64/page-dicey).
+w64-deps.sh builds nettle 3.10.1 (mini-gmp) and GnuTLS 3.8.9 for wasm64
+at w3.pins' versions and configure options, and keeps curl's CA bundle.
+w64-dist.sh configures the wasm64 tree `--with-gnutls`
+(`ac_cv_lib_soname_gnutls=libgnutls.so.30`) and stages the bundle at
+DIST/etc/ssl/certs/ca-certificates.crt. link-w64.sh links secur32's Unix
+side and GnuTLS, registers the 70 `gnutls_*` names crypt32 and schannel
+look up, and pulls in from libc.a every name gnulib takes weakly
+(thrd_exit, the pthread calls): left undefined they were `GOT.func`
+imports, and the loader would not instantiate. `W64_TLS=0` leaves it all
+out (S gets `-notls`). The loader grows from 5.77 MB to 7.52 MB.
+Natively (gooner, DOOR=1), scratch/W64/tls/https.exe gets 200 from
+https://example.com through winhttp and from https://example.org through
+wininet, with no crypt32 or schannel errors. The page does not copy
+DIST/etc into its /etc yet (W3's page bundle does).
+
+**Open: the native PE core in the single-thread page.** SP with
+`NATIVE=` (gooner, 2026-10-16) passes hello_args and apc, but sync,
+crtmem, tls and cxx time out at 900 s (crtmem after printing all its
+results, so in its exit); I stopped the run there. A native module's
+`gex.syscall` is `#nativeSyscall` in the single-thread build, synchronous,
+so a blocking call from native code cannot suspend. job_wine64_page's
+native leg should be MP only until wasmdll's syscall import goes through
+`#suspendingSyscall` there.
+
+**Later.** The opengl32 id fast path, and a W3 build tree that does not
+depend on the worktree it was configured from.
 
 **Worktrees, branches and files.**
 - gex: wt/w64, w64/main.
@@ -572,8 +592,9 @@ not depend on the worktree it was configured from.
   w64/section-alias af2068f56c1.
 - musl: wt/musl-w64 w64/wasm64 d18ccf68 (the varargs fix).
 - All of them are clean.
-- Current dist (new sysroot): scratch/W64/cache/dist64-4743fd9760ee-c21a537cdb,
-  prefix pfx64-7d8cb70c582d, native PE core pen64-4743fd9760ee-493ec7af09.
+- Current dist (new sysroot, TLS): scratch/W64/cache/dist64-4743fd9760ee-941a4c19a8,
+  prefix pfx64-7d8cb70c582d, native PE core pen64-4743fd9760ee-a0cc05b17a.
+  Before TLS: dist64-4743fd9760ee-c21a537cdb, pen64-4743fd9760ee-493ec7af09.
 - Dev tree: scratch/W64/dev64g, configured from wt/wine-w64 with
   OpenGL. Its deps and wasm64 sysroot were in hot/W64 and are now kept
   in scratch/W64/kept/{deps64,sr64}. Point `W64_DEPS` and

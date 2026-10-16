@@ -8,7 +8,8 @@
 #   tools/wine-wasm/link-w64.sh WINE_BUILD OUT   (GEX_WASM64_SYSROOT set)
 #
 # Also the Unix libraries crypt32, ws2_32, msv1_0, dnsapi and nsiproxy (as
-# W3's w3/link-loader.sh), registered with dlreg.py, and, when the tree was
+# W3's w3/link-loader.sh), registered with dlreg.py, secur32 (+ GnuTLS) when
+# the tree was configured --with-gnutls, and, when the tree was
 # configured with them (W64.4, w64-deps.sh's libraries: W64_DEPS), win32u
 # (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
 # (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64).
@@ -48,7 +49,8 @@ compile() {
 unixobjs() { # DIR LIB: the objects of DIR's LIB.so
 	sed -n "/^dlls\/$1\/$2.so:/,/^\t/p" Makefile | grep -o "dlls/$1/[a-z_0-9/-]*\.o" | sort -u
 }
-for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy; do
+tls=""; grep -q 'define SONAME_LIBGNUTLS' include/config.h && tls="secur32:secur32"
+for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.sys:nsiproxy $tls; do
 	dir=${spec%%:*} lib=${spec##*:}
 	mkdir -p "gexw64/$lib"
 	for c in $(unixobjs "$dir" "$lib"); do
@@ -59,6 +61,26 @@ for spec in crypt32:crypt32 ws2_32:ws2_32 msv1_0:msv1_0 dnsapi:dnsapi nsiproxy.s
 	reg="$reg $lib.so:data:__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
 done
 libs=""
+if [ -n "$tls" ]; then
+	# GnuTLS (W64_DEPS): crypt32 and secur32's schannel dlopen
+	# libgnutls.so.30 and look up each function they use.
+	: "${W64_DEPS:?set W64_DEPS to the install w64-deps.sh made, for GnuTLS}"
+	for f in $(grep -ohE 'LOAD_FUNCPTR\( *gnutls_[A-Za-z0-9_]+|dlsym\( *libgnutls_handle, *"gnutls_[A-Za-z0-9_]+"' \
+			"$WF/dlls/crypt32/unixlib.c" "$WF/dlls/secur32/schannel_gnutls.c" | sed -E 's/.*[("] *(gnutls_[A-Za-z0-9_]+)"?$/\1/' | sort -u); do
+		reg="$reg libgnutls.so.30:func:$f"
+	done
+	tlslibs="$W64_DEPS/lib/libgnutls.a $W64_DEPS/lib/libhogweed.a $W64_DEPS/lib/libnettle.a"
+	# gnulib's threadlib takes thrd_exit and the pthread calls weakly (to
+	# see whether threads are linked in), which pulls nothing from libc.a:
+	# left undefined, each is an import (GOT.func) the loader is never
+	# given. Every weak name libc.a defines is pulled in.
+	# shellcheck disable=SC2086
+	for f in $(comm -12 <(llvm-nm $tlslibs 2>/dev/null | awk '$1 == "w" { print $2 }' | sort -u) \
+			<(llvm-nm --defined-only "$GEX_WASM64_SYSROOT/lib/libc.a" 2>/dev/null | awk '$2 ~ /^[TW]$/ { print $3 }' | sort -u)); do
+		libs="$libs -Wl,-u,$f"
+	done
+	libs="$libs $tlslibs"
+fi
 if grep -q '^dlls/win32u/win32u.so:' Makefile; then
 	# win32u.so: its syscalls register at __wine_unix_lib_init; the names it
 	# shares with ntdll.so renamed apart. FreeType through dlopen.

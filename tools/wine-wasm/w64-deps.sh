@@ -7,7 +7,10 @@
 #   libwayland's one ffi_call (64-bit pointers: a call table by argument
 #   pattern, ffi64/gen.py), and gex-gl's EGL headers and pkg-config file
 #   (opengl32.so; the library, guest/gl/gexgl.c, is compiled by
-#   link-w64.sh, since it changes with gex). No OSS yet.
+#   link-w64.sh, since it changes with gex), and GnuTLS over nettle
+#   (crypt32's and secur32's schannel, through dlopen of libgnutls.so.30)
+#   with Mozilla's CA bundle (OUT/install/ca-certificates.crt, staged into
+#   the dist), as W3's. No OSS yet.
 #
 #   tools/wine-wasm/w64-deps.sh OUT DL
 #
@@ -21,7 +24,7 @@ WCC=$here/wcc64 HOST=wasm64-unknown-linux-musl
 out=$(realpath -m "${1:?OUT}") dl=$(realpath -m "${2:?DL}")
 J=${JOBS:-12}
 eval "$(sed -n 's/^\([A-Z0-9_]*\) *:= *\(.*\)$/\1=\2/p' "$here/w3.pins")"
-for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON; do
+for p in FREETYPE WAYLAND LIBXML2 XKBCOMMON MESON NETTLE GNUTLS CACERT; do
   u=${p}_URL s=${p}_SHA256; "$here/w3/dl.sh" "${!u}" "${!s}" "$dl"
 done
 rm -rf "$out" && mkdir -p "$out/install/lib/pkgconfig" "$out/install/include" "$out/host" "$out/build" "$out/src"
@@ -107,5 +110,27 @@ mkdir -p "$I/egl/include"
 cp -r /usr/include/EGL /usr/include/KHR "$I/egl/include/"
 printf 'Name: egl\nDescription: gex-gl EGL (wasm64 LP64, linked by link-w64.sh: guest/gl/gexgl.c)\nVersion: 1.5\nCflags: -I%s\nLibs:\n' \
   "$I/egl/include" > "$I/lib/pkgconfig/egl.pc"
+
+# nettle with mini-gmp, then GnuTLS over it with its included libtasn1 and
+# libunistring, configured as W3's w3/deps.sh (no p11-kit, idn, TPM,
+# compression or tools; the trust store is the path crypt32 reads).
+tar xf "$dl/nettle-$NETTLE_VERSION.tar.gz"
+(cd nettle-$NETTLE_VERSION &&
+  ./configure --host=$HOST --prefix="$I" --libdir="$I/lib" --enable-static --disable-shared \
+    --enable-mini-gmp --disable-assembler --disable-fat --disable-documentation --disable-openssl \
+    CC="$WCC" CFLAGS=-O2 > "$out/nettle-configure.log" 2>&1 &&
+  make -j"$J" > "$out/nettle-make.log" 2>&1 && make install > "$out/nettle-install.log" 2>&1)
+tar xf "$dl/gnutls-$GNUTLS_VERSION.tar.xz"
+(cd gnutls-$GNUTLS_VERSION &&
+  PKG_CONFIG_LIBDIR=$I/lib/pkgconfig ./configure --host=$HOST --prefix="$I" --libdir="$I/lib" --enable-static --disable-shared \
+    --with-nettle-mini --with-included-libtasn1 --with-included-unistring --without-p11-kit --without-idn \
+    --without-tpm --without-tpm2 --without-trousers-lib --without-brotli --without-zstd --without-zlib --without-leancrypto \
+    --disable-doc --disable-tools --disable-tests --disable-cxx --disable-nls --disable-hardware-acceleration \
+    --disable-padlock --disable-libdane --disable-guile --disable-ktls \
+    --with-default-trust-store-file=/etc/ssl/certs/ca-certificates.crt \
+    CC="$WCC" CFLAGS=-O2 > "$out/gnutls-configure.log" 2>&1 &&
+  make -j"$J" > "$out/gnutls-make.log" 2>&1 && make install > "$out/gnutls-install.log" 2>&1)
+[ -f "$I/lib/libgnutls.a" ] || { echo "w64-deps: GnuTLS failed ($out/gnutls-*.log)" >&2; exit 1; }
+cp "$dl/$(basename "$CACERT_URL")" "$I/ca-certificates.crt"
 rm -rf "$S"
 echo "w64-deps: $I"
