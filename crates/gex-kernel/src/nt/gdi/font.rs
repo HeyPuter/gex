@@ -149,11 +149,11 @@ static FACES: OnceLock<Vec<Face>> = OnceLock::new();
 
 fn faces(c: &Call<'_>) -> &'static [Face] {
     FACES.get_or_init(|| {
-        let k = c.kernel();
+        let vfs = c.kernel().vfs();
         let mut all = Vec::new();
         for f in FILES {
             let path = format!("{}/drive_c/windows/Fonts/{f}", c.p.cfg.prefix);
-            if let Ok(d) = crate::nt::file::read_guest_file(&k.vfs, &path) {
+            if let Ok(d) = crate::nt::file::read_guest_file(&vfs, &path) {
                 all.extend(parse_fon(&d, f));
             }
         }

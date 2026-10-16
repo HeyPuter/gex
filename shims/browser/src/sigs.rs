@@ -68,6 +68,18 @@ pub(crate) struct Home {
     unix_remote: Option<gex_kernel::unix::Remote>,
     socket_names: Arc<gex_kernel::unix::SocketNames>,
     host_names: Arc<gex_kernel::unix::SocketNames>,
+    /// Its threads, their contexts and run states (`Host::threads`, L23).
+    table: Arc<crate::Threads>,
+    /// Its live thread count (`Kernel::live_threads`), for `exit` (L25a).
+    live: Arc<std::sync::atomic::AtomicU32>,
+    /// Its next free register-context slot (`Kernel::next_ctx_slot`), for
+    /// `clone` (L25b).
+    slots: Arc<std::sync::atomic::AtomicU32>,
+    /// How it ended, decided once (L24).
+    exit: crate::ExitState,
+    /// Its image, command line and environment as `/proc` shows them
+    /// (`Kernel::publish_proc`, at its start and each exec).
+    image: Arc<gex_kernel::proclive::ProcCell>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -85,11 +97,11 @@ thread_local! {
 }
 
 /// Publish `k`'s process as this memory's (`set_host`).
-pub(crate) fn publish(k: &Kernel) {
-    HOME.store(Box::into_raw(Box::new(home_of(k))), Ordering::Release);
+pub(crate) fn publish(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proclive::ProcCell>) {
+    HOME.store(Box::into_raw(Box::new(home_of(k, table, image))), Ordering::Release);
 }
 
-fn home_of(k: &Kernel) -> Home {
+fn home_of(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proclive::ProcCell>) -> Home {
     Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
@@ -116,6 +128,11 @@ fn home_of(k: &Kernel) -> Home {
         unix_remote: k.unix_remote,
         socket_names: Arc::clone(&k.socket_names),
         host_names: Arc::clone(&k.host_names),
+        table: Arc::clone(table),
+        live: Arc::clone(&k.live_threads),
+        slots: Arc::clone(&k.next_ctx_slot),
+        exit: crate::ExitState::new(),
+        image: Arc::clone(image),
     }
 }
 
@@ -132,6 +149,31 @@ impl Home {
 
     pub(crate) fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Its threads (`Host::threads`), which lock themselves.
+    pub(crate) fn table(&self) -> &crate::Threads {
+        &self.table
+    }
+
+    /// Its image's path, as last published.
+    pub(crate) fn exe(&self) -> String {
+        self.image.exe()
+    }
+
+    /// Its argument vector, as last published.
+    pub(crate) fn argv(&self) -> Vec<String> {
+        self.image.argv()
+    }
+
+    /// Its environment, as last published.
+    pub(crate) fn envp(&self) -> Vec<String> {
+        self.image.envp()
+    }
+
+    /// How it ended (`exit_process`), which needs no lock.
+    pub(crate) fn exit(&self) -> &crate::ExitState {
+        &self.exit
     }
 
     /// Its user and group ids, which lock themselves.
@@ -214,8 +256,8 @@ thread_local! {
 
 /// Publish a vfork child's process for this Worker alone, or (`None`) go
 /// back to the memory's (vfork.rs).
-pub(crate) fn publish_here(k: Option<&Kernel>) {
-    let new = k.map_or(std::ptr::null_mut(), |k| Box::into_raw(Box::new(home_of(k))));
+pub(crate) fn publish_here(k: Option<(&Kernel, &Arc<crate::Threads>, &Arc<gex_kernel::proclive::ProcCell>)>) {
+    let new = k.map_or(std::ptr::null_mut(), |(k, table, image)| Box::into_raw(Box::new(home_of(k, table, image))));
     let old = HERE.with(|c| c.replace(new));
     if !old.is_null() {
         // SAFETY: made above by an earlier call, and only this Worker reads
@@ -244,6 +286,21 @@ pub(crate) fn bind(k: &mut Kernel, tid: i32) {
             return;
         }
         *m = Some((tid, k.thread_sig(tid)));
+    });
+}
+
+/// Make thread `tid`, one the process already has, this Worker's, with no
+/// kernel lock (a thread's adoption, L25b): its signal state from the
+/// process's table, where its `clone` put it; a thread made otherwise (an
+/// NT thread) gets one of its own, blocking nothing.
+pub(crate) fn bind_free(home: &Home, tid: i32) {
+    MINE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.as_ref().is_some_and(|(t, _)| *t == tid) {
+            return;
+        }
+        let own = home.threads.get_or_insert_with(tid, || Arc::new(ThreadSig::new_thread(0)));
+        *m = Some((tid, own));
     });
 }
 
@@ -388,6 +445,8 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         },
         signals: &view,
         procs: &home.procs,
+        live: &home.live,
+        slots: &home.slots,
         tty: &home.tty,
         pid: home.pid,
         creds: &home.creds,

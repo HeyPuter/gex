@@ -464,6 +464,8 @@ pub struct Process {
     pub yield_parked: AtomicU32,
     /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
     pub display_mode: AtomicU64,
+    /// The Linux kernel's parts the layer uses, set at boot ([`NtKernel`]).
+    pub kernel: std::sync::OnceLock<NtKernel>,
 }
 
 #[derive(Default)]
@@ -553,6 +555,7 @@ impl Process {
             next_sync_id: AtomicU64::new(2),
             next_word: AtomicU32::new(0),
             sync_id: 1,
+            kernel: std::sync::OnceLock::new(),
             unix: unixcall::Registry::default(),
             pipes: Arc::default(),
             atoms: Mutex::new(Default::default()),
@@ -652,40 +655,40 @@ pub enum Outcome {
     CallbackReturn,
 }
 
-/// How the NT layer reaches the process's Linux kernel (its VFS, memory map
-/// and devices). Natively that is a `Mutex<Kernel>` of its own; the browser
-/// shim's kernel lives in its host structure behind the shim's kernel lock,
-/// and handing the NT layer that lock (rather than a second kernel) is what
-/// keeps exactly one view of it (docs/nt-layer.md §10.2).
-pub trait KernelCell {
-    fn lock_kernel(&self) -> KernelGuard<'_>;
+/// What the NT layer reaches of the process's Linux kernel: its
+/// namespace, its memory map, its task ids and its thread counts. Each part
+/// is shared and carries its own lock (the mm lock) or none (the published
+/// namespace, the atomics), so the layer holds no kernel lock to use them
+/// (docs/kernel-locking.md §3.12, group H). Taken from the kernel once, at
+/// [`boot::boot`], where the process has one owner; an NT process neither
+/// execs nor forks, so none of these is replaced while it runs.
+pub struct NtKernel {
+    ns: Arc<crate::vfs::VfsView>,
+    /// The process's memory map: the same one ([`crate::mem::Mm::shared`]).
+    pub mem: crate::mem::Mm,
+    pub procs: Arc<crate::proc::ProcTable>,
+    /// The Linux pid.
+    pub pid: i32,
+    pub next_ctx_slot: Arc<AtomicU32>,
+    pub live_threads: Arc<AtomicU32>,
 }
 
-/// The kernel, held. Dropping it lets go.
-pub struct KernelGuard<'a>(Box<dyn std::ops::DerefMut<Target = Kernel> + 'a>);
-
-impl<'a> KernelGuard<'a> {
-    pub fn new(held: Box<dyn std::ops::DerefMut<Target = Kernel> + 'a>) -> Self {
-        KernelGuard(held)
+impl NtKernel {
+    pub fn of(k: &Kernel) -> NtKernel {
+        NtKernel {
+            ns: Arc::clone(k.vfs.view()),
+            mem: k.mem.shared(),
+            procs: Arc::clone(&k.procs),
+            pid: k.pid,
+            next_ctx_slot: Arc::clone(&k.next_ctx_slot),
+            live_threads: Arc::clone(&k.live_threads),
+        }
     }
-}
 
-impl std::ops::Deref for KernelGuard<'_> {
-    type Target = Kernel;
-    fn deref(&self) -> &Kernel {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for KernelGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Kernel {
-        &mut self.0
-    }
-}
-
-impl KernelCell for Mutex<Kernel> {
-    fn lock_kernel(&self) -> KernelGuard<'_> {
-        KernelGuard(Box::new(self.lock().unwrap_or_else(|e| e.into_inner())))
+    /// The namespace as it stands: a mount or a `chdir` since shows in the
+    /// next one.
+    pub fn vfs(&self) -> Arc<crate::vfs::Namespace> {
+        self.ns.get()
     }
 }
 
@@ -725,7 +728,6 @@ impl NtHost for NoHost {
 pub struct Call<'a> {
     pub p: &'a Arc<Process>,
     pub t: Arc<Thread>,
-    pub kernel: &'a dyn KernelCell,
     pub g: G<'a>,
     pub nr: u32,
     pub pc: u64,
@@ -770,8 +772,9 @@ impl<'a> Call<'a> {
         self.a(i) as u32
     }
 
-    pub fn kernel(&self) -> KernelGuard<'a> {
-        self.kernel.lock_kernel()
+    /// The process's Linux kernel, as far as the NT layer reaches it.
+    pub fn kernel(&self) -> &'a NtKernel {
+        self.p.kernel.get().expect("gex-nt: a call before boot")
     }
 
     pub fn unimplemented(&self, what: &str) -> Status {
@@ -872,7 +875,6 @@ impl Fault {
 /// adjusts); `info` fills `ExceptionInformation`.
 pub fn hardware_exception(
     p: &Arc<Process>,
-    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     code: u32,
@@ -896,7 +898,7 @@ pub fn hardware_exception(
             r(ctx::LAST_SOURCE)
         );
     }
-    let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None, ret64: None, host: &mut NoHost };
+    let mut c = Call { p, t, g, nr: 0, pc: rip, outcome: None, ret64: None, host: &mut NoHost };
     let r = (|| -> R<()> {
         let sp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
         let context = ((sp - 0x5c0) & !63) - 0x600;
@@ -932,14 +934,13 @@ pub fn hardware_exception(
 /// returns to guest code.
 pub fn syscall(
     p: &Arc<Process>,
-    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     pc: u64,
     host: &mut dyn NtHost,
 ) -> Outcome {
     let t = p.thread_by_ctx(ctx_addr);
-    syscall_on(p, t, kernel, data, ctx_addr, pc, host)
+    syscall_on(p, t, data, ctx_addr, pc, host)
 }
 
 /// A safepoint in guest code (the host's countdown expired, registers
@@ -966,7 +967,6 @@ pub fn syscalls_here() -> u64 {
 pub fn syscall_on(
     p: &Arc<Process>,
     t: Option<Arc<Thread>>,
-    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     pc: u64,
@@ -975,7 +975,7 @@ pub fn syscall_on(
     if let Some(t) = &t {
         t.in_kernel.store(true, Ordering::SeqCst);
     }
-    let o = syscall_inner(p, t.clone(), kernel, data, ctx_addr, pc, host);
+    let o = syscall_inner(p, t.clone(), data, ctx_addr, pc, host);
     if let Some(t) = &t {
         t.in_kernel.store(false, Ordering::SeqCst);
         if matches!(o, Outcome::Continue | Outcome::Resume(_) | Outcome::CallbackReturn) {
@@ -988,7 +988,6 @@ pub fn syscall_on(
 fn syscall_inner(
     p: &Arc<Process>,
     t: Option<Arc<Thread>>,
-    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     pc: u64,
@@ -1006,11 +1005,11 @@ fn syscall_inner(
         return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
     if p.kill_pending.load(Ordering::Acquire) != 0 && p.kill_list.lock().unwrap().contains(&t.tid) {
-        let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
+        let mut c = Call { p, t, g, nr, pc, outcome: None, ret64: None, host };
         thread::exit_thread(&mut c, p.exit_code.load(Ordering::Acquire));
         return Outcome::ThreadExit;
     }
-    let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
+    let mut c = Call { p, t, g, nr, pc, outcome: None, ret64: None, host };
     let r = dispatch(&mut c);
     let status = match r {
         Ok(s) => s,

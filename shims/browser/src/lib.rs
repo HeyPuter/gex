@@ -2264,18 +2264,18 @@ pub extern "C" fn gex_set_wl_trace(on: i32) {
 /// handler so the common OOB/"trapped inside" crash (not just guest SIGABRT)
 /// names all threads. TWO threads with the SAME `ctx=` is issue #126: two
 /// Workers on one register context, which clobbers stacks and looks like
-/// corruption anywhere. Reads with `with_host_free` (no borrow) so it answers
-/// even when a crash left the kernel borrowed.
+/// corruption anywhere. Reads the thread table, which needs no kernel lock
+/// (L23), so it answers even when a crash left the kernel held.
 #[no_mangle]
 pub extern "C" fn gex_dump_threads() {
-    with_host_free(|h| {
+    if let Some(home) = sigs::home() {
         let mut s = String::from("[gex] threads at crash:");
-        for (i, t) in h.threads.iter().enumerate() {
+        for (i, t) in home.table().iter() {
             let r = t.run();
             s.push_str(&format!(
                 " t{i}(tid={} ctx={:#x} pc={:#x} {})",
-                t.kstate.tid,
-                t.kstate.ctx_addr,
+                t.tid(),
+                t.ctx_addr(),
                 r.pc,
                 waiting_name(&r.waiting),
             ));
@@ -2286,7 +2286,7 @@ pub extern "C" fn gex_dump_threads() {
         // timing. klock too. Same process memory, so these are this pid's.
         s.push_str(&format!(" klock={}\n", klock_holder()));
         warn_line(&s);
-    });
+    }
 }
 
 /// Whether the thread whose context is at `ctx` has exited: a Worker whose
@@ -2294,11 +2294,10 @@ pub extern "C" fn gex_dump_threads() {
 /// thread, joined) is done, not stuck.
 #[no_mangle]
 pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
-    with_host(|h| {
-        h.threads
-            .iter()
-            .any(|t| t.kstate.ctx_addr == ctx as u64 && matches!(t.run().waiting, Waiting::Exited)) as i32
-    })
+    // The thread table, without the kernel lock (L23).
+    sigs::home().is_some_and(|home| {
+        home.table().iter().any(|(_, t)| t.ctx_addr() == ctx as u64 && matches!(t.run().waiting, Waiting::Exited))
+    }) as i32
 }
 
 /// How many of an object's stored units one dispatch miss may take, merged
@@ -2913,7 +2912,7 @@ enum Waiting {
     /// Waiting on the network. Readiness is the operation's question, held in
     /// `blocked_on`, so this only carries the deadline.
     Net(Option<u64>),
-    /// In `sigsuspend`: only a signal ends it (`thread_ready`'s first test).
+    /// In `sigsuspend`: only a signal ends it (`wait_ready`'s first test).
     Signal,
     /// In `rt_sigtimedwait` (`BlockOp::SigWait`, which says for which
     /// signals): until one of its set is pending, until this deadline, or a
@@ -2932,21 +2931,73 @@ enum Waiting {
 /// One guest thread. Its registers live in its context in guest memory, so
 /// switching to it is a call to the guest entry with a different context
 /// pointer; there is no wasm stack to save.
-struct Thread {
-    kstate: ThreadState,
+/// A process's threads (docs/kernel-locking.md §3.7, L23): each one's tid,
+/// context and run state, added and read from any Worker without the kernel
+/// lock. A thread's index is its own for its life (`cur()`).
+pub(crate) type Threads = gex_atomic::threads::ThreadTable<ThreadCell>;
+
+/// A process's table with its one thread.
+fn threads_of(t: ThreadState, pc: u64, waiting: Waiting) -> Arc<Threads> {
+    let table = Arc::new(Threads::default());
+    table.push(t.tid, t.ctx_addr, ThreadCell::new(Run::new(pc, waiting)));
+    table
+}
+
+/// What a slot of [`Threads`] says about its thread.
+pub(crate) trait ThreadSlot {
+    fn kstate(&self) -> ThreadState;
     /// Where it stands: its own Worker's, which changes it without the
     /// kernel lock (docs/kernel-locking.md §3.7).
-    run: Arc<Mutex<Run>>,
+    fn run(&self) -> std::sync::MutexGuard<'_, Run>;
+    /// Its [`ThreadCell::gone`].
+    fn gone(&self) -> &std::sync::atomic::AtomicBool;
+    /// Its [`ThreadCell::halted`].
+    fn halted(&self) -> &std::sync::atomic::AtomicBool;
+}
+
+impl ThreadSlot for gex_atomic::threads::Slot<ThreadCell> {
+    fn kstate(&self) -> ThreadState {
+        ThreadState::new(self.ctx_addr(), self.tid())
+    }
+
+    fn run(&self) -> std::sync::MutexGuard<'_, Run> {
+        self.state().run.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+
+    fn gone(&self) -> &std::sync::atomic::AtomicBool {
+        &self.state().gone
+    }
+
+    fn halted(&self) -> &std::sync::atomic::AtomicBool {
+        &self.state().halted
+    }
+}
+
+/// A slot's state in [`Threads`]: the thread's run, behind its own lock,
+/// and the two flags an `execve` from another thread sets and reads without
+/// it (Linux's de_thread).
+pub(crate) struct ThreadCell {
+    run: Mutex<Run>,
     /// Set when another thread's `execve` took the process from under this
-    /// one (Linux's de_thread): the thread has gone with the old program,
-    /// while the process goes on. Its Worker reads it, without the kernel
-    /// lock, through [`thread_gone`].
-    gone: Arc<std::sync::atomic::AtomicBool>,
+    /// one: the thread has gone with the old program, while the process goes
+    /// on. Its Worker reads it through [`thread_gone`].
+    gone: std::sync::atomic::AtomicBool,
     /// Set by the thread itself once it is `gone` and has stopped: it runs
     /// no more guest code. An `execve` from another thread waits for this
     /// before it replaces the image (`exec_waits`), as Linux's de_thread
     /// waits for the other threads to die.
-    halted: Arc<std::sync::atomic::AtomicBool>,
+    halted: std::sync::atomic::AtomicBool,
+}
+
+impl ThreadCell {
+    fn new(run: Run) -> ThreadCell {
+        ThreadCell { run: Mutex::new(run), gone: Default::default(), halted: Default::default() }
+    }
+
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Run>> {
+        self.run.lock()
+    }
 }
 
 /// A thread's place in its run: what it waits for and what its parked call
@@ -2954,7 +3005,7 @@ struct Thread {
 /// owns the thread finishes a parked call it finds ready with no other lock,
 /// and the rest (the idle look across threads, `exit_group`, the censuses)
 /// read or mark it under this one.
-struct Run {
+pub(crate) struct Run {
     /// Where to resume, which for a thread that blocked is the instruction
     /// after its `svc`.
     pc: u64,
@@ -2978,18 +3029,9 @@ struct Owed {
     reissue: bool,
 }
 
-impl Thread {
-    fn new(kstate: ThreadState, pc: u64, waiting: Waiting) -> Thread {
-        Thread {
-            kstate,
-            run: Arc::new(Mutex::new(Run { pc, waiting, blocked_on: None, owed: Owed::default() })),
-            gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    fn run(&self) -> std::sync::MutexGuard<'_, Run> {
-        self.run.lock().unwrap_or_else(|e| e.into_inner())
+impl Run {
+    fn new(pc: u64, waiting: Waiting) -> Run {
+        Run { pc, waiting, blocked_on: None, owed: Owed::default() }
     }
 }
 
@@ -3055,8 +3097,8 @@ thread_local! {
 }
 
 /// The JIT state, taking its lock for this thread if it does not hold it.
-/// Whoever takes it here gives it back with `jit_give` (`KLock`'s release,
-/// the end of an SP `with_host`, `with_jit_only`).
+/// Whoever takes it here gives it back with `jit_give` (`ExecLock`'s release,
+/// the end of an SP `with_exec_lock`, `with_jit_only`).
 fn jit_held() -> *mut Jit {
     JIT_HELD.with(|g| {
         let mut g = g.borrow_mut();
@@ -3235,8 +3277,7 @@ struct Host {
     /// could look at it.
     proc_state: Arc<gex_kernel::KernelProcSource>,
     /// Every guest thread, the running one included.
-    threads: Vec<Thread>,
-    exit: Option<i32>,
+    threads: Arc<Threads>,
     jit: JitHere,
     /// When an `execve` from a threaded process began waiting for its other
     /// threads to stop (`exec_waits`).
@@ -3340,7 +3381,7 @@ fn install_panic_hook() {
             //
             // `write` is a *syscall*: it takes the kernel. Almost every panic
             // worth reading happens with the kernel already taken -- that is
-            // what `with_host` panics about -- so the hook took the borrow a
+            // what `with_exec_lock` panics about -- so the hook took the borrow a
             // second time, panicked inside the panic, and the run ended as a
             // bare `unreachable` with nothing said. Which is how
             // `apt-get update` reported only
@@ -3394,7 +3435,7 @@ fn set_host(host: Host) {
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
     *jitout::BOX.0.borrow_mut() = None;
-    // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
+    // SAFETY: see `with_exec_lock` -- one Worker is inside the kernel at a time.
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
     // The new process's descriptor table (`FDS`).
     // SAFETY: as above; the table stays in place until the next `set_host`.
@@ -3410,63 +3451,64 @@ fn set_host(host: Host) {
     }
 }
 
+/// The host of a process this Worker alone has: a fork child's or an exec
+/// child's, between its adoption and its first guest instruction (F, L25c),
+/// before any other Worker of it exists. Its fields are written directly,
+/// with no lock: nothing else can reach them yet (docs/kernel-locking.md
+/// §3.12 F).
+fn with_own_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    #[cfg(not(feature = "shared-memory"))]
+    let r = HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: an adoption before its process")));
+    // SAFETY: the process has one Worker, this one, and it is not inside
+    // any other call into the shim (an adoption is its own export).
+    #[cfg(feature = "shared-memory")]
+    let r = f(unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut() }.expect("gex: an adoption before its process"));
+    debug_assert!(sigs::home().is_none_or(|h| h.table().len() == 1), "an own host with more than one thread");
+    r
+}
+
+/// Forget the host a fork's copy of its parent's memory holds, dropping
+/// nothing of it: its descriptors, sockets and ends are the parent's, and
+/// each closes its end in the global kernel when it drops (how a process
+/// leaving by a trap still releases them), charged to whichever pid this
+/// Worker answers as. That is what killed a terminal's session: the shell's
+/// slave end went with the copy, the master read end of file, and the whole
+/// foreground group took a SIGHUP one command in. The copy is leaked, into
+/// memory that is this process's own image anyway. No lock: the copy is
+/// this Worker's alone.
+fn forget_copied_host() {
+    #[cfg(not(feature = "shared-memory"))]
+    let old = HOST.with(|h| h.borrow_mut().take());
+    // SAFETY: as `with_own_host`.
+    #[cfg(feature = "shared-memory")]
+    let old = unsafe { (*core::ptr::addr_of_mut!(HOST)).take() };
+    std::mem::forget(old);
+}
+
 /// What a new process's Workers read without the kernel lock: its signal
 /// state (`sigs`), with its one thread as the one this Worker runs, and
 /// whether it is a wasm32 program (`WASM32`).
 fn publish_process(h: &mut Host) {
     WASM32.store(h.kernel.wasm32, std::sync::atomic::Ordering::Release);
-    sigs::publish(&h.kernel);
+    sigs::publish(&h.kernel, &h.threads, &h.proc_state.0);
     wl::publish_process(&h.kernel);
     h.kernel.publish_proc(&h.proc_state.0);
-    publish_runs(h);
     bind_mine(h, 0);
-}
-
-/// Most threads a process's run states are published for ([`publish_runs`]).
-const RUN_SLOTS: usize = 1024;
-
-/// Every thread's run state, published for readers without the kernel lock
-/// (docs/kernel-locking.md §3.7): the futex deadlock watch, which asks
-/// whether every thread is parked on a futex nothing will wake. Each slot is
-/// an `Arc::into_raw` that is never taken back: a run state lives as long as
-/// the memory does (a few words a thread), so a reader never meets a freed
-/// one, whatever replaced it.
-static RUNS: [std::sync::atomic::AtomicUsize; RUN_SLOTS] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; RUN_SLOTS];
-/// How many of [`RUNS`] are this process's threads.
-static RUNS_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Publish `h`'s threads' run states to [`RUNS`]: after the table changes
-/// (a new process, a new thread, an exec, a vfork's swap).
-pub(crate) fn publish_runs(h: &Host) {
-    use std::sync::atomic::Ordering::Release;
-    let n = h.threads.len().min(RUN_SLOTS);
-    for (i, t) in h.threads.iter().take(n).enumerate() {
-        if RUNS[i].load(std::sync::atomic::Ordering::Relaxed) != Arc::as_ptr(&t.run) as usize {
-            RUNS[i].store(Arc::into_raw(Arc::clone(&t.run)) as usize, Release);
-        }
-    }
-    RUNS_N.store(n, Release);
 }
 
 /// Whether every thread of this process is parked on a futex with no
 /// deadline, and not one of them already woken: a deadlock, if it lasts
-/// (`DEADLOCK_CONFIRM`). No kernel lock: each thread's run state has its own
-/// ([`RUNS`]).
+/// (`DEADLOCK_CONFIRM`). No kernel lock: the thread table and each run
+/// state lock themselves.
 pub(crate) fn all_futex_blocked() -> bool {
-    use std::sync::atomic::Ordering::Acquire;
-    let n = RUNS_N.load(Acquire);
-    if n == 0 {
+    let Some(home) = sigs::home() else { return false };
+    let table = home.table();
+    if table.is_empty() {
         return false;
     }
     let now = turn_now();
-    (0..n).all(|i| {
-        let p = RUNS[i].load(Acquire) as *const Mutex<Run>;
-        if p.is_null() {
-            return false;
-        }
-        // SAFETY: an `Arc::into_raw` of a run state, never released (`RUNS`).
-        let r = unsafe { &*p }.lock().unwrap_or_else(|e| e.into_inner());
+    table.iter().all(|(_, t)| {
+        let r = t.run();
         matches!(r.waiting, Waiting::Futex { deadline: None, .. }) && !wait_ready(&r.waiting, &r.blocked_on, now, false)
     })
 }
@@ -3475,7 +3517,7 @@ pub(crate) fn all_futex_blocked() -> bool {
 /// what reads its process without the kernel reads the child's, from this
 /// Worker only (vfork.rs); the parent's other Workers keep the parent's.
 fn publish_vfork_child(h: &mut Host) {
-    sigs::publish_here(Some(&h.kernel));
+    sigs::publish_here(Some((&h.kernel, &h.threads, &h.proc_state.0)));
     vfork::set_fds_here(&h.kernel.fds);
     h.kernel.publish_proc(&h.proc_state.0);
     bind_mine(h, 0);
@@ -3508,12 +3550,12 @@ pub extern "C" fn gex_has_host() -> i32 {
     }
     #[cfg(feature = "shared-memory")]
     {
-        // SAFETY: a read of an `Option`'s discriminant; see `with_host`.
+        // SAFETY: a read of an `Option`'s discriminant; see `with_exec_lock`.
         unsafe { (*core::ptr::addr_of!(HOST)).is_some() as i32 }
     }
 }
 
-/// Where the call currently inside `with_host` came from.
+/// Where the call currently inside `with_exec_lock` came from.
 ///
 /// Re-entering the kernel is the failure this shim is most prone to and the
 /// hardest to place: the panic says "already borrowed" and names the borrow
@@ -3801,7 +3843,7 @@ fn sys_recent() -> String {
     out
 }
 
-/// The last few `with_host` call sites, oldest first: a re-entrancy's
+/// The last few `with_exec_lock` call sites, oldest first: a re-entrancy's
 /// interesting part is the path, not just who holds the kernel.
 static RING: [std::sync::atomic::AtomicUsize; 6] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
@@ -3841,7 +3883,7 @@ fn holder() -> String {
 
 #[cfg(not(feature = "shared-memory"))]
 #[track_caller]
-fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+fn with_exec_lock<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     let here = std::panic::Location::caller();
     if let Some(child) = vfork::host_here() {
@@ -3876,76 +3918,25 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     })
 }
 
-/// The host, but only if nobody is inside it -- for a crash reporter, the one
-/// caller for which re-entry is expected: it runs after a trap, which leaves
-/// the borrow held forever. `None` ("cannot say") beats a panic that replaces
-/// the crash with a complaint about the reporter.
-#[cfg(not(feature = "shared-memory"))]
-fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
-    // A reporter that touches the JIT state takes its lock only for itself.
-    let held = jit_holds();
-    let r = with_host_free_in(f);
-    if !held {
-        jit_give();
-    }
-    r
-}
-
-#[cfg(not(feature = "shared-memory"))]
-fn with_host_free_in<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
-    if let Some(child) = vfork::host_here() {
-        // SAFETY: as `with_host`.
-        return Some(f(unsafe { &mut *child }));
-    }
-    HOST.with(|h| match h.try_borrow_mut() {
-        Ok(mut b) => b.as_mut().map(f),
-        Err(_) => None,
-    })
-}
-
-/// As above. The shared build has no `RefCell` to ask -- it borrows a static
-/// in place under `KLock` -- so the honest answer is the same one `with_host`
-/// gives, minus the initialisation panic.
-#[cfg(feature = "shared-memory")]
-fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
-    let held = jit_holds();
-    let r = with_host_free_in(f);
-    if !held {
-        jit_give();
-    }
-    r
-}
-
-#[cfg(feature = "shared-memory")]
-fn with_host_free_in<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
-    if let Some(child) = vfork::host_here() {
-        // SAFETY: as `with_host`.
-        return Some(f(unsafe { &mut *child }));
-    }
-    // SAFETY: as `with_host`. Read-mostly and only from a reporter, which
-    // runs when the guest has already stopped.
-    unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut().map(f) }
-}
-
-/// The same, under the kernel lock. Re-entrancy is a real hazard -- a host call
-/// that asks the guest to write can come back through here, a deadlock under a
-/// spinlock -- but every such path already had to avoid it.
+/// The same, under the exec lock ([`ExecLock`]). Re-entrancy is a real hazard
+/// -- a host call that asks the guest to write can come back through here, a
+/// deadlock under a spinlock -- but every such path already had to avoid it.
 #[cfg(feature = "shared-memory")]
 #[track_caller]
-fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+fn with_exec_lock<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     // A plain static borrowed in place, neither locked-across-`f` nor moved.
-    // The shim traps out of `with_host` as ordinary control flow (that is how
+    // The shim traps out of `with_exec_lock` as ordinary control flow (that is how
     // the stack goes back to JS) and a trap does not unwind, so a guard held
     // across `f` would never drop; moving the `Host` out and back copies it
     // twice per syscall, indistinguishable from a hang. The static is shared
     // between Workers for free (the shim's data is in the guest's
     // `SharedArrayBuffer` memory).
     //
-    // SAFETY: `KLock` makes one Worker inside the kernel at a time true rather
+    // SAFETY: `ExecLock` makes one Worker inside the kernel at a time true rather
     // than hoped for; taken here, given back before return; any non-return path
     // out of `f` is a trap that ends the process.
-    let _guard = KLock::take();
+    let _guard = ExecLock::take();
     // A vfork child running in this Worker has a process of its own
     // (vfork.rs); the lock still, for the translation state it shares.
     if let Some(child) = vfork::host_here() {
@@ -4165,7 +4156,7 @@ thread_local! {
     static WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// This instance holds a `gex_worker_init` slot.
     static CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// This Worker's kernel-lock recursion depth: a re-entrant `with_host`
+    /// This Worker's kernel-lock recursion depth: a re-entrant `with_exec_lock`
     /// (the panic handler writing to fd 2) would otherwise self-deadlock.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -4187,7 +4178,7 @@ pub extern "C" fn gex_set_worker(id: u32) {
 static KLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Who holds the kernel lock right now: 0 = nobody, else the holder's Worker id
-/// plus one. For deadlock diagnosis -- a Worker spinning in `KLock::take` while
+/// plus one. For deadlock diagnosis -- a Worker spinning in `ExecLock::take` while
 /// this stays non-zero and unchanged is blocked on whoever holds it.
 fn klock_holder() -> u32 {
     #[cfg(feature = "shared-memory")]
@@ -4200,22 +4191,28 @@ pub extern "C" fn gex_klock_holder() -> u32 {
     klock_holder()
 }
 
-/// The kernel lock, held for one call into `with_host`.
+/// The exec lock, held for one call into `with_exec_lock`: what is left of the
+/// kernel lock (docs/kernel-locking.md §3.12). Only the process calls take it
+/// -- `execve`, and `clone`, `clone3`, `fork` and `vfork` making a process,
+/// and the dynamic linker's `SNAP_SYSCALL` that keeps a linked image -- which
+/// replace, copy or record the whole `Host` (its image, its memory map, its JIT
+/// state): it keeps a fork from copying a process an exec is replacing, as
+/// Linux's `exec_update_lock` does. Every other call is the free path's.
 ///
 /// A `memory.atomic.wait32` rather than a spin, to not burn a core on a
 /// foreground tab. Blocking is legal here because every guest thread runs in a
 /// Worker; only the page's main thread may not block.
 #[cfg(feature = "shared-memory")]
-struct KLock;
+struct ExecLock;
 
 #[cfg(feature = "shared-memory")]
-impl KLock {
-    fn take() -> KLock {
+impl ExecLock {
+    fn take() -> ExecLock {
         let me = WORKER.with(|w| w.get()) + 1;
         if DEPTH.with(|d| d.get()) > 0 {
             // Already ours. Counted rather than taken again.
             DEPTH.with(|d| d.set(d.get() + 1));
-            return KLock;
+            return ExecLock;
         }
         // Outermost of the locks that nest: not under the JIT state's or
         // the memory map's (docs/kernel-locking.md §4.3).
@@ -4260,12 +4257,12 @@ impl KLock {
             }
         }
         DEPTH.with(|d| d.set(1));
-        KLock
+        ExecLock
     }
 }
 
 #[cfg(feature = "shared-memory")]
-impl Drop for KLock {
+impl Drop for ExecLock {
     fn drop(&mut self) {
         let d = DEPTH.with(|d| d.get());
         DEPTH.with(|c| c.set(d.saturating_sub(1)));
@@ -4283,7 +4280,7 @@ impl Drop for KLock {
     }
 }
 
-/// The JIT's own state while a translation runs outside `KLock`
+/// The JIT's own state while a translation runs outside `ExecLock`
 /// (docs/kernel-locking.md, step 5).
 ///
 /// A dispatch miss lifts with the kernel lock let go: the translator takes the
@@ -4647,7 +4644,9 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
         return -1;
     }
     let count = u32at(&mut p);
-    with_host(|h| {
+    // The map locks itself (no kernel lock, L25c).
+    let mm = sigs::proc_home().mm();
+    {
         for _ in 0..count {
             if p + 24 > raw.len() {
                 return -1;
@@ -4671,10 +4670,10 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 Some((id, off))
             };
             ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
-            h.kernel.mem.lock().adopt(start, end, prot, &name, code);
+            mm.lock().adopt(start, end, prot, &name, code);
         }
         0
-    })
+    }
 }
 
 /// The highest address this process inherited a mapping at, or zero if it
@@ -5133,8 +5132,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             wayland,
             root,
             proc_state,
-            threads: vec![Thread::new(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable)],
-            exit: None,
+            threads: threads_of(ThreadState::new(gex_abi::ctx_addr(0), 1), entry as u64, Waiting::Runnable),
             jit: JitHere,
             exec_waited_since: None,
         magic_tail: HOST_MAGIC,
@@ -6146,7 +6144,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     let had = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
     if had != entry {
         // With the pid, to tell one process renumbering from several numbering
-        // independently. `my_pid` reads a static: this runs inside `with_host`
+        // independently. `my_pid` reads a static: this runs inside `with_exec_lock`
         // closures and must not borrow.
         warn_line(&format!(
             "[gex] pid {} dir page {page}: {:#x} -> {:#x} by {who}\n",
@@ -6501,7 +6499,7 @@ thread_local! {
 /// enough that a real deadlock is still reported promptly.
 const DEADLOCK_CONFIRM: u32 = 32;
 
-/// Whether a pending signal makes a parked thread runnable. See `thread_ready`.
+/// Whether a pending signal makes a parked thread runnable. See `wait_ready`.
 /// A constant so bisecting can flip it in one build; measured off, the wedge is
 /// not this.
 const SIGNAL_ENDS_WAIT: bool = true;
@@ -6671,12 +6669,14 @@ pub extern "C" fn gex_wake() -> i32 {
     static WAKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 4096 {
-        let census = with_host(|h| {
+        // Without the kernel lock: the thread table and each run state lock
+        // themselves (L23).
+        let census = sigs::home().map(|home| {
             let mut out = String::new();
             // One process per Worker, so this Worker's threads are all there is
             // to report; other processes census their own.
-            for (pid, p) in std::iter::once((h.kernel.pid as usize, &h.threads)) {
-                for (i, t) in p.iter().enumerate() {
+            for (pid, p) in std::iter::once((home.pid() as usize, home.table())) {
+                for (i, t) in p.iter() {
                     let r = t.run();
                     out.push_str(&format!(
                         " {pid}.{i}={}@{:#x}",
@@ -6688,7 +6688,7 @@ pub extern "C" fn gex_wake() -> i32 {
                     // time vs now (equal => no wake was relayed to it), and the
                     // guest word vs the value it slept on (differ => the guest
                     // thinks it was woken, so a relay that never bumped the gen is
-                    // a lost wake). See `thread_ready`'s Futex arm.
+                    // a lost wake). See `wait_ready`'s Futex arm.
                     if let Waiting::Futex { parked, val, wake_gen, .. } = &r.waiting {
                         let a = parked.addr();
                         let gen_now = if unsafe { k_present() } != 0 {
@@ -6703,7 +6703,7 @@ pub extern "C" fn gex_wake() -> i32 {
                 }
             }
             out
-        });
+        }).unwrap_or_default();
         trace_line(&format!("[gex] woken {n} times, threads:{census}\n"));
     }
     set_paused_to(0);
@@ -6794,7 +6794,7 @@ static mut SYSLOG: [(u64, u64, u64, u64); SYSLOG_N] = [(0, 0, 0, 0); SYSLOG_N];
 static mut SYSLOG_AT: usize = 0;
 
 /// The ring, oldest first, as `name(arg0, arg1) = ret` lines. Without
-/// `with_host`: read from inside the guest's own write, which already holds it.
+/// `with_exec_lock`: read from inside the guest's own write, which already holds it.
 #[no_mangle]
 pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     let mut text = String::new();
@@ -6820,13 +6820,14 @@ pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
 /// per-process line (which program a cost belongs to).
 #[no_mangle]
 pub extern "C" fn gex_cmdline(out: u32, max: u32) -> u32 {
-    let text = with_host(|h| {
-        let mut t = h.kernel.argv.join(" ");
+    let text = (|| {
+        let Some(home) = sigs::home() else { return Default::default() };
+        let mut t = home.argv().join(" ");
         if t.is_empty() {
-            t = h.kernel.exe_path.clone();
+            t = home.exe().clone();
         }
         t
-    });
+    })();
     let mut n = text.len().min(max as usize);
     while n > 0 && !text.is_char_boundary(n) {
         n -= 1;
@@ -7193,7 +7194,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     }
     let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped) } {
     Some(stop) => stop,
-    None => with_host(|h| {
+    None => with_exec_lock(|h| {
         let stop = (|h: &mut Host| -> i32 {
         // Another thread's `execve` took the process from this one: the
         // thread table is the new program's, and this thread is not in it.
@@ -7210,7 +7211,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         set_my_pid(h.kernel.pid);
         report_new_pins_in(h);
         let mut gm = GuestMem::new(guest_bytes());
-        let kstate = h.threads[cur()].kstate.clone();
+        let kstate = h.threads[cur()].kstate();
         if ctx as u32 as u64 != kstate.ctx_addr {
             warn_line(&format!(
                 "[gex] syscall context mismatch at {:#x}: translated ctx={:#x}, worker thread {} ctx={:#x}",
@@ -7221,6 +7222,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             ));
         }
         h.kernel.enter_thread(&kstate);
+        // Whether this is a wasm32 program: `WASM32` says (cgen/wasmprog.rs
+        // sets it at the program's install, without the lock).
+        h.kernel.wasm32 = WASM32.load(std::sync::atomic::Ordering::Acquire);
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
         let nr = gm
@@ -7386,7 +7390,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 set_resume(target);
                 1
             }
-            SyscallOutcome::Exit(code) => exit_process(h, code),
+            SyscallOutcome::Exit(code) => exit_process(code),
             // A signal with no handler kills the *process*, not the run.
             // Setting the run's exit here is what ended `apt update`: apt
             // stops its http method with `kill(pid, SIGINT)` -- ordinary
@@ -7395,53 +7399,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             // Negative for "died of a signal"; see `exit_process`.
             SyscallOutcome::Killed { signal, .. } => {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                killed(h, signal as i32, at)
+                killed(signal as i32, at)
             }
-            SyscallOutcome::SpawnThread { ctx_addr, tid } => {
-                // The kernel has already written the child's context; it
-                // starts at the pc that context carries.
-                let start = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
-                // A Worker of its own. Always: a thread is a Worker here.
-                //
-                // The table entry is still this process's -- `join`, the
-                // futexes and `live_threads` are all counted here -- but the
-                // thread runs on another stack, and `Elsewhere` is the state
-                // that says "not me". Without it two Workers would run the
-                // same context.
-                h.threads.push(Thread::new(
-                    ThreadState { ctx_addr, tid },
-                    start,
-                    Waiting::Elsewhere,
-                ));
-                publish_runs(h);
-                // From here the process has a second Worker, so translated
-                // modules must be kept for it to catch up. Until now they were
-                // not (see `gex_jit_installed`) -- so on this first edge, take
-                // back into the registry everything already installed, or a
-                // joining thread traps in the low startup pages the main Worker
-                // lifted before this clone (see `backfill_registry`).
-                if !h.jit.ever_threaded {
-                    backfill_registry(h);
-                    h.jit.ever_threaded = true;
-                    regview::set_threaded(true);
-                }
-                stage_thread(tid, ctx_addr, start);
-                if frames_stay() {
-                    // A wasm32 program's frames cannot be left: the call
-                    // returns, and `#wasmprogSyscall` starts the thread.
-                    WASM32_STAGED.with(|c| c.set(true));
-                    return 0;
-                }
-                // The stack goes back so the host can see the record and
-                // start the Worker, exactly as a `fork` does. The parent
-                // resumes where it was: `clone` returns the tid to it.
-                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
-                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                1
-            }
+            SyscallOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].run().waiting = Waiting::Exited;
-                end_if_all_exited(h);
+                end_if_all_exited();
                 // Nowhere to resume this thread. A resume left from before
                 // (a call-out's return, `cgen::returned`, which a call-out
                 // that was not the one returned to leaves set) would be
@@ -7608,7 +7571,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // stack comes back. Letting the parent run on first copied it
                 // several syscalls later, with a context already saved over.
                 set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
-                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                set_resume_ctx(h.threads[cur()].ctx_addr());
                 1
             }
             SyscallOutcome::Exec { path, argv, envp } if vfork::active() => {
@@ -7641,7 +7604,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // failure here is the loader's: not an ELF, or one this
                     // cannot place. `ENOEXEC` is what the guest expects.
                     let mut gm = GuestMem::new(guest_bytes());
-                    let ctx_addr = h.threads[cur()].kstate.ctx_addr;
+                    let ctx_addr = h.threads[cur()].ctx_addr();
                     let _ = gex_kernel::syscalls::set_result(
                         &mut gm,
                         ctx_addr,
@@ -7650,12 +7613,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     0
                 } else {
                     set_resume(entry);
-                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                    set_resume_ctx(h.threads[cur()].ctx_addr());
                     1
                 }
             }
             _ => {
-                set_exit(h, 128 + 31);
+                set_exit(128 + 31);
                 2
             }
         }
@@ -8156,7 +8119,7 @@ fn wasm32_wait(pc: u64) -> i32 {
 }
 
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>, start: Option<u64>) {
-    let ctx_addr = h.threads[cur()].kstate.ctx_addr;
+    let ctx_addr = h.threads[cur()].ctx_addr();
     // Not with a sibling mid-translation: the child is a copy of this memory,
     // and a translator outside the lock is changing the heap.
     jit_in_held(&mut h.jit);
@@ -8458,7 +8421,12 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
 /// [`gex_adopt_fds`]'s work, on `stage_fork_fds`'s text.
 fn adopt_fds_text(text: &str) -> i32 {
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = Some(Default::default()));
-    let n = with_host(|h| {
+    // No kernel lock (L25c): the names resolve in the process's published
+    // namespace, and the descriptor table locks itself.
+    let home = sigs::proc_home();
+    let ns = home.ns();
+    let fds = fds_free().expect("gex: descriptors adopted before their process");
+    let n = {
         let mut n = 0;
         for line in text.lines() {
             let mut parts = line.splitn(5, ' ');
@@ -8475,7 +8443,7 @@ fn adopt_fds_text(text: &str) -> i32 {
                 continue;
             };
             let Some(path) = parts.next() else { continue };
-            let file = match rebuild_carried(&h.kernel.vfs, path, flags, offset) {
+            let file = match rebuild_carried(&ns, path, flags, offset) {
                 Ok(f) => f,
                 Err(e) => {
                     // Never quietly: a missing descriptor is an `EBADF` at
@@ -8484,12 +8452,12 @@ fn adopt_fds_text(text: &str) -> i32 {
                     continue;
                 }
             };
-            if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
+            if fds.install(fd, file, cloexec != 0).is_ok() {
                 n += 1;
             }
         }
         n
-    });
+    };
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = None);
     n
 }
@@ -8806,8 +8774,8 @@ fn set_resume_ctx(v: u64) {
 
 /// Where the running thread's register context is, without asking the kernel.
 ///
-/// Every question the crash reporter asks used to go through `with_host`, and
-/// a crash inside a `with_host` closure leaves the kernel borrowed -- so each
+/// Every question the crash reporter asks used to go through `with_exec_lock`, and
+/// a crash inside a `with_exec_lock` closure leaves the kernel borrowed -- so each
 /// question panicked on the leaked borrow instead of answering, and the
 /// report arrived with no pc at all:
 ///
@@ -8890,12 +8858,10 @@ fn set_current(h: &mut Host, i: usize) {
 /// without the kernel (its context, its tid, its signals).
 pub(crate) fn bind_mine(h: &mut Host, i: usize) {
     if let Some(t) = h.threads.get(i) {
-        let (tid, ctx_addr) = (t.kstate.tid, t.kstate.ctx_addr);
+        let (tid, ctx_addr) = (t.tid(), t.ctx_addr());
         MY_CTX.with(|c| c.set(ctx_addr));
         MY_TID.with(|c| c.set(tid));
-        MY_RUN.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.run)));
-        MY_GONE.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.gone)));
-        MY_HALTED.with(|c| *c.borrow_mut() = Some(Arc::clone(&t.halted)));
+        MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
         sigs::bind(&mut h.kernel, tid);
     }
 }
@@ -8914,32 +8880,25 @@ thread_local! {
     static MY_TID: Cell<i32> = const { Cell::new(0) };
     /// And its run state ([`Run`]), which this Worker changes without the
     /// kernel lock.
-    static MY_RUN: RefCell<Option<Arc<Mutex<Run>>>> = const { RefCell::new(None) };
-    /// And its [`Thread::gone`].
-    static MY_GONE: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
-    /// And its [`Thread::halted`].
-    static MY_HALTED: RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { RefCell::new(None) };
+    /// It is the thread's slot state, so its `gone` and `halted` with it.
+    static MY_RUN: RefCell<Option<Arc<ThreadCell>>> = const { RefCell::new(None) };
 }
 
 /// Whether this Worker's thread went with its old program when another
 /// thread of the process called `execve`. Its index into the thread table
 /// (`cur()`) means nothing any more: the table is the new program's.
 pub(crate) fn thread_gone() -> bool {
-    MY_GONE.with(|c| c.borrow().as_ref().is_some_and(|g| g.load(std::sync::atomic::Ordering::SeqCst)))
+    MY_RUN.with(|c| c.borrow().as_ref().is_some_and(|t| t.gone.load(std::sync::atomic::Ordering::SeqCst)))
 }
 
 /// This Worker's thread, found [`thread_gone`], stops: it is exited, runs no
 /// more guest code, and says so to the `execve` waiting for it
-/// ([`Thread::halted`]). Nowhere to resume.
+/// ([`ThreadCell::halted`]). Nowhere to resume.
 pub(crate) fn stop_gone() {
     if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
         run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+        run.halted.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    MY_HALTED.with(|c| {
-        if let Some(h) = c.borrow().as_ref() {
-            h.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
     set_resume_none();
     set_resume_ctx_none();
 }
@@ -8970,6 +8929,9 @@ pub(crate) fn my_tid() -> i32 {
 static THREAD: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// `THREAD[0]` while a stage writes the other two words (`stage_thread`).
+const STAGING: u64 = u64::MAX;
+
 // A thread is a Worker. There is no second shape.
 //
 // There used to be a `THREAD_WORKERS` switch and, behind it, a scheduler that
@@ -8984,6 +8946,50 @@ static THREAD: [std::sync::atomic::AtomicU64; 3] =
 // cannot start it. That is a loud failure rather than a quiet one, which is
 // the trade -- see `gex_thread_stage` and the host's side of it.
 
+/// A thread `clone` has made, by either path (L25b): into the thread table,
+/// staged for the host to give a Worker of its own, and the creator on
+/// after its `clone` (whose answer, the tid, is in its context). No kernel
+/// lock: the table claims a slot with an atomic add, the registry backfill
+/// is the JIT state's, and the stage is claimed by a swap. The stop value.
+fn thread_made(tid: i32, ctx_addr: u64, syscall_pc: u64) -> i32 {
+    // The kernel has already written the child's context; it starts at the
+    // pc that context carries.
+    let start = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    // A Worker of its own. Always: a thread is a Worker here.
+    //
+    // The table entry is still this process's -- `join`, the futexes and
+    // `live_threads` are all counted here -- but the thread runs on another
+    // stack, and `Elsewhere` is the state that says "not me". Without it two
+    // Workers would run the same context.
+    sigs::proc_home().table().push(tid, ctx_addr, ThreadCell::new(Run::new(start, Waiting::Elsewhere)));
+    // From here the process has a second Worker, so translated modules must
+    // be kept for it to catch up. Until now they were not (see
+    // `gex_jit_installed`) -- so on this first edge, take back into the
+    // registry everything already installed, or a joining thread traps in
+    // the low startup pages the main Worker lifted before this clone (see
+    // `backfill_registry`).
+    with_jit_only(|j| {
+        if !j.ever_threaded {
+            backfill_registry(j);
+            j.ever_threaded = true;
+            regview::set_threaded(true);
+        }
+    });
+    stage_thread(tid, ctx_addr, start);
+    if frames_stay() {
+        // A wasm32 program's frames cannot be left: the call returns, and
+        // `#wasmprogSyscall` starts the thread.
+        WASM32_STAGED.with(|c| c.set(true));
+        return 0;
+    }
+    // The stack goes back so the host can see the record and start the
+    // Worker, exactly as a `fork` does. The creator resumes where it was:
+    // `clone` returns the tid to it.
+    set_resume(syscall_pc + gex_abi::SYSCALL_INST_BYTES);
+    set_resume_ctx(my_ctx());
+    1
+}
+
 fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     // One slot, shared by every Worker. A second clone must not overwrite a
     // triple the claiming Worker has not finished reading: `gex_thread_pending`
@@ -8994,14 +9000,20 @@ fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     // to 0) before staging the next; the claim is quick (the clone syscall
     // returns straight to the JS that reads it), so this spins rarely and
     // briefly. Bounded only to turn a never-claimed slot into a loud message
-    // rather than a silent hang under `KLock`.
+    // rather than a silent hang under `ExecLock`.
+    // Without the kernel lock two Workers may stage at once: the slot is
+    // taken for writing by a swap from 0 to `STAGING`, which the claim
+    // (`gex_thread_pending`) passes over.
     let mut spins: u64 = 0;
-    while THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0 {
+    while THREAD[0]
+        .compare_exchange_weak(0, STAGING, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+        .is_err()
+    {
         core::hint::spin_loop();
         spins += 1;
         if spins == 1 << 30 {
             warn_line("gex: stage_thread: prior thread slot never claimed\n");
-            break;
+            spins = 0;
         }
     }
     THREAD[1].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
@@ -9029,6 +9041,11 @@ pub extern "C" fn gex_thread_pending() -> i32 {
         let tid = THREAD[0].load(std::sync::atomic::Ordering::Acquire);
         if tid == 0 {
             return 0;
+        }
+        // Being staged: a moment.
+        if tid == STAGING {
+            core::hint::spin_loop();
+            continue;
         }
         // Read the context words BEFORE claiming, then claim with a
         // compare-and-swap that also proves the tid did not change while they
@@ -9077,20 +9094,37 @@ pub extern "C" fn gex_thread_taken() {}
 #[no_mangle]
 pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
     phase(9);
-    with_host(|h| {
-        let Some(i) = h.threads.iter().position(|t| t.kstate.tid == tid) else {
-            return 0;
-        };
-        // Gone before it ever ran: another thread's `execve` is replacing
-        // the program it was made for.
-        if h.threads[i].gone.load(std::sync::atomic::Ordering::SeqCst) {
-            h.threads[i].halted.store(true, std::sync::atomic::Ordering::SeqCst);
-            return 0;
-        }
-        h.threads[i].run().waiting = Waiting::Runnable;
-        set_current(h, i);
-        h.threads[i].run().pc as i64
-    })
+    // No kernel lock (L25b): the thread table and the signal states lock
+    // themselves, and the binding is this Worker's own.
+    let Some(home) = sigs::home() else { return 0 };
+    let table = home.table();
+    let Some(i) = table.position(tid) else {
+        return 0;
+    };
+    // Gone before it ever ran: another thread's `execve` is replacing the
+    // program it was made for.
+    if table[i].gone().load(std::sync::atomic::Ordering::SeqCst) {
+        table[i].halted().store(true, std::sync::atomic::Ordering::SeqCst);
+        return 0;
+    }
+    table[i].run().waiting = Waiting::Runnable;
+    CURRENT.with(|c| c.set(i));
+    bind_free(i);
+    let pc = table[i].run().pc;
+    pc as i64
+}
+
+/// [`bind_mine`] with no kernel lock (L25b, L25c): thread `i` of this
+/// Worker's process, from its thread table and its signal states.
+pub(crate) fn bind_free(i: usize) {
+    let Some(home) = sigs::home() else { return };
+    if let Some(t) = home.table().get(i) {
+        let tid = t.tid();
+        MY_CTX.with(|c| c.set(t.ctx_addr()));
+        MY_TID.with(|c| c.set(tid));
+        MY_RUN.with(|c| *c.borrow_mut() = Some(t.state_arc()));
+        sigs::bind_free(home, tid);
+    }
 }
 
 /// Kept so a host built against the older shape still links; the claim in
@@ -9125,12 +9159,7 @@ pub extern "C" fn gex_adopt_child(
     // opened for it by `stage_fork_fds`, so the copy is leaked rather than
     // dropped -- into memory that is this process's own image anyway.
     if gex_has_host() != 0 {
-        with_host(|h| {
-            std::mem::forget(std::mem::replace(
-                &mut h.kernel.fds,
-                Arc::new(gex_kernel::file::FdTable::new()),
-            ));
-        });
+        forget_copied_host();
     }
     // The slot maps the copied low region names are the parent's.
     dense::child();
@@ -9255,7 +9284,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     // numbered from 1 reached N and drove two threads through one context (the
     // Win7 shell's COM factory child of explorer: its fifth thread ran on the
     // main thread's registers).
-    kernel.next_ctx_slot = kernel.next_ctx_slot.max(ctx_slots_below(ctx_addr));
+    kernel.next_ctx_slot.fetch_max(ctx_slots_below(ctx_addr), std::sync::atomic::Ordering::AcqRel);
     // The process's start, unless this is a vfork child's kernel: the
     // memory's other Workers are its parent's threads (vfork.rs).
     if vfork::pid_here().is_none() {
@@ -9313,8 +9342,7 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
         proc_state,
         // The child is one thread: `fork` does not carry the parent's others
         // across, and in this design they were never in this Worker anyway.
-        threads: vec![Thread::new(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable)],
-        exit: None,
+        threads: threads_of(ThreadState::new(ctx_addr, pid), pc as u64, Waiting::Runnable),
         jit: JitHere,
         exec_waited_since: None,
         magic_tail: HOST_MAGIC,
@@ -9327,12 +9355,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
 /// child's own image.
 #[no_mangle]
 pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
-    with_host(|h| {
-        h.kernel
-            .mem
-            .lock()
-            .insert(start as u64, end as u64, prot as u32, "[forked]");
-    });
+    // The map locks itself (no kernel lock, L25c).
+    sigs::proc_home().mm().lock().insert(start as u64, end as u64, prot as u32, "[forked]");
 }
 
 /// End the running process. Always returns 2: this Worker ran one process and
@@ -9341,26 +9365,51 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
 /// `code` is an exit status, or the negated signal number for a signal death --
 /// `wait4` reports the two differently (`code << 8` vs the bare signal), and
 /// carrying the sign keeps them apart without widening the status path.
-fn exit_process(h: &mut Host, code: i32) -> i32 {
+fn exit_process(code: i32) -> i32 {
+    // One thread ends the process; any other that gets here meanwhile (a
+    // second `exit_group`, the last thread's `exit`, a fault) only stops.
+    // No kernel lock: what the end touches locks itself.
+    if let Some(home) = sigs::home() {
+        if home.exit().claim() {
+            end_process_once(home, code);
+        }
+    } else {
+        set_exited(true);
+    }
+    // And nowhere to resume, said explicitly: the host re-enters the guest when
+    // `gex_resume_pc` is set, so a resume left over from an earlier parked call
+    // would send a just-exited process back into its own code with an emptied
+    // descriptor table.
+    set_resume_none();
+    set_resume_ctx_none();
+    2
+}
+
+/// The end [`exit_process`] claimed for its caller, run once per process.
+fn end_process_once(home: &sigs::Home, code: i32) {
     // Every thread marked `Exited`, because the scheduler ends a Worker only
     // when all threads are: a thread left `Runnable` gets picked again and
     // re-entered with its kernel state already released, so the guest keeps
     // making syscalls after it is gone.
-    for t in h.threads.iter() {
+    for (_, t) in home.table().iter() {
         let mut r = t.run();
         r.waiting = Waiting::Exited;
         r.blocked_on = None;
     }
     // See `gex_exited`: tells a program that finished from one that abandoned
-    // the wasm stack with no status set.
+    // the wasm stack with no status set. From here every other thread's next
+    // call, and the end of its park, is its end (`free_syscall`, `finish_mine`).
     set_exited(true);
     waitq::wake_process();
-    let pid = h.kernel.pid;
+    let pid = home.pid();
     // Descriptors go first and explicitly: a trap out of wasm does not unwind,
     // so nothing is dropped, and a pipe end between two Workers lives in the
     // global kernel and only learns of a close from `Drop` -- otherwise the
-    // reader waits forever for an EOF nobody sends.
-    h.kernel.fds.close_all();
+    // reader waits forever for an EOF nobody sends. A thread still inside a
+    // call on one keeps its description until the call ends.
+    if let Some(fds) = fds_free() {
+        fds.close_all();
+    }
     // And anything the table did not account for: a guest leaving by a trap
     // rather than `exit_group` never reaches the line above (see
     // `k_pipe_forget`).
@@ -9377,21 +9426,15 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             }
         }
     }
-    publish_exit(h, pid, code);
+    // The status last, so a parent's `wait4` finds the descriptors closed.
+    publish_exit(pid, code);
     // Nothing to hand the stack to: other processes are other Workers already
     // running, and the parent's `wait4` finds the status in the shared table.
     if tracing() {
         trace_line(&format!("[proc] exit {pid} with {code}\n"));
     }
-    // And nowhere to resume, said explicitly: the host re-enters the guest when
-    // `gex_resume_pc` is set, so a resume left over from an earlier parked call
-    // would send a just-exited process back into its own code with an emptied
-    // descriptor table.
-    set_resume_none();
-    set_resume_ctx_none();
     // A shell reports a signal death as 128 + the signal, and so does this.
-    set_exit(h, if code < 0 { 128 - code } else { code });
-    2
+    set_exit(if code < 0 { 128 - code } else { code });
 }
 
 /// `execve`: replace this process's image with another program's. Everything
@@ -9568,11 +9611,12 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
-    h.kernel.live_threads = 1;
+    cgen::wasmprog::stage(program.as_ref());
+    h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
     // Clones above the context this program goes on, which is the exec'ing
     // thread's: not slot 0 after an exec from a second thread.
     let here = if ctx_addr_get() != 0 { ctx_addr_get() } else { h.kernel.ctx_addr };
-    h.kernel.next_ctx_slot = ctx_slots_below(here).max(1);
+    h.kernel.next_ctx_slot.store(ctx_slots_below(here).max(1), std::sync::atomic::Ordering::Release);
 
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
@@ -9807,7 +9851,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // by content key.
     h.jit.installed_mods.clear();
 
-    let ctx_addr = h.threads[cur()].kstate.ctx_addr;
+    let ctx_addr = h.threads[cur()].ctx_addr();
     let c = ctx_addr as usize;
     // A loaded program starts with clear registers; a restored one keeps the
     // linker's (`x0` is `_dl_fini` for `atexit`, and the thread pointer names
@@ -9837,16 +9881,15 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Worker, parked or running, sees `gone` and ends, without the process.
     let me = cur();
     let others = h.threads.len() > 1;
-    for (i, t) in h.threads.iter().enumerate() {
+    for (i, t) in h.threads.iter() {
         if i != me {
-            t.gone.store(true, std::sync::atomic::Ordering::Release);
+            t.gone().store(true, std::sync::atomic::Ordering::Release);
             let mut r = t.run();
             r.waiting = Waiting::Exited;
             r.blocked_on = None;
         }
     }
-    h.threads = vec![Thread::new(ThreadState::new(ctx_addr, h.kernel.pid), entry, Waiting::Runnable)];
-    publish_runs(h);
+    h.threads.reset(h.kernel.pid, ctx_addr, ThreadCell::new(Run::new(entry, Waiting::Runnable)));
     set_current(h, 0);
     if others {
         waitq::wake_process();
@@ -9882,16 +9925,16 @@ fn exec_waits(h: &mut Host) -> bool {
     let me = cur();
     let mut running = false;
     let mut woke = false;
-    for (i, t) in h.threads.iter().enumerate() {
+    for (i, t) in h.threads.iter() {
         if i == me {
             continue;
         }
-        t.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        t.gone().store(true, std::sync::atomic::Ordering::SeqCst);
         let mut r = t.run();
         match r.waiting {
             Waiting::Exited => {}
             // Running, as far as anyone can tell: its Worker says when not.
-            Waiting::Runnable => running |= !t.halted.load(std::sync::atomic::Ordering::SeqCst),
+            Waiting::Runnable => running |= !t.halted().load(std::sync::atomic::Ordering::SeqCst),
             // Not adopted yet (`gex_adopt_thread` refuses it now), or parked.
             _ => {
                 woke |= !matches!(r.waiting, Waiting::Elsewhere);
@@ -10671,11 +10714,11 @@ fn shared_modules_of_object(
 /// impossible because the registry is empty until this runs -- the keep was
 /// gated off -- and every later module is a fresh id pushed by
 /// `gex_jit_installed`.
-fn backfill_registry(h: &mut Host) {
+fn backfill_registry(j: &mut Jit) {
     if unsafe { k_present() } == 0 {
         return;
     }
-    let ids: Vec<u32> = h.jit.installed_mods.iter().copied().collect();
+    let ids: Vec<u32> = j.installed_mods.iter().copied().collect();
     for id in ids {
         // SAFETY: `k_mod_len` sizes the buffer the `k_mod_read` below fills;
         // the kernel refuses rather than overruns when the two disagree.
@@ -10691,19 +10734,19 @@ fn backfill_registry(h: &mut Host) {
         let mut range = (0, 0);
         if dense::on() {
             if let Some(at) = gex_emit::dense::locate(&wasm) {
-                let Some(&base) = h.jit.dense_base.get(&id) else { continue };
+                let Some(&base) = j.dense_base.get(&id) else { continue };
                 gex_emit::dense::set_base(&mut wasm, &at, base);
                 range = (base, gex_emit::dense::section(&wasm, &at).map_or(0, |s| s.entries.len() as u32));
             }
         }
-        h.jit.registry_dense.push(range);
+        j.registry_dense.push(range);
         wasm.shrink_to_fit();
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        h.jit.registry_sums.push(chunk_sums(&wasm));
-        regview::publish_module(h.jit.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
-        h.jit.registry.push(wasm);
-        h.jit.registry_ext.push(None);
+        j.registry_sums.push(chunk_sums(&wasm));
+        regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
+        j.registry.push(wasm);
+        j.registry_ext.push(None);
     }
 }
 
@@ -10992,15 +11035,7 @@ enum Pick {
     Again,
 }
 
-/// Whether a thread could make progress if given the stack. Asked of threads in
-/// other processes too (what lets the scheduler cross a process boundary): all
-/// it consults is reference-counted and outside guest memory.
-fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
-    let r = t.run();
-    wait_ready(&r.waiting, &r.blocked_on, now, signalled)
-}
-
-/// [`thread_ready`] of a wait: what a lock-free idle turn asks of the wait it
+/// Whether a thread's wait is over: what a lock-free idle turn asks of the wait it
 /// registered (`waitq`). Reads nothing the kernel lock guards -- handles are
 /// reference-counted and synchronise themselves, the futex generations and
 /// the process table are the global kernel's.
@@ -11132,41 +11167,40 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
     let resume = resume().unwrap_or(0);
     // Whether this process is over: the run loop checks it first, so a finished
     // process takes the waiting branch however runnable its threads look.
-    let over = with_host_free(|h| h.exit.is_some()).unwrap_or(false);
-    let text = with_host_free(|h| {
+    let over = sigs::home().is_some_and(|h| h.exit().over());
+    let text = sigs::home().map(|home| {
+        let ns = home.ns();
+        let px = Px { mm: home.mm(), ns: &ns, pid: home.pid() };
         let mut s = format!(
             "pid {} worker-runs-t{} paused={why:#x} resume={resume:#x} exited={over}:",
-            h.kernel.pid,
+            home.pid(),
             cur(),
         );
-        for (i, t) in h.threads.iter().enumerate() {
+        for (i, t) in home.table().iter() {
             let r = t.run();
             s.push_str(&format!(" t{i}={}@{:#x}", waiting_name(&r.waiting), r.pc));
             // The LIVE pc from the context, not `r.pc` (updated only on a
             // block): a spinning `runnable` thread's real pc is here.
             if matches!(r.waiting, Waiting::Runnable) {
                 let gm = GuestMem::new(guest_bytes());
-                let live = gm.read_u64(t.kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                let live = gm.read_u64(t.ctx_addr() + ctx::PC as u64).unwrap_or(0);
                 // Also the file offset within the object, so `addr2line` can name
                 // the exact function a runnable-but-frozen thread is stuck in.
-                let foff = h
-                    .kernel
-                    .mem
-                    .lock()
+                let foff = home.mm().lock()
                     .vmas()
                     .iter()
                     .find(|v| live >= v.start && live < v.end)
                     .and_then(|v| v.code.as_ref().map(|(_, off)| off + (live - v.start)));
                 s.push_str(&format!(
                     "[live={live:#x} {}+{:#x}]",
-                    object_name_at(&Px::of(h), live),
+                    object_name_at(&px, live),
                     foff.unwrap_or(0)
                 ));
             }
             // Name a futex park's object too, so a deadlock says which lib's
             // lock each side is on.
             if let Waiting::Futex { parked, .. } = &r.waiting {
-                s.push_str(&format!("[{}]", object_name_at(&Px::of(h), parked.addr())));
+                s.push_str(&format!("[{}]", object_name_at(&px, parked.addr())));
             }
             // Not just "read" but what it is reading -- the question when two
             // processes wait for each other.
@@ -11232,13 +11266,16 @@ fn report_idle(why: u8) {
     if !n.is_power_of_two() || n < 1024 {
         return;
     }
-    let census = with_host(|h| {
+    // Without the kernel lock: the thread table, each run state, the map
+    // and the descriptor table lock themselves (L23).
+    let census = sigs::home().map(|home| {
         let mut out = String::new();
+        let table = fds_free();
         // This Worker's process only, with its descriptor table so a polled fd
         // can be named; the other half of a cross-process wait is in the other
         // Worker's census.
-        for (pid, p, k) in std::iter::once((h.kernel.pid as usize, &h.threads, &h.kernel)) {
-            for (i, t) in p.iter().enumerate() {
+        for (pid, p, k) in std::iter::once((home.pid() as usize, home.table(), home)) {
+            for (i, t) in p.iter() {
                 let r = t.run();
                 out.push_str(&format!(" {pid}.{i}={}@{:#x}", waiting_name(&r.waiting), r.pc));
                 // The live ctx pc (updated by the JIT at block boundaries), not
@@ -11247,10 +11284,10 @@ fn report_idle(why: u8) {
                 // here, where r.pc is still the entry. Names the block a stranded
                 // nested-clone thread died on (native-wayland gtk stall).
                 let cpc = GuestMem::new(guest_bytes())
-                    .read_u64(t.kstate.ctx_addr + ctx::PC as u64)
+                    .read_u64(t.ctx_addr() + ctx::PC as u64)
                     .unwrap_or(0);
                 if cpc != r.pc {
-                    let where_ = k.mem.lock().vmas().iter()
+                    let where_ = k.mm().lock().vmas().iter()
                         .find(|v| cpc >= v.start && cpc < v.end)
                         .map(|v| format!(" in {} +{:#x}", v.name, cpc - v.start))
                         .unwrap_or_default();
@@ -11274,14 +11311,13 @@ fn report_idle(why: u8) {
                 if let Some(gex_kernel::BlockOp::Poll { fds, .. }) = &r.blocked_on {
                     out.push('(');
                     for f in fds {
-                        let what = k
-                            .fds
-                            .get(f.fd)
+                        let what = table
+                            .and_then(|t| t.get(f.fd).ok())
                             .map(|o| {
                                 let d = o.handle.debug_state();
                                 if d.is_empty() { o.path.clone() } else { d }
                             })
-                            .unwrap_or_else(|_| "?".into());
+                            .unwrap_or_else(|| "?".into());
                         out.push_str(&format!(
                             "[{} {what} want{:#x} have{:#x}] ",
                             f.fd,
@@ -11306,7 +11342,7 @@ fn report_idle(why: u8) {
             }
         }
         out
-    });
+    }).unwrap_or_default();
     // Built from the bits, not matched on the whole mask: a match on exact
     // values misreports any mask carrying a new bit.
     let mut asked = String::new();
@@ -11480,7 +11516,7 @@ fn schedule() -> i32 {
         // a request then blocks on the reply, so it must run here, the one
         // place every thread passes through on its way to waiting. Needs the
         // kernel (to find a buffer's shared mapping) and guest memory (the
-        // pixels), so it pumps inside `with_host`; the device is a
+        // pixels), so it pumps inside `with_exec_lock`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
         let pick = match FIRST_PICK.with(|c| c.take()) {
             Some(pick) => pick,
@@ -11579,19 +11615,20 @@ fn deadlock_confirmed() -> bool {
 /// symptom into something to look up. The process ends (`set_exit`), which
 /// is the kernel's.
 fn report_deadlock() {
-    let who = with_host(|h| {
+    // Who is parked where, without the kernel lock (L23); the end is the
+    // kernel's.
+    let who = sigs::home().map(|home| {
         let mut s = String::new();
         let gm = GuestMem::new(guest_bytes());
-        for (i, t) in h.threads.iter().enumerate() {
+        for (i, t) in home.table().iter() {
             let r = t.run();
             if let Waiting::Futex { parked, .. } = &r.waiting {
-                let pc = gm.read_u64(t.kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                let pc = gm.read_u64(t.ctx_addr() + ctx::PC as u64).unwrap_or(0);
                 s.push_str(&format!(
                     "gex:   thread {i} parked on {:#x}, pc {:#x}{}\n",
                     parked.addr(),
                     pc,
-                    h.kernel
-                        .mem
+                    home.mm()
                         .lock()
                         .vmas()
                         .iter()
@@ -11602,10 +11639,10 @@ fn report_deadlock() {
             }
         }
         s
-    });
+    }).unwrap_or_default();
     trace_line("gex: every thread is blocked on a futex\n");
     trace_line(&who);
-    with_host(|h| set_exit(h, 128 + 31));
+    set_exit(128 + 31);
 }
 
 /// The compositor's work, when it has any, before a scheduler turn: a
@@ -11621,11 +11658,10 @@ fn pump_compositor() {
 /// Every thread gone ends this process, all this Worker has; the status is
 /// in the shared table for whoever waits. Asked where a thread exits, under
 /// that call's take: the last one out ends it.
-pub(crate) fn end_if_all_exited(h: &mut Host) {
-    if h.threads.iter().all(|t| matches!(t.run().waiting, Waiting::Exited)) {
-        let code = h.exit.take().unwrap_or(0);
-        exit_process(h, code);
-        h.exit.get_or_insert(code);
+pub(crate) fn end_if_all_exited() {
+    let Some(home) = sigs::home() else { return };
+    if home.table().iter().all(|(_, t)| matches!(t.run().waiting, Waiting::Exited)) {
+        exit_process(home.exit().status().unwrap_or(0));
     }
 }
 
@@ -11717,6 +11753,12 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
     let ctx_addr = ctx as u32 as u64;
     let mut gm = GuestMem::new(guest_bytes());
     let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1;
+    // The dynamic linker's jump to gex's stub entry, at a process's start
+    // (`SNAP_SYSCALL`): what it built is kept as an exec's image is made,
+    // under the exec lock.
+    if gm.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(0) == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
+        return None;
+    }
     let call = gex_kernel::syscalls::free_class(&gm, ctx_addr, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
@@ -11745,9 +11787,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
     } else {
         sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64)
     };
-    if n == nr::FUTEX {
-        // Every futex this call woke, relayed to the shared per-address
-        // counter, so a waiter parked in another Worker sees the wake.
+    if n == nr::FUTEX || n == nr::EXIT {
+        // Every futex this call woke (an `exit` wakes its thread's joiner),
+        // relayed to the shared per-address counter, so a waiter parked in
+        // another Worker sees the wake.
         if unsafe { k_present() } != 0 {
             if let Some(home) = sigs::home() {
                 for addr in home.futexes.take_woken() {
@@ -11756,7 +11799,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             }
         }
         // Every futex answer that is an error, by name (`ftx_recent`).
-        if let FreeOutcome::Done(_) = &outcome {
+        if let (nr::FUTEX, FreeOutcome::Done(_)) = (n, &outcome) {
             let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
             ftx_note(a1, a0, ret as i64, pc as u64, my_tid());
         }
@@ -11791,6 +11834,19 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             exit_here(-(signal as i32), Some(at))
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
+        // `exit` from one of several threads (L25a): this thread is over;
+        // the last one out of the thread table ends the process.
+        FreeOutcome::ThreadExit => {
+            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+            }
+            end_if_all_exited();
+            // Nowhere to resume this thread (as the kernel's `ThreadExit`).
+            set_resume_none();
+            set_resume_ctx_none();
+            3
+        }
+        FreeOutcome::SpawnThread { ctx_addr, tid } => thread_made(tid, ctx_addr, pc as u64),
         FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
         // A wasm32 program's sigreturn put back a call its handler
         // interrupted: that call, made now as a syscall of its own (without
@@ -11856,7 +11912,17 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         gex_kernel::BlockOp::SigWait { timeout, .. } => {
             Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
         }
-        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket or a signal"),
+        // `wait4` (L25a), as the kernel's park: `WNOHANG` answers on the
+        // first turn; anything else waits for the child, which may not have
+        // started yet.
+        gex_kernel::BlockOp::WaitChild { nohang, .. } => {
+            if *nohang {
+                Waiting::Runnable
+            } else {
+                Waiting::Child
+            }
+        }
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket, a signal or a child"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     let reissue = matches!(op, gex_kernel::BlockOp::AcceptWait { .. });
@@ -11884,7 +11950,7 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
 /// and what the call owes was taken from the kernel when it parked
 /// (docs/kernel-locking.md §3.7). The first turn of a class call's park
 /// ([`park_free`]) and every turn with no registered wait to ask.
-fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
+fn pick_mine(run: &Arc<ThreadCell>) -> Pick {
     loop {
         let sig = sigs::ready();
         let mut r = run.lock().unwrap_or_else(|e| e.into_inner());
@@ -11948,7 +12014,8 @@ fn pick_mine(run: &Arc<Mutex<Run>>) -> Pick {
 
 /// A signal with no handler kills this *process*, not the run (`exit_process`),
 /// its thread at `at`: said loudly, unless another process ended it on purpose.
-fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
+fn killed(signal: i32, at: u64) -> i32 {
+    let Some(home) = sigs::home() else { return exit_process(-signal) };
     // Loudly, and whatever the tracing settings.
     //
     // A guest that dies of a signal used to leave nothing at all
@@ -11982,7 +12049,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
     // Ended on purpose by another process (SIGINT, SIGKILL or
     // SIGTERM it sent this one): one quiet line, not the report.
     // apt ends every method this way after a clean run.
-    let pid = h.kernel.pid;
+    let pid = home.pid();
     if matches!(sent, Some((caller, target, signo))
         if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
             && caller != pid && (target == pid || target == -pid || target == 0))
@@ -11992,7 +12059,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
     warn_line(&format!(
         "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
          last calls:{}\n  address space:{}\n  futexes:{}",
-        h.kernel.pid,
+        pid,
         signal,
         last_stderr(),
         // Every thread, not only the one that died. Two threads
@@ -12000,15 +12067,14 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
         // everything downstream of that looks like corruption
         // somewhere else entirely -- which is the shape #126 has.
         // Cheap to rule in or out, and never recorded before.
-        h.threads
+        home.table()
             .iter()
-            .enumerate()
             .map(|(i, t)| {
                 let r = t.run();
                 format!(
                     " t{i}(tid={} ctx={:#x} pc={:#x} {})",
-                    t.kstate.tid,
-                    t.kstate.ctx_addr,
+                    t.tid(),
+                    t.ctx_addr(),
                     r.pc,
                     waiting_name(&r.waiting),
                 )
@@ -12019,7 +12085,7 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
         ftx_recent(),
     ));
     }
-    exit_process(h, -(signal as i32))
+    exit_process(-signal)
 }
 
 /// End this Worker's process (`exit_process`), from outside the kernel: a
@@ -12027,10 +12093,10 @@ fn killed(h: &mut Host, signal: i32, at: u64) -> i32 {
 /// halted machine. With `killed_at`, the thread's pc, a signal's death is
 /// reported as a syscall's is ([`killed`]). The stop value (2).
 fn exit_here(code: i32, killed_at: Option<u64>) -> i32 {
-    with_host(|h| match killed_at {
-        Some(at) if code < 0 => killed(h, -code, at),
-        _ => exit_process(h, code),
-    })
+    match killed_at {
+        Some(at) if code < 0 => killed(-code, at),
+        _ => exit_process(code),
+    }
 }
 
 /// How a parked call ended for its thread.
@@ -12522,7 +12588,7 @@ thread_local! {
 
 /// Did the shim mean to give the stack back? Clears the flag.
 ///
-/// Not `with_host`: this is asked on the way out of a trap, which is exactly
+/// Not `with_exec_lock`: this is asked on the way out of a trap, which is exactly
 /// when the kernel may still be borrowed by whatever trapped.
 #[no_mangle]
 pub extern "C" fn gex_handoff() -> i32 {
@@ -12543,7 +12609,20 @@ pub extern "C" fn gex_resume_ctx() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn gex_exit_code() -> i32 {
-    with_host(|h| h.exit.unwrap_or(0))
+    // An end claimed and still under way in another Worker: `exited` is set
+    // at the claim and the status recorded last (`end_process_once`), so a
+    // Worker that stopped on `exited` meanwhile would report 0 for it
+    // (main-thread-exit under load). It is a few calls away: wait for it,
+    // bounded, as the kernel lock used to make this wait.
+    if let Some(home) = sigs::home() {
+        if home.exit().over() && home.exit().status().is_none() {
+            let until = now_ns() + 5_000_000_000;
+            while home.exit().status().is_none() && now_ns() < until {
+                std::hint::spin_loop();
+            }
+        }
+    }
+    exit_status().unwrap_or(0)
 }
 
 fn write_u64(data: &mut [u8], off: usize, v: u64) {
@@ -12631,14 +12710,13 @@ fn hook_fault(pc: u64, code: u32, addr: u64) {
     if cgen::fault_hook() == 0 {
         return;
     }
-    with_host(|h| {
-        let mut gm = GuestMem::new(guest_bytes());
-        let c = h.threads[cur()].kstate.ctx_addr;
-        let _ = gm.write_u64(c + ctx::PC as u64, pc);
-        cgen::fault_stage(code, addr, 0);
-        set_resume(pc);
-        set_resume_ctx(c);
-    });
+    // No lock: the context is this Worker's thread's own (`my_ctx`).
+    let mut gm = GuestMem::new(guest_bytes());
+    let c = my_ctx();
+    let _ = gm.write_u64(c + ctx::PC as u64, pc);
+    cgen::fault_stage(code, addr, 0);
+    set_resume(pc);
+    set_resume_ctx(c);
     trap();
 }
 
@@ -12673,7 +12751,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
         raw as u32,
         pc
     ));
-    with_host(|h| set_exit(h, 128 + 4));
+    set_exit(128 + 4);
     trap();
 }
 /// `log2` of the guest bytes one dispatch slot spans (`gex_abi::DISPATCH_SHIFT`).
@@ -12700,9 +12778,13 @@ pub extern "C" fn gex_compat() -> i32 {
 /// state has been adopted, before any block is translated there.
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
-    with_host(|h| {
+    // Once per process, at a child's adoption in its own Worker, before any
+    // of its threads run: the process is this Worker's alone, and its
+    // fields are written directly (L25c). A thread's Worker never calls it
+    // (what it sets is shared).
+    with_own_host(|h| {
         h.kernel.compat = on != 0;
-        // A child's process starts now; a thread's is its process's, already set.
+        // A child's process starts now.
         if h.kernel.started == 0 {
             h.kernel.started = now_ns() as u128;
         }
@@ -12713,17 +12795,21 @@ pub extern "C" fn gex_set_compat(on: i32) {
     // an AArch64 build is another slot (its i386-ABI processes are wasm32
     // programs: posix_spawn's child starts on that stack).
     if on != 0 && !gex_abi::X86 && !gex_abi::PPC {
-        with_host(|h| {
-            let mut gm = GuestMem::new(guest_bytes());
-            let c = h.kernel.ctx_addr;
-            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
-            if sp != 0 {
-                let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
-                let _ = gm.write_u64(c + ctx::SP as u64, 0);
-            }
-        });
+        compat_stack(my_ctx());
     }
     gex_xlate::set_compat(on != 0);
+}
+
+/// An adopted i386-ABI child's stack, from `ctx::SP` (where its adoption
+/// put it) to `esp` (`ctx::sp_slot`), which on an AArch64 build is another
+/// slot: its context at `c`, its own.
+pub(crate) fn compat_stack(c: u64) {
+    let mut gm = GuestMem::new(guest_bytes());
+    let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+    if sp != 0 {
+        let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
+        let _ = gm.write_u64(c + ctx::SP as u64, 0);
+    }
 }
 
 #[no_mangle]
@@ -12743,9 +12829,9 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         trap();
     }
     if raw == gex_abi::imports::BRK_TRACE {
-        let line = with_host(|h| {
+        let line = (|| {
             let gm = GuestMem::new(guest_bytes());
-            let c = h.threads[cur()].kstate.ctx_addr;
+            let c = my_ctx();
             let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
             if gex_abi::X86 {
                 format!(
@@ -12762,7 +12848,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                     r(0), r(1), r(2), r(3), r(8), r(19), r(20), r(29), r(30)
                 )
             }
-        });
+        })();
         trace_line(&line);
         return;
     }
@@ -12806,16 +12892,15 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             HITS
         };
         {
-            let (line, unusual) = with_host(|h| {
+            let (line, unusual) = (|| {
+                let Some(home) = sigs::home() else { return Default::default() };
                 let gm = GuestMem::new(guest_bytes());
-                let c = h.threads[cur()].kstate.ctx_addr;
+                let c = my_ctx();
                 let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
                 let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
                 let x30 = r(30);
                 let object = |a: u64| {
-                    h.kernel
-                        .mem
-                        .lock()
+                    home.mm().lock()
                         .vmas()
                         .iter()
                         .find(|v| a >= v.start && a < v.end)
@@ -12824,7 +12909,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                 (format!(
                     "gex: TRAP_PC #{n} tid={} at pc={:#x}: x30={x30:#x} ({}) sp={sp:#x} \
                      x0={:#x} x1={:#x} x19={:#x} x20={:#x}\n",
-                    h.threads[cur()].kstate.tid,
+                    my_tid(),
                     pc as u64,
                     object(x30),
                     r(0),
@@ -12832,7 +12917,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                     r(19),
                     r(20),
                 ), r(1) > 0xff)
-            });
+            })();
             // The first hits establish the normal call shape. Keep reporting
             // a wildly non-ABI-looking x1 afterward: that is precisely how a
             // wrong function target hides behind thousands of valid lock
@@ -12852,14 +12937,14 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" },
             pc
         ));
-        with_host(|h| set_exit(h, 128 + 8));
+        set_exit(128 + 8);
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
     // SIGSEGV on Linux, fatal here.
     if raw == gex_abi::imports::BRK_GENERAL_PROTECTION {
         trace_line(&format!("gex: general protection fault at pc={pc:#x} (SIGSEGV)\n"));
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
         trap();
     }
     // An x87 exception the control word unmasks: gex does not deliver
@@ -12868,25 +12953,24 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         trace_line(&format!(
             "gex: unmasked x87 floating-point exception at pc={pc:#x}; gex does not deliver x87 exceptions (SIGFPE)\n"
         ));
-        with_host(|h| set_exit(h, 128 + 8));
+        set_exit(128 + 8);
         trap();
     }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.
     if raw == gex_abi::imports::BRK_BAD_SP {
-        let line = with_host(|h| {
+        let line = (|| {
+            let Some(home) = sigs::home() else { return Default::default() };
             let gm = GuestMem::new(guest_bytes());
-            let c = h.threads[cur()].kstate.ctx_addr;
+            let c = my_ctx();
             let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
             let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
             // `x30` is the link register, so it names whoever called into
             // this block -- which, for a block reached by `ret`, is the last
             // place the guest was somewhere sane.
             let object = |a: u64| {
-                h.kernel
-                    .mem
-                    .lock()
+                home.mm().lock()
                     .vmas()
                     .iter()
                     .find(|v| a >= v.start && a < v.end)
@@ -12897,9 +12981,9 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                 object(pc as u64),
                 object(x30),
             )
-        });
+        })();
         trace_line(&line);
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
         trap();
     }
     // A bare `brk` is almost always glibc's `abort()` (the trap it ends on when
@@ -12907,15 +12991,14 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     // was reached from and walk the stack a little, so a crash with no printed
     // message (a corrupted call, a fortify failure) still says which library
     // and which caller -- otherwise "breakpoint at pc" names only glibc's abort.
-    let line = with_host(|h| {
+    let line = (|| {
+        let Some(home) = sigs::home() else { return Default::default() };
         let gm = GuestMem::new(guest_bytes());
-        let c = h.threads[cur()].kstate.ctx_addr;
+        let c = my_ctx();
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
         let object = |a: u64| {
-            h.kernel
-                .mem
-                .lock()
+            home.mm().lock()
                 .vmas()
                 .iter()
                 .find(|v| a >= v.start && a < v.end)
@@ -12937,9 +13020,9 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             object(pc as u64),
             object(x30),
         )
-    });
+    })();
     trace_line(&line);
-    with_host(|h| set_exit(h, 128 + 5));
+    set_exit(128 + 5);
     trap();
 }
 #[no_mangle]
@@ -12979,7 +13062,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
             "gex: {} at pc={pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
             if reg == gex_kernel::ppc::SYSREG_MFFS_STRICT { "mffs under GEX_FP_STRICT" } else { "non-default FP rounding mode" },
         ));
-        with_host(|h| set_exit(h, 128 + 4));
+        set_exit(128 + 4);
         trap();
     }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
@@ -13020,7 +13103,7 @@ fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
     if nt::active() {
         nt::fault(ctx, gex_kernel::nt::Fault::LowWrite(addr), pc);
     }
-    with_host(|h| set_exit(h, 128 + 11));
+    set_exit(128 + 11);
     trap();
 }
 
@@ -13330,15 +13413,17 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             };
             top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             top.truncate(3);
-            let (blocks, census, whose) = with_host(|h| {
+            // The threads and the map without the kernel lock (L23), the
+            // block count from the JIT state alone.
+            let blocks = with_jit_only(|j| j.blocks);
+            let (census, whose) = sigs::home().map(|home| {
                 let mut out = String::new();
-                for (i, t) in h.threads.iter().enumerate() {
+                for (i, t) in home.table().iter() {
                     let r = t.run();
                     out.push_str(&format!(" {i}={}", waiting_name(&r.waiting)));
                 }
                 let name = |addr: u64| {
-                    h.kernel
-                        .mem
+                    home.mm()
                         .lock()
                         .vmas()
                         .iter()
@@ -13351,17 +13436,16 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                 }
                 // And which object the pc is in: the library and offset turn a
                 // bare spinning address into a disassembly.
-                let whose = h
-                    .kernel
-                    .mem
+                let whose = home
+                    .mm()
                     .lock()
                     .vmas()
                     .iter()
                     .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
                     .map(|v| format!("{}+{:#x}", v.name, pc as u64 - v.start))
                     .unwrap_or_default();
-                (h.jit.blocks, out, whose)
-            });
+                (out, whose)
+            }).unwrap_or_default();
             trace_line(&format!(
                 "[beat] {beat} safepoints, pc={:#x} ({whose}), {blocks} blocks, \
                  threads:{census}\n",
@@ -13783,7 +13867,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
             Err(_) => {
                 warn_line("gex: corrupt signal frame on sigreturn\n");
-                with_host(|h| set_exit(h, 128 + 11));
+                set_exit(128 + 11);
             }
         }
         trap();
@@ -13803,20 +13887,21 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // (Windows 7's comctl32 calls LpkEditControl's table, null without
     // lpk.dll, and expects the exception to be caught) ended the thread.
     if wild && cgen::fault_hook() != 0 {
-        with_host(|h| {
+        (|| {
             let mut gm = GuestMem::new(guest_bytes());
-            let c = h.threads[cur()].kstate.ctx_addr;
+            let c = my_ctx();
             let _ = gm.write_u64(c + ctx::PC as u64, pc);
             cgen::fault_stage(0xc000_0005, pc, 8);
             set_resume(pc);
             set_resume_ctx(c);
-        });
+        })();
         trap();
     }
     if wild {
-        with_host(|h| {
+        (|| {
+            let Some(home) = sigs::home() else { return Default::default() };
             let gm = GuestMem::new(guest_bytes());
-            let c = h.threads[cur()].kstate.ctx_addr;
+            let c = my_ctx();
             let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
             let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
             let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
@@ -13835,7 +13920,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             warn_line(&format!("[gex] wild branch: stack {}; regs {}\n", around.join(", "), regs.join(" ")));
             warn_line(&format!(
                 "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
-                h.kernel.pid,
+                home.pid(),
                 cur(),
                 object_off_at(last),
                 object_off_at(src),
@@ -13862,8 +13947,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
                 ));
             }
-            set_exit(h, 128 + 11);
-        });
+            set_exit(128 + 11);
+        })();
         trap();
     }
     // Which of this object's functions the backend serves itself, before either
@@ -13924,7 +14009,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // is translated at run time, so code the build never saw stops the run
     // here, saying so, rather than being lifted.
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
-        with_host(|h| {
+        (|| {
+            let Some(home) = sigs::home() else { return Default::default() };
             let stop = format!(
                 "gex-eject: code at {pc:#x} ({}) was not translated when this project was built: \
                  the recorded session never reached it. Record a session that reaches it and \
@@ -13941,12 +14027,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // (stack words just after a call instruction in an image) so a
             // single run lists what user/web-entries.txt needs.
             let gm = GuestMem::new(guest_bytes());
-            let sp = gm.read_u64(h.threads[cur()].kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
+            let sp = gm.read_u64(my_ctx() + ctx::SP as u64).unwrap_or(0);
             let mut cands = Vec::new();
             for i in 0..4096u64 {
                 let Ok(v) = gm.read_u32(sp + 4 * i) else { break };
                 let v = v as u64;
-                let in_image = h.kernel.mem.lock().vmas().iter().any(|m| m.prot & gex_kernel::mem::prot::EXEC != 0 && !m.name.is_empty() && v >= m.start + 6 && v < m.end);
+                let in_image = home.mm().lock().vmas().iter().any(|m| m.prot & gex_kernel::mem::prot::EXEC != 0 && !m.name.is_empty() && v >= m.start + 6 && v < m.end);
                 if !in_image || cands.contains(&v) {
                     continue;
                 }
@@ -13969,7 +14055,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // The frame-pointer chain: the frames really live (MSVC and
             // Wine code keep EBP frames), unlike stale stack words. A frame
             // without EBP is skipped over, not named; the scan above has it.
-            let mut ebp = gm.read_u64(h.threads[cur()].kstate.ctx_addr + ctx::x(5) as u64).unwrap_or(0) & 0xffff_ffff;
+            let mut ebp = gm.read_u64(my_ctx() + ctx::x(5) as u64).unwrap_or(0) & 0xffff_ffff;
             let mut chain = Vec::new();
             for _ in 0..256 {
                 if ebp < sp || ebp & 3 != 0 || ebp - sp > 8 << 20 {
@@ -13986,8 +14072,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             for chunk in chain.chunks(16) {
                 warn_line(&format!("gex-eject:   {}\n", chunk.join(" ")));
             }
-            set_exit(h, 128 + 11);
-        });
+            set_exit(128 + 11);
+        })();
         trap();
     }
     miss_count(6);
@@ -14726,13 +14812,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             trace_line("gex: the guest module carries no gex.meta section, so there is\n");
             trace_line("gex: nowhere for runtime translation to carry on from. Rebuild it.\n");
         }
-        with_host(|h| {
+        (|| {
+            let Some(home) = sigs::home() else { return Default::default() };
             let gm = GuestMem::new(guest_bytes());
-            let c = h.threads[cur()].kstate.ctx_addr;
+            let c = my_ctx();
             let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
             trace_line(&format!(
                 "gex: pid {} thread {} ctx {c:#x} miss at {pc:#x} sp={:#x} x30={:#x} x0={:#x} x1={:#x}\n",
-                h.kernel.pid,
+                home.pid(),
                 cur(),
                 gm.read_u64(c + ctx::SP as u64).unwrap_or(0),
                 r(30),
@@ -14744,14 +14831,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // become names which.
             trace_line(&format!(
                 "gex: running {:?}, {} vmas, last syscall {}, ctx pc={:#x}\n",
-                h.kernel.exe_path,
-                h.kernel.mem.lock().vmas().len(),
+                home.exe(),
+                home.mm().lock().vmas().len(),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
                 gm.read_u64(c + ctx::PC as u64).unwrap_or(0),
             ));
-        });
+        })();
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
-        with_host(|h| set_exit(h, 128 + 11));
+        set_exit(128 + 11);
     }
     trap();
 }
@@ -15341,7 +15428,7 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 /// Note the library functions in whichever object `addr` falls in, so the
 /// translator can serve them itself.
 ///
-/// Called before either path translates anything, and outside `with_host`
+/// Called before either path translates anything, and outside `with_exec_lock`
 /// because reading the object takes the host itself.
 /// Whether a dispatch miss may translate. Off for an ejected project built
 /// without a JIT fallback. See `gex_dispatch_miss`.
@@ -15430,7 +15517,7 @@ fn note_intrinsics(addr: u64) {
     if compat_abi() {
         return;
     }
-    // The map first, the JIT state after it and not under it (KLock, JIT,
+    // The map first, the JIT state after it and not under it (ExecLock, JIT,
     // mm: docs/kernel-locking.md §4.3), neither under the kernel lock.
     let Some((path, start)) = ({
         let mm = sigs::proc_home().mm().lock();
@@ -15814,7 +15901,7 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
 #[no_mangle]
 pub extern "C" fn gex_current_ctx() -> i64 {
     // The remembered address first, then the kernel: this is a crash reporter's
-    // question, and a trap leaves the kernel borrowed, so `with_host` would
+    // question, and a trap leaves the kernel borrowed, so `with_exec_lock` would
     // panic on top of the crash and describe the reporter instead of the fault.
     let at = ctx_addr_get();
     if at != 0 {
@@ -15862,16 +15949,11 @@ pub extern "C" fn gex_current_lr() -> i64 {
 /// Returns the length, or zero when nothing is mapped there.
 #[no_mangle]
 pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
-    // `with_host_free`, not `with_host`: this is a crash reporter -- the whole
-    // reason it is asked is to name the pc of a trap, and the trap it most needs
-    // to describe is one that happened *inside* a `with_host` (the kernel still
-    // borrowed). The panicking `with_host` re-entered that borrow and turned a
-    // clean "out of bounds at pc=0x..." into a confusing double-panic ("the
-    // kernel was re-entered"). Degrade to "no name" when the host is held.
-    let name = with_host_free(|h| {
-        h.kernel
-            .mem
-            .lock()
+    // Not the kernel: this is a crash reporter, asked to name the pc of a
+    // trap, and the trap it most needs to describe may have happened inside
+    // the kernel (still borrowed). It reads the published map.
+    let name = sigs::home().map(|home| {
+        home.mm().lock()
             .vmas()
             .iter()
             .find(|v| (addr as u64) >= v.start && (addr as u64) < v.end)
@@ -16241,15 +16323,16 @@ pub extern "C" fn gex_dump_state() {
     if gex_has_host() == 0 {
         return;
     }
-    with_host(|h| {
+    (|| {
+        let Some(home) = sigs::home() else { return Default::default() };
         let gm = GuestMem::new(guest_bytes());
-        let c = h.threads[cur()].kstate.ctx_addr;
+        let c = my_ctx();
         let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         trace_line(&format!(
             "gex: pid {} thread {} sp={sp:#x} x0={:#x} x1={:#x} x2={:#x} x30={:#x} \
              x19={:#x} x20={:#x} x21={:#x} x22={:#x} x23={:#x} x24={:#x}\n",
-            h.kernel.pid,
+            home.pid(),
             cur(),
             r(0),
             r(1),
@@ -16267,7 +16350,7 @@ pub extern "C" fn gex_dump_state() {
         // into nothing, which on Linux is `SIGSEGV` and here is a trap that
         // takes the Worker with it.
         let where_is = |a: u64| -> String {
-            match h.kernel.mem.lock().vmas().iter().find(|v| a >= v.start && a < v.end) {
+            match home.mm().lock().vmas().iter().find(|v| a >= v.start && a < v.end) {
                 Some(v) => format!("{:#x}..{:#x} {}", v.start, v.end, v.name),
                 None => "UNMAPPED".to_string(),
             }
@@ -16311,7 +16394,7 @@ pub extern "C" fn gex_dump_state() {
         ] {
             warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
         }
-    });
+    })();
 }
 
 /// Publish an exit for a process whose Worker is stopping without one.
@@ -16333,33 +16416,33 @@ pub extern "C" fn gex_dump_state() {
 /// lets the Worker call it unconditionally on its way out.
 #[no_mangle]
 pub extern "C" fn gex_abandon(code: i32) {
-    if gex_has_host() == 0 {
+    // No kernel lock: the end is claimed as `exit_process` claims it, and a
+    // process already ending (or with a status) is left to that.
+    let Some(home) = sigs::home() else { return };
+    if home.exit().status().is_some() || !home.exit().claim() {
         return;
     }
-    with_host(|h| {
-        let pid = h.kernel.pid;
-        if h.exit.is_some() {
-            return;
+    let pid = home.pid();
+    trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+    // The descriptors, on the same terms as `exit_process`: a status alone
+    // ends a `wait4` and nothing else. A parent reading a dead child's pipe
+    // -- which is every `$(...)`, and every apt method -- is not waiting on
+    // the status, it is waiting for the end of file that only the last close
+    // of the write end produces. Without this the pipe keeps a writer that
+    // no longer exists and the parent's `read` never returns: the run wedges
+    // one process further along than the one that died, which is the shape
+    // that made a lifter fault in a forked child look like a hang in `apt`.
+    if let Some(fds) = fds_free() {
+        fds.close_all();
+    }
+    // SAFETY: takes a scalar and borrows nothing here.
+    unsafe {
+        if k_present() != 0 {
+            k_pipe_forget(pid);
+            k_pty_forget(pid);
         }
-        trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
-        // The descriptors, on the same terms as `exit_process`: a status alone
-        // ends a `wait4` and nothing else. A parent reading a dead child's pipe
-        // -- which is every `$(...)`, and every apt method -- is not waiting on
-        // the status, it is waiting for the end of file that only the last close
-        // of the write end produces. Without this the pipe keeps a writer that
-        // no longer exists and the parent's `read` never returns: the run wedges
-        // one process further along than the one that died, which is the shape
-        // that made a lifter fault in a forked child look like a hang in `apt`.
-        h.kernel.fds.close_all();
-        // SAFETY: takes a scalar and borrows nothing here.
-        unsafe {
-            if k_present() != 0 {
-                k_pipe_forget(pid);
-                k_pty_forget(pid);
-            }
-        }
-        publish_exit(h, pid, code);
-    });
+    }
+    publish_exit(pid, code);
 }
 
 /// Make this process's exit visible to its parent (`wait4`, `waitid`,
@@ -16368,17 +16451,69 @@ pub extern "C" fn gex_abandon(code: i32) {
 /// messages, which nothing orders against another Worker's), so a parent that
 /// waited for this process could otherwise print before this process's last
 /// output did.
-fn publish_exit(h: &mut Host, pid: i32, status: i32) {
+fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
-    h.kernel.procs.exit(pid, status);
+    if let Some(home) = sigs::home() {
+        home.procs().exit(pid, status);
+    }
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
-fn set_exit(h: &mut Host, code: i32) {
-    h.exit = Some(code);
+fn set_exit(code: i32) {
+    if let Some(home) = sigs::home() {
+        home.exit().record(code);
+    }
     set_exited(true);
     waitq::wake_process();
+}
+
+/// How a process ended, decided once and read with no lock (L24): the
+/// status the Worker reports (`gex_exit_code`), and whether a thread has
+/// claimed the end (`exit_process`). One per process, in its `Home`.
+pub(crate) struct ExitState {
+    /// The status, or [`ExitState::NONE`].
+    status: std::sync::atomic::AtomicI64,
+    /// Whether the end has been claimed: its teardown runs once.
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl ExitState {
+    const NONE: i64 = i64::MIN;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            status: std::sync::atomic::AtomicI64::new(Self::NONE),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The status recorded, if any.
+    pub(crate) fn status(&self) -> Option<i32> {
+        let v = self.status.load(std::sync::atomic::Ordering::Acquire);
+        (v != Self::NONE).then_some(v as i32)
+    }
+
+    /// Record the status (the latest recorded is the one reported).
+    pub(crate) fn record(&self, code: i32) {
+        self.status.store(code as i64, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Claim the end: true for exactly one caller.
+    pub(crate) fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Whether the end is claimed, or a status recorded: someone is ending,
+    /// or has ended, the process.
+    pub(crate) fn over(&self) -> bool {
+        self.claimed.load(std::sync::atomic::Ordering::Acquire) || self.status().is_some()
+    }
+}
+
+/// This process's [`ExitState`]'s status, if it has one.
+fn exit_status() -> Option<i32> {
+    sigs::home().and_then(|h| h.exit().status())
 }
 
 /// Record that this process is gone, for one that crashed without saying so: a
@@ -16399,11 +16534,9 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         // already recorded the exit; the remote process table accepts this
         // idempotently and, crucially, wakes the parent's wait4.
         let pid = my_pid();
-        with_host(|h| {
-            if h.exit.is_none() {
-                publish_exit(h, pid, status);
-            }
-        });
+        if !sigs::home().is_some_and(|h| h.exit().over()) {
+            publish_exit(pid, status);
+        }
         return 0;
     }
     set_exited(true);
@@ -16418,7 +16551,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
             0
         }
     };
-    with_host(|h| publish_exit(h, pid, status));
+    publish_exit(pid, status);
     warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
     ));
@@ -16427,7 +16560,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn gex_exited() -> i32 {
-    // Deliberately not `with_host`: this is asked on the way out of a trap,
+    // Deliberately not `with_exec_lock`: this is asked on the way out of a trap,
     // which is exactly when the kernel may still be borrowed by whatever
     // trapped.
     exited() as i32
@@ -16789,7 +16922,7 @@ static mut HOT_N: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
 
 /// The hottest back edges, as `pc count` lines, most first.
 ///
-/// Without `with_host`: read from inside the guest's own `write`, which already
+/// Without `with_exec_lock`: read from inside the guest's own `write`, which already
 /// holds it. Addresses are left raw (symbolising needs the VMA list and lock);
 /// `gex_object_at` resolves them when the caller is somewhere safe.
 #[no_mangle]

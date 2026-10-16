@@ -509,7 +509,7 @@ fn map_nls(c: &mut Call<'_>, file: &str, section_name: Option<&str>) -> R<(u64, 
         Some(Obj::Section(s)) => s,
         _ => {
             let path = format!("{}/nls/{file}", c.p.cfg.prefix);
-            let data = super::file::read_guest_file(&c.kernel().vfs, &path).map_err(|e| {
+            let data = super::file::read_guest_file(&c.kernel().vfs(), &path).map_err(|e| {
                 crate::nt_log!("gex-nt: cannot read {path}: {e:?}");
                 Status(st::OBJECT_NAME_NOT_FOUND)
             })?;

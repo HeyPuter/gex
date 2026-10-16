@@ -725,7 +725,7 @@ pub mod raw {
 
 /// The i386 number of a PowerPC call whose arguments and structures are
 /// the same on both 32-bit ABIs, so `i386::translate` can take it from there.
-fn i386_number(n: u64) -> Option<u64> {
+pub(crate) fn i386_number(n: u64) -> Option<u64> {
     use crate::i386::raw as x;
     use raw as p;
     Some(match n {

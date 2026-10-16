@@ -146,6 +146,11 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # while one thread's mount is filled and unmounted by another (L22e: mount
 # and umount2 without the kernel lock, through the namespace's published
 # view). Natively it needs an unprivileged user namespace (unshare -rm).
+# exit-threads: a forked child's process ended by exit_group from its main
+# thread, from another thread, from two at once, and by its last thread's
+# exit, while its other threads are parked in a read, an accept and a futex
+# wait; its descriptors are closed before its status is seen (L24: process
+# end without the kernel lock).
 # fork-maps-threads (native tiers only for now): forks while other threads
 # map, protect and unmap memory and files (L19: a fork's image, code names
 # and the translator's file reads come from the published map, not the
@@ -156,7 +161,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # poll-timeout: poll, ppoll, select and epoll_wait ended only by their
 # 100 ms deadline, after the stack went back to the page (the clock scope a
 # trap left open froze the clock, and they never returned).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

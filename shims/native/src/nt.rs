@@ -481,7 +481,6 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         return Err(StopExecution.into());
     }
     let p = Arc::clone(state.nt.as_ref().expect("an NT syscall in a Linux process"));
-    let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
     if native && nr == nt::gex_nr::NATIVE_LEFT {
@@ -535,7 +534,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     };
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
-        nt::syscall_on(&p, t, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
+        nt::syscall_on(&p, t, memory.bytes(), ctx_addr, pc, &mut host)
     };
     // A callback inside that syscall may have ended the process or failed.
     if caller.data().exit.is_some() {
@@ -861,10 +860,7 @@ pub(crate) fn fault_at(caller: &mut Caller<'_, HostState>, f: Fault, pc: u64, re
         let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
         let p = Arc::clone(caller.data().nt.as_ref().expect("an NT fault in a Linux process"));
         let (code, rip, info) = f.exception(pc).expect("every fault but X87 is an exception");
-        let outcome = {
-            let state = caller.data_mut();
-            nt::hardware_exception(&p, &*state.kernel, memory.bytes(), ctx_addr, code, rip, &info)
-        };
+        let outcome = nt::hardware_exception(&p, memory.bytes(), ctx_addr, code, rip, &info);
         return match outcome {
             nt::Outcome::Resume(target) => {
                 let r = raise_nested(caller, &p, target, sp, None);
@@ -899,7 +895,7 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         return Err(StopExecution.into());
     }
     let (code, rip, info) = fault.exception(pc).expect("every fault but X87 is an exception");
-    let outcome = nt::hardware_exception(&p, &*state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
+    let outcome = nt::hardware_exception(&p, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
         nt::Outcome::Resume(target) => {
             if crate::ftab::stats_on() {

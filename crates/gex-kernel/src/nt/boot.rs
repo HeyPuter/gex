@@ -313,6 +313,9 @@ fn ntdll_exports(img: &PeImage, base: u64) -> Result<(NtdllEntries, [u64; 3]), S
 /// registers are already in its gex context (slot 0).
 pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<'_>) -> Result<u64, String> {
     let abi = p.abi;
+    if p.kernel.set(super::NtKernel::of(k)).is_err() {
+        return Err("the NT process is booted already".into());
+    }
     let sysdir = if abi == Abi::P64 { "system32" } else { "syswow64" };
     let sys = format!("{}/drive_c/windows/{sysdir}", p.cfg.prefix);
 
@@ -355,7 +358,7 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     }
     let image_dos = dos_path(&p.cfg.prefix, req.exe_path);
     let exe_nt = to_w(&format!("\\??\\{image_dos}"));
-    let (exe_base, _) = section::map_image(p, k, &mut g, &exe, 0, req.exe_path, &exe_nt)
+    let (exe_base, _) = section::map_image(p, &k.mem, &mut g, &exe, 0, req.exe_path, &exe_nt)
         .map_err(st_err(&format!("mapping {}", req.exe_path)))?;
 
     // ntdll, and the three variables Wine's unix side fills
@@ -365,7 +368,7 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     let ntdll = Arc::new(pe::parse(&ntdll_bytes).map_err(|e| format!("{ntdll_path}: {e}"))?);
     let ntdll_nt = to_w(&format!("\\??\\C:\\windows\\{sysdir}\\ntdll.dll"));
     let (ntdll_base, _) =
-        section::map_image(p, k, &mut g, &ntdll, 0, &ntdll_path, &ntdll_nt).map_err(st_err("mapping ntdll.dll"))?;
+        section::map_image(p, &k.mem, &mut g, &ntdll, 0, &ntdll_path, &ntdll_nt).map_err(st_err("mapping ntdll.dll"))?;
     let (entries, [p_sysdisp, p_unixdisp, p_unixhandle]) = ntdll_exports(&ntdll, ntdll_base)?;
     let w = |g: &mut G<'_>, a: u64, v: u64| g.wptr(a, v).map_err(st_err("writing ntdll's variables"));
     let (sysdisp, unixdisp) = match abi {
@@ -428,7 +431,7 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     g.wptr(pf!(HEAPDECOMMITFREEBLOCKTHRESHOLD), 0x1000).map_err(&e)?;
 
     // The main thread: gex's slot 0, as for a Linux process.
-    let t = super::thread::create_thread_state(p, k, &mut g, x.stack_reserve, Some((0, k.tid)))
+    let t = super::thread::create_thread_state(p, p.kernel.get().expect("set above"), &mut g, x.stack_reserve, Some((0, k.tid)))
         .map_err(st_err("creating the main thread"))?;
     p.add_thread(Arc::clone(&t));
 

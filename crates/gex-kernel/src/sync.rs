@@ -5,7 +5,7 @@
 //! - **native:** `std::sync`, a futex mutex;
 //! - **the shared-memory page shim** (`+atomics`): `std::sync` again, which
 //!   on wasm32 with atomics is a CAS word parked with
-//!   `memory.atomic.wait32/notify`, as `KLock` is;
+//!   `memory.atomic.wait32/notify`, as `ExecLock` is;
 //! - **the SP page build** (no atomics): `std::sync`'s single-thread form, a
 //!   flag that panics on re-entry. That is the no-op cell §4.0 asks for, with
 //!   its re-entry check.
@@ -48,7 +48,8 @@ thread_local! {
 const RANKED: bool = cfg!(any(debug_assertions, feature = "lock-ranks"));
 
 /// The order the nesting locks are taken in (docs/kernel-locking.md §4.3):
-/// a lower rank first. The kernel lock (`KLock`, the page shim's) is
+/// a lower rank first. The page shim's exec lock (`ExecLock`, what is left
+/// of its kernel lock: `execve` and a process's `clone` take it) is
 /// outermost; the JIT state's lock may be taken under it; the memory map's
 /// under either. Leaf locks (a pipe's, a futex shard's, a descriptor
 /// table's) take nothing under them and are not ranked.

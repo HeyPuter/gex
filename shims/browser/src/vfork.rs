@@ -21,7 +21,7 @@
 //!      process: a `Host` built as a forked child's Worker builds one
 //!      (`child_host`: its pid, descriptors, working directory, signal
 //!      state, one thread), with the parent's memory map and translation
-//!      state (the process's one `JIT`). `with_host` serves this Worker that host
+//!      state (the process's one `JIT`). `with_exec_lock` serves this Worker that host
 //!      while the child runs; what is read without the kernel (the pid, the
 //!      exit flag, the descriptor table, the signal state) is this Worker's
 //!      too. The parent's process stays in place for its other Workers.
@@ -57,7 +57,7 @@ thread_local! {
     /// The pid of the vfork child running in this Worker; 0 for none. Set
     /// from before its kernel is built until after it is dropped.
     static PID: Cell<i32> = const { Cell::new(0) };
-    /// Its `Host`, which `with_host` serves this Worker while it runs.
+    /// Its `Host`, which `with_exec_lock` serves this Worker while it runs.
     static CHILD: Cell<*mut Host> = const { Cell::new(std::ptr::null_mut()) };
     /// Its descriptor table, for what reads one without the kernel.
     static FDS: Cell<*const gex_kernel::file::FdTable> = const { Cell::new(std::ptr::null()) };
@@ -97,10 +97,19 @@ pub(crate) fn pid_here() -> Option<i32> {
     (pid != 0).then_some(pid)
 }
 
-/// The child's `Host`, while it runs here (`with_host`).
+/// The child's `Host`, while it runs here (`with_exec_lock`).
 pub(crate) fn host_here() -> Option<*mut Host> {
     let p = CHILD.with(|c| c.get());
     (!p.is_null()).then_some(p)
+}
+
+/// `f` on the child's `Host`, which only this Worker reaches (`CHILD`): no
+/// lock.
+fn with_child<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    let p = host_here().expect("gex: no vfork child here");
+    // SAFETY: boxed in `gex_vfork_begin`, dropped only by `gex_vfork_end`,
+    // both on this Worker, outside any call here.
+    f(unsafe { &mut *p })
 }
 
 /// The child's descriptor table, while it runs here (`fds_free`).
@@ -175,8 +184,12 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         gm.read(ctx_addr, ctx::SIZE).map(<[u8]>::to_vec).unwrap_or_default()
     };
-    let (compat, started, wasm32, mem) =
-        with_host(|h| (h.kernel.compat, h.kernel.started, h.kernel.wasm32, h.kernel.mem.clone()));
+    // The parent's constants and a copy of its map, from what it publishes
+    // (no kernel lock, L25c).
+    let compat = crate::compat_abi();
+    let started = crate::clock_started();
+    let wasm32 = crate::WASM32.load(Acquire);
+    let mem = crate::sigs::proc_home().mm().clone();
     // What `adoptProcess` stages before `gex_adopt_child`, from what
     // `do_fork` staged.
     *CWD.0.borrow_mut() = FORK_CWD.0.borrow().clone();
@@ -199,22 +212,18 @@ pub extern "C" fn gex_vfork_begin() -> i64 {
     CHILD.with(|c| c.set(&mut *child));
     std::mem::forget(child);
     CURRENT.with(|c| c.set(0));
-    adopt_fds_text(&fds);
-    with_host(|h| {
+    // The child's host is this Worker's alone (`CHILD`): no lock (L25c).
+    with_child(|h| {
         // As `gex_set_compat` does for an adopted child: on an AArch64
         // build an i386-ABI process's stack is `esp`, where `__clone`'s
         // child stack has to be.
         if h.kernel.compat && !gex_abi::X86 && !gex_abi::PPC {
-            let mut gm = GuestMem::new(guest_bytes());
-            let c = h.kernel.ctx_addr;
-            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
-            if sp != 0 {
-                let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
-                let _ = gm.write_u64(c + ctx::SP as u64, 0);
-            }
+            crate::compat_stack(h.kernel.ctx_addr);
         }
         publish_vfork_child(h);
     });
+    // Its descriptors, into its own table now that it is published here.
+    adopt_fds_text(&fds);
     set_resume_none();
     set_resume_ctx_none();
     pc as i64
@@ -349,7 +358,8 @@ pub extern "C" fn gex_vfork_end() -> i64 {
         let _ = gm.write(ctx_addr, &ctx);
     }
     CURRENT.with(|c| c.set(cur));
-    with_host(|h| bind_mine(h, cur));
+    // The parent's thread again, from its thread table (no kernel lock).
+    crate::bind_free(cur);
     // The caller goes on at the returned pc itself. Left in `RESUME`, that
     // pc was still there for the thread's next call that trapped without
     // setting one (a `read` the child's pipe kept waiting), and the thread
@@ -383,11 +393,12 @@ pub extern "C" fn gex_adopted_exec(ptr: u32, len: u32) -> u64 {
     // This Worker's memory is new (host.mjs gives an exec child no recycled
     // one), so the exec need not clear what no program wrote.
     EXEC_FRESH.with(|c| c.set(true));
-    with_host(|h| {
+    // A fresh Worker's process, its own until the program runs (L25c).
+    crate::with_own_host(|h| {
         let entry = do_exec(h, &path, &argv, &envp);
         if entry == 0 {
             warn_line(&format!("gex: {path}: the program could not be loaded\n"));
-            exit_process(h, 127);
+            exit_process(127);
             return 0;
         }
         entry

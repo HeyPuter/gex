@@ -406,7 +406,7 @@ fn relocatable_base(stl: &super::State, path: &str, size: u64) -> R<u64> {
 
 pub fn map_image(
     p: &Process,
-    k: &mut crate::Kernel,
+    mm: &crate::mem::Mm,
     g: &mut G<'_>,
     img: &Arc<PeImage>,
     want: u64,
@@ -486,8 +486,8 @@ pub fn map_image(
     }
     g.zero(base, size as usize)?;
     g.write(base, &bytes)?;
-    if stl.vm.mirror(&mut k.mem.lock(), base, base + size) {
-        k.mem.lock().log.retired_code.push((base, base + size));
+    if stl.vm.mirror(&mut mm.lock(), base, base + size) {
+        mm.lock().log.retired_code.push((base, base + size));
         crate::note_code_change();
     }
     let status = if img.machine != native_machine(p.abi) {
@@ -588,8 +588,8 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
         let (data, path, nt_path) = match load_order(c, &path) {
             LoadOrder::Disabled => return Err(Status(st::DLL_NOT_FOUND)),
             LoadOrder::Builtin(builtin) => {
-                let k = c.kernel();
-                match super::file::read_guest_file(&k.vfs, &builtin) {
+                let vfs = c.kernel().vfs();
+                match super::file::read_guest_file(&vfs, &builtin) {
                     Ok(b) if pe::is_pe(&b) => {
                         if c.p.cfg.trace {
                             crate::nt_log!("[nt:{:x}]   {path} -> builtin {builtin} (WINEDLLOVERRIDES)", c.t.tid);
@@ -705,9 +705,7 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
     match &sec.kind {
         SecKind::Image { pe, path, nt_path } => {
             let (pe, path, nt_path) = (Arc::clone(pe), path.clone(), nt_path.clone());
-            let mut k = c.kernel.lock_kernel();
-            let (base, status) = map_image(c.p, &mut k, &mut c.g, &pe, want, &path, &nt_path)?;
-            drop(k);
+            let (base, status) = map_image(c.p, &c.kernel().mem, &mut c.g, &pe, want, &path, &nt_path)?;
             sec.views.lock().unwrap().push(View { base, offset: 0, size: pe.image_size as u64 });
             c.g.wptr(base_p, base)?;
             c.g.wptr(size_p, align_up(pe.image_size as u64, PAGE))?;

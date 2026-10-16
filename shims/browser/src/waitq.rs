@@ -13,10 +13,10 @@
 //! parked Worker of every process.
 //!
 //! The scheduler's idle turn asks only its own thread, from the snapshot
-//! taken when the wait began ([`MyWait`]), with no kernel lock: a turn takes
-//! KLock only to finish the syscall once the wait is over, to pump the
-//! compositor when it has work, or when a signal may have arrived (the
-//! signal state is still under KLock, §5.2 step 7).
+//! taken when the wait began ([`MyWait`]), with no lock: finishing the
+//! syscall once the wait is over and delivering a signal that arrived are
+//! the free path's (`sigs::finish`), and the page's only lock left, the exec
+//! lock (`ExecLock`), is the process calls' alone.
 
 use super::*;
 
