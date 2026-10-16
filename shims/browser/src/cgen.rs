@@ -2119,7 +2119,11 @@ pub(crate) fn leaves() -> u64 {
 pub(crate) fn on_retire(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
     on_retire_pages(ranges, gone);
     libprov::forget_gone(gone);
-    wasmdll::forget_gone(gone);
+    // W64 only: on W3 it hung the Win7 shell's boot (X's 1016m: explorer
+    // went quiet after loading wer.dll).
+    if wasmprog::guest_x86_64() {
+        wasmdll::forget_gone(gone);
+    }
     // After the bits: a lookup once the probe cache is cleared sees them.
     // Every entry's probe cache slot first, the units' that retire here
     // included (as natively, ftab.rs `on_retire`): cleared after the

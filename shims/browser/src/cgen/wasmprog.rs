@@ -66,6 +66,16 @@ const FLAG_GUEST_I386: u32 = 1;
 /// shares W3's address-space split and trampoline page.
 const FLAG_GUEST_X86_64: u32 = 2;
 
+/// The running program's header has [`FLAG_GUEST_X86_64`] (W64), set at
+/// every publish (a fork's child has its parent's, in its copy of memory).
+static GUEST_X86_64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process runs 64-bit native Wine (W64): what only W64 has
+/// been tested on stays off W3 (X's 1016m boot hang).
+pub(crate) fn guest_x86_64() -> bool {
+    GUEST_X86_64.load(Ordering::Relaxed)
+}
+
 /// Whether `program` is a native wasm32 one (its header, from the image's
 /// segments).
 pub(crate) fn is_wasm32(program: &gex_ld::Program) -> bool {
@@ -156,6 +166,7 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     // trampoline page native Wine's gexrt sends the guest to. Once per fresh
     // image: a fork's child has its parent's.
     let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
+    GUEST_X86_64.store(flags & FLAG_GUEST_X86_64 != 0, Ordering::Relaxed);
     if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
         use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
         let page = gex_kernel::nt::boot::trampoline_page();
