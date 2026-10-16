@@ -22,6 +22,9 @@ const m64 = () => !!globalThis.GEX_MEM64;
  *  process with one Worker, and for one with threads. */
 const FTAB_SPARE_ALONE = 4096;
 const FTAB_SPARE_THREADED = 65536;
+/** Tests only (tests/w3/ftabstale.sh): both rooms this small, so one unit's
+ *  install outruns a sleeping thread's table. */
+const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.process?.env?.GEX_TEST_FTAB_SPARE ?? 0);
 const LIMIT64_BYTES = 16 * 2 ** 30;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
@@ -1443,6 +1446,9 @@ export class Gex {
         exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
         // An AOT-only run serves units and new threads inside the syscall
         // (nt.rs `serve_in_place`), as the NT callback loop does.
+        // This Worker's function table, short of what another Worker
+        // allocated, or this Worker not yet counted (cgen.rs `ftab_resume`).
+        ftab_grow: () => this.#cgenGrowIfShort(),
         serve_in_place: () => {
           this.#cgenServe();
           this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
@@ -3828,9 +3834,28 @@ export class Gex {
    *  replays it. */
   #cgenGrow() {
     const st = this.#cgen;
-    const want = (this.#shim.exports.gex_ftab_size() >>> 0) + this.#ftabSpare;
-    const have = Number(st.ftab.length);
-    if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
+    const e = this.#shim.exports;
+    let size = e.gex_ftab_size() >>> 0;
+    for (;;) {
+      const want = size + this.#ftabSpare;
+      const have = Number(st.ftab.length);
+      if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
+      // Counted for the probe cache's indices at this length (cgen.rs
+      // `gex_ftab_enter`); again if another Worker allocated meanwhile.
+      if (!e.gex_ftab_enter) return;
+      size = e.gex_ftab_enter(Number(st.ftab.length)) >>> 0;
+      if (size <= Number(st.ftab.length)) return;
+    }
+  }
+
+  /** Before guest code runs again from here: this Worker counted for the
+   *  probe cache's indices, and its function table grown if another Worker
+   *  allocated past its end meanwhile (cgen.rs `ftab_resume`, X's B16). */
+  #cgenGrowIfShort() {
+    const st = this.#cgen;
+    const e = this.#shim.exports;
+    if (!st || !e.gex_ftab_enter) return;
+    if ((e.gex_ftab_enter(Number(st.ftab.length)) >>> 0) > Number(st.ftab.length)) this.#cgenGrow();
   }
 
   /** The function table's room past the indices handed out. Only another
@@ -3839,13 +3864,14 @@ export class Gex {
    *  process's table by 65536 `resolve`s was 4.5 ms of each fork's child
    *  and 1.5 ms of each exec (the grow copies the whole table). A process
    *  takes the full room when it gets its second Worker (`#threaded`). */
-  #ftabSpare = FTAB_SPARE_ALONE;
+  #ftabSpare = ftabSpareTest() || FTAB_SPARE_ALONE;
 
   /** This Worker's process has more than one Worker from now on: grow to the
    *  full room before any other Worker can publish an index. */
   #threaded() {
-    if (this.#ftabSpare === FTAB_SPARE_THREADED) return;
-    this.#ftabSpare = FTAB_SPARE_THREADED;
+    const want = ftabSpareTest() || FTAB_SPARE_THREADED;
+    if (this.#ftabSpare === want) return;
+    this.#ftabSpare = want;
     if (this.#cgen) this.#cgenGrow();
   }
 
@@ -5612,6 +5638,7 @@ export class Gex {
         }
         // The single-thread build enters on a stack of the guest's own
         // (JSPI), which a blocking call suspends; see single.mjs.
+        this.#cgenGrowIfShort();
         if (single.on) {
           this.#where = 'enter';
           await this.#enterP(ctx, pc);
@@ -6302,6 +6329,7 @@ export class Gex {
           f(ctx);
         } else {
           this.#shim.exports.gex_callout_leave_ok?.(0);
+          this.#cgenGrowIfShort();
           this.#guest.exports.enter(ctx, pc);
         }
         console.error('[gex-nt] guest code returned out of a user-mode callback');
@@ -6873,6 +6901,7 @@ export class Gex {
             f(ctx);
           } else {
             this.#shim.exports.gex_callout_leave_ok?.(0);
+            this.#cgenGrowIfShort();
             this.#guest.exports.enter(ctx, pc);
           }
           console.error('[gex] guest code returned out of exception dispatch');
