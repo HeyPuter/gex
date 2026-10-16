@@ -12247,6 +12247,19 @@ pub extern "C" fn gex_resume_ctx() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn gex_exit_code() -> i32 {
+    // An end claimed and still under way in another Worker: `exited` is set
+    // at the claim and the status recorded last (`end_process_once`), so a
+    // Worker that stopped on `exited` meanwhile would report 0 for it
+    // (main-thread-exit under load). It is a few calls away: wait for it,
+    // bounded, as the kernel lock used to make this wait.
+    if let Some(home) = sigs::home() {
+        if home.exit().over() && home.exit().status().is_none() {
+            let until = now_ns() + 5_000_000_000;
+            while home.exit().status().is_none() && now_ns() < until {
+                std::hint::spin_loop();
+            }
+        }
+    }
     exit_status().unwrap_or(0)
 }
 
