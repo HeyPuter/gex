@@ -1029,7 +1029,7 @@ fn run_program_with(
             // argv[0] (all `exe_path` has here) may be a bare `wc`.
             k.argv = opts.args.clone();
             k.envp = opts.env.clone();
-            k.live_threads = 1;
+            k.live_threads.store(1, std::sync::atomic::Ordering::Release);
             k.next_ctx_slot = 1;
             (k, ps)
         }

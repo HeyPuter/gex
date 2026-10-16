@@ -968,7 +968,7 @@ pub fn nt_create_thread_ex(c: &mut Call<'_>) -> R {
     let t = {
         let mut k = c.kernel.lock_kernel();
         let t = create_thread_state(c.p, &mut k, &mut c.g, reserve, None)?;
-        k.live_threads += 1;
+        k.live_threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         t
     };
     if flags & (SKIP_THREAD_ATTACH | SKIP_LOADER_INIT) != 0 {
@@ -1088,7 +1088,16 @@ pub fn exit_thread(c: &mut Call<'_>, code: u32) {
     c.p.remove_thread(&t);
     {
         let mut k = c.kernel();
-        k.live_threads = k.live_threads.saturating_sub(1);
+        // One fewer, never below zero.
+        use std::sync::atomic::Ordering;
+        let live = &k.live_threads;
+        let mut n = live.load(Ordering::Acquire);
+        while n > 0 {
+            match live.compare_exchange_weak(n, n - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
     }
     c.outcome = Some(Outcome::ThreadExit);
 }

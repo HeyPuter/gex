@@ -9314,7 +9314,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
-    h.kernel.live_threads = 1;
+    h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
     h.kernel.next_ctx_slot = 1;
 
     let data = guest_bytes();
@@ -11388,9 +11388,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
     } else {
         sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64)
     };
-    if n == nr::FUTEX {
-        // Every futex this call woke, relayed to the shared per-address
-        // counter, so a waiter parked in another Worker sees the wake.
+    if n == nr::FUTEX || n == nr::EXIT {
+        // Every futex this call woke (an `exit` wakes its thread's joiner),
+        // relayed to the shared per-address counter, so a waiter parked in
+        // another Worker sees the wake.
         if unsafe { k_present() } != 0 {
             if let Some(home) = sigs::home() {
                 for addr in home.futexes.take_woken() {
@@ -11399,7 +11400,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             }
         }
         // Every futex answer that is an error, by name (`ftx_recent`).
-        if let FreeOutcome::Done(_) = &outcome {
+        if let (nr::FUTEX, FreeOutcome::Done(_)) = (n, &outcome) {
             let ret = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
             ftx_note(a1, a0, ret as i64, pc as u64, my_tid());
         }
@@ -11434,6 +11435,18 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             exit_here(-(signal as i32), Some(at))
         }
         FreeOutcome::Exit(code) => exit_here(code, None),
+        // `exit` from one of several threads (L25a): this thread is over;
+        // the last one out of the thread table ends the process.
+        FreeOutcome::ThreadExit => {
+            if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
+            }
+            end_if_all_exited();
+            // Nowhere to resume this thread (as the kernel's `ThreadExit`).
+            set_resume_none();
+            set_resume_ctx_none();
+            3
+        }
         FreeOutcome::Blocking(op, restore_sigmask) => park_free(op, restore_sigmask, pc as u64),
         // A wasm32 program's sigreturn put back a call its handler
         // interrupted: that call, made now as a syscall of its own (without
@@ -11499,7 +11512,17 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         gex_kernel::BlockOp::SigWait { timeout, .. } => {
             Waiting::SigWait(timeout.map(|d| turn_now().saturating_add(d.as_nanos() as u64)))
         }
-        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket or a signal"),
+        // `wait4` (L25a), as the kernel's park: `WNOHANG` answers on the
+        // first turn; anything else waits for the child, which may not have
+        // started yet.
+        gex_kernel::BlockOp::WaitChild { nohang, .. } => {
+            if *nohang {
+                Waiting::Runnable
+            } else {
+                Waiting::Child
+            }
+        }
+        _ => unreachable!("a class call parks only on a stream, a poll, a futex, a sleep, a socket, a signal or a child"),
     };
     let write_blocked = matches!(op, gex_kernel::BlockOp::WriteStream { .. });
     let reissue = matches!(op, gex_kernel::BlockOp::AcceptWait { .. });

@@ -70,6 +70,8 @@ pub(crate) struct Home {
     host_names: Arc<gex_kernel::unix::SocketNames>,
     /// Its threads, their contexts and run states (`Host::threads`, L23).
     table: Arc<crate::Threads>,
+    /// Its live thread count (`Kernel::live_threads`), for `exit` (L25a).
+    live: Arc<std::sync::atomic::AtomicU32>,
     /// How it ended, decided once (L24).
     exit: crate::ExitState,
     /// Its image, command line and environment as `/proc` shows them
@@ -124,6 +126,7 @@ fn home_of(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proc
         socket_names: Arc::clone(&k.socket_names),
         host_names: Arc::clone(&k.host_names),
         table: Arc::clone(table),
+        live: Arc::clone(&k.live_threads),
         exit: crate::ExitState::new(),
         image: Arc::clone(image),
     }
@@ -423,6 +426,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         },
         signals: &view,
         procs: &home.procs,
+        live: &home.live,
         tty: &home.tty,
         pid: home.pid,
         creds: &home.creds,
