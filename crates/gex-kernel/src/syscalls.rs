@@ -976,10 +976,14 @@ pub fn clock_call(
     clock: ClockFn,
     started: u128,
 ) -> bool {
-    if gex_abi::PPC {
-        return false;
-    }
-    let (raw, a0, a1) = if compat {
+    // A ppc32 process's clock calls are i386's but for their numbers, and
+    // in its 32-bit layouts whatever `compat` says.
+    let compat = compat || gex_abi::PPC;
+    let (raw, a0, a1) = if gex_abi::PPC {
+        let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
+        let Some(raw) = crate::ppc::i386_number(r(ctx::SYSCALL_NR)) else { return false };
+        (raw, r(ctx::SYSCALL_ARGS[0]), r(ctx::SYSCALL_ARGS[1]))
+    } else if compat {
         let r = |slot: usize| m.read_u64(ctx_addr + slot as u64).unwrap_or(!0) & 0xffff_ffff;
         (
             r(ctx::x(0)),
@@ -6448,15 +6452,20 @@ pub struct Idents {
 /// 0` means the host has none yet, and `ids.ppid == 0` leaves `getppid` to
 /// the full call. The 16-bit i386 forms are left to the full call.
 pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Idents, creds: &Creds) -> bool {
-    if gex_abi::PPC || ids.tid == 0 {
+    if ids.tid == 0 {
         return false;
     }
-    let raw = if compat {
+    // A ppc32 process's: i386's but for their numbers.
+    let raw = if gex_abi::PPC {
+        let raw = m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff;
+        let Some(raw) = crate::ppc::i386_number(raw) else { return false };
+        raw
+    } else if compat {
         m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
     } else {
         m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     };
-    let v = if compat {
+    let v = if compat || gex_abi::PPC {
         use crate::i386::raw as x;
         match raw {
             x::GETPID => ids.pid,
@@ -10759,16 +10768,31 @@ mod tests {
     /// call the kernel does not know answers `ENOSYS` either way.
     #[test]
     fn only_the_process_calls_take_the_locked_path() {
-        if gex_abi::X86 || gex_abi::PPC {
-            return;
-        }
         let mut locked = Vec::new();
         for n in 0..=470u64 {
+            // The ABI's own spelling of `n`; a number it has none for is
+            // not one of its calls.
+            let spelled = if gex_abi::X86 {
+                (0..512).any(|r| crate::x86::canonical_number(r) == n)
+            } else if gex_abi::PPC {
+                (0..512).any(|r| crate::ppc::canonical_number(r) == n)
+            } else {
+                true
+            };
+            if !spelled {
+                continue;
+            }
             let (mut buf, mut k) = setup();
             let at = k.ctx_addr;
             let mut m = GuestMem::new(&mut buf);
             set_args(&mut m, at, n, &[0; 6]);
             if free_class(&m, at, false).is_some() {
+                continue;
+            }
+            let ids = Idents { pid: k.pid as u32, ppid: 1, tid: k.tid as u32 };
+            let mut scratch = m.read(0, 0x40000).unwrap().to_vec();
+            let mut sm = GuestMem::new(&mut scratch);
+            if clock_call(&mut sm, at, false, k.clock, 1) || ident_call(&mut sm, at, false, &ids, &k.creds) {
                 continue;
             }
             let out = k.syscall(&mut m, 0);
@@ -10777,8 +10801,9 @@ mod tests {
                 locked.push(n);
             }
         }
-        eprintln!("locked: {:?}", locked.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>());
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{:?}", locked.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>());
+        let names: Vec<_> = locked.iter().map(|&n| syscall_name(n)).collect();
+        eprintln!("locked: {names:?}");
+        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{names:?}");
     }
 
     #[test]
