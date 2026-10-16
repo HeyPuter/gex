@@ -597,6 +597,16 @@ async function begin(opts, base, at, state, meter) {
   if (opts.wisp) {
     const { WispNetwork } = await import('./net.js');
     network = new WispNetwork(String(opts.wisp), (e) => say(`[net] ${e}\n`));
+    // Opened and waited for, as worker.mjs does: constructing one only
+    // remembers the address, and until the proxy has said hello `open`
+    // answers zero, which the shim turns into ENETUNREACH (every guest
+    // connect failed). A proxy that cannot be reached does not stop the run:
+    // the guest gets a network that fails, and the page says so.
+    try {
+      await network.start();
+    } catch (e) {
+      say(`[net] ${e?.message ?? e}\n`);
+    }
   }
   const run = runProgram(term, {
     network,
