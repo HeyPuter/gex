@@ -72,6 +72,9 @@ pub(crate) struct Home {
     table: Arc<crate::Threads>,
     /// How it ended, decided once (L24).
     exit: crate::ExitState,
+    /// Its image, command line and environment as `/proc` shows them
+    /// (`Kernel::publish_proc`, at its start and each exec).
+    image: Arc<gex_kernel::proclive::ProcCell>,
 }
 
 /// This process's [`Home`], published by `set_host`. A new one replaces it
@@ -89,11 +92,11 @@ thread_local! {
 }
 
 /// Publish `k`'s process as this memory's (`set_host`).
-pub(crate) fn publish(k: &Kernel, table: &Arc<crate::Threads>) {
-    HOME.store(Box::into_raw(Box::new(home_of(k, table))), Ordering::Release);
+pub(crate) fn publish(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proclive::ProcCell>) {
+    HOME.store(Box::into_raw(Box::new(home_of(k, table, image))), Ordering::Release);
 }
 
-fn home_of(k: &Kernel, table: &Arc<crate::Threads>) -> Home {
+fn home_of(k: &Kernel, table: &Arc<crate::Threads>, image: &Arc<gex_kernel::proclive::ProcCell>) -> Home {
     Home {
         sig: Arc::clone(k.signals.process()),
         procs: Arc::clone(&k.procs),
@@ -122,6 +125,7 @@ fn home_of(k: &Kernel, table: &Arc<crate::Threads>) -> Home {
         host_names: Arc::clone(&k.host_names),
         table: Arc::clone(table),
         exit: crate::ExitState::new(),
+        image: Arc::clone(image),
     }
 }
 
@@ -143,6 +147,21 @@ impl Home {
     /// Its threads (`Host::threads`), which lock themselves.
     pub(crate) fn table(&self) -> &crate::Threads {
         &self.table
+    }
+
+    /// Its image's path, as last published.
+    pub(crate) fn exe(&self) -> String {
+        self.image.exe()
+    }
+
+    /// Its argument vector, as last published.
+    pub(crate) fn argv(&self) -> Vec<String> {
+        self.image.argv()
+    }
+
+    /// Its environment, as last published.
+    pub(crate) fn envp(&self) -> Vec<String> {
+        self.image.envp()
     }
 
     /// How it ended (`exit_process`), which needs no lock.
@@ -230,8 +249,8 @@ thread_local! {
 
 /// Publish a vfork child's process for this Worker alone, or (`None`) go
 /// back to the memory's (vfork.rs).
-pub(crate) fn publish_here(k: Option<(&Kernel, &Arc<crate::Threads>)>) {
-    let new = k.map_or(std::ptr::null_mut(), |(k, table)| Box::into_raw(Box::new(home_of(k, table))));
+pub(crate) fn publish_here(k: Option<(&Kernel, &Arc<crate::Threads>, &Arc<gex_kernel::proclive::ProcCell>)>) {
+    let new = k.map_or(std::ptr::null_mut(), |(k, table, image)| Box::into_raw(Box::new(home_of(k, table, image))));
     let old = HERE.with(|c| c.replace(new));
     if !old.is_null() {
         // SAFETY: made above by an earlier call, and only this Worker reads

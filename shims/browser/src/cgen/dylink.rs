@@ -172,7 +172,8 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Vec<u8>>, relocate: bool, kee
 /// fill libc's registry. Returns libc's provider module.
 pub(super) fn install(wasm: Vec<u8>, info: Info, mem_base: u32, entry: u64, thread_entry: u64) -> Result<u32, String> {
     let path = exe_path();
-    let env = crate::with_host(|h| h.kernel.envp.clone());
+    // The environment as published at the load or exec (no kernel lock).
+    let env = crate::sigs::proc_home().envp();
     let ldpath = env
         .iter()
         .find_map(|e| e.strip_prefix("LD_LIBRARY_PATH="))

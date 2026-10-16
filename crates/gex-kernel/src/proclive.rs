@@ -54,6 +54,21 @@ impl ProcCell {
     fn get(&self) -> Option<Arc<Live>> {
         self.live.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// The image's path as last published (empty before the first).
+    pub fn exe(&self) -> String {
+        self.get().map(|l| l.exe.clone()).unwrap_or_default()
+    }
+
+    /// Its argument vector as last published.
+    pub fn argv(&self) -> Vec<String> {
+        self.get().map(|l| l.argv.clone()).unwrap_or_default()
+    }
+
+    /// Its environment as last published.
+    pub fn envp(&self) -> Vec<String> {
+        self.get().map(|l| l.envp.clone()).unwrap_or_default()
+    }
 }
 
 /// The `/proc` source a process's namespace mounts.
@@ -231,6 +246,8 @@ mod tests {
         k.publish_proc(&src.0);
         assert_eq!(src.pid(), k.pid);
         assert_eq!(src.cmdline(), b"a\0one\0");
+        // And the same image for what reads it without the kernel lock.
+        assert_eq!((src.0.exe(), src.0.argv()), ("/bin/a".to_string(), vec!["a".to_string(), "one".to_string()]));
         let at = k.mem.lock().mmap(0, 0x3000, crate::mem::prot::READ, crate::mem::flags::PRIVATE | crate::mem::flags::ANONYMOUS, "").unwrap();
         assert!(src.maps().contains(&format!("{at:x}-{:x} ", at + 0x3000)));
         k.mem.lock().unmap(at, 0x3000).unwrap();
