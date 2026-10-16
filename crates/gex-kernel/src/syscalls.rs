@@ -5551,7 +5551,7 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     } else {
         m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     };
-    let n = free_number(raw, compat)?;
+    let Some(n) = free_number(raw, compat) else { return nosys_call(raw, compat) };
     let mut a = [0u64; 6];
     for (i, v) in a.iter_mut().enumerate() {
         *v = if compat {
@@ -5601,7 +5601,7 @@ fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
         n => free_number(n, false) == Some(n) || is_quiet(n, true),
     };
     if !admitted {
-        return None;
+        return nosys_call(raw, false);
     }
     let mut a = [0u64; 6];
     for (i, v) in a.iter_mut().enumerate() {
@@ -5616,6 +5616,40 @@ fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
     }
     Some(FreeCall { n, raw, a })
 }
+
+/// A call in none of the free path's classes: one that makes or replaces
+/// a process (`execve`, and `clone`, `clone3`, `fork` and `vfork` making a
+/// process), which is the host's (`None`), or one the kernel does not make,
+/// which [`free_call`] answers `ENOSYS` (its number [`NOSYS`]). Which is
+/// which is `only_the_process_calls_take_the_locked_path`'s census.
+fn nosys_call(raw: u64, compat: bool) -> Option<FreeCall> {
+    let n = if gex_abi::PPC {
+        crate::ppc::canonical_number(raw)
+    } else if compat {
+        crate::i386::canonical_number(raw)
+    } else if gex_abi::X86 {
+        crate::x86::canonical_number(raw)
+    } else {
+        raw
+    };
+    if matches!(n, nr::EXECVE | nr::CLONE | nr::CLONE3) {
+        return None;
+    }
+    // A host answers the clocks and the ids before it classes a call
+    // ([`clock_call`], [`ident_call`]); one that reaches here is answered
+    // the same way.
+    let clock_or_id = matches!(
+        n,
+        nr::CLOCK_GETTIME | nr::CLOCK_GETRES | nr::GETTIMEOFDAY | nr::GETRUSAGE | nr::SCHED_YIELD | nr::TIMES | nr::TIME | nr::GETPID | nr::GETTID
+    );
+    Some(FreeCall { n: if clock_or_id { CLOCK_OR_ID } else { NOSYS }, raw, a: [0; 6] })
+}
+
+/// The number [`free_class`] gives a call the kernel does not make.
+pub const NOSYS: u64 = u64::MAX;
+
+/// The number [`free_class`] gives a clock or id call ([`nosys_call`]).
+const CLOCK_OR_ID: u64 = u64::MAX - 1;
 
 impl FreeCall {
     /// Its canonical number.
@@ -5642,7 +5676,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // (none of these has anything to do after the call: `Post::None`).
     let mut post = crate::i386::Post::None;
     let mut ppc_post = crate::ppc::PpcPost::None;
-    if gex_abi::PPC {
+    if n == NOSYS || n == CLOCK_OR_ID {
+        // Nothing to translate: the answer is ENOSYS, or the clock's or
+        // the id's, which read the call as the guest made it.
+    } else if gex_abi::PPC {
         // Every ppc32 call is translated, as the full call translates it.
         let (t, p, pp) = crate::ppc::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, ctx_addr);
         post = p;
@@ -5676,7 +5713,24 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     if let Some(code) = f.procs.halt_code() {
         return FreeOutcome::Exit(code);
     }
-    let r = if n == nr::RT_SIGPROCMASK {
+    if n == CLOCK_OR_ID {
+        let ids = Idents { pid: f.pid as u32, ppid: 0, tid: f.futex.tid };
+        if !clock_call(m, ctx_addr, compat, f.futex.clock, f.started) && !ident_call(m, ctx_addr, compat, &ids, f.creds) {
+            let _ = set_result(m, ctx_addr, Errno::ENOSYS.as_return());
+        }
+        let d = if f.signals.has_pending() {
+            signal::dispatch(f.signals, m, ctx_addr, compat).unwrap_or(Delivery::None)
+        } else {
+            Delivery::None
+        };
+        return FreeOutcome::Done(match d {
+            Delivery::Resume(_) if f.wasm32 => Delivery::None,
+            d => d,
+        });
+    }
+    let r = if n == NOSYS {
+        Err(Errno::ENOSYS)
+    } else if n == nr::RT_SIGPROCMASK {
         sigprocmask(f.signals, m, a[0] as u32, a[1], a[2])
     } else if n == nr::FUTEX {
         // As the full call: a wait parks, an operation answers, and a PI
@@ -10763,12 +10817,12 @@ mod tests {
     }
 
     /// What a page still makes under the kernel lock (docs/kernel-locking.md
-    /// §3.12): of the calls the kernel answers, every one but these is in
-    /// the free path's class. Each canonical number, with zero arguments; a
-    /// call the kernel does not know answers `ENOSYS` either way.
+    /// §3.12): every call but `execve` and a process's `clone` is in one of
+    /// the free path's classes, and one it answers `ENOSYS` the kernel does
+    /// not make either. Each canonical number, with zero arguments.
     #[test]
     fn only_the_process_calls_take_the_locked_path() {
-        let mut locked = Vec::new();
+        let (mut locked, mut wrong) = (Vec::new(), Vec::new());
         for n in 0..=470u64 {
             // The ABI's own spelling of `n`; a number it has none for is
             // not one of its calls.
@@ -10786,24 +10840,22 @@ mod tests {
             let at = k.ctx_addr;
             let mut m = GuestMem::new(&mut buf);
             set_args(&mut m, at, n, &[0; 6]);
-            if free_class(&m, at, false).is_some() {
-                continue;
-            }
-            let ids = Idents { pid: k.pid as u32, ppid: 1, tid: k.tid as u32 };
-            let mut scratch = m.read(0, 0x40000).unwrap().to_vec();
-            let mut sm = GuestMem::new(&mut scratch);
-            if clock_call(&mut sm, at, false, k.clock, 1) || ident_call(&mut sm, at, false, &ids, &k.creds) {
-                continue;
-            }
-            let out = k.syscall(&mut m, 0);
-            let enosys = matches!(out, SyscallOutcome::Continue) && ret(&m, at) == -(Errno::ENOSYS.0 as i64);
-            if !enosys {
-                locked.push(n);
+            match free_class(&m, at, false) {
+                None => locked.push(n),
+                // Answered ENOSYS without the kernel: the kernel must say
+                // the same.
+                Some(c) if c.number() == NOSYS => {
+                    let out = k.syscall(&mut m, 0);
+                    if !(matches!(out, SyscallOutcome::Continue) && ret(&m, at) == -(Errno::ENOSYS.0 as i64)) {
+                        wrong.push(n);
+                    }
+                }
+                Some(_) => {}
             }
         }
-        let names: Vec<_> = locked.iter().map(|&n| syscall_name(n)).collect();
-        eprintln!("locked: {names:?}");
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{names:?}");
+        let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
+        assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
+        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{:?}", names(&locked));
     }
 
     /// [`only_the_process_calls_take_the_locked_path`] for an i386 process
@@ -10814,7 +10866,7 @@ mod tests {
         if !gex_abi::X86 {
             return;
         }
-        let mut locked = Vec::new();
+        let (mut locked, mut wrong) = (Vec::new(), Vec::new());
         for raw in 0..=460u64 {
             let (mut buf, mut k) = setup();
             k.compat = true;
@@ -10824,22 +10876,20 @@ mod tests {
             for slot in crate::i386::ARG_SLOTS {
                 m.write_u64(at + slot as u64, 0).unwrap();
             }
-            if free_class(&m, at, true).is_some() {
-                continue;
-            }
-            let ids = Idents { pid: k.pid as u32, ppid: 1, tid: k.tid as u32 };
-            let mut scratch = m.read(0, 0x40000).unwrap().to_vec();
-            let mut sm = GuestMem::new(&mut scratch);
-            if clock_call(&mut sm, at, true, k.clock, 1) || ident_call(&mut sm, at, true, &ids, &k.creds) {
-                continue;
-            }
-            let out = k.syscall(&mut m, 0);
-            let r = m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
-            if !(matches!(out, SyscallOutcome::Continue) && r == -(Errno::ENOSYS.0)) {
-                locked.push(raw);
+            match free_class(&m, at, true) {
+                None => locked.push(raw),
+                Some(c) if c.number() == NOSYS => {
+                    let out = k.syscall(&mut m, 0);
+                    let r = m.read_u64(at + ctx::x(0) as u64).unwrap() as u32 as i32;
+                    if !(matches!(out, SyscallOutcome::Continue) && r == -(Errno::ENOSYS.0)) {
+                        wrong.push(raw);
+                    }
+                }
+                Some(_) => {}
             }
         }
         use crate::i386::raw as x;
+        assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes these i386 calls");
         assert_eq!(locked, vec![x::FORK, x::EXECVE, x::CLONE, x::VFORK, x::CLONE3], "{locked:?}");
     }
 
