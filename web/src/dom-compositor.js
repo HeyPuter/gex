@@ -279,6 +279,9 @@ export class DomDesktop {
   #windows = new Map();
   #memories = new Map();
   #focus = null;
+  /** The windows that had the keyboard before, newest last: where it goes
+   *  back to when the window with it goes away. */
+  #focusPrev = [];
   #pointerOver = null;
   #raf = 0;
   #running = false;
@@ -518,7 +521,16 @@ export class DomDesktop {
     for (const [k, win] of [...this.#windows]) {
       if (live.has(k)) continue;
       this.#windows.delete(k);
-      if (this.#focus === win) this.#focus = null;
+      this.#focusPrev = this.#focusPrev.filter((w) => w !== win);
+      if (this.#focus === win) {
+        // Back to the window that had it before, or the client's next key goes
+        // nowhere: Win32 does not activate anything when a menu, a tooltip or
+        // the Start menu's user picture goes, and winewayland takes the enter
+        // of a placed window as where keys go, not as an activation.
+        this.#focus = null;
+        const prev = [...this.#focusPrev].reverse().find((w) => this.#windows.get(w.key) === w);
+        if (prev) this.focus(prev);
+      }
       if (this.#cursor === win) {
         // The client took its cursor away: back to the page's own pointer,
         // which is what the scene compositor's fallback arrow amounts to.
@@ -643,6 +655,9 @@ export class DomDesktop {
     if (this.#focus === win) return;
     const old = this.#focus;
     this.#focus = win;
+    this.#focusPrev = this.#focusPrev.filter((w) => w !== win && w !== old);
+    if (old) this.#focusPrev.push(old);
+    if (this.#focusPrev.length > 16) this.#focusPrev.shift();
     if (old) {
       sendEvent(this.#channel, old.block, EV_KEYBOARD_FOCUS, 0, 0, 0, 0, old.client, 0);
       this.configure(old, old.width, old.height);
