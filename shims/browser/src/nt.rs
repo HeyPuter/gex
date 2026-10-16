@@ -303,17 +303,26 @@ mod imp {
 
     /// Where Windows executables want to be that the arena would reach:
     /// 0x10000000, Wine's own services, svchost, explorer, rundll32 and
-    /// wineboot, and MSVC's default DLL base. Kept out of the arena's way
-    /// (an island; it grows nothing until mapped or passed), as Wine's
-    /// reservation keeps 0x10000-0x05000000 for those at 0x400000 and
-    /// 0x01000000. A relocated native-wasm skeleton executable did not run
-    /// (wineboot at 0x320000: a table call into a provider never installed).
+    /// wineboot, and MSVC's default DLL base (16 MiB; the largest image a
+    /// bundle has there is 9.4 MiB). A relocated native-wasm skeleton
+    /// executable did not run (wineboot at 0x320000: a table call into a
+    /// provider never installed). Above it, [`DLL_BAND`]: the DLLs a bundle
+    /// pins (its prefix's dll-bases, soju's dll-bases.py), at the addresses
+    /// its units were built for. Both are kept out of the arena's way as one
+    /// island, which grows nothing until something is mapped there, as Wine's
+    /// reservation keeps 0x10000-0x05000000 for executables at 0x400000 and
+    /// 0x01000000. Low, so that a process's memory reaches about 0.3 GiB for
+    /// its images, not the 1.5 GiB of the old band at 0x60000000.
     fn keep_exe_slot() {
-        // Not if the heap is there already (then executables relocate).
-        crate::memmap::claim_island(EXE_SLOT, EXE_SLOT + EXE_SLOT_SIZE, &crate::ARENA_NEXT, "Windows executables' slot (0x10000000)");
+        // Not if the heap is there already (then images relocate).
+        crate::memmap::claim_island(EXE_SLOT, DLL_BAND_END, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)");
     }
     const EXE_SLOT: u64 = 0x1000_0000;
-    const EXE_SLOT_SIZE: u64 = 16 << 20;
+    /// The pinned DLLs' band, [0x11000000, 0x20000000): soju's dll-bases.py
+    /// lays them out from its start and asserts they end below its end.
+    const DLL_BAND: u64 = 0x1100_0000;
+    const DLL_BAND_END: u64 = 0x2000_0000;
+    const _: () = assert!(EXE_SLOT + (16 << 20) == DLL_BAND && DLL_BAND < DLL_BAND_END);
 
     /// What a W3 process's `windows_space` says: no line (1 is never one, a
     /// split's line being page-aligned), only "Windows lives here".
