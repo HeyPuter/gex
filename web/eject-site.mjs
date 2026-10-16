@@ -504,7 +504,20 @@ function w3Site() {
     place(ut, 'project/build/web/units.tar');
     if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${w3.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
-    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${bootUnits.length}`, '/project/build/web/units.tar']]));
+    // Only the units the recording used by its title are compiled with the
+    // page. The rest, first used after it (`at`, the recorder's seconds) or
+    // not at all (no `at`: a unit built for every DLL of the prefix), go to
+    // the Workers as bytes, and the first process to map one compiles it
+    // (gex.mjs `#cgenModule`) and shares it. Compiled, each held 2.8 times
+    // its size of the renderer's code space and a copy of its bytes: the
+    // Win7 shell's IE units, 170 MiB that no process mapped at start-up,
+    // were 640 MiB of the renderer's VmData. A recording that timed no unit
+    // (an older recorder) has every unit compiled with the page.
+    const title = typeof w3.title_seconds === 'number' ? w3.title_seconds : null;
+    const timed = title !== null && bootUnits.some((u) => typeof u.at === 'number');
+    const demand = timed ? bootUnits.filter((u) => !(typeof u.at === 'number' && u.at <= title)).map((u) => u.key) : [];
+    if (demand.length) console.log(`eject-site: ${demand.length} units compiled when first mapped (${w3.units.filter((u) => demand.includes(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${bootUnits.length - demand.length}`, '/project/build/web/units.tar', ...(demand.length ? [{ demand }] : [])]]));
   }
   for (const u of coldUnits ? w3.units : []) {
     const d = join(web, 'units', u.key);

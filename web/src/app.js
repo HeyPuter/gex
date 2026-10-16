@@ -912,26 +912,33 @@ async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null
   return out;
 }
 
-/** Compile the units a preload list (`[[name, path], ...]`) names while the
+/** Compile the units a preload list (`[[name, path, {demand}?], ...]`) names while the
  *  bundle downloads, a few at a time. */
 async function preloadUnits(list, f, at) {
   const out = [];
   let i = 0;
   const one = async () => {
     while (i < list.length) {
-      const [name, path] = list[i++];
+      const [name, path, opt] = list[i++];
       const href = at(path);
       try {
         if (name.startsWith('tar:')) {
           // Every unit in one archive (web/eject-site.mjs): its modules
           // compiled, its other files shared, and `closed`: the Workers
           // ask the host for no unit file the archive does not hold.
+          // Its `demand` units, the ones the recording first used after its
+          // window, are shared as bytes like its other files: the first
+          // Worker to map one compiles it (gex.mjs `#cgenModule`, before
+          // the image runs) and shares the Module. Compiled here, each held
+          // 2.8 times its size of the renderer's code space even if nothing
+          // mapped it.
+          const demand = new Set(opt?.demand ?? []);
           const tar = (await fetchShared(href, f)).buffer;
           const t = untar(tar);
           const mods = [];
           for (const [p, bytes] of Object.entries(t.files)) {
             const rel = p.replace(/^\/+/, '');
-            if (rel.endsWith('/c.wasm')) {
+            if (rel.endsWith('/c.wasm') && !demand.has(rel.slice(0, -'/c.wasm'.length))) {
               mods.push(WebAssembly.compile(bytes).then((m) => {
                 f.meter?.compiled();
                 return [`cgen:${rel.slice(0, -'/c.wasm'.length)}`, m];
