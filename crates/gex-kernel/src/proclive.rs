@@ -117,6 +117,20 @@ impl ProcSource for KernelProcSource {
             .map(|fds| fds.list().into_iter().map(|(fd, p)| (fd, crate::pty::link_name(&p))).collect())
             .unwrap_or_default()
     }
+    fn fd_link(&self, fd: i32) -> Option<String> {
+        // One descriptor, not the whole table rendered. Its path as opened,
+        // with the symlinks on it followed: a program asks this to learn a
+        // file's real name in one call (W3's wineserver, for every file it
+        // opens, where `realpath` was a `readlink` per directory, each one a
+        // proxied system call out of a door).
+        let l = self.0.get()?;
+        let path = l.fds.upgrade()?.get(fd).ok()?.path.clone();
+        if !path.starts_with('/') {
+            return Some(crate::pty::link_name(&path));
+        }
+        let canon = l.vfs.upgrade().map_or_else(|| path.clone(), |v| v.get().canonical(&path));
+        Some(crate::pty::link_name(&canon))
+    }
     fn stat(&self) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let (ppid, pgid, sid) = relations(&l);
@@ -250,6 +264,29 @@ mod tests {
         assert_eq!(src.cmdline(), b"a\0one\0");
         k.publish_proc(&src.0);
         assert_eq!(src.cmdline(), b"a\0two\0");
+    }
+
+    /// `/proc/self/fd/N` names the file with the symlinks on the path it
+    /// was opened by followed, as Linux does, so one `readlink` of it is a
+    /// `realpath` of an open file.
+    #[test]
+    fn an_fd_link_is_the_real_path() {
+        let mut k = Kernel::new(0x1000, 0x10000, "/bin/a".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        k.vfs.mkdir("/real", 0o755).unwrap();
+        k.vfs.symlink("real", "/via").unwrap();
+        k.vfs.symlink("f", "/real/g").unwrap();
+        let src = KernelProcSource::new();
+        k.publish_proc(&src.0);
+        let h = k.vfs.open("/via/f", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_RDWR, 0o644).unwrap();
+        let fd = k.fds.insert(crate::file::OpenFile::new(h, "/via/g".into(), 0, true, true), false).unwrap() as i32;
+        assert_eq!(src.fd_link(fd).as_deref(), Some("/real/f"));
+        // Listed as opened; and a name that walks nowhere is kept.
+        assert!(src.fds().contains(&(fd, "/via/g".to_string())));
+        let h = k.vfs.open("/real/f", crate::fs::oflags::O_RDONLY, 0).unwrap();
+        let gone = k.fds.insert(crate::file::OpenFile::new(h, "/nowhere/x".into(), 0, true, false), false).unwrap() as i32;
+        assert_eq!(src.fd_link(gone).as_deref(), Some("/nowhere/x"));
+        assert_eq!(src.fd_link(999), None);
     }
 
     /// A process that mounts its own `/proc` (as every gex process does)
