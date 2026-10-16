@@ -5540,7 +5540,7 @@ pub struct FreeCall {
 /// call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     if gex_abi::PPC {
-        return None;
+        return free_class_ppc(m, ctx_addr);
     }
     let raw = if compat {
         m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
@@ -5582,6 +5582,37 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
     Some(FreeCall { n, raw, a })
 }
 
+/// [`free_class`] for a ppc32 process: the number and arguments where the
+/// full call reads them (`SYSCALL_NR`, `SYSCALL_ARGS`), the class decided on
+/// the canonical number [`crate::ppc::translate`] gives, and the arguments
+/// left raw, for [`free_call`] to translate as the full call does.
+fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
+    let raw = m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff;
+    let n = crate::ppc::canonical_number(raw);
+    let admitted = match n {
+        crate::ppc::UNKNOWN => false,
+        // ppc32 has `alarm`, which the canonical (AArch64) numbering leaves
+        // out of its class.
+        nr::ALARM => true,
+        n => free_number(n, false) == Some(n) || is_quiet(n, true),
+    };
+    if !admitted {
+        return None;
+    }
+    let mut a = [0u64; 6];
+    for (i, v) in a.iter_mut().enumerate() {
+        *v = m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
+    }
+    // As for the other ABIs: only a thread's `clone` is the free path's.
+    if is_thread_clone(n) {
+        use crate::ppc::raw as p;
+        if (raw != p::CLONE && raw != p::CLONE3) || thread_clone_flags(m, n, &a).is_none() {
+            return None;
+        }
+    }
+    Some(FreeCall { n, raw, a })
+}
+
 impl FreeCall {
     /// Its canonical number.
     pub fn number(&self) -> u64 {
@@ -5606,7 +5637,14 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `pselect6` mask argument widened, and a 32-bit `futex`'s timeout
     // (none of these has anything to do after the call: `Post::None`).
     let mut post = crate::i386::Post::None;
-    if is_poll(n)
+    let mut ppc_post = crate::ppc::PpcPost::None;
+    if gex_abi::PPC {
+        // Every ppc32 call is translated, as the full call translates it.
+        let (t, p, pp) = crate::ppc::translate(raw, &mut a, m, ctx_addr + ctx::SCRATCH as u64, ctx_addr);
+        post = p;
+        ppc_post = pp;
+        debug_assert_eq!(t, n);
+    } else if is_poll(n)
         || (compat
             && (matches!(
                 n,
@@ -5729,7 +5767,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             // Returning from a handler restores a whole context, so it
             // does not go through "write the result and continue".
             nr::RT_SIGRETURN => {
-                let legacy = compat && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
+                let legacy = compat && !gex_abi::PPC && raw & 0xffff_ffff == crate::i386::raw::SIGRETURN;
                 return match signal::sigreturn(f.signals, m, ctx_addr, compat, legacy) {
                     // The restored context is in ctx: a wasm32 program goes
                     // on there, or makes the call its handler interrupted.
@@ -5852,6 +5890,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
         Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, v))),
+        Ok(v) if ppc_post != crate::ppc::PpcPost::None => encode(Ok(crate::ppc::finish(ppc_post, v))),
         r => encode(r),
     };
     let _ = set_result(m, ctx_addr, ret);
@@ -10610,9 +10649,6 @@ mod tests {
     /// nothing waiting parks, and the errors are the kernel's.
     #[test]
     fn free_socket_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -10719,9 +10755,6 @@ mod tests {
 
     #[test]
     fn free_quiet_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -10790,9 +10823,6 @@ mod tests {
     /// (a stat's owner), and a fork's ids are its own.
     #[test]
     fn free_cred_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -10878,9 +10908,6 @@ mod tests {
     /// thread's own state, found through the shared table.
     #[test]
     fn free_kill_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -10978,9 +11005,6 @@ mod tests {
     /// own. `unshare(CLONE_FS)` gives the caller a fs_struct of its own.
     #[test]
     fn thread_own_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
         k.enter_thread(&main);
@@ -11060,9 +11084,6 @@ mod tests {
     #[test]
     fn lifecycle_end_calls_answer_as_the_kernel_does() {
         use std::sync::atomic::Ordering::SeqCst;
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
         k.enter_thread(&main);
@@ -11137,9 +11158,6 @@ mod tests {
     #[test]
     fn thread_clone_calls_answer_as_the_kernel_does() {
         use std::sync::atomic::Ordering::SeqCst;
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
         k.enter_thread(&main);
@@ -11219,9 +11237,6 @@ mod tests {
     /// `chdir`s, are all kept.
     #[test]
     fn mounts_are_made_through_the_view() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11308,9 +11323,6 @@ mod tests {
     /// `EINTR`. A bad timeout is `EINVAL` before anything is taken.
     #[test]
     fn sigtimedwait_waits_for_its_set() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11486,9 +11498,6 @@ mod tests {
 
     #[test]
     fn free_fd_object_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11594,9 +11603,6 @@ mod tests {
 
     #[test]
     fn free_fd_misc_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11717,9 +11723,6 @@ mod tests {
 
     #[test]
     fn free_own_state_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11811,9 +11814,6 @@ mod tests {
 
     #[test]
     fn free_call_answers_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11992,9 +11992,6 @@ mod tests {
     /// or answer as the full call (docs/kernel-locking.md §5.2 step 5).
     #[test]
     fn free_sleep_answers_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12053,9 +12050,6 @@ mod tests {
     /// through its published view, which follows `mmap` and `munmap`.
     #[test]
     fn free_futex_answers_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12465,9 +12459,6 @@ mod tests {
     /// socket's park, and `MSG_DONTWAIT`'s EAGAIN, as the full call answers.
     #[test]
     fn free_socket_messages_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         const MSG_DONTWAIT: u64 = 0x40;
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
@@ -12536,9 +12527,6 @@ mod tests {
     /// the terminal's own (whatever stdin is here) and a bad descriptor.
     #[test]
     fn free_ioctl_answers_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         const FIONREAD: u64 = 0x541b;
         const FIONBIO: u64 = 0x5421;
         const FIOCLEX: u64 = 0x5451;
@@ -12781,9 +12769,6 @@ mod tests {
 
     #[test]
     fn free_fd_table_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         use crate::unix::lock_op;
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
@@ -12923,9 +12908,6 @@ mod tests {
     /// through a symlink, a stat of each kind, a listing, a missing name.
     #[test]
     fn free_path_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         let mut seen = Vec::new();
         for lock_free in [true, false] {
             let (_, mut k) = setup();
@@ -13044,9 +13026,6 @@ mod tests {
     /// directory finds nothing.
     #[test]
     fn free_path_writers_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         const NOREPLACE: u64 = 1;
         let mut seen = Vec::new();
         for lock_free in [true, false] {
@@ -13336,9 +13315,6 @@ mod tests {
     /// kernels, the same calls, one through each path.
     #[test]
     fn free_mapping_calls_answer_as_the_kernel_does() {
-        if gex_abi::PPC {
-            return;
-        }
         use crate::mem::{flags as mf, prot};
         let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
         let mut seen = Vec::new();
