@@ -12267,6 +12267,17 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
+    // The JIT state's lock is the one guard kept where a trap can reach it
+    // (`JIT_HELD`, this Worker's TLS): a bug to be holding it here, said, and
+    // given back by its own `Drop`, so that the lock, its rank and the held
+    // count below agree. Left, the count was zeroed while the guard stayed.
+    if jit_holds() {
+        warn_line(&format!(
+            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}; given back (docs/kernel-locking.md §4.1)\n",
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ));
+        jit_give();
+    }
     // A kernel lock guard alive here never drops: a trap does not unwind, so
     // the lock would stay taken for good (docs/kernel-locking.md §4.1). Lock
     // regions are leaf computations; one that reaches a trap is a bug.
@@ -12289,7 +12300,40 @@ fn trap() -> ! {
     // reading the trapping syscall took, and a timed `poll` or `epoll_wait`
     // whose stack went back to the page never reached its deadline.
     end_now_scopes();
+    check_scopes_at_trap();
     warch::unreachable()
+}
+
+/// The shim's own scopes, checked where it traps out, as the kernel's lock
+/// guards are (`check_trap_out`, docs/kernel-locking.md §4.1). None may be
+/// open here: a trap runs no `Drop`, so each would stay open on this Worker
+/// for good.
+///
+/// - the kernel: `KLock` in the shared build, which every other Worker
+///   would then wait on, or the `HOST` borrow in the plain one, which would
+///   make the next call panic as a re-entry;
+/// - a GL submit's deferral (`gl::DEFER`), under which a submit waits for
+///   the end of a syscall that has already gone.
+///
+/// Scopes that do outlive a trap are left alone: the ones JS sets back
+/// when it catches one (`CB_DEPTH`, `GUEST_CALLS`, the call-out stack, the
+/// NT layer's exception levels), and the ones a trap hands to the next
+/// entry (`NATIVE_LEFT`, `NO_LEAVE`, the resume point). Those this shim
+/// can end itself, `trap` ends.
+fn check_scopes_at_trap() {
+    #[cfg(feature = "shared-memory")]
+    let kernel = DEPTH.with(|d| d.get()) > 0;
+    #[cfg(not(feature = "shared-memory"))]
+    let kernel = HOST.with(|h| h.try_borrow_mut().is_err());
+    let defer = gl::DEFER.with(|d| d.get());
+    if kernel || defer {
+        warn_line(&format!(
+            "[gex] BUG: trapped out to JS with{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
+            if kernel { " the kernel" } else { "" },
+            if defer { " a GL deferral" } else { "" },
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        ));
+    }
 }
 
 /// Which of the shim's own entry points is running, for a report that cannot
