@@ -10753,6 +10753,34 @@ mod tests {
         }
     }
 
+    /// What a page still makes under the kernel lock (docs/kernel-locking.md
+    /// §3.12): of the calls the kernel answers, every one but these is in
+    /// the free path's class. Each canonical number, with zero arguments; a
+    /// call the kernel does not know answers `ENOSYS` either way.
+    #[test]
+    fn only_the_process_calls_take_the_locked_path() {
+        if gex_abi::X86 || gex_abi::PPC {
+            return;
+        }
+        let mut locked = Vec::new();
+        for n in 0..=470u64 {
+            let (mut buf, mut k) = setup();
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            set_args(&mut m, at, n, &[0; 6]);
+            if free_class(&m, at, false).is_some() {
+                continue;
+            }
+            let out = k.syscall(&mut m, 0);
+            let enosys = matches!(out, SyscallOutcome::Continue) && ret(&m, at) == -(Errno::ENOSYS.0 as i64);
+            if !enosys {
+                locked.push(n);
+            }
+        }
+        eprintln!("locked: {:?}", locked.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>());
+        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{:?}", locked.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>());
+    }
+
     #[test]
     fn free_quiet_calls_answer_as_the_kernel_does() {
         let (mut buf, mut k) = setup();
