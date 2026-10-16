@@ -24,7 +24,7 @@ export class NodeNetwork {
   /** A fresh identifier; the guest connects it next. */
   open() {
     const id = this.#next++;
-    this.#sockets.set(id, { sock: null, status: CONNECTING, rx: [], eof: false });
+    this.#sockets.set(id, { sock: null, status: CONNECTING, rx: [], eof: false, refs: 1 });
     return id;
   }
 
@@ -91,6 +91,21 @@ export class NodeNetwork {
     return n;
   }
 
+  /** `recv`, leaving the bytes queued (web/src/net.js's `peek`). */
+  peek(id, out) {
+    const s = this.#sockets.get(id);
+    if (!s) return 0;
+    if (!s.rx.length) return s.eof || s.status === REFUSED ? 0 : -1;
+    let n = 0;
+    for (const c of s.rx) {
+      if (n >= out.length) break;
+      const take = Math.min(c.length, out.length - n);
+      out.set(c.subarray(0, take), n);
+      n += take;
+    }
+    return n;
+  }
+
   /**
    * Whether a `recv` would return something -- including end of stream, which
    * is a thing to return rather than a reason to keep waiting.
@@ -100,8 +115,17 @@ export class NodeNetwork {
     return !!s && (s.rx.length > 0 || s.eof || s.status === REFUSED);
   }
 
+  /** Another holder (web/src/net.js's `dup`): the last `close` ends it. */
+  dup(id) {
+    const s = this.#sockets.get(id);
+    if (!s) return 0;
+    s.refs++;
+    return 1;
+  }
+
   close(id) {
     const s = this.#sockets.get(id);
+    if (s && --s.refs > 0) return;
     s?.sock?.destroy();
     this.#sockets.delete(id);
   }

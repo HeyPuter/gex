@@ -771,7 +771,7 @@ export function vforkTrace(line) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #netShared = false; #gl = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -1439,8 +1439,15 @@ export class Gex {
           this.#net
             ? this.#net.recv(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
             : 0,
+        // `recv(MSG_PEEK)`: -2 (an error) from a network without it.
+        net_peek: (id, ptr, len) =>
+          this.#net?.peek
+            ? this.#net.peek(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            : this.#net ? -2 : 0,
         net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
         net_close: (id) => this.#net?.close(id),
+        // Another holder of a stream (a socket passed to another process).
+        net_dup: (id) => (this.#netShared && this.#net?.dup ? this.#net.dup(id) : 0),
         // Graphics: the guest's GL library batched commands in its own memory;
         // this hands over the address and the page runs them on WebGL.
         // The token as well as the ring: the host keeps a GL context per
@@ -3601,8 +3608,15 @@ export class Gex {
    * default: a guest with no proxy should see a machine with no network, which
    * fails cleanly, not one whose connections hang.
    */
-  useNetwork(net) {
+  useNetwork(net, { shared = false } = {}) {
     this.#net = net;
+    // One network object every process of the machine reaches (the page's
+    // Wisp connection over net-bridge, or the single-thread build's one
+    // object): its stream ids mean the same in every process, so a socket can
+    // be handed to another process on the same stream (`net_dup`). A network
+    // of this Worker's own (run-node's sockets, a Worker's own Wisp client)
+    // has ids no other process knows.
+    this.#netShared = !!(net && shared);
     // Its events end a network wait (`#netWait`). Chained: the single-thread
     // build's scheduler wake is set before this.
     if (net && 'onActivity' in net) {

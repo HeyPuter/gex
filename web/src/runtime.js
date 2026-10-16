@@ -443,8 +443,9 @@ function pageGlobals() {
  * and forwards keys, sizes and output.
  */
 async function runInSystemWorker(term, opts) {
-  // `onFilesLoaded` is a function, which cannot cross to the Worker.
-  const { network, onNetEvent, onFilesLoaded, onDesktop, transfer, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
+  // `onFilesLoaded` and `onSystem` are functions, which cannot cross to the
+  // Worker (nt.html passes `onSystem`: its every run failed to start here).
+  const { network, onNetEvent, onFilesLoaded, onDesktop, onSystem, transfer, wl, wlInput, gl, hostX, preModules, closure, ...rest } = opts;
   // Said once, so a person (and tests/single/run.sh) can tell which build ran.
   term.writeln?.('gex: single-thread build (no SharedArrayBuffer): every guest thread in one Worker');
   // The compositor: a canvas only (not the DOM desktop), drawn by the system

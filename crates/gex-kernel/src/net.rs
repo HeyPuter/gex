@@ -79,6 +79,15 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         let _ = buf;
         Err(Errno::EOPNOTSUPP)
     }
+    /// This connection as a name another process can hold it by (a socket
+    /// passed over `SCM_RIGHTS`, or inherited across a fork, in a page where
+    /// each process has its own memory), counted as one more holder: the
+    /// connection ends when its last holder closes, as a socket outlives one
+    /// of its descriptors. `None` for one that cannot leave this process.
+    /// What the name means is the host's (`Socket::carry`).
+    fn carry(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Where a host's connections come from.
@@ -124,6 +133,9 @@ impl Resolver {
     /// is the first time it has been asked.
     pub fn address_for(&self, name: &str) -> u32 {
         let key = name.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(h) = SHARED_NAMES.get() {
+            return (h.address_for)(&key);
+        }
         if let Some(&a) = self.by_name.lock().unwrap().get(&key) {
             return a;
         }
@@ -135,8 +147,30 @@ impl Resolver {
 
     /// The name an address was handed out for.
     pub fn name_for(&self, addr: u32) -> Option<String> {
+        if let Some(h) = SHARED_NAMES.get() {
+            return (h.name_for)(addr);
+        }
         self.by_addr.lock().unwrap().get(&addr).cloned()
     }
+}
+
+/// The machine's one table of synthetic answers, where processes do not share
+/// a kernel (a page: a Worker and a memory per process). One process resolves
+/// a name and another connects to the address it was told -- Wine's clients
+/// call getaddrinfo and its wineserver makes the connection -- so every
+/// process must give a name the same address and read it back the same way.
+#[derive(Clone, Copy)]
+pub struct SharedNames {
+    pub address_for: fn(&str) -> u32,
+    pub name_for: fn(u32) -> Option<String>,
+}
+
+static SHARED_NAMES: std::sync::OnceLock<SharedNames> = std::sync::OnceLock::new();
+
+/// Answer every `Resolver`'s questions from `names` (set once, by a host with
+/// a global kernel, before any process resolves).
+pub fn share_names(names: SharedNames) {
+    let _ = SHARED_NAMES.set(names);
 }
 
 /// Build a DNS response for a query.
@@ -330,9 +364,24 @@ impl std::fmt::Debug for RemoteEnd {
     }
 }
 
+impl RemoteEnd {
+    /// An end by its id in the global kernel: one `carry` handed over.
+    pub fn adopt(id: i32, remote: crate::unix::Remote) -> RemoteEnd {
+        RemoteEnd { id, remote, reset: Default::default() }
+    }
+}
+
 impl Transport for RemoteEnd {
     fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
         Ok(())
+    }
+    /// Another id on the same end of the global kernel's stream: the end
+    /// lives until its last id closes, and `shutdown` on any id is the end's.
+    fn carry(&self) -> Option<String> {
+        match (self.remote.dup)(self.id) {
+            n if n >= 0 => Some(format!("loop:{n}")),
+            _ => None,
+        }
     }
     fn wait_queue(&self) -> u32 {
         (self.remote.queue)(self.id)
@@ -352,6 +401,25 @@ impl Transport for RemoteEnd {
             n if n >= 0 => Ok(n as usize),
             n => Err(Errno(-n)),
         }
+    }
+    /// The global kernel's `recv` with `MSG_PEEK` (its descriptor-passing
+    /// read, asked for none).
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut out = [0u8; 8];
+        let n = (self.remote.read_fds)(
+            self.id,
+            buf.as_mut_ptr() as crate::PAddr,
+            buf.len() as u32,
+            0,
+            1,
+            0,
+            out.as_mut_ptr() as crate::PAddr,
+            out.len() as u32,
+        );
+        if n < 0 {
+            return Err(Errno(-n));
+        }
+        Ok(n as usize)
     }
     fn has_data(&self) -> bool {
         (self.remote.readable)(self.id) != 0
@@ -708,6 +776,55 @@ impl Socket {
     /// it asked, so 0.0.0.0 made every answer look spoofed.
     pub fn set_peer(&self, addr: u32, port: u16) {
         *self.peer.lock().unwrap() = Some((addr, port));
+    }
+
+    /// This socket as a name another process can rebuild it from (a page's
+    /// `SCM_RIGHTS` and fork): `inet:PEER:PORT:LOCAL:PORT:TRANSPORT`, the last
+    /// part the transport's own (`Transport::carry`), counted as one more
+    /// holder of the connection. Only a TCP socket with a connection (open or
+    /// still connecting) can go: the two copies are then one connection, as
+    /// two descriptors are one socket. One not yet connected cannot -- its
+    /// copies would connect apart -- nor can a listener or a UDP socket.
+    pub fn carry(&self) -> Option<String> {
+        if self.kind != Kind::Tcp || self.backlog.lock().unwrap().is_some() {
+            return None;
+        }
+        let t = self.transport.lock().unwrap().as_ref()?.carry()?;
+        let (pa, pp) = self.peer().unwrap_or((0, 0));
+        let (la, lp) = self.local();
+        Some(format!("inet:{pa}:{pp}:{la}:{lp}:{t}"))
+    }
+
+    /// The other half of `carry`: a TCP socket on `transport` (what the
+    /// name's last part was rebuilt into), where the name says it was.
+    pub fn adopt(
+        desc: &str,
+        transport: Arc<dyn Transport>,
+        net: Arc<dyn NetStack>,
+        resolver: Arc<Resolver>,
+        ports: Arc<Ports>,
+        remote: Option<crate::unix::Remote>,
+    ) -> Option<Arc<Socket>> {
+        let mut p = desc.strip_prefix("inet:")?.splitn(5, ':');
+        let pa = p.next()?.parse::<u32>().ok()?;
+        let pp = p.next()?.parse::<u16>().ok()?;
+        let la = p.next()?.parse::<u32>().ok()?;
+        let lp = p.next()?.parse::<u16>().ok()?;
+        let sock = Arc::new(Socket::new(Kind::Tcp, net, resolver, ports, remote));
+        sock.set_self();
+        if pa != 0 || pp != 0 {
+            *sock.peer.lock().unwrap() = Some((pa, pp));
+        }
+        if la != 0 || lp != 0 {
+            *sock.local.lock().unwrap() = Some((la, lp));
+        }
+        *sock.transport.lock().unwrap() = Some(transport);
+        Some(sock)
+    }
+
+    /// The transport part of a `carry` name (`wisp:N`, `loop:N`).
+    pub fn carried_transport(desc: &str) -> Option<&str> {
+        desc.strip_prefix("inet:")?.splitn(5, ':').nth(4)
     }
 
     /// `connect`. Returns `EINPROGRESS` while still connecting; the kernel

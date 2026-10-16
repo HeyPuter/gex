@@ -41,6 +41,8 @@ async function main() {
   const env = (q.get('env') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean);
   const app = await start({
     canvas: document.getElementById('out'),
+    // `wisp=wss://…/`: the guest's network over that Wisp proxy (none without it)
+    ...(q.get('wisp') ? { wisp: q.get('wisp') } : {}),
     size: { w, h },
     baseUrl: new URL('/', location.href),
     onLog: () => { logEl.textContent = globalThis.__nt.out.slice(-4000); },
