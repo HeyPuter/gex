@@ -23,6 +23,11 @@ pub trait ProcSource: Send + Sync {
     fn cwd(&self) -> String;
     /// Names of the currently open descriptors, as `(fd, target)`.
     fn fds(&self) -> Vec<(i32, String)>;
+    /// What `/proc/self/fd/N` links to: the file's path with its symlinks
+    /// followed, as Linux shows it. By default the name [`Self::fds`] lists.
+    fn fd_link(&self, fd: i32) -> Option<String> {
+        self.fds().into_iter().find(|&(f, _)| f == fd).map(|(_, t)| t)
+    }
     fn stat(&self) -> String;
     fn status(&self) -> String;
     /// Every process on the system, this one included, for `/proc/<pid>`
@@ -376,12 +381,7 @@ impl FileSystem for ProcFs {
             other => {
                 if let Some(n) = other.strip_prefix("self/fd/") {
                     let fd: i32 = n.parse().map_err(|_| Errno::ENOENT)?;
-                    for (open_fd, target) in self.source.fds() {
-                        if open_fd == fd {
-                            return Ok(target);
-                        }
-                    }
-                    return Err(Errno::ENOENT);
+                    return self.source.fd_link(fd).ok_or(Errno::ENOENT);
                 }
                 Err(Errno::EINVAL)
             }

@@ -855,6 +855,17 @@ impl Namespace {
         self.mount_of(abs)
     }
 
+    /// Absolute `abs` with every root-filesystem symlink on it followed,
+    /// the last component's too: the name Linux's `/proc/self/fd/N` shows
+    /// for a file opened by `abs`. `abs` itself when the walk fails or
+    /// reaches another mount (which names its own links).
+    pub fn canonical(&self, abs: &str) -> String {
+        match self.walk(abs, true) {
+            Ok(Some(w)) if !w.at_mount => w.path,
+            _ => abs.to_string(),
+        }
+    }
+
     /// The root filesystem's [`FileSystem::walk`] of absolute `abs`, or
     /// `None` with nothing mounted at `/`.
     fn walk(&self, abs: &str, follow_final: bool) -> Result<Option<Walked>, Errno> {
