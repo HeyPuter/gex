@@ -10855,7 +10855,7 @@ mod tests {
         }
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{:?}", names(&locked));
+        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
     }
 
     /// [`only_the_process_calls_take_the_locked_path`] for an i386 process
@@ -11049,8 +11049,8 @@ mod tests {
             assert_eq!(ret(&m, at), want_ret, "call {n} {args:?}");
             assert_eq!(m.read_u64(at + ctx::FS_BASE as u64).unwrap(), fs, "call {n}");
         }
-        // Not quiet: declined, for the kernel.
-        set_args(&mut m, at, nr::WAIT4, &[0, 0, 0]);
+        // A process call: declined, for the kernel.
+        set_args(&mut m, at, nr::EXECVE, &[0, 0, 0]);
         assert!(free_class(&m, at, false).is_none());
     }
 
@@ -12100,11 +12100,16 @@ mod tests {
         }
         let done = |o: Option<FreeOutcome>| matches!(o, Some(FreeOutcome::Done(Delivery::None)));
 
-        // Not in the class: declined before anything is done.
+        // A process call: declined before anything is done. An id call
+        // is answered (`ident_call`), and an unknown one is ENOSYS.
+        set_args(&mut m, at, nr::EXECVE, &[0, 0, 0]);
+        assert!(free(&k, &mut m, at).is_none());
         set_args(&mut m, at, nr::GETPID, &[]);
-        assert!(free(&k, &mut m, at).is_none());
-        set_args(&mut m, at, nr::WAIT4, &[0, 0, 0]);
-        assert!(free(&k, &mut m, at).is_none());
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), k.pid as i64);
+        set_args(&mut m, at, 999, &[]);
+        assert!(done(free(&k, &mut m, at)));
+        assert_eq!(ret(&m, at), -(Errno::ENOSYS.0 as i64));
 
         // An empty pipe parks both ways, on the same stream.
         set_args(&mut m, at, nr::READ, &[rfd, 0x22000, 16]);
