@@ -93,7 +93,7 @@ const { targetId } = await browser.send('Target.createTarget', { url: 'about:bla
 const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
 
 // Every Worker's console, from its first line: auto-attach, paused at start.
-const units = new Map();     // key -> { path, hit }
+const units = new Map();     // key -> { path, hit, first: when it was first hit (Date.now()) }
 const processes = new Map(); // main image -> cmdline
 const modules = new Map();   // path -> content key
 const bases = new Map();     // unit key -> load base, for the images without one
@@ -106,7 +106,8 @@ browser.on('Runtime.consoleAPICalled', (p) => {
   let m;
   if ((m = /^\[gex-record\] unit ([0-9a-f]{64}) (hit|miss) (.*)$/.exec(t))) {
     const was = units.get(m[1]);
-    units.set(m[1], { path: m[3], hit: m[2] === 'hit' || !!was?.hit });
+    const hit = m[2] === 'hit' || !!was?.hit;
+    units.set(m[1], { path: m[3], hit, first: was?.first ?? (m[2] === 'hit' ? Date.now() : undefined) });
   } else if ((m = /^\[gex-record\] process (.*?) :: (.*)$/.exec(t))) {
     processes.set(m[1], m[2]);
   } else if ((m = /^\[gex-cov\] ([0-9a-f]{64}) (\S+)$/.exec(t))) {
@@ -196,7 +197,10 @@ const session = {
     ...[...modules.keys()].filter((m) => /^wasmdll:.*\.exe$/i.test(m) && !processes.has(m.slice(8)))
       .map((m) => ({ image: m.slice(8), cmdline: null })),
   ],
-  units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path })),
+  // `at`: seconds from the start to the unit's first use. A unit first used
+  // after the title is compiled when a process first maps it, not with the
+  // page (web/eject-site.mjs, preload.json's `demand`).
+  units: [...units].filter(([, u]) => u.hit).map(([key, u]) => ({ key, path: u.path, at: +((u.first - t0) / 1000).toFixed(2) })),
   unit_misses: [...units].filter(([, u]) => !u.hit).map(([key, u]) => ({ key, path: u.path, ...(bases.has(key) ? { base: bases.get(key) } : {}) })),
   modules: [...modules].map(([path, content]) => ({ path, content })),
   files_read: Array.isArray(opened) ? opened : null,

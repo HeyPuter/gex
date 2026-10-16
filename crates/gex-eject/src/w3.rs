@@ -162,7 +162,17 @@ pub fn eject(record: &Path, out: &Path, runtime: &Path, o: &W3Options) -> Result
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
         ("bundle", obj(vec![("file", s("bundle/rootfs.tar")), ("sha256", s(&bundle_sha)), ("from", s(&bundle))])),
         ("processes", Json::Arr(processes.to_vec())),
-        ("units", Json::Arr(units.iter().map(|(k, p)| obj(vec![("key", s(k)), ("path", s(p))])).collect())),
+        // Each with `at`, when the recording first used it (seconds; none
+        // from an older recorder): a unit first used after the title is
+        // compiled when a process maps it (web/eject-site.mjs, `demand`).
+        ("units", Json::Arr(list(&v, "units").iter().zip(&units).map(|(u, (k, p))| {
+            let mut kv = vec![("key", s(k)), ("path", s(p))];
+            if let Some(at) = u.get("at").filter(|a| matches!(a, Json::Num(_))) {
+                kv.push(("at", at.clone()));
+            }
+            obj(kv)
+        }).collect())),
+        ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("unit_misses", Json::Arr(list(&v, "unit_misses").to_vec())),
         ("modules", Json::Arr(modules.to_vec())),
         // The files the run opened (the recorder's `files_read`; null from an
@@ -756,6 +766,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
             _ => rec.get("size").cloned().unwrap_or(s("fit")),
         }),
         ("title", v.get("title").cloned().unwrap_or(Json::Null)),
+        ("title_seconds", v.get("title_seconds").cloned().unwrap_or(Json::Null)),
         ("params", Json::Obj(params)),
         ("features_off", strs(&off)),
         ("units", Json::Arr(units.iter().map(|u| {
