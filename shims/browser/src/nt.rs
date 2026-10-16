@@ -5,7 +5,7 @@
 //!
 //! - [`boot`] replaces the ELF placement in `gex_load`;
 //! - [`syscall`] is the whole `syscall` import for an NT process, entered
-//!   before `with_host` is ever taken;
+//!   without the kernel lock;
 //! - [`fault`] turns a breakpoint, an illegal instruction or a branch to
 //!   memory that is not executable into an NT exception;
 //! - [`tick`] keeps `KUSER_SHARED_DATA`'s clocks moving (there is no thread
@@ -14,10 +14,10 @@
 //!   entered from inside the `syscall` import on the calling Worker.
 //!
 //! One kernel: the process's `Kernel` is the one in [`Host`], and the NT
-//! layer reaches it through [`HostKernel`], which takes the same kernel lock
-//! (`KLock`) every other path through the shim takes. So signals, the
-//! dispatch-miss path, the devices and the NT layer can never hold two views
-//! of it.
+//! layer reaches the parts of it it uses (the namespace, the memory map, the
+//! task ids) through `nt::NtKernel`, taken from it at boot: the same shared
+//! objects, each with its own lock or none, so the NT layer never takes the
+//! kernel lock and never holds a second view of the kernel.
 //!
 //! Only the shared-memory build runs one: a Windows program blocks inside
 //! its syscalls (an NT wait parks the calling thread on a condition
@@ -127,11 +127,11 @@ mod stub {
 mod imp {
     use crate::{
         backfill_registry, cur, exit_process, grow_memory_to, guest_bytes, set_resume, set_resume_ctx,
-        set_resume_none, stage_thread, trap, warn_line, with_host, KLock, ThreadSlot, Waiting, ARENA_NEXT, HOST,
+        set_resume_none, stage_thread, trap, warn_line, ThreadSlot, Waiting, ARENA_NEXT,
     };
     use gex_abi::ctx;
     use gex_kernel::nt;
-    use gex_kernel::{GuestMem, Kernel, ThreadState};
+    use gex_kernel::{GuestMem, Kernel};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -185,40 +185,6 @@ mod imp {
     /// The bottom of the shim's heap in an NT process: the top of the
     /// Windows user address space and above (see `nt::vm::ALLOC_HIGH`).
     const NT_HEAP_BASE: u64 = 0x8000_0000;
-
-    /// The process's kernel, as the NT layer takes it: the one in `Host`,
-    /// under `KLock`.
-    struct HostKernel;
-
-    struct Held {
-        _lock: KLock,
-        k: &'static mut Kernel,
-    }
-
-    impl std::ops::Deref for Held {
-        type Target = Kernel;
-        fn deref(&self) -> &Kernel {
-            self.k
-        }
-    }
-
-    impl std::ops::DerefMut for Held {
-        fn deref_mut(&mut self) -> &mut Kernel {
-            self.k
-        }
-    }
-
-    impl nt::KernelCell for HostKernel {
-        fn lock_kernel(&self) -> nt::KernelGuard<'_> {
-            let lock = KLock::take();
-            // SAFETY: as `with_host`: `KLock` makes this Worker the only one
-            // inside the host until the guard drops, and the NT layer never
-            // holds the kernel across a call that takes it again (it would
-            // deadlock natively, where the lock is a plain `Mutex`).
-            let k = unsafe { &mut (*core::ptr::addr_of_mut!(HOST)).as_mut().expect("gex: not initialised").kernel };
-            nt::KernelGuard::new(Box::new(Held { _lock: lock, k }))
-        }
-    }
 
     /// `GEX_NT_TIME_SCALE`, as natively.
     static TIME_SCALE: AtomicU64 = AtomicU64::new(0);
@@ -1136,7 +1102,7 @@ mod imp {
         );
         let outcome = {
             let mut host = Nested { ctx_addr };
-            nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
+            nt::syscall(p, guest_bytes(), ctx_addr, pc as u64, &mut host)
         };
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("during", &nt::syscall_name(nr));
@@ -1649,7 +1615,7 @@ mod imp {
                 stack.join(" ")
             ));
         }
-        match nt::hardware_exception(p, &HostKernel, guest_bytes(), ctx_addr, code, rip, &info) {
+        match nt::hardware_exception(p, guest_bytes(), ctx_addr, code, rip, &info) {
             nt::Outcome::Resume(target) => {
                 set_resume(target);
                 set_resume_ctx(ctx_addr);

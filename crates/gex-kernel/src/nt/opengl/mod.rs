@@ -371,7 +371,7 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
         return Ok(());
     }
     drop(s);
-    let dev = c.kernel().vfs.open("/dev/gex-gl", 2, 0).ok();
+    let dev = c.kernel().vfs().open("/dev/gex-gl", 2, 0).ok();
     let Some(dev) = dev else {
         return Err(c.unimplemented("OpenGL without a GL device (run gexc with --gl)"));
     };

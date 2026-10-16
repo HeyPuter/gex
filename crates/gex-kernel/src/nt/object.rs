@@ -132,7 +132,7 @@ fn closed(c: &mut Call<'_>, obj: &Obj) {
     if let Obj::File(f) = obj {
         let still = c.p.st.lock().unwrap().handles.file_still_open(f);
         if !still {
-            super::file::on_last_close(&mut c.kernel(), f);
+            super::file::on_last_close(&c.kernel().vfs(), f);
             if f.delete_on_close.load(std::sync::atomic::Ordering::Relaxed) {
                 super::file::changed_path(c, &f.path);
             }

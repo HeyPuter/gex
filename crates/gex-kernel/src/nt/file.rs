@@ -160,8 +160,8 @@ pub fn nt_to_target(c: &Call<'_>, nt: &[u16]) -> R<Target> {
 /// Resolve `path` case-insensitively. `Ok(Err(parent_exists))` when the last
 /// component is missing (so a create can proceed if the parent exists).
 fn resolve_ci(c: &Call<'_>, path: &str) -> Result<String, bool> {
-    let k = c.kernel();
-    if k.vfs.metadata(path).is_ok() {
+    let vfs = c.kernel().vfs();
+    if vfs.metadata(path).is_ok() {
         return Ok(path.to_string());
     }
     let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
@@ -176,20 +176,19 @@ fn resolve_ci(c: &Call<'_>, path: &str) -> Result<String, bool> {
             continue;
         }
         let exact = format!("{cur}/{comp}");
-        if k.vfs.metadata(&exact).is_ok() {
+        if vfs.metadata(&exact).is_ok() {
             cur = exact;
             continue;
         }
         let dir = if cur.is_empty() { "/".to_string() } else { cur.clone() };
-        let found = k
-            .vfs
+        let found = vfs
             .open(&dir, oflags::O_RDONLY | oflags::O_DIRECTORY, 0)
             .and_then(|h| h.read_dir())
             .ok()
             .and_then(|es| es.into_iter().find(|e| e.name.eq_ignore_ascii_case(comp)));
         match found {
             Some(e) => cur = format!("{cur}/{}", e.name),
-            None => return Err(last && k.vfs.metadata(&dir).is_ok()),
+            None => return Err(last && vfs.metadata(&dir).is_ok()),
         }
     }
     Ok(if cur.is_empty() { "/".into() } else { cur })
@@ -325,7 +324,7 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
         Err(true) => (path.clone(), false),
         Err(false) => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
     };
-    let md = if exists { c.kernel().vfs.metadata(&resolved).ok() } else { None };
+    let md = if exists { c.kernel().vfs().metadata(&resolved).ok() } else { None };
     let is_dir = md.as_ref().is_some_and(|m| m.file_type == FileType::Directory);
     if is_dir && options & opt::NON_DIRECTORY_FILE != 0 {
         return Err(Status(st::FILE_IS_A_DIRECTORY));
@@ -374,14 +373,14 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
     let creating_dir = !exists && options & opt::DIRECTORY_FILE != 0;
     let creating = !exists && (creating_dir || flags & oflags::O_CREAT != 0);
     let handle = {
-        let k = c.kernel();
+        let vfs = c.kernel().vfs();
         if creating_dir {
-            k.vfs.mkdir(&resolved, 0o755)?;
-            k.vfs.open(&resolved, oflags::O_RDONLY | oflags::O_DIRECTORY, 0)?
+            vfs.mkdir(&resolved, 0o755)?;
+            vfs.open(&resolved, oflags::O_RDONLY | oflags::O_DIRECTORY, 0)?
         } else if is_dir {
-            k.vfs.open(&resolved, oflags::O_RDONLY | oflags::O_DIRECTORY, 0)?
+            vfs.open(&resolved, oflags::O_RDONLY | oflags::O_DIRECTORY, 0)?
         } else {
-            k.vfs.open(&resolved, flags, 0o644)?
+            vfs.open(&resolved, flags, 0o644)?
         }
     };
     let f = NtFile {
@@ -836,7 +835,7 @@ pub fn nt_set_information_file(c: &mut Call<'_>) -> R {
                 }
                 Err(false) => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
             };
-            c.kernel().vfs.rename(&from, &dest)?;
+            c.kernel().vfs().rename(&from, &dest)?;
             *f.moved_to.lock().unwrap() = Some(dest.clone());
             changed_path(c, &from);
             changed_path(c, &dest);
@@ -937,7 +936,7 @@ fn stat_attr_inner(c: &mut Call<'_>, nt: &[u16]) -> R<(String, Metadata)> {
             let path = resolve_ci(c, &p).map_err(|parent| {
                 Status(if parent { st::OBJECT_NAME_NOT_FOUND } else { st::OBJECT_PATH_NOT_FOUND })
             })?;
-            let md = c.kernel().vfs.metadata(&path)?;
+            let md = c.kernel().vfs().metadata(&path)?;
             Ok((path, md))
         }
         Target::Null => Ok((String::new(), console_md())),
@@ -1086,14 +1085,14 @@ pub fn nt_query_directory_file(c: &mut Call<'_>) -> R {
     if scan.is_none() || restart {
         let mut entries = Vec::new();
         let listing = f.handle.read_dir()?;
-        let k = c.kernel();
+        let vfs = c.kernel().vfs();
         for e in listing {
             let p = if e.name == "." || e.name == ".." { f.path.clone() } else { format!("{}/{}", f.path, e.name) };
-            if let Ok(md) = k.vfs.metadata(&p) {
+            if let Ok(md) = vfs.metadata(&p) {
                 entries.push((e.name, md));
             }
         }
-        drop(k);
+        drop(vfs);
         let keep_mask = scan.as_ref().and_then(|s| s.mask.clone());
         *scan = Some(DirScan { entries, next: 0, mask: mask.clone().or(keep_mask) });
     } else if let (Some(m), Some(s)) = (mask.clone(), scan.as_mut()) {
@@ -1223,10 +1222,10 @@ pub fn nt_flush_buffers_file(c: &mut Call<'_>) -> R {
 }
 
 /// Close-time work for a file: delete-on-close.
-pub fn on_last_close(k: &mut crate::Kernel, f: &NtFile) {
+pub fn on_last_close(vfs: &crate::vfs::Namespace, f: &NtFile) {
     if f.delete_on_close.load(Ordering::Relaxed) && f.kind == FileKind::Disk {
         let path = f.moved_to.lock().unwrap().clone().unwrap_or_else(|| f.path.clone());
-        let _ = if f.is_dir { k.vfs.rmdir(&path) } else { k.vfs.unlink(&path) };
+        let _ = if f.is_dir { vfs.rmdir(&path) } else { vfs.unlink(&path) };
     }
 }
 

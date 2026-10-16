@@ -737,7 +737,7 @@ pub fn nt_pid(gex_pid: i32) -> u32 {
 /// (the main thread); `None` allocates both.
 pub fn create_thread_state(
     p: &Process,
-    k: &mut crate::Kernel,
+    k: &super::NtKernel,
     g: &mut G<'_>,
     stack_reserve: u64,
     slot: Option<(u32, i32)>,
@@ -965,8 +965,8 @@ pub fn nt_create_thread_ex(c: &mut Call<'_>) -> R {
         return Err(c.unimplemented(&format!("NtCreateThreadEx flags {flags:#x}")));
     }
     let t = {
-        let mut k = c.kernel.lock_kernel();
-        let t = create_thread_state(c.p, &mut k, &mut c.g, reserve, None)?;
+        let k = c.kernel();
+        let t = create_thread_state(c.p, k, &mut c.g, reserve, None)?;
         k.live_threads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         t
     };
@@ -1086,7 +1086,7 @@ pub fn exit_thread(c: &mut Call<'_>, code: u32) {
     sync::yield_kick(c);
     c.p.remove_thread(&t);
     {
-        let mut k = c.kernel();
+        let k = c.kernel();
         // One fewer, never below zero.
         use std::sync::atomic::Ordering;
         let live = &k.live_threads;
