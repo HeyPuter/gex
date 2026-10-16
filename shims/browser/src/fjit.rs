@@ -662,6 +662,7 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
                 "callouttrap" => crate::cgen::TRAP_CALLOUTS.store(v != 0, Ordering::Relaxed),
                 "provcheck" => crate::cgen::libprov::PROV_CHECK.store(v != 0, Ordering::Relaxed),
                 "byobj" => BY_OBJECT_ON.store(v != 0, Ordering::Relaxed),
+                "coutstat" => crate::cgen::COUT_STAT.store(v != 0, Ordering::Relaxed),
                 _ => crate::warn_line(&format!("gex: ?fjitlibs: no switch {k}\n")),
             }
             continue;

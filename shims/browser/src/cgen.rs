@@ -1736,6 +1736,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         }
         x.push((t, ret as u64, want, depth as u32, -1, sp));
     });
+    cout_stat(t, ret as u64);
     // SAFETY: a host import taking scalars; nothing here holds a lock.
     let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
@@ -1775,6 +1776,46 @@ extern "C" {
 
 /// AOT-only fallbacks that found their target published and called it.
 pub(crate) static CAUGHT_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `?fjitlibs=coutstat=1`: say each call-out target once it has been called
+/// out to 64 times on a Worker (and from where), and this Worker's totals at
+/// every power of two from 1024: which code no unit holds is hot.
+pub(crate) static COUT_STAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static COUT_BY: std::cell::RefCell<std::collections::HashMap<u64, (u32, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static COUT_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn cout_stat(t: u64, ret: u64) {
+    if !COUT_STAT.load(Ordering::Relaxed) {
+        return;
+    }
+    let n = COUT_N.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    if n >= 1024 && n.is_power_of_two() {
+        let distinct = COUT_BY.with(|m| m.borrow().len());
+        crate::warn_line(&format!("[cout] pid {} {n} call-outs on this Worker, {distinct} targets\n", crate::gex_my_pid()));
+    }
+    let k = COUT_BY.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(t).or_insert((0, ret));
+        e.0 += 1;
+        e.0
+    });
+    if k == 64 {
+        crate::warn_line(&format!(
+            "[cout] pid {} hot target {t:#x} ({}), from ret {ret:#x} ({}), 64 call-outs; served by fjit {}\n",
+            crate::gex_my_pid(),
+            crate::nt::describe(t),
+            crate::nt::describe(ret),
+            ftab(|m| m.get(t).is_some()),
+        ));
+    }
+}
 
 /// `gex_set_callout(0)` turns the call-out off (the fallback always leaves,
 /// as before it existed), for measuring.
@@ -2482,7 +2523,7 @@ pub extern "C" fn gex_icall_note(_ctx: i32, ret: i64, target: i64) {
 /// last complete dump of a run is its profile.
 #[no_mangle]
 pub extern "C" fn gex_icall_dump() {
-    let pid = crate::my_pid();
+    let pid = crate::gex_my_pid();
     let mut lines = Vec::new();
     for i in 0..ICALL_SLOTS {
         if ICALL_TAG[i].load(Ordering::Acquire) == 0 {
