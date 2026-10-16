@@ -1,7 +1,9 @@
 # Removing the kernel lock (plan, 2026-10-12)
 
-Status: plan, no code yet. Backlog entry: "FULL REMOVAL OF THE GLOBAL KERNEL
-LOCK (KLock)" (user, 2026-10-11). Owner: stream W.
+Status (2026-10-16): done in the page but for the exec lock, which §3.12
+says why it stays; the native `Mutex<Kernel>` (§3.11) is left. Where each
+step is: §3.12, "Where this stands". Backlog entry: "FULL REMOVAL OF THE
+GLOBAL KERNEL LOCK (KLock)" (user, 2026-10-11). Owner: stream L.
 
 The goal is that no call into a process's kernel takes a lock shared by all of
 that process's threads. Each piece of state gets the narrowest
@@ -297,9 +299,10 @@ About 85 sites, and the hottest path after syscalls. The plan:
   reading, which is uncontended, so a single atomic add.
 - **Host sockets and tty** use `socket_names`, which gets its own `Mutex`,
   and the fd table (§3.4).
-- **The NT layer.** `KernelCell::lock_kernel` hands out the whole
-  `Kernel`. It becomes accessors for what NT actually uses (vfs, mm, fds,
-  devices). NT's own `nt::Process` state keeps its own locks.
+- **The NT layer.** Done (L26): `KernelCell::lock_kernel`, which handed
+  out the whole `Kernel`, is `nt::NtKernel`, the shared parts NT uses (the
+  published namespace, the mm, the task ids, the thread counts), taken
+  once at boot. NT's own `nt::Process` state keeps its own locks.
 
 ### 3.11 Native
 
@@ -462,62 +465,62 @@ three at a time.
 | L25 | lifecycle (clone, exec, wait, exit) and F |
 | L26 | H |
 
-After L26 the `HOST` static and `KLock` are deleted. The native
-`Mutex<Kernel>` (§3.11) goes last.
+After L26 the page's `KLock` was to be deleted with `HOST`. What is left
+of it is the exec lock, for the reason under "Where this stands"; `HOST`
+stays as the state those calls own. The native `Mutex<Kernel>` (§3.11)
+goes last.
 
-#### Where this stands (2026-10-15, stream L parked)
+#### Where this stands (2026-10-16)
 
-Done, on branch `l/klock-l12`. Each item is one commit with its tests:
+Every step of the table above is written. What the page still locks is
+the exec lock (L25g): `KLock` renamed `ExecLock`, `with_host`
+`with_exec_lock`, one call site, `gex_syscall`'s process calls:
 
-- L19 to L22d, the oflags fix and the integration-suite fix.
-- Blocking `rt_sigtimedwait` (3b2bc50c).
-- L22e:
-  - `set_tid_address` and `unshare` (2329d077). The word a thread's exit
-    clears is in its `ThreadSig`; `leave_thread` is gone.
-  - `mount` and `umount2` (9477b881). `VfsView` is the mount table's
-    one writer, and `Vfs::refresh` brings the kernel's copy up to date at
-    each locked call.
+- `execve`, and `clone`, `clone3`, `fork` and `vfork` that make a process;
+- the dynamic linker's `SNAP_SYSCALL`, which records a linked image.
 
-After L22e the browser's locked syscall path (group A) carries only the
-lifecycle calls: clone, clone3, execve, exit, exit_group, wait4 and
-reboot. Those are L25.
+Why it stays: these replace, copy or record the whole `Host` (the image,
+the memory map, the JIT state, the thread table). Nothing else touches
+`Host` any more, so the lock only keeps a fork from copying a process an
+exec is replacing, as Linux's `exec_update_lock` does. Removing it would
+mean an exec built from the published parts (`Home`, `Mm`, `fds_free`)
+with `Host` gone, a rewrite of `do_exec` and `do_fork` rather than a
+lock removal. Every other call is the free path's; the census tests
+(`only_the_process_calls_take_the_locked_path`, and its i386 twin) fail if
+a call the kernel makes leaves the free path's classes.
 
-Written but not handed over, on branch `l/parked` (on top of 9477b881):
+Lock sites in shims/browser/src: 54 on L23, 31 after L24, 16 after L24b,
+14 after L25b, 4 after L25c, 3 after L26, 1 after L25f (the definitions
+not counted).
 
-- 7c9233e4: `adoptThread` no longer calls `gex_set_compat` (group G's
-  last two sites). What it set is process-wide, in the shared memory.
-  Only a child's adoption calls it now, once per process. Built and
-  type-checked; not yet run through the battery.
-- b48fb20a, L23 (group D): `Host::threads` becomes
-  `gex_atomic::threads::ThreadTable`. Slots are in chunks that never move,
-  claimed with one atomic add and published by storing the run state
-  last. The table is also held in `Home`. The censuses, the deadlock
-  report, `gex_dump_threads`, `gex_ctx_exited` and `all_futex_blocked`
-  read it without the lock. `RUNS`, `publish_runs` and `Thread` are gone.
-  Its unit test is in gex-atomic. It type-checks on the SP and MP builds
-  (a64 and x86), but none of its builds or page tests have run. Before
-  handing it over: build, run the threaded page programs (x86 m64, SP,
-  a64), and run the w3 page legs.
+Branches, each commit with its tests:
 
-What is left, in order:
+- `l/l23`: L22e's `adoptThread` compat (6ec7edf4) and L23, the thread
+  table (33fbca4c). Battery green (x86-programs 206, SP, a64, wasm32, w3
+  vmreuse and hookpage, k legs, NT 47).
+- `l/l24` (in scratch/L/wt-l22e): L24, process end as a once (023181a8;
+  battery green on its builds, `exit-threads.c` added); L24b, the
+  diagnostics and image reads through `Home` and `ProcCell` (dbda41c4);
+  L25a, exit, exit_group, wait4 and reboot on the free path (758850dc).
+- `l/l25` (in scratch/L/wt-l25), on `l/l24`:
+  - L25b (52610378): a thread's clone and clone3 on the free path
+    (`ThreadMaker`), `gex_adopt_thread` lock-free;
+  - L25c (6ab6be24): adoption and vfork without the lock
+    (`with_own_host`: a process has one owner until it is published);
+  - L26 (0e7bea0f): NT's `lock_kernel` gone (`nt::NtKernel`);
+  - L25d (9a965996): a wasm32 program's install;
+  - L25e (3a4b7ba4, 937a4d59): ppc32's calls, clocks and ids on the free
+    path, with a twin-kernel ppc32 comparison test;
+  - L25f (a01ec204): an unknown call answered ENOSYS, a clock or id call
+    answered, on the free path; the census tests;
+  - L25g (64978f6b): the exec lock.
 
-- L24 (E, process end): exit as a once. A CAS on the exit status, then
-  `halt_code` checked at free-path entry and at the end of a park.
-  Teardown runs as the RCU writer of the descriptor table, and the
-  status is published last. Sites: `set_exit`, `exit_process`,
-  `gex_process_gone`, `exit_here`, `gex_abandon`, `gex_exit_code`, and
-  `end_if_all_exited`, which still takes the lock at a thread's exit
-  (Linux and NT).
-- L25 (lifecycle and F): clone, clone3, execve, exit, exit_group, wait4
-  and reboot off the locked path, and the adoptions with them:
-  - `gex_adopt_thread`, whose `set_current` and `bind_mine` reach
-    `sigs::bind(&mut Kernel)`;
-  - `gex_adopt_child` and the child's `gex_set_compat`;
-  - `gex_vfork_*`.
-  A process has a single owner until it is published.
-- L26 (H, NT): `lock_kernel`'s 16 callers become accessors.
-- Then delete `HOST`, `with_host`, `with_host_free` and `KLock`, and last
-  the native `Mutex<Kernel>` (§3.11).
+Left:
+
+- The native `Mutex<Kernel>` (§3.11). Natively the lock is the process's
+  `Mutex<Kernel>`, which every call still takes; the page's free path
+  runs the same gex-kernel code, so the native removal is the host's
+  side only.
 
 How each subsystem has been checked:
 
