@@ -35,6 +35,12 @@ pub enum Kind {
     /// Memory grown by someone other than the arena (std's `System`
     /// allocator): the arena steps over it.
     Foreign = 8,
+    /// The guest's, above the arena's cursor: a mapping placed at a fixed
+    /// address there (W3's compact space: KUSER_SHARED_DATA, an image at its
+    /// base), or one a forked child inherited. The guest's like `Guest`,
+    /// and the arena steps over it as over `Foreign`, rather than the cursor
+    /// jumping past it and everything between staying unused.
+    Island = 9,
 }
 
 impl Kind {
@@ -48,6 +54,7 @@ impl Kind {
             Kind::Stack => "worker stack",
             Kind::Tls => "worker tls",
             Kind::Foreign => "foreign",
+            Kind::Island => "guest island",
         }
     }
     fn from(v: u64) -> Kind {
@@ -59,6 +66,7 @@ impl Kind {
             5 => Kind::Heap,
             6 => Kind::Stack,
             7 => Kind::Tls,
+            9 => Kind::Island,
             _ => Kind::Foreign,
         }
     }
@@ -138,14 +146,24 @@ pub fn claim(kind: Kind, owner: u32, start: u64, end: u64, what: &'static str) {
     if end <= start {
         return;
     }
-    let tag = (kind as u64) << 32 | owner as u64;
     let _h = Held::take();
+    claim_locked(kind, owner, start, end, what);
+}
+
+impl Kind {
+    fn guests(self) -> bool {
+        matches!(self, Kind::Guest | Kind::Island)
+    }
+}
+
+fn claim_locked(kind: Kind, owner: u32, start: u64, end: u64, what: &'static str) {
+    let tag = (kind as u64) << 32 | owner as u64;
     let n = T.len.load(Ordering::Relaxed) as usize;
     for i in 0..n {
         let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
         if s < end && start < e {
             let other = T.tag[i].load(Ordering::Relaxed);
-            let ok = kind == Kind::Guest && Kind::from(other >> 32) == Kind::Guest;
+            let ok = kind.guests() && Kind::from(other >> 32).guests();
             if !ok {
                 say(format_args!(
                     "[gex] BUG: memory map overlap: {} {:#x}..{:#x} ({} of {}) overlaps {} {:#x}..{:#x} ({} of {})",
@@ -234,7 +252,7 @@ pub fn guest_only(start: u64, end: u64) -> Option<Vec<(u64, u64)>> {
     let n = T.len.load(Ordering::Relaxed) as usize;
     let mut out = vec![(start, end)];
     for i in 0..n {
-        if Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32) == Kind::Guest {
+        if Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32).guests() {
             continue;
         }
         let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
@@ -271,14 +289,55 @@ pub fn claim_fixed(heap_base: u64) {
     claim(Kind::Guest, 0, gex_abi::PLACE_BOTTOM, gex_abi::PLACE_TOP, "placement window (shared objects)");
 }
 
-/// The first `at' >= at` where `[at', at'+len)` overlaps no foreign region.
-pub fn skip_foreign(mut at: u64, len: u64) -> u64 {
+/// The first `at' >= at` where `[at', at'+len)` overlaps no foreign region
+/// and no island.
+pub fn skip_foreign(at: u64, len: u64) -> u64 {
     let _h = Held::take();
+    skip_locked(at, len)
+}
+
+/// Register `[start, end)` as an island, unless the arena's `cursor` has
+/// passed `start` (then the span below it may be the heap's, and the caller
+/// moves the cursor instead). Under the table's lock, as [`take_span`] is:
+/// a span is never handed out over an island registered while it was
+/// being chosen.
+pub fn claim_island(start: u64, end: u64, cursor: &AtomicU64, what: &'static str) -> bool {
+    let _h = Held::take();
+    // A full table checks nothing, and an island it does not hold is one
+    // the arena would not step over.
+    if cursor.load(Ordering::Acquire) > start || T.len.load(Ordering::Relaxed) as usize >= N {
+        return false;
+    }
+    claim_locked(Kind::Island, 0, start, end, what);
+    true
+}
+
+/// Whether `[start, end)` lies inside one island: the guest's already, a
+/// fixed mapping there needs nothing moved.
+pub fn within_island(start: u64, end: u64) -> bool {
+    let _h = Held::take();
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    (0..n).any(|i| {
+        Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32) == Kind::Island
+            && T.start[i].load(Ordering::Relaxed) <= start
+            && end <= T.end[i].load(Ordering::Relaxed)
+    })
+}
+
+/// Move the arena's `cursor` from `cur` to `at + len`, if `[at, at + len)`
+/// overlaps no foreign region or island and nobody moved it meanwhile.
+pub fn take_span(cursor: &AtomicU64, cur: u64, at: u64, len: u64) -> bool {
+    let _h = Held::take();
+    skip_locked(at, len) == at
+        && cursor.compare_exchange(cur, at + len, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+fn skip_locked(mut at: u64, len: u64) -> u64 {
     let n = T.len.load(Ordering::Relaxed) as usize;
     loop {
         let mut moved = false;
         for i in 0..n {
-            if Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32) != Kind::Foreign {
+            if !matches!(Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32), Kind::Foreign | Kind::Island) {
                 continue;
             }
             let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));

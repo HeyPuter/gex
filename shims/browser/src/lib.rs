@@ -2635,18 +2635,9 @@ fn arena_take(len: u64) -> Option<u64> {
     // and claims its own bytes. Any grow already done is harmless -- this memory
     // only ever grows, so a span reserved and then lost is just skipped.
     // Grown by someone else while this grew: look again.
-    if memmap::skip_foreign(at, len) != at {
-        return arena_take(len);
-    }
-    if ARENA_NEXT
-        .compare_exchange(
-            cur,
-            end,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
+    // The check and the move under the memory map's lock, which an island
+    // (`arena_back`) is registered under too.
+    if memmap::take_span(&ARENA_NEXT, cur, at, len) {
         Some(at)
     } else {
         arena_take(len)
@@ -2662,7 +2653,7 @@ fn arena_take(len: u64) -> Option<u64> {
 /// Answers where the cursor stood before, so the kernel can keep the bytes it
 /// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
 /// `None` when the memory would not grow.
-fn arena_back(end: u64) -> Option<u64> {
+fn arena_back(start: u64, end: u64) -> Option<u64> {
     // The high arena of a 64-bit memory (docs/mem64.md §3): the memory grows
     // to cover it (V8 commits lazily), but the low arena's cursor -- which
     // this module's heap also takes from, and whose addresses cross to JS as
@@ -10449,7 +10440,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
         // a restored process starts with only the fixed low layout.
-        arena_back(end)?;
+        arena_back(start, end)?;
         if from_file {
             let path = snap_read_str(raw, &mut p)?;
             let off = snap_read_u64(raw, &mut p)?;
