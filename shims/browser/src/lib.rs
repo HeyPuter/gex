@@ -7113,6 +7113,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             ));
         }
         h.kernel.enter_thread(&kstate);
+        // Whether this is a wasm32 program: `WASM32` says (cgen/wasmprog.rs
+        // sets it at the program's install, without the lock).
+        h.kernel.wasm32 = WASM32.load(std::sync::atomic::Ordering::Acquire);
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
         let nr = gm

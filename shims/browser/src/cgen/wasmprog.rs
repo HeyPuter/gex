@@ -253,15 +253,13 @@ fn named_slots<const N: usize>(wasm: &[u8], names: [&str; N]) -> Result<([Option
     Ok((slots, elems.len() as u32))
 }
 
-/// The program's path, with the kernel told the process is a wasm32 one
-/// (gex-kernel's wasm32 personality: signal frames stay in the context for
-/// the program's syscall stub).
+/// The program's path, as published at the load or exec, with the process
+/// marked a wasm32 one (gex-kernel's wasm32 personality: signal frames stay
+/// in the context for the program's syscall stub). `WASM32` is what says so;
+/// the kernel's own flag follows it at each locked call (`gex_syscall`).
 pub(super) fn exe_path() -> String {
-    crate::with_host(|h| {
-        h.kernel.wasm32 = true;
-        crate::WASM32.store(true, std::sync::atomic::Ordering::Release);
-        h.kernel.exe_path.clone()
-    })
+    crate::WASM32.store(true, std::sync::atomic::Ordering::Release);
+    crate::sigs::proc_home().exe()
 }
 
 /// The bridges for a program's entries (`__gex_start`, `__gex_thread_start`,
