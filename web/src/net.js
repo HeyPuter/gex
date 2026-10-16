@@ -1,7 +1,7 @@
 // The guest's network, carried over Wisp: a page cannot open a TCP connection,
 // so `@mercuryworkshop/wisp-js` multiplexes streams down one WebSocket to a
 // proxy that can. This adds the shape the shim asks for: integer stream ids, a
-// receive buffer per stream, and seven calls that never wait -- they must not,
+// receive buffer per stream, and calls that never wait -- they must not,
 // because the page's event loop is what delivers the bytes the parked guest is
 // waiting on.
 
@@ -25,6 +25,9 @@ class Stream {
     this.chunks = [];
     this.buffered = 0;
     this.wisp = null;
+    // Descriptors holding the stream, across processes (`dup`): closed when
+    // the last lets go, as a socket outlives one of its descriptors.
+    this.refs = 1;
   }
 
   take(out) {
@@ -37,6 +40,18 @@ class Stream {
       if (n === head.length) this.chunks.shift();
       else this.chunks[0] = head.subarray(n);
       this.buffered -= n;
+    }
+    return at;
+  }
+
+  /** `take` without taking: what is queued, left queued (`recv(MSG_PEEK)`). */
+  peek(out) {
+    let at = 0;
+    for (const c of this.chunks) {
+      if (at >= out.length) break;
+      const n = Math.min(out.length - at, c.length);
+      out.set(c.subarray(0, n), at);
+      at += n;
     }
     return at;
   }
@@ -236,15 +251,36 @@ export class WispNetwork {
     return s.take(out);
   }
 
+  /** `recv`, leaving the bytes queued. Wine's wineserver asks it of every
+   *  readable stream socket (one byte, MSG_PEEK), to tell data from the far
+   *  end having closed. */
+  peek(id, out) {
+    const s = this.#streams.get(id);
+    if (!s) return 0;
+    if (!s.chunks.length) return s.state === CLOSED || s.state === REFUSED ? 0 : -1;
+    return s.peek(out);
+  }
+
   available(id) {
     const s = this.#streams.get(id);
     if (!s) return true;
     return s.chunks.length > 0 || s.state === CLOSED || s.state === REFUSED;
   }
 
+  /** Another holder of a stream (a descriptor passed to another process:
+   *  SCM_RIGHTS, a fork): `close` then lets go of one hold, and only the last
+   *  ends the stream. 1 if the stream exists, else 0. */
+  dup(id) {
+    const s = this.#streams.get(id);
+    if (!s) return 0;
+    s.refs++;
+    return 1;
+  }
+
   close(id) {
     const s = this.#streams.get(id);
     if (!s) return;
+    if (--s.refs > 0) return;
     try {
       s.wisp?.close();
     } catch {
