@@ -520,7 +520,9 @@ Left:
 - The native `Mutex<Kernel>` (§3.11). Natively the lock is the process's
   `Mutex<Kernel>`, which every call still takes; the page's free path
   runs the same gex-kernel code, so the native removal is the host's
-  side only.
+  side only. Not started: the browser is the performance target and the
+  native host is a debugging tool (the user's direction), so it waits until
+  someone asks for native thread scaling.
 
 How each subsystem has been checked:
 
