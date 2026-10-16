@@ -9588,7 +9588,14 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // never allocates there; see `arena_take`) -- less anything the runtime
     // owns, by the memory map's own record.
     let mut dead: Vec<(u64, u64)> = h.kernel.mem.lock().arena_spans().to_vec();
-    let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    let mut inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    // W3's compact space: the shim's heap does allocate there, between the
+    // inherited regions, and above its cursor is what it will take next --
+    // not dead, whatever was inherited above it (KUSER_SHARED_DATA at 2 GiB).
+    // Below the cursor everything is claimed, so `guest_only` sorts it.
+    if nt::w3_compact() {
+        inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
+    }
     if inherited > gex_abi::ARENA_BOTTOM {
         dead.push((gex_abi::ARENA_BOTTOM, inherited));
     }
