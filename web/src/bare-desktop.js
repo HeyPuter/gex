@@ -133,6 +133,8 @@ export function bareDesktop(desktop, mount) {
         return `${w.key} role=${w.role} ${w.width}x${w.height}@${p.x},${p.y} serial=${w.serial} "${w.title ?? ''}"`;
       }),
       titles: tops.map((w) => w.title || '(untitled)'),
+      // where keys go: a key that reaches no window was sent while this was null
+      focus: desktop.focused?.()?.key ?? null,
       popups: wins.filter((w) => w.role === ROLE_POPUP).length,
       lit,
       hash,

@@ -477,6 +477,11 @@ export class DomDesktop {
     return [...this.#windows.values()];
   }
 
+  /** The window keys go to (null: none), for a harness. */
+  focused() {
+    return this.#focus;
+  }
+
   // -- the frame ----------------------------------------------------------
 
   #frame() {
