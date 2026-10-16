@@ -32,7 +32,7 @@
 
 use gex_kernel::ftab::{Event, FuncMap, Tier};
 use gex_kernel::GuestMem;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) mod elfprov;
@@ -219,12 +219,159 @@ static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::n
 static FTAB: Mutex<Option<FuncMap>> = Mutex::new(None);
 
 fn ftab<R>(f: impl FnOnce(&mut FuncMap) -> R) -> R {
-    f(lock(&FTAB).get_or_insert_with(FuncMap::new))
+    let mut g = lock(&FTAB);
+    let m = g.get_or_insert_with(FuncMap::new);
+    let r = f(m);
+    FTAB_SIZE.store(m.size(), SeqCst);
+    r
+}
+
+/// [`FuncMap::size`] as of the last change, read without the lock: what a
+/// Worker's `WebAssembly.Table` must reach before its code reads an index
+/// out of the probe cache.
+static FTAB_SIZE: AtomicU32 = AtomicU32::new(0);
+
+// ---- Which indices the probe cache may hold (X's B16) ----
+//
+// The probe cache (`gex_abi::FCACHE`) is process-wide, and compiled code
+// (units, providers, winepe.wasm) calls an index it finds there straight
+// through its own Worker's `WebAssembly.Table`, with no `lookup` to catch
+// that Worker up first. Each Worker grows its table only when it catches up
+// (`#cgenGrow`, with room over), so a thread that last caught up before
+// another thread installed a large unit read the new index as a hit and
+// called past its table's end ("table index is out of bounds":
+// StructuredQuery.dll's DllMain through winepe in the Win7 shell's Computer
+// window, tests/w3/ftabstale.sh). So every Worker that may be running guest
+// code says how long its table is, and an index goes into the cache only
+// when every one of their tables holds it; otherwise the cache slot stays
+// resolve and the call comes through `lookup`, which catches the caller up.
+// A Worker waiting out a blocking call (`schedule` gave the stack back) is
+// not counted: on its way back to guest code it is marked again, then grown
+// if short (`ftab_resume`), in that order, so a publisher either counts it
+// or it sees the publisher's index in `FTAB_SIZE`.
+
+/// The registry's slots: [`SLOT_CLAIMED`] | [`SLOT_IN`] | the table length;
+/// 0 is free. One per Worker with a function table, freed when its thread
+/// is over (a Worker that runs another thread claims one again).
+const FTAB_SLOTS: usize = 1024;
+static FTAB_LENS: [AtomicU64; FTAB_SLOTS] = [const { AtomicU64::new(0) }; FTAB_SLOTS];
+/// One past the highest slot ever claimed (the scan's end).
+static FTAB_HIGH: AtomicUsize = AtomicUsize::new(0);
+/// A Worker found no free slot: nothing is cached from then on.
+static FTAB_FULL: AtomicBool = AtomicBool::new(false);
+const SLOT_CLAIMED: u64 = 1 << 40;
+const SLOT_IN: u64 = 1 << 32;
+const NO_SLOT: usize = usize::MAX;
+
+/// The shortest table among the Workers that may be running guest code:
+/// an index below it is safe in the probe cache.
+fn ftab_safe_len() -> u32 {
+    if FTAB_FULL.load(SeqCst) {
+        return 0;
+    }
+    let high = FTAB_HIGH.load(SeqCst).min(FTAB_SLOTS);
+    FTAB_LENS[..high].iter().fold(u32::MAX, |m, s| {
+        let v = s.load(SeqCst);
+        if v & SLOT_CLAIMED != 0 && v & SLOT_IN != 0 { m.min(v as u32) } else { m }
+    })
+}
+
+/// Write `addr → idx` into the probe cache if every running Worker's table
+/// holds `idx`; otherwise leave the slot to resolve (clearing it if it named
+/// `addr`).
+fn fcache_publish(mem: &mut [u8], addr: u64, idx: u32) {
+    if idx < ftab_safe_len() {
+        gex_kernel::ftab::fcache_write(mem, addr, idx);
+    } else {
+        gex_kernel::ftab::fcache_clear(mem, addr);
+    }
+}
+
+#[link(wasm_import_module = "gex_env")]
+extern "C" {
+    /// Grow this Worker's function table past the process's size, with its
+    /// room over (`#cgenGrowIfShort`), which reports it (`gex_ftab_enter`).
+    fn ftab_grow();
+}
+
+/// JS: this Worker's function table is `len` long and its guest code may
+/// run. Returns the process's table size: if it is past `len`, JS grows
+/// again (another Worker allocated meanwhile).
+#[no_mangle]
+pub extern "C" fn gex_ftab_enter(len: u32) -> u32 {
+    HAS_FTAB.with(|c| c.set(true));
+    let mut slot = MY_FTAB_SLOT.with(|c| c.get());
+    if slot == NO_SLOT {
+        slot = FTAB_LENS.iter().position(|s| s.compare_exchange(0, SLOT_CLAIMED | SLOT_IN | len as u64, SeqCst, SeqCst).is_ok()).unwrap_or(NO_SLOT);
+        if slot == NO_SLOT {
+            FTAB_FULL.store(true, SeqCst);
+        } else {
+            FTAB_HIGH.fetch_max(slot + 1, SeqCst);
+            MY_FTAB_SLOT.with(|c| c.set(slot));
+        }
+    }
+    if slot != NO_SLOT {
+        FTAB_LENS[slot].store(SLOT_CLAIMED | SLOT_IN | len as u64, SeqCst);
+    }
+    FTAB_SIZE.load(SeqCst)
+}
+
+/// `schedule` gave the stack back: this Worker runs no guest code until it
+/// resumes (`ftab_resume`), and none at all if its thread is over.
+pub(crate) fn ftab_out(thread_over: bool) {
+    let slot = MY_FTAB_SLOT.with(|c| c.get());
+    if slot == NO_SLOT {
+        return;
+    }
+    if thread_over {
+        FTAB_LENS[slot].store(0, SeqCst);
+        MY_FTAB_SLOT.with(|c| c.set(NO_SLOT));
+    } else {
+        FTAB_LENS[slot].fetch_and(!SLOT_IN, SeqCst);
+    }
+}
+
+/// Before this Worker's guest code runs again (`schedule` resumed it, or a
+/// system call returns): counted as running, then grown if another Worker
+/// allocated past its table meanwhile. On the way back from a system call
+/// this also covers a thread that keeps running: each grow leaves room
+/// over (`FTAB_SPARE_THREADED`).
+pub(crate) fn ftab_resume() {
+    if !HAS_FTAB.with(|c| c.get()) {
+        // No table in this Worker (no unit, provider or native module).
+        return;
+    }
+    let slot = MY_FTAB_SLOT.with(|c| c.get());
+    let short = if slot == NO_SLOT {
+        true
+    } else {
+        let v = FTAB_LENS[slot].fetch_or(SLOT_IN, SeqCst);
+        FTAB_SIZE.load(SeqCst) > v as u32
+    };
+    if short {
+        // SAFETY: a host import without arguments; no lock is held.
+        unsafe { ftab_grow() };
+    }
+}
+
+/// A fork's child or an `execve`'s new program (with the probe cache's
+/// reset): the copied registry names the old process's Workers.
+pub(crate) fn ftab_registry_reset() {
+    for s in &FTAB_LENS {
+        s.store(0, SeqCst);
+    }
+    FTAB_HIGH.store(0, SeqCst);
+    FTAB_FULL.store(false, SeqCst);
+    MY_FTAB_SLOT.with(|c| c.set(NO_SLOT));
 }
 
 thread_local! {
     /// How far through the function table's log this Worker is.
     static HAVE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// This Worker's slot in `FTAB_LENS`, or `NO_SLOT`.
+    static MY_FTAB_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(NO_SLOT) };
+    /// This Worker has a function table (`gex_ftab_enter` was called).
+    static HAS_FTAB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1438,7 +1585,7 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         // holds the retired body would find itself in the slot when the body
         // sees its page patched and leaves through the cache -- calling
         // itself forever (explorer's uxtheme.dll DllMain, reloaded).
-        gex_kernel::ftab::fcache_write(mem, addr, f.idx);
+        fcache_publish(mem, addr, f.idx);
         Some(f.idx)
     });
     // An ejected project's training run (`run.mjs --record-entries`): an
@@ -1453,7 +1600,7 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
     if !served {
-        gex_kernel::ftab::fcache_write(mem, addr, idx);
+        fcache_publish(mem, addr, idx);
     }
     if libprov::any_registered() {
         LOOKUP_RING.with(|r| {

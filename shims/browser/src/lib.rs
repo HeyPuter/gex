@@ -6940,8 +6940,15 @@ fn count_syscall(nr: u64, ctx: u64) {
 /// `svc #0`. Returns normally when the guest carries straight on (almost every
 /// syscall); a redirect or exit traps out to JS, the way the native host
 /// unwinds out of wasm, since there is no other way to abandon the stack.
+/// On the way back this Worker's function table is grown if another Worker
+/// allocated past it meanwhile (`cgen::ftab_resume`, X's B16).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    syscall_entry(ctx, pc);
+    cgen::ftab_resume();
+}
+
+fn syscall_entry(ctx: i32, pc: i64) {
     // A recording of which unit functions ran (`?covrec=1`): reported now and then.
     // A Windows process's every syscall is an NT call, made before the kernel
     // is taken: the NT layer takes it itself, briefly, and blocks without it.
@@ -9184,6 +9191,7 @@ pub extern "C" fn gex_adopt_child(
     dense::child();
     // So is the probe cache, which names the parent's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
+    cgen::ftab_registry_reset();
     // Built from the module's `gex.meta`, as `gex_load` does: an empty
     // table would report "nothing to translate" almost at once, since `fork`
     // returns into libc. A fresh one, not the parent's copied in the image.
@@ -9611,6 +9619,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     }
     // The probe cache names the old program's table indices.
     gex_kernel::ftab::fcache_reset(guest_bytes());
+    cgen::ftab_registry_reset();
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
@@ -11473,8 +11482,20 @@ fn wait_why(r: &Run) -> u8 {
 
 /// Choose the next guest thread to run, and finish whatever syscall it was in
 /// the middle of. It no longer chooses between *processes*: there is one per
-/// Worker, and the others run elsewhere.
+/// Worker, and the others run elsewhere. Handing the stack back, this
+/// Worker stops counting for the probe cache's indices; resuming, it counts
+/// again and is grown first (`cgen::ftab_out`, `cgen::ftab_resume`).
 fn schedule() -> i32 {
+    let r = schedule_turn();
+    if r == 1 {
+        cgen::ftab_resume();
+    } else {
+        cgen::ftab_out(SCHED_OVER.with(|c| c.get()));
+    }
+    r
+}
+
+fn schedule_turn() -> i32 {
     // What this Worker's wait slot read *before* anything was asked about
     // what is runnable, so that a notify arriving while this makes up its
     // mind cannot be slept through: `gex_park` sleeps only while the slot
