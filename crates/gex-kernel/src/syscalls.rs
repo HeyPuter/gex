@@ -10806,8 +10806,100 @@ mod tests {
         assert_eq!(locked, vec![nr::CLONE, nr::EXECVE], "{names:?}");
     }
 
+    /// A ppc32 process's calls (L25e): each made by the full call in one
+    /// kernel and by the free path in a twin, from the same memory, answer
+    /// alike: the same result and the same memory after. Raw ppc32 numbers
+    /// and layouts, so the translation is the one under test.
+    #[test]
+    fn ppc_calls_answer_on_the_free_path_as_the_kernel_does() {
+        if !gex_abi::PPC {
+            return;
+        }
+        use crate::ppc::raw as p;
+        fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
+            let call = free_class(m, at, true)?;
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+            Some(free_call(&f, m, at, call))
+        }
+        let twin = || {
+            let (buf, mut k) = setup();
+            k.compat = true;
+            (buf, k)
+        };
+        let (mut ba, mut ka) = twin();
+        let (mut bb, mut kb) = twin();
+        let at = ka.ctx_addr;
+        let (path, data, buf, aux) = (0x20000u64, 0x20100u64, 0x21000u64, 0x22000u64);
+        for b in [&mut ba, &mut bb] {
+            let mut m = GuestMem::new(b);
+            put_str(&mut m, path, "/f");
+            m.write(data, b"hello").unwrap();
+            put_str(&mut m, data + 0x40, "/d");
+            // A signal set (sigset_t, 8 bytes) and a sigaction.
+            m.write_u64(aux, 1 << 9).unwrap();
+            m.write_u32(aux + 0x100, 1).unwrap();
+        }
+        let calls: Vec<(u64, [u64; 6])> = vec![
+            (p::OPEN, [path, 0o102, 0o644, 0, 0, 0]),
+            (p::WRITE, [3, data, 5, 0, 0, 0]),
+            (p::LSEEK, [3, 1, 0, 0, 0, 0]),
+            (p::READ, [3, buf, 16, 0, 0, 0]),
+            (p::_LLSEEK, [3, 0, 2, buf + 0x40, 0, 0]),
+            (p::PREAD64, [3, buf + 0x80, 4, 0, 0, 1]),
+            (p::FCNTL64, [3, 3, 0, 0, 0, 0]),
+            (p::FCNTL, [3, 1, 0, 0, 0, 0]),
+            (p::FSTAT64, [3, buf + 0x100, 0, 0, 0, 0]),
+            (p::STAT64, [path, buf + 0x200, 0, 0, 0, 0]),
+            (p::STAT64, [data + 0x40, buf + 0x300, 0, 0, 0, 0]),
+            (p::MKDIR, [data + 0x40, 0o755, 0, 0, 0, 0]),
+            (p::CHDIR, [data + 0x40, 0, 0, 0, 0, 0]),
+            (p::GETCWD, [buf + 0x400, 64, 0, 0, 0, 0]),
+            (p::DUP, [3, 0, 0, 0, 0, 0]),
+            (p::CLOSE, [4, 0, 0, 0, 0, 0]),
+            (p::CLOSE, [99, 0, 0, 0, 0, 0]),
+            (p::PIPE2, [buf + 0x500, 0, 0, 0, 0, 0]),
+            (p::EVENTFD2, [3, 0, 0, 0, 0, 0]),
+            (p::GETPPID, [0; 6]),
+            (p::GETUID, [0; 6]),
+            (p::UNAME, [buf + 0x600, 0, 0, 0, 0, 0]),
+            (p::RT_SIGPROCMASK, [0, aux, buf + 0x800, 8, 0, 0]),
+            (p::RT_SIGPROCMASK, [2, 0, buf + 0x808, 8, 0, 0]),
+            (p::RT_SIGACTION, [10, aux + 0x100, buf + 0x900, 8, 0, 0]),
+            (p::SIGALTSTACK, [0, buf + 0xa00, 0, 0, 0, 0]),
+            (p::SCHED_GETAFFINITY, [0, 128, buf + 0xb00, 0, 0, 0]),
+            (p::SET_TID_ADDRESS, [aux + 0x200, 0, 0, 0, 0, 0]),
+            (p::FUTEX, [aux + 0x300, 1, 1, 0, 0, 0]),
+            (p::UNSHARE, [0x400, 0, 0, 0, 0, 0]),
+            (p::UNSHARE, [0, 0, 0, 0, 0, 0]),
+            (p::KILL, [ka.pid as u64, 0, 0, 0, 0, 0]),
+            (p::MMAP, [0, 0x1000, 3, 0x22, !0u32 as u64, 0]),
+            (p::IOCTL, [3, 0x4004_667f, buf + 0xc00, 0, 0, 0]),
+        ];
+        for (n, a) in calls {
+            let mut ma = GuestMem::new(&mut ba);
+            let mut mb = GuestMem::new(&mut bb);
+            for m in [&mut ma, &mut mb] {
+                m.write_u64(at + ctx::SYSCALL_NR as u64, n).unwrap();
+                for (i, v) in a.iter().enumerate() {
+                    m.write_u64(at + ctx::SYSCALL_ARGS[i] as u64, *v).unwrap();
+                }
+            }
+            ka.syscall(&mut ma, 0);
+            let o = free(&kb, &mut mb, at);
+            assert!(matches!(o, Some(FreeOutcome::Done(Delivery::None))), "ppc call {n} on the free path");
+            assert_eq!(ret(&mb, at), ret(&ma, at), "ppc call {n} {a:x?}: result");
+            assert!(ma.read(0x20000, 0x20000).unwrap() == mb.read(0x20000, 0x20000).unwrap(), "ppc call {n} {a:x?}: memory");
+        }
+    }
+
     #[test]
     fn free_quiet_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -10876,6 +10968,11 @@ mod tests {
     /// (a stat's owner), and a fork's ids are its own.
     #[test]
     fn free_cred_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11058,6 +11155,11 @@ mod tests {
     /// own. `unshare(CLONE_FS)` gives the caller a fs_struct of its own.
     #[test]
     fn thread_own_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
         k.enter_thread(&main);
@@ -11210,6 +11312,11 @@ mod tests {
     /// is EINVAL both ways.
     #[test]
     fn thread_clone_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         use std::sync::atomic::Ordering::SeqCst;
         let (mut buf, mut k) = setup();
         let main = ThreadState::new(k.ctx_addr, k.tid);
@@ -11551,6 +11658,11 @@ mod tests {
 
     #[test]
     fn free_fd_object_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11656,6 +11768,11 @@ mod tests {
 
     #[test]
     fn free_fd_misc_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11776,6 +11893,11 @@ mod tests {
 
     #[test]
     fn free_own_state_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -11867,6 +11989,11 @@ mod tests {
 
     #[test]
     fn free_call_answers_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -12045,6 +12172,11 @@ mod tests {
     /// or answer as the full call (docs/kernel-locking.md §5.2 step 5).
     #[test]
     fn free_sleep_answers_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         let (mut buf, mut k) = setup();
         let at = k.ctx_addr;
         let mut m = GuestMem::new(&mut buf);
@@ -13368,6 +13500,11 @@ mod tests {
     /// kernels, the same calls, one through each path.
     #[test]
     fn free_mapping_calls_answer_as_the_kernel_does() {
+        // Its data is in the AArch64 layouts, little-endian; ppc32's free
+        // path is `ppc_calls_answer_on_the_free_path_as_the_kernel_does`'s.
+        if gex_abi::PPC {
+            return;
+        }
         use crate::mem::{flags as mf, prot};
         let anon = mf::PRIVATE | mf::ANONYMOUS | mf::FIXED;
         let mut seen = Vec::new();
