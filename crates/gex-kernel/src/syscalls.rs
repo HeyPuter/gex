@@ -5595,9 +5595,9 @@ fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
     let n = crate::ppc::canonical_number(raw);
     let admitted = match n {
         crate::ppc::UNKNOWN => false,
-        // ppc32 has `alarm`, which the canonical (AArch64) numbering leaves
-        // out of its class.
-        nr::ALARM => true,
+        // ppc32 has `alarm` and `dup2`, which the canonical (AArch64)
+        // numbering leaves out of its classes.
+        nr::ALARM | nr::DUP2 => true,
         n => free_number(n, false) == Some(n) || is_quiet(n, true),
     };
     if !admitted {
@@ -10944,6 +10944,10 @@ mod tests {
             (p::GETCWD, [buf + 0x400, 64, 0, 0, 0, 0]),
             (p::DUP, [3, 0, 0, 0, 0, 0]),
             (p::CLOSE, [4, 0, 0, 0, 0, 0]),
+            (p::DUP2, [3, 9, 0, 0, 0, 0]),
+            (p::DUP2, [3, 3, 0, 0, 0, 0]),
+            (p::DUP2, [77, 9, 0, 0, 0, 0]),
+            (p::ALARM, [0, 0, 0, 0, 0, 0]),
             (p::CLOSE, [99, 0, 0, 0, 0, 0]),
             (p::PIPE2, [buf + 0x500, 0, 0, 0, 0, 0]),
             (p::EVENTFD2, [3, 0, 0, 0, 0, 0]),
