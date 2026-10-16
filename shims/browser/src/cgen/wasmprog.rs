@@ -171,6 +171,9 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
             crate::w3_address_space(&mut mm, lo);
+            if flags & FLAG_GUEST_X86_64 != 0 {
+                crate::w64_reserve_pe_data(&mut mm);
+            }
             mm.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]");
         }
     }

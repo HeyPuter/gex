@@ -17,7 +17,8 @@
 // --mem64: a 64-bit guest memory (the wasm64 shim, `?mem64=1`; docs/unity-dotnet.md P5).
 // --lazy DIR: every file under DIR the bundle lacks, at /game/REL, read from the
 // page's server as the game reads it (a megabyte at a time; `?lazy=`), not bundled.
-// The input script's `move X Y` / `click X Y` are in the game window's pixels.
+// The input script's `move X Y` / `click X Y` are in the game window's pixels;
+// `button CODE 1|0` presses or releases a mouse button there.
 // --pins FILE: load addresses for libraries, `BASE SPAN PATH` per line (hex; `gexc run --pin`'s
 // format), added to the query's `pins=`: units built for those bases (`elfunits=`) then keep
 // applying when an unrelated change moves where the loader would have put them.
@@ -117,7 +118,20 @@ function bundle() {
   }
   const top = ['game', 'gex', 'home', 'tmp', ...new Set(files.map((f) => f.split('/')[1]))];
   mkdirSync(dirname(out), { recursive: true });
-  execFileSync('tar', ['-chf', out, '-C', stage, ...new Set(top)]);
+  // Links are followed (the stage is links), except a Wine prefix's
+  // dosdevices (z: is /), which go in as links.
+  const dosdevs = [];
+  const findDos = (rel, depth) => {
+    if (depth > 3) return;
+    for (const e of readdirSync(join(stage, rel), { withFileTypes: true })) {
+      const r = `${rel}/${e.name}`;
+      if (e.name === 'dosdevices') dosdevs.push(r);
+      else if (statSync(join(stage, r)).isDirectory()) findDos(r, depth + 1);
+    }
+  };
+  findDos('game', 0);
+  execFileSync('tar', ['-chf', out, ...dosdevs.map((d) => `--exclude=${d}`), '-C', stage, ...new Set(top)]);
+  if (dosdevs.length) execFileSync('tar', ['-rf', out, '-C', stage, ...dosdevs]);
   log(`bundle ${out}: ${(statSync(out).size / 1048576).toFixed(0)} MiB`);
   return out;
 }
@@ -175,6 +189,9 @@ function script() {
     if (w[1] === 'tap') { events.push([t, w[2], 'keydown'], [t + 0.1, w[2], 'keyup']); }
     else if (w[1] === 'key') events.push([t, w[2], w[3] === '1' ? 'keydown' : 'keyup']);
     else if (w[1] === 'move' || w[1] === 'click') events.push([t, `${w[2]},${w[3]}`, w[1]]);
+    // `button CODE 1|0`: a press or release (Linux's BTN_LEFT 272, BTN_RIGHT 273,
+    // BTN_MIDDLE 274) where the pointer is, as the native compositor's scripts hold them
+    else if (w[1] === 'button') events.push([t, w[2], w[3] === '1' ? 'press' : 'release']);
   }
   events.sort((a, b) => a[0] - b[0]);
   return { after, events };
@@ -229,12 +246,19 @@ async function main() {
     `(() => { for (const t of document.querySelectorAll('canvas')) t.dispatchEvent(new KeyboardEvent(${JSON.stringify(type)}, { code: ${JSON.stringify(c)}, key: ${JSON.stringify(c)}, bubbles: true })); return 1; })()`, true);
   // The game window's place on the page: the compositor's toplevel
   // (`role=1 WxH@X,Y`), the canvas at the page's origin (as browser-gui.mjs).
+  let at0 = { x: 0, y: 0 };
+  const button = async (type, c) => {
+    const b = { 272: 'left', 273: 'right', 274: 'middle' }[c] ?? 'left';
+    const bits = { left: 1, right: 2, middle: 4 }[b];
+    await browser.send('Input.dispatchMouseEvent', { type: type === 'press' ? 'mousePressed' : 'mouseReleased', ...at0, button: b, clickCount: 1, buttons: type === 'press' ? bits : 0 }, page);
+  };
   const pointer = async (type, xy) => {
     const [x, y] = xy.split(',').map(Number);
     const d = (await evaluate('globalThis.__gexCompositor?.describe()', true)) ?? {};
     const m = /role=1 (\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(JSON.stringify(d));
     const [ox, oy] = m ? [Number(m[3]), Number(m[4])] : [0, 0];
     const at = { x: ox + x, y: oy + y };
+    at0 = at;
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...at, button: 'none', buttons: 0 }, page);
     if (type === 'click') {
       await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', ...at, button: 'left', clickCount: 1, buttons: 1 }, page);
@@ -280,6 +304,7 @@ async function main() {
     while (start && next < events.length && Date.now() - start >= events[next][0] * 1000) {
       const [t, k, type] = events[next++];
       if (type === 'move' || type === 'click') await pointer(type, k);
+      else if (type === 'press' || type === 'release') await button(type, k);
       else await key(code(k), type);
       log(`input at ${t} s: ${type} ${k} (present ${n})`);
     }

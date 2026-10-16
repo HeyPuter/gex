@@ -287,8 +287,12 @@ pub(crate) fn rebridge(pc: u64) -> bool {
                 1
             }
         };
-        if gex_kernel::ftab::rebridge_gives_up(pc, n) {
-            crate::warn_line(&format!("gex: provider address {pc:#x} keeps losing its bridge; leaving it to tier-1\n"));
+        // Never for a native Wine DLL's skeleton: its code is `ud2` stubs,
+        // and tier-1 there raised c000001d (W64's rpcss and services in the
+        // page, Dicey Dungeons' boot).
+        if gex_kernel::ftab::rebridge_gives_up(pc, n) && !super::wasmdll::in_skeleton(pc) {
+            let vma = crate::sigs::proc_home().mm().lock().vmas().iter().find(|v| pc >= v.start && pc < v.end).map(|v| format!(" ({:#x}..{:#x} {})", v.start, v.end, v.name)).unwrap_or_default();
+            crate::warn_line(&format!("gex: provider address {pc:#x}{vma} keeps losing its bridge; leaving it to tier-1\n"));
             return false;
         }
         if n > REBRIDGE_LIMIT {

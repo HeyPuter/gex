@@ -3873,7 +3873,11 @@ export class Gex {
     // A wasm32 program built LP64 for wasm64 and lowered the same way (W64,
     // docs/wine-native-x64.md), told apart by its __memory_base import's type.
     const progLowered = wasmprog && !!e.gex_cgen_pmod_lowered?.(prov);
-    const lowered = (libprov || progLowered) && !m64();
+    // Wine's PE module in a W64 process (the native PE core, winepe.wasm,
+    // W64.2): built LP64 and lowered as its program was, so i64 globals and
+    // stack pointer. A Worker installs its program before any PE module.
+    const dllLowered = wasmdll && !wasmprog && !libprov && this.#wasmprogWide && !m64();
+    const lowered = (libprov || progLowered || dllLowered) && !m64();
     const w64 = m64() || lowered;
     if (wasmprog) this.#wasmprogWide = m64() || progLowered;
     // A wasm32 program's module, and Wine's PE module, is keyed by its bytes
@@ -3935,7 +3939,7 @@ export class Gex {
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
         // and its shared libraries share it (one per thread, as natively).
-        __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack())
+        __stack_pointer: memBase && !wasmprog ? (libprov || dllLowered ? this.#providerStack64() : this.#providerStack())
           : wasmprog ? this.#wasmprogStack()
           : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
         // clang's three names for a C main: Wine's crt_main references all

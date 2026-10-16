@@ -36,9 +36,9 @@
 # Node): mp the default build (SharedArrayBuffer), sp the single-thread one
 # (GEX_SINGLE=1, no SharedArrayBuffer, JSPI). It needs the x86 shared shim
 # and seed in web/public/gex (GEX_ARCH=x86 shims/browser/build.sh), and
-# runs on a page prefix template made from PREFIX (page-prefix.sh). Not
-# with NATIVE or NTDLL, whose DIST is links (a page mount does not follow
-# a link out of it), nor with WL or GL.
+# runs on a page prefix template made from PREFIX (page-prefix.sh). With
+# NATIVE or NTDLL the overlay is hard links (a page mount does not follow
+# a link out of it). Not with WL or GL.
 set -u
 # Output is compared with the native run: not even gex's default lines (log.mjs).
 export GEX_LOG=${GEX_LOG:-off}
@@ -58,7 +58,7 @@ tag=W64
 page=${PAGE:-}
 if [ -n "$page" ]; then
 	case $page in mp|sp) ;; *) echo "PAGE is mp or sp" >&2; exit 2 ;; esac
-	[ -z "${NTDLL:-}${NATIVE:-}${GL:-}" ] || { echo "PAGE runs without NATIVE, NTDLL and GL" >&2; exit 2; }
+	[ -z "${GL:-}" ] || { echo "PAGE runs without GL" >&2; exit 2; }
 	seed=$root/web/public/gex/seed.x86.shared.wasm
 	[ -f "$seed" ] && [ -f "$root/web/public/gex/gex_browser.x86.shared.wasm" ] ||
 		{ echo "no x86 shared shim and seed in web/public/gex; GEX_ARCH=x86 shims/browser/build.sh" >&2; exit 2; }
@@ -78,8 +78,14 @@ if [ -n "${NTDLL:-}${NATIVE:-}" ]; then
 	[ -z "${NATIVE:-}" ] || [ -f "$NATIVE/winepe.wasm" ] || { echo "no winepe.wasm in $NATIVE" >&2; exit 2; }
 	o=$w/dist; rm -rf "$o"; mkdir -p "$o/lib/wine/x86_64-windows"
 	cp -a "$dist/lib/wine/x86_64-unix" "$o/lib/wine/"
-	ln -s "$dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
-	for f in "$dist"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
+	if [ -n "$page" ]; then
+		# the page's mount does not follow a link out of it: hard links
+		cp -al "$dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
+		cp -al "$dist"/lib/wine/x86_64-windows/. "$o/lib/wine/x86_64-windows/"
+	else
+		ln -s "$dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
+		for f in "$dist"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
+	fi
 	if [ -n "${NTDLL:-}" ]; then
 		rm "$o/lib/wine/x86_64-windows/ntdll.dll"; cp "$NTDLL" "$o/lib/wine/x86_64-windows/ntdll.dll"
 		tag="W64 native ntdll"

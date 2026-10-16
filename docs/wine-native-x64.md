@@ -463,7 +463,12 @@ section-alias fix af2068f56c1, cherry-picked).
   10, plus dll) but mtx, which takes longer than nt-x64.sh's default
   300 s, door or not.
 - job_wine64_page can now take sync too:
-  `CASES="hello_args sync crtmem apc tls cxx exitproc seh seh-traps"`.
+  `CASES="hello_args sync crtmem apc tls cxx exitproc seh seh-traps"`,
+  and a leg on the native PE core (w64/page-dicey): the same with
+  `NATIVE=$W64_NATIVE`.
+- Branches: w64/sync-varargs (the livelock and highdata), then
+  w64/page-dicey on it (the native PE core in the page, Dicey Dungeons).
+  Both need musl-w64 d18ccf68 and Wine 4743fd9760e.
 
 **Fixed: the sync livelock in the page was a varargs bug.** A wasm64
 variadic argument takes its own type's size: an `int` fills 4 bytes, a
@@ -502,13 +507,56 @@ than 2 GiB of guest data in the page needs the memory64 page (W64.7:
 wine.64.wasm unlowered, the M64 shim). nt-x64.sh now prints `skip
 x64/highdata` in PAGE mode.
 
-**Next goal: Dicey Dungeons in the page**, to its title menu, with
-screenshots (natively it reaches the menu: tests/games/dicey-w64.wl,
-docs/games.md). In PAGE mode nt-x64.sh still skips the display and GL
-cases (WL and GL): they need the page's compositor and GL. That
-needs a GPU, so it runs on edger through bench.sh (BENCH_HOST=edger,
-BENCH_TIMEOUT), never worldmachine while the user's builds are there.
-The game files are private.
+**Done: Dicey Dungeons in the page, to its title menu** (2026-10-16,
+gooner, headless Chromium with software WebGPU; correctness only, no
+timing). The game's window is a toplevel in the page's compositor, its GL
+is Starling's 3.2 compatibility context on Mesa's gex WebGPU driver, the
+first-run language screen draws, and tests/games/dicey-w64.wl's PLAY
+click brings up the menu (PLAY, BONUS EPISODES, CREDITS, QUIT).
+Screenshots (the compositor's readback, private): scratch/W64/shots/
+page-dicey-lang/{language,menu}-gooner.png. Run it with
+tests/games/browser-linux.mjs:
+- `--dir` a stage with `pfx` (a page-prefix.sh template plus the Wayland
+  driver's registry lines and winewayland.drv in system32), the loader's
+  two ELFs (`w64/lib/wine/x86_64-unix/{wine,wineserver}`) and
+  `w64/share/wine/wine.inf` with its mtime kept (the prefix's
+  .update-timestamp must match, or wineboot updates the prefix and waits
+  in Wine Mono's installer).
+- `--lazy` a directory holding `w64` (the dist with W64_NATIVE's files in
+  place, hard links) and `dicey` (the game).
+- `--files` /usr/share/X11/xkb's files (xkbcommon's keymap).
+- `--exe w64/lib/wine/x86_64-unix/wine --cwd dicey --args
+  /game/dicey/diceydungeons.exe --env
+  'WINEPREFIX=/game/pfx,WINEGEX_DOOR=1,WINEDLLOVERRIDES=mscoree=;mshtml='
+  --input tests/games/dicey-w64.wl --size 1280x720`, and GEX_GL_X64 set to
+  any directory (unused by Wine).
+- My stage is scratch/W64/dicey-page (game, lazy, files.txt).
+
+What it took (gex w64/page-dicey):
+- **The native PE core in the page.** The winewayland.drv PE side exists
+  only in W64_NATIVE, so the display needs the core.
+  shims/browser/src/cgen/wasmdll.rs now does what the native wasmdll
+  does for an LLP64 module (W64.2): 16-byte entry pairs, an 8-byte
+  `__gexw_image_base`, and no i386 boot variables. Its data goes above
+  every image: the page cannot go above 2 GiB, so an x86-64 page process
+  reserves `W64_PE_DATA` (0x7fde0000..0x7ffe0000) at its split and keeps
+  mmap below it. The glue gives such a module i64 globals and the 64-bit
+  provider stack (`dllLowered` in gex.mjs). nt-x64.sh takes NATIVE= with
+  PAGE= now (hard links): MP 9 of 9 on the core.
+- **Skeletons keep their bridges.** The rebridge guard gave up on a
+  skeleton's export that kept losing its bridge, and tier-1 then ran the
+  `ud2` stub: c000001d in rpcss and services, and no services in the
+  session. The guard now never gives up inside a skeleton
+  (`wasmdll::in_skeleton`). An unmapped skeleton's bindings are retired
+  (`wasmdll::forget_gone`, only where nothing is mapped any more).
+- **browser-linux.mjs**: a Wine prefix's `dosdevices` go into the bundle
+  as links. Followed, z: is / (a 62 GB tar before I stopped it). The input
+  script takes `button CODE 1|0`, the held presses native .wl scripts use.
+
+Still open for the game: Wine's `try_map_free_area` reports for
+0xffee0000 (harmless: above the page's guest), and a check run on edger's
+GPU (screenshots there came out black for Retrocycles; the compositor
+readback above does not depend on Chrome's screenshot).
 
 **Also queued.** W's TLS pins for w64-deps.sh: gex w/w3-tls afe68fd5
 (w3.pins, w3/deps.sh). They are nettle 3.10.1 with mini-gmp, GnuTLS

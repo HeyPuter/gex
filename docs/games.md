@@ -635,8 +635,12 @@ clicks PLAY on it and the title menu follows (PLAY, BONUS EPISODES,
 CREDITS, QUIT). A script's positions are on Wine's toplevel surface, which
 includes the window frame (client area at (4, 30)), and its clock should
 start after the game's window is up: a Wine prefix update can show
-wineboot's window first, and that takes the early events. Next: the page
-(W64.5).
+wineboot's window first, and that takes the early events.
+
+In the page (2026-10-16, gooner's software WebGPU, correctness only): the
+same title menu, through tests/games/browser-linux.mjs with the native PE
+core, the language screen and the same .wl script's PLAY click. How to run
+it, and what it took, are in docs/wine-native-x64.md §7.
 
 ### Resume (stream G)
 

@@ -8584,6 +8584,25 @@ fn rebuild_carried(
     Ok(file)
 }
 
+/// W64 (an x86-64 guest, the native PE core): the window for the core's
+/// data, the top of the guest's space under KUSER_SHARED_DATA, kept from
+/// every other mapping. A PE32+ export's RVA is added to its DLL's base in
+/// 64 bits, so a data export below a skeleton's base would come out past
+/// 4 GiB (ws2_32's `__wine_unix_call_dispatcher` lookup did). Natively the
+/// data goes above 2 GiB; the page's guest ends below that.
+pub(crate) const W64_PE_DATA: (u64, u64) = (0x7fde_0000, 0x7ffe_0000);
+
+/// Reserve [`W64_PE_DATA`] (no access until the core's data is placed in
+/// it) and keep mmap below it.
+pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
+    use gex_kernel::mem::{flags, prot};
+    let (lo, hi) = W64_PE_DATA;
+    if let Err(e) = mem.mmap(lo, hi - lo, prot::NONE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[w64 PE data window]") {
+        warn_line(&format!("gex: W64: reserving the PE data window {lo:#x}..{hi:#x}: errno {}\n", e.0));
+    }
+    mem.set_mmap_top(lo);
+}
+
 /// The kernel's half of W3's address-space split (see
 /// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
 /// for there, what the host left below 2 GiB the process's own arena, and the

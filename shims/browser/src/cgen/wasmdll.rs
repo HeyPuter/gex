@@ -53,6 +53,9 @@ struct WinePe {
     /// rewriting them reset ntdll's `__wine_unixlib_handle`, which Wine's
     /// own loader had set (as the native host found).
     mapped: std::collections::HashSet<String>,
+    /// An LLP64 module (W64, its skeletons PE32+): pointers in its data are
+    /// 8 bytes, the entry pairs 16 (as natively).
+    ptr64: bool,
 }
 
 static WINE_PE: Mutex<Option<WinePe>> = Mutex::new(None);
@@ -116,7 +119,12 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         let wasm = gex_kernel::nt::file::read_guest_file(&crate::sigs::proc_home().ns(), &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
-        let data = provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?;
+        // (an LLP64 module's above the images: see `crate::W64_PE_DATA`)
+        let data = if pe.is64 {
+            alloc_pe_data_window((size as u64).max(16) + a, "[wine PE data]")?
+        } else {
+            provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
+        };
         let data = (data + a - 1) & !(a - 1);
         let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
         let mut slots = HashMap::new();
@@ -138,7 +146,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         }
         let data_exports = exported_offsets(&wasm)?;
         let number = lock(&PROVIDERS).len() as u32;
-        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, file, key: None, installed: false, mapped: Default::default() });
+        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, file, key: None, installed: false, mapped: Default::default(), ptr64: pe.is64 });
     }
     let wp = g.as_mut().expect("Wine's PE module");
     let slot = |n: &str| wp.slots.get(n).copied();
@@ -182,13 +190,16 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     let first_mapping = wp.mapped.insert(dll.clone());
     if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         let at = wp.data + *off as u64;
+        let bytes = if wp.ptr64 { base.to_le_bytes().to_vec() } else { (base as u32).to_le_bytes().to_vec() };
         if first {
-            wp.pending.push((at, (base as u32).to_le_bytes().to_vec()));
-        } else {
-            let _ = GuestMem::new(crate::guest_bytes()).write_u32(at, base as u32);
+            wp.pending.push((at, bytes));
+        } else if let Some(dst) = crate::guest_bytes().get_mut(at as usize..at as usize + bytes.len()) {
+            dst.copy_from_slice(&bytes);
         }
     }
-    if first_mapping && dll == "ntdll.dll" {
+    // (W64's ntdll has Wine's own Unix side, which sets them: these are
+    // gex-kernel's i386 trampolines)
+    if first_mapping && dll == "ntdll.dll" && !wp.ptr64 {
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {
                 wp.pending.push((wp.data + *off as u64, bytes));
@@ -222,6 +233,51 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 /// `User32InitializeImmEntryTable`: SIGILL in every W3 page process with
 /// `?fjit=1`).
 static SKELETON_CODE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Unmapped ranges (`super::on_retire`'s `gone`): a skeleton mapped there
+/// is gone, and so are its exports' bindings. Kept, they sent the code
+/// that next landed at those addresses to Wine's PE module: W64's wineboot
+/// maps DLLs as image views and unmaps them, and two pages of anonymous
+/// code later at 0x7fc11000 called a native export until the rebridge
+/// guard gave up.
+pub(super) fn forget_gone(gone: &[(u64, u64)]) {
+    if gone.is_empty() {
+        return;
+    }
+    let Some(install) = lock(&WINE_PE).as_ref().map(|w| w.install) else { return };
+    let bound: Vec<u64> = ftab(|m| {
+        gone.iter().flat_map(|&(s, e)| m.range(s, e).filter(|(_, f)| f.install == install).map(|(a, _)| a).collect::<Vec<_>>()).collect()
+    });
+    let skeletons = lock(&SKELETON_CODE).clone();
+    // Only where nothing is mapped now (Wine releases a view as a PROT_NONE
+    // reservation): a live skeleton's page made writable for a while (a
+    // hook's VirtualProtect) keeps its exports.
+    let (dead, dead_code): (Vec<u64>, Vec<(u64, u64)>) = {
+        let mm = crate::sigs::proc_home().mm().lock();
+        let released = |a: u64| mm.vma_at(a).is_none_or(|v| v.prot == 0);
+        (
+            bound.into_iter().filter(|&a| released(a)).collect(),
+            skeletons.into_iter().filter(|&(lo, hi)| gone.iter().any(|&(s, e)| s <= lo && hi <= e) && released(lo)).collect(),
+        )
+    };
+    if !dead.is_empty() {
+        let memory = crate::guest_bytes();
+        ftab(|m| {
+            for &a in &dead {
+                m.retire(a);
+                gex_kernel::ftab::fcache_clear(memory, a);
+            }
+        });
+    }
+    if !dead_code.is_empty() {
+        lock(&SKELETON_CODE).retain(|r| !dead_code.contains(r));
+    }
+}
+
+/// Whether `pc` is in a mapped skeleton's executable sections.
+pub(crate) fn in_skeleton(pc: u64) -> bool {
+    lock(&SKELETON_CODE).iter().any(|&(lo, hi)| lo <= pc && pc < hi)
+}
 
 pub(crate) fn skeleton_code() -> Vec<(u64, u64)> {
     lock(&SKELETON_CODE).clone()
@@ -278,6 +334,27 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     }
 }
 
+/// A PE32+ core's data, at the top of [`crate::W64_PE_DATA`] (reserved at
+/// the x86-64 split), zeroed.
+fn alloc_pe_data_window(size: u64, name: &str) -> Result<u64, String> {
+    use gex_kernel::mem::{flags, prot};
+    let (lo, hi) = crate::W64_PE_DATA;
+    let len = (size + 0xffff) & !0xffff;
+    if len > hi - lo {
+        return Err(format!("{name}: {len:#x} bytes do not fit the W64 PE data window"));
+    }
+    let at = hi - len;
+    let a = crate::sigs::proc_home()
+        .mm()
+        .lock()
+        .mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, name)
+        .map_err(|e| format!("mapping {name} at {at:#x}: errno {}", e.0))?;
+    if let Some(b) = crate::guest_bytes().get_mut(a as usize..(a + len) as usize) {
+        b.fill(0);
+    }
+    Ok(a)
+}
+
 fn clear(addrs: &[u64]) {
     let mem = crate::guest_bytes();
     for &a in addrs {
@@ -328,14 +405,14 @@ pub(super) fn wasm_key(number: u32) -> Option<(u64, u64)> {
 /// thunks (once).
 #[no_mangle]
 pub extern "C" fn gex_wasmdll_installed() {
-    let (install, data, entries, pending) = {
+    let (install, data, entries, pending, w) = {
         let mut g = lock(&WINE_PE);
         let Some(wp) = g.as_mut() else { return };
         let pending = std::mem::take(&mut wp.pending);
         let first = !std::mem::replace(&mut wp.installed, true);
         let entries = first.then(|| wp.data_exports.get("__gexw_entries").copied()).flatten();
         let decl = wp.data_exports.get("__gexw_entries_decl").copied();
-        (wp.install, wp.data, entries.map(|e| (e, decl)), pending)
+        (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 })
     };
     let mem = crate::guest_bytes();
     for (at, bytes) in pending {
@@ -351,12 +428,13 @@ pub extern "C" fn gex_wasmdll_installed() {
     let base = ftab(|m| m.install(install).base);
     let read = |off: u32| -> Vec<(u64, u32)> {
         let at = data + off as u64;
-        let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + 4).unwrap_or(0) as u64);
+        // (an LLP64 module's pointers are 8 bytes, their values below 4 GiB)
+        let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + w).unwrap_or(0) as u64);
         let mut out = Vec::new();
         let mut a = start;
-        while start != 0 && a + 8 <= stop {
-            let (f, t) = (gm.read_u32(a).unwrap_or(0), gm.read_u32(a + 4).unwrap_or(0));
-            a += 8;
+        while start != 0 && a + 2 * w <= stop {
+            let (f, t) = (gm.read_u32(a).unwrap_or(0), gm.read_u32(a + w).unwrap_or(0));
+            a += 2 * w;
             if f < base || t < base || f as u64 >= 0x3f0000 {
                 continue;
             }
