@@ -14,7 +14,7 @@ const GUEST_BYTES = 0xffff0000;
 import { lazyFetch } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
-import { logOn } from "./log.mjs";
+import { logOn, logQuiet } from "./log.mjs";
 
 // Read when used, not at import: a Worker learns it from its first message.
 const m64 = () => !!globalThis.GEX_MEM64;
@@ -1381,7 +1381,7 @@ export class Gex {
           // `[gex-info] `: one of the few things said by default (a process
           // starting, log.mjs): information, not a warning.
           if (text.startsWith('[gex-info] ')) {
-            console.info(`[gex] ${text.slice(11)}`);
+            if (!logQuiet()) console.info(`[gex] ${text.slice(11)}`);
             return;
           }
           // The shim's own per-library line, said once per session instead

@@ -6,6 +6,8 @@
 #   tests/wasm32/run.sh [gexc]   (an x86 gexc; GEX_WASM_SYSROOT = the
 #                                 sysroot from tools/wine-wasm/build-sysroot.sh)
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 GEXC=${1:-target/x86/release/gexc}

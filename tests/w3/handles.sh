@@ -11,6 +11,8 @@
 # shared-memory shim and seed in web/public/gex (GEX_ARCH=x86
 # shims/browser/build.sh) and, for the native leg, an x86 gexc.
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 dist=$(realpath "${1:?DIST}"); prefix=$(realpath "${2:?PREFIX}")

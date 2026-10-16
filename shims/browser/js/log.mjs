@@ -12,6 +12,8 @@
 //   GEX_LOG=record       the `[gex-record]` lines (tools/eject/record-w3.mjs)
 //   GEX_LOG=unit         a line per function-tier unit placed in a process
 //   GEX_LOG=a,b          several of those
+//   GEX_LOG=off          not even the default lines (tests that compare a
+//                        program's output with its native run)
 
 // The page's own `?log=` (a Worker's `location` is its script's, so Workers
 // are handed it in their start message instead).
@@ -31,10 +33,16 @@ function value() {
   return v === undefined || v === null || v === '' || v === '0' ? null : String(v);
 }
 
+/** `GEX_LOG=off` (or `none`): the default lines are off too. */
+export function logQuiet() {
+  const v = value();
+  return v === 'off' || v === 'none';
+}
+
 /** Whether debug output of kind `what` (or any, without one) is on. */
 export function logOn(what) {
   const v = value();
-  if (v === null) return false;
+  if (v === null || v === 'off' || v === 'none') return false;
   if (v === '1' || v === 'all') return true;
   const kinds = v.split(',');
   return what === undefined ? kinds.length > 0 : kinds.includes(what);

@@ -40,6 +40,8 @@
 # with NATIVE or NTDLL, whose DIST is links (a page mount does not follow
 # a link out of it), nor with WL or GL.
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 dist=$(realpath "${1:?DIST}"); prefix=$(realpath "${2:?PREFIX}")

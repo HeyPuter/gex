@@ -11,6 +11,8 @@
 # Needs gcc with -m32 support (the host's lib32 glibc); a missing i386
 # toolchain is a skip, not a pass.
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 WORK=${WORK:-$(mktemp -d)}

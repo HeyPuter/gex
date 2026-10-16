@@ -8,6 +8,8 @@
 #   tests/gexcc/run-browser.sh   (gexcc on PATH; web/public/gex has the x86
 #                                 shared shim and seed.x86.shared.wasm)
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 # GEX_ARCH=aarch64: the AArch64 build's shim and seed (native wasm32

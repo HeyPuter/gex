@@ -10,6 +10,8 @@
 #
 # Needs `GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh`.
 set -u
+# The provider lines ("addresses bound") are debug output (log.mjs).
+export GEX_LOG=${GEX_LOG:-debug}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 gexc=$(realpath "${1:?usage: tests/elf-prov/run-browser.sh GEXC}")

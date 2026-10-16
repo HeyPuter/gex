@@ -2642,12 +2642,22 @@ fn host_exec(req: &ExecRequest, kernel: &Kernel) -> Result<Option<Exit>> {
 /// for the first time in this run, and what went wrong.
 pub(crate) fn log_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GEX_LOG").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ON.get_or_init(|| std::env::var("GEX_LOG").is_ok_and(|v| !v.is_empty() && v != "0" && v != "off" && v != "none"))
+}
+
+/// `GEX_LOG=off` (or `none`): not even the default lines, for tests that
+/// compare a program's output with its native run.
+pub(crate) fn log_quiet() -> bool {
+    static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| std::env::var("GEX_LOG").is_ok_and(|v| v == "off" || v == "none"))
 }
 
 /// One of the default lines: a process starting, the file it runs and its
 /// arguments (the page says the same, shims/browser `note_exec`).
 fn note_exec(pid: i32, path: &str, argv: &[String]) {
+    if log_quiet() {
+        return;
+    }
     let mut args: String = argv.iter().skip(1).map(|a| format!(" {a}")).collect();
     if args.len() > 200 {
         let mut cut = 200;
@@ -2663,6 +2673,9 @@ fn note_exec(pid: i32, path: &str, argv: &[String]) {
 /// One of the default lines: a library (a Wine DLL, a wasm32 module) loaded
 /// for the first time in this gexc, once rather than once per process.
 pub(crate) fn note_library(path: &str) {
+    if log_quiet() {
+        return;
+    }
     static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.get_or_insert_with(Default::default).insert(path.to_string()) {

@@ -24,11 +24,12 @@ function narrate(text) {
  * scraping, which fails open. See task 146.
  */
 import { single } from './single.mjs';
-import { logOn } from './log.mjs';
+import { logOn, logQuiet } from './log.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
  *  console's info level. */
 function inform(text) {
+  if (logQuiet()) return;
   const fs = typeof process !== 'undefined' ? process.getBuiltinModule?.('fs') : null;
   if (fs?.writeSync) {
     try { fs.writeSync(2, `${text}\n`); return; } catch {}

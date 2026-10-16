@@ -5,6 +5,8 @@
 #
 #   tests/fjit-procs/run.sh [gexc]      (needs zig for the musl target)
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 HERE=$(cd "$(dirname "$0")" && pwd)
 GEXC=${1:-target/x86/release/gexc}
 W=${WORK:-$(mktemp -d)}

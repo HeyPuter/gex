@@ -14,6 +14,8 @@
 # days stale: sarestart, sockclose and sockpair "failed" on fixes it did
 # not have).
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 G=${1:-${GEXC:-}}
 if [ -n "$G" ]; then
     [ -x "$G" ] || { echo "no gexc at $G"; exit 2; }

@@ -8,6 +8,8 @@
 #                                     shim and seed in web/public/gex:
 #                                     GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh)
 set -u
+# Output is compared with the native run: not even gex's default lines (log.mjs).
+export GEX_LOG=${GEX_LOG:-off}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 : "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT (tools/wine-wasm/build-sysroot.sh)}"
