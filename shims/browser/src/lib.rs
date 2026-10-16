@@ -104,9 +104,14 @@ extern "C" {
     fn net_send(id: i32, ptr: u32, len: u32) -> i32;
     /// Bytes delivered, 0 at end of stream, -1 when nothing has arrived yet.
     fn net_recv(id: i32, ptr: u32, len: u32) -> i32;
+    /// `net_recv`, leaving the bytes queued (`recv(MSG_PEEK)`).
+    fn net_peek(id: i32, ptr: u32, len: u32) -> i32;
     /// Whether `net_recv` would answer without waiting.
     fn net_avail(id: i32) -> i32;
     fn net_close(id: i32);
+    /// One more holder of a stream (a socket another process now holds too):
+    /// `net_close` then ends it only at the last. 1 if it exists, else 0.
+    fn net_dup(id: i32) -> i32;
 }
 
 /// Whether the page gave the shim a network at all.
@@ -191,6 +196,22 @@ impl net::Transport for WispStream {
         }
     }
 
+    /// Wine's wineserver peeks one byte of every stream socket it sees
+    /// readable, to tell data from the far end having closed: without this
+    /// it took the socket for broken and every TLS handshake over Wisp
+    /// failed at its first read.
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return Ok(0);
+        }
+        match unsafe { net_peek(id, buf.as_mut_ptr() as u32, buf.len() as u32) } {
+            -1 => Err(Errno::EAGAIN),
+            n if n >= 0 => Ok(n as usize),
+            _ => Err(Errno::EOPNOTSUPP),
+        }
+    }
+
     fn has_data(&self) -> bool {
         let id = self.id.load(std::sync::atomic::Ordering::Acquire);
         id != 0 && unsafe { net_avail(id) } != 0
@@ -201,6 +222,14 @@ impl net::Transport for WispStream {
         if id != 0 {
             unsafe { net_close(id) };
         }
+    }
+
+    /// The page's stream ids are the page's, so another process's socket can
+    /// stand on the same stream: it is held once more (`net_dup`), and ends
+    /// when its last holder closes.
+    fn carry(&self) -> Option<String> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        (id != 0 && unsafe { net_dup(id) } == 1).then(|| format!("wisp:{id}"))
     }
 }
 
@@ -229,6 +258,11 @@ impl net::NetStack for WispNet {
 extern "C" {
     /// Is there a global kernel behind these calls at all?
     fn k_present() -> i32;
+    /// The machine's synthetic DNS answers (`gex_kernel::net::share_names`):
+    /// the address for a name, allocated on first asking; and the name an
+    /// address was given for, into `out` (its length, or -1 for none).
+    fn k_dns_addr(name: gex_kernel::PAddr, name_len: u32) -> u32;
+    fn k_dns_name(addr: u32, out: gex_kernel::PAddr, cap: u32) -> i32;
     /// Wait slots and wait queues (`shims/kernel/src/wait.rs`, `waitq`):
     /// this Worker's slot, its value, a park on it; a queue's waiters added,
     /// removed, notified; queues made, freed and chained for `gex_kernel::wait`.
@@ -1304,6 +1338,16 @@ fn scm_rebuild(ns: &gex_kernel::vfs::Namespace, desc: &str) -> Option<Arc<gex_ke
     }
 }
 
+fn shared_dns_addr(name: &str) -> u32 {
+    unsafe { k_dns_addr(name.as_ptr() as gex_kernel::PAddr, name.len() as u32) }
+}
+
+fn shared_dns_name(addr: u32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe { k_dns_name(addr, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) };
+    (n >= 0).then(|| String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned())
+}
+
 /// Where a unix socket's two ends live, when there is a global kernel to put
 /// them in.
 fn global_sockets() -> Option<gex_kernel::unix::Remote> {
@@ -1312,6 +1356,9 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     }
     // And one boot instant for every process's monotonic clocks.
     gex_kernel::share_monotonic_base(|want| unsafe { k_boot_secs(want as u32) } as u64);
+    // And one table of DNS answers: a name one process resolved means the
+    // same address in the process that connects to it.
+    gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
     // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
     let gc = unsafe { k_guest_clock(0, 0) };
     if gc != 0 {
@@ -8318,6 +8365,14 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
         return Some(format!("epoll:{key}:{}", set.describe()));
     }
+    // A connected TCP socket: the same connection, held once more (its Wisp
+    // stream, or its end in the global kernel). Wine's wineserver makes every
+    // socket and connects it, then hands the client the descriptor.
+    if let Some(sock) = Arc::clone(&file.handle).as_inet_socket() {
+        if let Some(name) = sock.carry() {
+            return Some(name);
+        }
+    }
     file.path.starts_with('/').then(|| file.path.clone())
 }
 
@@ -8502,6 +8557,31 @@ fn rebuild_carried(
         let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
         let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
         let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
+        let handle: Arc<dyn FileHandle> = sock;
+        OpenFile::new(handle, "socket".to_string(), flags, true, true)
+    } else if path.starts_with("inet:") {
+        // `Socket::carry`'s name: the connection the sender holds, already
+        // counted as this holder's.
+        let t = net::Socket::carried_transport(path).ok_or("bad inet name")?;
+        let transport: Arc<dyn net::Transport> = if let Some(id) = t.strip_prefix("wisp:") {
+            let id = id.parse::<i32>().map_err(|_| "bad stream id")?;
+            Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(id) })
+        } else if let Some(id) = t.strip_prefix("loop:") {
+            let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
+            Arc::new(net::RemoteEnd::adopt(id, global_sockets().ok_or("no global kernel")?))
+        } else {
+            return Err(format!("unknown connection '{t}'"));
+        };
+        let sock = net::Socket::adopt(
+            path,
+            transport,
+            Arc::new(WispNet),
+            Arc::new(net::Resolver::new()),
+            Arc::new(net::Ports::new()),
+            global_sockets(),
+        )
+        .ok_or("bad inet name")?;
         sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
         let handle: Arc<dyn FileHandle> = sock;
         OpenFile::new(handle, "socket".to_string(), flags, true, true)

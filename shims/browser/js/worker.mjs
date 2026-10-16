@@ -868,13 +868,13 @@ async function handle(msg) {
     // The single-thread build: the system's one Wisp connection, the object
     // itself (every fiber is in its realm). Its traffic wakes parked fibers.
     msg.wispNet.onActivity = () => sched.wake();
-    gex.useNetwork(msg.wispNet);
+    gex.useNetwork(msg.wispNet, { shared: true });
   } else if (msg.netChannel) {
     // The page's Wisp connection, called across shared memory (net-bridge.mjs):
     // a wasm32 program never hands this Worker's event loop back, so a
     // WebSocket of its own here would never deliver.
     const { NetProxy } = await bridge('net');
-    gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1));
+    gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
   } else if (msg.wispUrl) {
     // The site's Wisp client, imported only when a proxy was named.
     const { WispNetwork } = await import('../../../web/src/net.js');

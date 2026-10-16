@@ -3142,6 +3142,54 @@ pub extern "C" fn k_sock_dup(id: i32) -> i32 {
     }
 }
 
+// -- names --------------------------------------------------------------------
+
+/// The machine's synthetic DNS answers (gex-kernel's `net::Resolver`, through
+/// `net::share_names`): one table for every process, as one machine has one
+/// resolver. A name gets the next address of 240.0.0.0/4 the first time any
+/// process asks; the connecting process -- Wine's wineserver, for a name its
+/// client resolved -- reads the name back from the address.
+struct DnsNames {
+    by_name: std::collections::HashMap<String, u32>,
+    by_addr: std::collections::HashMap<u32, String>,
+    next: u32,
+}
+
+fn dns() -> &'static std::sync::Mutex<DnsNames> {
+    note_panics();
+    static D: OnceLock<std::sync::Mutex<DnsNames>> = OnceLock::new();
+    D.get_or_init(|| {
+        std::sync::Mutex::new(DnsNames { by_name: Default::default(), by_addr: Default::default(), next: 0xf000_0001 })
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn k_dns_addr(name: gex_kmem::PAddr, name_len: u32) -> u32 {
+    let key = path_of_raw(name, name_len.min(1024));
+    let mut d = dns().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&a) = d.by_name.get(&key) {
+        return a;
+    }
+    let a = d.next;
+    d.next += 1;
+    d.by_name.insert(key.clone(), a);
+    d.by_addr.insert(a, key);
+    a
+}
+
+#[no_mangle]
+pub extern "C" fn k_dns_name(addr: u32, out: gex_kmem::PAddr, cap: u32) -> i32 {
+    let d = dns().lock().unwrap_or_else(|e| e.into_inner());
+    match d.by_addr.get(&addr) {
+        Some(name) => {
+            let n = name.len().min(cap as usize);
+            unsafe { gex_kmem::push_checked(out, name.as_ptr(), n as u32) };
+            n as i32
+        }
+        None => -1,
+    }
+}
+
 // -- the boot instant ---------------------------------------------------------
 
 /// Where every process's monotonic clocks start, in wall-clock seconds

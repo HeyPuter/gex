@@ -6,7 +6,7 @@
 // on that Worker's event loop, and a native wasm32 program waiting in a
 // syscall never gives its Worker's event loop back (it is polled in place;
 // shims/browser/src/lib.rs). Nothing it waited for could ever arrive. The page's
-// event loop is free, so the bytes land there, and the seven calls below never
+// event loop is free, so the bytes land there, and the calls below never
 // wait on anything but the page answering.
 
 const STATE = 0; // 0 idle, 1 request, 2 reply
@@ -33,6 +33,8 @@ const SEND = 4;
 const RECV = 5;
 const AVAILABLE = 6;
 const CLOSE = 7;
+const DUP = 8;
+const PEEK = 9;
 
 /** Bytes one send or recv carries. A larger send is cut (it returns the count,
  *  as a socket does); a recv takes at most this much. */
@@ -77,6 +79,8 @@ export function serveNet(net, channel) {
         case RECV: r = net.recv(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))); break;
         case AVAILABLE: r = net.available(id) ? 1 : 0; break;
         case CLOSE: net.close(id); break;
+        case DUP: r = net.dup ? net.dup(id) : 0; break;
+        case PEEK: r = net.peek ? net.peek(id, data.subarray(0, Math.min(ctl[A1], DATA_BYTES))) : -2; break;
         default: r = -1;
       }
     } catch (e) {
@@ -107,7 +111,7 @@ export function serveNet(net, channel) {
   };
 }
 
-/** The Worker's half: the seven calls `Gex.useNetwork` wants. */
+/** The Worker's half: the calls `Gex.useNetwork` wants. */
 export class NetProxy {
   #ctl;
   #data;
@@ -198,7 +202,15 @@ export class NetProxy {
     });
   }
 
+  peek(id, out) {
+    return this.#run(this.#call(PEEK, id, Math.min(out.length, DATA_BYTES)), (r) => {
+      if (r > 0) out.set(this.#data.subarray(0, r), 0);
+    });
+  }
+
   available(id) { return this.#run(this.#call(AVAILABLE, id)) === 1; }
 
   close(id) { this.#run(this.#call(CLOSE, id)); }
+
+  dup(id) { return this.#run(this.#call(DUP, id)); }
 }
