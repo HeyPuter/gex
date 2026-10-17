@@ -599,6 +599,9 @@ async function runProgramHere(
     // Lazy files the page fills in the background (app.js `fill`), handed to
     // every Worker (lazy-fetch.mjs `setFill`).
     fill = null,
+    // The page's cache of lazy files (app.js, lazy-cache.mjs): its control
+    // buffer, handed to every Worker.
+    lazyCache = null,
     // Units' keys and identities (`base:key:identity:path;...`), so a Worker
     // takes them instead of hashing each image it maps (cgen.rs `known`).
     identities = null,
@@ -887,6 +890,7 @@ async function runProgramHere(
       // process is the X server and the client it forks, not the demo's shell.
       heartbeat: heartbeat || undefined,
       fill: fill || undefined,
+      lazyCache: lazyCache || undefined,
       identities: identities || undefined,
       // How many traps a forked child takes before it stops waiting to be an
       // `execve` and installs its parent's modules.

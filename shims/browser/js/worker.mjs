@@ -73,6 +73,7 @@ function forkTransfer(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { setFill, fillFile } from './lazy-fetch.mjs';
+import { setLazyCache } from './lazy-cache.mjs';
 import { noteFetch, noteStatus } from './fetch-note.mjs';
 import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
@@ -666,6 +667,8 @@ async function handle(msg) {
   // Lazy files the page is filling in the background (app.js `fill`): their
   // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
   if (msg.fill) setFill(msg.fill);
+  // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
+  if (msg.lazyCache) setLazyCache(msg.lazyCache);
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   // The runtime made in the pool, when this process runs on a fresh memory

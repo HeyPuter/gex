@@ -25,7 +25,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,11 +34,17 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--stable-from'].includes(av[i - 1]));
 // A W3 page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
 // next to each other in the tar so zstd's window stores the second as a match.
+// --pieces: the bundle's file bytes and the units in content-addressed
+// pieces (`pieces` in w3Site), which the page keeps in its own cache, so a
+// visit after a rebuild fetches only the pieces that changed; --stable-from
+// DIR (repeatable: the Windows image the program's files came from, a game's
+// own directory) keeps the files whose bytes are DIR's in pieces of their
+// own, which a rebuild of the rest never changes.
 if (!project || !out) {
   console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--wgsl-cache FILE] [--level N]');
   process.exit(2);
@@ -113,6 +119,11 @@ function walk(dir, fn, base = dir) {
     else if (e.isFile() || e.isSymbolicLink()) fn(p, relative(base, p));
   }
 }
+
+/** How many pieces each class of the bundle's files (stable, the rest) is
+ *  cut into, and the units: a file's piece is its path's hash modulo this,
+ *  so a changed file changes its own piece and no other. */
+const PIECES = 16;
 
 if (w3) {
   w3Site();
@@ -335,6 +346,117 @@ function noTestPage() {
   }
 }
 
+/** The files of DIRs (--stable-from), for `pieces`: by lower-case name
+ *  and size, the paths with those. */
+function stableIndex(dirs) {
+  const by = new Map();
+  const add = (d) => {
+    let es;
+    try { es = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) add(p);
+      else if (e.isFile()) {
+        const k = `${e.name.toLowerCase()}:${statSync(p).size}`;
+        if (!by.has(k)) by.set(k, []);
+        by.get(k).push(p);
+      }
+    }
+  };
+  for (const d of dirs) add(d);
+  return by;
+}
+
+/**
+ * The bundle's file bytes as content-addressed pieces (--pieces): every
+ * regular file of the extracted bundle X goes into one of PIECES pieces of
+ * its class, by its path's hash, and is left in X empty, so the tar keeps
+ * its name, mode and time (which change from build to build: a staged file
+ * is copied anew) and no bytes. A piece is its files' bytes one after
+ * another, in path order, named by their hash: the same files give the same
+ * piece, whatever else was rebuilt. The class "stable" is the files whose
+ * bytes are a file of --stable-from's, by name and size (a Windows DLL, as
+ * the image has it); the rest (Wine, the prefix, the runtime's tree) are
+ * cut apart from them, so a rebuild of the rest never touches a stable
+ * piece. Returns the index the page reads (pieces.json): the pieces, by
+ * URL and size, and each file's piece, offset and length.
+ */
+function pieces(x) {
+  const work = join(`${out.replace(/\/+$/, '')}.work`, 'pieces');
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+  const stable = stableIndex(opts('--stable-from'));
+  const isStable = (p, name, size, bytes) => {
+    for (const c of stable.get(`${name.toLowerCase()}:${size}`) ?? []) if (readFileSync(c).equals(bytes)) return true;
+    return false;
+  };
+  const groups = new Map(); // "class/n" -> [[rel, bytes]]
+  // A file's other names (hard links, which --dedupe makes): emptied with
+  // the first, so each takes the first's bytes and piece.
+  const inodes = new Map(); // "dev:ino" -> [group, bytes]
+  walk(x, (p, rel) => {
+    const st = lstatSync(p);
+    if (!st.isFile()) return;
+    const ino = `${st.dev}:${st.ino}`;
+    if (inodes.has(ino)) {
+      const [g, b] = inodes.get(ino);
+      groups.get(g).push([rel, b]);
+      return;
+    }
+    if (!st.size) return;
+    const b = readFileSync(p);
+    const cls = stable.size && isStable(p, rel.split('/').pop(), st.size, b) ? 'stable' : 'rest';
+    const n = parseInt(sha(rel).slice(0, 8), 16) % PIECES;
+    const g = `${cls}/${n}`;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push([rel, b]);
+    if (st.nlink > 1) inodes.set(ino, [g, b]);
+    // Emptied, its mode and time kept (a read-only file made writable for it).
+    if (!(st.mode & 0o200)) chmodSync(p, st.mode | 0o200);
+    truncateSync(p, 0);
+    if (!(st.mode & 0o200)) chmodSync(p, st.mode & 0o7777);
+    utimesSync(p, st.atime, st.mtime);
+  });
+  const index = { pieces: [], files: [] };
+  // The stable files' guest paths (lower case), for the units' grouping;
+  // not written out.
+  Object.defineProperty(index, 'stable', { value: new Set(), enumerable: false });
+  // Whether a file elsewhere (a lazy file, for its unit) is a stable one.
+  Object.defineProperty(index, 'isStable', { value: (f, name) => {
+    if (!stable.size || !existsSync(f)) return false;
+    const b = readFileSync(f);
+    return isStable(f, name, b.length, b);
+  }, enumerable: false });
+  let bytes = 0, stableBytes = 0;
+  for (const g of [...groups.keys()].sort()) {
+    const list = groups.get(g).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    const parts = [];
+    const at = new Map(); // a piece holds the same bytes once
+    let off = 0;
+    const files = [];
+    for (const [rel, b] of list) {
+      const h = sha(b);
+      if (!at.has(h)) { at.set(h, off); parts.push(b); off += b.length; }
+      files.push([`/${rel}`, at.get(h), b.length]);
+    }
+    const body = Buffer.concat(parts);
+    const id = sha(body).slice(0, 32);
+    const f = join(work, id);
+    writeFileSync(f, body);
+    place(f, `project/build/web/pieces/${id}`);
+    const i = index.pieces.length;
+    index.pieces.push([`/project/build/web/pieces/${id}`, body.length, g.split('/')[0]]);
+    for (const [path, o, n] of files) {
+      index.files.push([path, i, o, n]);
+      if (g.startsWith('stable/')) index.stable.add(path.toLowerCase());
+    }
+    bytes += body.length;
+    if (g.startsWith('stable/')) stableBytes += body.length;
+  }
+  console.log(`eject-site: pieces: ${index.pieces.length} (${index.files.length} files, ${mb(bytes)} MB; stable ${mb(stableBytes)} MB)`);
+  return index;
+}
+
 /** The site of a W3 page's project: its page (built with the project's
  *  features, as plain files), its bundle and units (packed, decoded by the
  *  page), the launcher and the hosting files. No service worker. */
@@ -380,7 +502,10 @@ function w3Site() {
   const lateGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
   const lateKeys = new Set();
   let lazyFiles = 0, lazyBytes = 0;
-  if (strip || flag('--prune') || flag('--dedupe') || split) {
+  let lazySource = new Map(); // a lazy file's guest path (lower case) -> its bytes in the store
+  const piecesOn = flag('--pieces');
+  let piecesIndex = null;
+  if (strip || flag('--prune') || flag('--dedupe') || split || piecesOn) {
     const x = join(work, 'tarx');
     mkdirSync(x, { recursive: true });
     execFileSync('tar', ['-xf', tar, '-C', x]);
@@ -423,6 +548,7 @@ function w3Site() {
         rmSync(p);
       });
       lazyFiles = lazy.length;
+      lazySource = new Map(lazy.map((f) => [f[0].toLowerCase(), join(store, f[2])]));
       lazyBytes = lazy.reduce((a, f) => a + f[1], 0);
       writeFileSync(join(out, 'project/build/web/lazy.json'), JSON.stringify({ base: '/project/build/web/lazy/', files: lazy }));
       w3.params = { ...(w3.params ?? {}), lazy: '/project/build/web/lazy.json' };
@@ -464,6 +590,7 @@ function w3Site() {
     tar = join(work, 'rootfs.tar');
     const dirs = [];
     const byHash = new Map();
+    if (piecesOn) piecesIndex = pieces(x);
     const all = (d, rel) => {
       for (const e of readdirSync(d, { withFileTypes: true })) {
         const r = rel ? `${rel}/${e.name}` : e.name;
@@ -485,6 +612,10 @@ function w3Site() {
   // download has of it; nt.json carries the rest's manifest by URL.
   if (w3.bundle) w3.bundle = { split: !!split, ...(split ? { read: split.size, lazy: lazyFiles, lazy_bytes: lazyBytes } : {}) };
   place(tar, 'project/build/web/rootfs.tar');
+  if (piecesIndex) {
+    writeFileSync(join(out, 'project/build/web/pieces.json'), JSON.stringify(piecesIndex));
+    w3.params = { ...(w3.params ?? {}), pieces: '/project/build/web/pieces.json' };
+  }
   // The units. Whole units (no "cold" split, the default): one archive,
   // units.tar, every unit's c.wasm and c.entries, packed as one zstd file.
   // The page decodes it once, compiles every module while the bundle
@@ -496,12 +627,36 @@ function w3Site() {
   if (!coldUnits) {
     // --late: the late files' units travel in the fill (above), not here.
     const bootUnits = w3.units.filter((u) => !lateKeys.has(u.key));
-    const list = join(work, 'units-list');
-    const names = bootUnits.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]);
-    writeFileSync(list, `${names.join('\n')}\n`);
-    const ut = join(work, 'units.tar');
-    execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '-cf', ut, '-T', list]);
-    place(ut, 'project/build/web/units.tar');
+    // One archive (units.tar), or with --pieces one per group of units, by
+    // their image's path (as the bundle's pieces) and its class (a stable
+    // file's units apart from the rest's), each named by its bytes: a unit
+    // that did not change keeps its archive, which the page has.
+    const groupsU = new Map();
+    // A unit's image by its Wine path (/pfx/dosdevices/c:/...), the bundle's
+    // file by the drive's (/pfx/drive_c/...).
+    // A lazy file's unit is stable when the file is.
+    const stableU = (u) => {
+      if (!piecesIndex) return false;
+      const p = String(u.path ?? '').replace(/\/dosdevices\/c:\//i, '/drive_c/').toLowerCase();
+      return piecesIndex.stable.has(p) || (lazySource.has(p) && piecesIndex.isStable(lazySource.get(p), p.split('/').pop()));
+    };
+    for (const u of bootUnits) {
+      const g = piecesOn ? (stableU(u) ? 0 : PIECES) + parseInt(sha(String(u.path ?? u.key)).slice(0, 8), 16) % PIECES : 0;
+      if (!groupsU.has(g)) groupsU.set(g, []);
+      groupsU.get(g).push(u);
+    }
+    const unitTars = [];
+    for (const g of [...groupsU.keys()].sort((a, b) => a - b)) {
+      const us = groupsU.get(g).sort((a, b) => (a.key < b.key ? -1 : 1));
+      const list = join(work, 'units-list');
+      writeFileSync(list, `${us.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]).join('\n')}\n`);
+      const ut = join(work, `units-${g}.tar`);
+      execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '--format=gnu', '-cf', ut, '-T', list]);
+      const site = piecesOn ? `project/build/web/pieces/u${sha(readFileSync(ut)).slice(0, 32)}.tar` : 'project/build/web/units.tar';
+      place(ut, site);
+      unitTars.push([`/${site}`, us]);
+    }
+    if (piecesOn) console.log(`eject-site: unit pieces: ${unitTars.length} (${bootUnits.filter(stableU).length} of ${bootUnits.length} units stable)`);
     if (lateKeys.size) console.log(`eject-site: ${lateKeys.size} units in the fill (${w3.units.filter((u) => lateKeys.has(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
     mkdirSync(join(out, 'project/build/web/units'), { recursive: true });
     // Only the units the recording used by its title are compiled with the
@@ -517,7 +672,11 @@ function w3Site() {
     const timed = title !== null && bootUnits.some((u) => typeof u.at === 'number');
     const demand = timed ? bootUnits.filter((u) => !(typeof u.at === 'number' && u.at <= title)).map((u) => u.key) : [];
     if (demand.length) console.log(`eject-site: ${demand.length} units compiled when first mapped (${w3.units.filter((u) => demand.includes(u.key)).map((u) => u.path.split('/').pop()).join(' ')})`);
-    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify([[`tar:${bootUnits.length - demand.length}`, '/project/build/web/units.tar', ...(demand.length ? [{ demand }] : [])]]));
+    const demandSet = new Set(demand);
+    writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(unitTars.map(([url, us]) => {
+      const d = us.filter((u) => demandSet.has(u.key)).map((u) => u.key);
+      return [`tar:${us.length - d.length}`, url, ...(d.length ? [{ demand: d }] : [])];
+    })));
   }
   for (const u of coldUnits ? w3.units : []) {
     const d = join(web, 'units', u.key);
