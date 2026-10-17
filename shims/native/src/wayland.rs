@@ -431,6 +431,7 @@ impl Wayland {
                     Routed::PointerClear => s.client.pointer_clear(),
                     Routed::Button(b, down, ms) => s.client.pointer_button(b, down, ms),
                     Routed::Key(k, down, ms) => s.client.keyboard_key(k, down, ms),
+                    Routed::KeyboardFocus(surface) => s.client.keyboard_focus(surface),
                     Routed::KeyboardLeave => s.client.keyboard_focus(0),
                 }
             }
@@ -529,6 +530,8 @@ enum Routed {
     PointerClear,
     Button(u32, bool, u32),
     Key(u32, bool, u32),
+    /// The keyboard to this surface (the screen chose it, no client did).
+    KeyboardFocus(u32),
     KeyboardLeave,
 }
 
@@ -650,6 +653,17 @@ impl Screen {
                     }
                 }
                 Ev::Key(k, down) => {
+                    // No client has activated a window (Wine activates its
+                    // own, and a slow start can leave none active when the
+                    // script's keys come): the topmost window gets the
+                    // keyboard, as a compositor focuses the window on top.
+                    if self.focus.is_none() {
+                        if let Some(top) = self.stack().last().copied() {
+                            eprintln!("[gex] input: no window has the keyboard; it goes to the top one, {}:{}", top.0, top.1);
+                            self.focus = Some(top);
+                            out.push((top.0, Routed::KeyboardFocus(top.1)));
+                        }
+                    }
                     if let Some((sid, _)) = self.focus {
                         out.push((sid, Routed::Key(k, down, ms)));
                     }
