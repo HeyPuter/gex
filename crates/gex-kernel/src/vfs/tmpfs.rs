@@ -132,10 +132,14 @@ pub fn set_lazy_fetch(f: LazyFetch) {
 
 /// Lazy files are fetched and kept in pieces this big.
 const LAZY_CHUNK: u64 = 1 << 20;
-/// How many chunks past the one read a sequential read fetches with it: a
-/// read at the start of a file, or right after a chunk already held. One
-/// synchronous request per MiB was 0.8 s of apt installing a 9 MB .deb of
-/// ours from the page; a random read still fetches only what it reads.
+/// The most chunks past the ones read that a sequential read fetches with
+/// them. A miss fetches what it reads, rounded to chunks; a miss right
+/// after a chunk already held reads ahead, twice as far as the last
+/// sequential miss did (1, 2, 4, 8, then this), and any other miss starts
+/// over. One synchronous request per MiB was 0.8 s of apt installing a 9 MB
+/// .deb of ours from the page; 16 MiB from offset 0 at once was a whole
+/// 22 MB DLL fetched (24 s at 0.7 MB/s) for a look at its headers and an
+/// icon.
 const LAZY_READAHEAD: u64 = 15;
 
 /// A file whose bytes live elsewhere (a URL) and arrive a chunk at a time,
@@ -146,6 +150,8 @@ struct Lazy {
     size: u64,
     chunks: std::collections::HashMap<u64, Box<[u8]>>,
     held: u64,
+    /// The readahead of the last sequential miss, in chunks (0: none yet).
+    ahead: u64,
 }
 
 impl Lazy {
@@ -162,8 +168,9 @@ impl Lazy {
                 c += 1;
                 continue;
             }
-            let sequential = c == 0 || self.chunks.contains_key(&(c - 1));
-            let limit = if sequential { last + LAZY_READAHEAD } else { last };
+            let sequential = c > 0 && self.chunks.contains_key(&(c - 1));
+            self.ahead = if sequential { (self.ahead * 2).clamp(1, LAZY_READAHEAD) } else { 0 };
+            let limit = last + self.ahead;
             let limit = limit.min((self.size - 1) / LAZY_CHUNK);
             let mut stop = c;
             while stop < limit && !self.chunks.contains_key(&(stop + 1)) {
@@ -521,7 +528,7 @@ impl TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
         let f = FileNode::new(Vec::new(), ino);
-        *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0 });
+        *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
     }
 
@@ -1430,6 +1437,9 @@ mod lazy_tests {
 
     /// Byte `i` of every lazy file here is `i % 251`.
     fn fake(url: &str, offset: u64, into: &mut [u8]) -> bool {
+        if url == "/data/r" {
+            return counting(url, offset, into);
+        }
         assert_eq!(url, "/data/f");
         for (k, b) in into.iter_mut().enumerate() {
             *b = ((offset + k as u64) % 251) as u8;
@@ -1450,6 +1460,38 @@ mod lazy_tests {
         fs.open("a/dir", 0, 0).unwrap();
         assert!(fs.open("a/missing", 0, 0).is_err());
         assert_eq!(fs.opened(), vec!["/a/lazy".to_string(), "/a/read".to_string()]);
+    }
+
+    /// Requests of `/data/r`, each `(offset, len)`.
+    static RUNS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+    fn counting(url: &str, offset: u64, into: &mut [u8]) -> bool {
+        if url == "/data/r" {
+            RUNS.lock().unwrap().push((offset, into.len() as u64));
+        }
+        for (k, b) in into.iter_mut().enumerate() {
+            *b = ((offset + k as u64) % 251) as u8;
+        }
+        true
+    }
+
+    /// A read at the start fetches its chunk only; sequential misses read
+    /// ahead 1, 2, 4... chunks; a jump starts over.
+    #[test]
+    fn lazy_readahead_grows_only_when_sequential() {
+        set_lazy_fetch(fake);
+        let fs = TmpFs::new();
+        fs.add_lazy("/r/f", 40 * LAZY_CHUNK, "/data/r");
+        let h = fs.open("r/f", 0, 0).unwrap();
+        let mut b = vec![0u8; 4096];
+        let mut at = 0;
+        while at < 12 * LAZY_CHUNK {
+            h.read_at(at, &mut b).unwrap();
+            at += 4096;
+        }
+        h.read_at(30 * LAZY_CHUNK, &mut b).unwrap();
+        let runs: Vec<(u64, u64)> = RUNS.lock().unwrap().iter().map(|&(o, n)| (o / LAZY_CHUNK, n / LAZY_CHUNK)).collect();
+        // (start chunk, chunks): the read's own, then 1, 2, 4, 8 ahead
+        assert_eq!(runs, vec![(0, 1), (1, 2), (3, 3), (6, 5), (11, 9), (30, 1)]);
     }
 
     #[test]
