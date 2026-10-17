@@ -2716,6 +2716,26 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
 /// per 256 MiB step a process reaches. A rare event, so on by default.
 fn w3_note_reach(to: u64, why: &str, start: u64, end: u64) {
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 30);
+    // Unguarded units fold only constant KUSER_SHARED_DATA addresses (cgen):
+    // a computed one into Windows' old page is caught by the engine's bounds
+    // check only while the memory ends below it. Past it, such a read would
+    // succeed with whatever is there, so say so, once, by default. The
+    // heap's own reach (`HEAP_REACH`, recorded where nothing may allocate)
+    // is checked here too, at the next mapping.
+    static KUSER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let reach = to.max(HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed));
+    if nt::w3_compact()
+        && gex_abi::kuser_fold()
+        && reach > gex_abi::KUSER_WINDOWS
+        && !KUSER_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        warn_line(&format!(
+            "gex: CRITICAL: W3 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}); unguarded units may read it\n",
+            my_pid(),
+            gex_abi::KUSER_WINDOWS,
+            reach,
+        ));
+    }
     if !nt::w3_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
