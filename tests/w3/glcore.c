@@ -26,6 +26,8 @@
 #define GL_STATIC_DRAW 0x88E4
 #define GL_READ_FRAMEBUFFER 0x8CA8
 #define GL_DRAW_FRAMEBUFFER 0x8CA9
+#define GL_BGRA 0x80E1
+#define GL_TEXTURE_3D 0x806F
 
 static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok  " : "FAIL", name); fflush(stdout); if (!ok_) failures++; } while (0)
@@ -49,6 +51,10 @@ PROC(void, glGenFramebuffers, (GLsizei, GLuint *))
 PROC(void, glBindFramebuffer, (GLenum, GLuint))
 PROC(void, glFramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))
 PROC(GLenum, glCheckFramebufferStatus, (GLenum))
+PROC(void, glGetInternalformativ, (GLenum, GLenum, GLenum, GLsizei, GLint *))
+PROC(void, glFramebufferTexture1D, (GLenum, GLenum, GLenum, GLuint, GLint))
+PROC(void, glFramebufferTexture3D, (GLenum, GLenum, GLenum, GLuint, GLint, GLint))
+PROC(void, glTexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))
 PROC(void, glGenVertexArrays, (GLsizei, GLuint *))
 PROC(void, glBindVertexArray, (GLuint))
 PROC(void, glGenBuffers, (GLsizei, GLuint *))
@@ -177,6 +183,23 @@ static HWND fake_window(int keep) {
     return f;
 }
 
+/* Clear the bound framebuffer blue, draw the red program over a W x H
+ * viewport, and read the middle back: an attachment that is "complete" but
+ * cannot be rendered into reads blue (or errors). */
+static void draw_check(GLuint prog, int w, int h, const char *name) {
+    unsigned char px[4] = {0};
+    char what[128];
+    glViewport(0, 0, w, h);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    pglUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    GLenum err = glGetError();
+    snprintf(what, sizeof(what), "%s: drawn red (%u %u %u %u, error %#x)", name, px[0], px[1], px[2], px[3], err);
+    CHECK(what, px[0] > 200 && px[1] < 50 && px[2] < 50 && err == GL_NO_ERROR);
+}
+
 int main(void) {
     WNDCLASSW wc = {0};
     wc.style = CS_OWNDC;
@@ -212,6 +235,7 @@ int main(void) {
     LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glGetAttachedShaders); LOAD(glBindAttribLocation);
     LOAD(glLinkProgram); LOAD(glGetProgramiv); LOAD(glGetProgramInfoLog); LOAD(glUseProgram);
     LOAD(glGenFramebuffers); LOAD(glBindFramebuffer); LOAD(glFramebufferTexture2D); LOAD(glCheckFramebufferStatus);
+    LOAD(glGetInternalformativ); LOAD(glFramebufferTexture1D); LOAD(glFramebufferTexture3D); LOAD(glTexImage3D);
     LOAD(glGenVertexArrays); LOAD(glBindVertexArray); LOAD(glGenBuffers); LOAD(glBindBuffer); LOAD(glBufferData);
     LOAD(glVertexAttribPointer); LOAD(glEnableVertexAttribArray); LOAD(glBlitFramebuffer);
     CHECK("entry points", pglCreateShader && pglGetAttachedShaders && pglCheckFramebufferStatus && pglGenVertexArrays);
@@ -257,6 +281,53 @@ int main(void) {
     GLenum err = glGetError();
     snprintf(what, sizeof(what), "no GL error (%#x)", err);
     CHECK(what, err == GL_NO_ERROR);
+
+    /* wined3d's format probe (check_fbo_compat): a 16-texel 1D texture and a
+     * 16x16x16 3D one as the only colour attachment. When these are
+     * incomplete every format loses its render-target cap for 1D and 3D, and
+     * D3D11's CreateTexture1D of a render target fails (Hades). */
+    for (int i = 0; i < 2; i++) {
+        const GLenum fmt = i ? GL_BGRA : GL_RGBA;
+        GLuint t1 = 0, t3 = 0, f = 0;
+        pglGenFramebuffers(1, &f);
+        pglBindFramebuffer(GL_FRAMEBUFFER, f);
+        glGenTextures(1, &t1);
+        glBindTexture(GL_TEXTURE_1D, t1);
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA8, 16, 0, fmt, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        pglFramebufferTexture1D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_1D, t1, 0);
+        status = pglCheckFramebufferStatus(GL_FRAMEBUFFER);
+        snprintf(what, sizeof(what), "1D RGBA8 texture FBO complete (%s data, %#x, error %#x)", i ? "BGRA" : "RGBA", status, glGetError());
+        CHECK(what, status == GL_FRAMEBUFFER_COMPLETE);
+        draw_check(usual, 16, 1, i ? "1D (BGRA data)" : "1D (RGBA data)");
+        pglFramebufferTexture1D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_1D, 0, 0);
+        glGenTextures(1, &t3);
+        glBindTexture(GL_TEXTURE_3D, t3);
+        pglTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 16, 16, 16, 0, fmt, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        pglFramebufferTexture3D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_3D, t3, 0, 0);
+        status = pglCheckFramebufferStatus(GL_FRAMEBUFFER);
+        snprintf(what, sizeof(what), "3D RGBA8 texture FBO complete (%s data, %#x, error %#x)", i ? "BGRA" : "RGBA", status, glGetError());
+        CHECK(what, status == GL_FRAMEBUFFER_COMPLETE);
+        draw_check(usual, 16, 16, i ? "3D slice 0 (BGRA data)" : "3D slice 0 (RGBA data)");
+        pglBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glDeleteTextures(1, &t1);
+        glDeleteTextures(1, &t3);
+    }
+    /* ...and, where ARB_internalformat_query2 is there, wined3d asks this
+     * instead of attaching (init_format_fbo_compat_info): it has to agree
+     * with the completeness checks above. */
+    if (pglGetInternalformativ) {
+        static const GLenum targets[] = {GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D};
+        static const char *const names[] = {"1D", "2D", "3D"};
+        for (int i = 0; i < 3; i++) {
+            GLint v = -1;
+            pglGetInternalformativ(targets[i], GL_RGBA8, 0x8289 /* GL_FRAMEBUFFER_RENDERABLE */, 1, &v);
+            snprintf(what, sizeof(what), "%s RGBA8 framebuffer renderable by query (%#x, error %#x)", names[i], v, glGetError());
+            CHECK(what, v == 0x82B7 /* GL_FULL_SUPPORT */);
+        }
+    }
+    glViewport(0, 0, 64, 64);
 
     /* wined3d presents by blitting its offscreen target into the window's back
      * buffer, flipped in Y (its targets are upside down). The FBO: bottom half
