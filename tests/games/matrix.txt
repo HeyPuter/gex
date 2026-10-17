@@ -44,7 +44,7 @@ retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles   
 warfork-linux|linux|Warfork                              |@warfork.x86_64                     | |-|-|-
 
 # x86-64 Windows games on W64 (64-bit native Wine, LLP64 lowered to wasm32).
-oneshot      |w64  |OneShot                              |steamshim.exe                       | |-|-|-|pe=ucrtbase.dll
+oneshot      |w64  |OneShot                              |steamshim.exe                       | |610|-|-|pe=ucrtbase.dll
 deltarune    |w64  |DELTARUNE                            |DELTARUNE.exe                       | |-|-|-
 will-you-snail|w64 |Will You Snail                       |Will You Snail.exe                  | |-|-|-
 hyper-light  |w64  |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-

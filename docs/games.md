@@ -353,6 +353,50 @@ above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
 images, stacks and the 512 MiB transient reservation are placed. So all
 three need a 64-bit guest memory (docs/mem64.md).
 
+## Game pages (stream G, 2026-10-17)
+
+Each runnable corpus game is served as a page on its own port, on the
+tailnet only. The sites hold the games' files, so they are private: they are
+never committed or published, and are built and served outside the tree
+(stream G's scratch). The port is 4400 plus the game's row index in
+tests/games/matrix.txt, so it stays fixed; rows without a page keep their number.
+
+A site is the eject web build (`web/build-eject-page.sh`: app.mjs, the x86
+shim, kernel, Mesa, Xwayland) with a small page of its own that calls
+`start()` with the game's launch: a bundle tar (the prefix's small files,
+Wine's Unix side and `share/`, xkb; for Linux games the guest GL, the libraries
+and the host files the game opens, and the program itself) and lazy files
+fetched as read (the game, the rest of Wine, the prefix's big DLLs). W3 pages
+pin each DLL at the base its native runs used (the prefix's `dll-bases`) and
+ship the function-tier units built for those bases by the page's own gexc
+(unit keys follow gex-cgen's sources). No recording is needed, unlike
+`gexc eject`.
+
+| port | game | kind | page (gooner, headless Chromium, SwiftShader; correctness only) |
+|---|---|---|---|
+| 4400 | Undertale | w3 | Wine boots, the game's window is up |
+| 4401 | Katana ZERO | w3 | served |
+| 4402 | N++ | w3 | served |
+| 4403 | Momodora | w3 | served |
+| 4404 | Retrocycles | w3 | served |
+| 4405 | Hades (x86) | w3 | served; natively stops at the ucrtbase rewind trap (fix in the gate) |
+| 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
+| 4407 | Retrocycles | linux-x11 | **language menu** |
+| 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
+| 4409 | OneShot | w64 | **title menu** (Start / Settings / Exit) |
+| - | DELTARUNE, Will You Snail | w64 | no page: fixed base 0x140000000 without relocations, needs memory64 |
+| 4412 | Hyper Light Drifter | w64 | served |
+| 4413 | Dicey Dungeons | w64 | **language menu** |
+| 4414 | Geometry Dash | w64 | served |
+| 4415 | 5D Chess | w64 | served |
+| 4416 | Mosa Lina | w64 | served |
+| 4417 | Spelunky 2 | w64 | served; natively a blank window |
+| 4418 | Hades | w64 | served |
+| 4419 | Baba Is You | w64 | served |
+| 4420 | Warfork | w64 | served |
+| - | TUNIC | w64 | no page: needs memory64 |
+| - | blocked, idea and dotnet rows | | no page: listed only |
+
 ## Games matrix, 2026-10-16 (stream G: W3, W64 and Linux)
 
 The x64 Windows rows run on W64 now (kind `w64`): W64_DIST's loader with
