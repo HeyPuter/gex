@@ -372,28 +372,28 @@ ship the function-tier units built for those bases by the page's own gexc
 (unit keys follow gex-cgen's sources). No recording is needed, unlike
 `gexc eject`.
 
-| port | game | kind | page (gooner, headless Chromium, SwiftShader; correctness only) |
+| port | game | kind | page at master 266f95cf (gooner, headless Chromium, SwiftShader, 480 s smoke; correctness only) |
 |---|---|---|---|
-| 4400 | Undertale | w3 | Wine boots, the game's window is up |
-| 4401 | Katana ZERO | w3 | served |
-| 4402 | N++ | w3 | served |
-| 4403 | Momodora | w3 | served |
-| 4404 | Retrocycles | w3 | served |
-| 4405 | Hades (x86) | w3 | served; natively stops at the ucrtbase rewind trap (fix in the gate) |
+| 4400 | Undertale | w3 | **intro renders** |
+| 4401 | Katana ZERO | w3 | **title menu** |
+| 4402 | N++ | w3 | window up, then the process exits within 120 s (no exception report) |
+| 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
+| 4404 | Retrocycles | w3 | **language menu** |
+| 4405 | Hades (x86) | w3 | shim trap in syscall 162 (the ucrtbase rewind); needs the W3 dist with the fix and new units |
 | 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
 | 4407 | Retrocycles | linux-x11 | **language menu** |
 | 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
 | 4409 | OneShot | w64 | **title menu** (Start / Settings / Exit) |
 | - | DELTARUNE, Will You Snail | w64 | no page: fixed base 0x140000000 without relocations, needs memory64 |
-| 4412 | Hyper Light Drifter | w64 | served |
+| 4412 | Hyper Light Drifter | w64 | runs, but the window stays black |
 | 4413 | Dicey Dungeons | w64 | **language menu** |
-| 4414 | Geometry Dash | w64 | served |
-| 4415 | 5D Chess | w64 | served |
-| 4416 | Mosa Lina | w64 | served |
-| 4417 | Spelunky 2 | w64 | served; natively a blank window |
-| 4418 | Hades | w64 | served |
-| 4419 | Baba Is You | w64 | served |
-| 4420 | Warfork | w64 | served |
+| 4414 | Geometry Dash | w64 | **menu** |
+| 4415 | 5D Chess | w64 | asks for a GL 3.3 core context; the page gives 3.2 (3.3 needs dual-source blending, which SwiftShader lacks) |
+| 4416 | Mosa Lina | w64 | "OpenGL 3.2+ is required": the same GL version limit |
+| 4417 | Spelunky 2 | w64 | needs D3D11 feature level 11.0; wined3d on GL 3.2 gives 10.1. Natively a blank window |
+| 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
+| 4419 | Baba Is You | w64 | **renders** (credits screen) |
+| 4420 | Warfork | w64 | error dialog: "Couldn't open UDP socket: setsockopt: Unknown error" |
 | - | TUNIC | w64 | no page: needs memory64 |
 | - | blocked, idea and dotnet rows | | no page: listed only |
 
