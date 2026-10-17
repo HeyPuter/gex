@@ -258,8 +258,14 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
             # the run copy; the original stays beside it as .orig.
             sn=${x#stub=}; sn=${sn%@*}; sp=$ov/${x#*@}
             [ -e "$sp" ] && mv "$sp" "$sp.orig"
-            "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
-                echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2 ;;
+            # MATRIX_STUBS=DIR: prebuilt DIR/NAME-ARCH.dll (a host without
+            # mingw-w64, e.g. a bench box).
+            if [ -n "${MATRIX_STUBS:-}" ] && [ -f "$MATRIX_STUBS/$sn-$arch.dll" ]; then
+                cp "$MATRIX_STUBS/$sn-$arch.dll" "$sp"
+            else
+                "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
+                    echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2
+            fi ;;
         host=*) ;;
         *) gflags+=("$x") ;;
         esac
