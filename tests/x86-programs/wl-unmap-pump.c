@@ -3,10 +3,13 @@
  * 64x64 toplevel from a wl_shm buffer, waits for a wl_display.sync to come
  * back (so the compositor has pumped and published the window), then destroys
  * the toplevel, its xdg_surface and its wl_surface, and blocks on a futex for
- * 3 s with nothing else running. Its process's compositor runs on that
- * process's own scheduler turns: the futex wait's turn has to pump it, or the
- * page goes on drawing the destroyed window (and handing it clicks) until the
- * process next passes the scheduler. Prints `mapped`, `destroyed` and `woke`
+ * 3 s with nothing else running -- or, with the argument `spin`, keeps
+ * running for 3 s, making system calls that never wait (getppid). Its
+ * process's compositor runs on that process's own scheduler turns: the futex
+ * wait's turn has to pump it, and a process that keeps running has its
+ * requests pumped when it sends them; otherwise the page goes on drawing the
+ * destroyed window (and handing it clicks) until the process next passes the
+ * scheduler. Prints `mapped`, `destroyed` and `woke`
  * with CLOCK_REALTIME in ms, which is the page's clock (gex.mjs hostNowNs);
  * the script compares them with the headless compositor's publish times
  * (GEX_WL_STUB_LOG). */
@@ -123,7 +126,7 @@ static void wl_bind(uint32_t name, const char *iface, uint32_t id) {
 	end();
 }
 
-int main(void) {
+int main(int argc, char **argv) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	struct sockaddr_un sa = { .sun_family = AF_UNIX };
 	const char *dir = getenv("XDG_RUNTIME_DIR");
@@ -200,10 +203,17 @@ int main(void) {
 	end();
 	flush(-1);
 	printf("destroyed t=%.1f\n", now_ms());
-	/* Nothing else runs: a 3 s wait only its deadline ends. */
-	static int word;
-	struct timespec ts = { 3, 0 };
-	syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, &ts, NULL, 0);
+	if (argc > 1 && !strcmp(argv[1], "spin")) {
+		/* Running on: calls that never wait, so no scheduler turn. */
+		double until = now_ms() + 3000;
+		while (now_ms() < until)
+			syscall(SYS_getppid);
+	} else {
+		/* Nothing else runs: a 3 s wait only its deadline ends. */
+		static int word;
+		struct timespec ts = { 3, 0 };
+		syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, &ts, NULL, 0);
+	}
 	printf("woke t=%.1f\n", now_ms());
 	return 0;
 }

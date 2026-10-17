@@ -6941,11 +6941,18 @@ fn count_syscall(nr: u64, ctx: u64) {
 /// syscall); a redirect or exit traps out to JS, the way the native host
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 /// On the way back this Worker's function table is grown if another Worker
-/// allocated past it meanwhile (`cgen::ftab_resume`, X's B16).
+/// allocated past it meanwhile (`cgen::ftab_resume`, X's B16), and the
+/// compositor pumped if the call wrote to (or closed) its socket: a client
+/// that keeps running reaches no scheduler turn, and its requests waited
+/// for one (X's B2: Wine's destroyed context menu stayed on top, catching
+/// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     syscall_entry(ctx, pc);
     cgen::ftab_resume();
+    if gex_kernel::unix::take_host_sent() {
+        pump_compositor();
+    }
 }
 
 fn syscall_entry(ctx: i32, pc: i64) {
