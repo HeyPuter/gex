@@ -223,6 +223,10 @@ impl std::fmt::Debug for Mm {
     }
 }
 
+/// What a host's `back` hook answers for a range it keeps as an island
+/// (see `MemoryMap::grows_on_demand`).
+pub const BACKED_ISLAND: u64 = u64::MAX;
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
@@ -249,11 +253,15 @@ pub struct MemoryMap {
     /// Make the host's memory reach an address, for a mapping the guest
     /// placed itself rather than one the arena handed out.
     ///
-    /// It answers where the shared cursor stood before (`None` when the memory
-    /// would not grow). The cursor only moves up, atomically, so the bytes
-    /// between that and `end` are this map's alone, and are recorded as arena
-    /// for later mappings to use.
-    back: Option<fn(u64) -> Option<u64>>,
+    /// Called with the mapping's `[start, end)`. It answers where the
+    /// shared cursor stood before (`None` when the memory would not grow).
+    /// The cursor only moves up, atomically, so the bytes between that and
+    /// `end` are this map's alone, and are recorded as arena for later
+    /// mappings to use. A host may instead leave the cursor where it is and
+    /// answer [`BACKED_ISLAND`], keeping the range as an island its cursor
+    /// steps over (W3 in the browser): backed, the guest's for mappings placed
+    /// there, and never arena.
+    back: Option<fn(u64, u64) -> Option<u64>>,
     /// Bumped by every change to the map. `/proc/self/maps` is derived from the
     /// tree; a counter lets a cached rendering be reused unchanged instead of
     /// reformatting on every read (measured half of an X server's time in
@@ -284,6 +292,10 @@ pub struct MemoryMap {
     /// The span the last [`Self::extend_arena`] took, until the caller asks
     /// ([`Self::take_fresh`]): memory nothing has been in, so zero.
     fresh: Option<(u64, u64)>,
+    /// The end of the span the cursor last handed this map (`extend_arena`):
+    /// where a free tail is looked for. Not simply the highest span, which
+    /// may be an island above the cursor (see `back`).
+    take_end: u64,
     /// What the mapping calls leave for the host and for each other, under
     /// the same lock as the map they describe ([`MapLog`]).
     pub log: MapLog,
@@ -431,6 +443,7 @@ impl MemoryMap {
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
             clean: Vec::new(),
             fresh: None,
+            take_end: 0,
             log: MapLog::default(),
         }
     }
@@ -556,10 +569,11 @@ impl MemoryMap {
 
     /// Hand out arena addresses bottom-up, for a host whose memory must be
     /// allocated up to whatever it hands out.
-    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> Option<u64>) {
+    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64, u64) -> Option<u64>) {
         self.take = Some(take);
         self.back = Some(back);
         self.arena.clear();
+        self.take_end = 0;
     }
 
     /// Take `[lo, hi)` as this map's own arena: the host has backed it and
@@ -673,7 +687,7 @@ impl MemoryMap {
             // placement window lies above what a process starts with).
             if end <= floor {
                 if let Some(back) = self.back {
-                    back(end).ok_or(Errno::ENOMEM)?;
+                    back(start, end).ok_or(Errno::ENOMEM)?;
                 }
             }
             return Ok(());
@@ -681,9 +695,17 @@ impl MemoryMap {
         let Some(back) = self.back.filter(|_| end <= MMAP_TOP) else {
             return Err(Errno::ENOMEM);
         };
-        let Some(prev) = back(end) else {
+        let Some(prev) = back(start, end) else {
             return Err(Errno::ENOMEM);
         };
+        // An island's range (W3's pinned DLL band, in the browser): backed and
+        // the guest's, but never this map's arena. Adopted, an image's slot
+        // went to the next bottom-up mapping once the image was unmapped, and
+        // the image loaded again (uxtheme, in Paint) relocated and missed its
+        // unit.
+        if prev == BACKED_ISLAND {
+            return Ok(());
+        }
         // What the cursor stepped over is backed now and nobody else's:
         // arena, so the next mapping lands in it rather than growing the
         // memory again. Without this a MAP_FIXED high up (a pinned library,
@@ -691,10 +713,8 @@ impl MemoryMap {
         // cursor and itself.
         let prev = prev.max(floor);
         if prev < end {
-            match self.arena.last_mut() {
-                Some(last) if last.1 == prev => last.1 = end,
-                _ => self.arena.push((prev, end)),
-            }
+            // Sorted, not pushed: an island lies above spans taken later.
+            self.adopt_arena(prev, end);
         }
         if ours(self) {
             Ok(())
@@ -707,7 +727,7 @@ impl MemoryMap {
     /// mapping and the end of the highest span. A fresh claim continues from
     /// here so the tail the last user gave back is spent first.
     fn free_tail(&self) -> u64 {
-        let Some(&(lo, hi)) = self.arena.last() else {
+        let Some(&(lo, hi)) = self.arena.iter().find(|s| s.1 == self.take_end) else {
             return 0;
         };
         let top = self
@@ -763,12 +783,14 @@ impl MemoryMap {
         // one region, but the free-hole search runs within a single span and
         // would miss a hole straddling a boundary -- glibc's ordinary heap
         // pattern, which reached the 2 GiB ceiling and aborted.
-        if let Some(last) = self.arena.last_mut() {
-            if last.1 == start {
-                last.1 = start + want;
-                self.fresh = Some((start, start + want));
-                return Ok(start - tail);
-            }
+        let take_end = self.take_end;
+        if let Some(last) = self.arena.iter_mut().find(|s| s.1 == start && start == take_end) {
+            last.1 = start + want;
+            self.take_end = start + want;
+            self.fresh = Some((start, start + want));
+            // An island may begin right where this span now ends.
+            self.adopt_arena(start, start + want);
+            return Ok(start - tail);
         }
         // Record the span and hand back its start. A single `take` is one
         // contiguous claim whatever the cursor does; a `29f6e7f` change added a
@@ -782,7 +804,8 @@ impl MemoryMap {
         // only under-backed case is a mapping larger than a CHUNK that followed
         // a freed tail, which is rare and predates this code -- fix that in the
         // mmap path if it ever bites, not with a second racing take.
-        self.arena.push((start, start + want));
+        self.adopt_arena(start, start + want);
+        self.take_end = start + want;
         self.fresh = Some((start, start + want));
         Ok(start)
     }
@@ -1076,7 +1099,7 @@ impl MemoryMap {
         if prot & prot::EXEC == 0 && origin.is_none() {
             if let Some(start) = self.find_high(len) {
                 if let Some(back) = self.back {
-                    back(start + len).ok_or(Errno::ENOMEM)?;
+                    back(start, start + len).ok_or(Errno::ENOMEM)?;
                 }
                 self.insert_from(start, start + len, prot, name, origin);
                 return Ok(start);
@@ -1408,7 +1431,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         let mut m = MemoryMap::new(0x40_1000);
@@ -1434,7 +1457,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
@@ -1485,7 +1508,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x2000_0000, std::sync::atomic::Ordering::SeqCst);
@@ -1526,7 +1549,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x5000_0000, std::sync::atomic::Ordering::SeqCst);
@@ -1611,7 +1634,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
@@ -1631,6 +1654,41 @@ mod tests {
         assert!(next < high && next > first, "{next:#x}");
         assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
         assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
+    }
+
+    /// A host's island (W3's pinned DLL band): a fixed mapping there is
+    /// backed but never becomes arena, so once it is unmapped the next
+    /// bottom-up mapping does not take its slot, and the image mapped there
+    /// again gets its address back.
+    #[test]
+    fn an_islands_slot_is_not_reused_by_the_arena() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(start: u64, end: u64) -> Option<u64> {
+            if start >= 0x1100_0000 && end <= 0x2000_0000 {
+                return Some(BACKED_ISLAND);
+            }
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x0800_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        // The arena's first chunk, full: a free slot anywhere else in the
+        // arena would be the next bottom-up mapping's.
+        m.mmap(0, 0x80_0000, 3, anon, "filler").unwrap();
+        let pin = 0x1150_0000;
+        let cursor = NEXT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(m.mmap(pin, 0x10_0000, 3, anon | flags::FIXED_NOREPLACE, "dll"), Ok(pin));
+        assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the cursor moved");
+        m.unmap(pin, 0x10_0000).unwrap();
+        for _ in 0..4 {
+            let a = m.mmap(0, 0x4_0000, 3, anon, "heap").unwrap();
+            assert!(a + 0x4_0000 <= pin || a >= pin + 0x10_0000, "the slot went to {a:#x}");
+        }
+        assert_eq!(m.mmap(pin, 0x10_0000, 3, anon | flags::FIXED_NOREPLACE, "dll again"), Ok(pin));
     }
 
     #[test]
@@ -1684,7 +1742,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);

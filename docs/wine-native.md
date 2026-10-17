@@ -1300,6 +1300,50 @@ from `make paths`, never from this list. The gate's W3 legs
 (`scratch/K/gate-w3legs/run.sh`) build and use them; `FROZEN=1` keeps the
 older frozen inputs.
 
+### 3.19 W3's address space and the size of its memories (2026-10-15)
+
+Each wasm memory counts its whole size towards the browser tab's data
+segment (Chrome's renderer RLIMIT_DATA), whether touched or not. A W3
+process's memory is as large as the highest address it maps, so W3 keeps
+everything Windows puts at fixed addresses low. Target: the whole tab under
+8 GiB VmData on Linux (`harness/legs/v/vmdata.sh`).
+
+| Range | What | Where it is set |
+|---|---|---|
+| 0x00010000-0x04ff0000 | Wine's one reservation: executables at 0x00400000 and 0x01000000 | ntdll unix `mmap_init` |
+| 0x04ff0000-0x04ff1000 | KUSER_SHARED_DATA (`WINE_USER_SHARED_DATA`, `gex_abi::W3_KUSER`) | `include/wine/kuser.h` |
+| 0x10000000-0x11000000 | executables linked at 0x10000000 (Wine's services, explorer, ...) | gex island, `nt.rs` `keep_exe_slot` |
+| 0x11000000-0x20000000 | the DLLs a bundle pins (its prefix's dll-bases; the shell uses 67 MiB of 240) | soju `dll-bases.py`; the same island |
+| the rest | Wine's views and gex's heap, bottom-up from the kernel's arena | ntdll unix `map_view`, gex `memmap` |
+
+- **No eager split.** W3 does not grow the memory to 2 GiB at start
+  (`w3_windows_space`, the compact space): the memory grows on demand, as
+  every other process's does. The start-up crashes that the eager grow had
+  hidden (and that `GEX_PREGROW` was a probe for) were execve's donation of
+  the dead arena above the cursor, which the heap then took a second time.
+  The donation is now capped at the cursor; no pre-grow was added.
+- **Views bottom-up.** Under `__wasm32__` ntdll takes its views from the
+  kernel's arena, lowest free range first, and ignores MEM_TOP_DOWN. A
+  relocatable DLL that no one pinned also goes there, not to its
+  preferred base.
+- **KUSER_SHARED_DATA at 0x04ff0000.** Windows code reads the page at
+  0x7ffe0000 by constant address. The address is defined once, in
+  `include/wine/kuser.h`, which ntdll (unix and PE), kernel32, kernelbase,
+  win32u and ntoskrnl use. Wine's wasm records it in a `gex_kuser` custom
+  section; `wasm-elf.py` checks that the section equals `W3_KUSER` and sets
+  the header flag `FLAG_KUSER_W3`. With the flag set, gex folds every
+  constant displacement inside 0x7ffe0000-0x7ffe0fff to the new page:
+  the lifter for each addressing form with an absolute displacement, and
+  tier 1 and cgen for constant effective addresses. Units built this way
+  carry `:w3kuser` in their key (`gexc cgen-image --w3-kuser`). Any other
+  access at or above 0x7ffe0000, such as a pointer computed at run time,
+  prints `KUSER access not folded at pc X (module+off)` and is delivered
+  to Wine as an access violation reading that address. There is no
+  emulation fallback: an unfolded form that shows up in practice is a
+  translator bug. The `[gex] kuser:` lines count the folds per translation
+  and per module. `tests/nt/src/kuser.c` (`kuser const`, `kuser pointer`)
+  covers both cases.
+
 ### 3.9 x64 programs (later)
 
 Superseded by docs/wine-native-x64.md (stream W64, 2026-10-14): no

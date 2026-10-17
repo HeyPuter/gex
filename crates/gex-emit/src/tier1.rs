@@ -126,6 +126,7 @@ mod code {
     pub const I64_EXTEND16_S: u8 = 0xc3;
     pub const I64_EXTEND32_S: u8 = 0xc4;
     pub const I64_LT_U: u8 = 0x54;
+    pub const I64_GE_U: u8 = 0x5a;
     pub const I64_SUB: u8 = 0x7d;
     pub const I32_EQZ: u8 = 0x45;
     pub const I32_EQ: u8 = 0x46;
@@ -245,7 +246,7 @@ fn t1_fold() -> bool {
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
 pub fn knobs() -> u8 {
-    inline_dispatch() as u8 | (t1_fold() as u8) << 1
+    inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2
 }
 
 /// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
@@ -424,7 +425,13 @@ pub fn set_guard_limit(limit: u64) {
 }
 
 fn guard_limit() -> u64 {
-    GUARD_LIMIT.load(Ordering::Relaxed)
+    let g = GUARD_LIMIT.load(Ordering::Relaxed);
+    // W3 with KUSER_SHARED_DATA folded: the old page and above fault by name.
+    if gex_abi::kuser_fold() {
+        g.min(gex_abi::KUSER_GUARD)
+    } else {
+        g
+    }
 }
 
 /// More pcs for the same breakpoint, beside [`set_trap_pc`]'s: to watch a
@@ -1500,9 +1507,21 @@ impl<'a> Emitter<'a> {
         // Constant addresses are extremely common (literal pools, absolute
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
-            let ea = c.wrapping_add(offset as u64);
+            let mut ea = c.wrapping_add(offset as u64);
+            // W3: Windows' KUSER_SHARED_DATA page is W3's (`gex_abi::W3_KUSER`).
+            if let Some(f) = gex_abi::fold_kuser(ea) {
+                gex_ir::note_kuser_fold();
+                ea = f;
+            }
             if ea < guard_limit() {
                 self.f.i32_const(ea as i32);
+                return 0;
+            }
+            // Past the guard with folding on: the named fault, as for a
+            // pointer (`guard_to_i32`).
+            if gex_abi::kuser_fold() {
+                self.f.i64_const(ea as i64);
+                self.guard_to_i32();
                 return 0;
             }
             self.f.i32_const(POISON_ADDR as i32);
@@ -1608,6 +1627,32 @@ impl<'a> Emitter<'a> {
 
     fn guard_to_i32_inner(&mut self) {
         let t = self.scratch_i64;
+        // W3 with KUSER_SHARED_DATA folded: an address at or above the old
+        // page is a pointer the translator could not fold. A branch to the
+        // host's named fault (`BRK_KUSER_UNFOLDED`: an access violation),
+        // where the select would steer to a bare trap. The context holds
+        // what the block last wrote back, at its start's pc, as natively for
+        // an out-of-bounds access.
+        if gex_abi::kuser_fold() {
+            self.f.local_tee(t);
+            self.f.i64_const(guard_limit() as i64);
+            self.f.byte(code::I64_GE_U);
+            self.f.if_void();
+            self.store_pc(self.block_start);
+            self.f.local_get(self.ctx_local);
+            self.f.i64_const(self.block_start as i64);
+            self.f.local_get(t);
+            self.f.i64_const(32);
+            self.f.byte(code::I64_SHL);
+            self.f.byte(code::I64_OR);
+            self.f.i32_const(gex_abi::imports::BRK_KUSER_UNFOLDED);
+            self.f.call(self.cx.breakpoint);
+            self.f.unreachable();
+            self.f.end();
+            self.f.local_get(t);
+            self.f.byte(code::I32_WRAP_I64);
+            return;
+        }
         self.f.local_set(t);
         self.f.local_get(t);
         self.f.byte(code::I32_WRAP_I64);

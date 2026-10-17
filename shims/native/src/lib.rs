@@ -1306,6 +1306,14 @@ fn run_program_with(
         // x86-64 entries and the native return pad serve W64)
         if wasmprog::flags(program) & wasmprog::FLAG_WINDOWS_SPACE != 0 {
             store.data_mut().with_kernel(|k| k.mem.lock().set_mmap_top(0x7ffe_0000));
+            // An i386 Wine with KUSER_SHARED_DATA at W3's address: Windows'
+            // constant addresses folded there, the old page and above a
+            // named fault (`gex_abi::KUSER_GUARD`).
+            let f = wasmprog::flags(program);
+            if f & wasmprog::FLAG_GUEST_I386 != 0 && f & wasmprog::FLAG_KUSER_W3 != 0 {
+                gex_abi::set_kuser_fold(true);
+                gex_xlate::set_guard_limit(gex_abi::KUSER_GUARD);
+            }
             // The NT layer's trampoline page, which native Wine's gexrt
             // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
             // wrappers): the same bytes at the same address.
@@ -4205,6 +4213,33 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::BREAKPOINT,
         |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+            // W3 with KUSER_SHARED_DATA folded: an access at or above the old
+            // page through a pointer the translator could not fold. Named,
+            // then an access violation for Wine's handler (SIGSEGV without
+            // one); never a read there.
+            if imm == gex_abi::imports::BRK_KUSER_UNFOLDED {
+                let (pc, addr) = gex_abi::kuser_miss_unpack(pc);
+                let name = match w3_image_at(pc) {
+                    Some((n, off)) => format!("{n} +{off:#x}"),
+                    None => caller.data_mut().with_kernel(|k| {
+                        k.mem.lock().vma_at(pc).map(|v| {
+                            let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+                            format!("{} +{:#x}", n.rsplit('/').next().unwrap_or(n), pc - v.start)
+                        })
+                    }).unwrap_or_default(),
+                };
+                eprintln!("[gex] KUSER access not folded at pc {pc:#x} ({name}), address {addr:#x}: an access violation");
+                if deliver_guest_fault(&mut caller, fault_code::ACCESS_VIOLATION, pc, addr)? {
+                    return Err(StopExecution.into());
+                }
+                caller.data_mut().exit = Some(Exit::Signal {
+                    signal: signal::SIGSEGV,
+                    pc,
+                    detail: format!("KUSER access not folded at {pc:#x} ({name}), address {addr:#x}"),
+                    internal: false,
+                });
+                return Err(StopExecution.into());
+            }
             let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
@@ -4880,6 +4915,21 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         )
     };
     jit_stats::note(pc);
+    // W3's KUSER_SHARED_DATA folds (`gex_abi::fold_kuser`), by object: the
+    // translator's line for them, as the browser's.
+    let folds = gex_ir::take_kuser_folds();
+    if folds != 0 {
+        let name = match w3_image_at(pc) {
+            Some((n, _)) => n,
+            None => caller.data_mut().with_kernel(|k| {
+                k.mem.lock().vma_at(pc).map(|v| {
+                    let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+                    n.rsplit('/').next().unwrap_or(n).to_string()
+                })
+            }).unwrap_or_default(),
+        };
+        eprintln!("[gex] kuser: {folds} KUSER_SHARED_DATA access(es) folded translating {pc:#x} in {name}");
+    }
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
         let (name, start) = caller
             .data_mut()
@@ -6382,4 +6432,23 @@ fn fault_context(gm: &GuestMem<'_>, ctx: i32, pc: u64) {
     let names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
     let regs: Vec<String> = (0..16).map(|i| format!("{}={:#x}", names[i], gm.read_u64(c + gex_abi::ctx::X as u64 + 8 * i as u64).unwrap_or(0))).collect();
     eprintln!("gex-nt:   regs {}", regs.join(" "));
+}
+
+/// The PE images Wine mapped in this process (`gex.image_mapped`): base,
+/// end and file name. Wine maps an image into anonymous memory, so the
+/// memory map has no name for its code; the KUSER lines name it from here.
+static W3_IMAGES: std::sync::Mutex<Vec<(u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_w3_image(base: u64, size: u64, path: &str) {
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let mut g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    // A range mapped again (an image unloaded, another in its place).
+    g.retain(|&(b, e, _)| e <= base || base + size <= b);
+    g.push((base, base + size, name));
+}
+
+/// The W3 image holding `pc` and the offset into it.
+fn w3_image_at(pc: u64) -> Option<(String, u64)> {
+    let g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
 }

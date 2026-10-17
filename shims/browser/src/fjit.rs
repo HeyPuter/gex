@@ -513,6 +513,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     let t0 = crate::now_ns();
     let wasm = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32);
     TRANSLATE_NS.fetch_add(crate::now_ns().saturating_sub(t0), Ordering::Relaxed);
+    crate::note_kuser_folds(addr);
     if let Some(w) = &wasm {
         WASM_BYTES.fetch_add(w.len() as u64, Ordering::Relaxed);
     }

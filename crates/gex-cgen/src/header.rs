@@ -30,6 +30,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_CACHE_OP_NEST_EXIT_SAMPLE {}", gex_abi::cache_op::NEST_EXIT_SAMPLE);
     let _ = writeln!(w, "#define GEX_CACHE_OP_LOW_ACCESS {}", gex_abi::cache_op::LOW_ACCESS);
     let _ = writeln!(w, "#define GEX_GUEST_FLOOR 0x{:x}u", gex_abi::GUEST_FLOOR);
+    let _ = writeln!(w, "#define GEX_W3_KUSER 0x{:x}u", gex_abi::W3_KUSER);
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
     let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
@@ -127,6 +128,11 @@ pub fn header() -> String {
         w.push_str(&mem64_helpers());
     } else {
         w.push_str(BODY_HELPERS);
+        if gex_abi::kuser_fold() {
+            let _ = writeln!(w, "#define GEX_KUSER_GUARD 0x{:x}ull", gex_abi::KUSER_GUARD);
+            let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED ({})", imports::BRK_KUSER_UNFOLDED);
+            w.push_str(KUSER_HELPERS);
+        }
     }
     w.push_str(X87_HELPERS);
     w.push_str("#endif\n");
@@ -200,6 +206,24 @@ fn mem64_helpers() -> String {
     s.push_str(&b);
     s
 }
+
+/// W3 with KUSER_SHARED_DATA folded (`gex_abi::kuser_fold`): tier-1's
+/// guard against the old page (`guard_to_i32`). The address names the block
+/// it is in, for the host's diagnostic and the access violation.
+const KUSER_HELPERS: &str = r#"
+__attribute__((noinline, cold, noreturn, unused)) static void gex_kuser_miss(int ctx, uint64_t pc, uint64_t a) {
+    GEX_C64(GEX_CTX_PC) = pc;
+    gex_breakpoint(ctx, (int64_t)((pc & 0xffffffffull) | (a << 32)), GEX_BRK_KUSER_UNFOLDED);
+    __builtin_unreachable();
+}
+/* An address at or above Windows' old KUSER_SHARED_DATA page is one the
+ * translator could not fold: the named fault, never a read there. */
+GEX_INLINE uint32_t gex_k(int ctx, uint64_t pc, uint64_t a) {
+    if (__builtin_expect(a >= GEX_KUSER_GUARD, 0))
+        gex_kuser_miss(ctx, pc, a);
+    return (uint32_t)a;
+}
+"#;
 
 const BODY_HELPERS: &str = r#"
 #define GEX_INLINE static inline __attribute__((always_inline))

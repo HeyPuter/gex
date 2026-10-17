@@ -1039,10 +1039,9 @@ export class Gex {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
         this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
-      // A forked child of a W3 process splits its memory at its parent's
-      // line before anything claims arena -- this stack is the first claim,
-      // and a fresh instance's would otherwise go above the inherited image,
-      // which there is the top of the 2 GiB.
+      // A W3 process says so before anything claims arena -- this stack is
+      // the first claim: the NT layer's split at its parent's line, or W3's
+      // compact space (nothing grown; inherited regions become islands).
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).
@@ -1051,7 +1050,13 @@ export class Gex {
         this.#shim.exports.gex_worker_slots_reset?.();
         // Where its inherited mappings end, before the claim below picks its
         // arena floor (`gex_note_inherited`).
-        for (const end of this.#inheritedEnds) this.#shim.exports.gex_note_inherited?.(BigInt(end));
+        // With its start where the shim takes it: a W3 child keeps the
+        // regions as islands its arena steps over (`gex_note_inherited_range`).
+        const e = this.#shim.exports;
+        for (const [at, end] of this.#inheritedEnds) {
+          if (e.gex_note_inherited_range) e.gex_note_inherited_range(BigInt(at), BigInt(end));
+          else e.gex_note_inherited?.(BigInt(end));
+        }
         this.#inheritedEnds = [];
       }
       const at = this.#shim.exports.gex_worker_init?.(); 
@@ -2873,7 +2878,7 @@ export class Gex {
     step(`image copied, ${live()} non-zero bytes in the context`);
     this.#windowsSpace = child.windowsSpace ?? 0;
     this.#forkChild = true;
-    this.#inheritedEnds = child.image.map((r) => Math.max(r.end ?? 0, r.at + imageLen(r)));
+    this.#inheritedEnds = child.image.map((r) => [r.at, Math.max(r.end ?? 0, r.at + imageLen(r))]);
     await this.attach(shimWasm, guestWasm);
     step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
@@ -4826,6 +4831,9 @@ export class Gex {
       // process's start and written by the first boot's fill (§6.2).
       usd_copy: (dst, size) => this.#usdMove(dst >>> 0, size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(src >>> 0, size >>> 0, true),
+      // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
+      // address against it at start): 0x7ffe0000 from a shim without the fold.
+      kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,

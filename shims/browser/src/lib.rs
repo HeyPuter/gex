@@ -2523,6 +2523,8 @@ fn arena_take(len: u64) -> Option<u64> {
     }
     let at = memmap::skip_foreign(at, len);
     let end = at.checked_add(len)?;
+    // No line from here: this is the allocator's refill path (see below).
+    HEAP_REACH.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > nt::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
@@ -2635,18 +2637,9 @@ fn arena_take(len: u64) -> Option<u64> {
     // and claims its own bytes. Any grow already done is harmless -- this memory
     // only ever grows, so a span reserved and then lost is just skipped.
     // Grown by someone else while this grew: look again.
-    if memmap::skip_foreign(at, len) != at {
-        return arena_take(len);
-    }
-    if ARENA_NEXT
-        .compare_exchange(
-            cur,
-            end,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
+    // The check and the move under the memory map's lock, which an island
+    // (`arena_back`) is registered under too.
+    if memmap::take_span(&ARENA_NEXT, cur, at, len) {
         Some(at)
     } else {
         arena_take(len)
@@ -2662,7 +2655,7 @@ fn arena_take(len: u64) -> Option<u64> {
 /// Answers where the cursor stood before, so the kernel can keep the bytes it
 /// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
 /// `None` when the memory would not grow.
-fn arena_back(end: u64) -> Option<u64> {
+fn arena_back(start: u64, end: u64) -> Option<u64> {
     // The high arena of a 64-bit memory (docs/mem64.md §3): the memory grows
     // to cover it (V8 commits lazily), but the low arena's cursor -- which
     // this module's heap also takes from, and whose addresses cross to JS as
@@ -2685,8 +2678,31 @@ fn arena_back(end: u64) -> Option<u64> {
     if end > GUEST_LIMIT {
         return None;
     }
-    if !grow_memory_to(end) {
+    // W3's compact space: KUSER_SHARED_DATA's island at 0x7ffe0000 takes the
+    // memory to 2 GiB, the guard's limit, as the split did -- the 64 KiB
+    // above it (Windows' no-access region) a fault there, not a trap past
+    // the end of the memory.
+    let grow_to = if nt::w3_compact() && end > 0x7f00_0000 { end.max(0x8000_0000) } else { end };
+    w3_note_reach(grow_to, "a fixed mapping", start, end);
+    if !grow_memory_to(grow_to) {
         return None;
+    }
+    // W3's compact space: a mapping wholly above the cursor (KUSER_SHARED_DATA
+    // at 0x7ffe0000, an image at its base) is an island the cursor steps over
+    // when it gets there, not a jump that leaves everything below it unused --
+    // for the shim's heap too, whose ceiling is 2 GiB. The kernel does not
+    // take the island as arena: what is unmapped there stays free for the
+    // image pinned there, not for the next bottom-up mapping.
+    // One inside an island already (the executables' slot, an inherited
+    // region) is the guest's as it stands.
+    let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
+    if nt::w3_compact()
+        && (memmap::within_island(start, end)
+            || cur != 0 && start >= cur && memmap::claim_island(start, end, &ARENA_NEXT, "guest fixed mapping above the arena"))
+    {
+        // Backed, and never the kernel's arena: a pinned image's slot stays
+        // free for it once it is unmapped.
+        return Some(gex_kernel::mem::BACKED_ISLAND);
     }
     let prev = ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > prev {
@@ -2694,6 +2710,51 @@ fn arena_back(end: u64) -> Option<u64> {
     }
     Some(prev)
 }
+
+/// W3's compact space: say what makes a process's memory reach past 1 GiB
+/// (it should stay well under; each step costs the tab's data segment). Once
+/// per 256 MiB step a process reaches. A rare event, so on by default.
+fn w3_note_reach(to: u64, why: &str, start: u64, end: u64) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 30);
+    // Unguarded units fold only constant KUSER_SHARED_DATA addresses (cgen):
+    // a computed one into Windows' old page is caught by the engine's bounds
+    // check only while the memory ends below it. Past it, such a read would
+    // succeed with whatever is there, so say so, once, by default. The
+    // heap's own reach (`HEAP_REACH`, recorded where nothing may allocate)
+    // is checked here too, at the next mapping.
+    static KUSER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let reach = to.max(HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed));
+    if nt::w3_compact()
+        && gex_abi::kuser_fold()
+        && reach > gex_abi::KUSER_WINDOWS
+        && !KUSER_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        warn_line(&format!(
+            "gex: CRITICAL: W3 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}); unguarded units may read it\n",
+            my_pid(),
+            gex_abi::KUSER_WINDOWS,
+            reach,
+        ));
+    }
+    if !nt::w3_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let step = (to + (256 << 20) - 1) & !((256u64 << 20) - 1);
+    if SAID.fetch_max(step, std::sync::atomic::Ordering::Relaxed) >= step {
+        return;
+    }
+    warn_line(&format!(
+        "gex: W3 pid {}: memory reaches {} MiB for {why} [{start:#x}, {end:#x}); arena cursor {:#x}, highest arena span end {:#x}\n",
+        my_pid(),
+        to >> 20,
+        ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed),
+        HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+}
+
+/// The end of the highest span `arena_take` has handed out (the shim's heap
+/// and the kernel's arena both), for [`w3_note_reach`].
+static HEAP_REACH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How far the high arena has been backed (claimed in `memmap`).
 static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2705,6 +2766,9 @@ static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 fn arena_grow(len: u64) -> u64 {
     arena_note(0, len);
     let at = arena_take(len).unwrap_or(0);
+    if at != 0 {
+        w3_note_reach(at + len, "the kernel's arena", at, at + len);
+    }
     if at != 0 {
         memmap::claim(memmap::Kind::Guest, 0, at, at + len, "guest mapping (arena)");
     }
@@ -4107,6 +4171,27 @@ pub extern "C" fn gex_note_inherited(end: u64) {
     if end <= nt::arena_ceiling() {
         ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// [`gex_note_inherited`] with the region's start. In W3's compact space
+/// (`nt::w3_compact`, set by `gex_adopt_windows_space` just before) an
+/// inherited region in the arena is an island the child's cursor steps
+/// over, not a floor: the parent's fixed mappings reach 2 GiB
+/// (KUSER_SHARED_DATA), so a floor above them left the child's heap no room,
+/// and everything between them is the parent's heap, which the child never
+/// reads.
+#[no_mangle]
+pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
+    w3_note_reach(end, "an inherited region", start, end);
+    if nt::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= nt::arena_ceiling() {
+        let start = start.max(gex_abi::ARENA_BOTTOM);
+        if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
+            && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
+        {
+            return;
+        }
+    }
+    gex_note_inherited(end);
 }
 
 /// Give this instance's slot back (`gex_worker_init`): the last call the
@@ -8637,19 +8722,33 @@ pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
     mem.set_mmap_top(lo);
 }
 
-/// The kernel's half of W3's address-space split (see
-/// `nt::split_windows_space`): no mapping above KUSER_SHARED_DATA unless asked
-/// for there, what the host left below 2 GiB the process's own arena, and the
-/// i386 code kept off the shim's heap above it.
+/// The kernel's half of a W3 process's address space: no mapping above
+/// KUSER_SHARED_DATA unless asked for there, and the i386 code kept off
+/// whatever is above 2 GiB. With the NT layer's split (`lo` its line), what
+/// the host left below 2 GiB is the process's own arena; with W3's compact
+/// space (`nt::w3_windows_space`) the arena grows on demand, shared with
+/// the shim's heap, as for any process.
 pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     mem.set_mmap_top(0x7ffe_0000);
-    mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    if !nt::w3_compact() {
+        mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+    }
     // And the low space a wasm32 program leaves free, between the dispatch
     // directory and its stack (its image and break are above, in the
     // placement window): where a Windows executable's 0x400000 is.
     mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
     // An access there faults, as in the NT layer.
     gex_xlate::set_guard_limit(0x8000_0000);
+}
+
+/// `gex.kuser_address()` (W3's Wine, at start): where this gex has i386
+/// code read KUSER_SHARED_DATA. `gex_abi::W3_KUSER` when the loader's
+/// header asked for the fold (`FLAG_KUSER_W3`), else Windows' 0x7ffe0000.
+/// Wine stops at once when it maps the page elsewhere, rather than run with
+/// every constant read of it landing on nothing.
+#[no_mangle]
+pub extern "C" fn gex_kuser_address() -> u32 {
+    if gex_abi::kuser_fold() { gex_abi::W3_KUSER as u32 } else { gex_abi::KUSER_WINDOWS as u32 }
 }
 
 /// Where this process's Windows address space starts (W3), or 0: what a fork
@@ -8665,13 +8764,9 @@ pub extern "C" fn gex_windows_space() -> u32 {
 /// space starts, or 0 on failure.
 #[no_mangle]
 pub extern "C" fn gex_split_windows_space() -> u32 {
-    match nt::split_windows_space() {
-        Ok(lo) => lo as u32,
-        Err(e) => {
-            warn_line(&format!("gex: W3: {e}\n"));
-            0
-        }
-    }
+    // W3 no longer splits (see `nt::w3_windows_space`); the name is the JS
+    // side's.
+    nt::w3_windows_space() as u32
 }
 
 /// A forked child of a W3 process: the split, first thing after
@@ -9521,6 +9616,10 @@ fn note_exec(path: &str, argv: &[String]) {
 
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
+    {
+        let size = warch::memory_size(0) as u64 * 65536;
+        w3_note_reach(size, "an execve, which keeps the memory", 0, size);
+    }
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -9578,7 +9677,14 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // never allocates there; see `arena_take`) -- less anything the runtime
     // owns, by the memory map's own record.
     let mut dead: Vec<(u64, u64)> = h.kernel.mem.lock().arena_spans().to_vec();
-    let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    let mut inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+    // W3's compact space: the shim's heap does allocate there, between the
+    // inherited regions, and above its cursor is what it will take next --
+    // not dead, whatever was inherited above it (KUSER_SHARED_DATA at 2 GiB).
+    // Below the cursor everything is claimed, so `guest_only` sorts it.
+    if nt::w3_compact() {
+        inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
+    }
     if inherited > gex_abi::ARENA_BOTTOM {
         dead.push((gex_abi::ARENA_BOTTOM, inherited));
     }
@@ -10449,7 +10555,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
         // a restored process starts with only the fixed low layout.
-        arena_back(end)?;
+        arena_back(start, end)?;
         if from_file {
             let path = snap_read_str(raw, &mut p)?;
             let off = snap_read_u64(raw, &mut p)?;
@@ -12895,6 +13001,9 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    if raw == gex_abi::imports::BRK_KUSER_UNFOLDED {
+        kuser_unfolded(pc);
+    }
     // As in `gex_illegal`: the browser traps out of a resumable fault too.
     let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
     // Native Wine's return pad (its int3 filler), translated by an earlier
@@ -14636,6 +14745,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             cfg!(feature = "shared-memory"),
             &intr,
         );
+        note_kuser_folds(pc);
         // The blocks are counted translated before the set goes back, so a
         // sibling that takes it up first does not lift them again; taken out
         // again below if the unit is dropped.
@@ -14960,6 +15070,79 @@ pub(crate) static IN_PLACE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[no_mangle]
 pub extern "C" fn gex_set_in_place(on: i32) {
     IN_PLACE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `BRK_KUSER_UNFOLDED` (W3 with KUSER_SHARED_DATA folded): an access at
+/// or above Windows' old KUSER page through a pointer the translator could
+/// not fold. Said by name, then an access violation for Wine's handler (the
+/// fault hook), as the wild-branch path raises one; without a hook, SIGSEGV.
+/// Never a read of the old page. Does not return.
+fn kuser_unfolded(arg: i64) -> ! {
+    let (pc, addr) = gex_abi::kuser_miss_unpack(arg);
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 32 || n.is_power_of_two() {
+            warn_line(&format!(
+                "[gex] KUSER access not folded at pc {pc:#x} ({}), address {addr:#x}: an access violation ({n} so far)\n",
+                w3_image_off_at(pc)
+            ));
+        }
+        let mut gm = GuestMem::new(guest_bytes());
+        let c = my_ctx();
+        let _ = gm.write_u64(c + ctx::PC as u64, pc);
+        if cgen::fault_hook() != 0 {
+            cgen::fault_stage(0xc000_0005, addr, 0);
+            set_resume(pc);
+            set_resume_ctx(c);
+        } else {
+            set_exit(128 + 11);
+        }
+    }
+    trap()
+}
+
+/// The PE images Wine mapped in this process (`gex_image_mapped`): base,
+/// end and file name. Wine maps an image into anonymous memory, so the
+/// memory map has no name for its code; the KUSER lines name it from here.
+static W3_IMAGES: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
+
+pub(crate) fn note_w3_image(base: u64, size: u64, path: &str) {
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let mut g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    // A range mapped again (an image unloaded, another in its place).
+    g.retain(|&(b, e, _)| e <= base || base + size <= b);
+    g.push((base, base + size, name));
+}
+
+/// The W3 image holding `pc` and the offset into it.
+fn w3_image_at(pc: u64) -> Option<(String, u64)> {
+    let g = W3_IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find(|&&(b, e, _)| b <= pc && pc < e).map(|(b, _, n)| (n.clone(), pc - b))
+}
+
+/// "module +off" for `pc`: a W3 image, else whatever the memory map has.
+fn w3_image_off_at(pc: u64) -> String {
+    match w3_image_at(pc) {
+        Some((n, off)) => format!("{n} +{off:#x}"),
+        None => object_off_at(pc),
+    }
+}
+
+/// What each translation folded of KUSER_SHARED_DATA (W3), by object: the
+/// translator's line for it, one per translation that folded any.
+pub(crate) fn note_kuser_folds(pc: u64) {
+    let n = gex_ir::take_kuser_folds();
+    if n == 0 {
+        return;
+    }
+    static BY: Mutex<Option<std::collections::BTreeMap<String, u64>>> = Mutex::new(None);
+    let name = w3_image_at(pc).map(|(n, _)| n).unwrap_or_else(|| object_file_off(pc).0);
+    let mut g = BY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    *m.entry(name.clone()).or_default() += n;
+    let list: Vec<String> = m.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    warn_line(&format!("[gex] kuser: {n} KUSER_SHARED_DATA access(es) folded translating {pc:#x} in {name}; by object: {}\n", list.join(", ")));
 }
 
 /// A fault import's pc without bit 62, which a unit sets on a fault it can

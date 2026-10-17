@@ -339,6 +339,12 @@ impl<'a> Lifter<'a> {
     /// The effective address of a memory operand, as an `I64`, and a static
     /// offset to carry on the access.
     fn addr(&mut self, m: &Mem) -> (Value, i64) {
+        self.addr_with(m, true)
+    }
+
+    /// [`Self::addr`], folding a KUSER_SHARED_DATA displacement (`fold`) or
+    /// not: `lea` is arithmetic, and its sum may be anything.
+    fn addr_with(&mut self, m: &Mem, fold: bool) -> (Value, i64) {
         let mut parts: Vec<Value> = Vec::new();
         if let Some(b) = m.base {
             parts.push(self.rd64(b));
@@ -365,14 +371,27 @@ impl<'a> Lifter<'a> {
                 Some(s) => self.b.bin(BinOp::Add, Ty::I64, s, p),
             });
         }
+        // W3 (`gex_abi::fold_kuser`): a displacement into Windows'
+        // KUSER_SHARED_DATA page names W3's page instead, in every form that
+        // has one (absolute, with a base, an index or both); not through a
+        // segment, and not for `lea`. An address the emitter sees as a
+        // constant (a pointer loaded in the same block) is folded there;
+        // one computed at run time faults by name (`BRK_KUSER_UNFOLDED`).
+        let disp = match gex_abi::fold_kuser(m.disp as u64 & 0xffff_ffff) {
+            Some(f) if fold && m.addr32 && m.seg.is_none() => {
+                gex_ir::note_kuser_fold();
+                f as i64
+            }
+            _ => m.disp,
+        };
         match sum {
             // A bare absolute address: in 32-bit code the sign-extended
             // disp32 names a 32-bit address.
-            None if m.addr32 => (self.k64(m.disp as u64 & 0xffff_ffff), 0),
+            None if m.addr32 => (self.k64(disp as u64 & 0xffff_ffff), 0),
             None => (self.k64(m.disp as u64), 0),
             Some(s) if m.addr32 => {
                 // 32-bit address arithmetic wraps before the access.
-                let d = self.k64(m.disp as u64);
+                let d = self.k64(disp as u64);
                 let s = self.b.bin(BinOp::Add, Ty::I64, s, d);
                 let s = self.b.wrap(s);
                 (self.b.extend(s, false), 0)
@@ -817,7 +836,7 @@ impl<'a> Lifter<'a> {
                 // lea has no segment base and no access: pure arithmetic.
                 let mut m = m;
                 m.seg = None;
-                let (a, off) = self.addr(&m);
+                let (a, off) = self.addr_with(&m, false);
                 let a = if off != 0 {
                     let d = self.k64(off as u64);
                     self.b.bin(BinOp::Add, Ty::I64, a, d)

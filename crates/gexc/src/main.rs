@@ -158,13 +158,15 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64] [--w3-kuser]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
-                                   is the peak
+                                   is the peak. --w3-kuser: a W3 unit (Wine as
+                                   wasm32): KUSER_SHARED_DATA's constant
+                                   addresses folded to W3's page
   gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
                                    the NT trampoline page's unit, which the
                                    native host builds at boot; the browser
@@ -2516,6 +2518,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
             // A unit for a 64-bit guest memory (docs/mem64.md): another
             // key, other code.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
+            // A W3 unit (Wine as wasm32, whose KUSER_SHARED_DATA is at
+            // gex_abi::W3_KUSER): constant accesses to Windows' page folded
+            // there, every other address checked. Another key.
+            "--w3-kuser" => gex_abi::set_kuser_fold(true),
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
@@ -2562,6 +2568,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let _lock = gex_native::nt_cgen::build_lock()?;
     let t0 = std::time::Instant::now();
     let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
+    if gex_abi::kuser_fold() {
+        // Zero for a unit the cache already held (nothing was lifted).
+        eprintln!("{path}: KUSER_SHARED_DATA accesses folded: {}", gex_ir::kuser_folds_total());
+    }
     eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
     // `GEX_CGEN_PRECOMPILE=1`: compile it for this host's engine too
     // (`c.cwasm`), which the first process to map it would otherwise do

@@ -259,7 +259,7 @@ fn unit_identities(dir: &Path, web: &Path, units: &[Json], site_key: &dyn Fn(&st
             let addrs: std::collections::HashSet<u64> = unit.addresses().into_iter().collect();
             let base = crate::reach::find_base(&pe, &addrs)?;
             let image = gex_xlate::func::pe_input(&pe, base).ok()?.0;
-            [true, false].into_iter().find(|&g| crate::rsrc::key_with(&image, g) == site)?;
+            crate::rsrc::FLAVORS.into_iter().find(|&g| crate::rsrc::key_with(&image, g) == site)?;
             Some(format!("{base:x}:{site}:{}:{path}", gex_key::image_identity(&image).trim_start_matches("image:")))
         })();
         match found {

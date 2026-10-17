@@ -430,14 +430,37 @@ pub fn site(env: &[String], tar: &crate::reach::Tar, prefix: &str) -> Site {
     Site { lang, dpi }
 }
 
-/// `gex_cgen::image::image_key` for the page's flavor: `unguarded` (mode
-/// bit 4, `gex_cgen_set_mode`) is the page's to set, not this gexc's. The
+/// The flavors a unit's key may name that are the page's, not this gexc's:
+/// `unguarded` (mode bit 4, `gex_cgen_set_mode`) and W3's KUSER_SHARED_DATA
+/// fold (`gexc cgen-image --w3-kuser`, which the runtime turns on for a W3
+/// Wine that maps it low). [`key_with`] for each; callers keep the one that
+/// gives the recorded key.
+pub(crate) const FLAVORS: [(bool, bool); 4] = [(true, false), (false, false), (true, true), (false, true)];
+
+/// The hash of `gex_cgen::image::abi_fingerprint` with W3's KUSER fold on
+/// or off: the C header a unit is built against has the fold's helpers only
+/// with it on (`gexc cgen-image --w3-kuser`), so the two flavors' keys differ
+/// there as well as in their `:w3kuser`. Each is computed once, with the
+/// process's fold set for the call and put back.
+fn abi_hash(kuser: bool) -> String {
+    static H: [std::sync::OnceLock<String>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    H[kuser as usize]
+        .get_or_init(|| {
+            let was = gex_abi::kuser_fold();
+            gex_abi::set_kuser_fold(kuser);
+            let mut h = gex_key::sha256::Sha256::new();
+            h.update(gex_cgen::image::abi_fingerprint().as_bytes());
+            gex_abi::set_kuser_fold(was);
+            gex_key::sha256::hex(&h.finish())
+        })
+        .clone()
+}
+
+/// `gex_cgen::image::image_key` for the page's flavor (see [`FLAVORS`]). The
 /// composition is `image::unit_inputs`'s, which [`rekey`] checks against a
 /// recorded key for every image.
-pub(crate) fn key_with(image: &gex_ld::Image, unguarded: bool) -> String {
-    let mut h = gex_key::sha256::Sha256::new();
-    h.update(gex_cgen::image::abi_fingerprint().as_bytes());
-    let mut inputs = format!("{}:{}", gex_cgen::image::UNIT_INPUTS, gex_key::sha256::hex(&h.finish()));
+pub(crate) fn key_with(image: &gex_ld::Image, (unguarded, kuser): (bool, bool)) -> String {
+    let mut inputs = format!("{}:{}", gex_cgen::image::UNIT_INPUTS, abi_hash(kuser));
     if unguarded {
         inputs.push_str(":unguarded");
     }
@@ -446,6 +469,9 @@ pub(crate) fn key_with(image: &gex_ld::Image, unguarded: bool) -> String {
     }
     if gex_cgen::image::icall_count() {
         inputs.push_str(":icallcount");
+    }
+    if kuser {
+        inputs.push_str(":w3kuser");
     }
     if gex_abi::mem64() {
         inputs.push_str(":mem64");
@@ -470,11 +496,11 @@ pub fn rekey(unit_wasm: &[u8], orig: &[u8], trimmed: &[u8], old: &str) -> Result
     let was = image(&pe)?;
     if std::env::var_os("GEX_RSRC_TRACE").is_some() {
         eprintln!("[rsrc] {old}: base {base:#x} (preferred {:#x}); identity {}", pe.preferred_base, gex_key::image_identity(&was));
-        for g in [false, true] {
-            eprintln!("[rsrc]   unguarded={g} -> {}", key_with(&was, g));
+        for g in FLAVORS {
+            eprintln!("[rsrc]   (unguarded, w3kuser)={g:?} -> {}", key_with(&was, g));
         }
     }
-    let Some(g) = [true, false].into_iter().find(|&g| key_with(&was, g) == old) else { return Ok(None) };
+    let Some(g) = FLAVORS.into_iter().find(|&g| key_with(&was, g) == old) else { return Ok(None) };
     let t = Tree { pe: &pe, data: orig, root: pe.dirs.get(2).map_or(0, |d| d.0) };
     for s in pe.sections.iter().filter(|s| !is_resource_section(&t, s)) {
         let r = s.raw_offset as usize..(s.raw_offset + s.raw_size) as usize;

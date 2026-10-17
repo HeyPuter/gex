@@ -63,6 +63,30 @@ def dylink_mem(w):
     raise SystemExit('no dylink.0 memory info: link with --experimental-pic -pie')
 
 
+def custom_section(w, want):
+    """The payload of custom section `want`, or None."""
+    p = 8
+    while p < len(w):
+        sid = w[p]; p += 1
+        n, p = leb(w, p)
+        end = p + n
+        if sid == 0:
+            ln, q = leb(w, p)
+            if w[q:q + ln] == want:
+                return w[q + ln:end]
+        p = end
+    return None
+
+
+# Where W3's Wine maps KUSER_SHARED_DATA (gex_abi::W3_KUSER). Wine's ntdll
+# names its address in a custom section, gex_kuser (include/wine/kuser.h's
+# WINE_USER_SHARED_DATA, 4 bytes little-endian); a loader that does sets the
+# header's FLAG_KUSER_W3 (4), and gex folds i386 code's constant accesses to
+# Windows' page (0x7ffe0000) there. A loader without the section keeps
+# Windows' address and gex folds nothing.
+W3_KUSER = 0x04ff0000
+
+
 def up(v, a):
     return (v + a - 1) & ~(a - 1)
 
@@ -89,6 +113,12 @@ def main():
         assert elf64, '--guest-x86-64 needs --elf64'
         flags |= 2
     w = open(src, 'rb').read()
+    kuser = custom_section(w, b'gex_kuser')
+    if kuser is not None and flags & 1:
+        at = struct.unpack('<I', kuser[:4])[0]
+        if at != W3_KUSER:
+            raise SystemExit(f'{src}: KUSER_SHARED_DATA at {at:#x}, gex folds to {W3_KUSER:#x} (gex_abi::W3_KUSER)')
+        flags |= 4
     mem_size, mem_align = dylink_mem(w)
     ehsize, phsize, nph = (64, 56, 4 if stub else 5) if elf64 else (52, 32, 4 if stub else 5)
     wasm_off = up(ehsize + phsize * nph, 16)

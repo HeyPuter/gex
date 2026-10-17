@@ -65,6 +65,10 @@ const FLAG_GUEST_I386: u32 = 1;
 /// Header flag: the program runs x86-64 code (64-bit native Wine, W64). It
 /// shares W3's address-space split and trampoline page.
 const FLAG_GUEST_X86_64: u32 = 2;
+/// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
+/// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
+/// the process folds Windows' constant addresses there (`nt::w3_kuser`).
+const FLAG_KUSER_W3: u32 = 4;
 
 /// The running program's header has [`FLAG_GUEST_X86_64`] (W64), set at
 /// every publish (a fork's child has its parent's, in its copy of memory).
@@ -173,12 +177,13 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
             dst.copy_from_slice(&page);
         }
-        // The address space split as the NT layer splits it (nt.rs): the
-        // memory grown to 2 GiB, the shim's heap above it, and what the
-        // host left below it the process's own arena, where the Unix side's
-        // mappings land and Wine's reservations succeed. Not above the
-        // guest's slice (`GUEST_LIMIT`, just under 2 GiB).
-        let lo = crate::nt::split_windows_space().map_err(|e| format!("W3: {e}"))?;
+        // W3's compact address space (`nt::w3_windows_space`): nothing
+        // grown up front; Wine's views come from the arena bottom-up, shared
+        // with the shim's heap, so the memory reaches only as high as used.
+        let lo = crate::nt::w3_windows_space();
+        if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
+            crate::nt::w3_kuser();
+        }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();
             crate::w3_address_space(&mut mm, lo);
