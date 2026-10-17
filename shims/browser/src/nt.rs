@@ -314,8 +314,14 @@ mod imp {
     /// 0x01000000. Low, so that a process's memory reaches about 0.3 GiB for
     /// its images, not the 1.5 GiB of the old band at 0x60000000.
     fn keep_exe_slot() {
-        // Not if the heap is there already (then images relocate).
-        crate::memmap::claim_island(EXE_SLOT, DLL_BAND_END, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)");
+        // Not if the heap is there already (then images relocate, and every
+        // pinned DLL misses its unit: said once, it is a rare, costly event).
+        if !crate::memmap::claim_island(EXE_SLOT, DLL_BAND_END, &crate::ARENA_NEXT, "Windows executables (0x10000000) and pinned DLLs (0x11000000)") {
+            warn_line(&format!(
+                "gex: W3: the exe slot and DLL band [{EXE_SLOT:#x}, {DLL_BAND_END:#x}) are not kept (arena cursor {:#x}); pinned images will relocate\n",
+                ARENA_NEXT.load(Ordering::Acquire)
+            ));
+        }
     }
     const EXE_SLOT: u64 = 0x1000_0000;
     /// The pinned DLLs' band, [0x11000000, 0x20000000): soju's dll-bases.py
