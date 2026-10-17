@@ -515,17 +515,69 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
     }
     let Ok((image, _)) = gex_xlate::func::pe_input(pe, base) else { return false };
     if !w3_matches(&image, base, pe, true) {
-        lock(&W3_DEFERRED).push(Pending { path: path.to_string(), base, pe: Arc::new(pe.clone()) });
-        W3_ANY_DEFERRED.store(true, Ordering::Release);
+        w3_defer(Deferred { path: path.to_string(), base, size: pe.image_size as u64, src: Src::Pe(Arc::new(pe.clone())) });
         return false;
     }
+    w3_forget(base, pe.image_size as u64);
     place(&image, path, base, true, Some(pe));
     !lock(&WANTED).is_empty()
 }
 
-/// Images [`w3_mapped`] left for their first miss.
-static W3_DEFERRED: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Whether an image Wine's loader mapped at `base` can wait for its first
+/// miss unread ([`w3_defer_unread`]): units are on, the page names its
+/// units' identities, and none is this image's at this base. Its key would
+/// be a hash of every byte (22 MB for ehres.dll, mapped three times by the
+/// shell for icons, 20 tzres.dll maps for time zone names: never run), for a
+/// unit that is not there; a resource-only map never misses, so it is never
+/// read or hashed at all.
+pub(crate) fn w3_may_defer(path: &str, base: u64) -> bool {
+    on() && lock(&KNOWN).as_ref().is_some_and(|k| !k.contains_key(&(base, path.to_string())))
+}
+
+/// Leave the image open as `file`, `size` bytes mapped at `base`, for its
+/// first miss ([`w3_miss`] reads and places it then).
+pub(crate) fn w3_defer_unread(path: &str, base: u64, size: u64, file: Arc<dyn gex_kernel::vfs::FileHandle>) {
+    w3_defer(Deferred { path: path.to_string(), base, size, src: Src::File(file) });
+}
+
+/// Where a deferred image's PE comes from: parsed at its mapping (its code
+/// was not yet its bytes), or its file, read at the first miss.
+enum Src {
+    Pe(Arc<gex_ld::pe::PeImage>),
+    File(Arc<dyn gex_kernel::vfs::FileHandle>),
+}
+
+struct Deferred {
+    path: String,
+    base: u64,
+    size: u64,
+    src: Src,
+}
+
+/// Images [`w3_mapped`] and [`w3_defer_unread`] left for their first miss.
+static W3_DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
 static W3_ANY_DEFERRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn w3_defer(d: Deferred) {
+    let mut v = lock(&W3_DEFERRED);
+    // An image mapped where an unmapped one waited (ehres.dll's three maps
+    // at one base): the old entry would claim the new image's misses.
+    v.retain(|o| o.base + o.size <= d.base || o.base >= d.base + d.size);
+    v.push(d);
+    W3_ANY_DEFERRED.store(true, Ordering::Release);
+}
+
+/// Drop deferred images overlapping `[base, base + size)` (one placed there now).
+fn w3_forget(base: u64, size: u64) {
+    if !W3_ANY_DEFERRED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut v = lock(&W3_DEFERRED);
+    v.retain(|o| o.base + o.size <= base || o.base >= base + size);
+    if v.is_empty() {
+        W3_ANY_DEFERRED.store(false, Ordering::Release);
+    }
+}
 
 /// Whether the mapped code is `image`'s.
 /// At the mapping (`at_map`) every byte counts, the import slots too: until
@@ -550,22 +602,47 @@ pub(crate) fn w3_miss(pc: u64) -> bool {
     if !W3_ANY_DEFERRED.load(Ordering::Acquire) {
         return false;
     }
-    let p = {
+    let d = {
         let mut d = lock(&W3_DEFERRED);
-        let Some(i) = d.iter().position(|p| pc >= p.base && pc < p.base + p.pe.image_size as u64) else { return false };
+        let Some(i) = d.iter().position(|p| pc >= p.base && pc < p.base + p.size) else { return false };
         let p = d.swap_remove(i);
         if d.is_empty() {
             W3_ANY_DEFERRED.store(false, Ordering::Release);
         }
         p
     };
-    let Ok((image, _)) = gex_xlate::func::pe_input(&p.pe, p.base) else { return false };
-    if !w3_matches(&image, p.base, &p.pe, false) {
-        crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", p.path, p.base));
+    let pe = match d.src {
+        Src::Pe(pe) => pe,
+        Src::File(f) => match read_pe(&*f) {
+            Some(pe) => Arc::new(pe),
+            None => {
+                crate::warn_line(&format!("gex-w3: {} at {:#x}: reading the image at its first miss failed; tier-1\n", d.path, d.base));
+                return false;
+            }
+        },
+    };
+    let Ok((image, _)) = gex_xlate::func::pe_input(&pe, d.base) else { return false };
+    if !w3_matches(&image, d.base, &pe, false) {
+        crate::warn_line(&format!("gex-w3: {} at {:#x}: its code is not the image's at its first miss; tier-1\n", d.path, d.base));
         return false;
     }
-    place(&image, &p.path, p.base, true, Some(&p.pe));
+    place(&image, &d.path, d.base, true, Some(&pe));
     !lock(&WANTED).is_empty()
+}
+
+/// A whole file, parsed as a PE image.
+pub(crate) fn read_pe(f: &dyn gex_kernel::vfs::FileHandle) -> Option<gex_ld::pe::PeImage> {
+    let size = f.metadata().ok()?.size as usize;
+    let mut b = vec![0u8; size];
+    let mut at = 0;
+    while at < size {
+        match f.read_at(at as u64, &mut b[at..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => at += n as usize,
+        }
+    }
+    b.truncate(at);
+    gex_ld::pe::parse(&b).ok()
 }
 
 /// Want the unit for `image`, mapped at `base`: its key, and the check that

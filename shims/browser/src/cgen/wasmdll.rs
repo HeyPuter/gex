@@ -283,6 +283,31 @@ pub(crate) fn skeleton_code() -> Vec<(u64, u64)> {
     lock(&SKELETON_CODE).clone()
 }
 
+/// From a PE file's first bytes: its size mapped (`SizeOfImage`) and
+/// whether it is a native Wine DLL's skeleton (a `.wasmref` section, as
+/// [`is_skeleton`]); `None` when the headers are not all there.
+fn pe_head(b: &[u8]) -> Option<(u64, bool)> {
+    let u16_at = |o: usize| b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+    let u32_at = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    if b.get(..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32_at(0x3c)? as usize;
+    if b.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let (sections, opt_size) = (u16_at(pe + 6)? as usize, u16_at(pe + 20)? as usize);
+    let opt = pe + 24;
+    // `SizeOfImage` is at 56 in both PE32 and PE32+ optional headers.
+    let size = u32_at(opt + 56)? as u64;
+    let mut skeleton = false;
+    for i in 0..sections {
+        let name = b.get(opt + opt_size + i * 40..opt + opt_size + i * 40 + 8)?;
+        skeleton |= name.split(|&c| c == 0).next() == Some(b".wasmref".as_slice());
+    }
+    Some((size, skeleton))
+}
+
 /// `gex.image_mapped(base, fd)` (W3, docs/wine-native.md §3.17): Wine's
 /// own PE loader mapped the image open at `fd` at `base`, relocated. A
 /// native DLL's skeleton gets Wine's PE module bound at its exports, as the
@@ -296,23 +321,25 @@ pub(crate) fn skeleton_code() -> Vec<(u64, u64)> {
 pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     let base = base as u64;
     // The table needs no kernel lock (step 3), and the read is the file's.
-    let Some((path, bytes)) = crate::fds_free().and_then(|fds| {
+    let Some((path, file)) = crate::fds_free().and_then(|fds| {
         let f = fds.get(fd).ok()?;
-        let size = f.handle.metadata().ok()?.size as usize;
-        let mut b = vec![0u8; size];
-        let mut at = 0;
-        while at < size {
-            match f.handle.read_at(at as u64, &mut b[at..]) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => at += n as usize,
-            }
-        }
-        b.truncate(at);
-        Some((f.path.clone(), b))
+        Some((f.path.clone(), Arc::clone(&f.handle)))
     }) else {
         return -1;
     };
-    let Ok(pe) = gex_ld::pe::parse(&bytes) else { return -1 };
+    // An i386 image no unit of the page's is for, at this base (a resource
+    // DLL mapped for its icons or strings): left unread for its first miss,
+    // which a resource-only map never has. Its headers say which.
+    if super::w3_may_defer(&path, base) {
+        let mut head = vec![0u8; 4096];
+        let n = file.read_at(0, &mut head).unwrap_or(0) as usize;
+        head.truncate(n);
+        if let Some((size, false)) = pe_head(&head) {
+            super::w3_defer_unread(&path, base, size, file);
+            return -1;
+        }
+    }
+    let Some(pe) = super::read_pe(&*file) else { return -1 };
     if !is_skeleton(&pe) {
         // An i386 image (the program's, a game's DLL): its function-tier
         // unit, when units are on; -3 tells JS to serve it.

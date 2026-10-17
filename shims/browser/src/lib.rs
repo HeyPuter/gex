@@ -3099,12 +3099,23 @@ thread_local! {
 /// The JIT state, taking its lock for this thread if it does not hold it.
 /// Whoever takes it here gives it back with `jit_give` (`ExecLock`'s release,
 /// the end of an SP `with_exec_lock`, `with_jit_only`).
+#[track_caller]
 fn jit_held() -> *mut Jit {
+    let here = std::panic::Location::caller();
     JIT_HELD.with(|g| {
         let mut g = g.borrow_mut();
-        let g = g.get_or_insert_with(|| jit_lock().lock());
+        let g = g.get_or_insert_with(|| {
+            JIT_TAKER.with(|t| t.set(Some(here)));
+            jit_lock().lock()
+        });
         &mut **g as *mut Jit
     })
+}
+
+thread_local! {
+    /// Where this thread last took the JIT lock (`jit_held`), for the trap's
+    /// "holding the JIT lock" line: the call that kept it.
+    static JIT_TAKER: std::cell::Cell<Option<&'static std::panic::Location<'static>>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether this thread holds the JIT lock (`jit_held`).
@@ -3127,6 +3138,7 @@ struct JitHere;
 
 impl std::ops::Deref for JitHere {
     type Target = Jit;
+    #[track_caller]
     fn deref(&self) -> &Jit {
         // SAFETY: the lock is this thread's until `jit_give`, which no kernel
         // call does while it holds a borrow of the `Host` this sits in.
@@ -3135,6 +3147,7 @@ impl std::ops::Deref for JitHere {
 }
 
 impl std::ops::DerefMut for JitHere {
+    #[track_caller]
     fn deref_mut(&mut self) -> &mut Jit {
         // SAFETY: as `deref`; one `&mut` at a time through the `Host`.
         unsafe { &mut *jit_held() }
@@ -12491,8 +12504,9 @@ fn trap() -> ! {
     // count below agree. Left, the count was zeroed while the guard stayed.
     if jit_holds() {
         warn_line(&format!(
-            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}; given back (docs/kernel-locking.md §4.1)\n",
+            "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}, taken at {}; given back (docs/kernel-locking.md §4.1)\n",
             LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+            JIT_TAKER.with(|t| t.get()).map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line())),
         ));
         jit_give();
     }
