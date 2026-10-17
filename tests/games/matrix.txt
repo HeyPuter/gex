@@ -5,7 +5,9 @@
 #
 # kind:      w3 (an i386 Windows program on W3, Wine's own Unix side as
 #            native wasm32: W3_DIST/lib/wine/i386-unix/wine under gexc, on a
-#            copy of W3_PREFIX), pe (the legacy NT layer, --wine-prefix; no
+#            copy of W3_PREFIX), w64 (an x86-64 Windows program on W64,
+#            64-bit native Wine: W64_DIST's loader with W64_NATIVE's PE
+#            core, on a copy of W64_PREFIX), pe (the legacy NT layer, --wine-prefix; no
 #            new work there, user 2026-10-06), linux, or linux-x11 (an
 #            X11-only program, on Xwayland inside the guest).
 #            Rows that are listed but not run: dotnet (stream U's .NET work;
@@ -38,22 +40,24 @@ baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren       
 retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
 warfork-linux|linux|Warfork                              |@warfork.x86_64                     | |-|-|-
 
+# x86-64 Windows games on W64 (64-bit native Wine, LLP64 lowered to wasm32).
+oneshot      |w64  |OneShot                              |steamshim.exe                       | |-|-|-
+deltarune    |w64  |DELTARUNE                            |DELTARUNE.exe                       | |-|-|-
+will-you-snail|w64 |Will You Snail                       |Will You Snail.exe                  | |-|-|-
+hyper-light  |w64  |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
+dicey        |w64  |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|dicey-w64.wl
+geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe                    | |-|-|-
+5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |-|-|-
+mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
+spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
+hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-
+baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
+warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
+tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-
+
 # Listed, not run.
 isaac        |blocked|The Binding of Isaac Rebirth      |SteamStub DRM: isaac-ng.exe relaunches through steam://run (the user's call)| |-|-|-
 antichamber  |blocked|Antichamber                       |UDK.exe is a mixed-mode CLR image: needs a CLR (stream U's area)| |-|-|-
-oneshot      |blocked|OneShot                           |x64 (oneshot.exe; only a stub is i386): waits on W64, 64-bit native Wine| |-|-|-
-deltarune    |blocked|DELTARUNE                         |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
-will-you-snail|blocked|Will You Snail                    |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
-hyper-light  |blocked|Hyper Light Drifter               |x64: waits on W64| |-|-|-
-dicey        |blocked|Dicey Dungeons                    |x64: waits on W64| |-|-|-
-geometry-dash|blocked|Geometry Dash                     |x64: waits on W64 (NT layer reached its menu)| |-|-|-
-5d-chess     |blocked|5D Chess With Multiverse Time Travel|x64: waits on W64 (NT layer reached gameplay)| |-|-|-
-mosa-lina    |blocked|Mosa Lina                         |x64: waits on W64| |-|-|-
-spelunky2    |blocked|Spelunky 2                        |x64: waits on W64| |-|-|-
-hades        |blocked|Hades                             |x64 build: waits on W64 (the i386 build is hades-x86)| |-|-|-
-baba         |blocked|Baba Is You                       |x64: waits on W64 (the Linux build is baba-linux)| |-|-|-
-warfork      |blocked|Warfork                           |x64: waits on W64 (the Linux build is warfork-linux)| |-|-|-
-tunic        |blocked|TUNIC                             |x64 Unity IL2CPP: waits on W64| |-|-|-
 cruelty-squad|idea |Cruelty Squad                       |Godot 3: engine substitution, unassigned (ask the user)| |-|-|-
 buckshot     |idea |Buckshot Roulette                   |Godot 4: engine substitution, unassigned (ask the user)| |-|-|-
 wildermyth   |idea |Wildermyth                          |Java (libGDX, bundled JRE): unassigned (ask the user)| |-|-|-
