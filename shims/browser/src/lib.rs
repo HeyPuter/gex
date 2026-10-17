@@ -2523,6 +2523,8 @@ fn arena_take(len: u64) -> Option<u64> {
     }
     let at = memmap::skip_foreign(at, len);
     let end = at.checked_add(len)?;
+    // No line from here: this is the allocator's refill path (see below).
+    HEAP_REACH.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > nt::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
@@ -2681,6 +2683,7 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // above it (Windows' no-access region) a fault there, not a trap past
     // the end of the memory.
     let grow_to = if nt::w3_compact() && end > 0x7f00_0000 { end.max(0x8000_0000) } else { end };
+    w3_note_reach(grow_to, "a fixed mapping", start, end);
     if !grow_memory_to(grow_to) {
         return None;
     }
@@ -2708,6 +2711,31 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     Some(prev)
 }
 
+/// W3's compact space: say what makes a process's memory reach past 1 GiB
+/// (it should stay well under; each step costs the tab's data segment). Once
+/// per 256 MiB step a process reaches. A rare event, so on by default.
+fn w3_note_reach(to: u64, why: &str, start: u64, end: u64) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 30);
+    if !nt::w3_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let step = (to + (256 << 20) - 1) & !((256u64 << 20) - 1);
+    if SAID.fetch_max(step, std::sync::atomic::Ordering::Relaxed) >= step {
+        return;
+    }
+    warn_line(&format!(
+        "gex: W3 pid {}: memory reaches {} MiB for {why} [{start:#x}, {end:#x}); arena cursor {:#x}, highest arena span end {:#x}\n",
+        my_pid(),
+        to >> 20,
+        ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed),
+        HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+}
+
+/// The end of the highest span `arena_take` has handed out (the shim's heap
+/// and the kernel's arena both), for [`w3_note_reach`].
+static HEAP_REACH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How far the high arena has been backed (claimed in `memmap`).
 static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2718,6 +2746,9 @@ static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 fn arena_grow(len: u64) -> u64 {
     arena_note(0, len);
     let at = arena_take(len).unwrap_or(0);
+    if at != 0 {
+        w3_note_reach(at + len, "the kernel's arena", at, at + len);
+    }
     if at != 0 {
         memmap::claim(memmap::Kind::Guest, 0, at, at + len, "guest mapping (arena)");
     }
@@ -4131,6 +4162,7 @@ pub extern "C" fn gex_note_inherited(end: u64) {
 /// reads.
 #[no_mangle]
 pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
+    w3_note_reach(end, "an inherited region", start, end);
     if nt::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= nt::arena_ceiling() {
         let start = start.max(gex_abi::ARENA_BOTTOM);
         if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
@@ -9564,6 +9596,10 @@ fn note_exec(path: &str, argv: &[String]) {
 
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let fresh = EXEC_FRESH.with(|c| c.replace(false));
+    {
+        let size = warch::memory_size(0) as u64 * 65536;
+        w3_note_reach(size, "an execve, which keeps the memory", 0, size);
+    }
     // A sibling's translation in flight is of the program this replaces.
     jit_in_held(&mut h.jit);
     jitout::EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
