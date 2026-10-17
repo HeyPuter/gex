@@ -25,15 +25,17 @@
 #            through winewayland), anything else GEX_NT_INPUT (pe).
 #
 # Optional per-game gexc flags go after the input, as a ninth field;
-# `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST.
+# `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST;
+# `stub=NAME@PATH` puts tests/games/stubs/NAME (built for the game's arch)
+# in place of the game's PATH, relative to its directory.
 
 # i386 Windows games on W3.
-undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |-|-|undertale-w3.wl
+undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
 katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |-|-|katana-zero-w3.wl
 npp          |w3   |N++                                  |N++.exe                             | |-|-|-
 momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl
-hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-
+hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-|stub=basecamp@x86/BasecampBugReporter.Native.dll
 
 # Linux builds (no Wine).
 baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|4000|baba.wl|--lazy seed=seed/baba@~/.local/share/Baba_Is_You
@@ -50,7 +52,7 @@ geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe      
 5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |-|-|-
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
-hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-
+hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
 warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
 tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-

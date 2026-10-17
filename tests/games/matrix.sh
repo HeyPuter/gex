@@ -251,6 +251,14 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
             sd=$state/seed-$slug/$nseed; nseed=$((nseed + 1))
             rm -rf "$sd"; mkdir -p "$sd"; cp -r "$here/$src/." "$sd/"
             gflags+=(--bind "$sd=$dst") ;;
+        stub=*@*)
+            # `stub=NAME@PATH`: tests/games/stubs' NAME, built for the game's
+            # arch, in place of PATH (relative to the game's directory) in
+            # the run copy; the original stays beside it as .orig.
+            sn=${x#stub=}; sn=${sn%@*}; sp=$ov/${x#*@}
+            [ -e "$sp" ] && mv "$sp" "$sp.orig"
+            "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
+                echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2 ;;
         host=*) ;;
         *) gflags+=("$x") ;;
         esac

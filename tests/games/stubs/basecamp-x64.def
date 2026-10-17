@@ -1,0 +1,6 @@
+LIBRARY BasecampBugReporter.Native.dll
+EXPORTS
+?HandleAssert@BasecampBugReporterNative@@YAHPEBD0H@Z=bb_HandleAssert
+?Initialize@BasecampBugReporterNative@@YAXPEBDH000@Z=bb_Initialize
+?ReportBug@BasecampBugReporterNative@@YAXPEAUBugReportInfo@sgg@@@Z=bb_ReportBug
+?WaitReportComplete@BasecampBugReporterNative@@YA_NXZ=bb_WaitReportComplete
