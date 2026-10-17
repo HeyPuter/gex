@@ -9,7 +9,7 @@
 // Out: { kind: 'ready', ok, why? } once; then { kind: 'bytes', net, cached }
 //      now and then (bytes from the network, from the cache, since the last).
 
-import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, WRITING, DONE, GIVEN_UP } from '../../shims/browser/js/lazy-cache.mjs';
+import { CHUNK, SLOTS, HEAD, SLOT, FREE, ASKED, TAKEN, WRITING, DONE, GIVEN_UP } from '../../shims/browser/js/lazy-cache.mjs';
 
 let net = 0, kept = 0, posted = 0;
 const report = () => {
@@ -97,6 +97,12 @@ self.onmessage = async ({ data: m }) => {
   const busy = new Set();
   const serve = async (i) => {
     const base = (HEAD + i * SLOT) / 4;
+    // Taken: the reader waits for this answer now, not its own fetch.
+    if (Atomics.compareExchange(ctl, base, ASKED, TAKEN) !== ASKED) {
+      if (Atomics.load(ctl, base) === GIVEN_UP) Atomics.store(ctl, base, FREE);
+      busy.delete(i);
+      return;
+    }
     const len = ctl[base + 3] >>> 0, dst = ctl[base + 2] >>> 0, ul = ctl[base + 4];
     const from = new Float64Array(m.ctl, HEAD + i * SLOT + 24, 1)[0];
     const url = new TextDecoder().decode(raw.slice(HEAD + i * SLOT + 32, HEAD + i * SLOT + 32 + ul));
@@ -106,9 +112,9 @@ self.onmessage = async ({ data: m }) => {
     } catch (e) {
       console.warn(`[lazy-cache] ${e?.message ?? e}`);
     }
-    // The reader may have gone to the network meanwhile: then nothing is
-    // written into its buffer, which may be gone.
-    if (Atomics.compareExchange(ctl, base, ASKED, WRITING) !== ASKED) {
+    // (A reader no longer gives up once its ask is taken; should one ever,
+    // nothing is written into its buffer, which may be gone.)
+    if (Atomics.compareExchange(ctl, base, TAKEN, WRITING) !== TAKEN) {
       Atomics.store(ctl, base, FREE);
     } else {
       if (bytes) new Uint8Array(memory.buffer, dst, len).set(bytes);

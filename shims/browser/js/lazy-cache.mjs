@@ -14,9 +14,10 @@
 // The slots: `ctl`, an Int32Array on a SharedArrayBuffer of SLOTS * SLOT
 // bytes after a header of HEAD bytes. ctl[0] counts requests (the owner
 // waits on it). A slot, i32 at SLOT/4 * i + HEAD/4:
-//   [0] state: FREE, ASKED (the reader waits), WRITING (the owner copies;
-//       the reader must not give up now), DONE, GIVEN_UP (the reader timed
-//       out and went to the network itself: the owner must not write)
+//   [0] state: FREE, ASKED (the reader waits), TAKEN (the owner reads the
+//       cache or fetches; the reader keeps waiting), WRITING (the owner
+//       copies), DONE, GIVEN_UP (no owner took the ask in time and the
+//       reader went to the network itself: the owner must not write)
 //   [1] result: bytes written, or -1
 //   [2] dst, [3] len, [4] url length, [5..6] offset (f64 at byte 24)
 //   bytes 32..: the URL (a path on the page's origin), at most URL_MAX
@@ -26,7 +27,7 @@ export const SLOTS = 32;
 export const HEAD = 64;
 export const SLOT = 1056;
 export const URL_MAX = SLOT - 32;
-export const FREE = 0, ASKED = 1, WRITING = 2, DONE = 3, GIVEN_UP = 4;
+export const FREE = 0, ASKED = 1, WRITING = 2, DONE = 3, GIVEN_UP = 4, TAKEN = 5;
 
 /** The control buffer the page makes and hands to the owner and to every
  *  Worker. */
@@ -43,8 +44,12 @@ export function setLazyCache(c) {
   raw = new Uint8Array(c.ctl);
 }
 
-// How long a reader waits for the owner before it asks the network itself
-// (an owner that is gone, or a cache that hangs).
+// How long a reader waits for the owner to take its ask before it asks the
+// network itself (an owner that is gone). Once taken, it waits for the
+// owner's answer however long the fetch takes: the owner gives -1 when its
+// fetch fails, and the reader's own request would be the same bytes again on
+// the same link (a 22 MB lazy DLL fetched twice at a first visit at 0.7 MB/s,
+// when the owner's fetch outlasted the old 60 s bound on the whole wait).
 const WAIT_MS = 60000;
 
 /** Read `len` bytes of `href` at `from` into the kernel memory at `dst`,
@@ -78,7 +83,7 @@ export function cachedRead(href, from, dst, len) {
       if (Atomics.compareExchange(ctl, base, ASKED, GIVEN_UP) === ASKED) return -1;
       continue;
     }
-    Atomics.wait(ctl, base, st, st === WRITING ? 1000 : 5000);
+    Atomics.wait(ctl, base, st, st === ASKED ? 5000 : 1000);
   }
   const n = ctl[base + 1];
   Atomics.store(ctl, base, FREE);
