@@ -74,6 +74,7 @@
 # WINEDLLOVERRIDES=mscoree=;mshtml= (no Mono or Gecko installer).
 # Every game runs in a systemd user scope with TasksMax=TASKS_MAX (default
 # 1024; MATRIX_SCOPE=0 leaves it out), so a runaway can't storm the host.
+# Games run at nice MATRIX_NICE (default 10; 15 or more while a gate runs).
 set -u
 # MATRIX_HERE: tests/games of the tree to use (for a copy of this script run
 # while the tree is edited: bash reads a running script as it goes).
@@ -357,7 +358,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
     argv=($args)
     t0=$(date +%s)
     if [ $fromroot = 1 ]; then cwd=$ov rel=./$prog; else cwd=$(dirname "$exe") rel=./$(basename "$exe"); fi
-    (cd "$cwd" && exec env "${env[@]}" "${scope[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
+    (cd "$cwd" && exec env "${env[@]}" "${scope[@]}" timeout -k 20 "$limit" nice -n "${MATRIX_NICE:-10}" "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
         < /dev/null 3<&- > "$g/log" 2>&1 &
     pid=$!
     first= tfirst= tmenu=

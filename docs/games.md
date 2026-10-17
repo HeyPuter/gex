@@ -353,6 +353,42 @@ above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
 images, stacks and the 512 MiB transient reservation are placed. So all
 three need a 64-bit guest memory (docs/mem64.md).
 
+## Games matrix, 2026-10-16 (stream G: W3, W64 and Linux)
+
+The x64 Windows rows run on W64 now (kind `w64`): W64_DIST's loader with
+W64_NATIVE's PE core in place, on a copy of W64_PREFIX with the Wayland
+driver and emulated display modes, `WINEGEX_DOOR=1`, no Mono or Gecko.
+Inputs: the gate's `w3-dist.sh` and `w64-dist.sh` outputs (wt/gate-wine-w3,
+wt/gate-wine-w64), gexc 8063ad1c (gate 1016r). The W3 rows use a unit cache
+(W3_UNITS; W3_UNITS_BUILD=0 builds nothing). Runs are on gooner and check
+correctness only; edger is used for checks that need a GPU.
+
+| game | kind | reached | where it stops / notes |
+|---|---|---|---|
+| Undertale | w3 | **gameplay** (the Ruins; menu frame 800, gameplay 2000) | undertale-w3.wl starts at frame 20; the window must have the keyboard first (focus-frame) |
+| Katana ZERO | w3 | **menu**; keys move the cursor | |
+| Retrocycles | w3 | **gameplay** (a match) | |
+| Momodora | w3 | **title** ("Press Any Button") | no input script yet |
+| N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
+| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then a stall in the loader and an `unreachable` trap |
+| Dicey Dungeons | w64 | **menu** | dicey-w64.wl |
+| Geometry Dash | w64 | **menu** (first-run terms notice on top) | |
+| 5D Chess | w64 | **menu** | |
+| Mosa Lina | w64 | **title** ("press any button") | |
+| Hyper Light Drifter | w64 | **title** splash | no audio device |
+| OneShot | w64 | blank window | starts from steamshim.exe; "Error opening OpenAL device": W64 has no audio driver yet (W64's) |
+| Baba Is You | w64 | none | a call through NULL right after mmdevapi finds no driver (audio, as OneShot) |
+| DELTARUNE, Will You Snail | w64 | none | c0000018: fixed base 0x140000000 with no relocations, needs memory64 (W64.7) |
+| Baba Is You | linux-x11 | **gameplay** | |
+| Retrocycles | linux-x11 | **gameplay** | |
+| Warfork | linux | **menu** | |
+
+Matrix changes: matrix.txt is read on its own fd (a Windows run ate the
+next rows from the loop's stdin, so every other Windows row was skipped);
+`stub=NAME@PATH` swaps a no-op DLL built from tests/games/stubs into the run
+copy; DIR/SLUG/focus-frame says when a window first had the keyboard;
+MATRIX_NICE sets the runs' nice level (15 while a gate runs).
+
 ## Games matrix, 2026-10-14 update (stream G, parked until W64)
 
 `tests/games/matrix.txt` now lists every game in the corpus. The rows that
