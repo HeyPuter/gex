@@ -33,6 +33,8 @@
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
 katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |1200|3000|katana-zero-w3.wl
+# npp: in the page on gooner (SwiftShader, GL 3.2) OpenGLRenderer.dll calls a GL entry point
+# the context lacks (NULL) and exits through its catch(...); on edger's GPU (GL 4.2) it runs.
 npp          |w3   |N++                                  |N++.exe                             | |-|-|-
 momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl
@@ -50,8 +52,15 @@ will-you-snail|w64 |Will You Snail                       |Will You Snail.exe    
 hyper-light  |w64  |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
 dicey        |w64  |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|dicey-w64.wl
 geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe                    | |1280|8320|geometry-dash-w64.wl
+# 5d-chess: in the page, mmap runs out of address space near 4 GiB (try_map_free_area
+# 0xfff40000-0xffff0000) and it stalls: needs memory64 (W64.7). Natively gameplay.
 5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
+# mosa-lina: needs GL 3.2+; the page on gooner's SwiftShader is 3.2 compat and refused, on
+# edger's GPU (GL 4.2) it runs.
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
+# spelunky2: needs D3D11 feature level 11.0: on SwiftShader (GL 3.2) wined3d gives 10.1, on edger's
+# GPU it passes. Then natively a blank window (loader lock), and in the page also the mmap OOM
+# near 4 GiB: needs memory64 (W64.7).
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
 hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-

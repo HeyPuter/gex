@@ -376,7 +376,7 @@ ship the function-tier units built for those bases by the page's own gexc
 |---|---|---|---|
 | 4400 | Undertale | w3 | **intro renders** |
 | 4401 | Katana ZERO | w3 | **title menu** |
-| 4402 | N++ | w3 | window up, then the process exits within 120 s (no exception report) |
+| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs |
 | 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
 | 4404 | Retrocycles | w3 | **language menu** |
 | 4405 | Hades (x86) | w3 | shim trap in syscall 162 (the ucrtbase rewind); needs the W3 dist with the fix and new units |
@@ -388,9 +388,9 @@ ship the function-tier units built for those bases by the page's own gexc
 | 4412 | Hyper Light Drifter | w64 | runs, but the window stays black |
 | 4413 | Dicey Dungeons | w64 | **language menu** |
 | 4414 | Geometry Dash | w64 | **menu** |
-| 4415 | 5D Chess | w64 | asks for a GL 3.3 core context; the page gives 3.2 (3.3 needs dual-source blending, which SwiftShader lacks) |
-| 4416 | Mosa Lina | w64 | "OpenGL 3.2+ is required": the same GL version limit |
-| 4417 | Spelunky 2 | w64 | needs D3D11 feature level 11.0; wined3d on GL 3.2 gives 10.1. Natively a blank window |
+| 4415 | 5D Chess | w64 | gooner: asks for GL 3.3 core, SwiftShader gives 3.2 (no dual-source blending). edger (GL 4.2): past that, then mmap runs out of address space near 4 GiB: needs memory64 (W64.7) |
+| 4416 | Mosa Lina | w64 | gooner: "OpenGL 3.2+ is required" (SwiftShader's limit); edger (GL 4.2): runs, its window drawn |
+| 4417 | Spelunky 2 | w64 | gooner: needs D3D11 feature level 11.0, wined3d on GL 3.2 gives 10.1. edger: past that; a blank window (the loader lock, as natively) and mmap out of address space near 4 GiB: needs memory64 (W64.7) |
 | 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
 | 4419 | Baba Is You | w64 | **renders** (credits screen) |
 | 4420 | Warfork | w64 | error dialog: "Couldn't open UDP socket: setsockopt: Unknown error" |
