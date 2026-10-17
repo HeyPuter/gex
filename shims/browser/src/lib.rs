@@ -3477,6 +3477,13 @@ fn with_own_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     #[cfg(feature = "shared-memory")]
     let r = f(unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut() }.expect("gex: an adoption before its process"));
     debug_assert!(sigs::home().is_none_or(|h| h.table().len() == 1), "an own host with more than one thread");
+    // The JIT lock, if the call took it (`JitHere`), as `with_exec_lock`
+    // gives it back. `do_exec` takes it (`jit_in_held(&mut h.jit)`) under an
+    // adoption (`gex_adopted_exec`): kept, it went into the new program with
+    // the thread and every exec'd process's first trap said "BUG: trapped
+    // out to JS holding the JIT lock" (B18, 9 in a Win7 shell boot), its
+    // other threads waiting on the lock meanwhile.
+    jit_give();
     r
 }
 
