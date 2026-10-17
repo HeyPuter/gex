@@ -223,6 +223,10 @@ impl std::fmt::Debug for Mm {
     }
 }
 
+/// What a host's `back` hook answers for a range it keeps as an island
+/// (see `MemoryMap::grows_on_demand`).
+pub const BACKED_ISLAND: u64 = u64::MAX;
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
@@ -254,8 +258,9 @@ pub struct MemoryMap {
     /// The cursor only moves up, atomically, so the bytes between that and
     /// `end` are this map's alone, and are recorded as arena for later
     /// mappings to use. A host may instead leave the cursor where it is and
-    /// answer `start`, keeping the range as an island its cursor steps over
-    /// (W3 in the browser): then only `[start, end)` is this map's.
+    /// answer [`BACKED_ISLAND`], keeping the range as an island its cursor
+    /// steps over (W3 in the browser): backed, the guest's for mappings placed
+    /// there, and never arena.
     back: Option<fn(u64, u64) -> Option<u64>>,
     /// Bumped by every change to the map. `/proc/self/maps` is derived from the
     /// tree; a counter lets a cached rendering be reused unchanged instead of
@@ -693,6 +698,14 @@ impl MemoryMap {
         let Some(prev) = back(start, end) else {
             return Err(Errno::ENOMEM);
         };
+        // An island's range (W3's pinned DLL band, in the browser): backed and
+        // the guest's, but never this map's arena. Adopted, an image's slot
+        // went to the next bottom-up mapping once the image was unmapped, and
+        // the image loaded again (uxtheme, in Paint) relocated and missed its
+        // unit.
+        if prev == BACKED_ISLAND {
+            return Ok(());
+        }
         // What the cursor stepped over is backed now and nobody else's:
         // arena, so the next mapping lands in it rather than growing the
         // memory again. Without this a MAP_FIXED high up (a pinned library,
@@ -1418,7 +1431,7 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(end: u64) -> Option<u64> {
+        fn back(_start: u64, end: u64) -> Option<u64> {
             Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         let mut m = MemoryMap::new(0x40_1000);
@@ -1641,6 +1654,41 @@ mod tests {
         assert!(next < high && next > first, "{next:#x}");
         assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
         assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
+    }
+
+    /// A host's island (W3's pinned DLL band): a fixed mapping there is
+    /// backed but never becomes arena, so once it is unmapped the next
+    /// bottom-up mapping does not take its slot, and the image mapped there
+    /// again gets its address back.
+    #[test]
+    fn an_islands_slot_is_not_reused_by_the_arena() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(start: u64, end: u64) -> Option<u64> {
+            if start >= 0x1100_0000 && end <= 0x2000_0000 {
+                return Some(BACKED_ISLAND);
+            }
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x0800_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        // The arena's first chunk, full: a free slot anywhere else in the
+        // arena would be the next bottom-up mapping's.
+        m.mmap(0, 0x80_0000, 3, anon, "filler").unwrap();
+        let pin = 0x1150_0000;
+        let cursor = NEXT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(m.mmap(pin, 0x10_0000, 3, anon | flags::FIXED_NOREPLACE, "dll"), Ok(pin));
+        assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the cursor moved");
+        m.unmap(pin, 0x10_0000).unwrap();
+        for _ in 0..4 {
+            let a = m.mmap(0, 0x4_0000, 3, anon, "heap").unwrap();
+            assert!(a + 0x4_0000 <= pin || a >= pin + 0x10_0000, "the slot went to {a:#x}");
+        }
+        assert_eq!(m.mmap(pin, 0x10_0000, 3, anon | flags::FIXED_NOREPLACE, "dll again"), Ok(pin));
     }
 
     #[test]

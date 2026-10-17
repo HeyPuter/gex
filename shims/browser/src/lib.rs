@@ -2687,8 +2687,9 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // W3's compact space: a mapping wholly above the cursor (KUSER_SHARED_DATA
     // at 0x7ffe0000, an image at its base) is an island the cursor steps over
     // when it gets there, not a jump that leaves everything below it unused --
-    // for the shim's heap too, whose ceiling is 2 GiB. The kernel keeps the
-    // island as arena of its own.
+    // for the shim's heap too, whose ceiling is 2 GiB. The kernel does not
+    // take the island as arena: what is unmapped there stays free for the
+    // image pinned there, not for the next bottom-up mapping.
     // One inside an island already (the executables' slot, an inherited
     // region) is the guest's as it stands.
     let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
@@ -2696,7 +2697,9 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
         && (memmap::within_island(start, end)
             || cur != 0 && start >= cur && memmap::claim_island(start, end, &ARENA_NEXT, "guest fixed mapping above the arena"))
     {
-        return Some(start);
+        // Backed, and never the kernel's arena: a pinned image's slot stays
+        // free for it once it is unmapped.
+        return Some(gex_kernel::mem::BACKED_ISLAND);
     }
     let prev = ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > prev {
