@@ -34,7 +34,8 @@
 # end is `exit N`, `signal N` or `timeout` (still running at --time). reason
 # is the last line of the log that looks like why it stopped (an unhandled
 # exception, an unimplemented call, a panic, ...), for a first look; DIR/SLUG/
-# excerpt holds the last 30 such lines.
+# excerpt holds the last 30 such lines. DIR/SLUG/focus-frame is the frame
+# (and seconds) at which a placed window first had the keyboard.
 #
 # This is a correctness/debug tool: never read speed from it (no timing on
 # gooner; fps comes from the bench box, scratch/bench/bench.sh).
@@ -60,7 +61,9 @@
 # as its arguments, e.g. 'C:\winlogon.exe' for the Win7 shell's prefix),
 # WINEDEBUG (default err+all,fixme-all), W3_UNITS (a unit cache, as
 # tools/wine-wasm/run.sh's: GEX_W3_UNITS=all GEX_CGEN_CACHE=W3_UNITS, and
-# GEX_W3_UNITS_BUILD=1 builds the missing ones for the next run).
+# GEX_W3_UNITS_BUILD=1 builds the missing ones in the background for the
+# next run; W3_UNITS_BUILD=0 builds none). GEX_W3_TRACE=1 names each image
+# that runs on tier-1 because its unit is missing.
 # Take W3_DIST and W3_PREFIX from tools/wine-wasm (`make -s paths`, or
 # w3-dist.sh WINE CACHE for a Wine checkout, as the gate's W3 legs).
 # W64 games (kind w64, x86-64 Windows on 64-bit native Wine): W64_DIST,
@@ -328,7 +331,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
         run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}"
               --wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}")
         pre=("$w3dist/lib/wine/i386-unix/wine")
-        [ -n "${W3_UNITS:-}" ] && env+=(GEX_W3_UNITS=all GEX_CGEN_CACHE="$W3_UNITS" GEX_W3_UNITS_BUILD=1)
+        [ -n "${W3_UNITS:-}" ] && env+=(GEX_W3_UNITS=all GEX_CGEN_CACHE="$W3_UNITS" GEX_W3_UNITS_BUILD=${W3_UNITS_BUILD:-1} GEX_W3_TRACE=1)
         [ -n "${W3_LAUNCHER:-}" ] && pre+=("$W3_LAUNCHER")
       else
         if [ $keep = 0 ] || [ ! -f "$pfx/.wine-version" ]; then
@@ -356,6 +359,10 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
         n=$(newest "$g/frames")
         [ -n "$n" ] && [ -z "$tfirst" ] && tfirst=$(( $(date +%s) - t0 ))
         [ -n "$n" ] && [ -z "$tmenu" ] && [ "$menu" != - ] && [ "$n" -ge "$menu" ] && tmenu=$(( $(date +%s) - t0 ))
+        # The frame at which a placed window first had the keyboard: where an
+        # input script's clock (`frames N`) should start.
+        [ -n "$n" ] && [ ! -f "$g/focus-frame" ] && grep -aq '^\[wl-place\].* focus' "$g/log" &&
+            echo "$n $(( $(date +%s) - t0 ))" > "$g/focus-frame"
         if [ -n "$n" ] && [ $keepframes = 1 ]; then
             for f in $(ls "$g/frames" | grep '\.ppm$' | grep -v "^f-0*$n\.ppm$"); do
                 python3 "$here/ppm2png.py" "$g/frames/$f" "$g/frames/${f%.ppm}.png" && rm -f "$g/frames/$f"
