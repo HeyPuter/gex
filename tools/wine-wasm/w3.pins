@@ -3,9 +3,9 @@
 # sources the W3 dist is built from are named. Change a pin here and `make`
 # rebuilds what depends on it (outputs are keyed by these values).
 
-# The Wine fork: branch mw/wasm32-w3.
+# The Wine fork: branch mw/wasm32-w3 (here v2/pack-w3, the W3 pin e977313a5b6 plus the compact-space pack).
 WINE_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE_COMMIT := b57ea7f7d694d626f739e141ba817af2f4fe2787
+WINE_COMMIT := abab5dde371f592e5cb17c7ab87a384734ff0323
 
 # The musl fork the wasm32 sysroot is built from (build-sysroot.sh):
 # branch mw/gex-wasm32-slim.
