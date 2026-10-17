@@ -19,7 +19,8 @@
 // (nt.html, nt-page.js) maps its query onto these options.
 
 import { untar } from './tar.js';
-import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls } from './runtime.js';
+import { makeControl as lazyCacheControl } from '../../shims/browser/js/lazy-cache.mjs';
+import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 
@@ -84,6 +85,8 @@ export async function start(opts = {}) {
   const at = (p) => (p ? new URL(String(p).replace(/^\//, ''), base).href : p);
   const state = { out: '', status: null, error: null, phase: 'loading' };
   globalThis.__nt = state;
+  // The guest Worker's modules: fetched, or from the page's cache (worker-graph.js).
+  state.workerGraph = workerGraphBytes;
   const meter = progressMeter(state, opts.onProgress);
   try {
     return await begin(opts, base, at, state, meter);
@@ -128,7 +131,7 @@ function progressMeter(state, onProgress) {
   const order = ['download', 'compile', 'boot', 'first-frame', 'ready'];
   const p = {
     phase: 'download',
-    download: { done: 0, total: 0, filesDone: 0, files: 0 },
+    download: { done: 0, total: 0, filesDone: 0, files: 0, cached: 0 },
     compile: { done: 0, total: 0 },
     at: { download: 0 },
     elapsed: 0,
@@ -279,6 +282,9 @@ function progressMeter(state, onProgress) {
     },
     /** Bytes in, a file whole, a size learned late, a unit compiled. */
     bytes(n) { p.download.done += n; this.tick(); },
+    /** Bytes the page had kept (a piece in its cache): counted as done, and
+     *  as `cached`, so the page can say they came from there. */
+    cached(n) { p.download.done += n; p.download.cached += n; this.tick(); },
     // A file whole is said at once, so the count shown is never a tick
     // behind the bytes (a phase change is, too: see `phase`).
     fileDone() { p.download.filesDone++; emit(); },
@@ -291,7 +297,10 @@ function progressMeter(state, onProgress) {
       p.phase = name;
       p.at[name] = Math.round(performance.now() - t0);
       const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
-      if (from === 'download') log('phase', `Downloaded ${(p.download.done / 1e6).toFixed(1)} MB in ${secs(p.at[name])}`);
+      if (from === 'download') {
+        const c = p.download.cached;
+        log('phase', `Downloaded ${((p.download.done - c) / 1e6).toFixed(1)} MB${c ? `, ${(c / 1e6).toFixed(1)} MB from cache,` : ''} in ${secs(p.at[name])}`);
+      }
       if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
       if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
       emit();
@@ -406,14 +415,16 @@ async function begin(opts, base, at, state, meter) {
   // The background fill's list (eject-site.mjs --late): lazy files the page
   // downloads once the boot's files are in, while the guest runs.
   const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
-  const fetcher = { pack, zstd, base, state, meter };
+  const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore() };
+  // The bundle's file bytes in pieces, kept in the page's cache.
+  const pieceList = b.pieces ? await fetchJson(at(b.pieces), 'the pieces\' list') : null;
   // What is to come, for the progress: the bundle's files and the units'.
   // The two small lists are read before the bundle starts, so the totals
   // are whole from the first count.
   const preList = b.preload ? await fetch(at(b.preload)).then((r) => (r.ok ? r.json() : null)).catch(() => null) : null;
   {
     const d = meter.p.download;
-    for (const href of [...b.tar.map(at), ...(preList ?? []).map(([, path]) => at(path))]) {
+    for (const href of [...b.tar.map(at), ...(pieceList?.pieces ?? []).map(([url]) => at(url)), ...(preList ?? []).map(([, path]) => at(path))]) {
       d.files++;
       d.total += (await packedEntry(href, fetcher))?.zsize ?? 0;
     }
@@ -438,6 +449,20 @@ async function begin(opts, base, at, state, meter) {
     .then((kv) => primeRuntime(Object.fromEntries(kv)));
   const trees = [];
   const buffers = [];
+  // The pieces, four at a time, beside the bundle's archive.
+  const pieceBufs = pieceList ? (async () => {
+    const out = new Array(pieceList.pieces.length);
+    let next = 0;
+    const one = async () => {
+      while (next < out.length) {
+        const i = next++;
+        out[i] = await fetchShared(at(pieceList.pieces[i][0]), fetcher);
+      }
+    };
+    await Promise.all([one(), one(), one(), one()]);
+    return out;
+  })() : null;
+  pieceBufs?.catch(() => {});
   for (const url of b.tar) {
     const tar = await fetchShared(at(url), fetcher);
     buffers.push(tar.buffer);
@@ -454,6 +479,17 @@ async function begin(opts, base, at, state, meter) {
     links: Object.assign(a.links ?? {}, t.links),
     mtimes: Object.assign(a.mtimes ?? {}, t.mtimes),
   }));
+  if (pieceBufs) {
+    // The archive holds each such file empty (its mode, its time); its bytes
+    // are a piece's, viewed, not copied.
+    const bufs = await pieceBufs;
+    for (const u of bufs) buffers.push(u.buffer);
+    for (const [path, i, off, n] of pieceList.files) {
+      const u = bufs[i];
+      tree.files[path] = new Uint8Array(u.buffer, u.byteOffset + off, n);
+    }
+    mark(`pieces in (${pieceList.pieces.length}, ${pieceList.files.length} files)`);
+  }
   const files = { ...tree.files };
   // A guest directory kept in IndexedDB: what the program left there last
   // time, over the bundle's.
@@ -566,8 +602,50 @@ async function begin(opts, base, at, state, meter) {
       fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late });
     }
   }
+  // The lazy files kept in the page's cache (lazy-cache.mjs): one Worker
+  // owns it and every Worker's read of a lazy file asks it first. Needs
+  // shared memory (the SP build reads lazy files from the network) and a
+  // Cache Storage that holds (`?lazycache=0` turns it off).
+  let lazyCache = null;
+  if (lazy.length && typeof SharedArrayBuffer === 'function' && sw.lazycache !== '0') {
+    const k = await globalKernel();
+    if (k?.memory) {
+      const ctl = lazyCacheControl();
+      const w = new Worker(new URL('./lazy-cache-worker.js', import.meta.url), { type: 'module', name: 'lazy-cache' });
+      const lc = (state.lazyCache = { on: false, net: 0, cached: 0 });
+      const ready = await new Promise((r) => {
+        w.onmessage = ({ data: m }) => {
+          if (m.kind === 'ready') r(m);
+          else if (m.kind === 'bytes') {
+            lc.net += m.net;
+            lc.cached += m.cached;
+            state.downloaded = (state.downloaded ?? 0) + m.net;
+            state.cached = (state.cached ?? 0) + m.cached;
+          }
+        };
+        w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
+        setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
+        w.postMessage({ ctl, memory: k.memory, cache: PIECE_CACHE });
+      });
+      if (ready.ok) {
+        lc.on = true;
+        lazyCache = { ctl };
+      } else {
+        w.terminate();
+        lc.why = ready.why;
+        say(`[app] lazy files not cached: ${ready.why}\n`);
+      }
+    }
+  }
   state.phase = 'running';
   mark('running');
+  // What this build no longer names goes from the cache: its pieces, its
+  // units' archives, its lazy files.
+  prunePieces(fetcher, [
+    ...(pieceList?.pieces ?? []).map(([u]) => u),
+    ...(preList ?? []).map(([, u]) => u),
+    ...lazy.map(([, , u]) => u),
+  ]).catch(() => {});
   if (keep) {
     const p = persist(keep.db, keep.dir, await globalKernel(), {
       every: Number(sw.persistms || 30000),
@@ -632,6 +710,7 @@ async function begin(opts, base, at, state, meter) {
     hostX: !!b.hostx && opts.hostx !== false,
     preModules,
     fill,
+    lazyCache,
     identities: b.identities ?? null,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
@@ -750,6 +829,9 @@ function launchBuild(m, at) {
     delete p.fill;
     const identities = p.identities ?? null;
     delete p.identities;
+    // The bundle's file bytes in pieces (eject-site.mjs --pieces).
+    const pieces = p.pieces ?? null;
+    delete p.pieces;
     return {
       tar: ['project/build/web/rootfs.tar'],
       exe: m.exe,
@@ -766,6 +848,7 @@ function launchBuild(m, at) {
       lazy,
       fill,
       identities,
+      pieces,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
       switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
@@ -877,6 +960,53 @@ function zstdLoader(src) {
   })());
 }
 
+/*
+ * The site's pieces (eject-site.mjs --pieces: project/build/web/pieces/ID,
+ * the bundle's file bytes and the units' archives, each named by its
+ * content) kept in the page's Cache Storage under their URL without the
+ * build's query: a visit after a rebuild takes every piece that did not
+ * change from there and fetches the rest. No service worker; the page reads
+ * and writes the cache itself. Where there is no Cache Storage (an insecure
+ * origin, a storage error) pieces are fetched as any file.
+ */
+const PIECE_CACHE = 'gex-pieces-v1';
+const isPiece = (href) => /\/pieces\/[^/]+$/.test(new URL(href).pathname.replace(/\.zst$/, ''));
+function pieceStore() {
+  let p = null;
+  return () => (p ??= (async () => {
+    try { return typeof caches === 'object' && caches ? await caches.open(PIECE_CACHE) : null; } catch { return null; }
+  })());
+}
+/** A piece's response, from the cache or the network (then kept); `cached`
+ *  says which. */
+async function pieceFetch(href, f, init) {
+  const u = new URL(href);
+  u.search = '';
+  const cache = await f.pieces?.();
+  if (cache) {
+    try {
+      const r = await cache.match(u.href);
+      if (r?.ok) return { res: r, cached: true, key: u.href, cache };
+    } catch { /* fetched */ }
+  }
+  const res = await fetch(u.href, init);
+  if (res.ok && cache) cache.put(u.href, res.clone()).catch(() => {});
+  return { res, cached: false, key: u.href, cache };
+}
+/** Pieces of older builds: whatever the cache holds that this build does not
+ *  name (`keep`, URL paths) goes once the program runs. */
+async function prunePieces(f, keep) {
+  const cache = await f.pieces?.();
+  if (!cache) return;
+  try {
+    const want = new Set(keep.map((k) => new URL(k, location.href).pathname));
+    for (const r of await cache.keys()) {
+      const path = new URL(r.url).pathname;
+      if (!want.has(path) && !want.has(path.replace(/\.zst$/, ''))) await cache.delete(r);
+    }
+  } catch { /* kept */ }
+}
+
 /**
  * A file in one ArrayBuffer, which is moved (not cloned) to pid 1's Worker:
  * a clone would copy it, and a SharedArrayBuffer stays resident for the
@@ -885,7 +1015,7 @@ function zstdLoader(src) {
 async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
   const z = await packedEntry(url, f);
   if (z) return fetchPacked(url, z, shared, f, { priority });
-  const res = await fetch(url, { cache: 'no-cache', priority });
+  const { res, cached } = isPiece(url) ? await pieceFetch(url, f, { priority }) : { res: await fetch(url, { cache: 'no-cache', priority }), cached: false };
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length'));
   if (!total) throw new Error(`${url}: no content-length`);
@@ -899,19 +1029,36 @@ async function fetchShared(url, f, { shared = false, priority = 'auto' } = {}) {
     if (done) break;
     out.set(value, at);
     at += value.length;
-    f.meter?.bytes(value.length);
+    if (cached) f.meter?.cached(value.length);
+    else f.meter?.bytes(value.length);
   }
   f.meter?.fileDone();
   if (at !== total) throw new Error(`${url}: ${at} of ${total} bytes`);
   return out;
 }
 
-async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null, progress = null, priority = 'auto' } = {}) {
+async function fetchPacked(url, z, shared, f, opt = {}) {
+  try {
+    return await fetchPackedOnce(url, z, shared, f, opt);
+  } catch (e) {
+    // A kept piece that does not decode (a cache cut short): dropped, and
+    // fetched again.
+    if (!e?.fromCache) throw e;
+    await e.fromCache.cache.delete(e.fromCache.key).catch(() => {});
+    console.warn(`[app] ${url}: the cached copy is bad (${e.message}); fetching it`);
+    return fetchPackedOnce(url, z, shared, f, { ...opt, noCache: true });
+  }
+}
+
+async function fetchPackedOnce(url, { size, zsize, build }, shared, f, { into = null, progress = null, priority = 'auto', noCache = false } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
-  const res = await fetch(u.href, { priority });
+  const piece = isPiece(u.href);
+  const got = piece ? await pieceFetch(u.href, noCache ? { ...f, pieces: null } : f, { priority }) : { res: await fetch(u.href, { priority }), cached: false };
+  const res = got.res;
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
+  const bad = (msg) => Object.assign(new Error(msg), got.cached ? { fromCache: got } : {});
   // Decoded as it arrives: the decode is done when the download is.
   const d = await f.zstd();
   const out = new Uint8Array(into ?? (shared ? new SharedArrayBuffer(size) : new ArrayBuffer(size)));
@@ -931,15 +1078,22 @@ async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null
       z.push(value, emit);
       progress?.(n);
       at += value.length;
-      f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
-      f.meter?.bytes(value.length);
+      if (got.cached) {
+        f.state.cached = (f.state.cached ?? 0) + value.length;
+        f.meter?.cached(value.length);
+      } else {
+        f.state.downloaded = (f.state.downloaded ?? 0) + value.length;
+        f.meter?.bytes(value.length);
+      }
     }
+  } catch (e) {
+    throw got.cached ? bad(e?.message ?? String(e)) : e;
   } finally {
     z.end();
   }
   f.meter?.fileDone();
-  if (at !== zsize) throw new Error(`${u.href}: ${at} of ${zsize} bytes`);
-  if (n !== size) throw new Error(`${url}: decoded ${n} of ${size} bytes`);
+  if (at !== zsize) throw bad(`${u.href}: ${at} of ${zsize} bytes`);
+  if (n !== size) throw bad(`${url}: decoded ${n} of ${size} bytes`);
   return out;
 }
 
@@ -947,6 +1101,7 @@ async function fetchPacked(url, { size, zsize, build }, shared, f, { into = null
  *  bundle downloads, a few at a time. */
 async function preloadUnits(list, f, at) {
   const out = [];
+  let closed = false;
   let i = 0;
   const one = async () => {
     while (i < list.length) {
@@ -981,7 +1136,8 @@ async function preloadUnits(list, f, at) {
             s.set(bytes);
             out.push([`file:${rel}`, s]);
           }
-          out.push(...await Promise.all(mods), ['closed', true]);
+          out.push(...await Promise.all(mods));
+          closed = true;
           // Everything in it is compiled (V8 keeps its own copy of each
           // module's bytes) or copied out: the archive itself goes now. Left
           // to the collector it stayed until the next full collection, the
@@ -1017,5 +1173,7 @@ async function preloadUnits(list, f, at) {
     }
   };
   await Promise.all([one(), one(), one(), one()]);
+  // After every archive (one, or the pieces': eject-site.mjs --pieces).
+  if (closed) out.push(['closed', true]);
   return out;
 }
