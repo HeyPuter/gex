@@ -722,10 +722,14 @@ impl<'a> Emitter<'a> {
             };
         }
         // W3 with KUSER_SHARED_DATA folded (tier-1's `emit_address`): a
-        // constant in Windows' page names W3's, and every other address is
-        // checked against the old page (`gex_k`), whose failure is the named
-        // fault, an access violation.
-        if gex_abi::kuser_fold() {
+        // constant in Windows' page names W3's. A guarded unit checks every
+        // other address against the old page (`gex_k`), whose failure is the
+        // named fault, an access violation. An unguarded one does not: that
+        // check on every access made units half as big again (advapi32
+        // 1.31 -> 2.01 MB) and Paint's start slower, and in W3's compact
+        // space an address there is past the memory's end, so the engine's
+        // own bounds check traps it (unnamed) as it would any other.
+        if gex_abi::kuser_fold() && (self.value_const[addr.0 as usize].is_some() || !(no_guard() || self.unguarded())) {
             let pc = self.block.start;
             if let Some(c) = self.value_const[addr.0 as usize] {
                 let ea = c.wrapping_add(offset as u64);
