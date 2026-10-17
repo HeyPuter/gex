@@ -32,7 +32,7 @@
 
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
-katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |-|-|katana-zero-w3.wl
+katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |1200|3000|katana-zero-w3.wl
 npp          |w3   |N++                                  |N++.exe                             | |-|-|-
 momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl

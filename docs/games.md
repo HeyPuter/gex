@@ -366,17 +366,19 @@ correctness only; edger is used for checks that need a GPU.
 | game | kind | reached | where it stops / notes |
 |---|---|---|---|
 | Undertale | w3 | **gameplay** (the Ruins; menu frame 800, gameplay 2000) | undertale-w3.wl starts at frame 20; the window must have the keyboard first (focus-frame) |
-| Katana ZERO | w3 | **menu**; keys move the cursor | |
+| Katana ZERO | w3 | **gameplay** (the first level; menu frame 1200, gameplay 3000) | katana-zero-w3.wl starts at frame 10, when the window has the keyboard; up to NEW GAME at 65 s |
 | Retrocycles | w3 | **gameplay** (a match) | |
 | Momodora | w3 | **title** ("Press Any Button") | no input script yet |
 | N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
-| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then a stall in the loader and an `unreachable` trap |
+| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh) |
+| Hades | w64 | **menu** (edger) | stub=basecamp (x64) |
+| Spelunky 2 | w64 | blank window | the main thread holds the loader lock after concrt140 loads while two threads spin on GetSystemTimeAsFileTime; open |
 | Dicey Dungeons | w64 | **menu** | dicey-w64.wl |
-| Geometry Dash | w64 | **menu** (first-run terms notice on top) | |
-| 5D Chess | w64 | **menu** | |
+| Geometry Dash | w64 | **gameplay** (menu frame 1280, gameplay 8320) | geometry-dash-w64.wl: OK on the terms notice, Play, the first level |
+| 5D Chess | w64 | **gameplay** (a board; menu frame 290, gameplay 4640) | 5d-chess-w64.wl: Versus, Play, moves; clicks are offset by the window frame (4,30) |
 | Mosa Lina | w64 | **title** ("press any button") | |
 | Hyper Light Drifter | w64 | **title** splash | no audio device |
-| OneShot | w64 | blank window | starts from steamshim.exe; "Error opening OpenAL device": W64 has no audio driver yet (W64's) |
+| OneShot | w64 | blank window | starts from steamshim.exe. With W64's wineoss (w64/oss) the audio device opens; then its Ruby exits with "unexpected ucrtbase.dll": Ruby finds __pioinfo by scanning _isatty's x86 code. Wine g/wine64-isatty gives _isatty that shape; `pe=ucrtbase.dll` keeps Wine's PE ucrtbase (the native one has no x86 code). Waits on W64's dist with both |
 | Baba Is You | w64 | none | a call through NULL right after mmdevapi finds no driver (audio, as OneShot) |
 | DELTARUNE, Will You Snail | w64 | none | c0000018: fixed base 0x140000000 with no relocations, needs memory64 (W64.7) |
 | Baba Is You | linux-x11 | **gameplay** | |
@@ -387,7 +389,8 @@ Matrix changes: matrix.txt is read on its own fd (a Windows run ate the
 next rows from the loop's stdin, so every other Windows row was skipped);
 `stub=NAME@PATH` swaps a no-op DLL built from tests/games/stubs into the run
 copy; DIR/SLUG/focus-frame says when a window first had the keyboard;
-MATRIX_NICE sets the runs' nice level (15 while a gate runs).
+MATRIX_NICE sets the runs' nice level (15 while a gate runs); `pe=DLL[,DLL...]` keeps a w64 game's DLLs Wine's PE build
+instead of W64_NATIVE's.
 
 ## Games matrix, 2026-10-14 update (stream G, parked until W64)
 
