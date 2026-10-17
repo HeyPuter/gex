@@ -12,7 +12,8 @@
 # the tree was configured --with-gnutls, and, when the tree was
 # configured with them (W64.4, w64-deps.sh's libraries: W64_DEPS), win32u
 # (+ FreeType), winewayland.drv (+ libwayland, xkbcommon) and opengl32
-# (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64).
+# (+ gex-gl's EGL, guest/gl/gexgl.c compiled LP64); and wineoss.drv's
+# (audio: OSSv4 against gex-kernel's /dev/dsp, as W3's).
 # WINE_BUILD is a wasm64 build tree of the Wine fork (configure
 # --host=wasm64-unknown-linux-musl CC=tools/wine-wasm/wcc64
 # CXX=tools/wine-wasm/wcc64++); the objects are made there first.
@@ -146,6 +147,28 @@ if grep -q '^dlls/opengl32/opengl32.so:' Makefile && grep -q 'SONAME_LIBEGL' inc
 	done
 	reg="$reg libwayland-client.so.0:data:wl_callback_interface"
 fi
+# wineoss.so (audio), a Unix library only: mmdevapi loads it by name
+# (__wine_load_unix_lib), no PE side. Configure leaves it out
+# (--without-oss: no OSSv4 header in the sysroot), so as W3's
+# w3/link-loader.sh, it is compiled with crypt32's unixlib command, against
+# w3/oss's sys/soundcard.h (OSSv4's API, which gex-kernel's /dev/dsp and
+# /dev/mixer answer). Without it an x64 game's audio device fails to open
+# (mmdevapi: "No driver from pulse,alsa,oss,coreaudio could be
+# initialized"; OpenAL Soft: "Error opening OpenAL device").
+mkdir -p gexw64/wineoss
+tmpl=$(make -n -W "$WF/dlls/crypt32/unixlib.c" dlls/crypt32/unixlib.o 2>/dev/null | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' |
+	grep -- "-c -o dlls/crypt32/unixlib.o")
+[ -n "$tmpl" ] || { echo "link-w64: no compile command for crypt32's unixlib (wineoss's template)" >&2; touch "$fail"; }
+for b in midipatch oss ossmidi; do
+	out=gexw64/wineoss/$b.o; objs="$objs $out"
+	[ "$out" -nt "$WF/dlls/wineoss.drv/$b.c" ] && [ "$out" -nt "$HERE/link-w64.sh" ] && continue
+	cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/wineoss.drv\/$b.c}
+	cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/wineoss.drv -I$HERE\/w3\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
+	( eval "$cmd -D__wine_unix_call_funcs=wineoss__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=wineoss__wine_unix_call_wow64_funcs" >&2 ) ||
+		{ echo "link-w64: wineoss.drv/$b.c failed" >&2; touch "$fail"; } &
+	while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done
+done
+reg="$reg wineoss.so:data:__wine_unix_call_funcs=wineoss__wine_unix_call_funcs"
 wait
 [ ! -e "$fail" ] || { echo "link-w64: compile failed; not linking" >&2; exit 1; }
 python3 "$HERE/dlreg.py" $reg > gexw64/reg.c

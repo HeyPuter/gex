@@ -18,8 +18,9 @@
 #               GnuTLS over nettle and Mozilla's CA bundle, as W3's)
 #   b64-K-S     the wasm64 build tree of the Unix side (wcc64), with them:
 #               win32u (+ FreeType), winewayland.drv and opengl32 (+ gex-gl's
-#               EGL, guest/gl/gexgl.c; W64.4) and secur32 (+ GnuTLS) in
-#               the loader; W64_TLS=0 leaves GnuTLS out (S gets -notls)
+#               EGL, guest/gl/gexgl.c; W64.4), secur32 (+ GnuTLS) and
+#               wineoss.drv (audio, against gex-kernel's /dev/dsp, as W3's)
+#               in the loader; W64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over W3_BUILD)
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               share/wine, and etc/ssl/certs/ca-certificates.crt (crypt32's
@@ -32,7 +33,8 @@
 #               (stage-native64.sh)
 # K is the Wine commit, P the Wine tree less its Unix side (tools, pe64,
 # pfx64), D the sysroot, the compiler and the libraries' pins and build,
-# S those, gex's link tools and gex-gl's guest library, N those, the PE
+# S those, gex's link tools, gex-gl's guest library and the OSSv4 header
+# (w3/oss), N those, the PE
 # linker and the DLL list.
 # Env: GEX_WASM64_SYSROOT (build-sysroot64.sh); JOBS (default 16); the
 # libraries' tarballs are kept in CACHE/dl, taken from W3_DL_SEED and
@@ -78,7 +80,7 @@ P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$here"/w64-deps.sh "$here"/w3.pins \
 	"$here"/ffi64/*; } | sha256sum | cut -c1-10)
 S=$( { echo "$DH"; cat "$here"/link-w64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
-	"$here"/../../guest/gl/*.inc; } | sha256sum | cut -c1-10)
+	"$here"/../../guest/gl/*.inc "$here"/w3/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${W64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
 without="--without-x --without-freetype --without-gstreamer --without-pulse --without-alsa --without-cups
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus

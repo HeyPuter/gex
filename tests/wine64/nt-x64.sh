@@ -21,6 +21,7 @@
 # (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
+# The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
 # The display case (W64.4), when the loader has winewayland.drv's Unix side
 # (link-w64.sh with W64_DEPS) and the driver's PE side is there (native:
 # NATIVE= with W64_NATIVE_DLLS' winewayland.drv): window.exe under gexc's
@@ -190,6 +191,20 @@ if grep -q winewayland.so "$wine" && [ -e "$dist/lib/wine/x86_64-windows/wineway
 		GL=1 WL="220,40,40 40,200,60 40,80,220 230,210,40 255,255,255:100" \
 			check glwindow 0 "shown${nl}frames [0-9]+${nl}bye" glwindow.exe 3
 	fi
+fi
+# Audio: waveOut and an mmdevapi stream each play 100 ms (audio.c) through
+# wineoss.drv's Unix side in the loader (link-w64.sh) to gex-kernel's
+# /dev/dsp, natively and in the page. A loader without it fails the case:
+# every x64 game that opens an audio device stops there (OneShot's OpenAL).
+# Not yet PAGE=sp: there, after waveOut, the process outlives its exit (the
+# server's SIGKILL; mmdevapi alone exits), so the case times out.
+if ! grep -q wineoss.so "$wine"; then
+	case " ${CASES:-audio} " in *" audio "*)
+		fail=$((fail + 1)); echo "FAIL x64/audio ($tag): the loader has no wineoss.so (link-w64.sh)" ;; esac
+elif x86_64-w64-mingw32-gcc -O1 -o "$w/audio.exe" "$here/audio.c" -lwinmm -lole32; then
+	check audio 0 "waveout ok${nl}mmdevapi ok" "$w/audio.exe"
+else
+	fail=$((fail + 1)); echo "FAIL x64/audio ($tag): x86_64-w64-mingw32-gcc"
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c). Not in the page:
 # there the shim's heap is the upper 2 GiB of the process's memory, and the
