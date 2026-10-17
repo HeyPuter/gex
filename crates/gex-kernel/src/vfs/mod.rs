@@ -15,6 +15,7 @@ pub mod devfs;
 #[cfg(unix)]
 pub mod hostfs;
 pub mod oss;
+pub mod peimage;
 pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
@@ -141,6 +142,16 @@ pub struct DirEntry {
 ///
 /// Handles are reference-counted so `dup` and `fork` can share one open-file
 /// description, which is what makes a shared file offset behave correctly.
+/// `POSIX_FADV_WILLNEED`.
+pub const FADV_WILLNEED: u32 = 3;
+/// gex's own `posix_fadvise` advice: fetch now the parts of a PE image the
+/// wineserver reads when it makes an image mapping of it (its headers, the
+/// export name, the version resource, the CLR and load-config headers, the
+/// shared sections: server/mapping.c `get_image_params`), so that its read
+/// inside a door call never waits on the network (`offset`, `len` unused).
+/// A W3 client advises this before `create_mapping` (ntdll's `NtCreateSection`).
+pub const FADV_GEX_IMAGE: u32 = 0x4745_0001;
+
 pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// Read at `offset`, returning the bytes read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult;
@@ -208,6 +219,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let _ = len;
         Err(Errno::EINVAL)
+    }
+    /// `posix_fadvise`: `advice` is `POSIX_FADV_*` or [`FADV_GEX_IMAGE`]. A
+    /// file whose bytes are all here has nothing to do; a lazy one
+    /// ([`tmpfs::TmpFs::add_lazy`]) fetches what is asked now, so that a later
+    /// read of it waits on nothing.
+    fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
+        let _ = (offset, len, advice);
+        Ok(())
     }
     /// `fchmod` on what this handle is open on, when the handle can do it
     /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.

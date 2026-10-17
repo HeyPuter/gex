@@ -156,21 +156,45 @@ struct Lazy {
 
 impl Lazy {
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<u64, Errno> {
+        self.read_ahead(offset, buf, true)
+    }
+
+    /// [`Lazy::read`], with or without the readahead.
+    fn read_ahead(&mut self, offset: u64, buf: &mut [u8], ahead: bool) -> Result<u64, Errno> {
         if offset >= self.size || buf.is_empty() {
             return Ok(0);
         }
         let end = (offset + buf.len() as u64).min(self.size);
-        let (first, last) = (offset / LAZY_CHUNK, (end - 1) / LAZY_CHUNK);
-        // Missing chunks in runs, one request a run.
+        self.fetch(offset / LAZY_CHUNK, (end - 1) / LAZY_CHUNK, ahead)?;
+        let mut at = offset;
+        while at < end {
+            let k = at / LAZY_CHUNK;
+            let chunk = &self.chunks[&k];
+            let from = (at - k * LAZY_CHUNK) as usize;
+            let n = ((end - at) as usize).min(chunk.len() - from);
+            let o = (at - offset) as usize;
+            buf[o..o + n].copy_from_slice(&chunk[from..from + n]);
+            at += n as u64;
+        }
+        Ok(end - offset)
+    }
+
+    /// Have chunks `first..=last` here: the missing ones in runs, one
+    /// request a run (and with `ahead`, a sequential run reads ahead).
+    fn fetch(&mut self, first: u64, last: u64, ahead: bool) -> Result<(), Errno> {
         let mut c = first;
         while c <= last {
             if self.chunks.contains_key(&c) {
                 c += 1;
                 continue;
             }
-            let sequential = c > 0 && self.chunks.contains_key(&(c - 1));
-            self.ahead = if sequential { (self.ahead * 2).clamp(1, LAZY_READAHEAD) } else { 0 };
-            let limit = last + self.ahead;
+            let limit = if ahead {
+                let sequential = c > 0 && self.chunks.contains_key(&(c - 1));
+                self.ahead = if sequential { (self.ahead * 2).clamp(1, LAZY_READAHEAD) } else { 0 };
+                last + self.ahead
+            } else {
+                last
+            };
             let limit = limit.min((self.size - 1) / LAZY_CHUNK);
             let mut stop = c;
             while stop < limit && !self.chunks.contains_key(&(stop + 1)) {
@@ -192,17 +216,37 @@ impl Lazy {
             }
             c = stop + 1;
         }
-        let mut at = offset;
-        while at < end {
-            let k = at / LAZY_CHUNK;
-            let chunk = &self.chunks[&k];
-            let from = (at - k * LAZY_CHUNK) as usize;
-            let n = ((end - at) as usize).min(chunk.len() - from);
-            let o = (at - offset) as usize;
-            buf[o..o + n].copy_from_slice(&chunk[from..from + n]);
-            at += n as u64;
+        Ok(())
+    }
+
+    /// `posix_fadvise` of this lazy file: `WILLNEED` fetches the chunks of
+    /// the range (no readahead), [`super::FADV_GEX_IMAGE`] those the
+    /// wineserver reads of the image ([`super::peimage::server_reads`]).
+    fn advise(&mut self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
+        match advice {
+            super::FADV_WILLNEED if offset < self.size => {
+                let end = if len == 0 { self.size } else { offset.saturating_add(len).min(self.size) };
+                self.fetch(offset / LAZY_CHUNK, (end - 1) / LAZY_CHUNK, false)
+            }
+            super::FADV_GEX_IMAGE => {
+                let mut failed = None;
+                super::peimage::server_reads(&mut |at, n| {
+                    let mut b = vec![0u8; n];
+                    match self.read_ahead(at, &mut b, false) {
+                        Ok(got) => {
+                            b.truncate(got as usize);
+                            Some(b)
+                        }
+                        Err(e) => {
+                            failed = Some(e);
+                            None
+                        }
+                    }
+                });
+                failed.map_or(Ok(()), Err)
+            }
+            _ => Ok(()),
         }
-        Ok(end - offset)
     }
 }
 
@@ -699,6 +743,14 @@ impl FileHandle for TmpHandle {
         let n = buf.len().min(data.len() - start);
         buf[..n].copy_from_slice(&data[start..start + n]);
         Ok(n as u64)
+    }
+
+    fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
+        let Some(file) = &self.file else { return Ok(()) };
+        match file.lazy.lock().unwrap().as_mut() {
+            Some(l) => l.advise(offset, len, advice),
+            None => Ok(()),
+        }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
@@ -1435,16 +1487,55 @@ mod tests {
 mod lazy_tests {
     use super::*;
 
-    /// Byte `i` of every lazy file here is `i % 251`.
+    /// `/data/pe`: [`PE`]'s bytes, each request noted in [`ASKED`]. Byte `i`
+    /// of every other lazy file here is `i % 251`.
     fn fake(url: &str, offset: u64, into: &mut [u8]) -> bool {
         if url == "/data/r" {
             return counting(url, offset, into);
+        }
+        if url == "/data/pe" {
+            let img = PE.get().unwrap();
+            ASKED.lock().unwrap().push((offset, into.len() as u64));
+            into.copy_from_slice(&img[offset as usize..offset as usize + into.len()]);
+            return true;
         }
         assert_eq!(url, "/data/f");
         for (k, b) in into.iter_mut().enumerate() {
             *b = ((offset + k as u64) % 251) as u8;
         }
         true
+    }
+    static PE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    static ASKED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+    /// The image advice fetches the chunks the server's reads touch and no
+    /// more (no readahead), and the server's reads after it fetch nothing:
+    /// what a door call then reads is here.
+    #[test]
+    fn image_advice_fetches_what_the_server_reads() {
+        set_lazy_fetch(fake);
+        let size = 20 * LAZY_CHUNK as usize + 77;
+        // .rsrc at 4 MiB, the version data 14 MiB into it (18 MiB)
+        let _ = PE.set(super::super::peimage::tests::image(size, 4 << 20, 14 << 20));
+        let fs = TmpFs::new();
+        fs.add_lazy("/d/pe", size as u64, "/data/pe");
+        let h = fs.open("d/pe", 0, 0).unwrap();
+        h.advise(0, 0, super::super::FADV_GEX_IMAGE).unwrap();
+        let mut chunks: Vec<u64> = ASKED.lock().unwrap().iter().flat_map(|&(o, n)| o / LAZY_CHUNK..(o + n).div_ceil(LAZY_CHUNK)).collect();
+        chunks.sort();
+        assert_eq!(chunks, vec![0, 4, 18]);
+        let before = ASKED.lock().unwrap().len();
+        // the server's reads, as get_image_params makes them
+        super::super::peimage::server_reads(&mut |at, n| {
+            let mut b = vec![0u8; n];
+            let got = h.read_at(at, &mut b).ok()?;
+            b.truncate(got as usize);
+            Some(b)
+        });
+        assert_eq!(ASKED.lock().unwrap().len(), before, "a read after the advice fetched");
+        // WILLNEED: the range's chunks, no readahead
+        h.advise(10 * LAZY_CHUNK + 5, 10, super::super::FADV_WILLNEED).unwrap();
+        assert_eq!(*ASKED.lock().unwrap().last().unwrap(), (10 * LAZY_CHUNK, LAZY_CHUNK));
     }
 
     #[test]

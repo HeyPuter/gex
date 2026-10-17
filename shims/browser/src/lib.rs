@@ -337,6 +337,7 @@ extern "C" {
     fn k_fs_fchmod(handle: i32, mode: u32) -> i32;
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
+    fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32;
     fn k_fs_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
@@ -837,6 +838,9 @@ extern "C" fn rf_meta(handle: i32, at: gex_kernel::PAddr) -> i32 {
 }
 extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
     unsafe { k_fs_truncate(handle, len) }
+}
+extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
+    unsafe { k_fs_advise(handle, offset, len, advice) }
 }
 extern "C" fn rf_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_fs_read_dir(handle, at, cap) }
@@ -1407,6 +1411,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             write: rf_write,
             meta: rf_meta,
             truncate: rf_truncate,
+            advise: rf_advise,
             read_dir: rf_read_dir,
             path_meta: rf_path_meta,
             read_link: rf_read_link,
