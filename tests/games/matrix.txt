@@ -52,7 +52,7 @@ geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe      
 5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
-hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll
+hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
 warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
 tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-
