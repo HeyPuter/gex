@@ -48,8 +48,8 @@ deltarune    |w64  |DELTARUNE                            |DELTARUNE.exe         
 will-you-snail|w64 |Will You Snail                       |Will You Snail.exe                  | |-|-|-
 hyper-light  |w64  |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
 dicey        |w64  |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|dicey-w64.wl
-geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe                    | |-|-|-
-5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |-|-|-
+geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe                    | |1280|8320|geometry-dash-w64.wl
+5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
 hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll
