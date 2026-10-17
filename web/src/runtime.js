@@ -13,6 +13,17 @@ import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
+import { workerGraph, workerUrlOf } from './worker-graph.js';
+
+/** The guest Worker's modules: bytes fetched, bytes from the page's cache
+ *  (worker-graph.js). */
+export const workerGraphBytes = { net: 0, cached: 0 };
+
+/** `u` made absolute against the page (unchanged where there is no page:
+ *  Node). */
+const absUrl = (u) => {
+  try { return new URL(u, globalThis.location?.href).href; } catch { return u; }
+};
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -392,10 +403,18 @@ async function guestWorkerFactory() {
   // The single-thread build: a process is a fiber of this realm.
   if (single.on) return () => new FiberWorker();
   if (typeof Worker === 'function') {
-    return () =>
+    const make = () =>
       new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
         type: 'module',
       });
+    // The module graph fetched once, each Worker started from it
+    // (worker-graph.js); `?workergraph=0` loads each by URL.
+    const url = pageParams().get('workergraph') === '0' ? null : workerUrlOf(make);
+    const blob = url ? await workerGraph(absUrl(url), (net, cached) => {
+      workerGraphBytes.net += net;
+      workerGraphBytes.cached += cached;
+    }) : null;
+    return blob ? () => new Worker(blob, { type: 'module' }) : make;
   }
   const { Worker: NodeWorker } = await import('node:worker_threads');
   const where = ['..', '..', 'shims', 'browser', 'js', 'worker.mjs'].join('/');
@@ -969,7 +988,8 @@ async function runProgramHere(
       // Otherwise the export providers the dist carries (gex/cgen/providers/,
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen', zstd: globalThis.GEX_CGEN_ZSTD }
+      // Absolute: a Worker started from a blob URL has no base to resolve a path against.
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD) }
         : flag('providers') === '0' ? undefined
         : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a

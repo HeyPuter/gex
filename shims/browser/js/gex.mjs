@@ -7297,7 +7297,7 @@ export class Gex {
         if (dir) try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${dir}/bad-${who}-${Date.now()}.wasm`, bytes); } catch {}
         try {
           const x = new XMLHttpRequest();
-          x.open('POST', `/__gex_dump?name=${encodeURIComponent(who)}`, false);
+          x.open('POST', new URL(`/__gex_dump?name=${encodeURIComponent(who)}`, globalThis.GEX_BASE ?? globalThis.location?.href).href, false);
           x.send(bytes.slice());
         } catch {}
       }

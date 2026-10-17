@@ -20,7 +20,7 @@
 
 import { untar } from './tar.js';
 import { makeControl as lazyCacheControl } from '../../shims/browser/js/lazy-cache.mjs';
-import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls } from './runtime.js';
+import { runProgram, globalKernel, singleMode, primeRuntime, runtimeUrls, workerGraphBytes } from './runtime.js';
 import { openedFiles } from './fs-opened.js';
 import { restore, persist } from './persist.js';
 
@@ -85,6 +85,8 @@ export async function start(opts = {}) {
   const at = (p) => (p ? new URL(String(p).replace(/^\//, ''), base).href : p);
   const state = { out: '', status: null, error: null, phase: 'loading' };
   globalThis.__nt = state;
+  // The guest Worker's modules: fetched, or from the page's cache (worker-graph.js).
+  state.workerGraph = workerGraphBytes;
   const meter = progressMeter(state, opts.onProgress);
   try {
     return await begin(opts, base, at, state, meter);

@@ -48,6 +48,10 @@ function fromFill(href, from, memory, dst, len) {
   return len;
 }
 
+const absolute = (h) => {
+  try { return new URL(h, globalThis.GEX_BASE ?? globalThis.location?.href).href; } catch { return h; }
+};
+
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
   return (url, urlLen, offset, dst, len) => {
@@ -60,7 +64,7 @@ export function lazyFetch(memory) {
     }
     const done = noteFetch(href, len);
     // The page's cache of lazy files, when it keeps one (lazy-cache.mjs).
-    if (cachedRead(href, from, dst, len) === len) {
+    if (cachedRead(absolute(href), from, dst, len) === len) {
       done(len);
       return len;
     }
@@ -70,7 +74,9 @@ export function lazyFetch(memory) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const x = new XMLHttpRequest();
-        x.open('GET', href, false);
+        // A path: against the page's origin (a Worker started from a blob
+        // URL has `GEX_BASE`, its module's real URL; worker-graph.js).
+        x.open('GET', absolute(href), false);
         x.responseType = 'arraybuffer';
         x.setRequestHeader('Range', `bytes=${from}-${from + len - 1}`);
         // The HTTP cache can answer a range from a partial entry badly (a
