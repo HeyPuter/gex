@@ -757,3 +757,51 @@ impl Buffers for PoolView<'_, '_> {
         self.mem.read(map.start, len).ok().map(|b| b.to_vec())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(s: &mut Screen, k: Key, x: i32) {
+        let p = Placement { placed: true, id: k.1, ..Placement::default() };
+        s.placed.insert(k, (x, 0, p));
+        s.order.push(k);
+        let f = Frame { surface: k.1, width: 100, height: 100, stride: 400, format: 0, pixels: Vec::new(), title: String::new() };
+        s.frames.insert(k, f);
+    }
+
+    /// No client activated a window: a scripted key gives the keyboard to the
+    /// top window first, then goes to it.
+    #[test]
+    fn key_with_no_active_window_focuses_the_top_one() {
+        let mut s = Screen::default();
+        window(&mut s, (1, 5), 0);
+        window(&mut s, (2, 7), 200);
+        let out = s.route(&[(Ev::Key(28, true), 10), (Ev::Key(28, false), 20)]);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], (2, Routed::KeyboardFocus(7))));
+        assert!(matches!(out[1], (2, Routed::Key(28, true, 10))));
+        assert!(matches!(out[2], (2, Routed::Key(28, false, 20))));
+        assert_eq!(s.focus, Some((2, 7)));
+    }
+
+    /// A window its client activated keeps the keyboard.
+    #[test]
+    fn key_goes_to_the_activated_window() {
+        let mut s = Screen::default();
+        window(&mut s, (1, 5), 0);
+        window(&mut s, (2, 7), 200);
+        s.focus = Some((1, 5));
+        let out = s.route(&[(Ev::Key(28, true), 10)]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], (1, Routed::Key(28, true, 10))));
+    }
+
+    /// With no window on the screen, a key goes nowhere.
+    #[test]
+    fn key_with_no_window_is_dropped() {
+        let mut s = Screen::default();
+        assert!(s.route(&[(Ev::Key(28, true), 10)]).is_empty());
+        assert_eq!(s.focus, None);
+    }
+}
