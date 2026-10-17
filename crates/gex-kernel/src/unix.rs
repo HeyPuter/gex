@@ -45,9 +45,33 @@ struct Pipe {
     /// wakes the one, room freed or the reader going wakes the other.
     reader_q: AtomicU32,
     writer_q: AtomicU32,
+    /// The host reads this direction (`UnixSocket::serviced_by_peer`): what
+    /// the guest writes waits for the host, so a write says so
+    /// ([`take_host_sent`]).
+    host_reads: AtomicBool,
+}
+
+/// A guest wrote to (or closed) a host-serviced socket since the last
+/// [`take_host_sent`]. Per process in the browser, where each process's
+/// compositor is in its own shim.
+static HOST_SENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether a guest wrote to, or closed, a socket the host services since
+/// the last call: the browser's compositor pumps right then, so a client
+/// that keeps running (and so reaches no scheduler turn) has its requests
+/// served (X's B2: a closed menu stayed on screen, catching clicks, for
+/// seconds while explorer ran).
+pub fn take_host_sent() -> bool {
+    HOST_SENT.load(Ordering::Relaxed) && HOST_SENT.swap(false, Ordering::AcqRel)
 }
 
 impl Pipe {
+    fn note_host(&self) {
+        if self.host_reads.load(Ordering::Relaxed) {
+            HOST_SENT.store(true, Ordering::Release);
+        }
+    }
+
     fn notify_reader(&self) {
         crate::wait::notify(self.reader_q.load(Ordering::SeqCst));
     }
@@ -78,6 +102,7 @@ impl Pipe {
         drop(s);
         if n > 0 {
             self.notify_reader();
+            self.note_host();
         }
         Ok(n as u64)
     }
@@ -136,6 +161,7 @@ impl Pipe {
 
     fn close(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.note_host();
         self.notify_reader();
         self.notify_writer();
     }
@@ -225,6 +251,7 @@ impl UnixSocket {
         if let Role::Connected { rx, tx, .. } = &*self.role.lock().unwrap() {
             let peer = tx.reader_q.load(Ordering::SeqCst);
             rx.reader_q.store(peer, Ordering::SeqCst);
+            rx.host_reads.store(true, Ordering::SeqCst);
             // And room the peer makes by reading is for the host to fill on
             // the peer's next turn: the peer's waiters, again.
             tx.writer_q.store(peer, Ordering::SeqCst);
