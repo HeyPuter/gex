@@ -15,6 +15,7 @@ import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';
 import { assetUrl, pageParams } from './page-env.js';
 import { logOn } from '@gex/log.mjs';
+import { ValidationLog } from './gl-validation.js';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -198,6 +199,8 @@ export class MesaGlDevice {
   #module = null;
   #submit = null;
   #failed = null;
+  /** WebGPU validation errors: counted, the first kept, rate-limited logs. */
+  #validation = new ValidationLog();
   /** Batches this device refused, and the last of them: a client's own
    *  problem, kept where a page can see it. */
   #rejects = 0;
@@ -274,12 +277,10 @@ export class MesaGlDevice {
         console.error('[mesa-gl] WebGPU device lost:', message);
         if (!out.#failed) out.#failed = `WebGPU device lost: ${message}`;
       });
+      // Kept and logged, not fatal: a validation error refuses one call and
+      // the device goes on. See gl-validation.js for what made it fatal cost.
       device.addEventListener('uncapturederror', (event) => {
-        const message = event.error?.message || String(event.error);
-        console.error('[mesa-gl] WebGPU validation:', message);
-        // A validation error poisons the WebGPU command buffer, so what the
-        // guest sees afterwards is not GL's answer. Record the first one.
-        if (!out.#failed) out.#failed = `WebGPU validation: ${message}`;
+        out.#validation.note(event.error?.message || String(event.error));
       });
 
       const Module = await loadGlue(url);
@@ -400,6 +401,15 @@ export class MesaGlDevice {
 
   get error() {
     return this.#failed;
+  }
+
+  /** The first WebGPU validation error, or null; `validationCount` how many. */
+  get validationError() {
+    return this.#validation.first;
+  }
+
+  get validationCount() {
+    return this.#validation.count;
   }
 
   describe() {
@@ -672,6 +682,7 @@ export class MesaGlDevice {
   glState() {
     if (!this.ok) return this.#failed ?? '';
     return (this.#rejects ? `rejects=${this.#rejects} (${this.#lastReject}) ` : '') +
+      this.#validation.summary() +
       `presented=${this.presentedCount()} produced=${this.producedCount()} ` +
       `mesa=1 submits=${this.#submits} bytes=${this.#bytes} ` +
       `submit_ms=${this.#submitMs.toFixed(1)} ` +
