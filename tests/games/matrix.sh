@@ -266,7 +266,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
                 "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
                     echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2
             fi ;;
-        host=*) ;;
+        host=*|pe=*) ;;
         *) gflags+=("$x") ;;
         esac
     done
@@ -323,18 +323,30 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
         pfx=$state/prefix-$slug
       if [ "$kind" = w64 ]; then
         w64_overlay || continue
+        # `pe=DLL[,DLL...]`: those DLLs stay Wine's PE build for this game
+        # instead of W64_NATIVE's (OneShot's Ruby scans ucrtbase's x86 code
+        # for _isatty, which the native module has none of). A per-game copy
+        # of the overlay, hard-linked.
+        w64g=$w64run
+        if [[ $extra =~ (^|[[:space:]])pe=([^[:space:]]+) ]]; then
+            w64g=$state/w64dist-$slug; rm -rf "$w64g"; cp -al "$w64run" "$w64g" || continue
+            for d in ${BASH_REMATCH[2]//,/ }; do
+                [ -e "$w64dist/lib/wine/x86_64-windows/$d" ] || { echo "$slug: pe=$d: not in W64_DIST" >&2; continue; }
+                rm -f "$w64g/lib/wine/x86_64-windows/$d"; ln -s "$w64dist/lib/wine/x86_64-windows/$d" "$w64g/lib/wine/x86_64-windows/"
+            done
+        fi
         if [ $keep = 0 ] || [ ! -d "$pfx/drive_c" ]; then
             rm -rf "$pfx"; cp -a "$w64prefix" "$pfx"
             printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="wayland"\n' >> "$pfx/user.reg"
             printf '\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' >> "$pfx/user.reg"
             [ -e "$pfx/drive_c/windows/system32/winewayland.drv" ] ||
-                cp "$w64run/lib/wine/x86_64-windows/winewayland.drv" "$pfx/drive_c/windows/system32/"
+                cp "$w64g/lib/wine/x86_64-windows/winewayland.drv" "$pfx/drive_c/windows/system32/"
         fi
         mkdir -p "$state/wl-$slug"
         run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}" --env WINEGEX_DOOR=1
               --env 'WINEDLLOVERRIDES=mscoree=;mshtml='
               --wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}")
-        pre=("$w64run/lib/wine/x86_64-unix/wine")
+        pre=("$w64g/lib/wine/x86_64-unix/wine")
       elif [ "$kind" = w3 ]; then
         # W3: Wine's own loader, as a program of the guest. The prefix is a
         # full copy: wineserver and the registry rewrite files in it.
