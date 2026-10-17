@@ -7,6 +7,10 @@
 //     --file <guest>=<host>     bundle a host file into the guest's filesystem
 //     --dir <guest>=<host>      bundle a whole directory tree
 //     --extract <guest>=<host>  write a file back out when the program ends
+//     --lazy <guest>=<host>     a lazy file (the page's lazy.json files),
+//                               fetched as it is read: here read from the
+//                               host file, each fetch GEX_LAZY_DELAY_MS late
+//                               (default 0), a slow link's (lazy-fetch.mjs)
 //     --tar <host.tar>          a root filesystem tar (web/src/tar.js, as the
 //                               page unpacks one): files, modes, empty
 //                               directories, hard and symbolic links
@@ -32,7 +36,7 @@
 // web/public/gex of this tree; an ejected project's runtime/web).
 
 import { appendFileSync, lstatSync, readdirSync, readFileSync, readlinkSync, statSync, writeFileSync, writeSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
@@ -63,6 +67,9 @@ if (process.env.GEX_DENSE_DEBUG) globalThis.GEX_DENSE_DEBUG = 1;
 // Options come first and are named, so a guest argument that happens to
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
 const files = {};
+// Lazy files (`--lazy`): [guest path, size, host path without its leading
+// slash] (the kernel puts the slash back: `k_fs_add_lazy`).
+const lazy = [];
 // Each bundled file's modification time, as the host has it (seconds).
 const mtimes = {};
 let strace = false;
@@ -150,6 +157,13 @@ const rest = [];
         }
       };
       walk(guestRoot.replace(/\/$/, ''), hostRoot.replace(/\/$/, ''));
+    } else if (av[i] === '--lazy') {
+      const spec = av[++i] ?? '';
+      const eq = spec.indexOf('=');
+      if (eq <= 0) { console.error('--lazy wants <guest>=<host>'); process.exit(2); }
+      const host = resolve(spec.slice(eq + 1)).replace(/^\/+/, '');
+      lazy.push([spec.slice(0, eq), statSync('/' + host).size, host]);
+      process.env.GEX_NODE_LAZY = '1';
     } else if (av[i] === '--extract') {
       const spec = av[++i] ?? '';
       const eq = spec.indexOf('=');
@@ -550,6 +564,7 @@ try {
     args,
     opts: {
       strace,
+      lazy,
       // GEX_STRACE_PID=N: narrate that one process (a forked child too).
       stracePid: process.env.GEX_STRACE_PID ? Number(process.env.GEX_STRACE_PID) : undefined,
       mtimes,

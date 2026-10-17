@@ -142,6 +142,8 @@ pub mod raw {
     pub const RT_SIGTIMEDWAIT: u64 = 177;
     pub const RT_SIGSUSPEND: u64 = 179;
     pub const PREAD64: u64 = 180;
+    pub const FADVISE64: u64 = 250;
+    pub const FADVISE64_64: u64 = 272;
     pub const PWRITE64: u64 = 181;
     pub const GETCWD: u64 = 183;
     pub const SIGALTSTACK: u64 = 186;
@@ -753,6 +755,16 @@ pub fn translate(
         x::PREAD64 => {
             *a = [sext(a[0]), a[1], a[2], pair(a[3], a[4]), 0, 0];
             nr::PREAD64
+        }
+        // fadvise64(fd, offset lo, hi, len, advice) and fadvise64_64(fd,
+        // offset lo, hi, len lo, hi, advice) (wasm32's musl: the latter).
+        x::FADVISE64 => {
+            *a = [sext(a[0]), pair(a[1], a[2]), a[3], a[4], 0, 0];
+            nr::FADVISE64
+        }
+        x::FADVISE64_64 => {
+            *a = [sext(a[0]), pair(a[1], a[2]), pair(a[3], a[4]), a[5], 0, 0];
+            nr::FADVISE64
         }
         x::PWRITE64 => {
             *a = [sext(a[0]), a[1], a[2], pair(a[3], a[4]), 0, 0];

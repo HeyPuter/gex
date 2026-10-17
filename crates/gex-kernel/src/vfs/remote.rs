@@ -38,6 +38,8 @@ pub struct Remote {
     /// Write this handle's metadata as [`META_BYTES`] bytes at `at`.
     pub meta: extern "C" fn(handle: i32, at: crate::PAddr) -> i32,
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
+    /// [`FileHandle::advise`]: 0 or a negated errno.
+    pub advise: extern "C" fn(handle: i32, offset: u64, len: u64, advice: u32) -> i32,
     /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short.
     pub read_dir: extern "C" fn(handle: i32, at: crate::PAddr, cap: u32) -> i32,
     pub path_meta: extern "C" fn(path: crate::PAddr, path_len: u32, at: crate::PAddr) -> i32,
@@ -478,6 +480,10 @@ impl FileHandle for RemoteHandle {
                 n => return Some(Err(Errno(-n))),
             }
         }
+    }
+
+    fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
+        ok((self.remote.advise)(self.id, offset, len, advice)).map(|_| ())
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {

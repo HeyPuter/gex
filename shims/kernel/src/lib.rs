@@ -2684,6 +2684,14 @@ pub extern "C" fn k_fs_truncate(handle: i32, len: u64) -> i32 {
     as_unit(h.truncate(len))
 }
 
+/// `posix_fadvise` of an open file (`FileHandle::advise`): a lazy file fetches
+/// what is asked now, in the caller's Worker.
+#[no_mangle]
+pub extern "C" fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.advise(offset, len, advice))
+}
+
 /// A directory listing, or `-ERANGE` when `cap` will not hold it.
 #[no_mangle]
 pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i32 {

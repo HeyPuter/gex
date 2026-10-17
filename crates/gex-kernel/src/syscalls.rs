@@ -176,6 +176,7 @@ pub mod nr {
     pub const EXECVE: u64 = 221;
     pub const CLONE3: u64 = 435;
     pub const MMAP: u64 = 222;
+    pub const FADVISE64: u64 = 223;
     pub const MREMAP: u64 = 216;
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
@@ -1500,6 +1501,12 @@ impl FdIo<'_> {
     /// `ftruncate`.
     pub fn ftruncate(&self, fd: i32, len: u64) -> SysResult {
         self.fds.get(fd).and_then(|f| f.handle.truncate(len).map(|_| 0))
+    }
+
+    /// `fadvise64(fd, offset, len, advice)`: [`crate::vfs::FileHandle::advise`]
+    /// (a lazy file fetches what `WILLNEED` or gex's image advice asks for).
+    pub fn fadvise(&self, fd: i32, offset: u64, len: u64, advice: u64) -> SysResult {
+        self.fds.get(fd).and_then(|f| f.handle.advise(offset, len, advice as u32).map(|_| 0))
     }
 
     /// `epoll_ctl`. A `struct epoll_event` on aarch64 is a 32-bit event mask,
@@ -4596,13 +4603,13 @@ pub fn is_own_state(n: u64) -> bool {
 
 /// The small descriptor and process calls that need no more than the
 /// descriptor table, the global kernel's pipes, the resource limits'
-/// own lock or nothing at all: `epoll_ctl`, `pipe2`, `ftruncate`,
+/// own lock or nothing at all: `epoll_ctl`, `pipe2`, `ftruncate`, `fadvise64`,
 /// `statfs`/`fstatfs`, `getpriority`/`setpriority`, `sysinfo` and
 /// `prlimit64` (L17). Canonical.
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
-        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
     )
 }
 
@@ -5391,6 +5398,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::EPOLL_CTL => nr::EPOLL_CTL,
             x::PIPE | x::PIPE2 => nr::PIPE2,
             x::FTRUNCATE | x::FTRUNCATE64 => nr::FTRUNCATE,
+            x::FADVISE64 | x::FADVISE64_64 => nr::FADVISE64,
             x::STATFS64 => nr::STATFS,
             x::FSTATFS64 => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
@@ -5887,6 +5895,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::PIPE2 => f.io.pipe2(m, a[0], a[1]),
             nr::FTRUNCATE => f.io.ftruncate(a[0] as i32, a[1]),
+            nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
             nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
             // As the kernel's arms: nice 0, and a change taken and ignored.
             nr::GETPRIORITY => Ok(20),
@@ -8364,6 +8373,7 @@ impl Kernel {
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self.fd_io().ftruncate(a[0] as i32, a[1]),
+            nr::FADVISE64 => self.fd_io().fadvise(a[0] as i32, a[1], a[2], a[3]),
             // `set_tid_address` and `unshare` (L22e).
             n if is_thread_own(n) => {
                 let fs = self.fs_of(self.ctx_addr);
@@ -9974,6 +9984,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::RENAMEAT => "renameat",
         nr::RENAMEAT2 => "renameat2",
         nr::FTRUNCATE => "ftruncate",
+        nr::FADVISE64 => "fadvise64",
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
         nr::FCHDIR => "fchdir",

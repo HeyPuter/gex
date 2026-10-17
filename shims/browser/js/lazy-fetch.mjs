@@ -48,6 +48,28 @@ function fromFill(href, from, memory, dst, len) {
   return len;
 }
 
+// Under Node (run-node.mjs --lazy, tests only): a lazy file's URL is a host
+// path, read here; GEX_LAZY_DELAY_MS holds each fetch back, as a slow link
+// would. -1 where there is no such setup.
+let sleeper = null;
+function nodeFetch(href, from, memory, dst, len) {
+  const fs = globalThis.process?.env?.GEX_NODE_LAZY && globalThis.process.getBuiltinModule?.('node:fs');
+  if (!fs) return -1;
+  const ms = Number(globalThis.process.env.GEX_LAZY_DELAY_MS || 0);
+  if (ms > 0) Atomics.wait(sleeper ??= new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  try {
+    const fd = fs.openSync(href, 'r');
+    try {
+      const b = new Uint8Array(len);
+      if (fs.readSync(fd, b, 0, len, from) !== len) return -1;
+      new Uint8Array(memory.buffer, dst, len).set(b);
+      return len;
+    } finally { fs.closeSync(fd); }
+  } catch {
+    return -1;
+  }
+}
+
 const absolute = (h) => {
   try { return new URL(h, globalThis.GEX_BASE ?? globalThis.location?.href).href; } catch { return h; }
 };
@@ -68,7 +90,11 @@ export function lazyFetch(memory) {
       done(len);
       return len;
     }
-    if (typeof XMLHttpRequest !== 'function') { done(0); return -1; }
+    if (typeof XMLHttpRequest !== 'function') {
+      const n = nodeFetch(href, from, memory, dst, len);
+      done(n > 0 ? n : 0);
+      return n;
+    }
     let last = 'no response';
     try {
     for (let attempt = 0; attempt < 3; attempt++) {
