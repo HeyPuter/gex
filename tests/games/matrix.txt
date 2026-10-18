@@ -31,6 +31,8 @@
 # `pe=DLL[,DLL...]` keeps those DLLs Wine's PE build instead of W64_NATIVE's.
 # `page=NAME[=VALUE]` is a page switch the game's site sets (scratch/G/
 # mksite.py, game.json `switches`; VALUE defaults to 1); native runs skip it.
+# Game sites start Wine's event log on demand (system.reg Eventlog Start=3:
+# no svchost at boot); `eventlog=1` keeps it auto-started. Native runs skip it.
 
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
