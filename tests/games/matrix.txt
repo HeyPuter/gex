@@ -31,6 +31,8 @@
 # `pe=DLL[,DLL...]` keeps those DLLs Wine's PE build instead of W64_NATIVE's.
 # `page=NAME[=VALUE]` is a page switch the game's site sets (scratch/G/
 # mksite.py, game.json `switches`; VALUE defaults to 1); native runs skip it.
+# Game sites start Wine's event log on demand (system.reg Eventlog Start=3:
+# no svchost at boot); `eventlog=1` keeps it auto-started. Native runs skip it.
 
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
@@ -66,12 +68,13 @@ mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe         
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
 hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
+# warfork: in the page, main menu by 301 s on gooner (G2 g2/page-inet-carry, 1019b).
 warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
 tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-
 
 # Listed, not run.
-isaac        |blocked|The Binding of Isaac Rebirth      |SteamStub DRM: isaac-ng.exe relaunches through steam://run (the user's call)| |-|-|-
-antichamber  |blocked|Antichamber                       |UDK.exe is a mixed-mode CLR image: needs a CLR (stream U's area)| |-|-|-
+isaac        |blocked|The Binding of Isaac Rebirth      |needs a Steam client (DRM: SteamStub relaunches through steam://run, exit 53); no workaround| |-|-|-
+peggle       |blocked|Peggle Deluxe                      |needs a Steam client: the shipped Peggle.exe (PopCap wrapper) stops at "Unable to load Steam.dll"| |-|-|-
 cruelty-squad|idea |Cruelty Squad                       |Godot 3: engine substitution, unassigned (ask the user)| |-|-|-
 buckshot     |idea |Buckshot Roulette                   |Godot 4: engine substitution, unassigned (ask the user)| |-|-|-
 wildermyth   |idea |Wildermyth                          |Java (libGDX, bundled JRE): unassigned (ask the user)| |-|-|-
@@ -83,5 +86,9 @@ ror2         |dotnet|Risk of Rain 2                     |Unity Mono: stream U| |
 ultrakill    |dotnet|ULTRAKILL                          |Unity Mono: stream U| |-|-|-
 gungeon      |dotnet|Enter the Gungeon                  |Unity Mono (x64 and i386 builds): stream U| |-|-|-
 stardew      |dotnet|Stardew Valley                     |MonoGame on .NET 6: stream U (also games-linux)| |-|-|-
-celeste      |dotnet|Celeste                            |XNA/FNA: stream U (also games-linux)| |-|-|-
-towerfall    |dotnet|TowerFall Ascension                |XNA: stream U| |-|-|-
+
+# i386 Windows games on W3, added 10-18 (G2), last so the served ports above keep their numbers.
+# celeste, towerfall, antichamber: .NET (XNA/FNA) and UDK on Wine Mono (W3 dist -mono11.2.0, 1018a).
+celeste      |w3   |Celeste                             |Celeste.exe                         | |4530|-|celeste-w3.wl
+towerfall    |w3   |TowerFall Ascension                 |TowerFall.exe                       | |9900|-|-
+antichamber  |w3   |Antichamber                         |Binaries/Win32/UDK.exe              | |-|-|-

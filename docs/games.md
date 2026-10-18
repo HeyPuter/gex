@@ -374,10 +374,10 @@ ship the function-tier units built for those bases by the page's own gexc
 |---|---|---|---|
 | 4400 | Undertale | w3 | **intro renders** |
 | 4401 | Katana ZERO | w3 | **title menu** |
-| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs (300 s, no OOM, with g/w3-dll-band's band pins; since W3's compact space it ran out of memory without them) |
-| 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
+| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs 300 s on master 1fc68d04 with 41 function-tier units hitting (DLLs pinned in the band) |
+| 4403 | Momodora | w3 | **title** ("Press Any Button"), gooner and edger, 360 s, master 1fc68d04, 49 units hitting |
 | 4404 | Retrocycles | w3 | **language menu** |
-| 4405 | Hades (x86) | w3 | **main menu** (gex g/w3-dll-band: DLLs pinned in the band, and `w3split=1` from the matrix's `page=w3split`: in W3's compact space its 1.5 GiB of mappings and the shim's heap do not fit together under 2 GiB, and it runs out of memory at the loading screen) |
+| 4405 | Hades (x86) | w3 | **main menu** (gooner, 480 s, 63 units hitting) with `page=w3split` and gex g/w3-split-provstack (provider stacks above 2 GiB); without the split it runs out of memory at the loading screen, and with the split but without that fix the units' provider stacks find no room at about 120 s |
 | 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
 | 4407 | Retrocycles | linux-x11 | **language menu** |
 | 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
@@ -391,7 +391,7 @@ ship the function-tier units built for those bases by the page's own gexc
 | 4417 | Spelunky 2 | w64 | gooner: needs D3D11 feature level 11.0, wined3d on GL 3.2 gives 10.1. edger: past that; a blank window (the loader lock, as natively) and mmap out of address space near 4 GiB: needs memory64 (W64.7) |
 | 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
 | 4419 | Baba Is You | w64 | **renders** (credits screen) |
-| 4420 | Warfork | w64 | error dialog: "Couldn't open UDP socket: setsockopt: Unknown error" |
+| 4420 | Warfork | w64 | **main menu** by 301 s (gooner; G2's g2/page-inet-carry, in round 1019b; before it, an error dialog: "Couldn't open UDP socket: setsockopt: Unknown error") |
 | - | TUNIC | w64 | no page: needs memory64 |
 | - | blocked, idea and dotnet rows | | no page: listed only |
 
@@ -411,6 +411,9 @@ correctness only; edger is used for checks that need a GPU.
 | Katana ZERO | w3 | **gameplay** (the first level; menu frame 1200, gameplay 3000) | katana-zero-w3.wl starts at frame 10, when the window has the keyboard; up to NEW GAME at 65 s |
 | Retrocycles | w3 | **gameplay** (a match) | |
 | Momodora | w3 | **title** ("Press Any Button") | no input script yet |
+| Celeste | w3 | **title** (the mountain, frame ~4500; G2, 1200 s and more) | XNA on Wine Mono 11.2.0 (FNA on d3d11); loading takes about 6 minutes on gooner; celeste-w3.wl starts at frame 4800 |
+| TowerFall Ascension | w3 | **title menu** (frame 9900; G2) | needed a Steam stand-in (it showed "Couldn't find Steam!" without one) |
+| Antichamber | w3 | not yet known | UDK.exe, mixed-mode CLR on Wine Mono; G2's run in progress |
 | N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
 | Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh); in the page it needs `page=w3split` (the shim's heap above 2 GiB) |
 | Hades | w64 | **menu** (edger) | stub=basecamp (x64) |
