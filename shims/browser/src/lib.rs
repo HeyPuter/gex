@@ -17287,6 +17287,14 @@ pub extern "C" fn gex_set_trap_pc(pc: i64) {
 /// Its own switch, not a level of `gex_set_trace`: a syscall trace of a
 /// Mesa-translating run is hundreds of megabytes and drowns the one line a
 /// second that says whether the guest is moving.
+/// How many processors the guest is told it has (`gex_kernel::cpus`): the
+/// page's `navigator.hardwareConcurrency`, since every guest thread is a Worker
+/// of its own.
+#[no_mangle]
+pub extern "C" fn gex_set_cpus(n: u32) {
+    gex_kernel::cpus::set(n);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_set_heartbeat(every: i64) {
     unsafe { HEARTBEAT = every.max(0) as u64 };

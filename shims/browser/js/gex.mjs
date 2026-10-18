@@ -1595,6 +1595,9 @@ export class Gex {
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+    // The processors the guest sees: each of its threads is a Worker, so the
+    // host's count (`opts.cpus` overrides it).
+    this.#shim.exports.gex_set_cpus?.(opts.cpus || globalThis.navigator?.hardwareConcurrency || 1);
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero (the guest's image); move

@@ -209,8 +209,8 @@ impl ProcFs {
             )
             .as_bytes()
             .to_vec(),
-            "cpuinfo" if gex_abi::X86 => crate::x86::CPUINFO.as_bytes().to_vec(),
-            "cpuinfo" => concat!(
+            "cpuinfo" if gex_abi::X86 => crate::cpus::proc_cpuinfo(crate::x86::CPUINFO).into_bytes(),
+            "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(
                 "processor\t: 0\n",
                 "BogoMIPS\t: 100.00\n",
                 "Features\t: fp asimd atomics cpuid\n",
@@ -219,20 +219,14 @@ impl ProcFs {
                 "CPU variant\t: 0x0\n",
                 "CPU part\t: 0xd08\n",
                 "CPU revision\t: 3\n\n",
-            )
-            .as_bytes()
-            .to_vec(),
+            ))
+            .into_bytes(),
             "version" => b"Linux version 6.1.0-gex (gex@puter) #1 SMP\n".to_vec(),
             "uptime" => b"1000.00 1000.00\n".to_vec(),
-            // One CPU (as sched_getaffinity says), idle, booted at a fixed
-            // time. Boehm's GC counts the cpu lines to size its markers.
-            "stat" => concat!(
-                "cpu  0 0 0 100000 0 0 0 0 0 0\n",
-                "cpu0 0 0 0 100000 0 0 0 0 0 0\n",
-                "intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
-            )
-            .as_bytes()
-            .to_vec(),
+            // One cpu line per processor (`crate::cpus`), all idle, booted at a
+            // fixed time. Boehm's GC counts the cpu lines to size its markers,
+            // and glibc's get_nprocs falls back to them when there is no sysfs.
+            "stat" => crate::cpus::proc_stat().into_bytes(),
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),

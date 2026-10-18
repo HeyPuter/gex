@@ -5225,13 +5225,14 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, m: &mut GuestMem<'_>, ctx_ad
         // Restartable sequences are an optimisation the guest can live
         // without, and both libcs treat ENOSYS as "not available".
         nr::RSEQ => Err(Errno::ENOSYS),
-        // One processor, and it is the one the caller is on. dpkg asks
-        // to size its worker pool.
+        // Every processor the guest is told about (`crate::cpus`): what
+        // musl's sysconf counts, and what dpkg and engines size their worker
+        // pools by.
         nr::SCHED_GETAFFINITY => {
             let (len, mask) = ((a[1] as usize).min(1024), a[2]);
             if mask != 0 && len >= 8 {
                 m.zero(mask, len)?;
-                m.write_u64(mask, 1)?;
+                m.write_u64(mask, crate::cpus::mask())?;
             }
             Ok(8)
         }
