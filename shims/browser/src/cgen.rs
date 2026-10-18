@@ -1092,11 +1092,15 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         let mut regs = Vec::with_capacity(2 * seen.len());
         // A dense table's slot gets an index in `blocks` of its own, which
         // JS writes the bridge at (as table `gex_emit::dense::TABLE_INDEX`).
+        // One index per slot for good: bridged again (`elfprov::rebridge`,
+        // a second publish over the same pages), it gets the one it had,
+        // which every Worker that wrote the bridge there still holds.
         let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::map(t as usize).is_some()).collect();
-        let first = if dense.is_empty() { 0 } else { crate::dense::alloc(dense.len() as u32) };
-        for (j, &(t, slot)) in dense.iter().enumerate() {
-            crate::dense::set_slot(gex_abi::dispatch_entry(t as usize, slot), first + j as u32);
-            regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, first + j as u32]);
+        let entries: Vec<u32> = dense.iter().map(|&(t, slot)| gex_abi::dispatch_entry(t as usize, slot)).collect();
+        let indices = gex_emit::dense::bridge_indices(&mut j.bridge_dense, &entries, crate::dense::alloc);
+        for (&entry, &d) in entries.iter().zip(&indices) {
+            crate::dense::set_slot(entry, d);
+            regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, d]);
         }
         for (t, slot) in seen {
             if crate::dense::map(t as usize).is_none() {
