@@ -3002,7 +3002,10 @@ fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
 /// `listen` worth modelling. Returns a listener id, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    let p = path_of_raw(path, path_len);
+    sock_bind(path_of_raw(path, path_len))
+}
+
+fn sock_bind(p: String) -> i32 {
     let s = std::sync::Arc::new(UnixSocket::new(true));
     if let Err(e) = s.bind(&p) {
         return -e.0;
@@ -3019,7 +3022,10 @@ pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
 /// Connect to a name. Returns this end's id, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
-    let p = path_of_raw(path, path_len);
+    sock_connect(path_of_raw(path, path_len))
+}
+
+fn sock_connect(p: String) -> i32 {
     let s = std::sync::Arc::new(UnixSocket::new(true));
     match names().connect(&s, &p) {
         // The listener's queue is notified by the connect itself.
@@ -3150,6 +3156,221 @@ pub extern "C" fn k_sock_dup(id: i32) -> i32 {
     }
 }
 
+// -- internet sockets -----------------------------------------------------------
+
+/// Internet sockets that more than one process holds (gex-kernel's
+/// `net::Socket::move_out`): Wine's wineserver makes every socket and hands
+/// the client the descriptor before either has done anything with it. The
+/// socket lives here and each process's descriptor is an id on it, as a unix
+/// socket's end is. Each socket has its own locks; the table's is held only to
+/// find one.
+type Inets = std::sync::Mutex<Vec<Option<std::sync::Arc<gex_kernel::net::Socket>>>>;
+
+fn inets() -> &'static Inets {
+    note_panics();
+    static S: OnceLock<Inets> = OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn inet_at(id: i32) -> Option<std::sync::Arc<gex_kernel::net::Socket>> {
+    inets().lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).cloned().flatten()
+}
+
+fn inet_keep(s: std::sync::Arc<gex_kernel::net::Socket>) -> i32 {
+    let mut t = inets().lock().unwrap_or_else(|e| e.into_inner());
+    match t.iter().position(|e| e.is_none()) {
+        Some(i) => {
+            t[i] = Some(s);
+            i as i32
+        }
+        None => {
+            t.push(Some(s));
+            (t.len() - 1) as i32
+        }
+    }
+}
+
+/// A buffer in this module's own memory, where `kl_sock_*` are handed one.
+unsafe fn kernel_bytes<'a>(at: gex_kmem::PAddr, len: u32) -> &'a [u8] {
+    if len == 0 {
+        return &[];
+    }
+    std::slice::from_raw_parts(at as usize as *const u8, len as usize)
+}
+
+unsafe fn kernel_bytes_mut<'a>(at: gex_kmem::PAddr, len: u32) -> &'a mut [u8] {
+    if len == 0 {
+        return &mut [];
+    }
+    std::slice::from_raw_parts_mut(at as usize as *mut u8, len as usize)
+}
+
+// The `k_sock_*` calls a moved socket makes from here, its buffers in this
+// module's memory rather than a process's (the loopback ports and UDP's
+// streams are unix sockets in the table above).
+extern "C" fn kl_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
+    sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned())
+}
+
+extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
+    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned())
+}
+
+extern "C" fn kl_sock_exists(path: gex_kmem::PAddr, path_len: u32) -> i32 {
+    names().exists(&String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) })) as i32
+}
+
+extern "C" fn kl_sock_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    match s.recv(unsafe { kernel_bytes_mut(at, len) }, 0, false) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+extern "C" fn kl_sock_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    match s.send(unsafe { kernel_bytes(at, len) }) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+/// Only a peek with no descriptors (`net::RemoteEnd::peek`).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn kl_sock_read_fds(
+    id: i32,
+    at: gex_kmem::PAddr,
+    len: u32,
+    _max_fds: u32,
+    peek: i32,
+    _pid: i32,
+    out: gex_kmem::PAddr,
+    out_cap: u32,
+) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let n = match s.recv(unsafe { kernel_bytes_mut(at, len) }, 0, peek != 0) {
+        Ok(n) => n as i32,
+        Err(e) => return -e.0,
+    };
+    if out_cap >= 4 {
+        unsafe { kernel_bytes_mut(out, 4) }.fill(0);
+    }
+    n
+}
+
+extern "C" fn kl_sock_pair(_out: gex_kmem::PAddr) -> i32 {
+    -38
+}
+
+extern "C" fn kl_sock_write_fds(_id: i32, _at: gex_kmem::PAddr, _len: u32, _d: gex_kmem::PAddr, _dl: u32) -> i32 {
+    -38
+}
+
+fn kernel_sockets() -> gex_kernel::unix::Remote {
+    gex_kernel::unix::Remote {
+        queue: k_sock_queue,
+        bind: kl_sock_bind,
+        connect: kl_sock_connect,
+        accept: k_sock_accept,
+        pending: k_sock_pending,
+        read: kl_sock_read,
+        write: kl_sock_write,
+        readable: k_sock_readable,
+        writable: k_sock_writable,
+        available: k_sock_available,
+        close: k_sock_close,
+        hup: k_sock_hup,
+        shutdown: k_sock_shutdown,
+        exists: kl_sock_exists,
+        pair: kl_sock_pair,
+        dup: k_sock_dup,
+        write_fds: kl_sock_write_fds,
+        read_fds: kl_sock_read_fds,
+        // Nothing passes descriptors over a moved socket's own streams.
+        describe: |_| None,
+        rebuild: |_, _| None,
+    }
+}
+
+fn dns_name(addr: u32) -> Option<String> {
+    dns().lock().unwrap_or_else(|e| e.into_inner()).by_addr.get(&addr).cloned()
+}
+
+/// The machine a moved socket is on: no network of its own (a connection out
+/// is a process's, over Wisp, and travels as its connection), the page's one
+/// DNS table, and ports chosen against the names every process binds.
+fn inet_machine() -> &'static (
+    std::sync::Arc<dyn gex_kernel::net::NetStack>,
+    std::sync::Arc<gex_kernel::net::Resolver>,
+    std::sync::Arc<gex_kernel::net::Ports>,
+) {
+    static M: OnceLock<(
+        std::sync::Arc<dyn gex_kernel::net::NetStack>,
+        std::sync::Arc<gex_kernel::net::Resolver>,
+        std::sync::Arc<gex_kernel::net::Ports>,
+    )> = OnceLock::new();
+    M.get_or_init(|| {
+        gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: |n| dns_addr(n.to_string()), name_for: dns_name });
+        (
+            std::sync::Arc::new(gex_kernel::net::NoNet),
+            std::sync::Arc::new(gex_kernel::net::Resolver::new()),
+            std::sync::Arc::new(gex_kernel::net::Ports::new()),
+        )
+    })
+}
+
+/// A socket moved here from a process: `net::Socket::export`'s bytes, in the
+/// caller's memory. Its id, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_inet_adopt(state: gex_kmem::PAddr, len: u32) -> i32 {
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), state, len) };
+    }
+    let (net, res, ports) = inet_machine();
+    match gex_kernel::net::Socket::import(
+        &buf,
+        std::sync::Arc::clone(net),
+        std::sync::Arc::clone(res),
+        std::sync::Arc::clone(ports),
+        Some(kernel_sockets()),
+    ) {
+        Some(s) => inet_keep(s),
+        None => -22,
+    }
+}
+
+/// One call on a moved socket (`net::op`), its buffer in the caller's memory.
+#[no_mangle]
+pub extern "C" fn k_inet_op(id: i32, op: u32, a: u64, b: u64, buf: gex_kmem::PAddr, len: u32) -> i64 {
+    use gex_kernel::net::op;
+    let Some(s) = inet_at(id) else { return -9 };
+    let mut v = vec![0u8; len as usize];
+    if op::takes(op) && len > 0 {
+        unsafe { gex_kmem::pull_checked(v.as_mut_ptr(), buf, len) };
+    }
+    let r = s.serve(op, a, b, &mut v);
+    if op::fills(op) && r > 0 {
+        unsafe { gex_kmem::push_checked(buf, v.as_ptr(), r as u32) };
+    }
+    r
+}
+
+/// Another holder of a moved socket.
+#[no_mangle]
+pub extern "C" fn k_inet_dup(id: i32) -> i32 {
+    inet_at(id).map_or(-9, inet_keep)
+}
+
+/// A holder gone. Out of the table under its lock, dropped after it: the
+/// last hold closes the socket's streams here (`k_sock_close`).
+#[no_mangle]
+pub extern "C" fn k_inet_close(id: i32) {
+    let s = inets().lock().unwrap_or_else(|e| e.into_inner()).get_mut(id as usize).and_then(Option::take);
+    drop(s);
+}
+
 // -- names --------------------------------------------------------------------
 
 /// The machine's synthetic DNS answers (gex-kernel's `net::Resolver`, through
@@ -3173,7 +3394,10 @@ fn dns() -> &'static std::sync::Mutex<DnsNames> {
 
 #[no_mangle]
 pub extern "C" fn k_dns_addr(name: gex_kmem::PAddr, name_len: u32) -> u32 {
-    let key = path_of_raw(name, name_len.min(1024));
+    dns_addr(path_of_raw(name, name_len.min(1024)))
+}
+
+fn dns_addr(key: String) -> u32 {
     let mut d = dns().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&a) = d.by_name.get(&key) {
         return a;
@@ -3287,6 +3511,8 @@ impl Drop for FdToken {
             k_fs_close(id);
         } else if let Some(id) = name.strip_prefix("sock:").and_then(|v| v.split(':').next()?.parse().ok()) {
             k_sock_close(id);
+        } else if let Some(id) = name.strip_prefix("inetg:").and_then(|v| v.split_once(':')?.1.parse().ok()) {
+            k_inet_close(id);
         }
     }
 }

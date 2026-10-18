@@ -2,7 +2,8 @@
 # sockpass.c in the page (web/nt.html, x86 shim; MP and SP): TCP sockets
 # passed over SCM_RIGHTS and inherited across fork between processes that
 # each have their own memory, and so carried by name (shims/browser
-# carry_name, "inet:"). Its remote cases go through the page's Wisp network:
+# carry_name, "inet:"), or, unconnected, moved to the global kernel and held
+# by both ("inetg:", net::Socket::move_out). Its remote cases go through the page's Wisp network:
 # by default a local Wisp server (web/node_modules' wisp-js, private
 # addresses allowed) to a local HTTP server on this host's first non-loopback
 # address; with WISP=URL, that proxy and HOST:PORT (default example.com 80).

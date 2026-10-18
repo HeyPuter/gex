@@ -231,6 +231,11 @@ impl net::Transport for WispStream {
         let id = self.id.load(std::sync::atomic::Ordering::Acquire);
         (id != 0 && unsafe { net_dup(id) } == 1).then(|| format!("wisp:{id}"))
     }
+
+    fn name(&self) -> Option<String> {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        (id != 0).then(|| format!("wisp:{id}"))
+    }
 }
 
 /// Where the browser's connections come from.
@@ -243,6 +248,12 @@ unsafe impl Sync for WispNet {}
 impl net::NetStack for WispNet {
     fn tcp(&self) -> Result<Arc<dyn net::Transport>, Errno> {
         Ok(Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(0) }))
+    }
+
+    /// Another holder of a stream another process opened (`net_dup`).
+    fn adopt(&self, name: &str) -> Option<Arc<dyn net::Transport>> {
+        let id = name.strip_prefix("wisp:")?.parse::<i32>().ok()?;
+        (id != 0 && unsafe { net_dup(id) } == 1).then(|| Arc::new(WispStream { id: std::sync::atomic::AtomicI32::new(id) }) as Arc<dyn net::Transport>)
     }
 }
 
@@ -499,6 +510,11 @@ extern "C" {
     fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_sock_pair(out: gex_kernel::PAddr) -> i32;
     fn k_sock_dup(id: i32) -> i32;
+    /// Internet sockets moved to the global kernel (`net::InetRemote`).
+    fn k_inet_adopt(state: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_inet_op(id: i32, op: u32, a: u64, b: u64, buf: gex_kernel::PAddr, len: u32) -> i64;
+    fn k_inet_dup(id: i32) -> i32;
+    fn k_inet_close(id: i32);
     fn k_boot_secs(want: u32) -> u32;
     fn k_guest_clock(scale_milli: u32, wall_shift: i32) -> u64;
     fn k_sock_write_fds(id: i32, at: gex_kernel::PAddr, len: u32, descs: gex_kernel::PAddr, descs_len: u32) -> i32;
@@ -1352,6 +1368,26 @@ fn shared_dns_name(addr: u32) -> Option<String> {
     (n >= 0).then(|| String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned())
 }
 
+fn gi_adopt(state: &[u8]) -> i32 {
+    unsafe { k_inet_adopt(state.as_ptr() as gex_kernel::PAddr, state.len() as u32) }
+}
+
+fn gi_op(id: i32, op: u32, a: u64, b: u64, buf: &mut [u8]) -> i64 {
+    unsafe { k_inet_op(id, op, a, b, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) }
+}
+
+fn gi_write(id: i32, data: &[u8]) -> i64 {
+    unsafe { k_inet_op(id, net::op::WRITE, 0, 0, data.as_ptr() as gex_kernel::PAddr, data.len() as u32) }
+}
+
+fn gi_dup(id: i32) -> i32 {
+    unsafe { k_inet_dup(id) }
+}
+
+fn gi_close(id: i32) {
+    unsafe { k_inet_close(id) }
+}
+
 /// Where a unix socket's two ends live, when there is a global kernel to put
 /// them in.
 fn global_sockets() -> Option<gex_kernel::unix::Remote> {
@@ -1363,6 +1399,8 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
     // And one table of DNS answers: a name one process resolved means the
     // same address in the process that connects to it.
     gex_kernel::net::share_names(gex_kernel::net::SharedNames { address_for: shared_dns_addr, name_for: shared_dns_name });
+    // And internet sockets that more than one process holds live there too.
+    net::share_inet(net::InetRemote { adopt: gi_adopt, op: gi_op, write: gi_write, dup: gi_dup, close: gi_close });
     // The page's benchmark clocks (`?timescale=`, `?fixedtime=`), if set.
     let gc = unsafe { k_guest_clock(0, 0) };
     if gc != 0 {
@@ -8455,8 +8493,12 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
     // A connected TCP socket: the same connection, held once more (its Wisp
     // stream, or its end in the global kernel). Wine's wineserver makes every
     // socket and connects it, then hands the client the descriptor.
+    // Any other internet socket -- unconnected, bound, listening, UDP --
+    // moves to the global kernel, and both processes hold that one socket:
+    // the wineserver binds and polls it while the client sends, receives and
+    // sets options on it.
     if let Some(sock) = Arc::clone(&file.handle).as_inet_socket() {
-        if let Some(name) = sock.carry() {
+        if let Some(name) = sock.carry().or_else(|| sock.move_out()) {
             return Some(name);
         }
     }
@@ -8649,6 +8691,20 @@ fn rebuild_carried(
         let (id, listening) = rest.split_once(':').ok_or("bad socket name")?;
         let id = id.parse::<i32>().map_err(|_| "bad socket id")?;
         let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, listening == "1", None, r));
+        sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
+        let handle: Arc<dyn FileHandle> = sock;
+        OpenFile::new(handle, "socket".to_string(), flags, true, true)
+    } else if path.starts_with("inetg:") {
+        // `Socket::move_out`'s name: a hold on the global kernel's socket,
+        // this holder's now.
+        let sock = net::Socket::moved_proxy(
+            path,
+            Arc::new(WispNet),
+            Arc::new(net::Resolver::new()),
+            Arc::new(net::Ports::new()),
+            global_sockets(),
+        )
+        .ok_or("bad moved socket name")?;
         sock.set_nonblocking(flags & oflags::O_NONBLOCK != 0);
         let handle: Arc<dyn FileHandle> = sock;
         OpenFile::new(handle, "socket".to_string(), flags, true, true)
