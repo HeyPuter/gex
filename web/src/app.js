@@ -582,7 +582,8 @@ async function begin(opts, base, at, state, meter) {
     fw.onerror = (e) => failed(e.message ?? e);
     fw.onmessage = ({ data: m }) => {
       if (m.kind === 'bytes') {
-        state.downloaded = (state.downloaded ?? 0) + m.n;
+        if (m.cached) state.cached = (state.cached ?? 0) + m.n;
+        else state.downloaded = (state.downloaded ?? 0) + m.n;
       } else if (m.kind === 'late') {
         if (m.error) say(`[app] late unit ${m.error}\n`);
         else add(m.entry);
@@ -599,7 +600,7 @@ async function begin(opts, base, at, state, meter) {
       const u = new URL(at(fl.url));
       u.search = z.build ? `v=${z.build}` : '';
       u.pathname += '.zst';
-      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late, demand: fl.demand ?? [] });
+      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late, demand: fl.demand ?? [], ...(/\/pieces\//.test(fl.url) ? { cache: PIECE_CACHE } : {}) });
     }
   }
   // The lazy files kept in the page's cache (lazy-cache.mjs): one Worker
@@ -645,6 +646,7 @@ async function begin(opts, base, at, state, meter) {
     ...(pieceList?.pieces ?? []).map(([u]) => u),
     ...(preList ?? []).map(([, u]) => u),
     ...lazy.map(([, , u]) => u),
+    ...(fl ? [fl.url] : []),
   ]).catch(() => {});
   if (keep) {
     const p = persist(keep.db, keep.dir, await globalKernel(), {

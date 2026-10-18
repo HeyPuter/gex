@@ -628,9 +628,14 @@ function w3Site() {
           console.log(`eject-site: --boot-units: ${fillDemand.length} units in the fill, compiled when first mapped`);
         }
         const fb = join(work, 'fill.bin');
-        writeFileSync(fb, Buffer.concat(parts));
-        place(fb, 'project/build/web/fill.bin');
-        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: '/project/build/web/fill.bin', size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
+        const fillBytes = Buffer.concat(parts);
+        writeFileSync(fb, fillBytes);
+        // With --pieces, named by its bytes like a piece, which the page keeps
+        // in its cache (fill-worker.js): a later visit, or a build that left
+        // the fill alone, does not download it again.
+        const fillSite = piecesOn ? `project/build/web/pieces/f${sha(fillBytes).slice(0, 32)}.bin` : 'project/build/web/fill.bin';
+        place(fb, fillSite);
+        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: `/${fillSite}`, size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
         w3.params.fill = '/project/build/web/fill.json';
         console.log(`eject-site: the fill: ${seen.size} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
       }
