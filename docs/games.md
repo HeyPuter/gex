@@ -374,10 +374,10 @@ ship the function-tier units built for those bases by the page's own gexc
 |---|---|---|---|
 | 4400 | Undertale | w3 | **intro renders** |
 | 4401 | Katana ZERO | w3 | **title menu** |
-| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs (300 s, no OOM, with g/w3-dll-band's band pins; since W3's compact space it ran out of memory without them) |
-| 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
+| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs 300 s on master 1fc68d04 with 41 function-tier units hitting (DLLs pinned in the band) |
+| 4403 | Momodora | w3 | **title** ("Press Any Button"), gooner and edger, 360 s, master 1fc68d04, 49 units hitting |
 | 4404 | Retrocycles | w3 | **language menu** |
-| 4405 | Hades (x86) | w3 | **main menu** (gex g/w3-dll-band: DLLs pinned in the band, and `w3split=1` from the matrix's `page=w3split`: in W3's compact space its 1.5 GiB of mappings and the shim's heap do not fit together under 2 GiB, and it runs out of memory at the loading screen) |
+| 4405 | Hades (x86) | w3 | **main menu** (gooner, 480 s, 63 units hitting) with `page=w3split` and gex g/w3-split-provstack (provider stacks above 2 GiB); without the split it runs out of memory at the loading screen, and with the split but without that fix the units' provider stacks find no room at about 120 s |
 | 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
 | 4407 | Retrocycles | linux-x11 | **language menu** |
 | 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
