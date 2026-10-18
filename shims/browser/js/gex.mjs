@@ -493,7 +493,7 @@ function slotsNeeded(meta) {
 /** clang's names for a C main (see the PE module's instantiation). */
 const MAIN_NAMES = ['main', '__main_argc_argv', '__original_main'];
 
-function isW3Program(elf) {
+function w3ProgramFlags(elf) {
   // ELF32 (W3, i386 Wine) or ELF64 (W64, x86-64 Wine: wasm-elf.py --elf64)
   if (!(elf instanceof Uint8Array) || elf.length < 64 || elf[0] !== 0x7f || (elf[4] !== 1 && elf[4] !== 2)) return false;
   const e64 = elf[4] === 2;
@@ -509,9 +509,9 @@ function isW3Program(elf) {
     const h = off + (at - vaddr);
     const magic = String.fromCharCode(...elf.subarray(h, h + 7));
     // FLAG_GUEST_I386 (1) or FLAG_GUEST_X86_64 (2): Windows' address space
-    return magic === 'GEXWASM' && (dv.getUint32(h + 36, true) & 3) !== 0;
+    return magic === 'GEXWASM' ? dv.getUint32(h + 36, true) & 3 : 0;
   }
-  return false;
+  return 0;
 }
 
 /** The epoch every Worker's high-resolution clock shares, in nanoseconds:
@@ -888,6 +888,8 @@ export class Gex {
   /** A W3 process's Windows address-space line: a forked child's from its
    *  parent, -1 for a fresh process to split at once (see `#workerStack`). */
   #windowsSpace = 0;
+  /** A W64 program being loaded: its space is the NT layer's split. */
+  #w64Split = false;
   get forkCopiedBytes() { return this.#forkCopied; }
   get forkSkippedBytes() { return this.#forkSkipped; }
   get forkZeroBytes() { return this.#forkZeros; }
@@ -1043,7 +1045,7 @@ export class Gex {
       // the first claim: the NT layer's split at its parent's line, or W3's
       // compact space (nothing grown; inherited regions become islands).
       // `?w3split=1` before the space is taken: the split, not the compact one.
-      if (globalThis.GEX_W3_SPLIT) this.#shim.exports.gex_set_w3_split?.(1);
+      if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).
@@ -1541,7 +1543,11 @@ export class Gex {
     // A W3 program (native Wine's loader) splits the memory with Windows
     // before the runtime's startup heap is taken, or that heap sits where
     // Windows DLLs load (0x10000000).
-    if (isW3Program(elf)) this.#windowsSpace = -1;
+    // A 64-bit one (W64) the NT layer's split: W3's compact space ends at
+    // 2 GiB, and a 64-bit Wine maps past it.
+    const w3 = w3ProgramFlags(elf);
+    if (w3) this.#windowsSpace = -1;
+    this.#w64Split = (w3 & 2) !== 0;
     // A compiled `WebAssembly.Module` if the host has one, bytes otherwise:
     // a module is structured-cloneable and the engine shares the code behind
     // it, so passing one saves recompiling the 8.7 MB shim per Worker.
