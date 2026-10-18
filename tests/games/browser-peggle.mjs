@@ -6,9 +6,8 @@
 //   node tests/games/browser-peggle.mjs [--peggle DIR] [--shot DIR]
 //        [--minutes N] [--measure S] [--no-input] [--keep]
 //
-// DIR (PEGGLE_DIR, default work/games/peggle) holds the game with its real
-// executable unwrapped (tests/games/popcap-unwrap.py Peggle.exe
-// popcapgame1.exe). The prefix is GEX_WINE_PREFIX (tools/nt-stage-wine.sh);
+// DIR (PEGGLE_DIR, default work/games/peggle) holds a copy of the game as
+// shipped; Peggle.exe (PopCap's wrapper) runs unmodified. The prefix is GEX_WINE_PREFIX (tools/nt-stage-wine.sh);
 // a prefix without Peggle's userdata starts at the name entry, which is what
 // the input script (tests/games/peggle-input.txt) expects.
 //
@@ -45,15 +44,15 @@ async function main() {
   for (const f of ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm']) {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}: run web/build-mesa-wasm.sh`);
   }
-  if (!existsSync(join(peggle, 'popcapgame1.exe'))) throw new Error(`no ${peggle}/popcapgame1.exe (tests/games/popcap-unwrap.py)`);
-  const tar = bundle('peggle', 'x86', { peggle }, [join(peggle, 'popcapgame1.exe')]);
+  if (!existsSync(join(peggle, 'Peggle.exe'))) throw new Error(`no ${peggle}/Peggle.exe`);
+  const tar = bundle('peggle', 'x86', { peggle }, [join(peggle, 'Peggle.exe')]);
   const env = ['GEX_NT_STATS=1', ...(input ? [`GEX_NT_INPUT=${input}`] : []),
     ...(process.env.GEX_NT_PAGE_ENV ? [process.env.GEX_NT_PAGE_ENV] : [])].join(',');
   const t0 = Date.now();
   // The screen is 1920x1080 as natively, so the script's client
   // coordinates are the same.
   const { evaluate, state, shot, consoleLines } = await openPage(
-    `tar=/gex/nt/${tar.split('/').pop()}&exe=/peggle/popcapgame1.exe&cwd=/peggle&gl=1&glbackend=wgpu`
+    `tar=/gex/nt/${tar.split('/').pop()}&exe=/peggle/Peggle.exe&cwd=/peggle&gl=1&glbackend=wgpu`
       + `&size=1920x1080&trapstack=1${process.env.GEX_NT_PAGE_FLAGS ?? ''}&env=${encodeURIComponent(env)}`,
     { width: 1920, height: 1080, shotDir },
   );

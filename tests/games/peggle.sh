@@ -6,7 +6,7 @@
 #
 #   tests/games/peggle.sh [--browser] [--measure S] [--shot DIR] [-- GEXC-FLAGS]
 #
-# Native (default): gexc runs popcapgame1.exe in its JIT tier (--no-cgen;
+# Native (default): gexc runs the shipped Peggle.exe in its JIT tier (--no-cgen;
 # GEXC-FLAGS replace that). --browser: tests/games/browser-peggle.mjs, the
 # same game and script in web/nt.html (GEX_WEBGPU_SOFTWARE=0 for the real
 # GPU).
@@ -15,9 +15,9 @@
 # (the frame the script's `# gameplay N` names), and frames/s over --measure
 # seconds of gameplay (default 60). --shot DIR keeps gameplay.png there.
 #
-# Env: GEXC (default target/x86/release/gexc), PEGGLE_DIR (the game with
-# popcapgame1.exe unwrapped: tests/games/popcap-unwrap.py Peggle.exe
-# popcapgame1.exe; default ../../work/games/peggle from the repo root),
+# Env: GEXC (default target/x86/release/gexc), PEGGLE_DIR (a copy of the
+# game as shipped, run unmodified: Peggle.exe is PopCap's wrapper, which
+# starts the game itself; default ../../work/games/peggle from the repo root),
 # GEX_WINE_PREFIX (a staged prefix, tools/nt-stage-wine.sh), CORES (default
 # 5,11).
 #
@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
 done
 game=${PEGGLE_DIR:-$root/../../work/games/peggle}
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
-[ -f "$game/popcapgame1.exe" ] || { echo "no $game/popcapgame1.exe (tests/games/popcap-unwrap.py)" >&2; exit 2; }
+[ -f "$game/Peggle.exe" ] || { echo "no $game/Peggle.exe" >&2; exit 2; }
 [ -f "$prefix/.wine-version" ] || { echo "no staged Wine prefix at $prefix (tools/nt-stage-wine.sh)" >&2; exit 2; }
 
 if [ $browser = 1 ]; then
@@ -71,7 +71,7 @@ cd "$game"
 t0=$(date +%s%N)
 GEX_NT_STRICT=1 GEX_NT_STATS=1 GEX_PPM_EVERY=10 GEX_NT_INPUT="$input" \
     taskset -c "${CORES:-5,11}" "$gexc" run "${flags[@]}" --wine-prefix "$run" --gl \
-    --wayland-out "$out/f" popcapgame1.exe > "$log" 2>&1 &
+    --wayland-out "$out/f" Peggle.exe > "$log" 2>&1 &
 pid=$!
 
 # GEX_NT_STATS prints `t=MS presents=N` each second.
