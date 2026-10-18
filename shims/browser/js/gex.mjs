@@ -269,6 +269,11 @@ const NATIVE_UNWOUND = 512n;
 /** Where a native caller's `run_until` goes after a stray return to its
  *  pad (cgen.rs `STRAY_PC`): the pad's filler, which no code has. */
 const STRAY_PC = NATIVE_RETURN_PAD + 1n;
+/** A thread `clone` made that could not be handed to the host. */
+function threadNotStarted(who, err) {
+  console.error(`[${who}] starting a thread: ${err?.message ?? err}`);
+}
+
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -1458,7 +1463,7 @@ export class Gex {
         ftab_grow: () => this.#cgenGrowIfShort(),
         serve_in_place: () => {
           this.#cgenServe();
-          this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
+          this.#startThread('gex-nt');
         },
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
@@ -3118,10 +3123,35 @@ export class Gex {
    * are already shared. All that crosses is which thread-table entry to run.
    */
   async #drainThread() {
+    const thread = this.#takeThread();
+    if (thread) await this.#postThread(thread);
+  }
+
+  /**
+   * `#drainThread` from a loop that may never reach the event loop again (a
+   * call-out, an NT callback, a system call served in place: a Wine thread's
+   * whole life can be one call-out). Nothing asynchronous unless a thread is
+   * there: a promise per trap, its rejection handler holding the trap's scope
+   * (and so the trap's error), is a microtask that never runs, and Hades x64's
+   * page queued 4 GB of them before the renderer died.
+   */
+  #startThread(who = 'gex') {
+    let thread;
+    try {
+      thread = this.#takeThread();
+    } catch (err) {
+      threadNotStarted(who, err);
+      return;
+    }
+    if (thread) this.#postThread(thread).catch((err) => threadNotStarted(who, err));
+  }
+
+  /** The thread `clone` left for the host, claimed: null with none. */
+  #takeThread() {
     const e = this.#shim.exports;
-    if (!e.gex_thread_pending) return;
+    if (!e.gex_thread_pending) return null;
     const tid = e.gex_thread_pending();
-    if (!tid) return;
+    if (!tid) return null;
     // Made before the first thread exists, so every Worker of the process
     // holds the same one.
     this.#moduleStore ??= makeModuleStore();
@@ -3164,6 +3194,11 @@ export class Gex {
           'Give the Env a `spawnThread`, or the thread will never run.',
       );
     }
+    return thread;
+  }
+
+  /** Start a claimed thread's Worker (`#takeThread`). */
+  async #postThread(thread) {
     // Before the thread exists: from its first install it may publish
     // indices past what this Worker has replayed.
     this.#threaded();
@@ -4784,7 +4819,7 @@ export class Gex {
           else if (ok !== -2) this.#vforkCopied(ok);
         }
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+        this.#startThread();
       }
     };
     const sync = (ctx, pc) => {
@@ -5313,7 +5348,7 @@ export class Gex {
     const staged = () => {
       if (e.gex_wasmprog_staged()) {
         this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+        this.#startThread();
       }
     };
     const sync = (ctx, pc) => {
@@ -5335,7 +5370,7 @@ export class Gex {
     const e = this.#shim.exports;
     if (e.gex_wasmprog_staged()) {
       this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
-      this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+      this.#startThread();
     }
   };
   #providerSyscallS = null;
@@ -5371,7 +5406,7 @@ export class Gex {
       while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
       this.#catchUpSync();
       this.#cgenServe();
-      this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+      this.#startThread();
     }
   };
 
@@ -6389,7 +6424,7 @@ export class Gex {
         this.#cgenServe();
         // A thread created inside the callback: posting it is synchronous,
         // only the answer would need the event loop.
-        this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
+        this.#startThread('gex-nt');
         const next = e.gex_resume_pc();
         if (next === 0n) {
           console.error('[gex-nt] a user-mode callback stopped with nowhere to resume');
@@ -6766,7 +6801,7 @@ export class Gex {
           while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
           this.#catchUpSync();
           this.#cgenServe();
-          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          this.#startThread();
           // The fault hook as one of this loop's steps: on a stack that may
           // suspend in the single-thread build (`#driveAsync`).
           let faulted = null;
@@ -6959,7 +6994,7 @@ export class Gex {
           while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
           this.#catchUpSync();
           this.#cgenServe();
-          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          this.#startThread();
           const faulted = this.#deliverFault(ctx);
           const resumed = e.gex_resume_pc();
           const nextPc = faulted ?? resumed;
@@ -7246,23 +7281,27 @@ export class Gex {
    * or another did and this one catches up): a thread that installed them
    * differently would dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
+  #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
+    if (!sync) return this.#installModuleAsync(bytes, need, segments, meta, who, precompiled, dense);
     const t0 = performance.now();
     this.#installs++;
-    if (sync) {
-      // Timed here: the inner call has done all its work when it returns,
-      // and a `finally` after an `await` would run only once the guest
-      // next yields, counting everything it ran meanwhile (a node start-up
-      // reported hours of "installing").
-      const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync, dense);
-      this.#installMs += performance.now() - t0;
-      return done;
-    }
+    // Timed here: the inner call has done all its work when it returns,
+    // and a `finally` after an `await` would run only once the guest
+    // next yields, counting everything it ran meanwhile (a node start-up
+    // reported hours of "installing").
+    // Not an async function: one returning the inner promise queues a
+    // microtask to adopt it, which a nested loop (that never reaches the
+    // event loop) left queued per install, holding the install's result.
+    const done = this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync, dense);
+    this.#installMs += performance.now() - t0;
+    return done;
+  }
+
+  async #installModuleAsync(bytes, need, segments, meta, who, precompiled, dense) {
+    const t0 = performance.now();
+    this.#installs++;
     try {
-      // With `sync` the inner call never awaits, so the install is complete
-      // when this returns its promise -- what a nested loop inside an import
-      // needs, since it cannot yield.
-      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync, dense);
+      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, false, dense);
     } finally {
       this.#installMs += performance.now() - t0;
     }
