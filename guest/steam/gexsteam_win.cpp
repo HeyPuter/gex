@@ -430,6 +430,7 @@ GEX_ACCESSOR(SteamGameServerNetworking, "STEAMNETWORKING")
 GEX_ACCESSOR(SteamGameServerStats, "STEAMGAMESERVERSTATS")
 GEX_ACCESSOR(SteamGameServerHTTP, "STEAMHTTP")
 GEX_ACCESSOR(SteamGameServerUGC, "STEAMUGC")
+GEX_ACCESSOR(SteamMasterServerUpdater, "STEAMMASTERSERVERUPDATER")
 
 /* The game server's ISteamClient, which pre-1.37 SDKs export as data
  * (CSteamworks.dll, Steamworks.NET's old native shim, imports it). */
