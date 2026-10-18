@@ -1862,12 +1862,46 @@ static size_t pixel_transfer_bytes(unsigned format, unsigned type, int w, int h,
     return layout.end;
 }
 
+void glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
+                     unsigned format, unsigned type, const void *pixels);
+
+/* Client pixels larger than one command can carry (a 4096x4096 RGBA atlas
+   is 64 MiB) go as bands of whole rows, each a glTexSubImage2D that fits:
+   the band's first row is addressed directly, with GL_UNPACK_SKIP_ROWS 0
+   meanwhile. Returns 0 when the image fits in one command. */
+static int tex_sub_image_2d_bands(unsigned target, int level, int x, int y, int w, int h,
+                                  unsigned format, unsigned type, const void *pixels,
+                                  size_t len) {
+    struct gexgl_pixel_layout layout;
+    size_t step = upload_chunk();
+    if (len <= step || h < 2 ||
+        !gexgl_compute_pixel_layout(format, type, w, h, -1, &unpack_store, &layout) ||
+        !layout.row_stride || layout.row_stride > step / 2)
+        return 0;
+    size_t skip_rows = unpack_store.skip_rows;
+    int rows = (int)((step - layout.row_stride) / layout.row_stride);
+    if (rows < 1) rows = 1;
+    glPixelStorei(0x0CF3u, 0); /* GL_UNPACK_SKIP_ROWS */
+    for (int y0 = 0; y0 < h; y0 += rows) {
+        int n = h - y0 < rows ? h - y0 : rows;
+        glTexSubImage2D(target, level, x, y + y0, w, n, format, type,
+                        (const uint8_t *)pixels + (skip_rows + (size_t)y0) * layout.row_stride);
+    }
+    glPixelStorei(0x0CF3u, (int)skip_rows);
+    return 1;
+}
+
 void glTexImage2D(unsigned target, int level, int internal, int w, int h, int border,
                   unsigned format, unsigned type, const void *pixels) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t len = pixels && !pbo ? pixel_transfer_bytes(format, type, w, h, -1,
                                                         &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
+    if (len > upload_chunk()) {
+        /* Allocate, then upload in bands. */
+        glTexImage2D(target, level, internal, w, h, border, format, type, NULL);
+        if (tex_sub_image_2d_bands(target, level, 0, 0, w, h, format, type, pixels, len)) return;
+    }
     uint32_t *p = begin(GEXGL_TEX_IMAGE_2D, 11, 4 + len);
     if (!p) return;
     p[0] = target; p[1] = (uint32_t)level; p[2] = (uint32_t)internal;
@@ -1885,6 +1919,7 @@ void glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
     size_t len = pixels && !pbo ? pixel_transfer_bytes(format, type, w, h, -1,
                                                         &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
+    if (tex_sub_image_2d_bands(target, level, x, y, w, h, format, type, pixels, len)) return;
     uint32_t *p = begin(GEXGL_TEX_SUB_IMAGE_2D, 11, 4 + len);
     if (!p) return;
     p[0] = target; p[1] = (uint32_t)level; p[2] = (uint32_t)x; p[3] = (uint32_t)y;

@@ -6,7 +6,9 @@
  * keeps its unwritten bytes through a write map (both read in parts). The
  * guest keeps a copy of a mapped buffer's contents and uploads only what a
  * write map changed: the copy must follow glBufferSubData and must not
- * survive a GPU write (glCopyBufferSubData). Prints
+ * survive a GPU write (glCopyBufferSubData). A 4096x4096 RGBA texture
+ * (64 MiB, larger than the command area) uploads whole, with
+ * GL_UNPACK_SKIP_ROWS and GL_UNPACK_ROW_LENGTH set. Prints
  * SUMMARY cases=N passed=N failed=0 when right; runs on native Mesa too.
  *
  *   cc -o probe gl-map-buffer-probe.c -lEGL -lGL       (native reference)
@@ -73,6 +75,57 @@ static GLuint fresh_big(void) {
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)BIG, data, GL_DYNAMIC_DRAW);
     free(data);
     return b;
+}
+
+/* 4096x4096 RGBA from client memory: rows 10.. of a 4100-pixel-wide image. */
+#define TEX 4096
+#define TEX_ROW 4100
+static unsigned tex_texel(size_t x, size_t y) { return (unsigned)(x * 2654435761u ^ y * 40503u) | 0xff000000u; }
+
+static void check_big_texture(const char *name, int sub) {
+    unsigned *src = malloc((size_t)TEX_ROW * (TEX + 10) * 4);
+    for (size_t y = 0; y < TEX + 10; y++)
+        for (size_t x = 0; x < TEX_ROW; x++) src[y * TEX_ROW + x] = tex_texel(x, y);
+    GLuint t, fb;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, TEX_ROW);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 10);
+    if (sub) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, TEX, TEX, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, TEX, TEX, GL_RGBA, GL_UNSIGNED_BYTE, src);
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, TEX, TEX, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+    /* Rows on both sides of every possible band edge are a few spans:
+       read 8 rows of 64 pixels at a spread of heights. */
+    int ok = 1;
+    unsigned got[8 * 64];
+    for (int y = 0; y < TEX && ok; y += 509) {
+        int x = (y * 7) % (TEX - 64);
+        glReadPixels(x, y, 64, 8, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        for (int r = 0; r < 8 && ok; r++)
+            for (int c = 0; c < 64 && ok; c++)
+                if (got[r * 64 + c] != tex_texel((size_t)(x + c), (size_t)(y + r + 10))) {
+                    ok = 0;
+                    printf("texel (%d,%d): %08x, want %08x\n", x + c, y + r, got[r * 64 + c],
+                           tex_texel((size_t)(x + c), (size_t)(y + r + 10)));
+                }
+    }
+    glReadPixels(TEX - 64, TEX - 8, 64, 8, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    for (int i = 0; i < 8 * 64 && ok; i++)
+        if (got[i] != tex_texel((size_t)(TEX - 64 + i % 64), (size_t)(TEX - 8 + i / 64 + 10))) ok = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb);
+    glDeleteTextures(1, &t);
+    free(src);
+    cases++; passed += ok;
+    printf("CASE %s %s\n", name, ok ? "PASS" : "FAIL");
 }
 
 int main(void) {
@@ -199,6 +252,9 @@ int main(void) {
     glUnmapBuffer(GL_ARRAY_BUFFER);
     memset(want + 60, 0x67, 4);
     check("write_map_keeps_gpu_copy", h, want);
+
+    check_big_texture("big_tex_image", 0);
+    check_big_texture("big_tex_sub_image", 1);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed, cases - passed);
     return cases == passed ? 0 : 1;
