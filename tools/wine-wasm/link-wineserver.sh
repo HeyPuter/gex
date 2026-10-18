@@ -26,16 +26,23 @@ compile_cmd() { # SRC_PATH OBJ_REL -> the build's compile command for it
 }
 tmpl=$(compile_cmd "$WF/server/atom.c" server/atom.o)
 [ -n "$tmpl" ] || { echo "link-wineserver: no compile command for server/atom.o in $B" >&2; exit 1; }
-# door.c: in the server's sources since Wine's Makefile.in names it, added
-# for trees configured before that.
-srcs=$( { sed -n '/^server\/wineserver:/,/^\t/p' Makefile | grep -o "server/[a-z_0-9]*\.o" | sed 's#server/##; s#\.o$##'; echo door; } | sort -u)
+# The sources are SRC's own (server/Makefile.in SOURCES), not BUILD's: the
+# server speaks SRC's protocol, and BUILD may be a Wine whose server has
+# files SRC's has not (W3's LPC ports, server/lpc.c, for the W64 dist built
+# over a W3 tree) or lacks some of SRC's. door.c is added for trees whose
+# Makefile.in does not name it yet.
+srcs=$( { sed -n '/^SOURCES *=/,/^[^\t]/p' "$F/server/Makefile.in" | sed -n 's/^[[:space:]]*\([a-z_0-9]*\)\.c[[:space:]\\]*$/\1/p'; echo door; } | sort -u)
+[ -n "$srcs" ] || { echo "link-wineserver: no SOURCES in $F/server/Makefile.in" >&2; exit 1; }
 objs=""; rm -f "$O/.fail"
 for b in $srcs; do
 	o=$O/$b.o; objs="$objs $o"; src=$F/server/$b.c
 	newer=0; for h in "$F"/server/*.h; do [ "$h" -nt "$o" ] && newer=1 && break; done
 	[ "$o" -nt "$src" ] && [ $newer = 0 ] && continue
-	if [ $b = door ]; then cmd=${tmpl//$WF\/server\/atom.c/$src}; cmd=${cmd//-c -o server\/atom.o/-c -o $o}
-	else cmd=$(compile_cmd "$WF/server/$b.c" server/$b.o); cmd=${cmd//-c -o server\/$b.o/-c -o $o}; fi
+	# BUILD's command for the file, or (door.c, and any file BUILD's server
+	# has not) atom.c's: the server's objects all compile alike.
+	cmd=""; [ $b = door ] || cmd=$(compile_cmd "$WF/server/$b.c" server/$b.o)
+	if [ -z "$cmd" ]; then cmd=${tmpl//$WF\/server\/atom.c/$src}; cmd=${cmd//-c -o server\/atom.o/-c -o $o}
+	else cmd=${cmd//-c -o server\/$b.o/-c -o $o}; fi
 	cmd=${cmd//$WF/$F}
 	( eval "$cmd -include $F/server/wasm32_door.h" ) || { echo "link-wineserver: server/$b.c failed" >&2; touch "$O/.fail"; } &
 	while [ "$(jobs -r | wc -l)" -ge "${JOBS:-6}" ]; do wait -n; done
