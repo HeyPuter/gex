@@ -13986,6 +13986,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume_ctx(my_ctx());
         trap();
     }
+    // W3/W64: the first miss in an image left until now (mapped unread, or
+    // relocated after mapping; cgen.rs `w3_miss`): JS serves its unit, then
+    // the guest goes on at this pc. Before the function JIT, which would
+    // otherwise take the image's code first.
+    if cgen::w3_miss(pc) {
+        miss_way(pc, 8);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     // An ejected project's training run: a pc of a unit image no function
     // holds is a web entry, whether the function JIT (below) or tier-1 then
     // runs it (the AOT-only run would stop here).
@@ -14014,15 +14024,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     if cgen::libprov::replaced(pc) {
         cgen::libprov::note_stray(pc);
-    }
-    // W3: the first miss in an image Wine relocated after mapping it, whose
-    // unit was left until now (cgen.rs `w3_miss`): JS serves it, then the
-    // guest goes on at this pc.
-    if cgen::w3_miss(pc) {
-        miss_way(pc, 8);
-        set_resume(pc);
-        set_resume_ctx(my_ctx());
-        trap();
     }
     remiss(pc);
     miss_way(pc, 13);
