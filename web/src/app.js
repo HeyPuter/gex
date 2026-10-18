@@ -893,6 +893,9 @@ export function setGlobals(get, b = {}) {
   if (get('callouttrace')) globalThis.GEX_CALLOUT_TRACE = 1;
   // straytrap=1: a return to native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
   if (get('straytrap')) globalThis.GEX_STRAY_TRAP = 1;
+  // w3split=1: W3 processes take the NT layer's 2 GiB split (the shim's heap above
+  // 2 GiB), not the compact space: for a game that needs all of Windows' 2 GiB.
+  if (get('w3split')) globalThis.GEX_W3_SPLIT = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));

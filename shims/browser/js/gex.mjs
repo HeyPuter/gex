@@ -1042,6 +1042,8 @@ export class Gex {
       // A W3 process says so before anything claims arena -- this stack is
       // the first claim: the NT layer's split at its parent's line, or W3's
       // compact space (nothing grown; inherited regions become islands).
+      // `?w3split=1` before the space is taken: the split, not the compact one.
+      if (globalThis.GEX_W3_SPLIT) this.#shim.exports.gex_set_w3_split?.(1);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).

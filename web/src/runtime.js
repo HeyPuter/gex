@@ -979,6 +979,8 @@ async function runProgramHere(
       calloutTrace: globalThis.GEX_CALLOUT_TRACE || undefined,
       // `?straytrap=1`: native Wine's pad past open call-outs stays a breakpoint (cgen.rs STRAY_TRAP).
       strayTrap: globalThis.GEX_STRAY_TRAP || undefined,
+      // `?w3split=1`: W3's address space split at 2 GiB (nt::w3_space), in every process.
+      w3Split: globalThis.GEX_W3_SPLIT || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
