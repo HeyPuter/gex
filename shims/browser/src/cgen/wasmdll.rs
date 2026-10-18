@@ -327,9 +327,9 @@ pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
     }) else {
         return -1;
     };
-    // An i386 image no unit of the page's is for, at this base (a resource
-    // DLL mapped for its icons or strings): left unread for its first miss,
-    // which a resource-only map never has. Its headers say which.
+    // An x86 image (not a skeleton): left unread for its first miss, which
+    // a resource-only map or an import scan never has. Its headers say
+    // which.
     if super::w3_may_defer(&path, base) {
         let mut head = vec![0u8; 4096];
         let n = file.read_at(0, &mut head).unwrap_or(0) as usize;

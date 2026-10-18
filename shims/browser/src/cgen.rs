@@ -524,14 +524,16 @@ pub(crate) fn w3_mapped(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> bool
 }
 
 /// Whether an image Wine's loader mapped at `base` can wait for its first
-/// miss unread ([`w3_defer_unread`]): units are on, the page names its
-/// units' identities, and none is this image's at this base. Its key would
-/// be a hash of every byte (22 MB for ehres.dll, mapped three times by the
-/// shell for icons, 20 tzres.dll maps for time zone names: never run), for a
-/// unit that is not there; a resource-only map never misses, so it is never
-/// read or hashed at all.
-pub(crate) fn w3_may_defer(path: &str, base: u64) -> bool {
-    on() && lock(&KNOWN).as_ref().is_some_and(|k| !k.contains_key(&(base, path.to_string())))
+/// miss unread ([`w3_defer_unread`]): whenever units are on. An image that
+/// never runs is then never read, hashed or placed: a resource DLL (22 MB
+/// of ehres.dll mapped three times by the shell for icons, 20 tzres.dll
+/// maps for time zone names), each KnownDll wineboot maps for its imports
+/// (40 of them, 3.8 s of W64 Dicey's start, edger), the game's exe in the
+/// first process, which only hands it to start.exe (its 261 MiB unit
+/// fetched, compiled and placed for nothing). One that runs is placed at
+/// its first miss, as a relocated image's is.
+pub(crate) fn w3_may_defer(_path: &str, _base: u64) -> bool {
+    on()
 }
 
 /// Leave the image open as `file`, `size` bytes mapped at `base`, for its
