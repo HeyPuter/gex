@@ -180,7 +180,8 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // W3's compact address space (`nt::w3_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
-        let lo = crate::nt::w3_windows_space();
+        // Or the NT layer's split, for a site that asks (`?w3split=1`).
+        let lo = crate::nt::w3_space().map_err(|e| format!("W3: {e}"))?;
         if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
             crate::nt::w3_kuser();
         }

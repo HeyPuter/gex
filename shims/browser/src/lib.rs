@@ -8769,9 +8769,22 @@ pub extern "C" fn gex_windows_space() -> u32 {
 /// space starts, or 0 on failure.
 #[no_mangle]
 pub extern "C" fn gex_split_windows_space() -> u32 {
-    // W3 no longer splits (see `nt::w3_windows_space`); the name is the JS
-    // side's.
-    nt::w3_windows_space() as u32
+    // W3's compact space (see `nt::w3_windows_space`), or the split when the
+    // site asked (`gex_set_w3_split`); the name is the JS side's.
+    match nt::w3_space() {
+        Ok(lo) => lo as u32,
+        Err(e) => {
+            warn_line(&format!("gex: W3: {e}\n"));
+            0
+        }
+    }
+}
+
+/// `?w3split=1`: this process's W3 address space is the NT layer's split, not
+/// the compact space (`nt::w3_space`). Set before the space is taken.
+#[no_mangle]
+pub extern "C" fn gex_set_w3_split(on: u32) {
+    nt::set_w3_split(on != 0);
 }
 
 /// A forked child of a W3 process: the split, first thing after

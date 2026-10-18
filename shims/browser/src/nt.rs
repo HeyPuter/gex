@@ -96,6 +96,12 @@ mod stub {
         0
     }
 
+    pub(crate) fn set_w3_split(_on: bool) {}
+
+    pub(crate) fn w3_space() -> Result<u64, String> {
+        Ok(w3_windows_space())
+    }
+
     pub(crate) fn w3_compact() -> bool {
         false
     }
@@ -301,6 +307,29 @@ mod imp {
         W3_COMPACT_LO
     }
 
+    /// `?w3split=1` (a site that asks): W3 takes the NT layer's split
+    /// instead of the compact space, as it did before it (9c5fc4fd): the
+    /// memory grown to 2 GiB at start and the shim's heap above it, so
+    /// everything below 2 GiB is Wine's. Costs the tab 2 GiB of data segment
+    /// per process; for a game whose views and the heap do not fit together
+    /// under 2 GiB (Hades x86: 1.5 GiB of guest mappings, 164 MiB of heap).
+    static W3_SPLIT: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn set_w3_split(on: bool) {
+        W3_SPLIT.store(on, Ordering::Relaxed);
+    }
+
+    /// A W3 process's address space: the compact one, or the split when the
+    /// site asked (`set_w3_split`). Where the Windows space starts (the
+    /// split's line, or [`W3_COMPACT_LO`]).
+    pub(crate) fn w3_space() -> Result<u64, String> {
+        if W3_SPLIT.load(Ordering::Relaxed) {
+            split_windows_space().map(|lo| lo & !W3_KUSER_BIT)
+        } else {
+            Ok(w3_windows_space())
+        }
+    }
+
     /// Where Windows executables want to be that the arena would reach:
     /// 0x10000000, Wine's own services, svchost, explorer, rundll32 and
     /// wineboot, and MSVC's default DLL base (16 MiB; the largest image a
@@ -380,6 +409,10 @@ mod imp {
             }
             return Ok(());
         }
+        // A split's line, with W3's KUSER bit when the parent is a W3 process
+        // that took the split (`?w3split=1`) and folds KUSER_SHARED_DATA.
+        let kuser = lo & W3_KUSER_BIT != 0;
+        let lo = lo & !W3_KUSER_BIT;
         if !grow_memory_to(NT_HEAP_BASE) {
             return Err("the engine will not grow this memory to 2 GiB".into());
         }
@@ -387,6 +420,9 @@ mod imp {
         ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
         crate::memmap::claim(crate::memmap::Kind::Guest, 0, lo, NT_HEAP_BASE, "Windows address space");
         WINDOWS_LO.store(lo, Ordering::Relaxed);
+        if kuser {
+            w3_kuser();
+        }
         Ok(())
     }
 

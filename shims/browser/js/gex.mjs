@@ -1042,6 +1042,8 @@ export class Gex {
       // A W3 process says so before anything claims arena -- this stack is
       // the first claim: the NT layer's split at its parent's line, or W3's
       // compact space (nothing grown; inherited regions become islands).
+      // `?w3split=1` before the space is taken: the split, not the compact one.
+      if (globalThis.GEX_W3_SPLIT) this.#shim.exports.gex_set_w3_split?.(1);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).
@@ -5721,7 +5723,13 @@ export class Gex {
             `, lr=0x${(lr < 0n ? lr + (1n << 64n) : lr).toString(16)}`);
           const code = ask(e.gex_exit_code, (c) => (c ? `, exit code ${c}` : ''));
           const heap = ask(e.gex_heap_used_kib, (k) =>
-            k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '');
+            k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '') +
+            // Where the process's arena went (guest mappings, the shim's heap,
+            // Worker stacks, MiB taken), and what its memory grew to: a trap
+            // after the guest ran out of address space says which side spent it.
+            ask(e.gex_arena_spent_mib, () =>
+              `, arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
+              `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB`);
           // "inside" only when the syscall is still on the stack: a plain
           // static, so it answers even with the kernel borrowed.
           const within = ask(e.gex_in_syscall, (v) => v) === 1;

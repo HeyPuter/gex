@@ -662,6 +662,8 @@ async function handle(msg) {
   if (msg.identities) Gex.identities = msg.identities;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.strayTrap) globalThis.GEX_STRAY_TRAP = 1;
+  // `?w3split=1`: a W3 process takes the NT layer's split, not the compact space.
+  if (msg.w3Split) globalThis.GEX_W3_SPLIT = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // Lazy files the page is filling in the background (app.js `fill`): their
