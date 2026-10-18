@@ -352,6 +352,12 @@ S_API bool SteamAPI_RestartAppIfNecessary(unsigned) { return false; }
 S_API bool SteamAPI_IsSteamRunning() { return true; }
 S_API const char *SteamAPI_GetSteamInstallPath() { return gex_steam_dir(); }
 S_API void SteamAPI_RunCallbacks() {}
+/* Flat entry points of SDKs before 1.37, which CSteamworks.dll (Celeste,
+ * TowerFall) imports: a run of one pipe's callbacks, the current user, and
+ * the interface-function registration (nothing to register here). */
+S_API void Steam_RunCallbacks(int, bool) {}
+S_API int Steam_GetHSteamUserCurrent() { return 1; }
+S_API void Steam_RegisterInterfaceFuncs(void *) {}
 S_API void SteamAPI_RegisterCallback(void *, int) {}
 S_API void SteamAPI_UnregisterCallback(void *) {}
 S_API void SteamAPI_RegisterCallResult(void *, unsigned long long) {}
@@ -420,7 +426,16 @@ GEX_ACCESSOR(SteamGameServerStats, "STEAMGAMESERVERSTATS")
 GEX_ACCESSOR(SteamGameServerHTTP, "STEAMHTTP")
 GEX_ACCESSOR(SteamGameServerUGC, "STEAMUGC")
 
-S_API bool SteamGameServer_Init(unsigned, unsigned short, unsigned short, unsigned short, int, const char *) { return true; }
+/* The game server's ISteamClient, which pre-1.37 SDKs export as data
+ * (CSteamworks.dll, Steamworks.NET's old native shim, imports it). */
+S_API void *g_pSteamClientGameServer = nullptr;
+S_API bool SteamGameServer_Init(unsigned, unsigned short, unsigned short, unsigned short, int, const char *) {
+    g_pSteamClientGameServer = gex_accessor("STEAMCLIENT");
+    return true;
+}
+S_API bool SteamGameServer_InitSafe(unsigned ip, unsigned short sp, unsigned short gp, unsigned short qp, int mode, const char *v) {
+    return SteamGameServer_Init(ip, sp, gp, qp, mode, v);
+}
 S_API bool SteamInternal_GameServer_Init(unsigned, unsigned short, unsigned short, unsigned short, int, const char *) { return true; }
 S_API int SteamInternal_GameServer_Init_V2(unsigned, unsigned short, unsigned short, int, const char *, const char *, char *err) {
     if (err) err[0] = 0;
