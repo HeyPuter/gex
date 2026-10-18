@@ -418,6 +418,18 @@ static int present_async(uint32_t *shown) {
     return 1;
 }
 
+/* A command larger than the whole command area is dropped: say so, once
+   per opcode (the first 32 opcodes), so the next such case is in the log. */
+static void too_big(uint32_t opcode, size_t len) {
+    static uint32_t told[32];
+    static unsigned n_told;
+    for (unsigned i = 0; i < n_told; i++)
+        if (told[i] == opcode) return;
+    if (n_told < 32) told[n_told++] = opcode;
+    fprintf(stderr, "gexgl: dropped opcode %u: %zu bytes, more than the %u-byte command area\n",
+            opcode, len, ring ? ring->capacity : 0u);
+}
+
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
@@ -435,6 +447,7 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
     if (ring->tail > ring->capacity || len > ring->capacity - ring->tail) {
         flush();
         if (len > ring->capacity) {
+            too_big(opcode, len);
             return NULL; /* one command larger than the whole buffer */
         }
     }

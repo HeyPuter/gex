@@ -14,6 +14,8 @@ cc -O2 -Wall -Wextra -o "$WORK/probe" "$SOURCE" -lEGL -lGL
 EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 "$WORK/probe" | tee "$WORK/native.log"
 grep -q 'SUMMARY cases=11 passed=11 failed=0' "$WORK/native.log"
 GEX_CC=${GEX_CC:-cc} "$ROOT/guest/gl/build.sh" "$WORK/guest-gl" >/dev/null
-"$GEXC" run --gl --env LD_LIBRARY_PATH="$WORK/guest-gl" "$WORK/probe" | tee "$WORK/gex.log"
+"$GEXC" run --gl --env LD_LIBRARY_PATH="$WORK/guest-gl" "$WORK/probe" 2>"$WORK/gex.err" | tee "$WORK/gex.log"
 grep -q 'SUMMARY cases=11 passed=11 failed=0' "$WORK/gex.log"
+# The 64 MiB glTexImage3D, tried twice, is reported once.
+[ "$(grep -c 'gexgl: dropped opcode' "$WORK/gex.err")" = 1 ] || { echo "FAIL gl-map-buffer: want one 'dropped opcode' line"; grep 'gexgl:' "$WORK/gex.err"; exit 1; }
 echo "ok   gl-map-buffer"

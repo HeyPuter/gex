@@ -8,7 +8,9 @@
  * write map changed: the copy must follow glBufferSubData and must not
  * survive a GPU write (glCopyBufferSubData). A 4096x4096 RGBA texture
  * (64 MiB, larger than the command area) uploads whole, with
- * GL_UNPACK_SKIP_ROWS and GL_UNPACK_ROW_LENGTH set. Prints
+ * GL_UNPACK_SKIP_ROWS and GL_UNPACK_ROW_LENGTH set. A 64 MiB 3D texture
+ * upload (not split) must leave one "gexgl: dropped opcode" line on
+ * stderr under gex, however often it is tried. Prints
  * SUMMARY cases=N passed=N failed=0 when right; runs on native Mesa too.
  *
  *   cc -o probe gl-map-buffer-probe.c -lEGL -lGL       (native reference)
@@ -255,6 +257,19 @@ int main(void) {
 
     check_big_texture("big_tex_image", 0);
     check_big_texture("big_tex_sub_image", 1);
+
+    /* Twice: gexgl says so once. Not a case (it works natively). */
+    {
+        unsigned char *vol = calloc(1, (size_t)1024 * 1024 * 16 * 4);
+        GLuint t3;
+        glGenTextures(1, &t3);
+        glBindTexture(GL_TEXTURE_3D, t3);
+        for (int i = 0; i < 2; i++)
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 1024, 1024, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, vol);
+        glFinish();
+        glDeleteTextures(1, &t3);
+        free(vol);
+    }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed, cases - passed);
     return cases == passed ? 0 : 1;
