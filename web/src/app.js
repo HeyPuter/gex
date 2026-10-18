@@ -599,7 +599,7 @@ async function begin(opts, base, at, state, meter) {
       const u = new URL(at(fl.url));
       u.search = z.build ? `v=${z.build}` : '';
       u.pathname += '.zst';
-      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late });
+      fw.postMessage({ url: u.href, zsize: z.zsize, size: z.size, buf, counter: counter.buffer, zstd: at(b.zstd ?? 'vendor/zstddec-stream.mjs'), late, demand: fl.demand ?? [] });
     }
   }
   // The lazy files kept in the page's cache (lazy-cache.mjs): one Worker

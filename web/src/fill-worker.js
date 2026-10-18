@@ -4,10 +4,12 @@
 // the compositor need. Every Worker reads the fill through `counter` (how
 // many leading bytes are whole); the page hears only what it acts on.
 //
-// In: { url, zsize, size, buf, counter, zstd, late: [[name, off, size]...] }
+// In: { url, zsize, size, buf, counter, zstd, late: [[name, off, size]...], demand: [KEY...] }
 // Out:
 //   { kind: 'late', entry }  a late unit whole: [`cgen:KEY`, Module] (compiled
-//                            here) or [`file:REL`, Uint8Array on a SAB]
+//                            here) or [`file:REL`, Uint8Array on a SAB] (its
+//                            other files, and a `demand` unit's c.wasm, which
+//                            the first process to map it compiles)
 //   { kind: 'bytes', n }     compressed bytes since the last such message
 //   { kind: 'done' } | { kind: 'failed', error }
 
@@ -20,13 +22,14 @@ self.onmessage = async ({ data: m }) => {
   let unsent = 0;
   let lastPost = 0;
   const late = m.late;
+  const demand = new Set(m.demand ?? []);
   // A late unit whose bytes are all in: compiled (or copied) here, handed
   // to the page.
   const takeLate = () => {
     for (; li < late.length && late[li][1] + late[li][2] <= n; li++) {
       const [name, off, size] = late[li];
       const rel = name.slice('unit:'.length);
-      if (rel.endsWith('/c.wasm')) {
+      if (rel.endsWith('/c.wasm') && !demand.has(rel.slice(0, -'/c.wasm'.length))) {
         WebAssembly.compile(out.slice(off, off + size)).then(
           (mod) => postMessage({ kind: 'late', entry: [`cgen:${rel.slice(0, -'/c.wasm'.length)}`, mod] }),
           (e) => postMessage({ kind: 'late', error: `${rel}: ${e}` }),

@@ -21,7 +21,8 @@
 // worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
 // (scripted input, the 4x clock); without it they are dropped, so a player
 // gets the real clock and their own input. --drop removes a guest path from
-// the bundle (e.g. a benchmark's seed-pinning mod).
+// the bundle (e.g. a benchmark's seed-pinning mod). --late FILE and
+// --boot-units FILE: what goes in the background fill (below).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -34,7 +35,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--stable-from'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
 // A W3 page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -501,6 +502,17 @@ function w3Site() {
   // the fill, not units.tar).
   const lateGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
   const lateKeys = new Set();
+  // --boot-units FILE: the images (guest paths, one a line) whose units the
+  // program loads before it is up (the Win7 shell's taskbar), recorded from
+  // a run of the page. Every other unit goes to the background fill, after
+  // the boot's download, not in it: the shell's IE, Paint and Sticky Notes
+  // units, 58 MB of its 285 MB first download, which nothing maps before
+  // the taskbar. They are shared as bytes and compiled when a process first
+  // maps one (preload.json's `demand`; fill.json's `demand`), as a unit the
+  // recording used late is; a process that maps one before the fill has it
+  // waits for its bytes there (worker.mjs `loadFile`).
+  const bootUnitsList = opt('--boot-units', null) ? new Set(readFileSync(opt('--boot-units', null), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).map(lateGuest)) : null;
+  const fillDemand = [];
   let lazyFiles = 0, lazyBytes = 0;
   let lazySource = new Map(); // a lazy file's guest path (lower case) -> its bytes in the store
   const piecesOn = flag('--pieces');
@@ -560,7 +572,7 @@ function w3Site() {
       // Each late image's unit follows its bytes there (`unit:KEY/FILE`):
       // the page compiles it from the fill, and a Worker started before
       // that reads it there (app.js, worker.mjs `loadFile`).
-      if (late.length) {
+      if (late.length || bootUnitsList) {
         const byPath = new Map(lazy.map((f) => [f[0], f]));
         const seen = new Map();
         const entries = [];
@@ -579,10 +591,25 @@ function w3Site() {
             for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(web, 'units', u.key, n)));
           }
         }
+        // --boot-units: the units no image of the list has, in the order the
+        // recording first used them (then the ones it never used).
+        if (bootUnitsList) {
+          const at = (u) => (typeof u.at === 'number' ? u.at : Infinity);
+          const deferred = (w3.units ?? [])
+            .filter((u) => !bootUnitsList.has(lateGuest(u.path)) && !lateKeys.has(u.key) && existsSync(join(web, 'units', u.key, 'c.wasm')) && !existsSync(join(web, 'units', u.key, 'cold')))
+            .sort((a, b) => at(a) - at(b) || (a.key < b.key ? -1 : 1));
+          for (const u of deferred) {
+            if (lateKeys.has(u.key)) continue;
+            lateKeys.add(u.key);
+            fillDemand.push(u.key);
+            for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(web, 'units', u.key, n)));
+          }
+          console.log(`eject-site: --boot-units: ${fillDemand.length} units in the fill, compiled when first mapped`);
+        }
         const fb = join(work, 'fill.bin');
         writeFileSync(fb, Buffer.concat(parts));
         place(fb, 'project/build/web/fill.bin');
-        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: '/project/build/web/fill.bin', size: off, files: entries }));
+        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: '/project/build/web/fill.bin', size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
         w3.params.fill = '/project/build/web/fill.json';
         console.log(`eject-site: the fill: ${seen.size} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
       }
