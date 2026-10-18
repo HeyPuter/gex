@@ -34,7 +34,8 @@
 # end is `exit N`, `signal N` or `timeout` (still running at --time). reason
 # is the last line of the log that looks like why it stopped (an unhandled
 # exception, an unimplemented call, a panic, ...), for a first look; DIR/SLUG/
-# excerpt holds the last 30 such lines.
+# excerpt holds the last 30 such lines. DIR/SLUG/focus-frame is the frame
+# (and seconds) at which a placed window first had the keyboard.
 #
 # This is a correctness/debug tool: never read speed from it (no timing on
 # gooner; fps comes from the bench box, scratch/bench/bench.sh).
@@ -58,9 +59,22 @@
 # for it with Graphics=wayland; default the same directory's pfx; copied per
 # run, never written), W3_LAUNCHER (a Windows program run first with the game
 # as its arguments, e.g. 'C:\winlogon.exe' for the Win7 shell's prefix),
-# WINEDEBUG (default err+all,fixme-all).
+# WINEDEBUG (default err+all,fixme-all), W3_UNITS (a unit cache, as
+# tools/wine-wasm/run.sh's: GEX_W3_UNITS=all GEX_CGEN_CACHE=W3_UNITS, and
+# GEX_W3_UNITS_BUILD=1 builds the missing ones in the background for the
+# next run; W3_UNITS_BUILD=0 builds none). GEX_W3_TRACE=1 names each image
+# that runs on tier-1 because its unit is missing.
+# Take W3_DIST and W3_PREFIX from tools/wine-wasm (`make -s paths`, or
+# w3-dist.sh WINE CACHE for a Wine checkout, as the gate's W3 legs).
+# W64 games (kind w64, x86-64 Windows on 64-bit native Wine): W64_DIST,
+# W64_PREFIX and W64_NATIVE, as tools/wine-wasm/w64-dist.sh prints them.
+# The dist runs with W64_NATIVE's files in place (the native PE core, which
+# has winewayland.drv), the prefix gets the Wayland driver with emulated
+# display modes (as nt-x64.sh's display cases), WINEGEX_DOOR=1, and
+# WINEDLLOVERRIDES=mscoree=;mshtml= (no Mono or Gecko installer).
 # Every game runs in a systemd user scope with TasksMax=TASKS_MAX (default
 # 1024; MATRIX_SCOPE=0 leaves it out), so a runaway can't storm the host.
+# Games run at nice MATRIX_NICE (default 10; 15 or more while a gate runs).
 set -u
 # MATRIX_HERE: tests/games of the tree to use (for a copy of this script run
 # while the tree is edited: bash reads a running script as it goes).
@@ -98,6 +112,7 @@ games_linux=${GAMES_LINUX:-$HOME/gex-sandbox/games-linux}
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 w3dist=${W3_DIST:-$HOME/gex-sandbox/scratch/K/gate-w3legs/dist}
 w3prefix=${W3_PREFIX:-$(dirname "$w3dist")/pfx}
+w64dist=${W64_DIST:-} w64prefix=${W64_PREFIX:-} w64native=${W64_NATIVE:-}
 scope=()
 [ "${MATRIX_SCOPE:-1}" = 1 ] && scope=(systemd-run --user --scope -q -p TasksMax=${TASKS_MAX:-1024})
 gl64=${GEX_GL_X64:-}
@@ -111,6 +126,26 @@ out=${out:-$state/out}
 mkdir -p "$out" "$state"
 summary=$out/summary.txt
 [ -f "$summary" ] || printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' slug arch host stage frames first menu secs end reason > "$summary"
+
+# The W64 dist with W64_NATIVE's files in place (nt-x64.sh's NATIVE=): the
+# Unix side copied (the loader finds the PE DLLs beside itself), links to
+# the rest. Made once per matrix run, in the state directory.
+w64run=
+w64_overlay() {
+    [ -n "$w64run" ] && return 0
+    [ -x "$w64dist/lib/wine/x86_64-unix/wine" ] || { echo "no W64 dist at '$w64dist' (W64_DIST)" >&2; return 1; }
+    [ -d "$w64prefix/drive_c" ] || { echo "no W64 prefix at '$w64prefix' (W64_PREFIX)" >&2; return 1; }
+    local o=$state/w64dist f
+    rm -rf "$o"; mkdir -p "$o/lib/wine/x86_64-windows"
+    cp -a "$w64dist/lib/wine/x86_64-unix" "$o/lib/wine/"
+    ln -s "$w64dist/share" "$o/share"; ln -s ../../share "$o/lib/wine/share"
+    for f in "$w64dist"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
+    if [ -n "$w64native" ]; then
+        [ -f "$w64native/winepe.wasm" ] || { echo "no winepe.wasm in $w64native (W64_NATIVE)" >&2; return 1; }
+        for f in "$w64native"/*; do rm -f "$o/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$o/lib/wine/x86_64-windows/"; done
+    fi
+    w64run=$o
+}
 
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf %s "$s"; }
 
@@ -146,7 +181,9 @@ excerpt_of() {
         | grep -avE 'gex-nt: stats|fixme:' | tail -30 | cut -c1-300
 }
 
-while IFS='|' read -r slug kind dir prog args menu play input extra; do
+# matrix.txt on fd 3, and every command in the loop on /dev/null: a
+# Windows run used to eat the next rows from the loop's stdin.
+while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
     slug=$(trim "$slug")
     case $slug in ''|'#'*) continue ;; esac
     [ -n "$only" ] && [[ $only != *",$slug,"* ]] && continue
@@ -215,7 +252,21 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             sd=$state/seed-$slug/$nseed; nseed=$((nseed + 1))
             rm -rf "$sd"; mkdir -p "$sd"; cp -r "$here/$src/." "$sd/"
             gflags+=(--bind "$sd=$dst") ;;
-        host=*) ;;
+        stub=*@*)
+            # `stub=NAME@PATH`: tests/games/stubs' NAME, built for the game's
+            # arch, in place of PATH (relative to the game's directory) in
+            # the run copy; the original stays beside it as .orig.
+            sn=${x#stub=}; sn=${sn%@*}; sp=$ov/${x#*@}
+            [ -e "$sp" ] && mv "$sp" "$sp.orig"
+            # MATRIX_STUBS=DIR: prebuilt DIR/NAME-ARCH.dll (a host without
+            # mingw-w64, e.g. a bench box).
+            if [ -n "${MATRIX_STUBS:-}" ] && [ -f "$MATRIX_STUBS/$sn-$arch.dll" ]; then
+                cp "$MATRIX_STUBS/$sn-$arch.dll" "$sp"
+            else
+                "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
+                    echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2
+            fi ;;
+        host=*|pe=*|page=*) ;;
         *) gflags+=("$x") ;;
         esac
     done
@@ -270,7 +321,33 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             done
         fi
         pfx=$state/prefix-$slug
-      if [ "$kind" = w3 ]; then
+      if [ "$kind" = w64 ]; then
+        w64_overlay || continue
+        # `pe=DLL[,DLL...]`: those DLLs stay Wine's PE build for this game
+        # instead of W64_NATIVE's (OneShot's Ruby scans ucrtbase's x86 code
+        # for _isatty, which the native module has none of). A per-game copy
+        # of the overlay, hard-linked.
+        w64g=$w64run
+        if [[ $extra =~ (^|[[:space:]])pe=([^[:space:]]+) ]]; then
+            w64g=$state/w64dist-$slug; rm -rf "$w64g"; cp -al "$w64run" "$w64g" || continue
+            for d in ${BASH_REMATCH[2]//,/ }; do
+                [ -e "$w64dist/lib/wine/x86_64-windows/$d" ] || { echo "$slug: pe=$d: not in W64_DIST" >&2; continue; }
+                rm -f "$w64g/lib/wine/x86_64-windows/$d"; ln -s "$w64dist/lib/wine/x86_64-windows/$d" "$w64g/lib/wine/x86_64-windows/"
+            done
+        fi
+        if [ $keep = 0 ] || [ ! -d "$pfx/drive_c" ]; then
+            rm -rf "$pfx"; cp -a "$w64prefix" "$pfx"
+            printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="wayland"\n' >> "$pfx/user.reg"
+            printf '\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' >> "$pfx/user.reg"
+            [ -e "$pfx/drive_c/windows/system32/winewayland.drv" ] ||
+                cp "$w64g/lib/wine/x86_64-windows/winewayland.drv" "$pfx/drive_c/windows/system32/"
+        fi
+        mkdir -p "$state/wl-$slug"
+        run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}" --env WINEGEX_DOOR=1
+              --env 'WINEDLLOVERRIDES=mscoree=;mshtml='
+              --wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}")
+        pre=("$w64g/lib/wine/x86_64-unix/wine")
+      elif [ "$kind" = w3 ]; then
         # W3: Wine's own loader, as a program of the guest. The prefix is a
         # full copy: wineserver and the registry rewrite files in it.
         [ -x "$w3dist/lib/wine/i386-unix/wine" ] || { echo "$slug: no W3 dist at $w3dist (W3_DIST)" >&2; continue; }
@@ -281,6 +358,7 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
         run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}"
               --wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}")
         pre=("$w3dist/lib/wine/i386-unix/wine")
+        [ -n "${W3_UNITS:-}" ] && env+=(GEX_W3_UNITS=all GEX_CGEN_CACHE="$W3_UNITS" GEX_W3_UNITS_BUILD=${W3_UNITS_BUILD:-1} GEX_W3_TRACE=1)
         [ -n "${W3_LAUNCHER:-}" ] && pre+=("$W3_LAUNCHER")
       else
         if [ $keep = 0 ] || [ ! -f "$pfx/.wine-version" ]; then
@@ -298,8 +376,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     argv=($args)
     t0=$(date +%s)
     if [ $fromroot = 1 ]; then cwd=$ov rel=./$prog; else cwd=$(dirname "$exe") rel=./$(basename "$exe"); fi
-    (cd "$cwd" && exec env "${env[@]}" "${scope[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
-        > "$g/log" 2>&1 &
+    (cd "$cwd" && exec env "${env[@]}" "${scope[@]}" timeout -k 20 "$limit" nice -n "${MATRIX_NICE:-10}" "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
+        < /dev/null 3<&- > "$g/log" 2>&1 &
     pid=$!
     first= tfirst= tmenu=
     while kill -0 $pid 2>/dev/null; do
@@ -308,6 +386,10 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
         n=$(newest "$g/frames")
         [ -n "$n" ] && [ -z "$tfirst" ] && tfirst=$(( $(date +%s) - t0 ))
         [ -n "$n" ] && [ -z "$tmenu" ] && [ "$menu" != - ] && [ "$n" -ge "$menu" ] && tmenu=$(( $(date +%s) - t0 ))
+        # The frame at which a placed window first had the keyboard: where an
+        # input script's clock (`frames N`) should start.
+        [ -n "$n" ] && [ ! -f "$g/focus-frame" ] && grep -aq '^\[wl-place\].* focus' "$g/log" &&
+            echo "$n $(( $(date +%s) - t0 ))" > "$g/focus-frame"
         if [ -n "$n" ] && [ $keepframes = 1 ]; then
             for f in $(ls "$g/frames" | grep '\.ppm$' | grep -v "^f-0*$n\.ppm$"); do
                 python3 "$here/ppm2png.py" "$g/frames/$f" "$g/frames/${f%.ppm}.png" && rm -f "$g/frames/$f"
@@ -345,4 +427,4 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     reason=$(reason_of "$g/log")
     excerpt_of "$g/log" > "$g/excerpt"
     printf '%-18s %-6s %-12s %-9s %7s %6s %6s %6s %-10s %s\n' "$slug" "$arch" "$host" "$stage" "$frames" "${tfirst:--}" "${tmenu:--}" "$secs" "$end" "${reason:--}" | tee -a "$summary"
-done < "$here/matrix.txt"
+done 3< "$here/matrix.txt" < /dev/null

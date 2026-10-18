@@ -353,6 +353,89 @@ above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
 images, stacks and the 512 MiB transient reservation are placed. So all
 three need a 64-bit guest memory (docs/mem64.md).
 
+## Game pages (stream G, 2026-10-17)
+
+Each runnable corpus game is served as a page on its own port, on the
+tailnet only. The sites hold the games' files, so they are private: they are
+never committed or published, and are built and served outside the tree
+(stream G's scratch). The port is 4400 plus the game's row index in
+tests/games/matrix.txt, so it stays fixed; rows without a page keep their number.
+
+A site is the eject web build (`web/build-eject-page.sh`: app.mjs, the x86
+shim, kernel, Mesa, Xwayland) with a small page of its own that calls
+`start()` with the game's launch: a bundle tar (the prefix's small files,
+Wine's Unix side and `share/`, xkb; for Linux games the guest GL, the libraries
+and the host files the game opens, and the program itself) and lazy files
+fetched as read (the game, the rest of Wine, the prefix's big DLLs). W3 pages
+pin each DLL at the base its native runs used (the prefix's `dll-bases`) and
+ship the function-tier units built for those bases by the page's own gexc
+(unit keys follow gex-cgen's sources). No recording is needed, unlike
+`gexc eject`.
+
+| port | game | kind | page at master 266f95cf (gooner, headless Chromium, SwiftShader, 480 s smoke; correctness only) |
+|---|---|---|---|
+| 4400 | Undertale | w3 | **intro renders** |
+| 4401 | Katana ZERO | w3 | **title menu** |
+| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs (300 s, no OOM, with g/w3-dll-band's band pins; since W3's compact space it ran out of memory without them) |
+| 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
+| 4404 | Retrocycles | w3 | **language menu** |
+| 4405 | Hades (x86) | w3 | **main menu** (gex g/w3-dll-band: DLLs pinned in the band, and `w3split=1` from the matrix's `page=w3split`: in W3's compact space its 1.5 GiB of mappings and the shim's heap do not fit together under 2 GiB, and it runs out of memory at the loading screen) |
+| 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
+| 4407 | Retrocycles | linux-x11 | **language menu** |
+| 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
+| 4409 | OneShot | w64 | **title menu** (Start / Settings / Exit) |
+| - | DELTARUNE, Will You Snail | w64 | no page: fixed base 0x140000000 without relocations, needs memory64 |
+| 4412 | Hyper Light Drifter | w64 | runs, but the window stays black |
+| 4413 | Dicey Dungeons | w64 | **language menu** |
+| 4414 | Geometry Dash | w64 | **menu** |
+| 4415 | 5D Chess | w64 | gooner: asks for GL 3.3 core, SwiftShader gives 3.2 (no dual-source blending). edger (GL 4.2): past that, then mmap runs out of address space near 4 GiB: needs memory64 (W64.7) |
+| 4416 | Mosa Lina | w64 | gooner: "OpenGL 3.2+ is required" (SwiftShader's limit); edger (GL 4.2): runs, its window drawn |
+| 4417 | Spelunky 2 | w64 | gooner: needs D3D11 feature level 11.0, wined3d on GL 3.2 gives 10.1. edger: past that; a blank window (the loader lock, as natively) and mmap out of address space near 4 GiB: needs memory64 (W64.7) |
+| 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
+| 4419 | Baba Is You | w64 | **renders** (credits screen) |
+| 4420 | Warfork | w64 | error dialog: "Couldn't open UDP socket: setsockopt: Unknown error" |
+| - | TUNIC | w64 | no page: needs memory64 |
+| - | blocked, idea and dotnet rows | | no page: listed only |
+
+## Games matrix, 2026-10-16 (stream G: W3, W64 and Linux)
+
+The x64 Windows rows run on W64 now (kind `w64`): W64_DIST's loader with
+W64_NATIVE's PE core in place, on a copy of W64_PREFIX with the Wayland
+driver and emulated display modes, `WINEGEX_DOOR=1`, no Mono or Gecko.
+Inputs: the gate's `w3-dist.sh` and `w64-dist.sh` outputs (wt/gate-wine-w3,
+wt/gate-wine-w64), gexc 8063ad1c (gate 1016r). The W3 rows use a unit cache
+(W3_UNITS; W3_UNITS_BUILD=0 builds nothing). Runs are on gooner and check
+correctness only; edger is used for checks that need a GPU.
+
+| game | kind | reached | where it stops / notes |
+|---|---|---|---|
+| Undertale | w3 | **gameplay** (the Ruins; menu frame 800, gameplay 2000) | undertale-w3.wl starts at frame 20; the window must have the keyboard first (focus-frame) |
+| Katana ZERO | w3 | **gameplay** (the first level; menu frame 1200, gameplay 3000) | katana-zero-w3.wl starts at frame 10, when the window has the keyboard; up to NEW GAME at 65 s |
+| Retrocycles | w3 | **gameplay** (a match) | |
+| Momodora | w3 | **title** ("Press Any Button") | no input script yet |
+| N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
+| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh); in the page it needs `page=w3split` (the shim's heap above 2 GiB) |
+| Hades | w64 | **menu** (edger) | stub=basecamp (x64) |
+| Spelunky 2 | w64 | blank window | the main thread holds the loader lock after concrt140 loads while two threads spin on GetSystemTimeAsFileTime; open |
+| Dicey Dungeons | w64 | **menu** | dicey-w64.wl |
+| Geometry Dash | w64 | **gameplay** (menu frame 1280, gameplay 8320) | geometry-dash-w64.wl: OK on the terms notice, Play, the first level |
+| 5D Chess | w64 | **gameplay** (a board; menu frame 290, gameplay 4640) | 5d-chess-w64.wl: Versus, Play, moves; clicks are offset by the window frame (4,30) |
+| Mosa Lina | w64 | **title** ("press any button") | |
+| Hyper Light Drifter | w64 | **title** splash | no audio device |
+| OneShot | w64 | blank window | starts from steamshim.exe. With W64's wineoss (w64/oss) the audio device opens; then its Ruby exits with "unexpected ucrtbase.dll": Ruby finds __pioinfo by scanning _isatty's x86 code. Wine g/wine64-isatty gives _isatty that shape; `pe=ucrtbase.dll` keeps Wine's PE ucrtbase (the native one has no x86 code). Waits on W64's dist with both |
+| Baba Is You | w64 | none | a call through NULL right after mmdevapi finds no driver (audio, as OneShot) |
+| DELTARUNE, Will You Snail | w64 | none | c0000018: fixed base 0x140000000 with no relocations, needs memory64 (W64.7) |
+| Baba Is You | linux-x11 | **gameplay** | |
+| Retrocycles | linux-x11 | **gameplay** | |
+| Warfork | linux | **menu** | |
+
+Matrix changes: matrix.txt is read on its own fd (a Windows run ate the
+next rows from the loop's stdin, so every other Windows row was skipped);
+`stub=NAME@PATH` swaps a no-op DLL built from tests/games/stubs into the run
+copy; DIR/SLUG/focus-frame says when a window first had the keyboard;
+MATRIX_NICE sets the runs' nice level (15 while a gate runs); `pe=DLL[,DLL...]` keeps a w64 game's DLLs Wine's PE build
+instead of W64_NATIVE's.
+
 ## Games matrix, 2026-10-14 update (stream G, parked until W64)
 
 `tests/games/matrix.txt` now lists every game in the corpus. The rows that

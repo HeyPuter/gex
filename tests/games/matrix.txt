@@ -5,7 +5,9 @@
 #
 # kind:      w3 (an i386 Windows program on W3, Wine's own Unix side as
 #            native wasm32: W3_DIST/lib/wine/i386-unix/wine under gexc, on a
-#            copy of W3_PREFIX), pe (the legacy NT layer, --wine-prefix; no
+#            copy of W3_PREFIX), w64 (an x86-64 Windows program on W64,
+#            64-bit native Wine: W64_DIST's loader with W64_NATIVE's PE
+#            core, on a copy of W64_PREFIX), pe (the legacy NT layer, --wine-prefix; no
 #            new work there, user 2026-10-06), linux, or linux-x11 (an
 #            X11-only program, on Xwayland inside the guest).
 #            Rows that are listed but not run: dotnet (stream U's .NET work;
@@ -23,37 +25,53 @@
 #            through winewayland), anything else GEX_NT_INPUT (pe).
 #
 # Optional per-game gexc flags go after the input, as a ninth field;
-# `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST.
+# `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST;
+# `stub=NAME@PATH` puts tests/games/stubs/NAME (built for the game's arch)
+# in place of the game's PATH, relative to its directory. On w64,
+# `pe=DLL[,DLL...]` keeps those DLLs Wine's PE build instead of W64_NATIVE's.
+# `page=NAME[=VALUE]` is a page switch the game's site sets (scratch/G/
+# mksite.py, game.json `switches`; VALUE defaults to 1); native runs skip it.
 
 # i386 Windows games on W3.
-undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |-|-|undertale-w3.wl
-katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |-|-|katana-zero-w3.wl
+undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
+katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe                     | |1200|3000|katana-zero-w3.wl
+# npp: in the page on gooner (SwiftShader, GL 3.2) OpenGLRenderer.dll calls a GL entry point
+# the context lacks (NULL) and exits through its catch(...); on edger's GPU (GL 4.2) it runs.
 npp          |w3   |N++                                  |N++.exe                             | |-|-|-
 momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl
-hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-
+hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-|stub=basecamp@x86/BasecampBugReporter.Native.dll page=w3split
 
 # Linux builds (no Wine).
 baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|4000|baba.wl|--lazy seed=seed/baba@~/.local/share/Baba_Is_You
 retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
 warfork-linux|linux|Warfork                              |@warfork.x86_64                     | |-|-|-
 
+# x86-64 Windows games on W64 (64-bit native Wine, LLP64 lowered to wasm32).
+oneshot      |w64  |OneShot                              |steamshim.exe                       | |610|-|-|pe=ucrtbase.dll
+deltarune    |w64  |DELTARUNE                            |DELTARUNE.exe                       | |-|-|-
+will-you-snail|w64 |Will You Snail                       |Will You Snail.exe                  | |-|-|-
+hyper-light  |w64  |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
+dicey        |w64  |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|dicey-w64.wl
+geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe                    | |1280|8320|geometry-dash-w64.wl
+# 5d-chess: in the page, mmap runs out of address space near 4 GiB (try_map_free_area
+# 0xfff40000-0xffff0000) and it stalls: needs memory64 (W64.7). Natively gameplay.
+5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
+# mosa-lina: needs GL 3.2+; the page on gooner's SwiftShader is 3.2 compat and refused, on
+# edger's GPU (GL 4.2) it runs.
+mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
+# spelunky2: needs D3D11 feature level 11.0: on SwiftShader (GL 3.2) wined3d gives 10.1, on edger's
+# GPU it passes. Then natively a blank window (loader lock), and in the page also the mmap OOM
+# near 4 GiB: needs memory64 (W64.7).
+spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
+hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
+baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
+warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
+tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-
+
 # Listed, not run.
 isaac        |blocked|The Binding of Isaac Rebirth      |SteamStub DRM: isaac-ng.exe relaunches through steam://run (the user's call)| |-|-|-
 antichamber  |blocked|Antichamber                       |UDK.exe is a mixed-mode CLR image: needs a CLR (stream U's area)| |-|-|-
-oneshot      |blocked|OneShot                           |x64 (oneshot.exe; only a stub is i386): waits on W64, 64-bit native Wine| |-|-|-
-deltarune    |blocked|DELTARUNE                         |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
-will-you-snail|blocked|Will You Snail                    |x64: waits on W64 (fixed base 0x140000000, no relocations)| |-|-|-
-hyper-light  |blocked|Hyper Light Drifter               |x64: waits on W64| |-|-|-
-dicey        |blocked|Dicey Dungeons                    |x64: waits on W64| |-|-|-
-geometry-dash|blocked|Geometry Dash                     |x64: waits on W64 (NT layer reached its menu)| |-|-|-
-5d-chess     |blocked|5D Chess With Multiverse Time Travel|x64: waits on W64 (NT layer reached gameplay)| |-|-|-
-mosa-lina    |blocked|Mosa Lina                         |x64: waits on W64| |-|-|-
-spelunky2    |blocked|Spelunky 2                        |x64: waits on W64| |-|-|-
-hades        |blocked|Hades                             |x64 build: waits on W64 (the i386 build is hades-x86)| |-|-|-
-baba         |blocked|Baba Is You                       |x64: waits on W64 (the Linux build is baba-linux)| |-|-|-
-warfork      |blocked|Warfork                           |x64: waits on W64 (the Linux build is warfork-linux)| |-|-|-
-tunic        |blocked|TUNIC                             |x64 Unity IL2CPP: waits on W64| |-|-|-
 cruelty-squad|idea |Cruelty Squad                       |Godot 3: engine substitution, unassigned (ask the user)| |-|-|-
 buckshot     |idea |Buckshot Roulette                   |Godot 4: engine substitution, unassigned (ask the user)| |-|-|-
 wildermyth   |idea |Wildermyth                          |Java (libGDX, bundled JRE): unassigned (ask the user)| |-|-|-

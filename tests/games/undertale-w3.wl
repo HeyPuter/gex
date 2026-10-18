@@ -1,7 +1,7 @@
 # W3 version of tests/games/undertale-input.txt (GEX_NT_INPUT frame numbers),
 # as seconds from the first frame: frame / 30 fps x 2.0 (slack for a
 # slower tier; extra time on a screen is harmless).
-frames 1
+frames 20
 20.00 tap enter
 30.00 tap enter
 40.00 tap enter
