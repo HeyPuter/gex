@@ -68,6 +68,7 @@ mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe         
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
 hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
+# warfork: in the page, main menu by 301 s on gooner (G2 g2/page-inet-carry, 1019b).
 warfork      |w64  |Warfork                              |warfork_x64.exe                     | |-|-|-
 tunic        |w64  |TUNIC                                |Tunic.exe                           | |-|-|-
 

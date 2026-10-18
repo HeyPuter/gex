@@ -391,7 +391,7 @@ ship the function-tier units built for those bases by the page's own gexc
 | 4417 | Spelunky 2 | w64 | gooner: needs D3D11 feature level 11.0, wined3d on GL 3.2 gives 10.1. edger: past that; a blank window (the loader lock, as natively) and mmap out of address space near 4 GiB: needs memory64 (W64.7) |
 | 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
 | 4419 | Baba Is You | w64 | **renders** (credits screen) |
-| 4420 | Warfork | w64 | error dialog: "Couldn't open UDP socket: setsockopt: Unknown error" |
+| 4420 | Warfork | w64 | **main menu** by 301 s (gooner; G2's g2/page-inet-carry, in round 1019b; before it, an error dialog: "Couldn't open UDP socket: setsockopt: Unknown error") |
 | - | TUNIC | w64 | no page: needs memory64 |
 | - | blocked, idea and dotnet rows | | no page: listed only |
 
