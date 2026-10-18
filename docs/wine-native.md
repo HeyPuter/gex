@@ -1226,6 +1226,16 @@ W3 builds from gex alone, from pins in `tools/wine-wasm/w3.pins`:
 - the host Wine version whose i386 DLLs are staged (`tools/nt-stage-wine.sh`);
 - the Unix libraries' tarballs, each with a SHA-256: FreeType, wayland,
   libxml2, libxkbcommon, and the meson wheel that builds libxkbcommon.
+- Wine Mono (2026-10-18), the .NET runtime, as its x86 tarball with a
+  SHA-256 (`WINE_MONO_*`). `w3/mono.sh` unpacks it into the dist at
+  `share/wine/mono/wine-mono-VERSION`, where mscoree finds it through
+  WINEDATADIR, so no prefix needs a registry key for it. The version is the
+  one the Wine commit's mscoree asks for. Only its i386 half is kept (about
+  210 MB, most of it the class libraries; a page fetches what a program
+  opens). `W3_MONO=0` builds a dist without it. Celeste and TowerFall (XNA,
+  through Wine Mono's FNA) run on it; `tests/w3/dotnet.sh` compiles a C#
+  program with Wine Mono's mcs.exe on W3 and runs it natively and in the
+  page.
 
 ```
 make -C tools/wine-wasm              # the dist and the game-ready prefix
@@ -1243,7 +1253,7 @@ named after what it is built from:
 | sysroot | musl and libgex | the musl commit and a hash of gex's sysroot inputs |
 | Unix libraries | the sysroot | the sysroot's name and a hash of the pins and their build script |
 | Wine's tools and wasm32 tree | the Wine commit | the Wine commit, or for `WINE_DIR` its path; a stamp holds the tree hash, so a changed tree makes incrementally |
-| dist | all of the above | the Wine id, the libraries' key, a hash of `guest/gl`, and a hash of these scripts |
+| dist | all of the above | the Wine id, the libraries' key, a hash of `guest/gl`, a hash of these scripts, and `-monoVERSION` (with Wine Mono) |
 | bare, installed and ready prefixes | the dist | the dist's key |
 
 A rerun redoes only what changed. With nothing changed, `make` takes about

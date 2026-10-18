@@ -47,3 +47,12 @@ GNUTLS_URL       := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.ta
 GNUTLS_SHA256    := 69e113d802d1670c4d5ac1b99040b1f2d5c7c05daec5003813c049b5184820ed
 CACERT_URL       := https://curl.se/ca/cacert-2026-08-13.pem
 CACERT_SHA256    := f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9
+
+# Wine Mono, the .NET runtime mscoree loads for .NET programs (Celeste and
+# TowerFall: XNA through Wine Mono's FNA). The version is the one this Wine's
+# mscoree asks for (WINE_MONO_VERSION in dlls/mscoree/mscoree_private.h); the
+# dist carries it at share/wine/mono/wine-mono-VERSION, where mscoree finds
+# it through WINEDATADIR (w3/mono.sh). W3_MONO=0 leaves it out.
+WINE_MONO_VERSION := 11.2.0
+WINE_MONO_URL     := https://dl.winehq.org/wine/wine-mono/11.2.0/wine-mono-11.2.0-x86.tar.xz
+WINE_MONO_SHA256  := c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06

@@ -46,6 +46,7 @@ export W3_JOBS GEX_WINE_PREFIX GEX_CRT_SRC W3_DL_SEED
 export FREETYPE_VERSION FREETYPE_URL FREETYPE_SHA256 WAYLAND_VERSION WAYLAND_URL WAYLAND_SHA256
 export LIBXML2_VERSION LIBXML2_URL LIBXML2_SHA256 XKBCOMMON_VERSION XKBCOMMON_URL XKBCOMMON_SHA256
 export MESON_VERSION MESON_URL MESON_SHA256
+export WINE_MONO_VERSION WINE_MONO_URL WINE_MONO_SHA256
 export NETTLE_VERSION NETTLE_URL NETTLE_SHA256 GNUTLS_VERSION GNUTLS_URL GNUTLS_SHA256 CACERT_URL CACERT_SHA256
 
 h = $(shell cat $(1) | sha1sum | cut -c1-$(or $(2),10))
@@ -85,7 +86,11 @@ TOOLS_KEY := $(call h,$(filter-out %/local.mk %/w3.pins %/run.sh %/w3/units.sh,$
 # never speaks https (Paint). The Wine build is the same either way.
 W3_TLS ?= 1
 export W3_TLS
-DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(W3_TLS)),-notls)
+# W3_MONO=0: no Wine Mono in the dist (.NET programs then fail to start,
+# as on a host without it), 210 MB less.
+W3_MONO ?= 1
+export W3_MONO
+DIST_KEY := $(WINE_ID)-$(DEPS_KEY)-$(GL_KEY)-$(TOOLS_KEY)$(if $(filter 0,$(W3_TLS)),-notls)$(if $(filter 0,$(W3_MONO)),,-mono$(WINE_MONO_VERSION))
 DIST := $(C)/dist-$(DIST_KEY)
 BARE := $(C)/pfx-bare-$(DIST_KEY)
 INSTALLED := $(C)/pfx-installed-$(DIST_KEY)
@@ -147,6 +152,7 @@ $(DIST)/.done: $(BUILD)/.done-$(WINE_ID) $(GL_O)
 	$(NICE) $(W3)/w3/link-loader.sh $(BUILD) $(WINE_SRC) $(BUILD)/gexw3-obj $(DEPS) $(GL_O) $(DIST).tmp
 	JOBS=$(W3_JOBS) $(NICE) $(W3)/link-wineserver.sh $(BUILD) $(WINE_SRC) $(BUILD)/gexw3-server $(DIST).tmp
 	$(NICE) $(W3)/w3/stage.sh $(BUILD) $(WINE_SRC) $(DIST).tmp $(BARE).tmp
+	$(if $(filter 0,$(W3_MONO)),,$(W3)/w3/mono.sh $(C)/dl $(DIST).tmp)
 	rm -rf $(DIST) $(BARE) && mv $(BARE).tmp $(BARE) && mv $(DIST).tmp $(DIST)
 	@echo "$(DIST_KEY) wine=$(WINE_ID) musl=$(MUSL_COMMIT) src=$(WINE_SRC)" > $(DIST)/.w3-build
 	touch $@
