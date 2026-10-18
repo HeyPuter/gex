@@ -353,6 +353,25 @@ pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     f.finish()
 }
 
+/// The `blocks` indices for bridging `entries` (dispatch slots, `table << 24
+/// | slot`), each slot keeping the index it was first given (`given`): a slot
+/// bridged again gets the same one, so re-bridging numbers nothing.
+/// `alloc(n)` hands out `n` fresh consecutive indices and is called at most
+/// once, only for slots never bridged before.
+pub fn bridge_indices(given: &mut std::collections::HashMap<u32, u32>, entries: &[u32], alloc: impl FnOnce(u32) -> u32) -> Vec<u32> {
+    let fresh = entries.iter().filter(|e| !given.contains_key(e)).collect::<std::collections::BTreeSet<_>>().len() as u32;
+    let mut next = if fresh == 0 { 0 } else { alloc(fresh) };
+    entries
+        .iter()
+        .map(|&e| {
+            *given.entry(e).or_insert_with(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +415,30 @@ mod tests {
     fn section_roundtrips() {
         let s = Section { base: 77, entries: vec![(4 << 24) | 5, (4 << 24) | 1029] };
         assert_eq!(Section::decode(&s.encode()), Some(s));
+    }
+
+    #[test]
+    fn bridging_a_slot_again_keeps_its_index() {
+        use std::collections::HashMap;
+        let mut given = HashMap::new();
+        let mut next = 100u32;
+        let mut calls = 0;
+        let mut alloc = |n: u32| {
+            calls += 1;
+            let b = next;
+            next += n;
+            b
+        };
+        let first = bridge_indices(&mut given, &[7, 9], &mut alloc);
+        assert_eq!(first, vec![100, 101]);
+        // The same slots again (a re-bridge): the same indices, nothing numbered.
+        for _ in 0..1000 {
+            assert_eq!(bridge_indices(&mut given, &[9, 7], &mut alloc), vec![101, 100]);
+        }
+        // One new slot beside an old one: only the new one is numbered.
+        assert_eq!(bridge_indices(&mut given, &[7, 12], &mut alloc), vec![100, 102]);
+        drop(alloc);
+        assert_eq!(calls, 2);
+        assert_eq!(next, 103, "the dense size grew past the slots bridged");
     }
 }
