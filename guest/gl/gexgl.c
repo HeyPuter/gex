@@ -680,10 +680,31 @@ struct buffer_object_state {
     size_t map_offset;
     size_t map_length;
     unsigned map_access;
+    /* What the host buffer holds, once it has been mapped: kept exact by
+       glBufferData/glBufferSubData and dropped by anything else that may
+       change it (buffer_contents_unknown). A map copies from it instead of
+       reading the buffer back, and its unmap uploads only what changed. */
+    uint8_t *mirror;
+    int mapped_once;
     struct buffer_object_state *next;
 };
 static struct buffer_target_state buffer_targets[16];
 static struct buffer_object_state *buffer_objects;
+static size_t mirrors_live;
+
+static void mirror_drop(struct buffer_object_state *object) {
+    if (!object || !object->mirror) return;
+    free(object->mirror);
+    object->mirror = NULL;
+    mirrors_live--;
+}
+
+/* Called first by every command that may change a buffer's contents other
+   than glBufferData/glBufferSubData (tools/gl_buffer_writers.py). */
+static void buffer_contents_unknown(void) {
+    for (struct buffer_object_state *o = buffer_objects; o && mirrors_live; o = o->next)
+        mirror_drop(o);
+}
 
 static struct buffer_target_state *buffer_target(unsigned target) {
     struct buffer_target_state *free_slot = NULL;
@@ -724,6 +745,7 @@ static void forget_buffer_object(unsigned name) {
         struct buffer_object_state *object = *link;
         if (object->name == name) {
             *link = object->next;
+            mirror_drop(object);
             free(object->map);
             free(object);
             return;
@@ -739,11 +761,11 @@ void glBindBuffer(unsigned target, unsigned name) {
     CMD2(GEXGL_BIND_BUFFER, target, name);
 }
 
+void glBufferSubData(unsigned target, long offset, long size, const void *data);
+
 /* The most one upload command may carry: the command area less room for
    its header and arguments, in whole 64 KiB parts. Larger buffer uploads
    are sent in parts (glBufferData, glBufferSubData). */
-void glBufferSubData(unsigned target, long offset, long size, const void *data);
-
 static size_t upload_chunk(void) {
     uint32_t cap = ring ? ring->capacity : CMD_CAPACITY;
     size_t step = cap > (1u << 20) ? ((size_t)cap - 65536u) & ~(size_t)65535u : cap / 2u;
@@ -755,6 +777,12 @@ void glBufferData(unsigned target, long size, const void *data, unsigned usage) 
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) object->size = len;
+    /* New storage: a mapped buffer's copy is its new contents, if given. */
+    mirror_drop(object);
+    if (object && object->mapped_once && data && len && (object->mirror = malloc(len))) {
+        memcpy(object->mirror, data, len);
+        mirrors_live++;
+    }
     /* Contents larger than one command can carry go as a bare allocation,
        then glBufferSubData in parts. */
     int split = data && len > upload_chunk();
@@ -772,6 +800,15 @@ void glBufferData(unsigned target, long size, const void *data, unsigned usage) 
 
 void glBufferSubData(unsigned target, long offset, long size, const void *data) {
     if (offset < 0 || size < 0 || (size && !data)) return;
+    if (mirrors_live) {
+        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
+        if (object && object->mirror) {
+            if ((size_t)offset <= object->size && (size_t)size <= object->size - (size_t)offset)
+                memcpy(object->mirror + offset, data, (size_t)size);
+            else
+                mirror_drop(object);
+        }
+    }
     /* An upload larger than one command can carry goes in parts. */
     size_t left = (size_t)size, step = upload_chunk();
     uint64_t at = (uint64_t)offset;
@@ -794,6 +831,7 @@ void glBufferSubData(unsigned target, long offset, long size, const void *data) 
    Mapping a readable buffer must use that transport query to populate the
    guest shadow before returning it to an unmodified desktop application. */
 void glGetBufferSubData(unsigned target, long offset, long size, void *data);
+static int buffer_read(unsigned target, long offset, long size, void *data);
 
 /* Mapped host memory cannot be exposed to an emulated guest address space.
    Return a guest shadow allocation and upload its written bytes at unmap.
@@ -815,7 +853,22 @@ void *glMapBufferRange(unsigned target, long offset, long length,
        are uploaded, so nothing else needs to be read. */
     unsigned keep = (access & 1u) ||
                     !(access & (0x4u | 0x8u | 0x10u)); /* INVALIDATE_RANGE/BUFFER, FLUSH_EXPLICIT */
-    if (object->map && keep && object->map_length)
+    /* GL_MAP_INVALIDATE_BUFFER_BIT leaves the rest of the buffer undefined. */
+    if (access & 0x8u) mirror_drop(object);
+    /* The first map that needs the buffer's bytes reads all of it once
+       and keeps the copy; later maps copy from it. */
+    object->mapped_once = 1;
+    if (!object->mirror && keep && object->size && (object->mirror = malloc(object->size))) {
+        if (buffer_read(target, 0, (long)object->size, object->mirror)) {
+            mirrors_live++;
+        } else {
+            free(object->mirror);
+            object->mirror = NULL;
+        }
+    }
+    if (object->map && object->mirror && object->map_length)
+        memcpy(object->map, object->mirror + offset, object->map_length);
+    else if (object->map && keep && object->map_length)
         glGetBufferSubData(target, offset, length, object->map);
     return object->map;
 }
@@ -827,6 +880,27 @@ void *glMapBuffer(unsigned target, unsigned access) {
     return object ? glMapBufferRange(target, 0, (long)object->size, bits) : NULL;
 }
 
+/* Unmap of a write map over a buffer whose contents the guest knows:
+   upload only the 4 KiB blocks the application changed. The bytes it did
+   not change already match the host's. (After GL_MAP_INVALIDATE_RANGE_BIT
+   the host's range is undefined, so that unmap uploads it all.) */
+static void upload_changed(unsigned target, struct buffer_object_state *object) {
+    const size_t block = 4096;
+    const uint8_t *now = object->map, *was = object->mirror + object->map_offset;
+    size_t n = object->map_length, start = SIZE_MAX;
+    for (size_t at = 0; at < n; at += block) {
+        size_t len = n - at < block ? n - at : block;
+        int changed = memcmp(now + at, was + at, len) != 0;
+        if (changed && start == SIZE_MAX) start = at;
+        if (!changed && start != SIZE_MAX) {
+            glBufferSubData(target, (long)(object->map_offset + start), (long)(at - start), now + start);
+            start = SIZE_MAX;
+        }
+    }
+    if (start != SIZE_MAX)
+        glBufferSubData(target, (long)(object->map_offset + start), (long)(n - start), now + start);
+}
+
 unsigned char glUnmapBuffer(unsigned target) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map) return 0;
@@ -834,8 +908,12 @@ unsigned char glUnmapBuffer(unsigned target) {
        wrote (glFlushMappedBufferRange, already uploaded); uploading the
        whole shadow would overwrite the rest of the range with zeros --
        a ring buffer's other, in-flight, contents. */
-    if ((object->map_access & 2u) && !(object->map_access & 0x10u))
-        glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
+    if ((object->map_access & 2u) && !(object->map_access & 0x10u)) {
+        if (object->mirror && !(object->map_access & 0x4u))
+            upload_changed(target, object);
+        else
+            glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
+    }
     free(object->map);
     object->map = NULL;
     object->map_offset = object->map_length = 0;
@@ -2040,6 +2118,7 @@ void glStencilOpSeparate(unsigned face,unsigned fail,unsigned zfail,unsigned zpa
 
 void glReadPixels(int x, int y, int w, int h, unsigned format, unsigned type, void *out) {
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    if (pbo) buffer_contents_unknown();
     uint32_t *p = begin(GEXGL_READ_PIXELS, 9, 0);
     if (!p) return;
     p[0] = (uint32_t)x; p[1] = (uint32_t)y; p[2] = (uint32_t)w; p[3] = (uint32_t)h;

@@ -3,7 +3,10 @@
  * GL_MAP_FLUSH_EXPLICIT_BIT changes only the ranges flushed (Unity's ring
  * buffers). gex-gl's guest shadow used to upload zeros over both. A 40 MiB
  * buffer, larger than the ring's 32 MiB reply area, reads back whole and
- * keeps its unwritten bytes through a write map (both read in parts). Prints
+ * keeps its unwritten bytes through a write map (both read in parts). The
+ * guest keeps a copy of a mapped buffer's contents and uploads only what a
+ * write map changed: the copy must follow glBufferSubData and must not
+ * survive a GPU write (glCopyBufferSubData). Prints
  * SUMMARY cases=N passed=N failed=0 when right; runs on native Mesa too.
  *
  *   cc -o probe gl-map-buffer-probe.c -lEGL -lGL       (native reference)
@@ -132,6 +135,70 @@ int main(void) {
     if (p) memset(p + BIG - 8192, 0x44, 4096);
     glUnmapBuffer(GL_ARRAY_BUFFER);
     check_big("big_write_map_keeps_rest", e, BIG - 8192, 4096, 0x44);
+
+    /* A second write map of the same 40 MiB buffer: both writes stay. */
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 4096, 8192, GL_MAP_WRITE_BIT);
+    if (p) memset(p + 100, 0x45, 16);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    {
+        unsigned char got[16], w2[16], w1[16];
+        memset(w2, 0x45, 16);
+        glGetBufferSubData(GL_ARRAY_BUFFER, 4096 + 100, 16, got);
+        int ok = memcmp(got, w2, 16) == 0;
+        glGetBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(BIG - 8192), 16, w1);
+        memset(w2, 0x44, 16);
+        ok = ok && memcmp(w1, w2, 16) == 0;
+        cases++; passed += ok;
+        printf("CASE big_second_write_map %s\n", ok ? "PASS" : "FAIL");
+    }
+
+    /* glBufferSubData after a map: the next write map keeps its bytes. */
+    GLuint f = fresh(want);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 0, 64, GL_MAP_WRITE_BIT);
+    if (p) memset(p, 0x50, 4);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    memset(want, 0x50, 4);
+    unsigned char sub[8];
+    memset(sub, 0x55, 8);
+    glBufferSubData(GL_ARRAY_BUFFER, 8, 8, sub);
+    memset(want + 8, 0x55, 8);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 32, 32, GL_MAP_WRITE_BIT);
+    if (p) memset(p + 8, 0x56, 4);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    memset(want + 40, 0x56, 4);
+    check("sub_data_after_map_kept", f, want);
+
+    /* A GPU copy into a mapped-before buffer: a read map and the next
+       write map both see the copied bytes. */
+    unsigned char other[64];
+    GLuint src = fresh(other);
+    memset(other, 0x66, 64);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, 64, other);
+    GLuint g = fresh(want);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 0, 64, GL_MAP_WRITE_BIT);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    glBindBuffer(GL_COPY_READ_BUFFER, src);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, g);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, 16);
+    memset(want, 0x66, 16);
+    glBindBuffer(GL_ARRAY_BUFFER, g);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 0, 64, GL_MAP_READ_BIT);
+    int seen = p && memcmp(p, want, 64) == 0;
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    cases++; passed += seen;
+    printf("CASE read_map_sees_gpu_copy %s\n", seen ? "PASS" : "FAIL");
+    GLuint h = fresh(want);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 0, 64, GL_MAP_WRITE_BIT);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, h);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, 16);
+    memset(want, 0x66, 16);
+    glBindBuffer(GL_ARRAY_BUFFER, h);
+    p = glMapBufferRange(GL_ARRAY_BUFFER, 0, 64, GL_MAP_WRITE_BIT);
+    if (p) memset(p + 60, 0x67, 4);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    memset(want + 60, 0x67, 4);
+    check("write_map_keeps_gpu_copy", h, want);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed, cases - passed);
     return cases == passed ? 0 : 1;
