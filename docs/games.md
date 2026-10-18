@@ -10,10 +10,9 @@ State as of 2026-10-03 (evening):
 | | native (`gexc`) | browser (`nt.html`, real GPU) |
 |---|---|---|
 | Half-Life (i386 Linux, GoldSrc) | plays c1a0, 16-29 fps | renders c1a0 (needs `-nomsaa`), 7-9 fps |
-| Peggle Deluxe (i386 Windows, PopCap) | plays Stage One: name entry, shots, scoring; 7-12 fps | plays Stage One with the same scripted input; 3-5 fps |
+| Peggle Deluxe (i386 Windows, PopCap) | not measured (results from an extracted executable were withdrawn, 2026-10-18) | not measured (as natively) |
 
-Screenshots: `work/games/screens/` (`halflife-c1a0-{native,browser}.png`,
-`peggle-stage1-{native,browser}.png`).
+Screenshots: `work/games/screens/` (`halflife-c1a0-{native,browser}.png`).
 
 ## Measurement scripts
 
@@ -50,8 +49,6 @@ Measured on this machine with the scripts (JIT tier, shared cores):
 
 | | time to first frame | time to gameplay / map | gameplay fps |
 |---|---|---|---|
-| Peggle native | 173 s | 332 s | 7.1 (120 s) |
-| Peggle browser, real GPU | 43 s | 487 s | 3.4 (150 s) |
 | Half-Life native | | 429 s | 16.0 (60 s) |
 | Half-Life browser, real GPU (`-nomsaa`) | | 88 s | 7.2 (60 s) |
 
@@ -148,20 +145,23 @@ Still open:
 ## Peggle Deluxe
 
 The game directory is `Peggle Deluxe/`. Make a run copy (`work/games/peggle`)
-and extract the real executable from the DRM wrapper with
-`tests/games/popcap-unwrap.py Peggle.exe popcapgame1.exe`. Stage the Wine prefix
-with `tools/nt-stage-wine.sh`. Then run:
+and run the game as shipped: `Peggle.exe` is PopCap's wrapper, which starts
+the game itself at run time. We never extract or modify it (the user,
+2026-10-18: the extraction script is gone, and every earlier Peggle result,
+which ran an extracted executable, is withdrawn). Stage the Wine prefix with
+`tools/nt-stage-wine.sh`. Then run:
 
 ```
 cd work/games/peggle
-GEX_NT_STRICT=1 GEX_NT_INPUT=... gexc run --no-cgen --wine-prefix $PREFIX --gl --wayland-out DIR popcapgame1.exe
+GEX_NT_STRICT=1 GEX_NT_INPUT=... gexc run --no-cgen --wine-prefix $PREFIX --gl --wayland-out DIR Peggle.exe
 ```
 
 or `tests/games/peggle.sh` (above). The window is 1920x1080 with Peggle's
 800x600 scaled to 1440x1080 in the middle; `GEX_NT_INPUT` coordinates are
 client coordinates of that window.
 
-What made it work:
+What made it work (on the extracted executable, before 2026-10-18; to be
+checked again on Peggle.exe):
 
 - bass.dll's self-check (tier-1 SMC guard fix), HWND_BROADCAST messages.
 - MMX lifted: j2k-codec decodes the JPEG 2000 images (logo, title screen).
@@ -178,9 +178,7 @@ parked commit). Peggle draws all its text itself.
 
 Open:
 
-1. Frame rate. Natively 7-12 fps in the JIT tier, in the page 3-5 fps, where
-   Peggle wants 100. Not profiled yet; the main thread is guest time
-   (`GEX_NT_STATS`' time split in the page).
+1. Everything above again on the shipped Peggle.exe (no numbers yet).
 2. The page's window has a caption, so a 1920x1080 client area does not fit
    a 1920x1080 page (scrollbars). Input is injected at client coordinates, so
    the script is not affected.
