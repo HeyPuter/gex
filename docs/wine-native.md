@@ -1141,6 +1141,32 @@ Chromium timing is still to do. What it took, in start order:
     unread releases its reference.
   - Fork carrying (`carry_name`, `rebuild_carried`) uses the same
     descriptions.
+- **Internet sockets two processes hold.** Wine's wineserver makes every
+  socket and hands its client the descriptor, often before either has done
+  anything with it: the client asks for the descriptor to set an option,
+  then the server binds it (or listens, or connects) and polls it while the
+  client sends and receives on it.
+  - A connected TCP socket travels as its connection (`inet:...`, a Wisp
+    stream or a loopback end in the global kernel, `Socket::carry`).
+  - Any other internet socket (unbound, bound, listening, UDP) moves to the
+    global kernel the first time it leaves its process (`Socket::move_out`,
+    `inetg:KIND:ID`). Its state goes there (`Socket::export`, `k_inet_adopt`),
+    and each process's descriptor is a hold on it by id that forwards every
+    call (`k_inet_op`, one `net::op` per `Socket` method); the last
+    `k_inet_close` frees it. The socket keeps its own locks there; the
+    table's is held only to find it. A socket that never leaves its
+    process is never moved and pays one load per call.
+  - The global kernel has no network of its own. A moved TCP socket's
+    `connect` to a loopback listener is made there; one out (`Socket::go_out`)
+    is a Wisp stream the connecting process opens. The global kernel keeps
+    only its name, every other call on the socket answers `EREMCHG`, and each
+    other holder then takes the stream up itself (`come_back`, `net_dup`)
+    and stops forwarding.
+  - Before this, such a socket was left behind in transit, the client's
+    `wine_server_receive_fd` got nothing, and every option call failed with
+    `STATUS_TOO_MANY_OPENED_FILES` (Warfork's "Couldn't open UDP socket:
+    setsockopt: Unknown error"). Test: tests/wasm32/sockpass-page.sh, the
+    `unconnected:` cases.
 - **The Windows address space split, early.**
   - A W3 program's Worker grows its memory to 2 GiB and puts the shim's
     heap above 0x80000000. This happens before `gex_worker_init`: JS

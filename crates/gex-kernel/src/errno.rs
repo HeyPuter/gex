@@ -56,6 +56,10 @@ impl Errno {
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
     pub const ECONNRESET: Errno = Errno(104);
+    pub const EISCONN: Errno = Errno(106);
+    /// Only between a process and the global kernel, never a guest's: a
+    /// moved socket another holder connected out (`net::op::WENT_OUT`).
+    pub const EREMCHG: Errno = Errno(78);
 
     /// The value the guest sees in `x0`.
     pub fn as_return(self) -> u64 {

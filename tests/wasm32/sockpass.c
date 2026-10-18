@@ -16,7 +16,20 @@
  *        exits; the parent talks over it after
  *   shutdown: inherited across fork, the child calls shutdown(SHUT_WR) while
  *        the parent still holds the descriptor; the far end reads EOF
- * Remote (HOST PORT): the first two again, each a GET answered with HTTP.
+ * Unconnected (the socket goes to the global kernel, "inetg:", and both
+ * processes hold the one socket; Wine's wineserver binds, listens, connects
+ * and polls while its client sends, receives and sets options):
+ *   udp: passed before it is bound; the sender binds it and sees a datagram
+ *        to it readable, the receiver reads it and answers from it
+ *   udp-close-sender: the sender closes its copy while the receiver polls
+ *   udp-close-receiver: the receiver closes its copy and exits while the
+ *        sender polls; the sender still receives
+ *   tcp-listen: passed unconnected; the sender listens and accepts on it
+ *   tcp-connect: passed unconnected; the sender connects it, the receiver
+ *        talks over it
+ * Remote (HOST PORT): the first two again, each a GET answered with HTTP; and
+ *   remote-unconnected: passed unconnected, the sender connects it out (the
+ *        connection is the sender's Wisp stream), the receiver does the GET
  * Every reader first peeks a byte (recv MSG_PEEK) and must find it still
  * there for the read after. */
 #include <arpa/inet.h>
@@ -24,6 +37,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,10 +208,192 @@ static void child_closes(const char *what, int s, int (*talk)(int, const char *)
 
 static int ping_talk(int s, const char *host) { (void)host; return ping(s); }
 
+static int udp_bound(int s, struct sockaddr_in *at)
+{
+    socklen_t len = sizeof *at;
+    return getsockname(s, (struct sockaddr *)at, &len) == 0 && at->sin_port != 0;
+}
+
+static int udp_socket(struct sockaddr_in *at)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(at, 0, sizeof *at);
+    at->sin_family = AF_INET; at->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (s < 0 || bind(s, (struct sockaddr *)at, sizeof *at) || !udp_bound(s, at)) return -1;
+    return s;
+}
+
+static int readable(int s, int ms)
+{
+    struct pollfd p = { s, POLLIN, 0 };
+    return poll(&p, 1, ms) == 1 && (p.revents & POLLIN);
+}
+
+/* A datagram of exactly WANT on s, and where it came from. */
+static int got(int s, const char *want, struct sockaddr_in *from)
+{
+    char b[32] = { 0 };
+    socklen_t len = sizeof *from;
+    ssize_t n;
+    if (!readable(s, 20000)) return 0;
+    n = recvfrom(s, b, sizeof b, 0, (struct sockaddr *)from, &len);
+    return n == (ssize_t)strlen(want) && !memcmp(b, want, n);
+}
+
+static int say(int s, const char *what, const struct sockaddr_in *to)
+{
+    return sendto(s, what, strlen(what), 0, (const struct sockaddr *)to, sizeof *to) == (ssize_t)strlen(what);
+}
+
+/* The unconnected cases: S passed to a child before anything is done with it,
+ * the parent keeping its copy (as wineserver does). */
+static void unconnected(void)
+{
+    struct sockaddr_in at, from, t_at;
+    int u[2], s, t, one = 1;
+    char b;
+    pid_t pid;
+
+    /* udp and udp-close-sender */
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    t = udp_socket(&t_at);
+    if (s < 0 || t < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) { ok(0, "unconnected: udp setup"); return; }
+    pid = fork();
+    if (pid == 0) {
+        int fd, r = 1;
+        close(u[0]); close(s);
+        fd = recv_fd(u[1]);
+        /* Wine's client sets an option first: the setsockopt that failed. */
+        if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one)) _exit(2);
+        write(u[1], "r", 1);
+        if (read(u[1], &b, 1) != 1 || !udp_bound(fd, &at)) _exit(3);
+        if (!got(fd, "ping", &from) || ntohs(from.sin_port) != ntohs(t_at.sin_port) || !say(fd, "pong", &from)) _exit(4);
+        write(u[1], "p", 1);
+        /* The sender closes its copy while this polls. */
+        if (!got(fd, "late", &from)) r = 5;
+        else r = 0;
+        _exit(r);
+    }
+    close(u[1]);
+    send_fd(u[0], s);
+    if (read(u[0], &b, 1) != 1) { ok(0, "unconnected: udp: the receiver took it"); status_of(pid); return; }
+    memset(&at, 0, sizeof at);
+    at.sin_family = AF_INET; at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s, (struct sockaddr *)&at, sizeof at) || !udp_bound(s, &at)) { ok(0, "unconnected: udp: bind"); status_of(pid); return; }
+    write(u[0], "b", 1);
+    {
+        int seen, answered;
+        say(t, "ping", &at);
+        seen = readable(s, 20000); /* the parent sees it, as wineserver's poll does */
+        answered = got(t, "pong", &from);
+        if (read(u[0], &b, 1) != 1) answered = 0;
+        ok(seen && answered, "unconnected: udp passed unbound; the sender binds and polls, the receiver reads and answers");
+    }
+    close(s);
+    usleep(200000);
+    say(t, "late", &at);
+    ok(status_of(pid) == 0, "unconnected: udp: the sender closes its copy while the receiver polls");
+    close(u[0]);
+
+    /* udp-close-receiver */
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) { ok(0, "unconnected: udp-close-receiver setup"); return; }
+    pid = fork();
+    if (pid == 0) {
+        int fd;
+        close(u[0]); close(s);
+        fd = recv_fd(u[1]);
+        if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one)) _exit(2);
+        write(u[1], "r", 1);
+        read(u[1], &b, 1);
+        usleep(200000);
+        close(fd);
+        _exit(0);
+    }
+    close(u[1]);
+    send_fd(u[0], s);
+    read(u[0], &b, 1);
+    memset(&at, 0, sizeof at);
+    at.sin_family = AF_INET; at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s, (struct sockaddr *)&at, sizeof at) || !udp_bound(s, &at)) { ok(0, "unconnected: udp-close-receiver: bind"); status_of(pid); return; }
+    write(u[0], "b", 1);
+    {
+        int quiet = !readable(s, 1000); /* the receiver closes and exits meanwhile */
+        int exited = status_of(pid) == 0;
+        say(t, "after", &at);
+        ok(quiet && exited && got(s, "after", &from), "unconnected: udp: the receiver closes its copy while the sender polls");
+    }
+    close(s); close(u[0]); close(t);
+
+    /* tcp-listen: the sender listens and accepts on the socket it passed. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) { ok(0, "unconnected: tcp-listen setup"); return; }
+    pid = fork();
+    if (pid == 0) {
+        int fd, c;
+        close(u[0]); close(s);
+        fd = recv_fd(u[1]);
+        if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one)) _exit(2);
+        write(u[1], "r", 1);
+        if (read(u[1], &b, 1) != 1 || !udp_bound(fd, &at)) _exit(3);
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        if (c < 0 || connect(c, (struct sockaddr *)&at, sizeof at)) _exit(4);
+        _exit(ping(c) ? 0 : 5);
+    }
+    close(u[1]);
+    send_fd(u[0], s);
+    read(u[0], &b, 1);
+    memset(&at, 0, sizeof at);
+    at.sin_family = AF_INET; at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s, (struct sockaddr *)&at, sizeof at) || listen(s, 4)) { ok(0, "unconnected: tcp-listen: listen"); status_of(pid); return; }
+    write(u[0], "l", 1);
+    {
+        int a2 = readable(s, 20000) ? accept(s, 0, 0) : -1;
+        int r = a2 >= 0 && pong(a2);
+        if (a2 >= 0) close(a2);
+        ok(r && status_of(pid) == 0, "unconnected: tcp passed unconnected; the sender listens and accepts on it");
+    }
+    close(s); close(u[0]);
+
+    /* tcp-connect: the sender connects the socket it passed; the receiver talks. */
+    {
+        struct sockaddr_in l_at = { 0 };
+        socklen_t len = sizeof l_at;
+        int l = socket(AF_INET, SOCK_STREAM, 0);
+        l_at.sin_family = AF_INET; l_at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (l < 0 || bind(l, (struct sockaddr *)&l_at, sizeof l_at) || getsockname(l, (struct sockaddr *)&l_at, &len) || listen(l, 4)) { ok(0, "unconnected: tcp-connect setup"); return; }
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) { ok(0, "unconnected: tcp-connect setup"); return; }
+        pid = fork();
+        if (pid == 0) {
+            int fd;
+            close(u[0]); close(s); close(l);
+            fd = recv_fd(u[1]);
+            if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one)) _exit(2);
+            write(u[1], "r", 1);
+            if (read(u[1], &b, 1) != 1) _exit(3);
+            _exit(ping(fd) ? 0 : 4);
+        }
+        close(u[1]);
+        send_fd(u[0], s);
+        read(u[0], &b, 1);
+        if (connect(s, (struct sockaddr *)&l_at, sizeof l_at)) { ok(0, "unconnected: tcp-connect: connect"); status_of(pid); return; }
+        write(u[0], "c", 1);
+        {
+            int a2 = readable(l, 20000) ? accept(l, 0, 0) : -1;
+            int r = a2 >= 0 && pong(a2);
+            if (a2 >= 0) close(a2);
+            ok(r && status_of(pid) == 0, "unconnected: tcp passed unconnected; the sender connects it, the receiver talks");
+        }
+        close(s); close(u[0]); close(l);
+    }
+}
+
 int main(int argc, char **argv)
 {
     int c, a;
     setvbuf(stdout, 0, _IONBF, 0);
+    signal(SIGPIPE, SIG_IGN); /* a case whose child died early reports, not kills the run */
     if (pair(&c, &a)) scm("loopback: passed over SCM_RIGHTS, the sender closing first", c, ping_talk, 0, a);
     else ok(0, "loopback pair (scm)");
     if (pair(&c, &a)) child_closes("loopback: inherited, the child closing first", c, ping_talk, 0, a);
@@ -209,6 +405,7 @@ int main(int argc, char **argv)
         ok(status_of(pid) == 0 && drain(a, 0, 0) == 0, "loopback: shutdown(SHUT_WR) in the child, the parent still holding it");
         close(c); close(a);
     } else ok(0, "loopback pair (shutdown)");
+    unconnected();
     if (argc > 2) {
         int s = dial(argv[1], argv[2]);
         if (s >= 0) scm("remote: passed over SCM_RIGHTS, the sender closing first", s, get, argv[1], -1);
@@ -216,6 +413,39 @@ int main(int argc, char **argv)
         s = dial(argv[1], argv[2]);
         if (s >= 0) child_closes("remote: inherited, the child closing first", s, get, argv[1], -1);
         else ok(0, "remote: connect (fork)");
+        {
+            struct addrinfo hints = { 0 }, *ai;
+            int u[2], one = 1;
+            char b;
+            pid_t pid;
+            hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+            s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s < 0 || getaddrinfo(argv[1], argv[2], &hints, &ai) || socketpair(AF_UNIX, SOCK_STREAM, 0, u)) ok(0, "remote-unconnected: setup");
+            else {
+                pid = fork();
+                if (pid == 0) {
+                    int fd;
+                    close(u[0]); close(s);
+                    fd = recv_fd(u[1]);
+                    if (fd < 0 || setsockopt(fd, IPPROTO_TCP, 1 /* TCP_NODELAY */, &one, sizeof one)) _exit(2);
+                    write(u[1], "r", 1);
+                    if (read(u[1], &b, 1) != 1) _exit(3);
+                    _exit(get(fd, argv[1]) ? 0 : 4);
+                }
+                close(u[1]);
+                send_fd(u[0], s);
+                read(u[0], &b, 1);
+                if (connect(s, ai->ai_addr, ai->ai_addrlen)) { printf("  (connect: %s)\n", strerror(errno)); ok(0, "remote-unconnected: connect"); status_of(pid); }
+                else {
+                    write(u[0], "c", 1);
+                    int st = status_of(pid);
+                    if (st) printf("  (the receiver's status %d)\n", st);
+                    ok(st == 0, "remote: passed unconnected, the sender connects it out, the receiver talks");
+                }
+                freeaddrinfo(ai);
+                close(s); close(u[0]);
+            }
+        }
     }
     printf("sockpass: %d failed\n", fails);
     return fails != 0;

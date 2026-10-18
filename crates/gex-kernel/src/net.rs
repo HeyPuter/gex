@@ -88,11 +88,22 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     fn carry(&self) -> Option<String> {
         None
     }
+    /// `carry`'s name without the hold: what another holder takes up with
+    /// `NetStack::adopt` (a moved socket's connection out, `Socket::go_out`).
+    fn name(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Where a host's connections come from.
 pub trait NetStack: Send + Sync + std::fmt::Debug {
     fn tcp(&self) -> Result<Arc<dyn Transport>, Errno>;
+    /// A connection by `Transport::name`, held once more here; `None` when
+    /// it has ended or this network has no such names.
+    fn adopt(&self, name: &str) -> Option<Arc<dyn Transport>> {
+        let _ = name;
+        None
+    }
 }
 
 /// No network behind the kernel (the browser without a Wisp relay): inet
@@ -562,6 +573,15 @@ pub struct Socket {
     remote_listener: Mutex<Option<i32>>,
     /// A UDP socket's streams in the global kernel.
     udp_remote: Mutex<UdpRemote>,
+    /// The id of this socket's hold in the global kernel once it has moved
+    /// there (`move_out`), else -1: every call is then that socket's, and the
+    /// fields above are unused, until a connection out brings it back
+    /// (`go_out`, `come_back`). For a socket that never leaves its process
+    /// it costs one load per call.
+    moved: std::sync::atomic::AtomicI32,
+    /// In the global kernel: the connection a holder made out of it, by
+    /// name (`op::GO_OUT`). Every holder then holds that connection itself.
+    went_out: Mutex<Option<String>>,
 }
 
 impl Socket {
@@ -582,6 +602,8 @@ impl Socket {
             remote,
             remote_listener: Mutex::new(None),
             udp_remote: Mutex::new(UdpRemote::default()),
+            moved: std::sync::atomic::AtomicI32::new(-1),
+            went_out: Mutex::new(None),
         }
     }
 
@@ -592,6 +614,9 @@ impl Socket {
 
     /// Where the last datagram read came from.
     pub fn last_from(&self) -> Option<(u32, u16)> {
+        if let Some(v) = self.fwd(op::LAST_FROM, 0, 0, &mut []) {
+            return unpack_addr(v);
+        }
         *self.last_from.lock().unwrap()
     }
 
@@ -637,6 +662,9 @@ impl Socket {
     /// `EADDRINUSE` (SO_REUSEADDR is not modelled: a listener that went away
     /// frees its port at once).
     pub fn bind(&self, addr: u32, port: u16) -> Result<(), Errno> {
+        if let Some(v) = self.fwd(op::BIND, addr as u64, port as u64, &mut []) {
+            return Socket::unit(v);
+        }
         if self.local.lock().unwrap().is_some() {
             return Err(Errno::EINVAL);
         }
@@ -672,12 +700,18 @@ impl Socket {
 
     /// Where this end is, for `getsockname`: 0.0.0.0:0 when unbound.
     pub fn local(&self) -> (u32, u16) {
+        if let Some(v) = self.fwd(op::LOCAL, 0, 0, &mut []) {
+            return unpack_addr(v).unwrap_or((0, 0));
+        }
         self.local.lock().unwrap().unwrap_or((0, 0))
     }
 
     /// `listen`: take the bound port (an ephemeral one if none), and
     /// connections from this machine's guests.
     pub fn listen(self: &Arc<Self>) -> Result<(), Errno> {
+        if let Some(v) = self.fwd(op::LISTEN, 0, 0, &mut []) {
+            return Socket::unit(v);
+        }
         if self.kind != Kind::Tcp || self.transport.lock().unwrap().is_some() {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -721,12 +755,32 @@ impl Socket {
     }
 
     pub fn is_listening(&self) -> bool {
+        if let Some(v) = self.fwd(op::LISTENING, 0, 0, &mut []) {
+            return v > 0;
+        }
         self.backlog.lock().unwrap().is_some()
     }
 
     /// `accept`: the next waiting connection as a socket of its own, or
     /// `EAGAIN`; `EINVAL` when not listening.
     pub fn accept(&self) -> Result<Arc<Socket>, Errno> {
+        let mut name = [0u8; 160];
+        if let Some(n) = self.moved().and_then(|_| self.fwd(op::ACCEPT, 0, 0, &mut name)) {
+            // The connection comes back as its `carry` name: an end in the
+            // global kernel, held by this process now.
+            if n < 0 {
+                return Err(errno_of(n));
+            }
+            let name = std::str::from_utf8(&name[..n as usize]).map_err(|_| Errno::EINVAL)?;
+            let r = self.remote.ok_or(Errno::EINVAL)?;
+            let id = Socket::carried_transport(name)
+                .and_then(|t| t.strip_prefix("loop:"))
+                .and_then(|t| t.parse::<i32>().ok())
+                .ok_or(Errno::EINVAL)?;
+            let t: Arc<dyn Transport> = Arc::new(RemoteEnd::adopt(id, r));
+            return Socket::adopt(name, t, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports), self.remote)
+                .ok_or(Errno::EINVAL);
+        }
         let remote_listener = *self.remote_listener.lock().unwrap();
         let (t, from): (Arc<dyn Transport>, u16) = match (remote_listener, self.remote) {
             (Some(id), Some(r)) => match (r.accept)(id) {
@@ -768,6 +822,9 @@ impl Socket {
     }
 
     pub fn peer(&self) -> Option<(u32, u16)> {
+        if let Some(v) = self.fwd(op::PEER, 0, 0, &mut []) {
+            return unpack_addr(v);
+        }
         *self.peer.lock().unwrap()
     }
 
@@ -775,6 +832,9 @@ impl Socket {
     /// from there: a resolver drops replies whose source is not the nameserver
     /// it asked, so 0.0.0.0 made every answer look spoofed.
     pub fn set_peer(&self, addr: u32, port: u16) {
+        if self.fwd(op::SET_PEER, addr as u64, port as u64, &mut []).is_some() {
+            return;
+        }
         *self.peer.lock().unwrap() = Some((addr, port));
     }
 
@@ -786,6 +846,10 @@ impl Socket {
     /// two descriptors are one socket. One not yet connected cannot -- its
     /// copies would connect apart -- nor can a listener or a UDP socket.
     pub fn carry(&self) -> Option<String> {
+        // A moved socket goes as another hold on it (`move_out`).
+        if self.moved().is_some() {
+            return None;
+        }
         if self.kind != Kind::Tcp || self.backlog.lock().unwrap().is_some() {
             return None;
         }
@@ -831,6 +895,15 @@ impl Socket {
     /// turns that into a wait for a blocking descriptor. Idempotent: asking
     /// twice does not open a second connection.
     pub fn connect(&self, addr: u32, port: u16) -> Result<(), Errno> {
+        if let Some(v) = self.fwd(op::CONNECT, addr as u64, port as u64, &mut []) {
+            // The global kernel has no network of its own: a connection
+            // out is made here, and the socket comes back to this process
+            // (`go_out`).
+            if v != -(Errno::ENETUNREACH.0 as i64) || self.kind != Kind::Tcp {
+                return Socket::unit(v);
+            }
+            return self.go_out(addr, port);
+        }
         if let Some(t) = self.transport.lock().unwrap().as_ref() {
             return match t.status() {
                 Status::Connecting => Err(Errno::EINPROGRESS),
@@ -877,6 +950,9 @@ impl Socket {
 
     /// `shutdown` on a connected stream.
     pub fn shutdown(&self, how: u64) -> Result<u64, Errno> {
+        if let Some(v) = self.fwd(op::SHUTDOWN, how, 0, &mut []) {
+            return Socket::count(v);
+        }
         if how > 2 {
             return Err(Errno::EINVAL);
         }
@@ -887,6 +963,14 @@ impl Socket {
     }
 
     pub fn status(&self) -> Status {
+        if let Some(v) = self.fwd(op::STATUS, 0, 0, &mut []) {
+            return match v {
+                0 => Status::Connecting,
+                1 => Status::Open,
+                3 => Status::Refused,
+                _ => Status::Closed,
+            };
+        }
         match &*self.transport.lock().unwrap() {
             Some(t) => t.status(),
             None => Status::Closed,
@@ -896,6 +980,9 @@ impl Socket {
     /// A datagram: to a guest on this machine bound to the port it is for,
     /// else to the resolver, which answers it and queues the reply.
     pub fn send_dgram(&self, data: &[u8]) -> SysResult {
+        if let Some(v) = self.fwd_write(data) {
+            return Socket::count(v);
+        }
         let to = self.peer();
         if let (Some((_, port)), Some(r)) = (to.filter(|&(a, _)| is_local(a)), self.remote) {
             if self.local.lock().unwrap().is_none() {
@@ -1007,6 +1094,9 @@ impl Socket {
     }
 
     pub fn recv_dgram(&self, buf: &mut [u8]) -> SysResult {
+        if let Some(v) = self.fwd(op::READ, 0, 0, buf) {
+            return Socket::count(v);
+        }
         self.udp_pump();
         match self.dgrams.lock().unwrap().pop_front() {
             Some((d, from)) => {
@@ -1025,6 +1115,9 @@ impl Socket {
     /// for the next read. Wine's server peeks a byte to tell a socket that
     /// has data from one that was closed.
     pub fn peek(&self, buf: &mut [u8]) -> SysResult {
+        if let Some(v) = self.fwd(op::PEEK, 0, 0, buf) {
+            return Socket::count(v);
+        }
         if self.kind == Kind::Udp {
             self.udp_pump();
             return match self.dgrams.lock().unwrap().front() {
@@ -1053,12 +1146,465 @@ impl Socket {
     }
 }
 
+// -- sockets in the global kernel ----------------------------------------------
+
+/// Internet sockets that live in the global kernel module (a page: a Worker
+/// and a memory per process). A socket that has to be in two processes at
+/// once -- Wine's wineserver makes every socket, binds it and polls it, while
+/// the client sends, receives and sets options on the same one -- moves there
+/// the first time it leaves its process unconnected (`Socket::move_out`), and
+/// each process's descriptor forwards to it by id. A connected TCP socket
+/// still travels as its connection (`Socket::carry`), and one that never
+/// leaves stays where it is.
+#[derive(Clone, Copy, Debug)]
+pub struct InetRemote {
+    /// A socket rebuilt from `Socket::export`'s bytes: its id, or a negated
+    /// errno.
+    pub adopt: fn(state: &[u8]) -> i32,
+    /// One call on socket `id` (`op::*`), `buf` filled by those `op::fills`
+    /// names: the result, or a negated errno.
+    pub op: fn(id: i32, op: u32, a: u64, b: u64, buf: &mut [u8]) -> i64,
+    /// `op::WRITE`, whose bytes are the caller's to send.
+    pub write: fn(id: i32, data: &[u8]) -> i64,
+    /// Another holder of the same socket (a descriptor on its way to another
+    /// process): its id, or a negated errno.
+    pub dup: fn(id: i32) -> i32,
+    /// One holder gone; the socket goes with its last.
+    pub close: fn(id: i32),
+}
+
+static INET_REMOTE: std::sync::OnceLock<InetRemote> = std::sync::OnceLock::new();
+
+/// Let unconnected sockets leave their process (set once, by a host with a
+/// global kernel).
+pub fn share_inet(remote: InetRemote) {
+    let _ = INET_REMOTE.set(remote);
+}
+
+/// A socket's place in the global kernel.
+#[derive(Clone, Copy, Debug)]
+struct Moved {
+    id: i32,
+    r: InetRemote,
+}
+
+/// The calls `InetRemote::op` carries, one per `Socket` method.
+pub mod op {
+    pub const BIND: u32 = 1;
+    pub const LISTEN: u32 = 2;
+    /// The connection's `carry` name into `buf`; its length.
+    pub const ACCEPT: u32 = 3;
+    pub const CONNECT: u32 = 4;
+    pub const SHUTDOWN: u32 = 5;
+    pub const STATUS: u32 = 6;
+    pub const LOCAL: u32 = 7;
+    pub const PEER: u32 = 8;
+    pub const SET_PEER: u32 = 9;
+    pub const LAST_FROM: u32 = 10;
+    /// `buf` is the bytes to send.
+    pub const WRITE: u32 = 11;
+    /// `buf` is filled; the bytes read.
+    pub const READ: u32 = 12;
+    pub const PEEK: u32 = 13;
+    pub const AVAILABLE: u32 = 14;
+    pub const READABLE: u32 = 15;
+    pub const WRITABLE: u32 = 16;
+    pub const LISTENING: u32 = 17;
+    pub const QUEUE: u32 = 18;
+    /// A holder connected it out (`Socket::go_out`): `buf` is the
+    /// connection's `carry` name. `EISCONN` if another holder did first.
+    pub const GO_OUT: u32 = 19;
+    /// That name into `buf`; its length. Every other call on such a socket
+    /// is `EREMCHG`, which tells its holder to take the connection up.
+    pub const WENT_OUT: u32 = 20;
+
+    /// Whether the call reads `buf` (copied from the caller first).
+    pub fn takes(op: u32) -> bool {
+        matches!(op, WRITE | GO_OUT)
+    }
+
+    /// Whether the call fills `buf` (copied back to the caller).
+    pub fn fills(op: u32) -> bool {
+        matches!(op, ACCEPT | READ | PEEK | WENT_OUT)
+    }
+}
+
+fn pack_addr(a: Option<(u32, u16)>) -> i64 {
+    a.map_or(-1, |(ip, port)| (ip as i64) << 16 | port as i64)
+}
+
+fn unpack_addr(v: i64) -> Option<(u32, u16)> {
+    (v >= 0).then(|| ((v >> 16) as u32, v as u16))
+}
+
+fn errno_of(v: i64) -> Errno {
+    Errno((-v) as i32)
+}
+
+/// The little-endian writer and reader of `Socket::export`'s bytes.
+#[derive(Default)]
+struct StateOut(Vec<u8>);
+
+impl StateOut {
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn addr(&mut self, a: Option<(u32, u16)>) {
+        match a {
+            Some((ip, port)) => {
+                self.u32(1);
+                self.u32(ip);
+                self.u32(port as u32);
+            }
+            None => self.u32(0),
+        }
+    }
+    fn id(&mut self, v: Option<i32>) {
+        self.u32(v.map_or(u32::MAX, |v| v as u32));
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+}
+
+struct StateIn<'a>(&'a [u8]);
+
+impl StateIn<'_> {
+    fn u32(&mut self) -> Option<u32> {
+        let (h, t) = self.0.split_at_checked(4)?;
+        self.0 = t;
+        Some(u32::from_le_bytes(h.try_into().ok()?))
+    }
+    fn addr(&mut self) -> Option<Option<(u32, u16)>> {
+        Some(match self.u32()? {
+            0 => None,
+            _ => Some((self.u32()?, self.u32()? as u16)),
+        })
+    }
+    fn id(&mut self) -> Option<Option<i32>> {
+        Some(match self.u32()? {
+            u32::MAX => None,
+            v => Some(v as i32),
+        })
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.u32()? as usize;
+        let (h, t) = self.0.split_at_checked(n)?;
+        self.0 = t;
+        Some(h.to_vec())
+    }
+}
+
+impl Socket {
+    /// The global kernel's socket this one forwards to, if it has moved.
+    fn moved(&self) -> Option<Moved> {
+        match self.moved.load(Ordering::Acquire) {
+            id if id < 0 => None,
+            id => Some(Moved { id, r: *INET_REMOTE.get()? }),
+        }
+    }
+
+    /// One call on the moved socket, if this one has moved: its result.
+    /// `None` too once the socket has come back to this process as a
+    /// connection another holder made (`come_back`): the caller then goes
+    /// on as for a socket that never left.
+    fn fwd(&self, call: u32, a: u64, b: u64, buf: &mut [u8]) -> Option<i64> {
+        let m = self.moved()?;
+        let v = (m.r.op)(m.id, call, a, b, buf);
+        if v == -(Errno::EREMCHG.0 as i64) {
+            return match self.come_back(m) {
+                Ok(()) => None,
+                Err(e) => Some(-(e.0 as i64)),
+            };
+        }
+        Some(v)
+    }
+
+    fn fwd_write(&self, data: &[u8]) -> Option<i64> {
+        let m = self.moved()?;
+        let v = (m.r.write)(m.id, data);
+        if v == -(Errno::EREMCHG.0 as i64) {
+            return match self.come_back(m) {
+                Ok(()) => None,
+                Err(e) => Some(-(e.0 as i64)),
+            };
+        }
+        Some(v)
+    }
+
+    /// A moved TCP socket connecting out: the connection is this process's
+    /// (a Wisp stream), made here; the global kernel keeps its name for the
+    /// other holders, each of which takes it up at its next call, and this
+    /// one stops forwarding.
+    fn go_out(&self, addr: u32, port: u16) -> Result<(), Errno> {
+        let Some(m) = self.moved() else { return self.connect(addr, port) };
+        let host = self.resolver.name_for(addr).unwrap_or_else(|| {
+            let b = addr.to_be_bytes();
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        });
+        let t = self.net.tcp()?;
+        t.connect(&host, port)?;
+        let Some(tname) = t.name() else {
+            t.close();
+            return Err(Errno::ENETUNREACH);
+        };
+        let mut name = format!("inet:{addr}:{port}:0:0:{tname}").into_bytes();
+        let v = (m.r.op)(m.id, op::GO_OUT, 0, 0, &mut name);
+        if v < 0 {
+            // Another holder got there first: its connection is this one's.
+            t.close();
+            self.come_back(m)?;
+            return self.connect(addr, port);
+        }
+        *self.peer.lock().unwrap() = Some((addr, port));
+        *self.transport.lock().unwrap() = Some(t);
+        if self.moved.compare_exchange(m.id, -1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            (m.r.close)(m.id);
+        }
+        Err(Errno::EINPROGRESS)
+    }
+
+    /// The connection another holder made out of this socket, held here
+    /// now (`go_out`): this holder stops forwarding.
+    fn come_back(&self, m: Moved) -> Result<(), Errno> {
+        let mut name = [0u8; 160];
+        let n = (m.r.op)(m.id, op::WENT_OUT, 0, 0, &mut name);
+        if n < 0 {
+            return Err(errno_of(n));
+        }
+        let name = std::str::from_utf8(&name[..n as usize]).map_err(|_| Errno::EINVAL)?;
+        let t = Socket::carried_transport(name).and_then(|t| self.net.adopt(t)).ok_or(Errno::ECONNRESET)?;
+        let mut p = name.strip_prefix("inet:").unwrap_or("").splitn(3, ':');
+        let pa = p.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let pp = p.next().and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+        let _guard = self.udp_remote.lock().unwrap();
+        if self.moved.compare_exchange(m.id, -1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            *self.peer.lock().unwrap() = Some((pa, pp));
+            *self.transport.lock().unwrap() = Some(t);
+            (m.r.close)(m.id);
+        } else {
+            // Another thread here took it up first.
+            t.close();
+        }
+        Ok(())
+    }
+
+    fn unit(v: i64) -> Result<(), Errno> {
+        if v < 0 { Err(errno_of(v)) } else { Ok(()) }
+    }
+
+    fn count(v: i64) -> SysResult {
+        if v < 0 { Err(errno_of(v)) } else { Ok(v as u64) }
+    }
+
+    /// Everything this socket is, as bytes `import` rebuilds it from, taken
+    /// out of it: its ids in the global kernel are the new socket's now.
+    fn export(&self, u: UdpRemote) -> Vec<u8> {
+        let mut o = StateOut::default();
+        o.u32(match self.kind {
+            Kind::Tcp => 0,
+            Kind::Udp => 1,
+        });
+        o.addr(*self.local.lock().unwrap());
+        o.addr(*self.peer.lock().unwrap());
+        o.addr(*self.last_from.lock().unwrap());
+        o.id(self.remote_listener.lock().unwrap().take());
+        // A listener's waiting connections are the global kernel's already
+        // (in a page nothing queues here).
+        o.u32(self.backlog.lock().unwrap().take().is_some() as u32);
+        o.id(u.listener);
+        o.u32(u.inbound.len() as u32);
+        for (id, buf) in &u.inbound {
+            o.u32(*id as u32);
+            o.bytes(buf);
+        }
+        o.u32(u.outbound.len() as u32);
+        for (port, id) in &u.outbound {
+            o.u32(*port as u32);
+            o.u32(*id as u32);
+        }
+        let q = std::mem::take(&mut *self.dgrams.lock().unwrap());
+        o.u32(q.len() as u32);
+        for (d, from) in &q {
+            o.bytes(d);
+            o.addr(Some(*from));
+        }
+        o.0
+    }
+
+    /// The other half of `export`: the socket, here (the global kernel).
+    pub fn import(
+        state: &[u8],
+        net: Arc<dyn NetStack>,
+        resolver: Arc<Resolver>,
+        ports: Arc<Ports>,
+        remote: Option<crate::unix::Remote>,
+    ) -> Option<Arc<Socket>> {
+        let mut i = StateIn(state);
+        let kind = match i.u32()? {
+            0 => Kind::Tcp,
+            _ => Kind::Udp,
+        };
+        let s = Socket::new(kind, net, resolver, ports, remote);
+        *s.local.lock().unwrap() = i.addr()?;
+        *s.peer.lock().unwrap() = i.addr()?;
+        *s.last_from.lock().unwrap() = i.addr()?;
+        *s.remote_listener.lock().unwrap() = i.id()?;
+        if i.u32()? != 0 {
+            *s.backlog.lock().unwrap() = Some(VecDeque::new());
+        }
+        {
+            let mut u = s.udp_remote.lock().unwrap();
+            u.listener = i.id()?;
+            for _ in 0..i.u32()? {
+                let id = i.u32()? as i32;
+                u.inbound.push((id, i.bytes()?));
+            }
+            for _ in 0..i.u32()? {
+                let port = i.u32()? as u16;
+                u.outbound.insert(port, i.u32()? as i32);
+            }
+        }
+        {
+            let mut q = s.dgrams.lock().unwrap();
+            for _ in 0..i.u32()? {
+                let d = i.bytes()?;
+                q.push_back((d, i.addr()??));
+            }
+        }
+        let s = Arc::new(s);
+        s.set_self();
+        Some(s)
+    }
+
+    /// This socket as one another process can hold too: moved to the global
+    /// kernel if it is not there yet, then held once more. The name it goes
+    /// by (`inetg:KIND:ID`), or `None` where there is no global kernel to
+    /// move to, or for a connected TCP socket (`carry`'s).
+    pub fn move_out(&self) -> Option<String> {
+        let r = *INET_REMOTE.get()?;
+        let kind = match self.kind {
+            Kind::Tcp => 0,
+            Kind::Udp => 1,
+        };
+        // The UDP state's lock is the move's: two threads handing the socket
+        // on at once move it once.
+        let mut u = self.udp_remote.lock().unwrap();
+        if self.moved().is_none() {
+            if self.transport.lock().unwrap().is_some() {
+                return None;
+            }
+            let state = self.export(std::mem::take(&mut *u));
+            let id = (r.adopt)(&state);
+            if id < 0 {
+                return None;
+            }
+            self.moved.store(id, Ordering::Release);
+        }
+        drop(u);
+        let m = self.moved()?;
+        let dup = (m.r.dup)(m.id);
+        (dup >= 0).then(|| format!("inetg:{kind}:{dup}"))
+    }
+
+    /// A descriptor's socket from `move_out`'s name: the global kernel's,
+    /// held by this process now.
+    pub fn moved_proxy(
+        name: &str,
+        net: Arc<dyn NetStack>,
+        resolver: Arc<Resolver>,
+        ports: Arc<Ports>,
+        remote: Option<crate::unix::Remote>,
+    ) -> Option<Arc<Socket>> {
+        let r = *INET_REMOTE.get()?;
+        let (kind, id) = name.strip_prefix("inetg:")?.split_once(':')?;
+        let kind = if kind == "1" { Kind::Udp } else { Kind::Tcp };
+        let id = id.parse::<i32>().ok()?;
+        let s = Socket::new(kind, net, resolver, ports, remote);
+        let _ = r;
+        s.moved.store(id, Ordering::Release);
+        let s = Arc::new(s);
+        s.set_self();
+        Some(s)
+    }
+
+    /// `InetRemote::op`'s other end, run by the global kernel on its own
+    /// socket. `buf` is the caller's bytes for `op::WRITE`, and what the
+    /// `op::fills` calls fill.
+    pub fn serve(self: &Arc<Self>, call: u32, a: u64, b: u64, buf: &mut [u8]) -> i64 {
+        let unit = |r: Result<(), Errno>| r.map_or_else(|e| -(e.0 as i64), |_| 0);
+        let count = |r: SysResult| r.map_or_else(|e| -(e.0 as i64), |n| n as i64);
+        {
+            let mut out = self.went_out.lock().unwrap();
+            match (call, out.as_ref()) {
+                (op::WENT_OUT, Some(name)) if name.len() <= buf.len() => {
+                    buf[..name.len()].copy_from_slice(name.as_bytes());
+                    return name.len() as i64;
+                }
+                (op::WENT_OUT, _) => return -(Errno::EINVAL.0 as i64),
+                (op::GO_OUT, Some(_)) => return -(Errno::EISCONN.0 as i64),
+                (op::GO_OUT, None) => {
+                    if self.transport.lock().unwrap().is_some() || self.is_listening() {
+                        return -(Errno::EISCONN.0 as i64);
+                    }
+                    *out = Some(String::from_utf8_lossy(buf).into_owned());
+                    return 0;
+                }
+                (_, Some(_)) => return -(Errno::EREMCHG.0 as i64),
+                _ => {}
+            }
+        }
+        match call {
+            op::BIND => unit(self.bind(a as u32, b as u16)),
+            op::LISTEN => unit(self.listen()),
+            op::ACCEPT => match self.accept() {
+                Ok(s) => match s.carry() {
+                    Some(name) if name.len() <= buf.len() => {
+                        buf[..name.len()].copy_from_slice(name.as_bytes());
+                        name.len() as i64
+                    }
+                    _ => -(Errno::ENOMEM.0 as i64),
+                },
+                Err(e) => -(e.0 as i64),
+            },
+            op::CONNECT => unit(self.connect(a as u32, b as u16)),
+            op::SHUTDOWN => count(self.shutdown(a)),
+            op::STATUS => match self.status() {
+                Status::Connecting => 0,
+                Status::Open => 1,
+                Status::Closed => 2,
+                Status::Refused => 3,
+            },
+            op::LOCAL => pack_addr(Some(self.local())),
+            op::PEER => pack_addr(self.peer()),
+            op::SET_PEER => {
+                self.set_peer(a as u32, b as u16);
+                0
+            }
+            op::LAST_FROM => pack_addr(self.last_from()),
+            op::WRITE => count(self.write_at(0, buf)),
+            op::READ => count(self.read_at(0, buf)),
+            op::PEEK => count(self.peek(buf)),
+            op::AVAILABLE => self.available().unwrap_or(0) as i64,
+            op::READABLE => self.poll_readable() as i64,
+            op::WRITABLE => self.poll_writable() as i64,
+            op::LISTENING => self.is_listening() as i64,
+            op::QUEUE => self.wait_queue() as i64,
+            _ => -(Errno::ENOSYS.0 as i64),
+        }
+    }
+}
+
 impl FileHandle for Socket {
     fn as_inet_socket(self: Arc<Self>) -> Option<Arc<Socket>> {
         Some(self)
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if let Some(v) = self.fwd(op::READ, 0, 0, buf) {
+            return Socket::count(v);
+        }
         if self.kind == Kind::Udp {
             return self.recv_dgram(buf);
         }
@@ -1083,6 +1629,9 @@ impl FileHandle for Socket {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if let Some(v) = self.fwd_write(buf) {
+            return Socket::count(v);
+        }
         if self.kind == Kind::Udp {
             return self.send_dgram(buf);
         }
@@ -1121,6 +1670,9 @@ impl FileHandle for Socket {
     /// must be exact -- the length of the next datagram, which a caller uses
     /// to size its buffer.
     fn available(&self) -> Option<u64> {
+        if let Some(v) = self.fwd(op::AVAILABLE, 0, 0, &mut []) {
+            return Some(v.max(0) as u64);
+        }
         if self.kind == Kind::Udp {
             self.udp_pump();
             return Some(
@@ -1141,6 +1693,9 @@ impl FileHandle for Socket {
     }
 
     fn poll_readable(&self) -> bool {
+        if let Some(v) = self.fwd(op::READABLE, 0, 0, &mut []) {
+            return v != 0;
+        }
         if self.kind == Kind::Udp {
             self.udp_pump();
             return !self.dgrams.lock().unwrap().is_empty();
@@ -1166,6 +1721,9 @@ impl FileHandle for Socket {
     /// through the connection or the bytes (tests/x86-programs/tcp-loopback,
     /// a forked child connecting to its parent).
     fn wait_queue(&self) -> u32 {
+        if let Some(v) = self.fwd(op::QUEUE, 0, 0, &mut []) {
+            return v.max(0) as u32;
+        }
         if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
             return (r.queue)(id);
         }
@@ -1177,6 +1735,9 @@ impl FileHandle for Socket {
     /// the caller waits for writable, then asks `SO_ERROR`. The trait's
     /// default `true` would signal "finished" before it was.
     fn poll_writable(&self) -> bool {
+        if let Some(v) = self.fwd(op::WRITABLE, 0, 0, &mut []) {
+            return v != 0;
+        }
         if self.kind == Kind::Udp {
             return true;
         }
@@ -1191,6 +1752,11 @@ impl FileHandle for Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
+        // A moved socket's state is the global kernel's: this was one hold.
+        if let Some(m) = self.moved() {
+            (m.r.close)(m.id);
+            return;
+        }
         if let Some(t) = self.transport.lock().unwrap().take() {
             t.close();
         }
