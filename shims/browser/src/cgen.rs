@@ -1331,6 +1331,16 @@ pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
 /// bottom up, as the native `libprov::stack`).
 #[no_mangle]
 pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
+    // W3 with the split (`?w3split=1`): the guest's 2 GiB are Wine's and a
+    // game may fill them (Hades x86 with its units: no room for a Worker's
+    // stack), while only wasm code runs on this one. It comes from the shim's
+    // heap, above 2 GiB, zeroed, and lives as long as the process.
+    if crate::nt::w3_split() && crate::nt::process().is_none() {
+        let layout = std::alloc::Layout::from_size_align(size as usize, 4096).expect("provider stack layout");
+        // SAFETY: a non-zero size; the block is never freed (the process's stack).
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        return p as u32;
+    }
     if lock(&STATEFUL).is_empty() {
         gex_provider_alloc_top(size)
     } else {
