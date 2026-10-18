@@ -1,0 +1,77 @@
+# W64's pinned builtins (tools/wine-wasm/w64/dll-bases.py), in the order
+# their band addresses are handed out. APPEND ONLY: an entry's address is
+# the sum of the sizes before it, and a function-tier unit is keyed by it.
+# Left out: the native PE core (ntdll, kernel32, kernelbase, msvcrt,
+# ucrtbase, winewayland.drv: compiled, not translated), programs, and
+# resource-only DLLs (tzres, normaliz: no relocations, no code).
+# The first list is what Dicey Dungeons, Geometry Dash and Hyper Light
+# Drifter load (page runs, 2026-10-18), in the order they first load it.
+advapi32.dll
+sechost.dll
+rpcrt4.dll
+cryptbase.dll
+ws2_32.dll
+ole32.dll
+combase.dll
+gdi32.dll
+user32.dll
+win32u.dll
+setupapi.dll
+cfgmgr32.dll
+coml2.dll
+userenv.dll
+shell32.dll
+shlwapi.dll
+shcore.dll
+windowscodecs.dll
+oleaut32.dll
+propsys.dll
+imm32.dll
+wevtsvc.dll
+iphlpapi.dll
+dnsapi.dll
+nsi.dll
+wow64cpu.dll
+comdlg32.dll
+difxapi.dll
+gdiplus.dll
+imagehlp.dll
+msctf.dll
+psapi.dll
+wow64.dll
+wow64win.dll
+comctl32.dll
+wininet.dll
+mpr.dll
+crypt32.dll
+bcrypt.dll
+ncrypt.dll
+rsaenh.dll
+winmm.dll
+msacm32.dll
+version.dll
+wldap32.dll
+uxtheme.dll
+actxprxy.dll
+mmdevapi.dll
+dsound.dll
+dinput8.dll
+hid.dll
+xinput1_4.dll
+opengl32.dll
+vcruntime140.dll
+vcruntime140_1.dll
+msvcp140.dll
+dbghelp.dll
+concrt140.dll
+secur32.dll
+kerberos.dll
+msv1_0.dll
+netapi32.dll
+netutils.dll
+dwmapi.dll
+ntoskrnl.exe
+mountmgr.sys
+winebus.sys
+hidclass.sys
+nsiproxy.sys
