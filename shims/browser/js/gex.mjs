@@ -5721,7 +5721,13 @@ export class Gex {
             `, lr=0x${(lr < 0n ? lr + (1n << 64n) : lr).toString(16)}`);
           const code = ask(e.gex_exit_code, (c) => (c ? `, exit code ${c}` : ''));
           const heap = ask(e.gex_heap_used_kib, (k) =>
-            k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '');
+            k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '') +
+            // Where the process's arena went (guest mappings, the shim's heap,
+            // Worker stacks, MiB taken), and what its memory grew to: a trap
+            // after the guest ran out of address space says which side spent it.
+            ask(e.gex_arena_spent_mib, () =>
+              `, arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
+              `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB`);
           // "inside" only when the syscall is still on the stack: a plain
           // static, so it answers even with the kernel borrowed.
           const within = ask(e.gex_in_syscall, (v) => v) === 1;
