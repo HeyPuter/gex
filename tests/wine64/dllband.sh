@@ -4,6 +4,8 @@
 # which must pass its own check, and four of the dist's DLLs loaded at the
 # addresses it gives them, in [0x11000000, 0x20000000), in the program and in
 # a second process it starts, natively and in the page (run-node.mjs).
+# Also that PREFIX carries W3's session (w64-dist.sh applies w3-session.reg)
+# and that no driver fails to load in either leg.
 # Prints "ok   dllband64 <leg>" per leg.
 #
 #   tests/wine64/dllband.sh DIST PREFIX [gexc]
@@ -37,6 +39,28 @@ assign() {
 		python3 "$tool" check "$p/dll-bases" ||
 		{ echo "FAIL dllband64: dll-bases.py"; sed 's/^/  /' "$w/assign.log"; exit 1; }
 }
+# The prefix carries W3's session (w3-session.reg, w64-dist.sh's pfs64):
+# no boot-start MountMgr or root bus devices whose drivers fail to load
+# (each a winedevice process before the program starts), Event Log on demand.
+session() { # PFX: the session's keys, as reg-apply.py writes them
+	python3 - "$1/system.reg" <<'PY'
+import re, sys
+t = open(sys.argv[1], encoding='utf-8').read()
+def start(svc):
+    m = re.search(r'^\[System\\\\ControlSet001\\\\Services\\\\' + svc + r'\] .*?\n\n', t + '\n\n', re.M | re.S | re.I)
+    s = m and re.search(r'^"Start"=dword:([0-9a-f]{8})$', m.group(0), re.M)
+    return s and int(s.group(1), 16)
+bad = [f'{s} Start={start(s)}' for s in ('MountMgr', 'Eventlog') if start(s) != 3]
+bad += [d for d in ('WINEBUS', 'WINEUSB', 'WINEBTH') if re.search(r'^\[System\\\\ControlSet001\\\\Enum\\\\ROOT\\\\WINE\\\\' + d + r'\]', t, re.M | re.I)]
+sys.exit('; '.join(bad) if bad else 0)
+PY
+}
+if err=$(session "$prefix" 2>&1); then echo "ok   dllband64 session"; else
+	echo "FAIL dllband64 session: $prefix is not W3's session ($err): tools/wine-wasm/w64-dist.sh's W64_PREFIX"; fail=$((fail + 1)); fi
+drivers() { # LEG LOG: no driver failed to load (the session left none that would)
+	if grep -aq 'err:ntoskrnl:ZwLoadDriver' "$2"; then
+		echo "FAIL dllband64 $1 drivers"; grep -a 'err:ntoskrnl:ZwLoadDriver' "$2" | head -4 | sed 's/^/  /'; fail=$((fail + 1)); fi
+}
 # Natively the server names an image by the dist's own path.
 if [ -x "$gexc" ]; then
 	rm -rf "$w/pfx"; cp -a "$prefix" "$w/pfx"; cp "$w/dllband.exe" "$w/pfx/drive_c/"
@@ -44,7 +68,7 @@ if [ -x "$gexc" ]; then
 	(cd "$w/pfx/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run --no-cgen \
 		--env WINEPREFIX="$w/pfx" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
 		"$dist/lib/wine/x86_64-unix/wine" 'C:\dllband.exe' 'Z:'"$w/pfx/dll-bases") > "$w/native.log" 2>&1
-	verdict native "$w/native.log"
+	verdict native "$w/native.log"; drivers native "$w/native.log"
 else
 	echo "skip native: no $gexc"
 fi
@@ -60,5 +84,5 @@ assign "$w/pfx-page" /w64 --map /w64="$dist"
 	--env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=0 \
 	--cwd /pfx/drive_c --argv0 /w64/lib/wine/x86_64-unix/wine \
 	"$pub/seed.x86.shared.wasm" "$dist/lib/wine/x86_64-unix/wine" 'C:\dllband.exe' Z:/pfx/dll-bases) > "$w/page.log" 2>&1
-verdict page "$w/page.log"
+verdict page "$w/page.log"; drivers page "$w/page.log"
 [ "$fail" = 0 ]

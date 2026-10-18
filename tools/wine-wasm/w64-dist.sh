@@ -13,6 +13,8 @@
 #   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
 #               a native x86_64 Unix side, used only to make the prefix)
 #   pfx64-P     a win64 prefix (wineboot -i, native, no display)
+#   pfs64-P-R   it with W3's session applied (w3-session.reg; R: that and
+#               reg-apply.py): W64_PREFIX
 #   deps64-D    the Unix side's display libraries, LP64 wasm64 (w64-deps.sh:
 #               FreeType, libwayland, libxml2, xkbcommon, EGL headers; W64.4;
 #               GnuTLS over nettle and Mozilla's CA bundle, as W3's)
@@ -118,6 +120,19 @@ pfx_make() {
 }
 log "win64 prefix ($P)"; step pfx64-$P pfx_make
 
+# The session W3's prefixes have (w3-session.reg, docs/wine-native.md
+# §3.17): the 64-bit loader has no Unix side for MountMgr, winebus,
+# wineusb or winebth either, so services.exe started a winedevice for each
+# only to see DriverEntry fail (c0000135), one after another, before
+# wineboot let the program start (W64 Dicey Dungeons on edger: the game
+# 5 s sooner). On a copy, so the session changes without a new wineboot.
+R=$(cat "$here"/w3-session.reg "$here"/reg-apply.py | sha256sum | cut -c1-10)
+pfs_make() {
+	cp -a "$C/pfx64-$P/pfx" pfx
+	python3 "$here/reg-apply.py" pfx/system.reg "$here/w3-session.reg"
+}
+log "win64 prefix's session ($P, $R)"; step pfs64-$P-$R pfs_make
+
 deps64_build() {
 	W3_DL_SEED="${W3_DL_SEED:-} ${W3_CACHE:-$HOME/.cache/gex-w3}/dl" JOBS=$J nice -n 10 "$here/w64-deps.sh" "$PWD" "$C/dl"
 }
@@ -183,7 +198,7 @@ pe_native() {
 }
 log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
 echo "W64_DIST=$C/dist64-$K-$S"
-echo "W64_PREFIX=$C/pfx64-$P/pfx"
+echo "W64_PREFIX=$C/pfs64-$P-$R/pfx"
 echo "W64_TOOLS=$T"
 echo "W64_SRC=$W"
 echo "W64_NTDLL=$C/ntdll64-$K-$S/ntdll.dll"
