@@ -98,6 +98,10 @@ mod stub {
 
     pub(crate) fn set_w3_split(_on: bool) {}
 
+    pub(crate) fn w3_split() -> bool {
+        false
+    }
+
     pub(crate) fn w3_space() -> Result<u64, String> {
         Ok(w3_windows_space())
     }
@@ -317,6 +321,12 @@ mod imp {
 
     pub(crate) fn set_w3_split(on: bool) {
         W3_SPLIT.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether this is a W3 process that took the split (`?w3split=1`):
+    /// everything below 2 GiB is Wine's, the shim's heap above it.
+    pub(crate) fn w3_split() -> bool {
+        W3_SPLIT.load(Ordering::Relaxed) && !W3_COMPACT.load(Ordering::Relaxed) && WINDOWS_LO.load(Ordering::Relaxed) != 0
     }
 
     /// A W3 process's address space: the compact one, or the split when the

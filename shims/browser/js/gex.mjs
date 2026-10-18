@@ -4285,7 +4285,14 @@ export class Gex {
       // Top down unless an ejected project's providers are set (cgen.rs).
       const e = this.#shim.exports;
       const base = (e.gex_provider_stack ? e.gex_provider_stack(size) : e.gex_provider_alloc(size)) >>> 0;
-      if (!base) throw new Error('gex-nt: no memory for a provider stack');
+      if (!base) {
+        // Where the arena went, as a shim trap says it (guest maps, heap, stacks).
+        const a = e.gex_arena_spent_mib
+          ? ` (arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
+            `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB)`
+          : '';
+        throw new Error(`gex-nt: no memory for a provider stack${a}`);
+      }
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
     }
     return this.#provStack;
