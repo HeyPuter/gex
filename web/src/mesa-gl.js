@@ -16,6 +16,7 @@ import { captureIfRequested } from './gl-capture.js';
 import { assetUrl, pageParams } from './page-env.js';
 import { logOn } from '@gex/log.mjs';
 import { ValidationLog } from './gl-validation.js';
+import { fitReply } from './gl-reply.js';
 
 // Header words, matching crates/gex-gl/src/proto.rs.
 const H_MAGIC = 0;
@@ -204,6 +205,8 @@ export class MesaGlDevice {
   /** Batches this device refused, and the last of them: a client's own
    *  problem, kept where a page can see it. */
   #rejects = 0;
+  /** Replies cut to the ring's reply area (gl-reply.js). */
+  #replyCuts = 0;
   #lastReject = '';
   #description = '';
   #submits = 0;
@@ -495,12 +498,14 @@ export class MesaGlDevice {
         words[H_FAILED_AT] = 0;
         return rc;
       }
-      const replyLen = this.#module._gex_gl_reply_len();
-      if (replyLen > replyCap) {
-        words[H_STATUS] = error.BAD_ARGUMENT;
-        words[H_REPLY_LEN] = 0;
-        words[H_TAIL] = 0;
-        return -1;
+      // A reply larger than the ring's reply area is cut to it, as the
+      // native host does (gl-reply.js), not refused.
+      const fit = fitReply(this.#module._gex_gl_reply_len(), replyCap);
+      const replyLen = fit.len;
+      if (fit.cut) {
+        if (!this.#replyCuts++) {
+          console.error(`[mesa-gl] client ${client}: a reply ${fit.cut} bytes over the ring's ${replyCap}; cut, as natively`);
+        }
       }
       if (replyLen) {
         const from = this.#module._gex_gl_reply_data();
@@ -682,6 +687,7 @@ export class MesaGlDevice {
   glState() {
     if (!this.ok) return this.#failed ?? '';
     return (this.#rejects ? `rejects=${this.#rejects} (${this.#lastReject}) ` : '') +
+      (this.#replyCuts ? `reply-cuts=${this.#replyCuts} ` : '') +
       this.#validation.summary() +
       `presented=${this.presentedCount()} produced=${this.producedCount()} ` +
       `mesa=1 submits=${this.#submits} bytes=${this.#bytes} ` +
