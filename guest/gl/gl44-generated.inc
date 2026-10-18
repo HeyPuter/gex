@@ -30,6 +30,7 @@ void glBeginQueryIndexed(unsigned target, unsigned index, unsigned id) {
     packet[at++] = (uint32_t)(id);
 }
 void glBeginTransformFeedback(unsigned primitiveMode) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1030, 1, 0);
     if (!packet) return;
     size_t at = 0;
@@ -207,6 +208,7 @@ void glBlendFunci(unsigned buf, unsigned src, unsigned dst) {
     packet[at++] = (uint32_t)(dst);
 }
 void glBufferStorage(unsigned target, long size, const void *data, unsigned flags) {
+    buffer_contents_unknown();
     if (size < 0) return;
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
@@ -225,6 +227,7 @@ void glClampColor(unsigned target, unsigned clamp) {
     packet[at++] = (uint32_t)(clamp);
 }
 void glClearBufferData(unsigned target, unsigned internalformat, unsigned format, unsigned type, const void *data) {
+    buffer_contents_unknown();
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
     uint32_t *a = begin(1068, 4, 4 + blob_len);
@@ -236,6 +239,7 @@ void glClearBufferData(unsigned target, unsigned internalformat, unsigned format
     put_blob(a + 4, data, blob_len);
 }
 void glClearBufferSubData(unsigned target, unsigned internalformat, long offset, long size, unsigned format, unsigned type, const void *data) {
+    buffer_contents_unknown();
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
     uint32_t *a = begin(1069, 8, 4 + blob_len);
@@ -419,6 +423,7 @@ void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoff
     put_blob(packet + at, data, blob_len);
 }
 void glCopyBufferSubData(unsigned readTarget, unsigned writeTarget, long readOffset, long writeOffset, long size) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1090, 8, 0);
     if (!packet) return;
     size_t at = 0;
@@ -570,6 +575,7 @@ void glDisablei(unsigned target, unsigned index) {
     packet[at++] = (uint32_t)(index);
 }
 void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned num_groups_z) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1126, 3, 0);
     if (!packet) return;
     size_t at = 0;
@@ -578,6 +584,7 @@ void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned nu
     packet[at++] = (uint32_t)(num_groups_z);
 }
 void glDispatchComputeIndirect(long indirect) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1127, 2, 0);
     if (!packet) return;
     size_t at = 0;
@@ -757,6 +764,7 @@ void glEndQueryIndexed(unsigned target, unsigned index) {
     packet[at++] = (uint32_t)(index);
 }
 void glEndTransformFeedback(void) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1153, 0, 0);
     if (!packet) return;
 }
@@ -861,16 +869,28 @@ void glGetBufferParameteriv(unsigned target, unsigned pname, int *params) {
     if (params && source && reply_len == expected)
         memcpy(params, source, expected);
 }
+static int buffer_read(unsigned target, long offset, long size, void *data) {
+    uint64_t off = (uint64_t)offset, left = (uint64_t)size;
+    uint8_t *out = (uint8_t *)data;
+    const uint64_t step = readback_chunk();
+    do {
+        uint64_t bytes = (size > 0 && left > step) ? step : left;
+        uint32_t *a = begin(1193, 5, 0);
+        if (!a) return 0;
+        a[0] = target; a[1] = (uint32_t)off; a[2] = (uint32_t)(off >> 32);
+        a[3] = (uint32_t)bytes; a[4] = (uint32_t)(bytes >> 32); flush();
+        uint32_t reply_len = 0; const uint8_t *reply = reply_blob(&reply_len);
+        if (!out || size <= 0 || !reply || reply_len != bytes) return 0;
+        memcpy(out, reply, reply_len);
+        off += bytes; out += bytes; left -= bytes;
+    } while (left);
+    return 1;
+}
 void glGetBufferSubData(unsigned target, long offset, long size, void *data) {
-    uint32_t *a = begin(1193, 5, 0);
-    if (!a) return;
-    uint64_t off = (uint64_t)offset, bytes = (uint64_t)size;
-    a[0] = target; a[1] = (uint32_t)off; a[2] = (uint32_t)(off >> 32);
-    a[3] = (uint32_t)bytes; a[4] = (uint32_t)(bytes >> 32); flush();
-    uint32_t reply_len = 0; const uint8_t *reply = reply_blob(&reply_len);
-    if (data && size > 0 && reply && reply_len == (uint64_t)size) memcpy(data, reply, reply_len);
+    buffer_read(target, offset, size, data);
 }
 void glGetCompressedTexImage(unsigned target, int level, void *img) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
     uint32_t *a = begin(1194, 5, 0);
     if (!a) return;
@@ -1121,6 +1141,7 @@ void glGetQueryIndexediv(unsigned target, unsigned index, unsigned pname, int *p
         memcpy(params, source, expected);
 }
 void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
+    if (bound_buffer(0x9192u)) buffer_contents_unknown();
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1228, 2, 0);
     if (!packet) return;
@@ -1133,6 +1154,7 @@ void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
         memcpy(params, source, expected);
 }
 void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
+    if (bound_buffer(0x9192u)) buffer_contents_unknown();
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1229, 2, 0);
     if (!packet) return;
@@ -1145,6 +1167,7 @@ void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
         memcpy(params, source, expected);
 }
 void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *params) {
+    if (bound_buffer(0x9192u)) buffer_contents_unknown();
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1230, 2, 0);
     if (!packet) return;
@@ -1157,6 +1180,7 @@ void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *para
         memcpy(params, source, expected);
 }
 void glGetQueryObjectuiv(unsigned id, unsigned pname, unsigned *params) {
+    if (bound_buffer(0x9192u)) buffer_contents_unknown();
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1231, 2, 0);
     if (!packet) return;
@@ -1262,6 +1286,7 @@ int glGetSubroutineUniformLocation(unsigned program, unsigned shadertype, const 
 }
 void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
                        void *pixels) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
     uint32_t *a = begin(1247, 7, 0);
     if (!a) return;
@@ -1615,6 +1640,7 @@ void glLogicOp(unsigned opcode) {
     packet[at++] = (uint32_t)(opcode);
 }
 void glMemoryBarrier(unsigned barriers) {
+    buffer_contents_unknown();
     uint32_t *packet = begin(1296, 1, 0);
     if (!packet) return;
     size_t at = 0;

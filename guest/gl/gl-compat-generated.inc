@@ -251,14 +251,17 @@ void glBufferAddressRangeNV(unsigned pname_, unsigned index_, unsigned long long
     gexgen_call(8354u, "v w w q q", args__);
 }
 void glBufferAttachMemoryNV(unsigned target_, unsigned memory_, unsigned long long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[3] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)memory_, (uint64_t)offset_};
     gexgen_call(8355u, "v w w q", args__);
 }
 void glBufferPageCommitmentARB(unsigned target_, long offset_, long size_, unsigned char commit_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)target_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)commit_};
     gexgen_call(8358u, "v w q q w", args__);
 }
 void glBufferPageCommitmentMemNV(unsigned target_, long offset_, long size_, unsigned memory_, unsigned long long memOffset_, unsigned char commit_) {
+    buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)target_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)memory_, (uint64_t)memOffset_, (uint64_t)(uint32_t)commit_};
     gexgen_call(8359u, "v w q q w q w", args__);
 }
@@ -267,6 +270,7 @@ void glBufferParameteriAPPLE(unsigned target_, unsigned pname_, int param_) {
     gexgen_call(8360u, "v w w w", args__);
 }
 void glBufferStorageMemEXT(unsigned target_, long size_, unsigned memory_, unsigned long long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)target_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)memory_, (uint64_t)offset_};
     gexgen_call(8364u, "v w q w q", args__);
 }
@@ -783,6 +787,7 @@ void glCopyMultiTexSubImage3DEXT(unsigned texunit_, unsigned target_, int level_
     gexgen_call(8579u, "v w w w w w w w w w w", args__);
 }
 void glCopyNamedBufferSubData(unsigned readBuffer_, unsigned writeBuffer_, long readOffset_, long writeOffset_, long size_) {
+    buffer_contents_unknown();
     uint64_t args__[5] = {(uint64_t)(uint32_t)readBuffer_, (uint64_t)(uint32_t)writeBuffer_, (uint64_t)(int64_t)readOffset_, (uint64_t)(int64_t)writeOffset_, (uint64_t)(int64_t)size_};
     gexgen_call(8580u, "v w w q q q", args__);
 }
@@ -911,6 +916,7 @@ void glDisableVertexAttribAPPLE(unsigned index_, unsigned pname_) {
     gexgen_call(8730u, "v w w", args__);
 }
 void glDispatchComputeGroupSizeARB(unsigned num_groups_x_, unsigned num_groups_y_, unsigned num_groups_z_, unsigned group_size_x_, unsigned group_size_y_, unsigned group_size_z_) {
+    buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)num_groups_x_, (uint64_t)(uint32_t)num_groups_y_, (uint64_t)(uint32_t)num_groups_z_, (uint64_t)(uint32_t)group_size_x_, (uint64_t)(uint32_t)group_size_y_, (uint64_t)(uint32_t)group_size_z_};
     gexgen_call(8739u, "v w w w w w w", args__);
 }
@@ -1407,10 +1413,12 @@ unsigned glGetCommandHeaderNV(unsigned tokenID_, unsigned size_) {
     return (unsigned)gexgen_call(9092u, "w w w", args__);
 }
 void glGetCompressedTextureImage(unsigned texture_, int level_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)texture_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9096u, "v w w w o1:z2", args__);
 }
 void glGetCompressedTextureSubImage(unsigned texture_, int level_, int xoffset_, int yoffset_, int zoffset_, int width_, int height_, int depth_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[10] = {(uint64_t)(uint32_t)texture_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)(int32_t)xoffset_, (uint64_t)(uint32_t)(int32_t)yoffset_, (uint64_t)(uint32_t)(int32_t)zoffset_, (uint64_t)(uint32_t)(int32_t)width_, (uint64_t)(uint32_t)(int32_t)height_, (uint64_t)(uint32_t)(int32_t)depth_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9098u, "v w w w w w w w w w o1:z8", args__);
 }
@@ -1859,18 +1867,22 @@ void glGetProgramivNV(unsigned id_, unsigned pname_, int * params_) {
     gexgen_call(9335u, "v w w o4:n4", args__);
 }
 void glGetQueryBufferObjecti64v(unsigned id_, unsigned buffer_, unsigned pname_, long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)buffer_, (uint64_t)(uint32_t)pname_, (uint64_t)(int64_t)offset_};
     gexgen_call(9336u, "v w w w q", args__);
 }
 void glGetQueryBufferObjectiv(unsigned id_, unsigned buffer_, unsigned pname_, long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)buffer_, (uint64_t)(uint32_t)pname_, (uint64_t)(int64_t)offset_};
     gexgen_call(9337u, "v w w w q", args__);
 }
 void glGetQueryBufferObjectui64v(unsigned id_, unsigned buffer_, unsigned pname_, long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)buffer_, (uint64_t)(uint32_t)pname_, (uint64_t)(int64_t)offset_};
     gexgen_call(9338u, "v w w w q", args__);
 }
 void glGetQueryBufferObjectuiv(unsigned id_, unsigned buffer_, unsigned pname_, long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)id_, (uint64_t)(uint32_t)buffer_, (uint64_t)(uint32_t)pname_, (uint64_t)(int64_t)offset_};
     gexgen_call(9339u, "v w w w q", args__);
 }
@@ -1939,6 +1951,7 @@ unsigned long long glGetTextureHandleNV(unsigned texture_) {
     return (unsigned long long)gexgen_call(9414u, "q w", args__);
 }
 void glGetTextureImage(unsigned texture_, int level_, unsigned format_, unsigned type_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)texture_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)format_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9415u, "v w w w w w o1:z4", args__);
 }
@@ -1975,6 +1988,7 @@ unsigned long long glGetTextureSamplerHandleNV(unsigned texture_, unsigned sampl
     return (unsigned long long)gexgen_call(9431u, "q w w", args__);
 }
 void glGetTextureSubImage(unsigned texture_, int level_, int xoffset_, int yoffset_, int zoffset_, int width_, int height_, int depth_, unsigned format_, unsigned type_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[12] = {(uint64_t)(uint32_t)texture_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)(int32_t)xoffset_, (uint64_t)(uint32_t)(int32_t)yoffset_, (uint64_t)(uint32_t)(int32_t)zoffset_, (uint64_t)(uint32_t)(int32_t)width_, (uint64_t)(uint32_t)(int32_t)height_, (uint64_t)(uint32_t)(int32_t)depth_, (uint64_t)(uint32_t)format_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9432u, "v w w w w w w w w w w w o1:z10", args__);
 }
@@ -2083,10 +2097,12 @@ void glGetnColorTableARB(unsigned target_, unsigned format_, unsigned type_, int
     gexgen_call(9508u, "v w w w w o1:z3", args__);
 }
 void glGetnCompressedTexImage(unsigned target_, int lod_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)(int32_t)lod_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9509u, "v w w w o1:z2", args__);
 }
 void glGetnCompressedTexImageARB(unsigned target_, int lod_, int bufSize_, void * img_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)(int32_t)lod_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)img_};
     gexgen_call(9510u, "v w w w o1:z2", args__);
 }
@@ -2139,10 +2155,12 @@ void glGetnPolygonStippleARB(int bufSize_, unsigned char * pattern_) {
     gexgen_call(9530u, "v w o1:p0", args__);
 }
 void glGetnTexImage(unsigned target_, int level_, unsigned format_, unsigned type_, int bufSize_, void * pixels_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)format_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)pixels_};
     gexgen_call(9533u, "v w w w w w o1:z4", args__);
 }
 void glGetnTexImageARB(unsigned target_, int level_, unsigned format_, unsigned type_, int bufSize_, void * img_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)target_, (uint64_t)(uint32_t)(int32_t)level_, (uint64_t)(uint32_t)format_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)img_};
     gexgen_call(9534u, "v w w w w w o1:z4", args__);
 }
@@ -2727,6 +2745,7 @@ void glMaxShaderCompilerThreadsKHR(unsigned count_) {
     gexgen_call(9795u, "v w", args__);
 }
 void glMemoryBarrierByRegion(unsigned barriers_) {
+    buffer_contents_unknown();
     uint64_t args__[1] = {(uint64_t)(uint32_t)barriers_};
     gexgen_call(9797u, "v w", args__);
 }
@@ -3159,38 +3178,47 @@ void glMulticastWaitSyncNV(unsigned signalGpu_, unsigned waitGpuMask_) {
     gexgen_call(9977u, "v w w", args__);
 }
 void glNamedBufferAttachMemoryNV(unsigned buffer_, unsigned memory_, unsigned long long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[3] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(uint32_t)memory_, (uint64_t)offset_};
     gexgen_call(9978u, "v w w q", args__);
 }
 void glNamedBufferData(unsigned buffer_, long size_, const void * data_, unsigned usage_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)size_, (uint64_t)(uintptr_t)data_, (uint64_t)(uint32_t)usage_};
     gexgen_call(9979u, "v w q i1:z1 w", args__);
 }
 void glNamedBufferDataEXT(unsigned buffer_, long size_, const void * data_, unsigned usage_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)size_, (uint64_t)(uintptr_t)data_, (uint64_t)(uint32_t)usage_};
     gexgen_call(9980u, "v w q i1:z1 w", args__);
 }
 void glNamedBufferPageCommitmentARB(unsigned buffer_, long offset_, long size_, unsigned char commit_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)commit_};
     gexgen_call(9981u, "v w q q w", args__);
 }
 void glNamedBufferPageCommitmentEXT(unsigned buffer_, long offset_, long size_, unsigned char commit_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)commit_};
     gexgen_call(9982u, "v w q q w", args__);
 }
 void glNamedBufferPageCommitmentMemNV(unsigned buffer_, long offset_, long size_, unsigned memory_, unsigned long long memOffset_, unsigned char commit_) {
+    buffer_contents_unknown();
     uint64_t args__[6] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)memory_, (uint64_t)memOffset_, (uint64_t)(uint32_t)commit_};
     gexgen_call(9983u, "v w q q w q w", args__);
 }
 void glNamedBufferStorage(unsigned buffer_, long size_, const void * data_, unsigned flags_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)size_, (uint64_t)(uintptr_t)data_, (uint64_t)(uint32_t)flags_};
     gexgen_call(9984u, "v w q i1:z1 w", args__);
 }
 void glNamedBufferStorageMemEXT(unsigned buffer_, long size_, unsigned memory_, unsigned long long offset_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)size_, (uint64_t)(uint32_t)memory_, (uint64_t)offset_};
     gexgen_call(9987u, "v w q w q", args__);
 }
 void glNamedBufferSubData(unsigned buffer_, long offset_, long size_, const void * data_) {
+    buffer_contents_unknown();
     uint64_t args__[4] = {(uint64_t)(uint32_t)buffer_, (uint64_t)(int64_t)offset_, (uint64_t)(int64_t)size_, (uint64_t)(uintptr_t)data_};
     gexgen_call(9988u, "v w q q i1:z2", args__);
 }
@@ -4235,6 +4263,7 @@ void glReadInstrumentsSGIX(int marker_) {
     gexgen_call(10415u, "v w", args__);
 }
 void glReadnPixels(int x_, int y_, int width_, int height_, unsigned format_, unsigned type_, int bufSize_, void * data_) {
+    if (bound_buffer(0x88EBu)) buffer_contents_unknown();
     uint64_t args__[8] = {(uint64_t)(uint32_t)(int32_t)x_, (uint64_t)(uint32_t)(int32_t)y_, (uint64_t)(uint32_t)(int32_t)width_, (uint64_t)(uint32_t)(int32_t)height_, (uint64_t)(uint32_t)format_, (uint64_t)(uint32_t)type_, (uint64_t)(uint32_t)(int32_t)bufSize_, (uint64_t)(uintptr_t)data_};
     gexgen_call(10417u, "v w w w w w w w o1:z6", args__);
 }
