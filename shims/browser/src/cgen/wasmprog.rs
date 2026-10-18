@@ -180,7 +180,13 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // W3's compact address space (`nt::w3_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
-        // Or the NT layer's split, for a site that asks (`?w3split=1`).
+        // Or the NT layer's split, for a site that asks (`?w3split=1`), and
+        // always for a 64-bit (W64) process: the compact space ends at 2 GiB,
+        // and a 64-bit Wine maps past it (Hades x64's page ran out of memory
+        // at 2 GiB with it).
+        if flags & FLAG_GUEST_X86_64 != 0 {
+            crate::nt::set_w3_split(true);
+        }
         let lo = crate::nt::w3_space().map_err(|e| format!("W3: {e}"))?;
         if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
             crate::nt::w3_kuser();

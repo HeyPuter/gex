@@ -71,4 +71,21 @@ if "$ROOT/tools/wine-wasm/wcc64" -O2 -Wl,--gex-guest-x86-64 -o "$WORK/winspace" 
 else
     echo "FAIL winspace: wcc64"; fail=1
 fi
+# And past 2 GiB: a W64 process's space is the NT layer's split, not W3's
+# compact one (which ends at 2 GiB: 1536 MiB here before).
+want='mapped 2560 MiB, above 2 GiB 1'
+if "$ROOT/tools/wine-wasm/wcc64" -O2 -Wl,--gex-guest-x86-64 -o "$WORK/winspace-high" "$HERE/winspace-high.c"; then
+    for flavour in mp sp; do
+        s=; [ $flavour = sp ] && s=1
+        got=$(run "$s" --file "/t/winspace-high=$WORK/winspace-high" --cwd /t --argv0 ./winspace-high "$SEED" "$WORK/winspace-high")
+        if [ "$got" = "$want" ]; then
+            echo "ok   wasm64/winspace-high (browser $flavour, past 2 GiB)"
+        else
+            echo "FAIL wasm64/winspace-high (browser $flavour, past 2 GiB)"; printf '%s\n' "$got" | sed 's/^/  got: /'
+            grep -a 'arena cannot grow' "$WORK/err" | head -2 | sed 's/^/  stderr: /'; fail=1
+        fi
+    done
+else
+    echo "FAIL winspace-high: wcc64"; fail=1
+fi
 exit $fail
