@@ -266,7 +266,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
                 "$here/stubs/build.sh" "$sn" "$arch" "$sp" >"$g/stub-$sn.log" 2>&1 ||
                     echo "$slug: stub $sn did not build (see $g/stub-$sn.log)" >&2
             fi ;;
-        host=*|pe=*|page=*|eventlog=*) ;;
+        host=*|pe=*|page=*|eventlog=*|lib=*) ;;
         *) gflags+=("$x") ;;
         esac
     done

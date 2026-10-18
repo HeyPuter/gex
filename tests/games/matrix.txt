@@ -33,6 +33,9 @@
 # mksite.py, game.json `switches`; VALUE defaults to 1); native runs skip it.
 # Game sites start Wine's event log on demand (system.reg Eventlog Start=3:
 # no svchost at boot); `eventlog=1` keeps it auto-started. Native runs skip it.
+# `lib=PATH` puts a host library (and its ldd closure) in a Linux game's site
+# bundle; mksite.py also adds what the bundle's ELF files dlopen by soname.
+# Native runs skip it.
 
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
@@ -89,6 +92,6 @@ stardew      |dotnet|Stardew Valley                     |MonoGame on .NET 6: str
 
 # i386 Windows games on W3, added 10-18 (G2), last so the served ports above keep their numbers.
 # celeste, towerfall, antichamber: .NET (XNA/FNA) and UDK on Wine Mono (W3 dist -mono11.2.0, 1018a).
-celeste      |w3   |Celeste                             |Celeste.exe                         | |4530|-|celeste-w3.wl
+celeste      |w3   |Celeste                             |Celeste.exe                         | |4530|-|celeste-w3.wl|page=w3split
 towerfall    |w3   |TowerFall Ascension                 |TowerFall.exe                       | |9900|-|-
-antichamber  |w3   |Antichamber                         |Binaries/Win32/UDK.exe              | |-|-|-
+antichamber  |w3   |Antichamber                         |Binaries/Win32/UDK.exe              | |-|-|-|page=w3split
