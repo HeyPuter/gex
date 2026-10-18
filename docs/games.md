@@ -376,10 +376,10 @@ ship the function-tier units built for those bases by the page's own gexc
 |---|---|---|---|
 | 4400 | Undertale | w3 | **intro renders** |
 | 4401 | Katana ZERO | w3 | **title menu** |
-| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs |
+| 4402 | N++ | w3 | gooner (SwiftShader, GL 3.2): OpenGLRenderer.dll calls a GL entry point the context lacks and exits; edger's GPU (GL 4.2): runs (300 s, no OOM, with g/w3-dll-band's band pins; since W3's compact space it ran out of memory without them) |
 | 4403 | Momodora | w3 | unhandled page fault on execute in the game within 120 s |
 | 4404 | Retrocycles | w3 | **language menu** |
-| 4405 | Hades (x86) | w3 | shim trap in syscall 162 (the ucrtbase rewind); needs the W3 dist with the fix and new units |
+| 4405 | Hades (x86) | w3 | **main menu** (gex g/w3-dll-band: DLLs pinned in the band, and `w3split=1` from the matrix's `page=w3split`: in W3's compact space its 1.5 GiB of mappings and the shim's heap do not fit together under 2 GiB, and it runs out of memory at the loading screen) |
 | 4406 | Baba Is You | linux-x11 | renders (credits screen; cropped, as natively fullscreen) |
 | 4407 | Retrocycles | linux-x11 | **language menu** |
 | 4408 | Warfork | linux | stops: ld.so's `_dl_get_origin` assertion (`/proc/self/exe` is not an absolute path in the page) |
@@ -414,7 +414,7 @@ correctness only; edger is used for checks that need a GPU.
 | Retrocycles | w3 | **gameplay** (a match) | |
 | Momodora | w3 | **title** ("Press Any Button") | no input script yet |
 | N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
-| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh) |
+| Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh); in the page it needs `page=w3split` (the shim's heap above 2 GiB) |
 | Hades | w64 | **menu** (edger) | stub=basecamp (x64) |
 | Spelunky 2 | w64 | blank window | the main thread holds the loader lock after concrt140 loads while two threads spin on GetSystemTimeAsFileTime; open |
 | Dicey Dungeons | w64 | **menu** | dicey-w64.wl |

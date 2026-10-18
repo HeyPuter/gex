@@ -29,6 +29,8 @@
 # `stub=NAME@PATH` puts tests/games/stubs/NAME (built for the game's arch)
 # in place of the game's PATH, relative to its directory. On w64,
 # `pe=DLL[,DLL...]` keeps those DLLs Wine's PE build instead of W64_NATIVE's.
+# `page=NAME[=VALUE]` is a page switch the game's site sets (scratch/G/
+# mksite.py, game.json `switches`; VALUE defaults to 1); native runs skip it.
 
 # i386 Windows games on W3.
 undertale    |w3   |Undertale                            |UNDERTALE.exe                       | |800|2000|undertale-w3.wl
@@ -38,7 +40,7 @@ katana-zero  |w3   |Katana ZERO                          |Katana ZERO.exe       
 npp          |w3   |N++                                  |N++.exe                             | |-|-|-
 momodora     |w3   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |w3   |Retrocycles                          |Retrocycles.exe                     | |-|-|retrocycles-w3.wl
-hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-|stub=basecamp@x86/BasecampBugReporter.Native.dll
+hades-x86    |w3   |Hades                                |x86/Hades.exe                       | |-|-|-|stub=basecamp@x86/BasecampBugReporter.Native.dll page=w3split
 
 # Linux builds (no Wine).
 baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|4000|baba.wl|--lazy seed=seed/baba@~/.local/share/Baba_Is_You
