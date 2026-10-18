@@ -411,6 +411,9 @@ correctness only; edger is used for checks that need a GPU.
 | Katana ZERO | w3 | **gameplay** (the first level; menu frame 1200, gameplay 3000) | katana-zero-w3.wl starts at frame 10, when the window has the keyboard; up to NEW GAME at 65 s |
 | Retrocycles | w3 | **gameplay** (a match) | |
 | Momodora | w3 | **title** ("Press Any Button") | no input script yet |
+| Celeste | w3 | **title** (the mountain, frame ~4500; G2, 1200 s and more) | XNA on Wine Mono 11.2.0 (FNA on d3d11); loading takes about 6 minutes on gooner; celeste-w3.wl starts at frame 4800 |
+| TowerFall Ascension | w3 | **title menu** (frame 9900; G2) | needed a Steam stand-in (it showed "Couldn't find Steam!" without one) |
+| Antichamber | w3 | not yet known | UDK.exe, mixed-mode CLR on Wine Mono; G2's run in progress |
 | N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
 | Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh); in the page it needs `page=w3split` (the shim's heap above 2 GiB) |
 | Hades | w64 | **menu** (edger) | stub=basecamp (x64) |
