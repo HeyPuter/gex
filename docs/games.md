@@ -425,9 +425,12 @@ per-version headers: `~/src/gbe_fork/sdk/steam`, a sparse clone of
 github.com/Detanup01/gbe_fork, plus `~/src/Steamworks.NET/CodeGen/steam/steam_api.json`;
 neither is in the tree). Pre-1.37 accessors (SteamUser() ...) use the
 versions found in the `.orig` DLL. Undertale and Katana ZERO get through
-Steam init with it. `GEX_STEAM_TRACE=1` (GAME_ENV) is meant to log
-lookups but writes to the GUI process's stderr handle, which shows
-nothing yet; use OutputDebugString next time.
+Steam init with it. `GEX_STEAM_TRACE=1` (GAME_ENV) logs Steam init, the
+accessors, misses and every interface method called, through
+OutputDebugStringA: run with `WINEDEBUG=+debugstr` to see it. Celeste and
+TowerFall's CSteamworks.dll (Steamworks.NET 7, SDK 1.33a) also needs the
+pre-1.37 flat exports (Steam_RunCallbacks, g_pSteamClientGameServer ...)
+and a non-null GetISteamUnifiedMessages.
 
 ### Scope (user, 2026-10-05)
 
