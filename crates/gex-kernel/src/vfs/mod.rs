@@ -24,7 +24,7 @@ pub mod tmpfs;
 pub use devfs::DevFs;
 #[cfg(unix)]
 pub use hostfs::HostFs;
-pub use procfs::{ProcFs, ProcSource};
+pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
 pub use tmpfs::TmpFs;
 

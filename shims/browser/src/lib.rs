@@ -1684,6 +1684,7 @@ fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
+    kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
     proc_state
 }
 
@@ -5067,6 +5068,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
+    // The processors, as glibc's get_nprocs and Wine's topology read them.
+    root.add_dir("/sys/devices/system/cpu");
+    kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
     kernel.clock = browser_clock;
     // And the clock a write stamps a file with.
     gex_kernel::vfs::tmpfs::set_clock(browser_clock);

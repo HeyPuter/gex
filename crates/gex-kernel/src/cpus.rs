@@ -86,12 +86,17 @@ pub fn proc_cpuinfo(block: &str) -> String {
     s
 }
 
+/// Tests that set the count hold this, since the count is process-wide.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn every_report_agrees() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(6);
         assert_eq!(count(), 6);
         assert_eq!(mask(), 0b11_1111);
