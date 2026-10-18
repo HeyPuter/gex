@@ -36,8 +36,7 @@ __declspec(dllimport) unsigned long WINAPI GetFileSize(void *, unsigned long *);
 __declspec(dllimport) int WINAPI CloseHandle(void *);
 __declspec(dllimport) unsigned long WINAPI GetCurrentDirectoryA(unsigned long, char *);
 __declspec(dllimport) void WINAPI GetSystemTimeAsFileTime(unsigned long long *);
-__declspec(dllimport) void *WINAPI GetStdHandle(unsigned long);
-__declspec(dllimport) int WINAPI WriteFile(void *, const void *, unsigned long, unsigned long *, void *);
+__declspec(dllimport) void WINAPI OutputDebugStringA(const char *);
 __declspec(dllimport) unsigned long WINAPI GetModuleFileNameA(void *, char *, unsigned long);
 __declspec(dllimport) int WINAPI GetModuleHandleExA(unsigned long, const char *, void **);
 __declspec(dllimport) void *WINAPI VirtualAlloc(void *, uintptr_t, unsigned long, unsigned long);
@@ -69,15 +68,19 @@ static bool gex_streq(const char *a, const char *b) {
     return *a == *b;
 }
 
+/* GEX_STEAM_TRACE=1: one line per call worth seeing, through
+ * OutputDebugStringA (Wine's +debugstr channel shows it; a GUI process's
+ * stderr handle shows nothing). */
 static void gex_log(const char *a, const char *b = "") {
     char tr[8];
     if (!GetEnvironmentVariableA("GEX_STEAM_TRACE", tr, sizeof tr)) return;
-    void *err = GetStdHandle((unsigned long)-12);
-    unsigned long w;
-    WriteFile(err, "gex-steam: ", 11, &w, 0);
-    WriteFile(err, a, (unsigned long)gex_strlen(a), &w, 0);
-    WriteFile(err, b, (unsigned long)gex_strlen(b), &w, 0);
-    WriteFile(err, "\n", 1, &w, 0);
+    char line[256];
+    unsigned long n = 0;
+    const char *parts[3] = {"gex-steam: ", a, b};
+    for (const char *p : parts)
+        for (; *p && n < sizeof line - 1; p++) line[n++] = *p;
+    line[n] = 0;
+    OutputDebugStringA(line);
 }
 
 /* A whole small file, or 0 (VirtualAlloc'd; *len is its size). */
@@ -173,6 +176,7 @@ static unsigned gex_steam_time() {
     return (unsigned)gex_udiv(ft - 116444736000000000ull, 10000000u);
 }
 
+#define GEX_TRACE(s) gex_log(s)
 #include "steam_versions.inc"
 
 typedef struct gex_agg_CSteamID gex_ret_CSteamID;
@@ -349,7 +353,7 @@ S_API int SteamAPI_InitFlat(char *err) { if (err) err[0] = 0; return 0; }
 S_API int SteamInternal_SteamAPI_Init(const char *, char *err) { if (err) err[0] = 0; return 0; }
 S_API void SteamAPI_Shutdown() {}
 S_API bool SteamAPI_RestartAppIfNecessary(unsigned) { return false; }
-S_API bool SteamAPI_IsSteamRunning() { return true; }
+S_API bool SteamAPI_IsSteamRunning() { gex_log("SteamAPI_IsSteamRunning"); return true; }
 S_API const char *SteamAPI_GetSteamInstallPath() { return gex_steam_dir(); }
 S_API void SteamAPI_RunCallbacks() {}
 /* Flat entry points of SDKs before 1.37, which CSteamworks.dll (Celeste,
@@ -382,7 +386,7 @@ S_API bool SteamAPI_ManualDispatch_GetAPICallResult(int, unsigned long long, voi
 S_API void *SteamInternal_FindOrCreateUserInterface(int, const char *v) { gex_log("user interface ", v); return gex_find(v); }
 S_API void *SteamInternal_FindOrCreateGameServerInterface(int, const char *v) { return gex_find(v); }
 S_API void *SteamInternal_CreateInterface(const char *v) { gex_log("interface ", v); return gex_find(v); }
-S_API void *CreateInterface(const char *v, int *rc) { if (rc) *rc = 0; return gex_find(v); }
+S_API void *CreateInterface(const char *v, int *rc) { gex_log("CreateInterface ", v); if (rc) *rc = 0; return gex_find(v); }
 
 /* `{ void (*init)(void *ctx); uintptr_t counter; void *ctx; }`: run the
  * accessor's initialiser once per counter, then hand back its slot. */
@@ -396,7 +400,8 @@ S_API void *SteamInternal_ContextInit(void *data) {
 }
 
 /* SDKs before 1.37: accessors exported by steam_api.dll. */
-#define GEX_ACCESSOR(name, family) S_API void *name() { return gex_accessor(family); }
+#define GEX_ACCESSOR(name, family) \
+    S_API void *name() { void *p = gex_accessor(family); gex_log(#name, p ? "" : " -> null"); return p; }
 GEX_ACCESSOR(SteamClient, "STEAMCLIENT")
 GEX_ACCESSOR(SteamUser, "STEAMUSER")
 GEX_ACCESSOR(SteamFriends, "STEAMFRIENDS")
