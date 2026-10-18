@@ -739,33 +739,55 @@ void glBindBuffer(unsigned target, unsigned name) {
     CMD2(GEXGL_BIND_BUFFER, target, name);
 }
 
+/* The most one upload command may carry: the command area less room for
+   its header and arguments, in whole 64 KiB parts. Larger buffer uploads
+   are sent in parts (glBufferData, glBufferSubData). */
+void glBufferSubData(unsigned target, long offset, long size, const void *data);
+
+static size_t upload_chunk(void) {
+    uint32_t cap = ring ? ring->capacity : CMD_CAPACITY;
+    size_t step = cap > (1u << 20) ? ((size_t)cap - 65536u) & ~(size_t)65535u : cap / 2u;
+    return step ? step : 4u;
+}
+
 void glBufferData(unsigned target, long size, const void *data, unsigned usage) {
     if (size < 0) return;
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) object->size = len;
-    size_t blob_len = data ? len : 0;
+    /* Contents larger than one command can carry go as a bare allocation,
+       then glBufferSubData in parts. */
+    int split = data && len > upload_chunk();
+    size_t blob_len = data && !split ? len : 0;
     uint32_t *p = begin(GEXGL_BUFFER_DATA, 5, 4 + blob_len);
     if (!p) return;
     p[0] = target;
     p[1] = usage;
     p[2] = (uint32_t)(uint64_t)size;
     p[3] = (uint32_t)((uint64_t)size >> 32);
-    p[4] = data != NULL;
+    p[4] = data != NULL && !split;
     put_blob(p + 5, data, blob_len);
+    if (split) glBufferSubData(target, 0, size, data);
 }
 
 void glBufferSubData(unsigned target, long offset, long size, const void *data) {
     if (offset < 0 || size < 0 || (size && !data)) return;
-    size_t len = (size_t)size;
-    uint32_t *p = begin(GEXGL_BUFFER_SUB_DATA, 5, 4 + len);
-    if (!p) return;
-    p[0] = target;
-    p[1] = (uint32_t)(uint64_t)offset;
-    p[2] = (uint32_t)((uint64_t)offset >> 32);
-    p[3] = (uint32_t)(uint64_t)size;
-    p[4] = (uint32_t)((uint64_t)size >> 32);
-    put_blob(p + 5, data, len);
+    /* An upload larger than one command can carry goes in parts. */
+    size_t left = (size_t)size, step = upload_chunk();
+    uint64_t at = (uint64_t)offset;
+    const uint8_t *from = (const uint8_t *)data;
+    do {
+        size_t len = left > step ? step : left;
+        uint32_t *p = begin(GEXGL_BUFFER_SUB_DATA, 5, 4 + len);
+        if (!p) return;
+        p[0] = target;
+        p[1] = (uint32_t)at;
+        p[2] = (uint32_t)(at >> 32);
+        p[3] = (uint32_t)(uint64_t)len;
+        p[4] = (uint32_t)((uint64_t)len >> 32);
+        put_blob(p + 5, from, len);
+        at += len; from += len; left -= len;
+    } while (left);
 }
 
 /* Generated below with the rest of the GL 4.4 synchronous query surface.
@@ -2605,6 +2627,15 @@ void glGetSynciv(void *sync, unsigned pname, int buf_size, int *length, int *val
     } else if (length) {
         *length = 0;
     }
+}
+
+/* The most one readback command may ask for: the reply area less room for
+   its length word and anything else in the reply, in whole 64 KiB parts.
+   Readbacks larger than this are asked for in parts (glGetBufferSubData). */
+static uint64_t readback_chunk(void) {
+    uint32_t cap = ring ? ring->reply_capacity : REPLY_CAPACITY;
+    uint64_t step = cap > (1u << 20) ? ((uint64_t)cap - 65536u) & ~(uint64_t)65535u : cap / 2u;
+    return step ? step : 4u;
 }
 
 /* Registry-derived, pointer-free OpenGL 4.4 entry points.  This include is

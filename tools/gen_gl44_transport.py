@@ -973,14 +973,23 @@ def guest_function(command: dict, opcode: int) -> str:
 }}
 """
     if name == "glGetBufferSubData":
+        # A read larger than the reply area is asked for in parts, each one
+        # command whose reply fits (HLD reads a 64 MiB vertex buffer back).
         return f"""void {name}(unsigned target, long offset, long size, void *data) {{
-    uint32_t *a = begin({opcode}, 5, 0);
-    if (!a) return;
-    uint64_t off = (uint64_t)offset, bytes = (uint64_t)size;
-    a[0] = target; a[1] = (uint32_t)off; a[2] = (uint32_t)(off >> 32);
-    a[3] = (uint32_t)bytes; a[4] = (uint32_t)(bytes >> 32); flush();
-    uint32_t reply_len = 0; const uint8_t *reply = reply_blob(&reply_len);
-    if (data && size > 0 && reply && reply_len == (uint64_t)size) memcpy(data, reply, reply_len);
+    uint64_t off = (uint64_t)offset, left = (uint64_t)size;
+    uint8_t *out = (uint8_t *)data;
+    const uint64_t step = readback_chunk();
+    do {{
+        uint64_t bytes = (size > 0 && left > step) ? step : left;
+        uint32_t *a = begin({opcode}, 5, 0);
+        if (!a) return;
+        a[0] = target; a[1] = (uint32_t)off; a[2] = (uint32_t)(off >> 32);
+        a[3] = (uint32_t)bytes; a[4] = (uint32_t)(bytes >> 32); flush();
+        uint32_t reply_len = 0; const uint8_t *reply = reply_blob(&reply_len);
+        if (!out || size <= 0 || !reply || reply_len != bytes) return;
+        memcpy(out, reply, reply_len);
+        off += bytes; out += bytes; left -= bytes;
+    }} while (left);
 }}
 """
     if name in INDEXED_INTEGER_QUERIES:

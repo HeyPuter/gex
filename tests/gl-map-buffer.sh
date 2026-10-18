@@ -12,8 +12,8 @@ WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 cc -O2 -Wall -Wextra -o "$WORK/probe" "$SOURCE" -lEGL -lGL
 EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 "$WORK/probe" | tee "$WORK/native.log"
-grep -q 'SUMMARY cases=3 passed=3 failed=0' "$WORK/native.log"
+grep -q 'SUMMARY cases=5 passed=5 failed=0' "$WORK/native.log"
 GEX_CC=${GEX_CC:-cc} "$ROOT/guest/gl/build.sh" "$WORK/guest-gl" >/dev/null
 "$GEXC" run --gl --env LD_LIBRARY_PATH="$WORK/guest-gl" "$WORK/probe" | tee "$WORK/gex.log"
-grep -q 'SUMMARY cases=3 passed=3 failed=0' "$WORK/gex.log"
+grep -q 'SUMMARY cases=5 passed=5 failed=0' "$WORK/gex.log"
 echo "ok   gl-map-buffer"
