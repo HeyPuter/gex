@@ -33,13 +33,19 @@
 //      raises a placed window. A right click on the caption opens Wine's
 //      window menu (the guest has the right button) and the browser's
 //      context menu is cancelled.
+//   1b. fill.json's `demand` units (eject-site.mjs --boot-units: units no
+//      image loads before the program is up) are whole in the fill and in no
+//      boot archive; run, the fill ends (`[app] fill:`) with no unit of it
+//      failing (`[app] late unit`, `[app] the fill failed`);
+//   1c. with pieces (eject-site.mjs --pieces), no bytes twice: files of one
+//      class with the same bytes share one piece's copy;
 //   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
 //      the site's page instead, a hand-written one with its own container,
 //      size, arguments and onExit. The desktop is its box's size, inside the
 //      box; then kill() ends the run, `exited` and onExit say 137.
 // Prints PASS or FAIL lines; exits 0 only when all pass.
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createReadStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -88,9 +94,45 @@ if (off.includes('compositor')) {
   const boot = pre.filter(([k]) => /^tar:/.test(k)).reduce((a, [k]) => a + Number(k.slice(4)), 0);
   const inFill = new Set(fill.files.filter(([n]) => /^unit:.*\/c\.wasm$/.test(n)).map(([n]) => n.slice(5, -7)));
   const units = nt.units ?? [];
+  if (fill.demand) {
+    const names = new Set(fill.files.map(([n]) => n));
+    const bootKeys = new Set();
+    for (const [k, url] of pre) {
+      if (!/^tar:/.test(k)) continue;
+      const tp = join(site, String(url).replace(/^\/+/, ''));
+      // A unit archive is packed (pack.json: TAR.zst); its names are the units' keys.
+      const z = existsSync(`${tp}.zst`) ? `${tp}.zst` : null;
+      const list = z ? execFileSync('sh', ['-c', 'zstd -dc "$1" | tar -t', 'sh', z], { encoding: 'utf8' }) : existsSync(tp) ? execFileSync('tar', ['-tf', tp], { encoding: 'utf8' }) : '';
+      for (const l of list.split('\n')) if (l.endsWith('/c.wasm')) bootKeys.add(l.slice(0, -7));
+    }
+    const whole = fill.demand.filter((k) => names.has(`unit:${k}/c.wasm`) && names.has(`unit:${k}/c.entries`));
+    const twice = fill.demand.filter((k) => bootKeys.has(k));
+    check(fill.demand.length > 0 && whole.length === fill.demand.length && twice.length === 0,
+      `the fill's demand units: ${fill.demand.length}, ${whole.length} whole in the fill, ${twice.length} also in a boot archive`);
+  }
   if (pre.some(([k]) => /^tar:/.test(k))) {
     check(lateOnly.length === 0 && boot + inFill.size === units.length,
       `every unit loadable by every Worker: ${boot} in the boot archive + ${inFill.size} in the fill = ${units.length} units${lateOnly.length ? `; given only to later Workers: ${lateOnly.join(', ')}` : ''}`);
+  }
+}
+{
+  const pj = join(site, 'project/build/web/pieces.json');
+  if (existsSync(pj)) {
+    const { createHash } = await import('node:crypto');
+    const pi = JSON.parse(readFileSync(pj, 'utf8'));
+    const body = pi.pieces.map(([url]) => {
+      const f = join(site, String(url).replace(/^\/+/, ''));
+      return existsSync(`${f}.zst`) ? execFileSync('zstd', ['-dc', `${f}.zst`], { maxBuffer: 1 << 30 }) : readFileSync(f);
+    });
+    const at = new Map(); // "class:hash" -> "piece:offset"
+    let twice = 0, bytes = 0;
+    for (const [path, i, off, n] of pi.files) {
+      const k = `${pi.pieces[i][2]}:${createHash('sha256').update(body[i].subarray(off, off + n)).digest('hex')}`;
+      const here = `${i}:${off}`;
+      if (!at.has(k)) at.set(k, here);
+      else if (at.get(k) !== here) { twice++; bytes += n; }
+    }
+    check(twice === 0, `pieces: no file's bytes stored twice (${pi.files.length} files; ${twice} copies stored again, ${bytes} bytes)`);
   }
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');
@@ -182,6 +224,8 @@ await browser.send('Runtime.enable', {}, page);
 // ("[gex-record] unit KEY hit|miss PATH"), and with W3PAGE_CONSOLE=FILE
 // every line, timestamped, for a diagnosis.
 const units = { hit: new Set(), miss: new Set() };
+// The background fill: its end, and a unit of it that failed.
+const fillSeen = { done: null, failed: [] };
 {
   const { appendFileSync } = await import('node:fs');
   const t0 = Date.now();
@@ -189,6 +233,8 @@ const units = { hit: new Set(), miss: new Set() };
     const line = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
     const u = /\[gex-record\] unit [0-9a-f-]+ (hit|miss) (\S+)/.exec(line);
     if (u) units[u[1]].add(u[2]);
+    if (/\[app\] fill: \d+ files/.test(line)) fillSeen.done = line.replace(/^.*\[app\] /, '');
+    if (/\[app\] (late unit|the fill failed)/.test(line)) fillSeen.failed.push(line.replace(/^.*\[app\] /, ''));
     if (process.env.W3PAGE_CONSOLE) appendFileSync(process.env.W3PAGE_CONSOLE, `${Date.now() - t0} ${line}\n`);
   });
   browser.on('Target.attachedToTarget', async (p) => {
@@ -258,6 +304,16 @@ await sleep(2000);
 d = JSON.parse((await ev('(async () => JSON.stringify(await globalThis.__gexCompositor.describe()))()')) ?? '{}');
 check((d.lit ?? 0) > 1000, `the window has pixels (lit ${d.lit})`);
 if (nt.bundle?.split) console.log(`info: ${lazyReads} lazy read(s) to the window`);
+// 1b, run: the fill (with --boot-units, the units deferred to it) ends, and
+// none of its units failed.
+{
+  const fillP = join(site, 'project/build/web/fill.json');
+  const fill = existsSync(fillP) ? JSON.parse(readFileSync(fillP, 'utf8')) : null;
+  if (fill?.demand) {
+    for (let i = 0; i < 240 && !fillSeen.done && !fillSeen.failed.length; i++) await sleep(500);
+    check(!!fillSeen.done && !fillSeen.failed.length, `the fill ends with every unit in it whole (${fillSeen.done ?? 'no end in 120 s'}${fillSeen.failed.length ? `; ${fillSeen.failed.slice(0, 3).join('; ')}` : ''})`);
+  }
+}
 
 // 6. A page of its own: the desktop in its box, at the box's size; kill().
 if (shell) {

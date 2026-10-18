@@ -21,7 +21,8 @@
 // worker: the host sends the isolation headers (serve.mjs, _headers). --bench keeps the recorded benchmark settings
 // (scripted input, the 4x clock); without it they are dropped, so a player
 // gets the real clock and their own input. --drop removes a guest path from
-// the bundle (e.g. a benchmark's seed-pinning mod).
+// the bundle (e.g. a benchmark's seed-pinning mod). --late FILE and
+// --boot-units FILE: what goes in the background fill (below).
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -34,7 +35,7 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--stable-from'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache', '--late', '--boot-units', '--stable-from'].includes(av[i - 1]));
 // A W3 page's site (below): --strip takes the debug sections out of every
 // .wasm (the bundle's included), --prune leaves out files the browser never
 // reads (precompiled .cwasm, static archives), --dedupe puts identical files
@@ -393,30 +394,51 @@ function pieces(x) {
   const groups = new Map(); // "class/n" -> [[rel, bytes]]
   // A file's other names (hard links, which --dedupe makes): emptied with
   // the first, so each takes the first's bytes and piece.
-  const inodes = new Map(); // "dev:ino" -> [group, bytes]
+  const inodes = new Map(); // "dev:ino" -> [rel, bytes]
+  // Each file with its bytes and class, then its group: the group of the
+  // first path (in order) of its class with the same bytes, so a file's
+  // copies (Wine's builtin in /w3 and its copy in system32, the four of each
+  // .nls) are stored once, in one piece. By its own path they fell in
+  // different pieces, and zstd, a piece at a time, stored each: 22.5 MB of
+  // the Win7 shell's 479 MB, 7.7 MB packed. Still a function of the files
+  // alone: the same files give the same pieces.
+  const found = []; // [rel, bytes, class, hash]
   walk(x, (p, rel) => {
     const st = lstatSync(p);
     if (!st.isFile()) return;
     const ino = `${st.dev}:${st.ino}`;
     if (inodes.has(ino)) {
-      const [g, b] = inodes.get(ino);
-      groups.get(g).push([rel, b]);
+      const [first, b] = inodes.get(ino);
+      found.push([rel, b, null, first]);
       return;
     }
     if (!st.size) return;
     const b = readFileSync(p);
     const cls = stable.size && isStable(p, rel.split('/').pop(), st.size, b) ? 'stable' : 'rest';
-    const n = parseInt(sha(rel).slice(0, 8), 16) % PIECES;
-    const g = `${cls}/${n}`;
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push([rel, b]);
-    if (st.nlink > 1) inodes.set(ino, [g, b]);
+    found.push([rel, b, cls, sha(b)]);
+    if (st.nlink > 1) inodes.set(ino, [rel, b]);
     // Emptied, its mode and time kept (a read-only file made writable for it).
     if (!(st.mode & 0o200)) chmodSync(p, st.mode | 0o200);
     truncateSync(p, 0);
     if (!(st.mode & 0o200)) chmodSync(p, st.mode & 0o7777);
     utimesSync(p, st.atime, st.mtime);
   });
+  const firstOf = new Map(); // "class:hash" -> the first path with them
+  for (const [rel, , cls, h] of found) {
+    if (cls === null) continue;
+    const k = `${cls}:${h}`;
+    if (!firstOf.has(k) || rel < firstOf.get(k)) firstOf.set(k, rel);
+  }
+  const groupOf = new Map(); // rel -> group
+  for (const [rel, b, cls, h] of found) {
+    if (cls === null) continue;
+    const g = `${cls}/${parseInt(sha(firstOf.get(`${cls}:${h}`)).slice(0, 8), 16) % PIECES}`;
+    groupOf.set(rel, g);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push([rel, b]);
+  }
+  // A hard link: with the first name's bytes, in its piece.
+  for (const [rel, b, cls, first] of found) if (cls === null) groups.get(groupOf.get(first)).push([rel, b]);
   const index = { pieces: [], files: [] };
   // The stable files' guest paths (lower case), for the units' grouping;
   // not written out.
@@ -501,6 +523,17 @@ function w3Site() {
   // the fill, not units.tar).
   const lateGuest = (p) => String(p ?? '').replace(/^\/pfx\/dosdevices\/c:\//i, '/pfx/drive_c/').toLowerCase();
   const lateKeys = new Set();
+  // --boot-units FILE: the images (guest paths, one a line) whose units the
+  // program loads before it is up (the Win7 shell's taskbar), recorded from
+  // a run of the page. Every other unit goes to the background fill, after
+  // the boot's download, not in it: the shell's IE, Paint and Sticky Notes
+  // units, 58 MB of its 285 MB first download, which nothing maps before
+  // the taskbar. They are shared as bytes and compiled when a process first
+  // maps one (preload.json's `demand`; fill.json's `demand`), as a unit the
+  // recording used late is; a process that maps one before the fill has it
+  // waits for its bytes there (worker.mjs `loadFile`).
+  const bootUnitsList = opt('--boot-units', null) ? new Set(readFileSync(opt('--boot-units', null), 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).map(lateGuest)) : null;
+  const fillDemand = [];
   let lazyFiles = 0, lazyBytes = 0;
   let lazySource = new Map(); // a lazy file's guest path (lower case) -> its bytes in the store
   const piecesOn = flag('--pieces');
@@ -560,7 +593,7 @@ function w3Site() {
       // Each late image's unit follows its bytes there (`unit:KEY/FILE`):
       // the page compiles it from the fill, and a Worker started before
       // that reads it there (app.js, worker.mjs `loadFile`).
-      if (late.length) {
+      if (late.length || bootUnitsList) {
         const byPath = new Map(lazy.map((f) => [f[0], f]));
         const seen = new Map();
         const entries = [];
@@ -579,10 +612,30 @@ function w3Site() {
             for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(web, 'units', u.key, n)));
           }
         }
+        // --boot-units: the units no image of the list has, in the order the
+        // recording first used them (then the ones it never used).
+        if (bootUnitsList) {
+          const at = (u) => (typeof u.at === 'number' ? u.at : Infinity);
+          const deferred = (w3.units ?? [])
+            .filter((u) => !bootUnitsList.has(lateGuest(u.path)) && !lateKeys.has(u.key) && existsSync(join(web, 'units', u.key, 'c.wasm')) && !existsSync(join(web, 'units', u.key, 'cold')))
+            .sort((a, b) => at(a) - at(b) || (a.key < b.key ? -1 : 1));
+          for (const u of deferred) {
+            if (lateKeys.has(u.key)) continue;
+            lateKeys.add(u.key);
+            fillDemand.push(u.key);
+            for (const n of ['c.entries', 'c.wasm']) put(`unit:${u.key}/${n}`, readFileSync(join(web, 'units', u.key, n)));
+          }
+          console.log(`eject-site: --boot-units: ${fillDemand.length} units in the fill, compiled when first mapped`);
+        }
         const fb = join(work, 'fill.bin');
-        writeFileSync(fb, Buffer.concat(parts));
-        place(fb, 'project/build/web/fill.bin');
-        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: '/project/build/web/fill.bin', size: off, files: entries }));
+        const fillBytes = Buffer.concat(parts);
+        writeFileSync(fb, fillBytes);
+        // With --pieces, named by its bytes like a piece, which the page keeps
+        // in its cache (fill-worker.js): a later visit, or a build that left
+        // the fill alone, does not download it again.
+        const fillSite = piecesOn ? `project/build/web/pieces/f${sha(fillBytes).slice(0, 32)}.bin` : 'project/build/web/fill.bin';
+        place(fb, fillSite);
+        writeFileSync(join(out, 'project/build/web/fill.json'), JSON.stringify({ url: `/${fillSite}`, size: off, files: entries, ...(fillDemand.length ? { demand: fillDemand } : {}) }));
         w3.params.fill = '/project/build/web/fill.json';
         console.log(`eject-site: the fill: ${seen.size} files and ${lateKeys.size} units, ${off} bytes, after the bundle`);
       }
