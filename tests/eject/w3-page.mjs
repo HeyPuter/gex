@@ -37,6 +37,8 @@
 //      image loads before the program is up) are whole in the fill and in no
 //      boot archive; run, the fill ends (`[app] fill:`) with no unit of it
 //      failing (`[app] late unit`, `[app] the fill failed`);
+//   1c. with pieces (eject-site.mjs --pieces), no bytes twice: files of one
+//      class with the same bytes share one piece's copy;
 //   6. with --shell PAGE (tests/eject/w3-shell-min.html): PAGE is served as
 //      the site's page instead, a hand-written one with its own container,
 //      size, arguments and onExit. The desktop is its box's size, inside the
@@ -111,6 +113,26 @@ if (off.includes('compositor')) {
   if (pre.some(([k]) => /^tar:/.test(k))) {
     check(lateOnly.length === 0 && boot + inFill.size === units.length,
       `every unit loadable by every Worker: ${boot} in the boot archive + ${inFill.size} in the fill = ${units.length} units${lateOnly.length ? `; given only to later Workers: ${lateOnly.join(', ')}` : ''}`);
+  }
+}
+{
+  const pj = join(site, 'project/build/web/pieces.json');
+  if (existsSync(pj)) {
+    const { createHash } = await import('node:crypto');
+    const pi = JSON.parse(readFileSync(pj, 'utf8'));
+    const body = pi.pieces.map(([url]) => {
+      const f = join(site, String(url).replace(/^\/+/, ''));
+      return existsSync(`${f}.zst`) ? execFileSync('zstd', ['-dc', `${f}.zst`], { maxBuffer: 1 << 30 }) : readFileSync(f);
+    });
+    const at = new Map(); // "class:hash" -> "piece:offset"
+    let twice = 0, bytes = 0;
+    for (const [path, i, off, n] of pi.files) {
+      const k = `${pi.pieces[i][2]}:${createHash('sha256').update(body[i].subarray(off, off + n)).digest('hex')}`;
+      const here = `${i}:${off}`;
+      if (!at.has(k)) at.set(k, here);
+      else if (at.get(k) !== here) { twice++; bytes += n; }
+    }
+    check(twice === 0, `pieces: no file's bytes stored twice (${pi.files.length} files; ${twice} copies stored again, ${bytes} bytes)`);
   }
 }
 check(!existsSync(join(site, 'sw.js')), 'the site ships no service worker (no sw.js)');

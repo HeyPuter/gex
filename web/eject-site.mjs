@@ -394,30 +394,51 @@ function pieces(x) {
   const groups = new Map(); // "class/n" -> [[rel, bytes]]
   // A file's other names (hard links, which --dedupe makes): emptied with
   // the first, so each takes the first's bytes and piece.
-  const inodes = new Map(); // "dev:ino" -> [group, bytes]
+  const inodes = new Map(); // "dev:ino" -> [rel, bytes]
+  // Each file with its bytes and class, then its group: the group of the
+  // first path (in order) of its class with the same bytes, so a file's
+  // copies (Wine's builtin in /w3 and its copy in system32, the four of each
+  // .nls) are stored once, in one piece. By its own path they fell in
+  // different pieces, and zstd, a piece at a time, stored each: 22.5 MB of
+  // the Win7 shell's 479 MB, 7.7 MB packed. Still a function of the files
+  // alone: the same files give the same pieces.
+  const found = []; // [rel, bytes, class, hash]
   walk(x, (p, rel) => {
     const st = lstatSync(p);
     if (!st.isFile()) return;
     const ino = `${st.dev}:${st.ino}`;
     if (inodes.has(ino)) {
-      const [g, b] = inodes.get(ino);
-      groups.get(g).push([rel, b]);
+      const [first, b] = inodes.get(ino);
+      found.push([rel, b, null, first]);
       return;
     }
     if (!st.size) return;
     const b = readFileSync(p);
     const cls = stable.size && isStable(p, rel.split('/').pop(), st.size, b) ? 'stable' : 'rest';
-    const n = parseInt(sha(rel).slice(0, 8), 16) % PIECES;
-    const g = `${cls}/${n}`;
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push([rel, b]);
-    if (st.nlink > 1) inodes.set(ino, [g, b]);
+    found.push([rel, b, cls, sha(b)]);
+    if (st.nlink > 1) inodes.set(ino, [rel, b]);
     // Emptied, its mode and time kept (a read-only file made writable for it).
     if (!(st.mode & 0o200)) chmodSync(p, st.mode | 0o200);
     truncateSync(p, 0);
     if (!(st.mode & 0o200)) chmodSync(p, st.mode & 0o7777);
     utimesSync(p, st.atime, st.mtime);
   });
+  const firstOf = new Map(); // "class:hash" -> the first path with them
+  for (const [rel, , cls, h] of found) {
+    if (cls === null) continue;
+    const k = `${cls}:${h}`;
+    if (!firstOf.has(k) || rel < firstOf.get(k)) firstOf.set(k, rel);
+  }
+  const groupOf = new Map(); // rel -> group
+  for (const [rel, b, cls, h] of found) {
+    if (cls === null) continue;
+    const g = `${cls}/${parseInt(sha(firstOf.get(`${cls}:${h}`)).slice(0, 8), 16) % PIECES}`;
+    groupOf.set(rel, g);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push([rel, b]);
+  }
+  // A hard link: with the first name's bytes, in its piece.
+  for (const [rel, b, cls, first] of found) if (cls === null) groups.get(groupOf.get(first)).push([rel, b]);
   const index = { pieces: [], files: [] };
   // The stable files' guest paths (lower case), for the units' grouping;
   // not written out.
