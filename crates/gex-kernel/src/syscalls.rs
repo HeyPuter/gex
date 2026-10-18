@@ -7339,6 +7339,13 @@ impl Kernel {
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let (mut path, argv, envp) = self.read_exec_args(m, a)?;
+        // The program as `/proc/self/exe` will name it: absolute, from the
+        // caller's working directory, as Linux records it. ld.so asserts that
+        // the link starts with `/` when it works out `$ORIGIN` (Warfork's
+        // launcher execs `./wf_steam.x86_64`).
+        if !path.starts_with('/') {
+            path = crate::vfs::normalize(&path, &self.caller_cwd());
+        }
         // `/proc/self/exe` and its kind name this process's files, which the
         // exec replaces before the loader reads its program's segments: the
         // file they name now, not the link.
