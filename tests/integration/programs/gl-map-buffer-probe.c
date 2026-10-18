@@ -8,9 +8,11 @@
  * write map changed: the copy must follow glBufferSubData and must not
  * survive a GPU write (glCopyBufferSubData). A 4096x4096 RGBA texture
  * (64 MiB, larger than the command area) uploads whole, with
- * GL_UNPACK_SKIP_ROWS and GL_UNPACK_ROW_LENGTH set. A 64 MiB 3D texture
- * upload (not split) must leave one "gexgl: dropped opcode" line on
- * stderr under gex, however often it is tried. Prints
+ * GL_UNPACK_SKIP_ROWS and GL_UNPACK_ROW_LENGTH set; so do 3D textures
+ * (64 MiB in whole images; 128 MiB of 64 MiB RGBA32F images, in row bands) and a 64 MiB DXT5 image,
+ * each read back through a pixel pack buffer. A 64 MiB ASTC upload (not
+ * split) must leave one "gexgl: dropped opcode" line on stderr under gex,
+ * however often it is tried. Prints
  * SUMMARY cases=N passed=N failed=0 when right; runs on native Mesa too.
  *
  *   cc -o probe gl-map-buffer-probe.c -lEGL -lGL       (native reference)
@@ -128,6 +130,85 @@ static void check_big_texture(const char *name, int sub) {
     free(src);
     cases++; passed += ok;
     printf("CASE %s %s\n", name, ok ? "PASS" : "FAIL");
+}
+
+/* Read a texture level back whole through a pack buffer (a reply could
+   not carry it) and compare it with WANT. */
+static int pack_readback_equals(GLenum target, int compressed, GLenum format, GLenum type,
+                                const unsigned char *want, size_t len) {
+    GLuint pb;
+    glGenBuffers(1, &pb);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pb);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)len, NULL, GL_STREAM_READ);
+    if (compressed) glGetCompressedTexImage(target, 0, NULL);
+    else glGetTexImage(target, 0, format, type, NULL);
+    unsigned char *got = malloc(len);
+    memset(got, 0, len);
+    glGetBufferSubData(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)len, got);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glDeleteBuffers(1, &pb);
+    size_t bad = len;
+    for (size_t i = 0; i < len && bad == len; i++)
+        if (got[i] != want[i]) bad = i;
+    if (bad != len) printf("first difference at byte %zu: %02x, want %02x\n", bad, got[bad], want[bad]);
+    free(got);
+    return bad == len;
+}
+
+/* A W x H x D 3D texture (RGBA8, or RGBA32F when FLOATS) from client
+   memory with ROW_LENGTH W+6, IMAGE_HEIGHT H+3, SKIP_ROWS 3 and
+   SKIP_IMAGES 1. Every word is an ordinary float's bits, so RGBA32F keeps it. */
+static void check_big_3d(const char *name, int w, int h, int d, int floats) {
+    size_t px = floats ? 16 : 4;
+    size_t rl = (size_t)w + 6, ih = (size_t)h + 3;
+    size_t src_len = rl * ih * ((size_t)d + 1) * px;
+    unsigned *src = malloc(src_len);
+    for (size_t i = 0; i < src_len / 4; i++) {
+        float f = (float)((i * 2654435761u) & 0xffff) + 0.5f;
+        memcpy(&src[i], &f, 4);
+    }
+    unsigned char *want = malloc((size_t)w * h * d * px);
+    for (int z = 0; z < d; z++)
+        for (int y = 0; y < h; y++)
+            memcpy(want + (((size_t)z * h + y) * w) * px,
+                   (unsigned char *)src + ((size_t)(z + 1) * ih + (size_t)(y + 3)) * rl * px, (size_t)w * px);
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_3D, t);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, (int)rl);
+    glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, (int)ih);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 3);
+    glPixelStorei(GL_UNPACK_SKIP_IMAGES, 1);
+    glTexImage3D(GL_TEXTURE_3D, 0, floats ? GL_RGBA32F : GL_RGBA8, w, h, d, 0, GL_RGBA,
+                 floats ? GL_FLOAT : GL_UNSIGNED_BYTE, src);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+    int ok = pack_readback_equals(GL_TEXTURE_3D, 0, GL_RGBA, floats ? GL_FLOAT : GL_UNSIGNED_BYTE, want,
+                                  (size_t)w * h * d * px);
+    glDeleteTextures(1, &t);
+    free(src);
+    free(want);
+    cases++; passed += ok;
+    printf("CASE %s %s\n", name, ok ? "PASS" : "FAIL");
+}
+
+/* 8192x8192 DXT5: 64 MiB of blocks. */
+static void check_big_dxt5(void) {
+    size_t len = (size_t)2048 * 2048 * 16;
+    unsigned char *blocks = malloc(len);
+    for (size_t i = 0; i < len; i++) blocks[i] = (unsigned char)(i * 167u + (i >> 16));
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, 0x83F3 /* GL_COMPRESSED_RGBA_S3TC_DXT5_EXT */,
+                           8192, 8192, 0, (GLsizei)len, blocks);
+    int ok = pack_readback_equals(GL_TEXTURE_2D, 1, 0, 0, blocks, len);
+    glDeleteTextures(1, &t);
+    free(blocks);
+    cases++; passed += ok;
+    printf("CASE big_dxt5 %s\n", ok ? "PASS" : "FAIL");
 }
 
 int main(void) {
@@ -258,17 +339,25 @@ int main(void) {
     check_big_texture("big_tex_image", 0);
     check_big_texture("big_tex_sub_image", 1);
 
-    /* Twice: gexgl says so once. Not a case (it works natively). */
+    check_big_3d("big_3d_images", 1024, 1024, 16, 0);
+    check_big_3d("big_3d_rows", 2048, 2048, 2, 1); /* 64 MiB images: in row bands */
+    check_big_dxt5();
+
+    /* An upload gexgl does not split (ASTC 4x4, 64 MiB), twice: gexgl says
+       so once. Not a case (natively it may or may not be supported). */
     {
-        unsigned char *vol = calloc(1, (size_t)1024 * 1024 * 16 * 4);
-        GLuint t3;
-        glGenTextures(1, &t3);
-        glBindTexture(GL_TEXTURE_3D, t3);
+        size_t len = (size_t)2048 * 2048 * 16;
+        unsigned char *astc = calloc(1, len);
+        GLuint ta;
+        glGenTextures(1, &ta);
+        glBindTexture(GL_TEXTURE_2D, ta);
         for (int i = 0; i < 2; i++)
-            glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 1024, 1024, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, vol);
+            glCompressedTexImage2D(GL_TEXTURE_2D, 0, 0x93B0 /* GL_COMPRESSED_RGBA_ASTC_4x4_KHR */,
+                                   8192, 8192, 0, (GLsizei)len, astc);
         glFinish();
-        glDeleteTextures(1, &t3);
-        free(vol);
+        while (glGetError() != GL_NO_ERROR) {}
+        glDeleteTextures(1, &ta);
+        free(astc);
     }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed, cases - passed);

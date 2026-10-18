@@ -2009,6 +2009,10 @@ void glTexStorage3D(unsigned target, int levels, unsigned internal,
     p[3]=(uint32_t)width; p[4]=(uint32_t)height; p[5]=(uint32_t)depth;
 }
 
+void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset,
+                     int width, int height, int depth, unsigned format, unsigned type,
+                     const void *pixels);
+
 void glTexImage3D(unsigned target, int level, int internal, int width,
                   int height, int depth, int border, unsigned format,
                   unsigned type, const void *data) {
@@ -2016,6 +2020,12 @@ void glTexImage3D(unsigned target, int level, int internal, int width,
     size_t len = data && !pbo ? pixel_transfer_bytes(format, type, width, height, depth,
                                                       &unpack_store, NULL) : 0;
     if (len > UINT32_MAX - 4u) return;
+    if (len > upload_chunk()) {
+        /* Allocate, then upload in parts (split_glTexSubImage3D, below). */
+        glTexImage3D(target, level, internal, width, height, depth, border, format, type, NULL);
+        glTexSubImage3D(target, level, 0, 0, 0, width, height, depth, format, type, data);
+        return;
+    }
     uint32_t *p = begin(GEXGL_TEX_IMAGE_3D, 12, 4 + len); if (!p) return;
     p[0]=target; p[1]=(uint32_t)level; p[2]=(uint32_t)internal;
     p[3]=(uint32_t)width; p[4]=(uint32_t)height; p[5]=(uint32_t)depth;
@@ -2763,6 +2773,153 @@ static uint64_t readback_chunk(void) {
     uint32_t cap = ring ? ring->reply_capacity : REPLY_CAPACITY;
     uint64_t step = cap > (1u << 20) ? ((uint64_t)cap - 65536u) & ~(uint64_t)65535u : cap / 2u;
     return step ? step : 4u;
+}
+
+/* Uploads larger than one command can carry, the generated commands' part
+   (tools/gen_gl44_transport.py calls these first; each returns 1 when it
+   sent the upload itself, as smaller commands of the same kind). */
+void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset,
+                     int width, int height, int depth, unsigned format, unsigned type,
+                     const void *pixels);
+void glCompressedTexSubImage2D(unsigned target, int level, int xoffset, int yoffset,
+                               int width, int height, unsigned format, int imageSize,
+                               const void *data);
+void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoffset,
+                               int zoffset, int width, int height, int depth, unsigned format,
+                               int imageSize, const void *data);
+
+/* glTexSubImage3D: whole images per band when one fits, else each image in
+   bands of whole rows (GL_UNPACK_SKIP_IMAGES, and then SKIP_ROWS, 0
+   meanwhile: each band's first image or row is addressed directly). */
+static int split_glTexSubImage3D(unsigned target, int level, int x, int y, int z,
+                                 int w, int h, int d, unsigned format, unsigned type,
+                                 const void *pixels) {
+    struct gexgl_pixel_layout layout;
+    size_t step = upload_chunk();
+    if (!pixels || bound_buffer(0x88ECu) || d < 1 || h < 1 ||
+        !gexgl_compute_pixel_layout(format, type, w, h, d, &unpack_store, &layout) ||
+        layout.end <= step || !layout.image_stride || !layout.row_stride ||
+        layout.row_stride > step / 2)
+        return 0;
+    const uint8_t *base = pixels;
+    size_t skip_images = unpack_store.skip_images, skip_rows = unpack_store.skip_rows;
+    glPixelStorei(0x806Du, 0); /* GL_UNPACK_SKIP_IMAGES */
+    if (d > 1 && layout.image_stride <= step / 2) {
+        int n = (int)((step - layout.image_stride) / layout.image_stride);
+        if (n < 1) n = 1;
+        for (int z0 = 0; z0 < d; z0 += n)
+            glTexSubImage3D(target, level, x, y, z + z0, w, h, d - z0 < n ? d - z0 : n, format, type,
+                            base + (skip_images + (size_t)z0) * layout.image_stride);
+    } else {
+        int rows = (int)((step - layout.row_stride) / layout.row_stride);
+        if (rows < 1) rows = 1;
+        glPixelStorei(0x0CF3u, 0); /* GL_UNPACK_SKIP_ROWS */
+        for (int z0 = 0; z0 < d; z0++)
+            for (int y0 = 0; y0 < h; y0 += rows)
+                glTexSubImage3D(target, level, x, y + y0, z + z0, w, h - y0 < rows ? h - y0 : rows, 1,
+                                format, type,
+                                base + (skip_images + (size_t)z0) * layout.image_stride +
+                                    (skip_rows + (size_t)y0) * layout.row_stride);
+        glPixelStorei(0x0CF3u, (int)skip_rows);
+    }
+    glPixelStorei(0x806Du, (int)skip_images);
+    return 1;
+}
+
+/* Bytes per 4x4 block of the block-compressed formats an upload is split
+   for (S3TC, RGTC, BPTC, ETC2/EAC); 0 for any other. */
+static size_t block_bytes(unsigned format) {
+    switch (format) {
+    case 0x83F0u: case 0x83F1u: case 0x8C4Cu: case 0x8C4Du:      /* DXT1 */
+    case 0x8DBBu: case 0x8DBCu:                                    /* RGTC1 */
+    case 0x9274u: case 0x9275u: case 0x9276u: case 0x9277u:      /* ETC2 RGB(A1) */
+    case 0x9270u: case 0x9271u:                                    /* EAC R11 */
+        return 8;
+    case 0x83F2u: case 0x83F3u: case 0x8C4Eu: case 0x8C4Fu:      /* DXT3, DXT5 */
+    case 0x8DBDu: case 0x8DBEu:                                    /* RGTC2 */
+    case 0x8E8Cu: case 0x8E8Du: case 0x8E8Eu: case 0x8E8Fu:      /* BPTC */
+    case 0x9278u: case 0x9279u: case 0x9272u: case 0x9273u:      /* ETC2 RGBA8, EAC RG11 */
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+/* Compressed images in bands of whole block rows (or whole images, 3D),
+   when the data is tightly packed as the format's blocks say. */
+static int split_compressed(unsigned target, int level, int x, int y, int z, int w, int h,
+                            int d, unsigned format, int image_size, const void *data, int is_3d) {
+    size_t step = upload_chunk(), bpb = block_bytes(format);
+    if (!data || bound_buffer(0x88ECu) || image_size <= 0 || (size_t)image_size <= step ||
+        !bpb || w < 1 || h < 1 || d < 1)
+        return 0;
+    size_t brow = (((size_t)w + 3) / 4) * bpb, brows = ((size_t)h + 3) / 4;
+    size_t image = brow * brows;
+    if (image * (size_t)d != (size_t)image_size || brow > step / 2) return 0;
+    const uint8_t *base = data;
+    if (is_3d && d > 1 && image <= step / 2) {
+        int n = (int)((step - image) / image);
+        if (n < 1) n = 1;
+        for (int z0 = 0; z0 < d; z0 += n) {
+            int k = d - z0 < n ? d - z0 : n;
+            glCompressedTexSubImage3D(target, level, x, y, z + z0, w, h, k, format,
+                                      (int)(image * (size_t)k), base + image * (size_t)z0);
+        }
+        return 1;
+    }
+    size_t per = (step - brow) / brow;
+    if (per < 1) per = 1;
+    for (int z0 = 0; z0 < d; z0++)
+        for (size_t b0 = 0; b0 < brows; b0 += per) {
+            size_t n = brows - b0 < per ? brows - b0 : per;
+            int top = (int)(b0 * 4), rows = (int)(n * 4) < h - top ? (int)(n * 4) : h - top;
+            const uint8_t *at = base + image * (size_t)z0 + brow * b0;
+            if (is_3d)
+                glCompressedTexSubImage3D(target, level, x, y + top, z + z0, w, rows, 1, format,
+                                          (int)(brow * n), at);
+            else
+                glCompressedTexSubImage2D(target, level, x, y + top, w, rows, format,
+                                          (int)(brow * n), at);
+        }
+    return 1;
+}
+
+static int split_glCompressedTexSubImage2D(unsigned target, int level, int x, int y, int w,
+                                           int h, unsigned format, int image_size,
+                                           const void *data) {
+    return split_compressed(target, level, x, y, 0, w, h, 1, format, image_size, data, 0);
+}
+
+static int split_glCompressedTexSubImage3D(unsigned target, int level, int x, int y, int z,
+                                           int w, int h, int d, unsigned format,
+                                           int image_size, const void *data) {
+    return split_compressed(target, level, x, y, z, w, h, d, format, image_size, data, 1);
+}
+
+/* The allocating forms: storage first (no data), then the parts. */
+void glCompressedTexImage2D(unsigned target, int level, unsigned internalformat, int width,
+                            int height, int border, int imageSize, const void *data);
+void glCompressedTexImage3D(unsigned target, int level, unsigned internalformat, int width,
+                            int height, int depth, int border, int imageSize,
+                            const void *data);
+
+static int split_glCompressedTexImage2D(unsigned target, int level, unsigned internal, int w,
+                                        int h, int border, int image_size, const void *data) {
+    if (!data || bound_buffer(0x88ECu) || image_size <= 0 ||
+        (size_t)image_size <= upload_chunk() || !block_bytes(internal))
+        return 0;
+    glCompressedTexImage2D(target, level, internal, w, h, border, image_size, NULL);
+    return split_compressed(target, level, 0, 0, 0, w, h, 1, internal, image_size, data, 0);
+}
+
+static int split_glCompressedTexImage3D(unsigned target, int level, unsigned internal, int w,
+                                        int h, int d, int border, int image_size,
+                                        const void *data) {
+    if (!data || bound_buffer(0x88ECu) || image_size <= 0 ||
+        (size_t)image_size <= upload_chunk() || !block_bytes(internal))
+        return 0;
+    glCompressedTexImage3D(target, level, internal, w, h, d, border, image_size, NULL);
+    return split_compressed(target, level, 0, 0, 0, w, h, d, internal, image_size, data, 1);
 }
 
 /* Registry-derived, pointer-free OpenGL 4.4 entry points.  This include is

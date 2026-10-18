@@ -324,6 +324,7 @@ void glCompressedTexImage1D(unsigned target, int level, unsigned internalformat,
     put_blob(packet + at, data, blob_len);
 }
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalformat, int width, int height, int border, int imageSize, const void *data) {
+    if (split_glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data)) return;
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
     uint32_t *packet = begin(1085, 11, blob_len);
@@ -343,6 +344,7 @@ void glCompressedTexImage2D(unsigned target, int level, unsigned internalformat,
     put_blob(packet + at, data, blob_len);
 }
 void glCompressedTexImage3D(unsigned target, int level, unsigned internalformat, int width, int height, int depth, int border, int imageSize, const void *data) {
+    if (split_glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data)) return;
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
     uint32_t *packet = begin(1086, 12, blob_len);
@@ -381,6 +383,7 @@ void glCompressedTexSubImage1D(unsigned target, int level, int xoffset, int widt
     put_blob(packet + at, data, blob_len);
 }
 void glCompressedTexSubImage2D(unsigned target, int level, int xoffset, int yoffset, int width, int height, unsigned format, int imageSize, const void *data) {
+    if (split_glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data)) return;
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
     uint32_t *packet = begin(1088, 12, blob_len);
@@ -401,6 +404,7 @@ void glCompressedTexSubImage2D(unsigned target, int level, int xoffset, int yoff
     put_blob(packet + at, data, blob_len);
 }
 void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned format, int imageSize, const void *data) {
+    if (split_glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data)) return;
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
     uint32_t *packet = begin(1089, 14, blob_len);
@@ -2668,6 +2672,7 @@ void glTexSubImage1D(unsigned target, int level, int xoffset, int width,
 void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset,
                             int width, int height, int depth, unsigned format, unsigned type,
                             const void *pixels) {
+    if (split_glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels)) return;
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = pixels && !pbo ? pixel_transfer_bytes(format, type, width, height, depth,
                                                              &unpack_store, NULL) : 0;

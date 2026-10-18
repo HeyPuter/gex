@@ -35,3 +35,21 @@ def mark_buffer_writer(name: str, function: str) -> str:
         call = "if (bound_buffer(0x9192u)) " + call  # GL_QUERY_BUFFER
     at = function.index("{\n") + 2
     return function[:at] + "    " + call + "\n" + function[at:]
+
+
+# Uploads gexgl.c splits when larger than one command can carry: each such
+# command first calls split_<name>(its arguments), which returns 1 when it
+# sent the upload itself (guest/gl/gexgl.c).
+SPLIT_UPLOADS = {"glTexSubImage3D", "glCompressedTexImage2D", "glCompressedTexImage3D",
+                 "glCompressedTexSubImage2D", "glCompressedTexSubImage3D"}
+
+
+def mark_split_upload(name: str, function: str) -> str:
+    """FUNCTION with the split_<NAME> call added as its first statement."""
+    if name not in SPLIT_UPLOADS:
+        return function
+    head = function[:function.index("{\n")]
+    params = head[head.index("(") + 1:head.rindex(")")]
+    args = ", ".join(re.findall(r"(\w+)\s*(?:,|$)", params.replace("\n", " ")))
+    at = function.index("{\n") + 2
+    return function[:at] + f"    if (split_{name}({args})) return;\n" + function[at:]
