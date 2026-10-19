@@ -84,6 +84,8 @@ enum Ev {
     Motion(i32, i32),
     Button(u32, bool),
     Key(u32, bool),
+    /// Scroll: axis (0 vertical, 1 horizontal) and wl_fixed pixels.
+    Axis(u32, i32),
 }
 
 /// A script of input events at times (seconds) after the compositor's Nth
@@ -99,7 +101,14 @@ enum Ev {
 /// 32    button 272 1         # a Linux BTN_* code, 1 down / 0 up
 /// 40    tap enter            # key down, and up 0.1 s later
 /// 41    key z 1              # a key name or Linux KEY_* code, 1 down / 0 up
+/// 42    scroll 100           # pixels down (negative: up); 100 is a wheel notch
+/// 43    scroll 2.5 x 40      # 40 events of 2.5 px, 1/60 s apart (a trackpad)
+/// 44    hscroll -100         # pixels right (negative: left), `x N` as scroll
 /// ```
+///
+/// `window W H` in place of `frames N` starts the clock once a placed window
+/// of W x H is on the screen: what a test waits for when a loaded machine
+/// makes any fixed delay after the first frame too short.
 ///
 /// Coordinates are the focused surface's pixels.
 struct Input {
@@ -109,6 +118,8 @@ struct Input {
     /// Frames to see before the clock starts, and how many have been.
     after: u64,
     seen: u64,
+    /// `window W H`: the clock starts once a placed window this size is up.
+    window: Option<(u32, u32)>,
 }
 
 /// Linux `KEY_*` codes for the names a script may use (else a number).
@@ -135,6 +146,7 @@ impl Input {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let mut events = Vec::new();
         let mut after = 1;
+        let mut window = None;
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -144,6 +156,11 @@ impl Input {
             let bad = || format!("{path}:{}: cannot read `{line}`", n + 1);
             if w[0] == "frames" {
                 after = w.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                continue;
+            }
+            if w[0] == "window" {
+                let n = |i: usize| -> Result<u32, String> { w.get(i).and_then(|v| v.parse().ok()).ok_or_else(bad) };
+                window = Some((n(1)?, n(2)?));
                 continue;
             }
             let t: f64 = w[0].parse().map_err(|_| bad())?;
@@ -160,6 +177,18 @@ impl Input {
                 }
                 Some("button") => events.push((t, Ev::Button(num(2)? as u32, down(3)?), l)),
                 Some("key") => events.push((t, Ev::Key(key(2)?, down(3)?), l)),
+                Some(c @ ("scroll" | "hscroll")) => {
+                    let px: f64 = w.get(2).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                    let n: u32 = match w.get(3).copied() {
+                        None => 1,
+                        Some("x") => w.get(4).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                        Some(_) => return Err(bad()),
+                    };
+                    let axis = (c == "hscroll") as u32;
+                    for i in 0..n {
+                        events.push((t + i as f64 / 60.0, Ev::Axis(axis, (px * 256.0).round() as i32), l.clone()));
+                    }
+                }
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
                     events.push((t + 0.1, Ev::Key(key(2)?, false), l));
@@ -169,8 +198,8 @@ impl Input {
         }
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
-        let start = if after == 0 { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, next: 0, start, after, seen: 0 })
+        let start = if after == 0 && window.is_none() { Some(std::time::Instant::now()) } else { None };
+        Ok(Input { events, next: 0, start, after, seen: 0, window })
     }
 }
 
@@ -207,10 +236,27 @@ impl Wayland {
         crate::stall::frame();
         if let Some(inp) = self.inner.input.lock().unwrap().as_mut() {
             inp.seen += 1;
-            if inp.seen >= inp.after && inp.start.is_none() {
+            if inp.window.is_none() && inp.seen >= inp.after && inp.start.is_none() {
                 eprintln!("[gex] input: the script's clock starts at frame {}", inp.seen);
                 inp.start = Some(std::time::Instant::now());
             }
+        }
+    }
+
+    /// The screen changed: the input script's clock starts once its
+    /// `window W H` is up.
+    fn note_screen(&self) {
+        let mut g = self.inner.input.lock().unwrap();
+        let Some(inp) = g.as_mut() else { return };
+        let (Some((w, h)), None) = (inp.window, inp.start) else { return };
+        let screen = self.inner.screen.lock().unwrap();
+        let up = screen
+            .placed
+            .keys()
+            .any(|k| screen.frames.get(k).is_some_and(|f| f.width as u32 == w && f.height as u32 == h));
+        if up {
+            eprintln!("[gex] input: the script's clock starts with a {w}x{h} window up");
+            inp.start = Some(std::time::Instant::now());
         }
     }
 
@@ -422,6 +468,7 @@ impl Wayland {
                     Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
                     Ev::Button(b, down) => s.client.pointer_button(b, down, ms),
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
+                    Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
                 }
             }
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
@@ -430,6 +477,7 @@ impl Wayland {
                     Routed::PointerTo(surface, x, y, ms) => s.client.pointer_to(surface, x, y, ms),
                     Routed::PointerClear => s.client.pointer_clear(),
                     Routed::Button(b, down, ms) => s.client.pointer_button(b, down, ms),
+                    Routed::Axis(axis, v, ms) => s.client.pointer_axis(axis, v, ms),
                     Routed::Key(k, down, ms) => s.client.keyboard_key(k, down, ms),
                     Routed::KeyboardFocus(surface) => s.client.keyboard_focus(surface),
                     Routed::KeyboardLeave => s.client.keyboard_focus(0),
@@ -480,6 +528,7 @@ impl Wayland {
             self.note_frame();
             // One screen per batch of commits, not one per surface.
             self.save(&produced);
+            self.note_screen();
             self.inner.frames.lock().unwrap().extend(produced);
         }
     }
@@ -529,6 +578,7 @@ enum Routed {
     PointerTo(u32, i32, i32, u32),
     PointerClear,
     Button(u32, bool, u32),
+    Axis(u32, i32, u32),
     Key(u32, bool, u32),
     /// The keyboard to this surface (the screen chose it, no client did).
     KeyboardFocus(u32),
@@ -652,6 +702,11 @@ impl Screen {
                         out.push((sid, Routed::Button(b, down, ms)));
                     }
                 }
+                Ev::Axis(axis, v) => {
+                    if let Some((sid, _)) = self.pointer {
+                        out.push((sid, Routed::Axis(axis, v, ms)));
+                    }
+                }
                 Ev::Key(k, down) => {
                     // No client has activated a window (Wine activates its
                     // own, and a slow start can leave none active when the
@@ -697,8 +752,10 @@ impl Screen {
                 continue;
             };
             s += &format!(
-                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}",
+                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}{}",
                 k.0, k.1, p.id, f.width, f.height, x, y, p.layer,
+                // the client draws its whole window: a page compositor puts no frame round it
+                if p.unmanaged { " unmanaged" } else { "" },
                 if self.focus == Some(k) { " focus" } else { "" }
             );
         }

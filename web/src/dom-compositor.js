@@ -814,8 +814,11 @@ export class DomDesktop {
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
       // Wayland's axis is a fixed-point number of surface units; the browser's
-      // is pixels (or lines, which are about sixteen of them).
-      const scale = e.deltaMode === 1 ? 16 : 1;
+      // is pixels, lines or pages. The compositor makes wheel notches of it at
+      // 100 px a notch (gex-wayland WHEEL_PX, Chromium's deltaY for one), so a
+      // line is a third of that (a notch scrolls three) and a page is the
+      // window. A trackpad's many small pixel deltas add up there.
+      const scale = e.deltaMode === 1 ? 100 / 3 : e.deltaMode === 2 ? (win.height || 600) : 1;
       const send = (axis, v) => {
         if (!v) return;
         sendEvent(this.#channel, win.block, EV_AXIS, axis, Math.round(v * scale * 256),

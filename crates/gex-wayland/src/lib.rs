@@ -445,10 +445,17 @@ pub const STATE_RESIZING: u32 = 4;
 const FRAME_W: i32 = 2;
 const FRAME_H: i32 = 27;
 
+/// Pixels of scroll that make one wheel notch (WHEEL_DELTA, 120 value120
+/// units): what a browser's mouse wheel scrolls a notch by (Chromium's
+/// `deltaY` 100, `deltaMode` pixels).
+pub const WHEEL_PX: i32 = 100;
+
 const GLOBALS: &[(&str, u32)] = &[
     ("wl_compositor", 4),
     ("wl_shm", 1),
-    ("wl_seat", 5),
+    // 8 for `wl_pointer.axis_value120`: Wine's winewayland turns only discrete
+    // or value120 scrolls into WM_MOUSEWHEEL, never the continuous `axis`.
+    ("wl_seat", 8),
     ("wl_output", 3),
     // 4 for `xdg_toplevel.configure_bounds`: the room a window has, so a
     // client that chooses its own size chooses one that fits.
@@ -731,6 +738,14 @@ pub struct Client {
     /// them, so injected input has somewhere to go.
     pointer: Option<u32>,
     keyboard: Option<u32>,
+    /// The `wl_seat` version the client bound: which scroll events its
+    /// pointer takes (`axis_discrete` from 5, `axis_value120` from 8).
+    seat_version: u32,
+    /// Scroll not yet sent as wheel units, per axis: in 1/(256 * WHEEL_PX)
+    /// of a value120 unit for `axis_value120`, and value120 units short of a
+    /// whole notch for `axis_discrete`.
+    scroll_rest: [i64; 2],
+    scroll_notch: [i32; 2],
     /// The surface input is delivered to when the host has not said which:
     /// the last one to commit a buffer. What a one-window host wants, and the
     /// fallback for the native host, which composites from copies and has no
@@ -794,6 +809,9 @@ impl Client {
             failed: None,
             pointer: None,
             keyboard: None,
+            seat_version: 0,
+            scroll_rest: [0; 2],
+            scroll_notch: [0; 2],
             focus_surface: None,
             pointer_target: None,
             keyboard_target: None,
@@ -1135,6 +1153,7 @@ impl Client {
             }
             "wl_seat" => {
                 self.objects.insert(id, Object::Seat);
+                self.seat_version = self.seat_version.max(version);
                 // Pointer (bit 0) and keyboard (bit 1). The keyboard's `keymap`
                 // event needs a real fd for its middle `h` argument, which the
                 // host attaches from the socket's ancillary channel (see
@@ -2990,19 +3009,40 @@ impl Client {
         self.pointer_frame();
     }
 
-    /// Scroll. `axis` 0 is vertical, 1 horizontal; `value` is a pixel-ish delta.
+    /// Scroll. `axis` 0 is vertical, 1 horizontal; `value` is a wl_fixed delta
+    /// in surface pixels (1/256 px), positive down or right.
+    ///
+    /// Besides the continuous `axis`, the scroll goes out in wheel units, which
+    /// is all Wine's winewayland reads (its `axis` handler is empty): WHEEL_PX
+    /// pixels are one notch, 120 value120 units, Windows' WHEEL_DELTA. Pixels
+    /// short of a unit are kept for the next scroll, so a trackpad's stream of
+    /// small deltas adds up instead of each rounding to nothing. A v8 client
+    /// gets `axis_value120` (partial notches, as a Windows precision touchpad
+    /// sends); a v5-v7 one `axis_discrete`, once a whole notch has built up.
     pub fn pointer_axis(&mut self, axis: u32, value: i32, time: u32) {
         let Some(ptr) = self.pointer else { return };
-        if self.pointer_on.is_none() {
+        if self.pointer_on.is_none() || axis > 1 {
             return;
         }
+        let a = axis as usize;
+        let unit = 256 * WHEEL_PX as i64;
+        let rest = self.scroll_rest[a] + value as i64 * 120;
+        let v120 = (rest / unit) as i32;
+        self.scroll_rest[a] = rest - v120 as i64 * unit;
+        if v120 != 0 && self.seat_version >= 8 {
+            // axis_value120(axis, value120): before the axis event of its frame.
+            self.send(Writer::new(ptr, 9).uint(axis).int(v120));
+        } else if v120 != 0 && self.seat_version >= 5 {
+            let notch = self.scroll_notch[a] + v120;
+            let n = notch / 120;
+            self.scroll_notch[a] = notch - n * 120;
+            if n != 0 {
+                // axis_discrete(axis, discrete)
+                self.send(Writer::new(ptr, 8).uint(axis).int(n));
+            }
+        }
         // axis(time, axis, value)
-        self.send(
-            Writer::new(ptr, 4)
-                .uint(time)
-                .uint(axis)
-                .fixed(Fixed::from_int(value)),
-        );
+        self.send(Writer::new(ptr, 4).uint(time).uint(axis).fixed(Fixed(value)));
         self.pointer_frame();
     }
 
@@ -3288,6 +3328,79 @@ mod tests {
         assert_eq!(r.fixed().map(|f| f.to_int()), Some(10), "x");
         assert_eq!(r.fixed().map(|f| f.to_int()), Some(20), "y");
         assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 5), "frame");
+    }
+
+    /// A client with a pointer (13) on the window, its seat bound at `version`.
+    fn pointer_at_version(version: u32) -> Client {
+        let (mut c, _) = draw(vec![0u8; 16], 2, 2, 8);
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(version).new_id(12).finish(),
+            &[],
+            &no_pool(),
+        );
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
+        c.pointer_motion(1, 1, 1);
+        let _ = c.take_outgoing();
+        c
+    }
+
+    /// Scroll as the pointer's (opcode, axis, int) events: value120 (9) and
+    /// discrete (8) by their int, axis (4) by its fixed value.
+    fn scrolls(c: &mut Client) -> Vec<(u16, u32, i32)> {
+        messages(&c.take_outgoing())
+            .into_iter()
+            .filter(|(o, op, _)| *o == 13 && matches!(*op, 4 | 8 | 9))
+            .map(|(_, op, body)| {
+                let mut fds = Vec::new();
+                let mut r = Reader::new(&body, &mut fds);
+                if op == 4 {
+                    let _time = r.uint();
+                    (op, r.uint().unwrap(), r.fixed().unwrap().0)
+                } else {
+                    (op, r.uint().unwrap(), r.int().unwrap())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_scroll_is_wheel_units_and_small_ones_add_up() {
+        // v8: a notch (100 px) is value120 120, before its axis event.
+        let mut c = pointer_at_version(8);
+        c.pointer_axis(0, 100 << 8, 5);
+        assert_eq!(scrolls(&mut c), vec![(9, 0, 120), (4, 0, 100 << 8)]);
+        // 40 trackpad deltas of 2.5 px up: 100 px, so -120 in all, none lost.
+        let mut sum = 0;
+        let mut axes = 0;
+        for i in 0..40 {
+            c.pointer_axis(0, -640, 10 + i);
+            for (op, axis, v) in scrolls(&mut c) {
+                assert_eq!(axis, 0);
+                match op {
+                    9 => sum += v,
+                    4 => { assert_eq!(v, -640); axes += 1 }
+                    _ => panic!("discrete to a v8 client"),
+                }
+            }
+        }
+        assert_eq!((sum, axes), (-120, 40));
+        // Horizontal keeps its own remainder.
+        c.pointer_axis(1, 50 << 8, 60);
+        c.pointer_axis(1, 50 << 8, 61);
+        let h: i32 = scrolls(&mut c).iter().filter(|e| e.0 == 9).map(|e| { assert_eq!(e.1, 1); e.2 }).sum();
+        assert_eq!(h, 120);
+        // v5: whole notches only, as axis_discrete, once 100 px have built up.
+        let mut c = pointer_at_version(5);
+        let mut notches = Vec::new();
+        for i in 0..40 {
+            c.pointer_axis(0, 640, i);
+            notches.extend(scrolls(&mut c).into_iter().filter(|e| e.0 != 4));
+        }
+        assert_eq!(notches, vec![(8, 0, 1)]);
+        // v4: the continuous axis alone.
+        let mut c = pointer_at_version(4);
+        c.pointer_axis(0, 100 << 8, 5);
+        assert_eq!(scrolls(&mut c), vec![(4, 0, 100 << 8)]);
     }
 
     #[test]
