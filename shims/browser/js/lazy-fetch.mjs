@@ -74,6 +74,49 @@ const absolute = (h) => {
   try { return new URL(h, globalThis.GEX_BASE ?? globalThis.location?.href).href; } catch { return h; }
 };
 
+/** Empty memories, one per type, for the process import a kernel instance
+ *  does not use (`processMemories`), when the kernel spec brings none. */
+const emptyMemories = new Map();
+
+/**
+ * The empty memories a page's kernel instances import for the flavour they
+ * do not use (`processMemories`), made once and carried in the kernel spec
+ * (`spare`) to every Worker: shared, a Worker's copy is the same memory.
+ * One per Worker cost each Worker an engine reservation of its own (a
+ * 32-bit memory's guard region; a memory64's), and Dicey Dungeons' page, a
+ * few dozen Workers, ran out ("WebAssembly.Memory(): could not allocate
+ * memory" as a thread joined).
+ */
+export function spareMemories(shared = true) {
+  return {
+    m32: new WebAssembly.Memory({ initial: 0, maximum: 0, shared }),
+    m64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared }),
+  };
+}
+
+/**
+ * The global kernel module's two process-memory imports for a Worker whose
+ * process memory is `mem`: `process`, a 32-bit memory, and `process64`, a
+ * memory64 (gex-kmem: one module serves both flavours, so a page whose
+ * processes differ has one kernel data layout). `mem` as the one of its type
+ * (`is64`: a memory64), and an empty memory, shared as `mem` is, as the
+ * other: the kernel spec's (`spare`, `spareMemories`) when it has them.
+ */
+export function processMemories(mem, is64 = false, spare = null) {
+  const shared = typeof SharedArrayBuffer !== 'undefined' && mem.buffer instanceof SharedArrayBuffer;
+  let empty = is64 ? spare?.m32 : spare?.m64;
+  if (empty && (typeof SharedArrayBuffer !== 'undefined' && empty.buffer instanceof SharedArrayBuffer) !== shared) empty = null;
+  const key = `${is64 ? 32 : 64}:${shared}`;
+  empty ??= emptyMemories.get(key);
+  if (!empty) {
+    empty = is64
+      ? new WebAssembly.Memory({ initial: 0, maximum: 0, shared })
+      : new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared });
+    emptyMemories.set(key, empty);
+  }
+  return is64 ? { process: empty, process64: mem } : { process: mem, process64: empty };
+}
+
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
   return (url, urlLen, offset, dst, len) => {

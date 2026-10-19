@@ -29,7 +29,7 @@ const probe = (await WebAssembly.instantiate(
   {
     env: {
       memory: kernel,
-      lazy_fetch: () => -1,
+      lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }),
       process: new WebAssembly.Memory({
         initial: GUEST_PAGES, maximum: GUEST_PAGES, shared: true,
       }),
@@ -49,7 +49,7 @@ const WORKER = `
   });
   const k = (await WebAssembly.instantiate(
     await WebAssembly.compile(workerData.bytes),
-    { env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1 } },
+    { env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }) } },
   )).exports;
   // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
   // starts every one at the same shared address.
@@ -70,25 +70,25 @@ const WORKER = `
       const [da, dn] = put(DATA, enc.encode(m.text));
       // flags is an i64 in the module type, so it must be a BigInt: a Number
       // throws inside the Worker, which reads from outside as a hang.
-      const h = k.k_fs_open(pa, pn, BigInt(m.flags ?? 0o101), 0o644); // O_WRONLY|O_CREAT
+      const h = k.k_fs_open(BigInt(pa), pn, BigInt(m.flags ?? 0o101), 0o644); // O_WRONLY|O_CREAT
       r.handle = h;
       if (h >= 0) {
-        r.wrote = k.k_fs_write(h, 0n, da, dn);
+        r.wrote = k.k_fs_write(h, 0n, BigInt(da), dn);
         k.k_fs_close(h);
       }
     } else if (m.kind === 'read') {
       const [pa, pn] = path(m.path);
-      const h = k.k_fs_open(pa, pn, 0n, 0);
+      const h = k.k_fs_open(BigInt(pa), pn, 0n, 0);
       r.handle = h;
       if (h >= 0) {
-        const n = k.k_fs_read(h, 0n, OUT, 256);
+        const n = k.k_fs_read(h, 0n, BigInt(OUT), 256);
         r.n = n;
         r.text = n > 0 ? dec.decode(u8.subarray(OUT, OUT + n)) : '';
         k.k_fs_close(h);
       }
     } else if (m.kind === 'meta') {
       const [pa, pn] = path(m.path);
-      r.rc = k.k_fs_path_meta(pa, pn, OUT);
+      r.rc = k.k_fs_path_meta(BigInt(pa), pn, BigInt(OUT));
       if (r.rc === 0) {
         const dv = new DataView(proc.buffer, OUT, 32);
         r.type = dv.getUint32(0, true);
@@ -97,13 +97,13 @@ const WORKER = `
       }
     } else if (m.kind === 'mkdir') {
       const [pa, pn] = path(m.path);
-      r.rc = k.k_fs_mkdir(pa, pn, 0o755);
+      r.rc = k.k_fs_mkdir(BigInt(pa), pn, 0o755);
     } else if (m.kind === 'list') {
       const [pa, pn] = path(m.path);
-      const h = k.k_fs_open(pa, pn, 0n, 0);
+      const h = k.k_fs_open(BigInt(pa), pn, 0n, 0);
       r.handle = h;
       if (h >= 0) {
-        const n = k.k_fs_read_dir(h, OUT, 4096);
+        const n = k.k_fs_read_dir(h, BigInt(OUT), 4096);
         r.n = n;
         r.names = [];
         const dv = new DataView(proc.buffer);
@@ -117,7 +117,7 @@ const WORKER = `
     } else if (m.kind === 'add') {
       const [pa, pn] = path(m.path);
       const [da, dn] = put(DATA, enc.encode(m.text));
-      r.rc = k.k_fs_add(pa, pn, da, dn);
+      r.rc = k.k_fs_add(BigInt(pa), pn, BigInt(da), dn);
     }
     parentPort.postMessage(r);
   });

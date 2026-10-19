@@ -48,6 +48,7 @@ const kernel = { module: kernelModule, memory: kernelMemory };
 const probe = (await WebAssembly.instantiate(kernelModule, {
   env: {
     lazy_fetch: () => -1, // the kernel's lazy-file reads (none here)
+    process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n }),
     memory: kernelMemory,
     process: new WebAssembly.Memory({ initial: 0xffff0000 / 65536, maximum: 0xffff0000 / 65536 }),
   },

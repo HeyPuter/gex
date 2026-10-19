@@ -80,6 +80,13 @@ pub(crate) fn guest_x86_64() -> bool {
     GUEST_X86_64.load(Ordering::Relaxed)
 }
 
+/// [`guest_x86_64`], for the host: W64's fault hook takes a 64-bit address
+/// (Wine's `__wine_gex_fault`, signal_wasm64.c), W3's a 32-bit one.
+#[no_mangle]
+pub extern "C" fn gex_guest_x86_64() -> i32 {
+    guest_x86_64() as i32
+}
+
 /// Whether `program` is a native wasm32 one (its header, from the image's
 /// segments).
 pub(crate) fn is_wasm32(program: &gex_ld::Program) -> bool {

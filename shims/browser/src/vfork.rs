@@ -73,6 +73,9 @@ thread_local! {
     /// its descriptors (as `stage_fork_fds` describes them, for this pid),
     /// its working directory and its signal state, pending signals included.
     static EXEC_PARTS: RefCell<[Vec<u8>; 4]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+    /// The staged exec's memory, in a 64-bit memory's page (`exec_memory`):
+    /// 1 a 64-bit one, 0 a 32-bit one, -1 the parent's.
+    static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
 }
 
 struct Saved {
@@ -260,6 +263,18 @@ pub(crate) fn check(nr: u64) {
 /// staging took references of the new Worker's -- and the run ends (the
 /// caller returns 1).
 pub(crate) fn stage_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) {
+    stage_exec_parts(h, path, argv, envp);
+    WHY.with(|c| c.set(EXEC));
+    set_resume_none();
+    set_resume_ctx_none();
+}
+
+/// An exec's record for a new Worker (`EXEC_PARTS`, `EXEC_MEM64`): its
+/// command line, descriptors (this kernel's references then closed: the
+/// staging took the new Worker's), cwd and signal state. A vfork child's
+/// (`stage_exec`) or a process's whose program needs the other memory
+/// flavour (lib.rs `exec_away`).
+pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: &[String]) {
     let pid = h.kernel.pid;
     // The child's own `/proc/self/exe` (its parent's program) means
     // nothing in the Worker the exec goes on in: named by its file.
@@ -285,11 +300,117 @@ pub(crate) fn stage_exec(h: &mut Host, path: &str, argv: &[String], envp: &[Stri
     let fds = std::mem::take(&mut *FORK_FDS.0.borrow_mut()).into_bytes();
     let cwd = h.kernel.caller_cwd().into_bytes();
     let state = state_bytes(&h.kernel, true);
+    let mem64 = if gex_abi::mem64() { exec_memory_of(h, path).map_or(-1, |m| m as i32) } else { -1 };
+    EXEC_MEM64.with(|c| c.set(mem64));
     EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
     h.kernel.fds.close_all();
-    WHY.with(|c| c.set(EXEC));
-    set_resume_none();
-    set_resume_ctx_none();
+}
+
+/// [`exec_memory`] for an exec's path, relative to the caller's cwd.
+fn exec_memory_of(h: &Host, path: &str) -> Option<bool> {
+    if path.starts_with('/') {
+        exec_memory(path)
+    } else {
+        let cwd = h.kernel.caller_cwd();
+        exec_memory(&format!("{}/{path}", cwd.trim_end_matches('/')))
+    }
+}
+
+/// Whether this process's exec of `path` goes on in another Worker: in a
+/// 64-bit memory's page, a program that cannot run in one (lib.rs
+/// `exec_away`).
+pub(crate) fn exec_elsewhere(h: &Host, path: &str) -> bool {
+    gex_abi::mem64() && exec_memory_of(h, path) == Some(false)
+}
+
+/// Whether the program at `path` can run in a 64-bit memory, for the Worker
+/// its exec goes on in (the page's flavour, docs/mem64.md §5, is what a
+/// process gets that can run in either): a 32-bit ELF (an i386 program, or a
+/// wasm32 container such as W64's wineserver, docs/wine-native-x64.md §4)
+/// cannot run in one, a 64-bit ELF can, and a gex wasm container wants
+/// what its module's memory import is. `None`: not an ELF (a script), or
+/// unreadable: the parent's.
+fn exec_memory(path: &str) -> Option<bool> {
+    let home = crate::sigs::proc_home();
+    let mut head = [0u8; 64];
+    if home.read_file_at(path, 0, &mut head)? < 64 || &head[..4] != b"\x7fELF" {
+        return None;
+    }
+    if head[4] == 1 {
+        return Some(false);
+    }
+    // The module sits right after the program headers (wasm-elf.py), and
+    // its import section after the type section: the first 4 MiB hold it.
+    let mut buf = vec![0u8; 4 << 20];
+    let n = home.read_file_at(path, 0, &mut buf)?;
+    let buf = &buf[..n];
+    let Some(at) = buf.windows(8).take(64 << 10).position(|w| w == b"\0asm\x01\0\0\0") else {
+        return Some(true);
+    };
+    Some(wasm_memory64(&buf[at..]).unwrap_or(true))
+}
+
+/// Whether `wasm`'s imported memory is a 64-bit one; `None` when its
+/// import section is not in `wasm` or it imports no memory.
+fn wasm_memory64(wasm: &[u8]) -> Option<bool> {
+    fn leb(b: &[u8], i: &mut usize) -> Option<u64> {
+        let (mut r, mut s) = (0u64, 0);
+        loop {
+            let x = *b.get(*i)?;
+            *i += 1;
+            r |= ((x & 0x7f) as u64) << s;
+            s += 7;
+            if x < 0x80 {
+                return Some(r);
+            }
+        }
+    }
+    let mut i = 8;
+    while i < wasm.len() {
+        let id = wasm[i];
+        i += 1;
+        let size = leb(wasm, &mut i)? as usize;
+        let end = i.checked_add(size)?;
+        if id == 2 {
+            let mut j = i;
+            for _ in 0..leb(wasm, &mut j)? {
+                for _ in 0..2 {
+                    let l = leb(wasm, &mut j)? as usize;
+                    j += l;
+                }
+                match *wasm.get(j)? {
+                    0 => {
+                        j += 1;
+                        leb(wasm, &mut j)?;
+                    }
+                    1 => {
+                        j += 2;
+                        let fl = *wasm.get(j - 1)?;
+                        leb(wasm, &mut j)?;
+                        if fl & 1 != 0 {
+                            leb(wasm, &mut j)?;
+                        }
+                    }
+                    2 => return Some(*wasm.get(j + 1)? & 4 != 0),
+                    3 => j += 3,
+                    _ => return None,
+                }
+            }
+            return None;
+        }
+        if id > 2 && id != 0 {
+            return None;
+        }
+        i = end;
+    }
+    None
+}
+
+/// The staged exec's memory (`exec_memory`): 1 64-bit, 0 32-bit, -1 the
+/// parent's (and always -1 outside a 64-bit memory's page).
+#[no_mangle]
+pub extern "C" fn gex_vfork_exec_mem64() -> i32 {
+    EXEC_MEM64.with(|c| c.get())
 }
 
 /// Why the child's run ended: 0 (it exited, or crashed), 2 an exec staged,

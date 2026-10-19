@@ -31,7 +31,7 @@ const ROOT = join(HERE, '..', '..', '..');
 
 async function instantiate(module, memory, process_) {
   const inst = await WebAssembly.instantiate(module, {
-    env: { memory, process: process_, lazy_fetch: () => 0 },
+    env: { memory, process: process_, lazy_fetch: () => 0, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }) },
   });
   return inst.exports;
 }

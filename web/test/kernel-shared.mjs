@@ -48,7 +48,7 @@ const WORKER = `
   });
   const mod = await WebAssembly.compile(workerData.bytes);
   const k = (await WebAssembly.instantiate(mod, {
-    env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1 },
+    env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }) },
   })).exports;
   const u8 = new Uint8Array(proc.buffer);
 
@@ -60,7 +60,7 @@ const WORKER = `
     } else if (m.kind === 'checksum') {
       const b = new TextEncoder().encode(m.text);
       u8.set(b, m.at);
-      parentPort.postMessage({ kind: 'sum', sum: k.k_checksum(m.at, b.length) });
+      parentPort.postMessage({ kind: 'sum', sum: k.k_checksum(BigInt(m.at), b.length) });
     } else if (m.kind === 'peek') {
       // Whatever is at this address in *my* process memory.
       parentPort.postMessage({ kind: 'peeked', byte: u8[m.at] });

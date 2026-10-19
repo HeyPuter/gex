@@ -15,7 +15,7 @@
 // Message in: { spec: { module, memory }, stackTop, url, name }
 // Messages out: { progress, got, total }, { done, files, bytes, ms }, { error }
 
-import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
+import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { untar } from './tar.js';
 import { isZstd, unzstd } from './zfetch.js';
 
@@ -31,7 +31,7 @@ async function kernel(spec, stackTop) {
     mem = new WebAssembly.Memory({ initial: 16, maximum: 65535, shared });
     try {
       inst = await WebAssembly.instantiate(spec.module, {
-        env: { memory: spec.memory, process: mem, lazy_fetch: lazyFetch(spec.memory) },
+        env: { memory: spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(spec.memory) },
       });
       break;
     } catch (e) {
@@ -64,14 +64,14 @@ function put(a, b) {
 
 function readFile(path) {
   const [pp, pl] = put(path);
-  const h = k.k_fs_open(pp, pl, 0n, 0);
+  const h = k.k_fs_open(BigInt(pp), pl, 0n, 0);
   if (h < 0) return null;
   const parts = [];
   let off = 0;
   const at = 1 << 16;
   for (;;) {
     bytes(at + (1 << 20));
-    const n = k.k_fs_read(h, BigInt(off), at, 1 << 20);
+    const n = k.k_fs_read(h, BigInt(off), BigInt(at), 1 << 20);
     if (n <= 0) break;
     parts.push(new Uint8Array(mem.buffer).slice(at, at + n));
     off += n;
@@ -88,8 +88,8 @@ function readFile(path) {
 
 function addFile(path, data) {
   const [pp, pl, dp, dl] = put(path, data);
-  k.k_fs_unlink(pp, pl); // a symlink in the way would be written through
-  k.k_fs_add(pp, pl, dp, dl);
+  k.k_fs_unlink(BigInt(pp), pl); // a symlink in the way would be written through
+  k.k_fs_add(BigInt(pp), pl, BigInt(dp), dl);
 }
 
 async function overlay({ url, name }) {
@@ -128,7 +128,7 @@ async function overlay({ url, name }) {
   let size = 0;
   for (const d of tree.dirs) {
     const [pp, pl] = put(d);
-    k.k_fs_mkdir(pp, pl, 0o755);
+    k.k_fs_mkdir(BigInt(pp), pl, 0o755);
   }
   let status = '';
   // Files fetched from the page as the guest reads them (`k_fs_add_lazy`):
@@ -144,26 +144,26 @@ async function overlay({ url, name }) {
     addFile(p, data);
     if (tree.modes[p] !== undefined) {
       const [pp, pl] = put(p);
-      k.k_fs_chmod(pp, pl, tree.modes[p]);
+      k.k_fs_chmod(BigInt(pp), pl, tree.modes[p]);
     }
     n++;
     size += data.length;
   }
   for (const [p, target] of Object.entries(tree.hard)) {
     const [tp, tl, pp, pl] = put(target, p);
-    k.k_fs_unlink(pp, pl);
-    k.k_fs_link(tp, tl, pp, pl);
+    k.k_fs_unlink(BigInt(pp), pl);
+    k.k_fs_link(BigInt(tp), tl, BigInt(pp), pl);
     n++;
   }
   for (const [p, target] of Object.entries(tree.links)) {
     const [tp, tl, pp, pl] = put(target, p);
-    k.k_fs_unlink(pp, pl);
-    k.k_fs_symlink(tp, tl, pp, pl);
+    k.k_fs_unlink(BigInt(pp), pl);
+    k.k_fs_symlink(BigInt(tp), tl, BigInt(pp), pl);
     n++;
   }
   for (const [p, size, url] of lazy) {
     const [pp, pl, up, ul] = put(p, url);
-    k.k_fs_add_lazy(pp, pl, up, ul, BigInt(size));
+    k.k_fs_add_lazy(BigInt(pp), pl, BigInt(up), ul, BigInt(size));
     n++;
   }
   if (status) {

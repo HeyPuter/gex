@@ -8,7 +8,7 @@
 // Message out: { synced: id, wrote, removed, files, bytes } or { error }.
 
 import { openDb, txDone } from './persist-db.js';
-import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
+import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 
 const SCRATCH = 0x1000; // where paths and buffers go in this worker's process memory
 const CHUNK = 1 << 20;
@@ -43,7 +43,7 @@ function meta(path) {
   const n = putPath(path);
   const at = SCRATCH + ((n + 15) & ~15);
   ensure(at - SCRATCH + 64);
-  if (k.k_fs_path_meta(SCRATCH, n, at) < 0) return null;
+  if (k.k_fs_path_meta(BigInt(SCRATCH), n, BigInt(at)) < 0) return null;
   const v = new DataView(mem.buffer, at, 36);
   return {
     dir: v.getUint32(0, true) === 1,
@@ -55,7 +55,7 @@ function meta(path) {
 
 function open(path) {
   const n = putPath(path);
-  return k.k_fs_open(SCRATCH, n, 0n, 0);
+  return k.k_fs_open(BigInt(SCRATCH), n, 0n, 0);
 }
 
 function list(path) {
@@ -64,7 +64,7 @@ function list(path) {
   try {
     for (let cap = 1 << 16; ; cap *= 4) {
       ensure(cap);
-      const n = k.k_fs_read_dir(h, SCRATCH, cap);
+      const n = k.k_fs_read_dir(h, BigInt(SCRATCH), cap);
       if (n === -34) continue;
       if (n < 0) return [];
       const out = [];
@@ -92,7 +92,7 @@ function read(path, size) {
     ensure(CHUNK);
     let off = 0;
     while (off < size) {
-      const n = k.k_fs_read(h, BigInt(off), SCRATCH, Math.min(CHUNK, size - off));
+      const n = k.k_fs_read(h, BigInt(off), BigInt(SCRATCH), Math.min(CHUNK, size - off));
       if (n < 0) return null;
       if (n === 0) break;
       out.set(bytes().subarray(SCRATCH, SCRATCH + n), off);
@@ -191,7 +191,7 @@ self.onmessage = (e) => {
       for (const shared of [true, false]) {
         mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
         try {
-          inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, process: mem, lazy_fetch: lazyFetch(m.spec.memory) } });
+          inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, ...processMemories(mem), lazy_fetch: lazyFetch(m.spec.memory) } });
           break;
         } catch (e) {
           if (!shared) throw e;

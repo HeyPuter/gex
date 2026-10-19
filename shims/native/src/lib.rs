@@ -5763,7 +5763,14 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
     }
     let f = crate::ftab::table_func(caller, hook)?;
-    let typed = f.typed::<(i32, i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, unsigned, unsigned)")?;
+    // W64's hook (signal_wasm64.c) takes the address as 64 bits, W3's
+    // (signal_wasm32.c) as 32.
+    let wide = f.typed::<(i32, i32, i64, i32), ()>(&*caller).ok();
+    let narrow = if wide.is_none() {
+        Some(f.typed::<(i32, i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, address, unsigned)")?)
+    } else {
+        None
+    };
     // The hook's C frames go below the guest's stack pointer, as a signal
     // frame does: the shared shadow stack pointer may be wherever a native
     // call from the guest last left it, above the live guest stack. The
@@ -5780,7 +5787,11 @@ pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code:
         }
         _ => None,
     };
-    let r = typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32, kind as i32));
+    let r = match (wide, narrow) {
+        (Some(w), _) => w.call(&mut *caller, (ctx_addr as i32, code as i32, addr as i64, kind as i32)),
+        (None, Some(n)) => n.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32, kind as i32)),
+        (None, None) => unreachable!(),
+    };
     if let (Some(g), Some(cur)) = (&sp, saved) {
         sp_set(&mut *caller, g, cur)?;
     }

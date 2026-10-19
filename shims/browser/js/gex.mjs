@@ -11,7 +11,7 @@ const GUEST_BYTES = 0xffff0000;
 // memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
 // stack, data and the low runtime words) stay below 4 GiB either way; only
 // the memory's type and the i64 globals of a wasm64 module differ.
-import { lazyFetch } from "./lazy-fetch.mjs";
+import { lazyFetch, processMemories } from "./lazy-fetch.mjs";
 import { xcRead, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logOn, logQuiet } from "./log.mjs";
@@ -28,6 +28,12 @@ const ftabSpareTest = () => Number(globalThis.GEX_TEST_FTAB_SPARE ?? globalThis.
 const LIMIT64_BYTES = 16 * 2 ** 30;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
+/** An address a wasm program passed to a `gex` import: a BigInt from a
+ *  memory64 program's (W64's memory64 flavour, GEX_MEMORY64, i64 at its
+ *  imports), a Number from a 32-bit or lowered one's. As a Number, and for
+ *  a shim export taking a 64-bit address, as a BigInt. */
+const addrNum = (v) => (typeof v === 'bigint' ? Number(v) : v >>> 0);
+const addrBig = (v) => (typeof v === 'bigint' ? v : BigInt(v >>> 0));
 /** The global imports of a wasm module, as `module.name` -> WebAssembly.Global descriptor
  *  (JS cannot ask a Module for its imports' types). */
 function importedGlobals(bytes) {
@@ -1250,7 +1256,7 @@ export class Gex {
       s = end;
     }
     for (let j = 0; j < runs.length; j += 2) {
-      if (k.k_proc_zero(runs[j], runs[j + 1]) !== 0) return null;
+      if (k.k_proc_zero(BigInt(runs[j]), runs[j + 1]) !== 0) return null;
     }
     return this.#memory;
   }
@@ -2241,7 +2247,7 @@ export class Gex {
     let id = total ? k.k_stage_take(total) : 0;
     let off = 0;
     for (const r of id > 0 ? staged : []) {
-      if (k.k_stage_pull(id, off, r.at, r.len) !== 0) {
+      if (k.k_stage_pull(id, off, BigInt(r.at), r.len) !== 0) {
         k.k_stage_drop(id);
         id = 0;
         break;
@@ -2466,14 +2472,14 @@ export class Gex {
   async #startKernel() {
     const _k = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[kernel] ${s}`); };
     if (!this.#kernelSpec || this.#kernel) { _k(`skip (spec=${!!this.#kernelSpec} kernel=${!!this.#kernel})`); return; }
-    const { module, memory, stackTop } = this.#kernelSpec;
+    const { module, memory, stackTop, spare } = this.#kernelSpec;
     _k(`compile (isModule=${module instanceof WebAssembly.Module} stackTop=0x${(stackTop>>>0).toString(16)})`);
     const mod = module instanceof WebAssembly.Module
       ? module
       : await WebAssembly.compile(module);
     _k('instantiate');
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, process: this.#memory, lazy_fetch: lazyFetch(memory) },
+      env: { memory, ...processMemories(this.#memory, m64(), spare), lazy_fetch: lazyFetch(memory) },
     });
     _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
@@ -2884,7 +2890,7 @@ export class Gex {
       }
       zeros += r.zeros ?? 0;
       if (r.stage !== undefined) {
-        if (this.#kernel.k_stage_push(stage, r.stage, r.at, n) !== 0) {
+        if (this.#kernel.k_stage_push(stage, r.stage, BigInt(r.at), n) !== 0) {
           throw new Error(`fork image: staged run at 0x${r.at.toString(16)} (${n} bytes) did not copy`);
         }
         copied += n;
@@ -3395,6 +3401,18 @@ export class Gex {
   /** The record of an exec a vfork child staged (`vfork::stage_exec`): a
    *  fork record with no image, which the host starts as any child, and
    *  whose Worker runs the exec (`#adoptExec`). */
+  /** The record of the exec this process handed to another Worker (lib.rs
+   *  `exec_away`: a program of the other memory flavour), null when it
+   *  handed none: a posix_spawn child's exec record, for the same pid. */
+  execAwayRecord() {
+    const e = this.#shim.exports;
+    if (!e.gex_exec_away?.()) return null;
+    const r = this.#vforkExecRecord(e.gex_exec_away_of(0), e.gex_exec_away_of(1), 0);
+    r.vforkMs = undefined;
+    e.gex_vfork_exec_done();
+    return r;
+  }
+
   #vforkExecRecord(pid, ctx, ms) {
     const e = this.#shim.exports;
     const part = (i) => {
@@ -3423,6 +3441,9 @@ export class Gex {
       cwd: new TextDecoder().decode(part(2)),
       state: part(3),
       exe: null,
+      // The memory its program needs, in a 64-bit memory's page (vfork.rs
+      // `exec_memory`): true or false, or undefined for the parent's.
+      mem64: (() => { const m = e.gex_vfork_exec_mem64?.() ?? -1; return m < 0 ? undefined : m === 1; })(),
       // How long the child ran in its parent's Worker before this exec, for
       // the process's exit line: a child with this ran in place, nothing copied.
       vforkMs: ms,
@@ -4076,11 +4097,14 @@ export class Gex {
           // Wine's Unix side (W3.1): its system-call dispatcher and fault
           // hook, process-wide in the shim (the page's delivery of faults
           // is still to come).
-          unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, idx) ?? 0,
-          fault_hook: (idx) => e.gex_fault_hook_set?.(idx),
-          signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
-          code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
-          wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
+          unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, addrNum(idx)) ?? 0,
+          fault_hook: (idx) => e.gex_fault_hook_set?.(addrNum(idx)),
+          signal_hook: (idx) => e.gex_signal_hook_set?.(addrNum(idx)),
+          code_changed: (addr, len) => e.gex_code_changed?.(addrBig(addr), len),
+          wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(addrNum(ptr), len) ?? 0,
+          // A memory64 program's context address is an i64 (Wine's
+          // gex_addr_t); the shim's export takes the i32 every context is.
+          ...(wasmprog && m64() ? { sysreg_write: (ctx, pc, reg, v) => this.#imports.sysreg_write(addrNum(ctx), pc, reg, v) } : {}),
           // W3.7: Wine's Unix side runs the program's code nested
           // (signal_wasm32.c's `gex_call_out(ctx, pc, 0, 0)`, a call-out
           // that never returns for a thread's loop), and reports each image
@@ -4095,7 +4119,7 @@ export class Gex {
               : this.#callOutAsync(ctx >>> 0, target, ret, spWant)))
             : (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
           image_mapped: (base, fd) => {
-            const number = e.gex_image_mapped?.(base, fd) ?? -1;
+            const number = e.gex_image_mapped?.(addrBig(base), fd) ?? -1;
             if (number === -1) return;
             // An i386 image with a function-tier unit to fetch (cgen.rs
             // `w3_mapped`): served here, before Wine's loader goes on. (-2
@@ -4892,20 +4916,20 @@ export class Gex {
       // instantiates the new modules and runs their constructors; other
       // Workers instantiate them as they next catch up
       dlopen: (path, err, errlen) => {
-        const h = e.gex_wasmprog_dlopen(path, err, errlen) >>> 0;
+        const h = e.gex_wasmprog_dlopen(addrBig(path), addrBig(err), errlen) >>> 0;
         if (!h) return 0;
         this.#cgenCatchUp();
         const st = this.#cgenStore();
         for (let k = 0, n; (n = e.gex_wasmprog_dl_new(k)) >= 0; k++) st.dyl.get(n)?.exports.__wasm_call_ctors?.();
         return h | 0;
       },
-      dlsym: (h, name) => e.gex_wasmprog_dlsym(h, name) | 0,
+      dlsym: (h, name) => e.gex_wasmprog_dlsym(h, addrBig(name)) | 0,
       // Door calls into the wineserver (docs/wineserver-kernel.md).
       door_publish: (area) => this.#doorPublish(area >>> 0),
-      door_call: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, false),
+      door_call: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, false),
       // A 64-bit client's (W64's lowered LP64 ntdll.so): the request's
       // gather list at LP64 offsets (`#doorRun`, shims/native's door::req_layout).
-      door_call_lp64: (req, pid, tid) => this.#doorCall(req >>> 0, pid, tid, true),
+      door_call_lp64: (req, pid, tid) => this.#doorCall(addrNum(req), pid, tid, true),
       // A Worker the door was broadcast to while it ran (it takes no
       // messages): Wine runs its program again as a child, which starts with
       // the door (loader.c `wineserver_relaunch`). None in the SP build.
@@ -4914,19 +4938,19 @@ export class Gex {
       // +132), copied from directly by win32u (docs/wineserver-kernel.md
       // §6.1): the bytes copied, or -1 with no door session; the session's
       // size for a size of 0.
-      session_copy: (dst, off, size) => this.#sessionCopy(dst >>> 0, off >>> 0, size >>> 0),
+      session_copy: (dst, off, size) => this.#sessionCopy(addrNum(dst), off >>> 0, size >>> 0),
       session_seq: (off) => this.#sessionSeq(off >>> 0),
       // The server's user shared data page (area +140), copied at a
       // process's start and written by the first boot's fill (§6.2).
-      usd_copy: (dst, size) => this.#usdMove(dst >>> 0, size >>> 0, false),
-      usd_publish: (src, size) => this.#usdMove(src >>> 0, size >>> 0, true),
+      usd_copy: (dst, size) => this.#usdMove(addrNum(dst), size >>> 0, false),
+      usd_publish: (src, size) => this.#usdMove(addrNum(src), size >>> 0, true),
       // Where i386 code reads KUSER_SHARED_DATA (W3's Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
       // The server's own (the pump): a thread's wait pipe, which door calls
       // write in place (docs/wineserver-kernel.md §4.5). Global pipe ids.
       wake_pipe: (fd) => this.#shim.exports.gex_fd_pipe_id?.(fd) ?? -1,
-      wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, buf >>> 0, len >>> 0) ?? -38,
+      wake_write: (id, buf, len) => this.#kernel?.k_pipe_write?.(id, addrBig(buf), len >>> 0) ?? -38,
       wake_close: () => {},
     };
   }
@@ -5169,12 +5193,12 @@ export class Gex {
     if (len > 64 || !this.#doorScratch) return -22;
     const { u8 } = this.#doorView();
     this.#bytes().set(u8.subarray(buf, buf + len), this.#doorScratch);
-    return this.#kernel?.k_pipe_write?.(id, this.#doorScratch, len) ?? -38;
+    return this.#kernel?.k_pipe_write?.(id, BigInt(this.#doorScratch), len) ?? -38;
   }
 
   #doorKick() {
     // one byte, from anywhere in this process's memory: the pump only drains
-    this.#kernel?.k_pipe_write?.(this.#door.kickId, 0, 1);
+    this.#kernel?.k_pipe_write?.(this.#door.kickId, 0n, 1);
   }
 
   /** `gex.door_call(req, unix_pid, unix_tid)`: 0 done (the reply in `req`),
@@ -5183,6 +5207,10 @@ export class Gex {
    *  it stays optimised: every server request of a W3 process comes here
    *  (docs/wine-overhead.md). */
   #doorCall(req, pid, tid, lp64) {
+    // A 64-bit memory's client (W64's memory64 flavour) goes by the pipes:
+    // the server is a wasm32 program, which a door runs in the client's
+    // Worker on this Worker's shim, and the request's pointers may pass 4 GiB.
+    if (m64()) return 1;
     if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid, lp64);
     const d = this.#door;
     if (!d || single.on) return 1;
@@ -6977,7 +7005,10 @@ export class Gex {
     const esp = new DataView(this.#memory.buffer).getUint32(ctx + CTX_SP, true);
     const low = Math.min(Number(cur) >>> 0, esp);
     spG.value = typeof cur === 'bigint' ? BigInt(((low - 4096) & ~15) >>> 0) : ((low - 4096) & ~15) | 0;
-    return { f, code: code | 0, addr: Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
+    // W64's hook (signal_wasm64.c) takes the address as a 64-bit integer
+    // (above 4 GiB in a 64-bit memory), W3's (signal_wasm32.c) as 32 bits.
+    const wide = e.gex_guest_x86_64?.() === 1;
+    return { f, code: code | 0, addr: wide ? BigInt.asUintN(64, addr) : Number(BigInt.asUintN(32, addr)) | 0, kind: kind | 0, spG, cur };
   }
 
   /**

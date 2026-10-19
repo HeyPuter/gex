@@ -88,6 +88,12 @@ DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$h
 S=$( { echo "$DH"; cat "$here"/link-w64.sh "$here"/dlreg.py "$here"/../../guest/gl/*.c "$here"/../../guest/gl/*.h \
 	"$here"/../../guest/gl/*.inc "$here"/w3/oss/sys/soundcard.h; } | sha256sum | cut -c1-10)
 TLS=${W64_TLS:-1}; [ "$TLS" != 0 ] || S=$S-notls
+# W64_MEM64=1: the memory64 flavour (docs/wine-native-x64.md §0.1): the Unix
+# side compiled with wcc64 -mgex-memory64 and left unlowered (S gets -m64),
+# for a process with a 64-bit memory (gexc run --mem64, the page's
+# ?mem64=1). The server stays the wasm32 one.
+M64=${W64_MEM64:-0}; WCC="$here/wcc64"; WCXX="$here/wcc64++"
+if [ "$M64" != 0 ]; then S=$S-m64; WCC="$WCC -mgex-memory64"; WCXX="$WCXX -mgex-memory64"; fi
 without="--without-x --without-freetype --without-gstreamer --without-pulse --without-alsa --without-cups
   --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus
   --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-sdl --without-oss
@@ -162,11 +168,11 @@ b64_build() {
 	[ "$TLS" = 0 ] || o="${o//--without-gnutls/} --with-gnutls"
 	PKG_CONFIG_LIBDIR=$DEPS/install/lib/pkgconfig "$W/configure" --host=wasm64-unknown-linux-musl --with-wine-tools="$T" \
 		--disable-tests --without-mingw --enable-archs= --without-unwind $o \
-		CC="$here/wcc64" CXX="$here/wcc64++" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
+		CC="$WCC" CXX="$WCXX" PKG_CONFIG=pkg-config WAYLAND_SCANNER="$DEPS/host/wayland-scanner" \
 		ac_cv_lib_soname_xkbregistry=libxkbregistry.so.0 ac_cv_lib_soname_freetype=libfreetype.so.6 \
 		ac_cv_lib_soname_EGL=libEGL.so.1 ac_cv_lib_soname_gnutls=libgnutls.so.30
 	mkdir -p out
-	W64_DEPS=$DEPS/install JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
+	W64_MEM64=$M64 W64_DEPS=$DEPS/install JOBS=$J "$here/link-w64.sh" "$PWD" "$PWD/out/wine"
 }
 log "wasm64 Unix side ($K, $S)"; step b64-$K-$S b64_build
 
@@ -197,6 +203,11 @@ ntdll_native() {
 	( cd "$C/b64-$K-$S" && nice -n 10 make -j"$J" dlls/ntdll/wasm64-windows/ntdll.dll )
 	cp -p "$C/b64-$K-$S"/dlls/ntdll/wasm64-windows/ntdll.dll .
 }
+if [ "$M64" != 0 ]; then
+	# the native PE side's memory64 link is still to come
+	echo "W64_DIST=$C/dist64-$K-$S"; echo "W64_PREFIX=$C/pfx64-$P/pfx"; echo "W64_TOOLS=$T"; echo "W64_SRC=$W"
+	exit 0
+fi
 log "native ntdll ($K, $S)"; step ntdll64-$K-$S ntdll_native
 
 D=${W64_NATIVE_DLLS:-ntdll.dll kernelbase.dll kernel32.dll msvcrt.dll ucrtbase.dll winewayland.drv}

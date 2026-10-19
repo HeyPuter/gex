@@ -79,7 +79,7 @@ let probe = null;
 if (args.includes('--probe')) {
   const mem = new WebAssembly.Memory({ initial: 2, maximum: 4, shared: true });
   const inst = await WebAssembly.instantiate(kernel.module, {
-    env: { memory: kernel.memory, process: mem, lazy_fetch: () => -1 },
+    env: { memory: kernel.memory, process: mem, lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }) },
   });
   const k = inst.exports;
   const bytes = new Uint8Array(mem.buffer);
@@ -98,7 +98,7 @@ function pumpProbe() {
     for (const name of ['\0/tmp/.X11-unix/X0', '/tmp/.X11-unix/X0']) {
       const raw = new TextEncoder().encode(name);
       put(0, raw);
-      const id = k.k_sock_connect(0, raw.length);
+      const id = k.k_sock_connect(0n, raw.length);
       say(`probe: connect ${JSON.stringify(name)} -> ${id}`);
       if (id >= 0) {
         probe.id = id;
@@ -112,13 +112,13 @@ function pumpProbe() {
     // The X11 setup request: little-endian, protocol 11.0, no authorisation.
     const setup = new Uint8Array([0x6c, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     put(256, setup);
-    const n = k.k_sock_write(probe.id, 256, setup.length);
+    const n = k.k_sock_write(probe.id, 256n, setup.length);
     say(`probe: wrote ${n} bytes of setup`);
     probe.state = 'waiting';
     return;
   }
   if (probe.state === 'waiting') {
-    const n = k.k_sock_read(probe.id, 512, 4096);
+    const n = k.k_sock_read(probe.id, 512n, 4096);
     if (n <= 0) return;
     const reply = probe.bytes.subarray(512, 512 + n);
     say(`probe: the server answered ${n} bytes, first byte ${reply[0]}`

@@ -34,7 +34,7 @@ const probe = (await WebAssembly.instantiate(
   {
     env: {
       memory: kernel,
-      lazy_fetch: () => -1,
+      lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }),
       process: new WebAssembly.Memory({
         initial: GUEST_PAGES, maximum: GUEST_PAGES, shared: true,
       }),
@@ -54,7 +54,7 @@ const WORKER = `
   });
   const k = (await WebAssembly.instantiate(
     await WebAssembly.compile(workerData.bytes),
-    { env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1 } },
+    { env: { memory: workerData.kernel, process: proc, lazy_fetch: () => -1, process64: new WebAssembly.Memory({ address: 'i64', initial: 0n, maximum: 0n, shared: true }) } },
   )).exports;
   // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
   // starts every one at the same shared address.
@@ -68,9 +68,9 @@ const WORKER = `
       // address it cannot dereference.
       const b = new TextEncoder().encode(m.text);
       u8.set(b, AT);
-      parentPort.postMessage({ kind: 'put', n: k.k_pipe_write(m.id, AT, b.length) });
+      parentPort.postMessage({ kind: 'put', n: k.k_pipe_write(m.id, BigInt(AT), b.length) });
     } else if (m.kind === 'get') {
-      const n = k.k_pipe_read(m.id, AT, m.len);
+      const n = k.k_pipe_read(m.id, BigInt(AT), m.len);
       parentPort.postMessage({
         kind: 'get',
         n,

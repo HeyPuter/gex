@@ -22,11 +22,14 @@ J=${JOBS:-6}
 HERE=$(cd "$(dirname "$0")" && pwd)
 [ $# -eq 2 ] || { sed -n 2,12p "$0" >&2; exit 2; }
 B=$(cd "$1" && pwd) OUT=$2
+# W64_MEM64=1: the memory64 flavour (docs/wine-native-x64.md §0.1), for a
+# tree configured with CC="wcc64 -mgex-memory64".
+M64=; [ "${W64_MEM64:-0}" = 0 ] || M64=-mgex-memory64
 : "${GEX_WASM64_SYSROOT:?set GEX_WASM64_SYSROOT (tools/wine-wasm/build-sysroot64.sh)}"
 cd "$B"
 objs=$(sed -n '/^dlls\/ntdll\/ntdll.so:/,/^\t/p' Makefile | grep -o 'dlls/ntdll/unix/[a-z_0-9]*\.o' | sort -u |
        grep -v 'signal_arm\|signal_i386\|signal_x86_64\|signal_wasm32')
-nice -n 10 make -j"$J" CXX="$HERE/wcc64++" loader/main.o $objs >&2
+nice -n 10 make -j"$J" CXX="$HERE/wcc64++${M64:+ $M64}" loader/main.o $objs >&2
 mkdir -p gexw64
 reg="ntdll.so:func:__wine_main"
 # The Unix libraries without a display or other dependencies, as W3's
@@ -138,7 +141,7 @@ if grep -q '^dlls/opengl32/opengl32.so:' Makefile && grep -q 'SONAME_LIBEGL' inc
 	reg="$reg opengl32.so:data:__wine_unix_call_funcs=opengl32__wine_unix_call_funcs"
 	gl=$HERE/../../guest/gl
 	if ! [ gexw64/gexgl.o -nt "$gl/gexgl.c" ] || [ -n "$(find "$gl" -maxdepth 1 -newer gexw64/gexgl.o \( -name '*.h' -o -name '*.inc' \))" ]; then
-		nice -n 10 "$HERE/wcc64" -O2 -c -o gexw64/gexgl.o "$gl/gexgl.c" >&2 || { echo "link-w64: gexgl.c failed" >&2; touch "$fail"; }
+		nice -n 10 "$HERE/wcc64" $M64 -O2 -c -o gexw64/gexgl.o "$gl/gexgl.c" >&2 || { echo "link-w64: gexgl.c failed" >&2; touch "$fail"; }
 	fi
 	objs="$objs gexw64/gexgl.o"
 	for f in $(llvm-nm --defined-only --extern-only gexw64/gexgl.o | awk '$2 == "T" { print $3 }'); do reg="$reg libEGL.so.1:func:$f"; done
@@ -171,5 +174,11 @@ done
 reg="$reg wineoss.so:data:__wine_unix_call_funcs=wineoss__wine_unix_call_funcs"
 wait
 [ ! -e "$fail" ] || { echo "link-w64: compile failed; not linking" >&2; exit 1; }
+if [ -n "$M64" ]; then
+	# the sysroot's libgex.a is the lowered flavour's: its dlopen again, with
+	# 64-bit addresses at its imports (then nothing of it comes from there)
+	"$HERE/wcc64" $M64 -O2 -c -o gexw64/dl64.o "$HERE/libgex/dl.c" || exit 1
+	objs="$objs gexw64/dl64.o"
+fi
 python3 "$HERE/dlreg.py" $reg > gexw64/reg.c
-"$HERE/wcc64" -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexw64/reg.c $objs $libs
+"$HERE/wcc64" $M64 -O1 -Wl,--gex-guest-x86-64 -o "$OUT" loader/main.o gexw64/reg.c $objs $libs

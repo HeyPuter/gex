@@ -655,6 +655,7 @@ async function handle(msg) {
   if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
   // A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim's process.
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
+  else delete globalThis.GEX_MEM64;
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;
@@ -1083,6 +1084,16 @@ async function handle(msg) {
     globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
     const runStarted = performance.now();
     const status = gone ? 0 : await gex.run(entry, ctx);
+    // The process's exec went to another Worker (a program of the other
+    // memory flavour, lib.rs `exec_away`): this one ends, the process does
+    // not. The host starts the exec as a posix_spawn child's.
+    const away = !gone && msg.kind !== 'thread' ? gex.execAwayRecord?.() : null;
+    if (away) {
+      gex.close?.();
+      gex.releaseWorker?.();
+      port.post({ kind: 'execAway', child: away });
+      return;
+    }
     // This Worker's thread went with the old program when another thread
     // called `execve`: the process runs on in that thread's Worker, so this
     // one ends as a thread does, never as the process.
