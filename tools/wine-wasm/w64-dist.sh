@@ -9,8 +9,10 @@
 # for tests/wine64/nt-x64.sh, W64_NTDLL=... (the native PE ntdll, W64.2) and
 # W64_NATIVE=... (the native PE core, W64.2: nt-x64.sh's NATIVE=).
 # Each step is cached in CACHE by what it depends on, and skipped when done:
-#   tools-P     Wine's build tools, native (widl and winebuild know wasm64)
-#   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install (with
+#   tools-TP    Wine's build tools, native (widl and winebuild know wasm64);
+#               TP: tools/, include/, libs/, nls/ and the configure inputs
+#   pe64-P      the x86_64 PE DLLs, MinGW, and native64 their install, made
+#               in pe64-work-* incrementally (with
 #               a native x86_64 Unix side, used only to make the prefix)
 #   pfx64-P     a win64 prefix (wineboot -i, native, no display)
 #   pfs64-P-R   it with W3's session applied (w3-session.reg; R: that and
@@ -77,6 +79,8 @@ fi
 # (dlls/*/unix, server, loader): keyed by the rest of the tree, so a
 # Unix-side change rebuilds only the wasm64 tree and the server.
 P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader/)' | sha256sum | cut -c1-12)
+# The tools only by what builds them, so a DLL change keeps them.
+TP=$(git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|configure|aclocal.m4|Makefile.in$)' | sha256sum | cut -c1-12)
 # The display libraries are keyed by what builds them; the wasm64 tree by
 # those, the link and gex-gl's guest library (linked into the loader).
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/flags64.sh "$here"/w64-deps.sh "$here"/w3.pins \
@@ -100,13 +104,25 @@ tools_build() {
 	"$W/configure" --enable-archs= --without-mingw --disable-tests $without
 	nice -n 10 make -j"$J" __tooldeps__ nls/locale.nls
 }
-log "tools ($P)"; step tools-$P tools_build
-T=$C/tools-$P
+log "tools ($TP)"; step tools-$TP tools_build
+T=$C/tools-$TP
 
+# Built incrementally in one tree per Wine checkout and tools (make sees
+# what a new commit changed: git touches only the files it rewrites), and
+# its install copied into pe64-P. A pin bump that changes one DLL took
+# about 40 minutes from scratch. W64_PE_FRESH=1 starts that tree over.
+WK=$C/pe64-work-$(echo "$W $T" | sha256sum | cut -c1-10)
 pe_build() {
-	"$W/configure" --enable-archs=x86_64 --with-wine-tools="$T" --disable-tests $without
-	nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
-	nice -n 10 make install prefix="$PWD/install"
+	local out=$PWD
+	(
+		flock 9
+		[ "${W64_PE_FRESH:-0}" = 1 ] && rm -rf "$WK"
+		mkdir -p "$WK"; cd "$WK"
+		[ -f Makefile ] || "$W/configure" --enable-archs=x86_64 --with-wine-tools="$T" --disable-tests $without
+		nice -n 10 make -k -j"$J" || nice -n 10 make -j"$J"
+		rm -rf install; nice -n 10 make install prefix="$WK/install"
+		cp -a --reflink=auto install "$out/install"
+	) 9>"$WK.lock"
 }
 log "x86_64 PE DLLs ($P)"; step pe64-$P pe_build
 N=$C/pe64-$P/install
