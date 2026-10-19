@@ -267,6 +267,9 @@ static void unconnected(void)
         if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof one)) _exit(2);
         write(u[1], "r", 1);
         if (read(u[1], &b, 1) != 1 || !udp_bound(fd, &at)) _exit(3);
+        /* Read only once the sender has seen the datagram: read first, it
+         * leaves nothing for the sender's poll (on Linux too, under load). */
+        if (read(u[1], &b, 1) != 1) _exit(6);
         if (!got(fd, "ping", &from) || ntohs(from.sin_port) != ntohs(t_at.sin_port) || !say(fd, "pong", &from)) _exit(4);
         write(u[1], "p", 1);
         /* The sender closes its copy while this polls. */
@@ -285,6 +288,7 @@ static void unconnected(void)
         int seen, answered;
         say(t, "ping", &at);
         seen = readable(s, 20000); /* the parent sees it, as wineserver's poll does */
+        write(u[0], "s", 1);
         answered = got(t, "pong", &from);
         if (read(u[0], &b, 1) != 1) answered = 0;
         ok(seen && answered, "unconnected: udp passed unbound; the sender binds and polls, the receiver reads and answers");
