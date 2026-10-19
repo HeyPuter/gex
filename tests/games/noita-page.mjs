@@ -41,6 +41,21 @@ const IMAGE = 0x400000;
 const worldBy = Number(process.env.NOITA_WORLD_BY_MIN || 12) * 60000;
 // Images that have no code to build a unit from (NOITA_UNITLESS_OK, a regex).
 const unitlessOk = new RegExp(process.env.NOITA_UNITLESS_OK || '/(tzres|normaliz)\\.dll$');
+// The images the unit set covers (TREE/units.list, tools/units-for.sh: a
+// path under images/ and its base): an image it names that runs without a
+// unit is a moved base or a stale set, and fails the run; one it does not
+// name was not in the run the set was made from (a driver Wine loads that
+// had no unit before gex could build one) and runs on tier-1, said only.
+// No list: every image counts, as before.
+const covered = (() => {
+  try {
+    const lines = readFileSync(process.env.NOITA_UNITS_LIST || join(tree, 'units.list'), 'utf8').split('\n');
+    return new Set(lines.map((l) => l.trim().split(/\s+/)[0]).filter(Boolean).map((p) => p.replace(/^images\//, '/')));
+  } catch {
+    return null;
+  }
+})();
+const counts = (path) => !unitlessOk.test(path) && (!covered || covered.has(path));
 
 // noita.exe's PE signature and file header (24 bytes at e_lfanew: machine,
 // sections, link time stamp...), as mapped at its base.
@@ -142,7 +157,7 @@ for (;;) {
   // So is an image with code that has no unit at the base it landed at
   // (Wine's builtins are all relocated, so a base can move between builds):
   // it runs on tier-1. Data-only images (no unit can be built) excepted.
-  const unitless = consoleLines.map((l) => /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l)).find((m) => m && !unitlessOk.test(m[1]));
+  const unitless = consoleLines.map((l) => /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l)).find((m) => m && counts(m[1]));
   if (unitless) { why = `${unitless[1]} at ${unitless[2]} has no function-tier unit (rebuild the units for its base)`; break; }
   if (tRun === null && s && s.phase !== 'loading' && s.phase !== 'fetching') tRun = now;
   const n = tRun === null ? 0 : await produced();
@@ -235,7 +250,7 @@ await grab('end');
 if (process.env.NOITA_SHOT && s?.out) writeFileSync(join(process.env.NOITA_SHOT, 'out.txt'), s.out);
 for (const l of consoleLines.filter((x) => /no function-tier unit/.test(x))) {
   const m = /image (\S+) at base (0x[0-9a-f]+): no function-tier unit/.exec(l);
-  if (m) console.log(`unitless: ${m[1]} ${m[2]}`);
+  if (m) console.log(`unitless: ${m[1]} ${m[2]}${counts(m[1]) ? '' : ' (not in the unit set: tier-1)'}`);
 }
 if (result) {
   const presents = result.n;
