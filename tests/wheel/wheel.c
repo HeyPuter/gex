@@ -56,7 +56,7 @@ int main(int argc, char **argv)
     wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
     wc.lpszClassName = "wheel";
     RegisterClassA(&wc);
-    hwnd = CreateWindowA("wheel", "wheel", WS_POPUP | WS_VISIBLE, 0, 0, 640, 480, NULL, NULL, wc.hInstance, NULL);
+    hwnd = CreateWindowA("wheel", "wheel", WS_POPUP | WS_VISIBLE, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, wc.hInstance, NULL);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
     printf("wheel: window up\n");
