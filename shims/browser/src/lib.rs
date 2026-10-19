@@ -3396,6 +3396,23 @@ struct Jit {
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
+    /// The page each directory entry this process published names (by the
+    /// entry: table and first slot), so a module's blocks can be told which
+    /// pages they are on.
+    base_pages: std::collections::BTreeMap<u32, u64>,
+    /// The runtime modules with blocks on each page (their dense bases), and
+    /// per module its block count and how many of those pages are still
+    /// live. A module none of whose pages is left cannot be reached: an
+    /// unloaded image's (FL's plugin scan loads and unloads dozens, and every
+    /// Worker's `blocks` kept each one's instance and code until the tab ran
+    /// out of memory). It joins `dense_dead`. A module with a block on a page
+    /// not in `base_pages` is not tracked, and lives.
+    dense_on_page: std::collections::HashMap<u64, Vec<u32>>,
+    dense_live: std::collections::HashMap<u32, (u32, u32)>,
+    /// Dead modules, `(dense base, blocks)`, in the order they died: each
+    /// Worker points their `blocks` entries back at the miss stub and drops
+    /// its references (`gex_dense_dead_*`, `Gex#reapDead`).
+    dense_dead: Vec<(u32, u32)>,
     /// Translations by pc (`remiss`): a pc translated again and again is a livelock.
     remiss: std::collections::HashMap<u64, u32>,
     /// How the shared-slot lookup went. Three outcomes: the page had a base in
@@ -9582,6 +9599,7 @@ pub extern "C" fn gex_adopt_child(
 /// A process's first JIT state, from the module's `gex.meta`, so runtime
 /// translation carries on where the build stopped.
 fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
+    DENSE_DEAD.store(0, std::sync::atomic::Ordering::Release);
     Jit {
         described: meta.next_slot != 0,
         page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
@@ -9602,6 +9620,10 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         own_ids: Default::default(),
         stale_again: Default::default(),
         retired_pages: Default::default(),
+        base_pages: Default::default(),
+        dense_on_page: Default::default(),
+        dense_live: Default::default(),
+        dense_dead: Vec::new(),
         remiss: Default::default(),
         reuse_have: 0,
         reuse_hit: 0,
@@ -15832,6 +15854,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             continue;
         }
         j.translated.retain(|a| *a < start || *a >= end);
+        j.provider.retain(|a, _| *a < start || *a >= end);
         // The stale-check bound counts translations of one code's block, so
         // new code at those addresses starts from 0 (a block a page before
         // `start` may run onto it): Wine's ACM codecs, loaded and unloaded
@@ -15852,7 +15875,24 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
-            unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+            let entry = unsafe { (*(at as usize as *const AtomicU32)).swap(0, Ordering::AcqRel) };
+            // Its slots name blocks of the code that was there: whatever
+            // gets this base next (the same file mapped again adopts it) must
+            // miss, not reach them.
+            if entry != 0 {
+                dense::clear_page(entry);
+                j.base_pages.remove(&entry);
+            }
+            if let Some(mods) = j.dense_on_page.remove(&page) {
+                for b in mods {
+                    let Some(l) = j.dense_live.get_mut(&b) else { continue };
+                    l.1 -= 1;
+                    if l.1 == 0 {
+                        let (n, _) = j.dense_live.remove(&b).unwrap_or_default();
+                        dense_die(j, b, n);
+                    }
+                }
+            }
             // TEST(gex_test_unpublished_retire): the retired page numbered
             // again at once and its entry left unwritten, as a publisher
             // that numbered pages and has not installed (or never will)
@@ -15862,6 +15902,73 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             }
         }
     }
+}
+
+/// Note the pages an installed runtime module has blocks on (`dense_on_page`).
+fn track_dense(j: &mut Jit, d: &gex_emit::dense::Section) {
+    let mut pages: Vec<u64> = Vec::new();
+    let mut last: Option<(u32, u64)> = None;
+    for &e in &d.entries {
+        let page = match last {
+            Some((b, p)) if gex_abi::dispatch_entry_table(b) == gex_abi::dispatch_entry_table(e)
+                && e >= b && (e - b) < gex_abi::SLOTS_PER_PAGE as u32 => p,
+            _ => {
+                let Some((&b, &p)) = j.base_pages.range(..=e).next_back() else { return };
+                if gex_abi::dispatch_entry_table(b) != gex_abi::dispatch_entry_table(e)
+                    || (e - b) >= gex_abi::SLOTS_PER_PAGE as u32
+                {
+                    return;
+                }
+                last = Some((b, p));
+                p
+            }
+        };
+        if pages.last() != Some(&page) && !pages.contains(&page) {
+            pages.push(page);
+        }
+    }
+    if pages.is_empty() {
+        return;
+    }
+    for &p in &pages {
+        j.dense_on_page.entry(p).or_default().push(d.base);
+    }
+    j.dense_live.insert(d.base, (d.entries.len() as u32, pages.len() as u32));
+}
+
+/// A runtime module none of whose pages is live any more: no dispatch can
+/// reach it. The registry forgets it (a joining Worker does not instantiate
+/// it, and a catch-up miss does not find it), and it is listed for every
+/// Worker to let go of (`gex_dense_dead_*`).
+fn dense_die(j: &mut Jit, base: u32, n: u32) {
+    j.dense_dead.push((base, n));
+    DENSE_DEAD.store(j.dense_dead.len() as u32, std::sync::atomic::Ordering::Release);
+    j.module_dense.remove(&base);
+    if let Some(i) = j.registry_dense.iter().rposition(|&(b, _)| b == base) {
+        #[cfg(feature = "shared-memory")]
+        REGISTRY_BYTES.fetch_sub(j.registry[i].len() as u64, std::sync::atomic::Ordering::Relaxed);
+        j.registry[i] = Vec::new();
+        j.registry_sums[i] = Vec::new();
+        j.registry_ext[i] = None;
+        j.registry_dense[i] = (0, 0);
+        regview::clear_module(i);
+    }
+}
+
+/// `Jit::dense_dead`'s length, for a Worker to check without the JIT lock
+/// (a waiting thread checks every time it wakes).
+static DENSE_DEAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many runtime modules of this process have died (`dense_die`).
+#[no_mangle]
+pub extern "C" fn gex_dense_dead_len() -> u32 {
+    DENSE_DEAD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Dead module `i`'s dense base, or its block count (`what` 1).
+#[no_mangle]
+pub extern "C" fn gex_dense_dead_at(i: u32, what: u32) -> u32 {
+    with_jit_only(|j| j.dense_dead.get(i as usize).map_or(0, |&(b, n)| if what == 1 { n } else { b }))
 }
 
 /// What `retire_code` retired since a translation took the JIT state out at
@@ -17055,6 +17162,10 @@ pub extern "C" fn gex_jit_installed() {
             }
             dir_note(page, base, "install-done");
             let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
+            j.base_pages.insert(base, page);
+        }
+        if let Some(d) = &done.dense {
+            track_dense(j, d);
         }
         // Kept only for a process that has run a second thread-Worker: the
         // registry exists solely so a joining Worker can instantiate every
@@ -17629,6 +17740,15 @@ pub(crate) mod regview {
         r.ext.store(ext.map_or(0, |(off, _)| off + 1), Ordering::Relaxed);
         r.key.store(ext.map_or(0, |(_, k)| k), Ordering::Relaxed);
         COUNT.store(i as u32 + 1, Ordering::Release);
+    }
+
+    /// Row `i` holds nothing any more (`dense_die`): a reader skips it.
+    pub fn clear_module(i: usize) {
+        let Some(r) = row(i as u32) else { return };
+        r.ptr.store(0, Ordering::Relaxed);
+        r.len.store(0, Ordering::Relaxed);
+        r.ext.store(0, Ordering::Relaxed);
+        r.key.store(0, Ordering::Relaxed);
     }
 
     /// A new, empty registry (a new process's host).

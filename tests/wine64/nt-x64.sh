@@ -141,8 +141,11 @@ check() {
 		wl=(--wayland "$w/wl-$name" --wayland-size "${WL_SIZE:-640x480}" --wayland-out "$w/$name")
 	fi
 	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
+	# RSS_OUT=FILE: the page run's peak RSS (KiB, the node process and its Workers) into FILE
+	local rss=()
+	[ -n "${RSS_OUT:-}" ] && rss=(python3 -c 'import resource,subprocess,sys; rc=subprocess.call(sys.argv[2:]); open(sys.argv[1],"w").write("%d\n" % resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss); sys.exit(rc)' "$RSS_OUT")
 	if [ -n "$page" ]; then
-		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
+		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 "${rss[@]}" timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
 			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
@@ -235,6 +238,44 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/authattrs.exe" "$here/authattrs.c" -lcrypt3
 else
 	case " ${CASES:-authattrs} " in *" authattrs "*)
 		fail=$((fail + 1)); echo "FAIL x64/authattrs ($tag): x86_64-w64-mingw32-gcc" ;; esac
+fi
+# Images loaded, run and unloaded one after another (dllcycle.c: 24 distinct
+# DLLs of ~1000 functions each, dllcycle-gen.py), as a plugin scan does: each
+# one's translations must go with it. In the page, every Worker's `blocks`
+# kept each unloaded image's modules alive (FL Studio's verified scan of ~50
+# plugins ran the tab out of memory), so the run's peak RSS is checked
+# against 4 such images: under DLLCYCLE_MB (default 8) MiB per further one.
+# ROUNDS=2 loads each again at the same base (translated again).
+if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
+	python3 "$here/dllcycle-gen.py" 1000 "$w/bigcode.c" &&
+	x86_64-w64-mingw32-gcc -O1 -c -o "$w/bigcode.o" "$w/bigcode.c" &&
+	for i in $(seq -w 0 23); do
+		x86_64-w64-mingw32-gcc -shared -o "$w/plug$i.dll" "$w/bigcode.o" \
+			-Wl,--image-base=$(printf '0x%x' $((0x300000000 + 10#$i * 0x1000000))) || exit 1
+	done; then
+	plugs=$(ls "$w"/plug*.dll | tr '\n' ' ')
+	# x as the plugins' code computes it (each image's code runs right after a reload too)
+	x4=$(python3 "$here/dllcycle-gen.py" 1000 --expect 4)
+	x24=$(python3 "$here/dllcycle-gen.py" 1000 --expect 24)
+	xr=$(python3 "$here/dllcycle-gen.py" 1000 --expect $((24 * ${ROUNDS:-1})))
+	if [ -n "$page" ] && case " ${CASES:-dllcycle} " in *" dllcycle "*) true ;; *) false ;; esac; then
+		f0=$fail
+		EXTRA="$plugs" RSS_OUT="$w/rss4" CASES=dllcycle4 check dllcycle4 0 "dllcycle 4 x $x4" "$w/dllcycle.exe" 4 1
+		EXTRA="$plugs" RSS_OUT="$w/rss24" CASES=dllcycle check dllcycle 0 "dllcycle $((24 * ${ROUNDS:-1})) x $xr" "$w/dllcycle.exe" 24 ${ROUNDS:-1}
+		if [ "$fail" = "$f0" ] && [ -s "$w/rss4" ] && [ -s "$w/rss24" ]; then
+			per=$(( ($(cat "$w/rss24") - $(cat "$w/rss4")) / (20 * ${ROUNDS:-1}) / 1024 ))
+			if [ "$per" -lt "${DLLCYCLE_MB:-8}" ]; then
+				pass=$((pass + 1)); echo "ok   x64/dllcycle-rss ($tag): $per MiB per unloaded image"
+			else
+				fail=$((fail + 1)); echo "FAIL x64/dllcycle-rss ($tag): $per MiB per unloaded image (bound ${DLLCYCLE_MB:-8})"
+			fi
+		fi
+	else
+		EXTRA="$plugs" check dllcycle 0 "dllcycle 24 x $x24" "$w/dllcycle.exe" 24 1
+	fi
+else
+	case " ${CASES:-dllcycle} " in *" dllcycle "*)
+		fail=$((fail + 1)); echo "FAIL x64/dllcycle ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c). Not in a 32-bit
 # memory's page: there the shim's heap is the upper 2 GiB of the process's

@@ -878,6 +878,39 @@ export class ProcessHost {
         }
         break;
       }
+      case 'droppedModules': {
+        // A Worker let go of modules its process can no longer reach
+        // (`Gex#reapDead`): the relay forgets them, so their code can go.
+        // Its siblings and the Workers in the pool hold them too (relayed
+        // and pooled), and so does the page's unit cache: all of them let go,
+        // or the code stays. A unit dropped here is compiled again if the
+        // same bytes come back (a DLL loaded again).
+        const proc = String(pid).split(':')[0];
+        const keys = m.keys ?? [];
+        const cache = this.#moduleCache.get(proc);
+        const units = [];
+        for (const k of keys) {
+          if (cache?.has(k)) {
+            cache.delete(k);
+            cache.bytes = (cache.bytes ?? 0) - regKeyBytes(k);
+          }
+          if (this.#unitModules.delete(k)) {
+            this.#unitBytes -= Number(k.split(':')[1]);
+            units.push(k);
+          }
+        }
+        for (const [key, other] of this.#workers) {
+          if (other !== w && String(key).split(':')[0] === proc) other.postMessage({ kind: 'droppedModules', keys });
+        }
+        if (units.length) {
+          for (const p of this.#warm) {
+            if (!p[POOLED]) continue;
+            for (const k of units) p[POOLED].delete(k);
+            p.postMessage({ kind: 'droppedModules', keys: units });
+          }
+        }
+        break;
+      }
       case 'compiledModule': {
         // A Worker compiled a module with content key `m.key`. Remember it for this process
         // and relay it to the process's other live Workers so none recompiles
