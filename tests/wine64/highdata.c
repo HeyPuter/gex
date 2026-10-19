@@ -8,6 +8,14 @@
  * limit: 5 GiB of data, some of it above 4 GiB, executable memory runs
  * wherever it lands, and a high data page made executable runs.
  *
+ * `highdata where`: only which flavour this process is ("flavour 64" when
+ * a top-down allocation lands above 4 GiB, else "flavour 32"), exit 0.
+ *
+ * Any arguments after the first are a command line run as a child process
+ * once the checks are done, waited for, and its exit code printed ("child
+ * exit N"): the memory flavour is per program (gex docs/mem64.md §5), so a
+ * memory64 highdata's child is a 32-bit process unless it asks too.
+ *
  *   x86_64-w64-mingw32-gcc -O1 -o highdata.exe highdata.c */
 #include <windows.h>
 #include <stdio.h>
@@ -26,6 +34,12 @@ static void check(int ok, const char *what)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "where"))
+    {
+        void *p = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+        printf("flavour %d\n", p && (ULONG_PTR)p >= LIMIT32 ? 64 : 32);
+        return 0;
+    }
     int mem64 = argc > 1 && !strcmp(argv[1], "mem64");
     /* 2560 MiB, or 5 GiB in the memory64 flavour */
     int want = mem64 ? 40 : 20;
@@ -126,5 +140,23 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < n; i++) VirtualFree(blocks[i], 0, MEM_RELEASE);
     printf("%d failures\n", failures);
+    if (argc > 2)
+    {
+        char cmd[1024] = "";
+        STARTUPINFOA si = { sizeof si };
+        PROCESS_INFORMATION pi;
+        DWORD code = 99;
+        for (int i = 2; i < argc; i++)
+            snprintf(cmd + strlen(cmd), sizeof cmd - strlen(cmd), "%s%s", i > 2 ? " " : "", argv[i]);
+        fflush(stdout);
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+            printf("FAIL CreateProcess %lu\n", GetLastError());
+        else
+        {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            GetExitCodeProcess(pi.hProcess, &code);
+            printf("child exit %lu\n", code);
+        }
+    }
     return failures;
 }
