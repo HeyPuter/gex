@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* MAP_SHARED file mappings agree with read and write of the same file
  * within a process (scratch/KC/map-shared.md, option A): a read returns the
  * mapping's unwritten-back stores, a write (pwrite, write, writev) shows in
@@ -70,6 +71,18 @@ int main(void) {
     munmap(p, 8192);
     memset(buf, 0, sizeof buf);
     check("written back", pread(fd, buf, 11, 0) == 11 && !memcmp(buf, "hello", 5) && buf[10] == 'Q');
+
+    /* A fixed shared mapping where the caller says, though the file is
+     * mapped elsewhere (Wine maps each view into its own reserved range):
+     * at that address, with the file's bytes. */
+    char *e = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    /* (below 4 GiB: a 64-bit memory's fixed mappings above are mem64-wx's) */
+    char *spot = mmap(0, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    e[20] = 'F';
+    char *f = mmap(spot, 8192, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    check("fixed elsewhere", f == spot && !memcmp(f, "hello", 5) && f[20] == 'F');
+    munmap(f, 8192);
+    munmap(e, 8192);
 
     close(fd);
     unlink(path);

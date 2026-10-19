@@ -3742,8 +3742,14 @@ impl MapIo<'_> {
                 }) {
                     let existing = &mm.log.shared_maps[i];
                     let at = existing.start + (offset - existing.offset);
-                    mm.log.shared_maps.alias(i, at, len_aligned);
-                    return Ok(at);
+                    // Not for a fixed mapping elsewhere: the caller uses the
+                    // address it named (Wine maps every view into its own
+                    // reserved range), so that one is a mapping of its own,
+                    // read from the file the others are written back to.
+                    if flags & crate::mem::flags::FIXED == 0 || addr == at {
+                        mm.log.shared_maps.alias(i, at, len_aligned);
+                        return Ok(at);
+                    }
                 }
             }
             // The path and offset travel with the mapping. Two processes
