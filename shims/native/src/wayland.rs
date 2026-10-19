@@ -752,8 +752,10 @@ impl Screen {
                 continue;
             };
             s += &format!(
-                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}",
+                " {}:{} id={:#x} {}x{}+{}+{} layer={}{}{}",
                 k.0, k.1, p.id, f.width, f.height, x, y, p.layer,
+                // the client draws its whole window: a page compositor puts no frame round it
+                if p.unmanaged { " unmanaged" } else { "" },
                 if self.focus == Some(k) { " focus" } else { "" }
             );
         }
