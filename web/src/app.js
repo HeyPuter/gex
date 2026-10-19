@@ -906,6 +906,10 @@ export function setGlobals(get, b = {}) {
   // w3split=1: W3 processes take the NT layer's 2 GiB split (the shim's heap above
   // 2 GiB), not the compact space: for a game that needs all of Windows' 2 GiB.
   if (get('w3split')) globalThis.GEX_W3_SPLIT = 1;
+  // nullguard=1: guest accesses below 64 KiB fault, as a null pointer's do
+  // natively (gex_abi::null_guard). A debugging opt-in: off, tier 1 and the
+  // units are as without it; on, 2-8% slower in tier 1.
+  if (get('nullguard') === '1') globalThis.GEX_NULL_GUARD = 1;
   if (get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(get('heartbeat'));
   // Benchmarks: game clocks faster than real time, a fixed start date (runtime.js).
   if (get('timescale')) globalThis.GEX_TIME_SCALE = Number(get('timescale'));

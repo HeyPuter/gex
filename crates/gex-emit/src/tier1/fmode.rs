@@ -102,6 +102,7 @@ impl<'a> FnBody<'a> {
         let n = n_values as usize;
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
+        e.value_ctx = vec![false; n];
         e.value_ty = vec![Ty::I64; n];
         e.value_fp = vec![None; n];
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
@@ -185,14 +186,38 @@ impl<'a> FnBody<'a> {
     pub fn block(&mut self, start: u64, stmts: &[Stmt], keep: &[Value], defer: &[usize]) -> Deferred {
         self.e.block_start = start;
         let mut u32s = vec![false; self.e.value_local.len()];
+        // Which values a load or a register read defines: a pointer, likely
+        // chased (`p = p->next`), whose null guard goes beside the access
+        // rather than on its address (`emit_address`).
+        let mut fetched = vec![false; self.e.value_local.len()];
+        let mut chase = vec![false; self.e.value_local.len()];
         for st in stmts {
-            if let Stmt::Def { dst, expr: Expr::Extend { signed: false, .. } } = st {
-                if let Some(u) = u32s.get_mut(dst.0 as usize) {
-                    *u = true;
+            if let Stmt::Def { dst, expr } = st {
+                match expr {
+                    Expr::Load { .. } | Expr::ReadReg(_) => {
+                        if let Some(u) = fetched.get_mut(dst.0 as usize) {
+                            *u = true;
+                        }
+                    }
+                    Expr::Extend { signed: false, a } => {
+                        if let Some(u) = u32s.get_mut(dst.0 as usize) {
+                            *u = true;
+                        }
+                        if fetched.get(a.0 as usize).copied().unwrap_or(false) {
+                            if let Some(u) = chase.get_mut(dst.0 as usize) {
+                                *u = true;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         self.e.value_u32 = u32s;
+        self.e.value_chase = chase;
+        for c in self.e.value_ctx.iter_mut() {
+            *c = false;
+        }
         // Values are numbered per block: forget the last block's (a value
         // nobody read keeps its local, which is only a local lost).
         for v in self.e.value_local.iter_mut() {
@@ -364,6 +389,7 @@ impl<'a> FnBody<'a> {
         }
         // Sunk code is pure: no address to guard; nothing claimed for it.
         self.e.value_u32.clear();
+        self.e.value_chase.clear();
         self.e.value_local.clone_from(&d.local);
         self.e.value_const.clone_from(&d.cnst);
         self.e.value_ty.clone_from(&d.ty);

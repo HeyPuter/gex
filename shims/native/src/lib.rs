@@ -1999,11 +1999,10 @@ fn run_thread_loop(
                         continue;
                     }
                 }
-                // A wild pointer in a Linux guest with no SIGSEGV handler:
-                // the process dies of SIGSEGV, as it would natively (the
-                // translated code cannot say which instruction faulted, so a
-                // handler, which would resume there, is not run; that case
-                // stays a gex error below).
+                // A wild pointer in a Linux guest: the process dies of
+                // SIGSEGV, as it would natively, or its handler runs. The
+                // translated code cannot say which instruction faulted, so
+                // the handler sees the context as last written back.
                 if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds))
                     && store.data().nt.is_none()
                 {
@@ -2059,6 +2058,30 @@ fn run_thread_loop(
                             detail: "guest memory access out of bounds".into(),
                             internal: false,
                         }));
+                    }
+                    // A handler (a null pointer's read, which traps at the null
+                    // guard, gex_abi::NULL_GUARD): its frame goes on the
+                    // context as the faulting code last wrote it back -- the
+                    // block's start in tier-1 -- with the fault's address
+                    // unknown (0, a null pointer's).
+                    if let Some(memory) = store.data().memory.clone() {
+                        let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+                        let mut gm = GuestMem::new(memory.bytes());
+                        match store.data_mut().with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, at, 0)) {
+                            gex_kernel::signal::Delivery::Resume(target) => {
+                                note_resume(store.data_mut(), target, "SIGSEGV");
+                                pc = target;
+                                continue;
+                            }
+                            _ => {
+                                return Ok(Stopped::Exited(Exit::Signal {
+                                    signal: signal::SIGSEGV,
+                                    pc: at,
+                                    detail: "guest memory access out of bounds".into(),
+                                    internal: false,
+                                }))
+                            }
+                        }
                     }
                 }
                 return Err(classify_trap(e, store));

@@ -1071,6 +1071,38 @@ pub mod cache_op {
 /// Checked where an access already goes through host code or a slow path.
 pub const GUEST_FLOOR: u64 = DISPATCH_DIR_END;
 
+/// The null guard, a debugging opt-in ([`null_guard`]; GEX_NULL_GUARD=1
+/// natively, `?nullguard=1` in the page): every translated guest access
+/// below this address traps, as a read or write of an unmapped page does on
+/// Linux (`vm.mmap_min_addr` is 64 KiB) and of the 64 KiB Windows reserves
+/// at 0. Nothing a guest may map lies below [`GUEST_FLOOR`], so the guard
+/// never refuses a real access. Off, the translators' output is what it was
+/// without it, and no key names it.
+///
+/// The translators fold it into the access at no more than one add: the
+/// address less `NULL_GUARD` wraps past 2^32 when it is below, and the
+/// access's static offset adds `NULL_GUARD` back, so the engine's own bounds
+/// check (the sum is past the end of memory) is the trap. Accesses to the
+/// thread's own context (the x87 stack, `EFLAGS_SYS`), which lives below,
+/// are left out by the value they are made through (`GuestReg::CtxAddr`).
+pub const NULL_GUARD: u64 = 0x1_0000;
+const _: () = assert!(NULL_GUARD <= GUEST_FLOOR && NULL_GUARD % 16 == 0);
+
+static NULL_GUARD_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn the null guard ([`NULL_GUARD`]) on or off, before anything is
+/// translated. A debugging switch: off by default, since it costs 2-8% in
+/// tier 1 (scratch/KC/ab-45.txt) and a guest that reads through a null
+/// pointer is broken anyway.
+pub fn set_null_guard(on: bool) {
+    NULL_GUARD_ON.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the null guard is on ([`set_null_guard`]).
+pub fn null_guard() -> bool {
+    NULL_GUARD_ON.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// KUSER_SHARED_DATA where Windows has it, a page every process maps
 /// read-only and much i386 code reads by constant (tick counts, the
 /// interrupt time, the OS version).

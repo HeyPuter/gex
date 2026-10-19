@@ -184,7 +184,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # mmap-writeback: a fork's child writes its pages of a shared mapping back
 # at exit, and only those (B; the page carries the mapping to the child's
 # Worker with its descriptors).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback"}
+# null-access (with GEX_NULL_GUARD=1, the debug opt-in): loads and stores
+# through null pointers (and below 64 KiB) fault: a SIGSEGV handler runs and
+# jumps back out, and with no handler the process dies of SIGSEGV.
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -194,7 +197,7 @@ for src in "$HERE"/*.c; do
     # *smc*: self-modifying code, under the function JIT as well (which
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
-    case $name in *smc* | copy-loop) tiers="t1 fjit" ;; esac
+    case $name in *smc* | copy-loop | null-access) tiers="t1 fjit" ;; esac
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
@@ -217,6 +220,8 @@ for src in "$HERE"/*.c; do
         # and fixing its guard, so the writer's stores land in between.
         envs=""
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
+        # null-access needs the null guard, a debug opt-in (gex_abi::null_guard).
+        [ $name = null-access ] && envs="GEX_NULL_GUARD=1"
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""

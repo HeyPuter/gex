@@ -217,6 +217,12 @@ Stream T ends here (coordinator, 2026-10-10).
 - `GEX_DISCOVER_SKIP`: bit 8 is the discovery log (`GEX_DL_FILE`); bits 16-23
   are a depth limit.
 - Inline dispatch: `GEX_INLINE_DISPATCH` / `?inlinedispatch=1`.
+- The null guard, a debugging opt-in: `GEX_NULL_GUARD=1` / `?nullguard=1`
+  (`gex_abi::null_guard`). Guest accesses below 64 KiB fault, as a null
+  pointer's do natively, in tier 1 (block and function mode) and the C units.
+  Off, their output is byte-identical to a build without it and no key names
+  it; on, tier 1 is 2-8% slower (scratch/KC/ab-45.txt, variant G). Test:
+  tests/x86-programs/null-access.c, which run.sh runs with it on.
 - `?xlatereport=N`.
 - The emitter switches are in the native module cache key, with a test
   (`cache_key_tests`).

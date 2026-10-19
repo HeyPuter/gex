@@ -1063,6 +1063,8 @@ export class Gex {
       // compact space (nothing grown; inherited regions become islands).
       // `?w3split=1` before the space is taken: the split, not the compact one.
       if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
+      // `?nullguard=1` before anything is translated (gex_abi::null_guard).
+      if (globalThis.GEX_NULL_GUARD) this.#shim.exports.gex_set_null_guard?.(1);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).
@@ -5787,14 +5789,22 @@ export class Gex {
         // borrowed -- a second call would bury the first error.
         // Asked once: the answer is taken with it.
         const crashed = !err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff();
-        if (crashed && this.#vfork && !/table index is out of bounds/.test(err?.message ?? '')) {
+        // The guest's own access out of bounds (a null pointer's, at the
+        // null guard, or a wild one past the end): the shim makes it the
+        // guest's fault -- the fault hook, a SIGSEGV handler, or the
+        // process's death by SIGSEGV -- and the trap is a handoff after all.
+        // Not when the shim says the trap was its own (in a syscall, or
+        // translating): that stays a crash.
+        const guestFault = crashed && /memory access out of bounds/.test(err?.message ?? '') &&
+          (this.#shim.exports.gex_guest_oob?.(ctx) ?? 0) === 1;
+        if (crashed && !guestFault && this.#vfork && !/table index is out of bounds/.test(err?.message ?? '')) {
           // posix_spawn's child crashed in this Worker: it ends, and the
           // thread that cloned it goes on.
           this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
           ({ pc, ctx } = this.#vforkLeave(err));
           continue;
         }
-        if (crashed) {
+        if (crashed && !guestFault) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -6844,7 +6854,10 @@ export class Gex {
                 continue;
               }
             }
-            throw err;
+            // The guest's own access out of bounds (a null pointer's): its
+            // fault, staged for the hook below (W3) or its SIGSEGV, as the
+            // run loop does and natively's call-out loop.
+            if (!(/memory access out of bounds/.test(err?.message ?? '') && (e.gex_guest_oob?.(ctx) ?? 0) === 1)) throw err;
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: hit ${hit}`); return ended(hit === me ? 1 : 0); }

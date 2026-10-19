@@ -18,6 +18,9 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_SYSCALL_INST_BYTES {}u", gex_abi::SYSCALL_INST_BYTES);
     let _ = writeln!(w, "#define GEX_GUEST_LIMIT 0x{:x}ull", gex_abi::GUEST_LIMIT);
     let _ = writeln!(w, "#define GEX_POISON_ADDR 0x{:x}u", gex_abi::POISON_ADDR);
+    if null_on() {
+        let _ = writeln!(w, "#define GEX_NULL_GUARD 0x{:x}u", gex_abi::NULL_GUARD);
+    }
     let _ = writeln!(w, "#define GEX_RESUMABLE_PC 0x{:x}ull", crate::RESUMABLE_PC);
     // The flavour's directory and patched bits: an M64 unit's are the dense
     // tables above 4 GiB (gex_abi::DISPATCH_DIR64), hence `ull` there; an M32
@@ -131,11 +134,11 @@ pub fn header() -> String {
     if gex_abi::mem64() {
         w.push_str(&mem64_helpers());
     } else {
-        w.push_str(BODY_HELPERS);
+        w.push_str(&body_helpers());
         if gex_abi::kuser_fold() {
             let _ = writeln!(w, "#define GEX_KUSER_GUARD 0x{:x}ull", gex_abi::KUSER_GUARD);
             let _ = writeln!(w, "#define GEX_BRK_KUSER_UNFOLDED ({})", imports::BRK_KUSER_UNFOLDED);
-            w.push_str(KUSER_HELPERS);
+            w.push_str(&kuser_helpers());
         }
     }
     w.push_str(X87_HELPERS);
@@ -207,6 +210,10 @@ fn mem64_helpers() -> String {
         assert!(b.contains(from), "the M64 header no longer matches BODY_HELPERS: {from}");
         b = b.replace(from, to);
     }
+    if null_on() {
+        b = with_subs(b, &NULL_SUBS[2..]);
+        b.push_str(&NULL_HELPER.replace("uint32_t", "uint64_t"));
+    }
     s.push_str(&b);
     s
 }
@@ -228,6 +235,72 @@ GEX_INLINE uint32_t gex_k(int ctx, uint64_t pc, uint64_t a) {
     return (uint32_t)a;
 }
 "#;
+
+/// The null guard (gex-emit `null_guard_on`), a debugging opt-in: off, the
+/// header is as it was without it, so are the units and their keys.
+fn null_on() -> bool {
+    gex_emit::tier1::null_guard_on()
+}
+
+fn with_subs(mut b: String, subs: &[(&str, &str)]) -> String {
+    for (from, to) in subs {
+        assert!(b.contains(from), "the null guard's header no longer matches: {from}");
+        b = b.replace(from, to);
+    }
+    b
+}
+
+/// The guard helpers with the null guard on: the bounds check's range
+/// starts at `GEX_NULL_GUARD` (one subtraction), in [`BODY_HELPERS`]'s
+/// `gex_g`, `gex_gb` and `gex_gb32`.
+const NULL_SUBS: &[(&str, &str)] = &[
+    (
+        "    return a < GEX_GUEST_LIMIT ? (uint32_t)a : GEX_POISON_ADDR;",
+        "    return a - GEX_NULL_GUARD < GEX_GUEST_LIMIT - GEX_NULL_GUARD ? (uint32_t)a : GEX_POISON_ADDR;",
+    ),
+    (
+        "    return (char *)(uintptr_t)(a < GEX_GUEST_LIMIT ? (uint32_t)a : (uint32_t)GEX_GUEST_LIMIT);",
+        "    return (char *)(uintptr_t)(a - GEX_NULL_GUARD < GEX_GUEST_LIMIT - GEX_NULL_GUARD ? (uint32_t)a : (uint32_t)GEX_GUEST_LIMIT);",
+    ),
+    (
+        "    return (char *)(uintptr_t)(a < (uint32_t)GEX_GUEST_LIMIT ? a : (uint32_t)GEX_GUEST_LIMIT);",
+        "    return (char *)(uintptr_t)(a - GEX_NULL_GUARD < (uint32_t)GEX_GUEST_LIMIT - GEX_NULL_GUARD ? a : (uint32_t)GEX_GUEST_LIMIT);",
+    ),
+];
+
+/// The null guard of an unguarded access, with the guard on: the address
+/// less the guard, which the access's constant offset adds back. clang
+/// folds a non-negative inbounds offset into the memarg, whose sum does not
+/// wrap, so below the guard the access is past 2^32 and the engine traps.
+/// The barrier keeps clang from cancelling the two.
+const NULL_HELPER: &str = r#"GEX_INLINE char *gex_n(uint32_t a) {
+    uint32_t b = a - GEX_NULL_GUARD;
+    __asm__("" : "+r"(b));
+    return (char *)(uintptr_t)b;
+}
+"#;
+
+/// [`BODY_HELPERS`], with the null guard's when it is on.
+fn body_helpers() -> String {
+    if !null_on() {
+        return BODY_HELPERS.to_string();
+    }
+    let mut b = with_subs(BODY_HELPERS.to_string(), NULL_SUBS);
+    b.push_str(NULL_HELPER);
+    b
+}
+
+/// [`KUSER_HELPERS`], with an address below the null guard a fault too
+/// when it is on.
+fn kuser_helpers() -> String {
+    if !null_on() {
+        return KUSER_HELPERS.to_string();
+    }
+    with_subs(
+        KUSER_HELPERS.to_string(),
+        &[("    if (__builtin_expect(a >= GEX_KUSER_GUARD, 0))", "    if (__builtin_expect(a - GEX_NULL_GUARD >= GEX_KUSER_GUARD - GEX_NULL_GUARD, 0))")],
+    )
+}
 
 const BODY_HELPERS: &str = r#"
 #define GEX_INLINE static inline __attribute__((always_inline))

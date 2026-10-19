@@ -2327,6 +2327,14 @@ fn pregrow() -> bool {
     PREGROW.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `gex_set_null_guard(1)` (`?nullguard=1`, run-node's GEX_NULL_GUARD=1):
+/// the null guard (`gex_abi::null_guard`), a debugging opt-in, before
+/// anything is translated.
+#[no_mangle]
+pub extern "C" fn gex_set_null_guard(on: u32) {
+    gex_abi::set_null_guard(on != 0);
+}
+
 /// Turn on gex-wayland protocol tracing (buffers, commits, "produced no frame")
 /// -- the shim has no env, so `GEX_WL_TRACE` can't reach the compositor here.
 #[no_mangle]
@@ -15596,6 +15604,49 @@ fn kuser_unfolded(arg: i64) -> ! {
         }
     }
     trap()
+}
+
+/// A "memory access out of bounds" trap the run loop caught (gex.mjs):
+/// the guest's, a null pointer's read or write at the null guard
+/// (`gex_abi::NULL_GUARD`) or a wild pointer past the end, unless this
+/// thread was in a syscall or translating, where it is the runtime's own
+/// crash (0: JS reports it as one). The guest's is a fault at the context's
+/// pc as the faulting code last wrote it back (a block's start in tier-1),
+/// its address unknown (0, a null pointer's): an access violation for a
+/// process with a fault hook (W3), else SIGSEGV for its handler, else the
+/// process dies of it. 1: the trap is a handoff, the resume set or the
+/// process ended.
+#[no_mangle]
+pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
+    if IN_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) || jit_holds() || sigs::home().is_none() {
+        return 0;
+    }
+    let c = match my_ctx() {
+        0 => ctx_addr as u64,
+        m => m,
+    };
+    let mut gm = GuestMem::new(guest_bytes());
+    let Ok(pc) = gm.read_u64(c + ctx::PC as u64) else { return 0 };
+    if cgen::fault_hook() != 0 {
+        cgen::fault_stage(0xc000_0005, 0, 0);
+        set_resume(pc);
+        set_resume_ctx(c);
+        return 1;
+    }
+    match sigs::fault(&mut gm, c, 11, pc, 0) {
+        gex_kernel::signal::Delivery::Resume(target) => {
+            if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+            }
+            set_resume(target);
+            set_resume_ctx(c);
+        }
+        _ => {
+            trace_line(&format!("gex: guest memory access out of bounds at pc={pc:#x} (SIGSEGV)\n"));
+            exit_here(-11, Some(pc));
+        }
+    }
+    1
 }
 
 /// The PE images Wine mapped in this process (`gex_image_mapped`): base,

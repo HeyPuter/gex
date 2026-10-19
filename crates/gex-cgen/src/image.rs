@@ -91,6 +91,9 @@ fn unit_inputs() -> String {
     // W3's KUSER_SHARED_DATA fold (`gex_abi::kuser_fold`): its units read
     // the page where W3's Wine maps it and check every other address.
     let base = if gex_abi::kuser_fold() { format!("{base}:w3kuser") } else { base };
+    // The null guard, a debugging opt-in: named only when on, so the
+    // units of a build without it keep their keys.
+    let base = if gex_emit::tier1::null_guard_on() { format!("{base}:nullguard:{:x}", gex_abi::NULL_GUARD) } else { base };
     // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {
@@ -900,7 +903,10 @@ mod fingerprint_tests {
             ("lib.rs", include_str!("lib.rs")),
         ];
         // Not values: modules, types, functions of the host side.
-        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index"];
+        // NULL_GUARD: embedded only with the null guard on, whose units'
+        // key names it (`unit_inputs`), so the fingerprint of every other
+        // build stays as it was.
+        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index", "NULL_GUARD"];
         let mut missing = Vec::new();
         for (file, text) in sources {
             for prefix in ["ctx::", "gex_abi::"] {
