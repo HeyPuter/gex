@@ -392,6 +392,9 @@ ship the function-tier units built for those bases by the page's own gexc
 | 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
 | 4419 | Baba Is You | w64 | **renders** (credits screen) |
 | 4420 | Warfork | w64 | **main menu** by 301 s (gooner; G2's g2/page-inet-carry, in round 1019b; before it, an error dialog: "Couldn't open UDP socket: setsockopt: Unknown error") |
+| 4435 | Celeste | w3 | starfield backdrop renders at 1200 s, still loading (GFX load 281 s, mountain load 137 s); needs `page=w3split` (in the compact space the shim's heap reached 1296 MiB and it ran out at 240 s) |
+| 4436 | TowerFall Ascension | w3 | "Couldn't find Steam!": its site has no Steam stand-in yet |
+| 4437 | Antichamber | w3 | with `page=w3split` no out-of-memory; Wine Mono then crashes (c0000005) at about 420 s |
 | - | TUNIC | w64 | no page: needs memory64 |
 | - | blocked, idea and dotnet rows | | no page: listed only |
 
