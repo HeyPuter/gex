@@ -19,7 +19,9 @@
 // Latency, measured: each report (`__gexAudio.last`) has `backlog` (ms of
 // frames in the ring when a quantum starts: avg, min, max over the report),
 // and the context's own `base` and `output` latencies (ms). `?audioclock=0`
-// leaves the device on the wall clock, as it was, to compare.
+// leaves the device on the wall clock, as it was, to compare;
+// `?audiolatency=S` gives the context a latency hint of S seconds instead
+// of 'interactive'.
 
 const WORKLET = `
 let LOW = 0.01;
@@ -95,11 +97,18 @@ let started = false;
 
 /** Play the ring at `at` in the global kernel's `memory` (a shared
  *  WebAssembly.Memory). Once per page; later calls do nothing. */
-export function startAudio({ memory, at, clock = true }) {
+export function startAudio({ memory, at, clock = true, latency = 'interactive' }) {
   if (started || !at || !memory || typeof AudioContext !== 'function' || typeof AudioWorkletNode !== 'function') return;
   if (typeof SharedArrayBuffer !== 'function' || !(memory.buffer instanceof SharedArrayBuffer)) return;
   started = true;
-  const ctx = new AudioContext({ latencyHint: 'interactive' });
+  // `?audiolatency=S`: the context's latency hint in seconds (the browser
+  // picks its nearest; 0 asks for its smallest), for measuring.
+  let ctx;
+  try {
+    ctx = new AudioContext({ latencyHint: latency });
+  } catch {
+    ctx = new AudioContext({ latencyHint: 'interactive' });
+  }
   const info = { ctx, last: null, history: [] };
   globalThis.__gexAudio = info;
   const resume = () => {
