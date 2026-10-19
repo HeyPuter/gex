@@ -14,6 +14,7 @@ import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
+import { startAudio } from './audio.js';
 
 /** The guest Worker's modules: bytes fetched, bytes from the page's cache
  *  (worker-graph.js). */
@@ -1024,6 +1025,8 @@ async function runProgramHere(
       // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
       fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
+      // `?jitdiag=1`: retire counts by page and call, and the watch on a page that keeps translating.
+      jitDiag: flag('jitdiag') ? 1 : undefined,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,
       // `?log=1` (or `?log=record,...`): gex's debug output, off by default
@@ -1132,6 +1135,8 @@ async function runProgramHere(
       else if (m.kind === 'net') onNetEvent?.(m.event);
       // Pid 1 has copied `files` into the kernel's filesystem.
       else if (m.kind === 'files-loaded') onFilesLoaded?.();
+      // Where `/dev/dsp`'s output is: played from the first gesture on.
+      else if (m.kind === 'audio') startAudio({ ...m, clock: flag('audioclock') !== '0' });
     },
   });
 

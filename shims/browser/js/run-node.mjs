@@ -422,6 +422,8 @@ const host = new ProcessHost({
     // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
+    // GEX_JIT_DIAG: retire counts by page and call, and the watch on a page that keeps translating.
+    jitDiag: !!process.env.GEX_JIT_DIAG,
     // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
     traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
     watchMem: process.env.GEX_WATCH_MEM || undefined,
@@ -538,6 +540,7 @@ const host = new ProcessHost({
     }
   },
   onMessage: (m, pid) => {
+    if (m?.kind === 'audio') audioRing ??= m;
     // Memory before the guest runs an instruction: whether the cost is placing
     // the image or running it.
     if (m?.kind === 'loaded' && pid === 1 && process.env.GEX_DEBUG_EXIT) {
@@ -545,6 +548,52 @@ const host = new ProcessHost({
     }
   },
 });
+
+// `/dev/dsp`'s ring in the global kernel (shims/kernel/src/audio.rs), as
+// the page plays it (web/src/audio.js). GEX_AUDIO_TAP=1 reports, at exit,
+// what the newest quarter second in it sounds like: its rate, generation,
+// RMS and frequency (left channel, by zero crossings).
+let audioRing = null;
+function audioTap() {
+  if (!audioRing) { process.stderr.write('[audio] no ring\n'); return; }
+  const { memory, at } = audioRing;
+  const words = new Uint32Array(memory.buffer, at, 8);
+  const [, w, rate, cap, owner, gen] = words;
+  const n = Math.min(w, cap, Math.floor(rate / 4));
+  const f = new Float32Array(memory.buffer, at + 32, cap * 2);
+  let sq = 0, cross = 0, last = 0;
+  for (let i = w - n; i < w; i++) {
+    const l = f[((i >>> 0) % cap) * 2];
+    sq += l * l;
+    if (i > w - n && (l >= 0) !== (last >= 0)) cross++;
+    last = l;
+  }
+  const rms = n ? Math.sqrt(sq / n) : 0, hz = n ? cross / 2 / (n / rate) : 0;
+  process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)}\n`);
+}
+
+// GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that
+// plays the ring at SPEED times its rate (1: real time), publishing its read
+// position and heartbeat as the worklet does, so the OSS device paces its
+// writers to it (tests/browser-audio.sh's dsp-pace).
+if (process.env.GEX_AUDIO_PLAYER) {
+  const speed = Number(process.env.GEX_AUDIO_PLAYER) || 1;
+  let t = performance.now(), acc = 0, gen = -1;
+  setInterval(() => {
+    const now = performance.now(), dt = now - t;
+    t = now;
+    if (!audioRing) return;
+    const words = new Uint32Array(audioRing.memory.buffer, audioRing.at, 8);
+    const w = Atomics.load(words, 1), g = Atomics.load(words, 5);
+    if (g !== gen) { gen = g; Atomics.store(words, 6, w); acc = 0; }
+    acc += dt / 1000 * (words[2] || 44100) * speed;
+    const k = Math.floor(acc);
+    acc -= k;
+    const r = Atomics.load(words, 6);
+    Atomics.store(words, 6, ((w - r) >>> 0) < k ? w : (r + k) >>> 0);
+    Atomics.add(words, 7, 1);
+  }, 2).unref();
+}
 
 let status;
 // GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
@@ -574,6 +623,7 @@ try {
       // message: `opts` is what a fork record carries to a child's Worker.
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
       traceMisses: !!process.env.GEX_TRACE_MISSES,
+      jitDiag: !!process.env.GEX_JIT_DIAG,
       checkSp: !!process.env.GEX_CHECK_SP,
       watchMem: process.env.GEX_WATCH_MEM || undefined,
       noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
@@ -611,4 +661,5 @@ try {
 if (SINGLE && process.env.GEX_SINGLE_STATS) {
   process.stderr.write(`[single] fibers ${FiberWorker.count}, sched ${JSON.stringify(sched.stats)}\n`);
 }
+if (process.env.GEX_AUDIO_TAP) audioTap();
 process.exitCode = status;

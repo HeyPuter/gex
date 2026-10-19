@@ -267,6 +267,11 @@ pub(crate) fn rebridge(pc: u64) -> bool {
     if !(provided(pc) || super::provider_serves(pc)) || super::index_of(pc).is_none() {
         return false;
     }
+    // A native Wine DLL's binding where its skeleton no longer is: the
+    // guest's own code now, for tier-1 (wasmdll `binding_is_stale`).
+    if super::wasmprog::guest_x86_64() && super::wasmdll::binding_is_stale(pc) {
+        return false;
+    }
     {
         // Counted only while nothing else happens in between. A long-running
         // process loses a provider's bridge legitimately every time a new

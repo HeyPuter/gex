@@ -978,6 +978,10 @@ async function handle(msg) {
         },
       );
       if (!entry) throw new Error('the program could not be loaded');
+      // Where `/dev/dsp`'s output is, for the page to play (once per page;
+      // every process tells it, the first one wins).
+      const ring = gex.audioRing?.();
+      if (ring) port.post({ kind: 'audio', memory: ring.memory, at: ring.at });
       // The files are in the kernel's filesystem now, copied. The views here
       // are of the page's bundle (one SharedArrayBuffer, ~460 MiB for the
       // mspaint demo), which stays resident while anything views it: let go,
@@ -1047,6 +1051,7 @@ async function handle(msg) {
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.vforkTrace ?? msg.opts?.vforkTrace) globalThis.GEX_VFORK_TRACE = 1;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.jitDiag) ex.gex_set_jit_diag?.(1);
     if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));
     if (msg.checkSp) ex.gex_set_check_sp?.(1);

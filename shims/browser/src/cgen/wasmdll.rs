@@ -274,6 +274,51 @@ pub(super) fn forget_gone(gone: &[(u64, u64)]) {
     }
 }
 
+/// Whether the binding of Wine's PE module at `pc` outlived its skeleton:
+/// the bytes there are no longer the skeleton's stub (each export is
+/// `ud2; ud2`, tools/wine-wasm/specgen.py), so the code is the guest's and
+/// the native export has nothing to do with it. Every binding of the
+/// install in that mapping whose stub is gone too is forgotten here, and
+/// the caller lets tier-1 translate `pc`.
+///
+/// [`forget_gone`] catches a view unmapped, but not every way new code
+/// lands where a skeleton was: FL Studio's page start had two pages of
+/// anonymous code at 0x7fc11000 and 0x7fc31000, where a skeleton had been
+/// mapped as an image view, rebridged to the native export at every call
+/// (`elfprov::rebridge`, "provider re-bridge", 254 misses running) while
+/// the thread held the loader lock. (Not the mapping's file: Wine reads an
+/// image whose sections are not page-aligned into anonymous memory, so a
+/// live skeleton is often anonymous too.)
+pub(crate) fn binding_is_stale(pc: u64) -> bool {
+    let Some(install) = lock(&WINE_PE).as_ref().map(|w| w.install) else { return false };
+    if !ftab(|m| m.get(pc).is_some_and(|f| f.install == install)) {
+        return false;
+    }
+    let gm = crate::GuestMem::new(crate::guest_bytes());
+    let stub = |a: u64| matches!(gm.read_u32(a), Ok(w) if w == 0x0b0f_0b0f);
+    // Unreadable or the stub still there: a live skeleton.
+    if gm.read_u32(pc).is_err() || stub(pc) {
+        return false;
+    }
+    let (lo, hi) = {
+        let mm = crate::sigs::proc_home().mm().lock();
+        match mm.vma_at(pc) {
+            Some(v) => (v.start, v.end),
+            None => (pc & !0xfff, (pc & !0xfff) + 0x1000),
+        }
+    };
+    let memory = crate::guest_bytes();
+    let gone: Vec<u64> = ftab(|m| m.range(lo, hi).filter(|(a, f)| f.install == install && !stub(*a)).map(|(a, _)| a).collect());
+    ftab(|m| {
+        for &a in &gone {
+            m.retire(a);
+            gex_kernel::ftab::fcache_clear(memory, a);
+        }
+    });
+    crate::trace_line(&format!("gex: {} native bindings in {lo:#x}..{hi:#x} outlived their skeleton; forgotten\n", gone.len()));
+    true
+}
+
 /// Whether `pc` is in a mapped skeleton's executable sections.
 pub(crate) fn in_skeleton(pc: u64) -> bool {
     lock(&SKELETON_CODE).iter().any(|&(lo, hi)| lo <= pc && pc < hi)

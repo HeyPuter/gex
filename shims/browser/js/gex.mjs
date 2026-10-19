@@ -1155,6 +1155,16 @@ export class Gex {
    *  and where the wait slots' words start, or null: what a compositor walks
    *  to wake this process's parked threads after an input event
    *  (`wl-bridge.mjs` `sendEvent`). */
+  /** The global kernel's memory and the address in it of `/dev/dsp`'s
+   *  ring (shims/kernel/src/audio.rs), or null: what the page plays
+   *  (web/src/audio.js). */
+  audioRing() {
+    const e = this.#shim?.exports;
+    if (!this.#kernel || !e?.gex_audio_ring_addr || !this.#kernelSpec?.memory) return null;
+    const at = e.gex_audio_ring_addr() >>> 0;
+    return at ? { memory: this.#kernelSpec.memory, at } : null;
+  }
+
   kernelWake() {
     const e = this.#shim?.exports;
     if (!this.#kernel || !e?.gex_proc_queue_addr || !this.#kernelSpec?.memory) return null;
@@ -1620,6 +1630,7 @@ export class Gex {
       stracePid: opts.stracePid,
       tty: opts.tty, uid: opts.uid, gid: opts.gid,
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
+      jitDiag: opts.jitDiag,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
       // The translator's knobs, for every process of the run: set only here,
@@ -2778,6 +2789,7 @@ export class Gex {
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
+    if (o.jitDiag) e.gex_set_jit_diag?.(1);
     if (o.checkSp) e.gex_set_check_sp?.(1);
     if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
     if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);

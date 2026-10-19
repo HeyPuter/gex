@@ -4556,7 +4556,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let again = match caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     Some(shared) => {
                         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        let again = sh.provider.get(&start).map_or(true, |&m| m == addr as u64);
+                        // `addr`'s low half is the module id; the high half its
+                        // dense base, when it has one (tier1 `emit_page_check`).
+                        let again = sh.provider.get(&start).map_or(true, |&m| m & 0xffff_ffff == addr as u64 & 0xffff_ffff);
                         if again {
                             sh.translated.remove(&start);
                             sh.provider.remove(&start);

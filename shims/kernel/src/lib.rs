@@ -19,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 use gex_kernel::proc::ProcTable;
 
+mod audio;
 mod wait;
 
 /// Stacks, one per Worker. Every Worker instantiates this module and shares its

@@ -197,6 +197,10 @@ pub struct Context<'a> {
     pub page_bases: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
+    /// The module's imported dense base (`crate::dense::GLOBAL`), when it
+    /// has one: `PAGE_STALE` passes its value, where this module's dense
+    /// blocks really are in the process running it.
+    pub dense_global: Option<u32>,
     /// Every address some block of `gir` branches back to (a successor at or
     /// below the branching block's start). A region needs a back edge to its
     /// entry, so a block not in here grows none and the walk is skipped.
@@ -5158,7 +5162,21 @@ impl<'a> Emitter<'a> {
             self.f.local_get(self.ctx_local);
             self.f.i64_const(start as i64);
             self.f.i32_const(gex_abi::cache_op::PAGE_STALE);
-            self.f.i64_const(self.cx.module_id as i64);
+            // The argument: this module's dense base (high half, read at run
+            // time: where its blocks are in the process running it, unique
+            // there by construction) and its id (low half). The id is
+            // compiled in and code outlives its process (units adopted from
+            // another, modules restored from the translation cache), so ids
+            // repeat; it only decides whether to translate again, never
+            // whether to resume from JavaScript (`gex_cache_op`).
+            self.f.i64_const((self.cx.module_id & 0xffff_ffff) as i64);
+            if let Some(g) = self.cx.dense_global {
+                self.f.global_get(g);
+                self.f.byte(0xad); // i64.extend_i32_u
+                self.f.i64_const(32);
+                self.f.byte(0x86); // i64.shl
+                self.f.byte(0x84); // i64.or
+            }
             self.f.call(self.cx.cache_op);
         }
         self.store_pc(start);

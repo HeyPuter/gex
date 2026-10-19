@@ -954,6 +954,7 @@ impl ModuleBuilder {
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
                 module_id,
+                dense_global: self.dense_global,
                 loop_heads: Some(&heads),
                 enter: Some(self.dispatch),
             };
