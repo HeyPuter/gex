@@ -283,6 +283,9 @@ pub fn claim_fixed(heap_base: u64) {
     }
     claim(Kind::Reserved, 0, 0, gex_abi::RESERVED_END, "page zero, contexts, runtime words");
     claim(Kind::Reserved, 0, gex_abi::DISPATCH_DIR, gex_abi::DISPATCH_DIR_END, "dispatch directory");
+    if gex_abi::mem64() {
+        claim(Kind::Reserved, 0, gex_abi::DISPATCH_DIR64, gex_abi::HIGH_TABLES_END, "M64 dispatch directory, patched pages");
+    }
     claim(Kind::Guest, 0, gex_abi::DISPATCH_DIR_END, 0x0580_0000, "low layout: image, interpreter, break, stack");
     claim(Kind::BootStacks, 0, 0x0580_0000, 0x0600_0000, "gex_worker_init's bootstrap slices");
     claim(Kind::ShimData, 0, 0x0600_0000, heap_base, "shim data and bss");

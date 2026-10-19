@@ -979,7 +979,7 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
         let mem = crate::guest_bytes();
         for &(page, hash) in &x.pages {
             map.insert(page, hash);
-            let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
+            let off = (gex_abi::patched_pages() + page / 8) as usize;
             if let Some(b) = mem.get_mut(off) {
                 *b &= !(1 << (page % 8));
             }
@@ -1080,7 +1080,7 @@ pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
         let mut pages: std::collections::BTreeMap<u64, u32> = Default::default();
         for &a in addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
-            if page >= gex_abi::DISPATCH_MAX_PAGES {
+            if page >= gex_abi::dispatch_max_pages() {
                 continue;
             }
             let base = match j.page_table.lookup(page) {
@@ -1498,7 +1498,7 @@ pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
         for (page, base) in dirs {
             if j.page_table.lookup(page) == Some(base) {
                 crate::dense::note_entry(base);
-                let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
             }
         }
     });
@@ -1662,7 +1662,7 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
             !crate::fjit::current(f.install)
         } else {
             let page = addr / gex_abi::DISPATCH_PAGE;
-            let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
+            let patched = mem.get((gex_abi::patched_pages() + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
             // A provider serves the export whatever its bytes became: Noita's
             // mod sandbox rewrites lua51's entry points, which the Lua provider
             // replaces (as natively, ftab.rs `current`).
@@ -2189,10 +2189,10 @@ pub(crate) fn callouts() -> (u64, u64) {
 pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
     let pc = pc as u64;
     let page = gex_abi::dispatch_page(pc);
-    if page >= gex_abi::DISPATCH_MAX_PAGES {
+    if page >= gex_abi::dispatch_max_pages() {
         return -1;
     }
-    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
     if entry == 0 {
         return -1;
     }
@@ -2467,7 +2467,7 @@ fn on_retire_pages(ranges: &[(u64, u64)], gone: &[(u64, u64)]) {
             let at = page * gex_abi::DISPATCH_PAGE;
             let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
             if unmapped || page_hash(memory, page) != built {
-                let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
+                let off = (gex_abi::patched_pages() + page / 8) as usize;
                 if let Some(b) = memory.get_mut(off) {
                     *b |= 1 << (page % 8);
                 }

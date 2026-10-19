@@ -19,9 +19,13 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_GUEST_LIMIT 0x{:x}ull", gex_abi::GUEST_LIMIT);
     let _ = writeln!(w, "#define GEX_POISON_ADDR 0x{:x}u", gex_abi::POISON_ADDR);
     let _ = writeln!(w, "#define GEX_RESUMABLE_PC 0x{:x}ull", crate::RESUMABLE_PC);
-    let _ = writeln!(w, "#define GEX_DISPATCH_DIR 0x{:x}u", gex_abi::DISPATCH_DIR);
+    // The flavour's directory and patched bits: an M64 unit's are the dense
+    // tables above 4 GiB (gex_abi::DISPATCH_DIR64), hence `ull` there; an M32
+    // unit's header is as it was.
+    let sfx = if gex_abi::mem64() { "ull" } else { "u" };
+    let _ = writeln!(w, "#define GEX_DISPATCH_DIR 0x{:x}{sfx}", gex_abi::dispatch_dir());
     let _ = writeln!(w, "#define GEX_DISPATCH_PAGE 0x{:x}u", gex_abi::DISPATCH_PAGE);
-    let _ = writeln!(w, "#define GEX_DISPATCH_MAX_PAGES 0x{:x}u", gex_abi::DISPATCH_MAX_PAGES);
+    let _ = writeln!(w, "#define GEX_DISPATCH_MAX_PAGES 0x{:x}{sfx}", gex_abi::dispatch_max_pages());
     let _ = writeln!(w, "#define GEX_DISPATCH_SHIFT {}u", gex_abi::DISPATCH_SHIFT);
     let _ = writeln!(w, "#define GEX_DISPATCH_TABLES {}u", gex_abi::DISPATCH_TABLES);
     let _ = writeln!(w, "#define GEX_DISPATCH_SLOT_BITS {}u", gex_abi::DISPATCH_SLOT_BITS);
@@ -32,7 +36,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_GUEST_FLOOR 0x{:x}u", gex_abi::GUEST_FLOOR);
     let _ = writeln!(w, "#define GEX_W3_KUSER 0x{:x}u", gex_abi::W3_KUSER);
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
-    let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
+    let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}{sfx}", gex_abi::patched_pages());
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
     let _ = writeln!(w, "#define GEX_FCACHE 0x{:x}u", gex_abi::FCACHE);
     let _ = writeln!(w, "#define GEX_FCACHE_BITS {}u", gex_abi::FCACHE_BITS);

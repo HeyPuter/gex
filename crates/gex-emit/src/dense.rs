@@ -293,7 +293,7 @@ pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32
 /// bridge carries on in tier-1 through such a function).
 pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     use crate::wasm::{FuncBody, ValType};
-    use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE};
+    use gex_abi::{ctx, DISPATCH_PAGE};
     let mut f = FuncBody::new(1);
     let target = f.add_local(ValType::I64);
     let page = f.add_local(ValType::I64);
@@ -312,10 +312,10 @@ pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     f.i32_const(4);
     f.byte(0x6c); // i32.mul
     f.addr_i32();
-    f.load(0x28, 2, DISPATCH_DIR as u32);
+    f.load64(0x28, 2, gex_abi::dispatch_dir());
     f.i32_const(0);
     f.local_get(page);
-    f.i64_const(DISPATCH_MAX_PAGES as i64);
+    f.i64_const(gex_abi::dispatch_max_pages() as i64);
     f.byte(0x54); // i64.lt_u
     f.select();
     f.local_tee(entry);

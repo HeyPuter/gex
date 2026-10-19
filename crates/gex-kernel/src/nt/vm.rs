@@ -202,6 +202,8 @@ impl Vm {
     pub fn is_free(&self, start: u64, end: u64) -> bool {
         start >= PAGE
             && end <= self.limit()
+            // An M64 memory's dense tables (docs/mem64.md §3) below the arena.
+            && !(self.high.is_some() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
             && !self.regions.range(..end).any(|(_, r)| r.end() > start)
     }
 
@@ -649,12 +651,6 @@ pub fn nt_protect_virtual_memory(c: &mut Call<'_>) -> R {
     let size = c.g.ptr(size_p)?;
     let start = addr & !(PAGE - 1);
     let end = align_up(addr + size.max(1), PAGE);
-    // Code in the high arena is beyond the dispatch directory's reach
-    // (docs/mem64.md §3): refused, loudly, until a sparse page table covers it.
-    if end > gex_abi::HIGH_ARENA_BASE && linux_prot(prot) & crate::mem::prot::EXEC != 0 {
-        crate::nt_log!("gex-nt: making {start:#x}..{end:#x} executable, above 4 GiB in a 64-bit memory: not supported yet (docs/mem64.md)");
-        return Err(Status(st::INVALID_PAGE_PROTECTION));
-    }
     let old = c.p.st.lock().unwrap().vm.protect(start, end, prot)?;
     after_change(c, start, end, &[])?;
     c.g.wptr(addr_p, start)?;

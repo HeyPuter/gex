@@ -196,11 +196,65 @@ pub const LIMIT64: u64 = 16 << 30;
 /// Wasm pages in [`LIMIT64`].
 pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
 
+/// An M64 process's dense per-page tables (docs/mem64.md §3): its dispatch
+/// directory, one `u32` for every page of `[0, LIMIT64)`, so code can live
+/// anywhere in the memory (a W^X JIT's high pages made executable), and its
+/// [`PATCHED_PAGES`] bits after it. At the bottom of the high region, below
+/// the arena. An M32 process uses the low region's directory instead; see
+/// [`dispatch_dir`].
+pub const DISPATCH_DIR64: u64 = 1 << 32;
+
+/// Pages [`DISPATCH_DIR64`] covers: all of [`LIMIT64`].
+pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
+
+/// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
+pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
+
+/// End of the M64 tables, rounded to 1 MiB.
+pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
+
 /// The bottom of an M64 process's high arena: non-executable data (Linux
 /// `mmap` without `PROT_EXEC`, NT allocations without an executable
-/// protection) goes here, above everything a wasm32 process has, so code and
-/// every per-page runtime array keep their reach (docs/mem64.md §3).
-pub const HIGH_ARENA_BASE: u64 = 1 << 32;
+/// protection) goes here, above everything a wasm32 process has and above
+/// the M64 tables (docs/mem64.md §3).
+pub const HIGH_ARENA_BASE: u64 = HIGH_TABLES_END;
+
+/// The dispatch directory of this process's memory flavour: the low region's
+/// [`DISPATCH_DIR`] for M32, [`DISPATCH_DIR64`] for M64. Also [`page_gen`].
+#[inline]
+pub fn dispatch_dir() -> u64 {
+    if mem64() { DISPATCH_DIR64 } else { DISPATCH_DIR }
+}
+
+/// Pages [`dispatch_dir`] covers.
+#[inline]
+pub fn dispatch_max_pages() -> u64 {
+    if mem64() { DISPATCH_MAX_PAGES64 } else { DISPATCH_MAX_PAGES }
+}
+
+/// The [`PAGE_GEN`] words of this flavour (the directory, as for M32).
+#[inline]
+pub fn page_gen() -> u64 {
+    dispatch_dir()
+}
+
+/// The [`PATCHED_PAGES`] bits of this flavour.
+#[inline]
+pub fn patched_pages() -> u64 {
+    if mem64() { PATCHED_PAGES64 } else { PATCHED_PAGES }
+}
+
+/// The directory's byte range `[dispatch_dir(), end)`.
+#[inline]
+pub fn dispatch_dir_range() -> (u64, u64) {
+    (dispatch_dir(), dispatch_dir() + dispatch_max_pages() * 4)
+}
+
+/// The patched-pages bitmap's byte range.
+#[inline]
+pub fn patched_pages_range() -> (u64, u64) {
+    (patched_pages(), patched_pages() + dispatch_max_pages() / 8)
+}
 
 /// Address used for effective addresses that do not fit in 32 bits. Chosen so
 /// that even a 16-byte access starting here stays out of bounds.
@@ -1157,5 +1211,10 @@ mod tests {
         assert!(INTERP_BASE < STACK_TOP);
         assert!(STACK_TOP <= MMAP_BOTTOM);
         assert!(MMAP_TOP <= GUEST_LIMIT);
+        // The M64 tables sit above every M32 address, below the arena.
+        assert!(DISPATCH_DIR64 >= GUEST_LIMIT);
+        assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
+        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
+        assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
     }
 }

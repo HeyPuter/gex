@@ -413,8 +413,12 @@ pub fn note_address_space_short(len: u64) {
 ///   arena: in the browser the shim shares the guest's memory and keeps its
 ///   own stack and data there. Natively it is only unused, and refusing it
 ///   moves a guest's mapping elsewhere, which is harmless.
+/// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
+///   directory and patched-page bits (docs/mem64.md §3).
 pub fn hits_runtime(start: u64, end: u64) -> bool {
-    start < gex_abi::DISPATCH_DIR_END || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
+    start < gex_abi::DISPATCH_DIR_END
+        || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
+        || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
 }
 
 pub fn page_align_up(v: u64) -> u64 {
@@ -691,6 +695,15 @@ impl MemoryMap {
                 }
             }
             return Ok(());
+        }
+        // In an M64 memory's high arena (a fixed mapping or a hint there,
+        // code or data): backed as the arena's own mappings are, the memory
+        // grown over it, and never the low arena's cursor.
+        if let (Some((lo, hi)), Some(back)) = (self.high, self.back) {
+            if start >= lo && end <= hi {
+                back(start, end).ok_or(Errno::ENOMEM)?;
+                return Ok(());
+            }
         }
         let Some(back) = self.back.filter(|_| end <= MMAP_TOP) else {
             return Err(Errno::ENOMEM);
@@ -1051,12 +1064,6 @@ impl MemoryMap {
             if end > self.limit() {
                 return Err(Errno::ENOMEM);
             }
-            // Code above 4 GiB is beyond the dispatch directory (docs/mem64.md
-            // §3), as for mprotect.
-            if prot & prot::EXEC != 0 && self.high.is_some() && end > gex_abi::HIGH_ARENA_BASE {
-                eprintln!("gex: an executable mapping at {addr:#x}..{end:#x}, above 4 GiB in a 64-bit memory: not supported yet (docs/mem64.md)");
-                return Err(Errno::EACCES);
-            }
             // `MAP_FIXED_NOREPLACE` (which wins over `MAP_FIXED`, as on
             // Linux) fails over any existing mapping, a PROT_NONE
             // reservation included: a program that probes for free address
@@ -1296,16 +1303,6 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
-        // Code in the high arena is beyond the dispatch directory's reach
-        // (docs/mem64.md §3): refused, loudly, until a sparse page table
-        // covers it.
-        if new_prot & prot::EXEC != 0 && self.high.is_some() && end > gex_abi::HIGH_ARENA_BASE {
-            eprintln!(
-                "gex: mprotect makes {addr:#x}..{end:#x} executable, above 4 GiB in a 64-bit memory: \
-                 not supported yet (docs/mem64.md)"
-            );
-            return Err(Errno::EACCES);
-        }
         if new_prot & prot::WRITE != 0 {
             self.mark_dirty(addr, end);
         }
@@ -1916,8 +1913,9 @@ mod tests {
         assert!(!m.check_access(0x1000_1800, 0x1000, prot::READ));
     }
 
-    /// docs/mem64.md §3: in an M64 process, data goes above 4 GiB, code stays
-    /// below MMAP_TOP, and a high page cannot become code.
+    /// docs/mem64.md §3: in an M64 process, data goes above 4 GiB and code
+    /// stays below MMAP_TOP, but a high page may become code (a W^X JIT's
+    /// flip): the M64 dispatch directory covers the whole memory.
     #[test]
     fn a_64_bit_memory_puts_data_in_the_high_arena() {
         let mut m = MemoryMap::new(0x40_0000);
@@ -1932,8 +1930,8 @@ mod tests {
         }
         let code = m.mmap(0, 0x10000, prot::READ | prot::WRITE | prot::EXEC, 0, "jit").unwrap();
         assert!(code < MMAP_TOP);
-        assert_eq!(m.protect(last, 0x1000, prot::READ | prot::EXEC), Err(Errno::EACCES));
         assert!(m.protect(last, 0x1000, prot::READ | prot::WRITE).is_ok());
+        assert!(m.protect(last, 0x1000, prot::READ | prot::EXEC).is_ok());
         // A hint or a fixed address up to the 64-bit limit is honoured.
         let fixed = 10u64 << 30;
         assert_eq!(m.mmap(fixed, 0x1000, prot::READ, flags::FIXED, "f"), Ok(fixed));
@@ -1944,8 +1942,28 @@ mod tests {
         assert!(lib < MMAP_TOP);
         let res = m.mmap_low(0, 0x40_0000, prot::NONE, 0, "").unwrap();
         assert!(res < MMAP_TOP);
-        // ... and refuses executable pages above 4 GiB in either form.
-        assert_eq!(m.mmap(11u64 << 30, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Err(Errno::EACCES));
+        // ... and takes executable pages above 4 GiB in either form.
+        assert_eq!(m.mmap(11u64 << 30, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Ok(11u64 << 30));
+    }
+
+    /// In the browser (a map whose host grows the memory on demand), a fixed
+    /// mapping in the high arena is backed there -- executable too, a W^X
+    /// JIT's -- where it was refused for lying above MMAP_TOP.
+    #[test]
+    fn a_fixed_high_mapping_is_backed_on_demand() {
+        static BACKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            0x2000_0000 + len
+        }
+        fn back(_start: u64, end: u64) -> Option<u64> {
+            Some(BACKED.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        let mut m = MemoryMap::new(0x40_0000);
+        m.grows_on_demand(take, back);
+        m.set_high_arena(gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64);
+        let at = 11u64 << 30;
+        assert_eq!(m.mmap(at, 0x1000, prot::READ | prot::WRITE | prot::EXEC, flags::FIXED_NOREPLACE, "jit"), Ok(at));
+        assert!(BACKED.load(std::sync::atomic::Ordering::SeqCst) >= at + 0x1000);
     }
 
     /// An M32 map is unchanged, and running out of address space is recorded

@@ -585,7 +585,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
     let mut slots = Vec::with_capacity(entries.len());
     for &a in entries {
         let page = a / gex_abi::DISPATCH_PAGE;
-        if page >= gex_abi::DISPATCH_MAX_PAGES {
+        if page >= gex_abi::dispatch_max_pages() {
             continue;
         }
         let base = match s.page_table.lookup(page) {
@@ -621,10 +621,10 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
 /// translation yet (returned to the caller in `fresh` so the directory is
 /// written when the translation is published).
 fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64) -> u32 {
-    if page >= gex_abi::DISPATCH_MAX_PAGES {
+    if page >= gex_abi::dispatch_max_pages() {
         return u32::MAX;
     }
-    let off = (gex_abi::PAGE_GEN + 4 * page) as usize;
+    let off = (gex_abi::page_gen() + 4 * page) as usize;
     let have = memory.bytes().get(off..off + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     if have != 0 {
         return have;
@@ -663,14 +663,14 @@ fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -
     match inst.tier {
         Tier::Unit => {
             let page = addr / gex_abi::DISPATCH_PAGE;
-            let byte = memory.get((gex_abi::PATCHED_PAGES + page / 8) as usize).copied().unwrap_or(0);
+            let byte = memory.get((gex_abi::patched_pages() + page / 8) as usize).copied().unwrap_or(0);
             byte & (1 << (page % 8)) == 0
         }
         _ => s
             .ftab
             .checks
             .get(&f.install)
-            .is_none_or(|c| c.iter().all(|&(p, g)| word(gex_abi::PAGE_GEN + 4 * p) == g)),
+            .is_none_or(|c| c.iter().all(|&(p, g)| word(gex_abi::page_gen() + 4 * p) == g)),
     }
 }
 

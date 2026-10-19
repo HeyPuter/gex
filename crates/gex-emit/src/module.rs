@@ -12,7 +12,7 @@
 use crate::tier1;
 use crate::wasm::{DataSegment, ElementSegment, ExportKind, FuncBody, FuncType, Module, ValType};
 use gex_abi::{
-    ctx, dispatch_page, exports, imports, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE,
+    ctx, dispatch_page, exports, imports, DISPATCH_PAGE,
     GUEST_MEM_INITIAL_PAGES, GUEST_MEM_PAGES, IMPORT_MODULE, MISS_SLOTS, SLOTS_PER_PAGE,
 };
 use gex_ir::Block;
@@ -1000,7 +1000,7 @@ impl ModuleBuilder {
                     i += 1;
                 }
                 self.data.push(DataSegment {
-                    offset: DISPATCH_DIR + start_page * 4,
+                    offset: gex_abi::dispatch_dir() + start_page * 4,
                     bytes,
                 });
             }
@@ -1402,10 +1402,10 @@ impl ModuleBuilder {
         f.i32_const(4);
         f.byte(0x6c); // i32.mul
         f.addr_i32();
-        f.load(0x28, 2, DISPATCH_DIR as u32);
+        f.load64(0x28, 2, gex_abi::dispatch_dir());
         f.i32_const(0);
         f.local_get(page);
-        f.i64_const(DISPATCH_MAX_PAGES as i64);
+        f.i64_const(gex_abi::dispatch_max_pages() as i64);
         f.byte(0x54); // i64.lt_u
         f.select();
         f.local_tee(entry);

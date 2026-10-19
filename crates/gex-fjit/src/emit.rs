@@ -282,7 +282,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         for &(page, gen) in pages {
             let fb = b.f();
             fb.addr_const(0);
-            fb.load(0x28, 2, (gex_abi::PAGE_GEN + 4 * page) as u32); // i32.load
+            fb.load64(0x28, 2, gex_abi::page_gen() + 4 * page); // i32.load
             fb.i32_const(gen as i32);
             fb.byte(0x47); // i32.ne
             fb.if_void();
@@ -1239,7 +1239,7 @@ impl E<'_, '_> {
         }
         let one = |fb: &mut gex_emit::wasm::FuncBody, a: u64| {
             fb.addr_const(0);
-            fb.load(0x2d, 0, (gex_abi::PATCHED_PAGES + (a >> 15)) as u32); // i32.load8_u
+            fb.load64(0x2d, 0, gex_abi::patched_pages() + (a >> 15)); // i32.load8_u
             fb.i32_const(((a >> 12) & 7) as i32);
             fb.byte(0x76); // i32.shr_u
             fb.i32_const(1);

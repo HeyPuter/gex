@@ -1290,7 +1290,7 @@ fn run_program_with(
     {
         let data = memory.bytes();
         for (page, base) in &meta.dir_entries {
-            let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            let off = (gex_abi::dispatch_dir() + page * 4) as usize;
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&base.to_le_bytes());
             }
@@ -2255,8 +2255,14 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // to that boundary leaves the child with an all-zero directory, so
         // every page resolves to the miss stub and the first branch after the
         // fork translates the same block forever.
-        let low = (gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4) as usize;
+        let low = gex_abi::DISPATCH_DIR_END as usize;
         dst[..low].copy_from_slice(&src[..low]);
+        // An M64 memory's directory and patched bits are its dense tables
+        // above 4 GiB instead (docs/mem64.md §3).
+        if gex_abi::mem64() {
+            let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::HIGH_TABLES_END as usize);
+            dst[a..b].copy_from_slice(&src[a..b]);
+        }
         let mut sparse = SparseCopy::new();
         for (start, end) in &regions {
             let (a, b) = (*start as usize, (*end as usize).min(src.len()));
@@ -4190,7 +4196,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         .read_u64(state.thread.ctx_addr + ctx::LAST_TARGET as u64)
                         .unwrap_or(0);
                     let dir = |a: u64| {
-                        gm.read_u32(gex_abi::DISPATCH_DIR + gex_abi::dispatch_page(a) * 4)
+                        gm.read_u32(gex_abi::dispatch_dir() + gex_abi::dispatch_page(a) * 4)
                             .unwrap_or(0)
                     };
                     state.exit = Some(Exit::Signal {
@@ -4536,7 +4542,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // Bit 63: the target's page is marked patched (a unit
                     // leaves for a callee there instead of calling it).
                     let t = addr as u64;
-                    let patched = gm.read(gex_abi::PATCHED_PAGES + (t >> 15), 1).map(|b| (b[0] >> ((t >> 12) & 7)) & 1 == 1).unwrap_or(false);
+                    let patched = gm.read(gex_abi::patched_pages() + (t >> 15), 1).map(|b| (b[0] >> ((t >> 12) & 7)) & 1 == 1).unwrap_or(false);
                     let addr = (t | ((patched as u64) << 63)) as i64;
                     if leave {
                         *LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
@@ -4847,7 +4853,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
     };
-    if pc % gex_abi::INST_ALIGN != 0 || pc >= gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE {
+    if pc % gex_abi::INST_ALIGN != 0 || pc >= gex_abi::dispatch_max_pages() * gex_abi::DISPATCH_PAGE {
         return Ok(false);
     }
     // Only translate what the guest says is executable, so a wild branch into
@@ -5048,7 +5054,7 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
         return Ok(());
     }
     let page = pc / gex_abi::DISPATCH_PAGE;
-    let dir = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+    let dir = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
     let base = sh.page_table.lookup(page);
     let slot = base.map(|b| b as u64 + ((pc % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
     let owner = base.and_then(|b| sh.slot_owner.get(&b).copied());
@@ -5398,10 +5404,10 @@ const NATIVE_UNWOUND: u64 = 512;
 /// The table-0 slot dispatch reaches `pc` through, as the directory says now.
 fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<u64> {
     let page = pc / gex_abi::DISPATCH_PAGE;
-    if page >= gex_abi::DISPATCH_MAX_PAGES {
+    if page >= gex_abi::dispatch_max_pages() {
         return None;
     }
-    let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).ok()?;
+    let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).ok()?;
     if gex_abi::dispatch_entry_table(entry) != 0 {
         return None;
     }
@@ -5802,8 +5808,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
     if ret != 0 {
         let page = ret / gex_abi::DISPATCH_PAGE;
-        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(1);
-        if page < gex_abi::DISPATCH_MAX_PAGES && entry(&memory) == 0 {
+        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(1);
+        if page < gex_abi::dispatch_max_pages() && entry(&memory) == 0 {
             translate_and_install(caller, ret)?;
             if entry(&memory) == 0 && std::env::var_os("GEX_W3_TRACE").is_some() {
                 eprintln!("gex-w3: call-out return {ret:#x}: its page has still no dispatch entry");
@@ -6069,7 +6075,7 @@ fn retire_translations(
                 *sh.retired_pages.entry(page).or_default() += 1;
                 jit_stats::RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            let off = (gex_abi::dispatch_dir() + page * 4) as usize;
             let data = memory.bytes();
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -6089,7 +6095,7 @@ fn retire_translations(
 fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> Result<()> {
     let data = memory.bytes();
     for (page, base) in entries {
-        let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+        let off = (gex_abi::dispatch_dir() + page * 4) as usize;
         if off + 4 > data.len() {
             bail!("dispatch directory entry for page {page} is out of range");
         }

@@ -203,10 +203,10 @@ pub(crate) fn lookup(pc: u64) -> u32 {
         return 0;
     }
     let page = gex_abi::dispatch_page(pc);
-    if page >= gex_abi::DISPATCH_MAX_PAGES {
+    if page >= gex_abi::dispatch_max_pages() {
         return 0;
     }
-    let entry = word(gex_abi::DISPATCH_DIR + 4 * page).load(Ordering::Acquire);
+    let entry = word(gex_abi::dispatch_dir() + 4 * page).load(Ordering::Acquire);
     let k = gex_abi::dispatch_entry_table(entry);
     if entry == 0 || !dense::table(k) {
         return 0;

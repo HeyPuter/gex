@@ -604,7 +604,7 @@ fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
     };
     // target >= the directory's reach: leave.
     f.instruction(&I::LocalGet(1));
-    f.instruction(&I::I64Const((gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE) as i64));
+    f.instruction(&I::I64Const((gex_abi::dispatch_max_pages() * gex_abi::DISPATCH_PAGE) as i64));
     f.instruction(&I::I64GeU);
     leave(&mut f);
     // entry = dir[target >> 12]; table = entry >> SLOT_BITS
@@ -615,7 +615,7 @@ fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
     widen_addr(&mut f);
-    f.instruction(&I::I32Load(m(gex_abi::DISPATCH_DIR, 2)));
+    f.instruction(&I::I32Load(m(gex_abi::dispatch_dir(), 2)));
     f.instruction(&I::LocalTee(5));
     f.instruction(&I::I32Const(gex_abi::DISPATCH_SLOT_BITS as i32));
     f.instruction(&I::I32ShrU);
@@ -702,10 +702,10 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
     widen_addr(&mut f);
-    f.instruction(&I::I32Load(m(gex_abi::DISPATCH_DIR, 2)));
+    f.instruction(&I::I32Load(m(gex_abi::dispatch_dir(), 2)));
     f.instruction(&I::I32Const(0));
     f.instruction(&I::LocalGet(2));
-    f.instruction(&I::I64Const(gex_abi::DISPATCH_MAX_PAGES as i64));
+    f.instruction(&I::I64Const(gex_abi::dispatch_max_pages() as i64));
     f.instruction(&I::I64LtU);
     f.instruction(&I::Select);
     f.instruction(&I::LocalTee(3));
