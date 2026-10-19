@@ -16,7 +16,7 @@
 // layout a page would otherwise do, and the `describe()` a harness reads from
 // the scene compositor (titles, the surface list, a content hash).
 
-import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_CURSOR } from './dom-compositor.js';
+import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR } from './dom-compositor.js';
 
 /** Lay `desktop`'s windows out in `mount` (a positioned element). */
 export function bareDesktop(desktop, mount) {
@@ -56,8 +56,20 @@ export function bareDesktop(desktop, mount) {
   // Placed windows' stacking, bottom to top, per layer (0 normal, 1 topmost,
   // 2 menus); every layer above every unplaced window.
   const stacks = [[], [], []];
+  // A subsurface is part of its parent (Wine's GL client area is one, over
+  // its toplevel): it takes the parent's z and is above it by being later in
+  // the document, so it goes wherever the parent is stacked. Over every
+  // toplevel instead, it was under each placed one -- the whole of Wine --
+  // and a GL window showed only the white of its own client area.
+  const lift = (win) => {
+    for (const w of desktop.windows()) {
+      if (w.role !== ROLE_SUBSURFACE || keyOfParent(w) !== win.key) continue;
+      w.canvas.style.zIndex = win.canvas.style.zIndex;
+      lift(w);
+    }
+  };
   const restack = () => {
-    stacks.forEach((list, layer) => list.forEach((w, i) => { w.canvas.style.zIndex = String(2000000 + layer * 100000 + i); }));
+    stacks.forEach((list, layer) => list.forEach((w, i) => { w.canvas.style.zIndex = String(2000000 + layer * 100000 + i); lift(w); }));
   };
   const unstack = (win) => { for (const list of stacks) { const i = list.indexOf(win); if (i >= 0) list.splice(i, 1); } };
   // `below`: the stack id of the window this one is directly under; 0 the top
@@ -90,10 +102,13 @@ export function bareDesktop(desktop, mount) {
       const roomY = Math.max(1, mount.clientHeight - win.height);
       placed.set(win.key, { x: (n * step) % roomX, y: (n * step) % roomY });
       c.style.zIndex = String(z++);
-      c.addEventListener('pointerdown', () => { if (!win.placed) c.style.zIndex = String(z++); });
+      c.addEventListener('pointerdown', () => { if (!win.placed) { c.style.zIndex = String(z++); lift(win); } });
       win.place(placed.get(win.key).x, placed.get(win.key).y);
+    } else if (win.role === ROLE_SUBSURFACE && win.parent) {
+      const parent = desktop.windows().find((w) => w.key === keyOfParent(win));
+      c.style.zIndex = parent?.canvas.style.zIndex || String(1000000 + z++);
     } else {
-      // Popups and subsurfaces above every toplevel.
+      // Popups above every unplaced toplevel.
       c.style.zIndex = String(1000000 + z++);
     }
     win.onplace = () => move(win);
