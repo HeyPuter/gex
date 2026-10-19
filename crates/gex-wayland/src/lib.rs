@@ -3020,8 +3020,17 @@ impl Client {
     /// gets `axis_value120` (partial notches, as a Windows precision touchpad
     /// sends); a v5-v7 one `axis_discrete`, once a whole notch has built up.
     pub fn pointer_axis(&mut self, axis: u32, value: i32, time: u32) {
-        let Some(ptr) = self.pointer else { return };
-        if self.pointer_on.is_none() || axis > 1 {
+        // A scroll with nowhere to go is lost for good (a wheel test's sum
+        // comes up short), so it is said, not dropped quietly.
+        let Some(ptr) = self.pointer else {
+            trace_out("[wl] scroll dropped: the client has no pointer");
+            return;
+        };
+        if axis > 1 {
+            return;
+        }
+        if self.pointer_on.is_none() {
+            trace_out(&format!("[wl] scroll dropped: the pointer is on no surface (axis {axis}, {value}/256 px)"));
             return;
         }
         let a = axis as usize;

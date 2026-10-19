@@ -705,6 +705,8 @@ impl Screen {
                 Ev::Axis(axis, v) => {
                     if let Some((sid, _)) = self.pointer {
                         out.push((sid, Routed::Axis(axis, v, ms)));
+                    } else {
+                        eprintln!("[gex] input: scroll dropped: the pointer is over no window (axis {axis}, {v}/256 px)");
                     }
                 }
                 Ev::Key(k, down) => {
