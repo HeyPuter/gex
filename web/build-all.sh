@@ -86,12 +86,37 @@ if [ "$ASSETS" = 1 ]; then
 fi
 
 # -- 2. Mesa and Xwayland, per flavour ----------------------------------------
+# What a Mesa build reads, as xwl_key does for Xwayland: the Mesa checkout (its commit and any
+# uncommitted change), the build script, the toolchain, and gex's own sources that the build
+# compiles or includes (web/mesa, web/mobilegl, guest/gl: every file outside third_party/mesa in
+# its ninja deps). ninja alone rebuilt and relinked gex-wgpu-replay every gate round (2-4 min a
+# flavour, 15-40 min under load) because a merge touched those files' mtimes, not their content.
+mesa_key() { # mesa_key <mt|st>
+    {
+        echo "$1 ${GEX_MESA_PAGE_ONLY:-}"
+        cat "$HERE/build-mesa-wasm.sh"
+        emcc --version 2>/dev/null | head -1
+        git -C "$ROOT/third_party/mesa" rev-parse HEAD
+        git -C "$ROOT/third_party/mesa" diff HEAD
+        git -C "$ROOT" ls-files -z web/mesa web/mobilegl guest/gl | (cd "$ROOT" && xargs -0 cat)
+    } | sha256sum | cut -c1-32
+}
 mesa() { # mesa <mt|st>
     t=1; [ "$1" = st ] && t=0
+    key=$(mesa_key "$1") stamp="$CACHE/mesa-$1.stamp" list="$CACHE/mesa-$1.published"
+    # Unchanged inputs and every published file still in place: kept (GEX_MESA_REBUILD=1 forces).
+    if [ "${GEX_MESA_REBUILD:-0}" != 1 ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$key" ] && [ -s "$list" ] &&
+       (while read -r f; do [ -f "$f" ] || exit 1; done < "$list"); then
+        say "Mesa ($1): unchanged, its published files kept"
+        return 0
+    fi
     say "Mesa ($1)"
+    rm -f "$stamp"
     GEX_MESA_THREADS=$t "$HERE/build-mesa-wasm.sh" "$CACHE/mesa-$1" > "$CACHE/mesa-$1.log" 2>&1 ||
         { tail -30 "$CACHE/mesa-$1.log"; echo "Mesa ($1) failed; log in $CACHE/mesa-$1.log" >&2; exit 1; }
     grep -a "published" "$CACHE/mesa-$1.log" || true
+    sed -n 's/^  published //p' "$CACHE/mesa-$1.log" > "$list"
+    [ -s "$list" ] && echo "$key" > "$stamp"
 }
 xwl_key() { # xwl_key <mt|st>
     {
