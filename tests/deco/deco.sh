@@ -50,7 +50,8 @@ log = open(sys.argv[1], errors="replace").read()
 fails = []
 def check(ok, what):
     if not ok: fails.append(what); print("  missing: " + what)
-lists = [l for l in log.splitlines() if l.startswith("[wl-place]")]
+# (anywhere in a line: the program's stdout shares the log, unsynchronised)
+lists = [l[l.index("[wl-place]"):] for l in log.splitlines() if "[wl-place]" in l]
 wins = set()
 for l in lists:
     for w, h, x, y, u in re.findall(r"id=0x[0-9a-f]+ (\d+)x(\d+)\+(-?\d+)\+(-?\d+) layer=\d( unmanaged)?", l):
