@@ -8452,6 +8452,15 @@ fn stage_fork_fds(h: &Host, child: i32) {
             name
         ));
     }
+    // And the shared file mappings, `m <mapping> <name>`: the child's
+    // stores to them are the file's too, written back at its exit
+    // (`adopt_fds_text`; a line no descriptor number starts).
+    let maps: Vec<_> = h.kernel.mem.lock().log.shared_maps.iter().cloned().collect();
+    for s in &maps {
+        if let Some(name) = carry_name(&s.file, child) {
+            out.push_str(&format!("m {} {}\n", gex_kernel::syscalls::SharedMaps::carry(s), name));
+        }
+    }
     *FORK_FDS.0.borrow_mut() = out;
 }
 
@@ -8602,6 +8611,10 @@ fn adopt_fds_text(text: &str) -> i32 {
     let n = {
         let mut n = 0;
         for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("m ") {
+                adopt_shared_map(&ns, rest, home);
+                continue;
+            }
             let mut parts = line.splitn(5, ' ');
             let Some(fd) = parts.next().and_then(|v| v.parse::<i32>().ok()) else {
                 continue;
@@ -8633,6 +8646,22 @@ fn adopt_fds_text(text: &str) -> i32 {
     };
     ADOPTED_EPOLLS.with(|m| *m.borrow_mut() = None);
     n
+}
+
+/// One `m` line of [`stage_fork_fds`]'s text: a shared file mapping the
+/// parent had, which the copied memory holds and this process writes back.
+fn adopt_shared_map(ns: &gex_kernel::vfs::Namespace, text: &str, home: &sigs::Home) {
+    let mut parts = text.splitn(6, ' ');
+    let map: Vec<&str> = parts.by_ref().take(5).collect();
+    let Some(name) = parts.next().filter(|_| map.len() == 5) else { return };
+    let file = match rebuild_carried(ns, name, gex_kernel::fs::oflags::O_RDWR, 0) {
+        Ok(f) => f,
+        Err(e) => {
+            warn_line(&format!("gex: fork left a shared mapping of {name} behind: {e}\n"));
+            return;
+        }
+    };
+    let _ = home.mm().lock().log.shared_maps.adopt(&map.join(" "), file);
 }
 
 /// The other half of [`carry_name`]: the open file a name stands for, in

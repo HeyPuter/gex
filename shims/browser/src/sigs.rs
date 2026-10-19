@@ -428,7 +428,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     let fs = home.thread_fs.of(ctx_addr).unwrap_or_else(|| Arc::clone(&home.proc_fs));
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
-        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks, pipes: home.pipes },
+        io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
         map: map(),
         path: PathIo {
             ns: &ns,
