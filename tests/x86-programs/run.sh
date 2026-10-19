@@ -161,7 +161,10 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # poll-timeout: poll, ppoll, select and epoll_wait ended only by their
 # 100 ms deadline, after the stack went back to the page (the clock scope a
 # trap left open froze the clock, and they never returned).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads"}
+# fork-dirs: a forked child running its parent's code on pages the parent
+# numbered; any "gex: heal" line in the page's stderr fails it (heal_dirs
+# writing a directory entry is a bug report).
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -201,7 +204,7 @@ for src in "$HERE"/*.c; do
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then
-            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>"$WORK/$name.page.err"; gs=$?
             # 125: run-node's flaky "nothing could wake it" after a threaded
             # program has finished (OPTIMIZATION-BACKLOG.md); once more.
             if [ $gs = 125 ]; then
@@ -209,6 +212,10 @@ for src in "$HERE"/*.c; do
                 env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
             fi
             gex=$(grep -v '^\[host\]' "$WORK/$name.page")
+            if [ $name = fork-dirs ] && grep -q 'gex: heal' "$WORK/$name.page.err"; then
+                grep 'gex: heal' "$WORK/$name.page.err" | head -3
+                gex="$gex (heal lines)"
+            fi
         else
             gex=$(env $envs "$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
         fi
