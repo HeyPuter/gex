@@ -343,9 +343,9 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   }
 }
 
-/** Queue words: a bitmap of the slots registered on it, 8 words
+/** Queue words: a bitmap of the slots registered on it, 64 words
  *  (shims/kernel/src/wait.rs `Queue`). */
-const Q_BITS = 8;
+const Q_BITS = 64;
 
 /**
  * Notify the wait queue at byte address `q` in the kernel's memory `w`, as

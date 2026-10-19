@@ -26,15 +26,16 @@
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering::SeqCst};
 
 /// How many slots: more than the Workers that can exist at once
-/// (`STACK_COUNT`), each of which owns at most one.
-pub const SLOTS: usize = 256;
+/// (`STACK_COUNT`), each of which owns at most one, and the waiters that are
+/// not Workers' guest threads (`k_ws_alloc`).
+pub const SLOTS: usize = 2048;
 const WORDS: usize = SLOTS / 32;
 /// Queues chained to one queue, kept inline (JavaScript walks them too).
 /// More spill into a map only Rust reads.
 const CHAINS: usize = 4;
 
-/// One queue: 64 bytes. Fixed layout, read by JavaScript: the slot bitmap
-/// (8 words), then the inline chains (4), then the spill count.
+/// One queue: 320 bytes. Fixed layout, read by JavaScript: the slot bitmap
+/// (`WORDS` words, 64), then the inline chains (4), then the spill count.
 #[repr(C, align(64))]
 pub struct Queue {
     bits: [AtomicU32; WORDS],
@@ -42,10 +43,10 @@ pub struct Queue {
     spilled: AtomicU32,
     /// 1 while the queue is allocated, for a diagnostic.
     live: AtomicU32,
-    _pad: [u32; 2],
+    _pad: [u32; 10],
 }
 
-const QUEUE_BYTES: usize = 64;
+const QUEUE_BYTES: usize = 320;
 const _: () = assert!(std::mem::size_of::<Queue>() == QUEUE_BYTES);
 
 /// Queues are allocated in chunks, never freed (a freed queue's number is
@@ -125,7 +126,7 @@ pub fn new_queue() -> u32 {
                             chains: [const { AtomicU32::new(0) }; CHAINS],
                             spilled: AtomicU32::new(0),
                             live: AtomicU32::new(0),
-                            _pad: [0; 2],
+                            _pad: [0; 10],
                         })
                         .collect();
                     DIR[c].store(Box::leak(chunk).as_mut_ptr(), SeqCst);

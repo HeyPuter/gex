@@ -616,7 +616,9 @@ export class ProcessHost {
     // Slice 0 belongs to nobody: the first Worker uses the linked-in stack.
     const n = ++this.#stacksTaken;
     this.#stackOf.set(key, n);
-    if (n >= this.#stacks.count) {
+    // The top slice (and the one below it: hostx.js) are the helpers' that
+    // take a stack of their own (tty.mjs, persist-worker.js, fs-opened-worker.js).
+    if (n >= this.#stacks.count - 1) {
       throw new Error(
         `the global kernel has ${this.#stacks.count} stacks and this is Worker ${n + 1}. ` +
           'Raise STACK_COUNT in shims/kernel.',
