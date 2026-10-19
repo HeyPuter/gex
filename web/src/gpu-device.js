@@ -144,27 +144,32 @@ export function requestGexDevice() {
       maxStorageBuffersInVertexStage: 16,
       maxStorageBuffersInFragmentStage: 16,
       maxColorAttachmentBytesPerSample: 64,
-      // GL 4.3's compute limits (with them the context is GL 4.6) drew
-      // Muck's 3D scene black (U, mp26), so they are only per run; GL 4.1's
-      // texture limits are the default, below.
     };
     // `?gllimits=40|41|43` (GEX_GL_LIMITS, set by the compositor worker;
-    // 41 when unset): GL 4.1 wants 16384 texels a side and 2048 array
+    // 43 when unset): GL 4.1 wants 16384 texels a side and 2048 array
     // layers, GL 4.3's compute shaders 1024 invocations a workgroup and
     // 32 KiB of shared memory; WebGPU's defaults (8192, 256; 256, 16 KiB)
     // keep the context at GL 4.0. Unity drops shaders whose target the
     // context is below: at 4.0 Muck's grass geometry shader ("Shader
     // Unsupported ... All passes removed") left the grass as dots; at 4.2
     // with mesa-wink 60202246 it draws blades (U, mpg3).
+    //
+    // Compute is the adapter's own limits, not just GL's minimum: a Windows
+    // driver's context is 4.6 with compute, and games look for it whatever
+    // version they ask for. Mosa Lina asks for 3.2 core, then gives up
+    // ("OpenGL 3.2+ is required") when wglGetProcAddress has no
+    // glDispatchCompute -- st/mesa only advertises ARB_compute_shader at
+    // 1024 invocations a workgroup, and the device's default is 256.
     const glLimitsSet = globalThis.GEX_GL_LIMITS;
-    const glLimits = glLimitsSet === undefined ? 41 : Number(glLimitsSet) || 0;
+    const glLimits = glLimitsSet === undefined ? 43 : Number(glLimitsSet) || 0;
     if (glLimits >= 41) {
       Object.assign(want, { maxTextureDimension1D: 16384, maxTextureDimension2D: 16384,
         maxTextureDimension3D: 2048, maxTextureArrayLayers: 2048 });
     }
     if (glLimits >= 43) {
-      Object.assign(want, { maxComputeInvocationsPerWorkgroup: 1024, maxComputeWorkgroupSizeX: 1024,
-        maxComputeWorkgroupSizeY: 1024, maxComputeWorkgroupSizeZ: 64, maxComputeWorkgroupStorageSize: 32768 });
+      for (const limit of ['maxComputeInvocationsPerWorkgroup', 'maxComputeWorkgroupSizeX',
+        'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ', 'maxComputeWorkgroupStorageSize',
+        'maxComputeWorkgroupsPerDimension']) want[limit] = Infinity;
     }
     const requiredLimits = {};
     for (const [limit, wanted] of Object.entries(want)) {

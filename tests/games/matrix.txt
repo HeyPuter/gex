@@ -62,13 +62,12 @@ geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe      
 # 5d-chess: in the page, mmap runs out of address space near 4 GiB (try_map_free_area
 # 0xfff40000-0xffff0000) and it stalls: needs memory64 (W64.7). Natively gameplay.
 5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
-# mosa-lina: needs gllimits=43 (compute): it fails "OpenGL 3.2+ is required" when
-# wglGetProcAddress has no glDispatchCompute, and st/mesa offers compute only at 1024
-# invocations a workgroup (4.6 on edger). Title screen on edger by 202 s (G2 10-19). Its
-# Worker heap grew ~9 MiB/s on page JS older than g2/callout-leak 7a599a4a: fixed by
-# rebuilding the site (largest Worker 50-60 MiB to 364 s). Not the default yet: Muck drew
-# black at 4.6.
-mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-|page=gllimits=43
+# mosa-lina: needs GL compute: it fails "OpenGL 3.2+ is required" when wglGetProcAddress
+# has no glDispatchCompute, and st/mesa offers compute only at 1024 invocations a
+# workgroup. The page's default limits give that (GL 4.6 since G2 10-19). Title screen on
+# edger by 202 s (G2 10-19). Its Worker heap grew ~9 MiB/s on page JS older than
+# g2/callout-leak 7a599a4a: fixed by rebuilding the site (largest Worker 50-60 MiB to 364 s).
+mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
 # spelunky2: needs memory64 (W64.7): it makes fixed allocations at 7-8 TiB, which a wasm32
 # guest cannot place; in the page it runs out of address space at about 120 s. Not a bug.
 # (Also: D3D11 feature level 11.0, which SwiftShader's GL 3.2 does not give; edger's GPU does.)
@@ -85,6 +84,9 @@ peggle       |blocked|Peggle Deluxe                      |needs a Steam client: 
 cruelty-squad|idea |Cruelty Squad                       |Godot 3: engine substitution, unassigned (ask the user)| |-|-|-
 buckshot     |idea |Buckshot Roulette                   |Godot 4: engine substitution, unassigned (ask the user)| |-|-|-
 wildermyth   |idea |Wildermyth                          |Java (libGDX, bundled JRE): unassigned (ask the user)| |-|-|-
+# muck: in the page (tools/unity-dotnet/page/muck-page.sh) at the default GL 4.6 limits:
+# menu scene correct with MultiScaleVO AO, 22.7-24.1 presents/s (32.6 forced to GL 4.2,
+# which drops the AO pass; edger, G2 10-19, mesa g2/msvo-unformatted).
 muck         |dotnet|Muck                               |Unity Mono: stream U| |-|-|-
 hollow-knight|dotnet|Hollow Knight                      |Unity Mono: stream U (also games-linux)| |-|-|-
 silksong     |dotnet|Hollow Knight Silksong             |Unity Mono: stream U| |-|-|-

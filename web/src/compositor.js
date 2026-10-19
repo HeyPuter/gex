@@ -149,9 +149,9 @@ export class Compositor {
     const direct = pq?.get('direct') === '1';
     this.#pointerLock = pq?.get('pointerlock') === '1';
     // `?gllimits=40|41|43`: the device asks for WebGPU's default limits,
-    // GL 4.1's texture limits (the default), or 4.3's compute ones too,
-    // which decide the GL version Mesa's context earns (gpu-device.js). At
-    // 4.6 Muck's 3D scene drew black, so 43 is only per run.
+    // GL 4.1's texture limits, or those and the adapter's compute limits too
+    // (the default), which decide the GL version Mesa's context earns
+    // (gpu-device.js).
     const glLimits = pq?.has('gllimits') ? Number(pq.get('gllimits')) || 0 : null;
     worker.postMessage(
       { kind: 'init', canvas: offscreen, width: canvas.width, height: canvas.height, scale,

@@ -50,13 +50,16 @@ push** (rebased onto upstream wink 0dd84167; nothing pushed):
    and multiplied every lit surface to black. Such an image is now served
    through the packed-buffer path in that dispatch's variant (dyn_packed).
    `tests/gl43-msvo-probe-page.sh` covers the shapes (17/21 before, 21/21
-   after, edger). Muck at gllimits=43 (context level 4.5) now renders its
+   after, edger). Muck at gllimits=43 (context level 4.5, now the default) renders its
    menu correctly at 22.7-24.1 presents/s, against 32.6 at 4.2 (g2mf43
    vs g2mv42, edger), so the AO pass costs about a quarter of the frame rate.
 2. *Grass:* fixed at GL 4.2 by GL 4.1's texture limits with mesa-wink
    60202246 (U mpg3: blades, 36.6-38.1 presents/s). gex's pin is 60202246
-   and `?gllimits=41` is the default since U's pin commit on merge/unity
-   (`?gllimits=0` turns it off; 43 stays per run).
+   and `?gllimits=41` was the default from U's pin commit on merge/unity
+   until 2026-10-19. The default is now 43: GL 4.1's texture limits and the
+   adapter's own compute limits, so the context is GL 4.6 for every game
+   (user, 10-19: "most faithful; games pay for their compute effects").
+   `?gllimits=41`, `40` or `0` still lower it.
 3. *Noita's world fps* is bound by its job hand-off, not by GL: the main
    thread is parked about 37% waiting on job threads, and KLock is 0.14%
    (stream F's area). The page's GL submit is no longer the limit
