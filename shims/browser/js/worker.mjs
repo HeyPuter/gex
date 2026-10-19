@@ -348,7 +348,11 @@ async function handle(msg) {
     // made, since no start message has said it yet (it was left i32, and
     // every m64 Worker's runtime failed to instantiate).
     const mem64 = !!msg.mem64;
+    // Either way: a Worker the pool took back may have run the other
+    // flavour's process last (a 64-bit program's, docs/mem64.md §5).
     if (mem64) globalThis.GEX_MEM64 = 1;
+    else delete globalThis.GEX_MEM64;
+    if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
     preattached = (async () => {
       const gex = new Gex(new Env(), {
         kernel: { ...msg.kernel, stackTop: stack },
@@ -656,6 +660,8 @@ async function handle(msg) {
   // A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim's process.
   if (msg.mem64) globalThis.GEX_MEM64 = 1;
   else delete globalThis.GEX_MEM64;
+  // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
+  if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
   if (msg.providerSkip) Gex.providerSkip = msg.providerSkip;

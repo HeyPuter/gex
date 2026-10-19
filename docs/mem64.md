@@ -446,4 +446,37 @@ browser shim; the coordinator sequences them.
   flavour (OPTIMIZATION-BACKLOG.md).
 - Next: the per-program choice of §5 (a flag at exec, or the learned
   per-binary record), so that one game (Hades x64) runs in M64 while the
-  rest of the same page stays M32. Until then the choice is page-wide.
+  rest of the same page stays M32 (done for Linux programs: below).
+
+### State at 2026-10-19, later: the per-program choice (§5, level 1, page)
+
+- The default page stays 32-bit, and so does every program in it unless an
+  exec asks. An exec goes on in a 64-bit memory when (vfork.rs
+  `exec_target`), in order:
+  1. its program needs one (a gex wasm container whose module imports an
+     i64 memory, a `W64_MEM64=1` install); a 32-bit ELF or wasm32 container
+     always gets a 32-bit memory;
+  2. the call's environment has `GEX_MEM64=1` (`=0` asks for 32-bit). The
+     kernel takes the entry out of the new program's environment at execve
+     (`Kernel::exec_flavour`, `exec_mem64`), so it applies to that exec
+     alone: the program's children, by fork+exec or posix_spawn, are the
+     page's flavour again unless they ask;
+  3. the image's `user.gex.mem64` attribute is `1` (or `0`): the learned
+     per-binary record, set by `setfattr -n user.gex.mem64 -v 1` (or a
+     setup script) on the program;
+  4. otherwise the page's flavour: 32-bit, unless the page is `?mem64=1`.
+- The default page with nothing asked does not look at the program at all
+  (no read, no attribute lookup in the shim). With the global kernel it
+  offers the 64-bit memory's shim and seed as host.mjs `other`, fetched only
+  when an exec first asks (runtime.js, run-node.mjs).
+- A 64-bit memory's translations are keyed apart from a 32-bit one's
+  (lib.rs `flavour_salt` in the code identities), so the page never serves
+  one flavour's modules to the other.
+- Test: tests/browser-mem64-pick.sh (the asked program is 64-bit; its fork
+  and posix_spawn children, a sibling, and the program after its record
+  is removed are 32-bit; the record and `GEX_MEM64=0` over it).
+- Not yet: W64 per program needs the W64_MEM64 dist's loader beside the
+  default one in one prefix, with Wine's exec of a PE resolved to an image
+  for the record (Wine passes the Windows command line, not a path). The
+  overflow detection that writes the record (§5), and native per-process
+  flavours (OPTIMIZATION-BACKLOG.md).

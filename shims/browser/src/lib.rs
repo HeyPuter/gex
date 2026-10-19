@@ -11037,9 +11037,21 @@ fn object_identity(p: &Px<'_>, addr: u64) -> Option<u64> {
     let (id, _) = v.code.as_ref()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
+    flavour_salt(&mut hasher);
     let key = hasher.finish();
     note_key(p, key, id);
     Some(key)
+}
+
+/// The memory flavour in a code identity ([`object_identity`],
+/// [`page_identity`]): a 64-bit memory's translations import an i64 memory,
+/// so a 32-bit process of the same program must not be served them, in a
+/// page that runs both (docs/mem64.md §5). Nothing is added for a 32-bit
+/// memory, whose keys stay as they were.
+fn flavour_salt(h: &mut impl std::hash::Hasher) {
+    if gex_abi::mem64() {
+        h.write_u8(64);
+    }
 }
 
 /// Whether the object covering this page has been translated whole.
@@ -11414,6 +11426,7 @@ fn page_identity(p: &Px<'_>, page: u64) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     (off + (page - v.start)).hash(&mut hasher);
+    flavour_salt(&mut hasher);
     let key = hasher.finish();
     note_key(p, key, id);
     Some(key)

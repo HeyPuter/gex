@@ -73,8 +73,8 @@ thread_local! {
     /// its descriptors (as `stage_fork_fds` describes them, for this pid),
     /// its working directory and its signal state, pending signals included.
     static EXEC_PARTS: RefCell<[Vec<u8>; 4]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
-    /// The staged exec's memory, in a 64-bit memory's page (`exec_memory`):
-    /// 1 a 64-bit one, 0 a 32-bit one, -1 the parent's.
+    /// The staged exec's memory (`exec_target`): 1 a 64-bit one, 0 a 32-bit
+    /// one, -1 the parent's (a page that runs one flavour).
     static EXEC_MEM64: Cell<i32> = const { Cell::new(-1) };
 }
 
@@ -300,14 +300,14 @@ pub(crate) fn stage_exec_parts(h: &mut Host, path: &str, argv: &[String], envp: 
     let fds = std::mem::take(&mut *FORK_FDS.0.borrow_mut()).into_bytes();
     let cwd = h.kernel.caller_cwd().into_bytes();
     let state = state_bytes(&h.kernel, true);
-    let mem64 = if gex_abi::mem64() { exec_memory_of(h, path).map_or(-1, |m| m as i32) } else { -1 };
+    let mem64 = if page_flavours() & 2 != 0 { exec_target(h, path) as i32 } else { -1 };
     EXEC_MEM64.with(|c| c.set(mem64));
     EXEC_PARTS.with(|p| *p.borrow_mut() = [cmd, fds, cwd, state]);
     h.kernel.fds.close_all();
 }
 
 /// [`exec_memory`] for an exec's path, relative to the caller's cwd.
-fn exec_memory_of(h: &Host, path: &str) -> Option<bool> {
+fn exec_memory_of(h: &Host, path: &str) -> Need {
     if path.starts_with('/') {
         exec_memory(path)
     } else {
@@ -316,38 +316,99 @@ fn exec_memory_of(h: &Host, path: &str) -> Option<bool> {
     }
 }
 
-/// Whether this process's exec of `path` goes on in another Worker: in a
-/// 64-bit memory's page, a program that cannot run in one (lib.rs
-/// `exec_away`).
-pub(crate) fn exec_elsewhere(h: &Host, path: &str) -> bool {
-    gex_abi::mem64() && exec_memory_of(h, path) == Some(false)
+/// The page's memory flavours, from JS (`gex_set_page_flavours`): bit 0 the
+/// page's own is a 64-bit memory (`?mem64=1`), bit 1 it runs the other one
+/// too (a global kernel, host.mjs `#other`). Unset (-1): this Worker's
+/// flavour is the page's, and only a 64-bit memory's page runs the other.
+static PAGE_FLAVOURS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn page_flavours() -> i32 {
+    match PAGE_FLAVOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        -1 if gex_abi::mem64() => 3,
+        -1 => 0,
+        v => v,
+    }
 }
 
-/// Whether the program at `path` can run in a 64-bit memory, for the Worker
-/// its exec goes on in (the page's flavour, docs/mem64.md §5, is what a
-/// process gets that can run in either): a 32-bit ELF (an i386 program, or a
-/// wasm32 container such as W64's wineserver, docs/wine-native-x64.md §4)
-/// cannot run in one, a 64-bit ELF can, and a gex wasm container wants
-/// what its module's memory import is. `None`: not an ELF (a script), or
-/// unreadable: the parent's.
-fn exec_memory(path: &str) -> Option<bool> {
+/// Bit 0: the page's memory is a 64-bit one; bit 1: it runs the other
+/// flavour as well ([`exec_target`]). Set in every Worker before the guest
+/// runs.
+#[no_mangle]
+pub extern "C" fn gex_set_page_flavours(bits: i32) {
+    PAGE_FLAVOURS.store(bits & 3, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The memory flavour an exec of `path` goes on in (docs/mem64.md §5), true
+/// a 64-bit one: what the program needs (`exec_memory`), else what the exec
+/// asked for (the kernel's `exec_mem64`: the call's GEX_MEM64 entry, which
+/// it took out of the new environment, or the image's `user.gex.mem64`
+/// record) when the page runs that flavour, else the page's own -- the
+/// lowered wasm32 memory unless the page is `?mem64=1`. So a 64-bit
+/// program's children are the page's flavour again unless they ask.
+pub(crate) fn exec_target(h: &Host, path: &str) -> bool {
+    let page = page_flavours();
+    let own = page & 1 != 0;
+    // The default page, and nothing asked: the lowered wasm32 memory, as
+    // without the choice, the program not even looked at.
+    if !own && h.kernel.exec_mem64.is_none() {
+        return false;
+    }
+    match exec_memory_of(h, path) {
+        Need::Is(m) => m,
+        Need::Either => match h.kernel.exec_mem64 {
+            Some(m) if m == own || page & 2 != 0 => m,
+            Some(m) => {
+                crate::warn_line(&format!(
+                    "gex: {path}: a {}-bit memory was asked for, which this page does not run\n",
+                    if m { 64 } else { 32 }
+                ));
+                own
+            }
+            None => own,
+        },
+    }
+}
+
+/// Whether this process's exec of `path` goes on in another Worker: its
+/// program's memory flavour ([`exec_target`]) is not this Worker's (lib.rs
+/// `exec_away`).
+pub(crate) fn exec_elsewhere(h: &Host, path: &str) -> bool {
+    page_flavours() & 2 != 0 && exec_target(h, path) != gex_abi::mem64()
+}
+
+/// What memory a program needs: [`Need::Is`] the one it can run in, or
+/// either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Need {
+    Is(bool),
+    Either,
+}
+
+/// What memory the program at `path` needs (docs/mem64.md §5): a 32-bit
+/// ELF (an i386 program, or a wasm32 container such as W64's wineserver,
+/// docs/wine-native-x64.md §4) a 32-bit one, a gex wasm container what its
+/// module's memory import is, and a 64-bit ELF, translated, either. Not an
+/// ELF (a script) or unreadable: either.
+fn exec_memory(path: &str) -> Need {
     let home = crate::sigs::proc_home();
-    let mut head = [0u8; 64];
-    if home.read_file_at(path, 0, &mut head)? < 64 || &head[..4] != b"\x7fELF" {
-        return None;
+    let mut head = vec![0u8; 64 << 10];
+    let Some(n) = home.read_file_at(path, 0, &mut head) else { return Need::Either };
+    if n < 64 || &head[..4] != b"\x7fELF" {
+        return Need::Either;
     }
     if head[4] == 1 {
-        return Some(false);
+        return Need::Is(false);
     }
-    // The module sits right after the program headers (wasm-elf.py), and
-    // its import section after the type section: the first 4 MiB hold it.
-    let mut buf = vec![0u8; 4 << 20];
-    let n = home.read_file_at(path, 0, &mut buf)?;
-    let buf = &buf[..n];
-    let Some(at) = buf.windows(8).take(64 << 10).position(|w| w == b"\0asm\x01\0\0\0") else {
-        return Some(true);
+    // The module sits right after the program headers (wasm-elf.py), in
+    // the first 64 KiB, and its import section after the type section: the
+    // 4 MiB from there hold it. A translated program has none, and only its
+    // first 64 KiB are read.
+    let Some(at) = head[..n].windows(8).position(|w| w == b"\0asm\x01\0\0\0") else {
+        return Need::Either;
     };
-    Some(wasm_memory64(&buf[at..]).unwrap_or(true))
+    let mut buf = vec![0u8; 4 << 20];
+    let Some(n) = home.read_file_at(path, at as u64, &mut buf) else { return Need::Either };
+    wasm_memory64(&buf[..n]).map_or(Need::Either, Need::Is)
 }
 
 /// Whether `wasm`'s imported memory is a 64-bit one; `None` when its
