@@ -4236,6 +4236,13 @@ pub extern "C" fn gex_worker_init() -> u32 {
             }
             memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
         }
+        // An M64 memory's dense directory (docs/mem64.md §3) is read by every
+        // dispatch, so the memory covers it from the start (V8 commits
+        // lazily: untouched pages of it cost nothing).
+        if gex_abi::mem64() && !grow_memory_to(gex_abi::HIGH_TABLES_END) {
+            SLOT_USED.fetch_and(!(1 << i), Ordering::AcqRel);
+            return 0;
+        }
         memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
         memmap::claim(
             memmap::Kind::Tls,
@@ -6184,7 +6191,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             // And the guest's own directory, which a branch reads: a `Shared`
             // module has no memory to publish its own from, so the host writes.
             dir_note(*page, *base, "pin-meta");
-            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
+            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, *base);
         }
     }));
     1
@@ -6354,7 +6361,7 @@ pub extern "C" fn gex_claim_page(page: u64) -> u32 {
     // address space starts at linear address 0 (see `guest_bytes`), so the
     // guest address is the native address; `with_exposed_provenance` keeps LLVM
     // from folding it to a null-derived pointer.
-    let addr = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+    let addr = (gex_abi::dispatch_dir() + page * 4) as usize;
     let dir = unsafe {
         &*(std::ptr::with_exposed_provenance::<u32>(addr)
             as *const std::sync::atomic::AtomicU32)
@@ -6412,7 +6419,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
         return;
     }
     let gm = GuestMem::new(guest_bytes());
-    let had = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+    let had = gm.read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(0);
     if had != entry {
         // With the pid, to tell one process renumbering from several numbering
         // independently. `my_pid` reads a static: this runs inside `with_exec_lock`
@@ -6435,7 +6442,7 @@ pub extern "C" fn gex_watch_dir_marker() {}
 #[no_mangle]
 pub extern "C" fn gex_page_base(page: u32) -> u32 {
     let gm = GuestMem::new(guest_bytes());
-    gm.read_u32(gex_abi::DISPATCH_DIR + page as u64 * 4)
+    gm.read_u32(gex_abi::dispatch_dir() + page as u64 * 4)
         .unwrap_or(0)
         & gex_abi::DISPATCH_SLOT_MASK
 }
@@ -6479,7 +6486,7 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
         for (page, base) in &meta.dir_entries {
             j.page_table.assign(*page, *base);
             dir_note(*page, *base, "register-module");
-            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
+            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, *base);
             owner.insert(*page, idx);
         }
         j.page_table.advance_to(meta.next_slot);
@@ -6519,14 +6526,13 @@ pub extern "C" fn gex_reset_directory() -> u32 {
     phase(6);
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
     let data = guest_bytes();
-    let from = gex_abi::DISPATCH_DIR as usize;
-    let to = LOW_END as usize;
-    gex_kernel::zero_dirty_bytes(&mut data[from..to]);
+    let (from, to) = gex_abi::dispatch_dir_range();
+    gex_kernel::zero_dirty_bytes(&mut data[from as usize..to as usize]);
     let mut gm = GuestMem::new(guest_bytes());
     let mut n = 0u32;
     for (page, base) in &meta.dir_entries {
         dir_note(*page, *base, "restore-dirs");
-        if gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base).is_ok() {
+        if gm.write_u32(gex_abi::dispatch_dir() + page * 4, *base).is_ok() {
             n += 1;
         }
     }
@@ -8099,8 +8105,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
 
 /// Everything below the guest's image: the register contexts, the exclusive
 /// monitor scratch, and the dispatch directory. None of it is in the memory
-/// map, and all of it is per-process.
-const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
+/// map, and all of it is per-process. (An M64 memory's directory is above
+/// 4 GiB instead: `gex_abi::dispatch_dir_range`.)
+const LOW_END: u64 = gex_abi::DISPATCH_DIR_END;
 
 // The snapshot switcher was here (`Region`, `snapshot_memory`,
 // `restore_memory`, `clear_mapped`, `switch_process`, `install_process`). It
@@ -10117,7 +10124,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     if DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed) >= 0 {
         warn_line(&format!("[gex] pid {} dir cleared by exec\n", my_pid()));
     }
-    gex_kernel::zero_dirty_bytes(&mut data[gex_abi::DISPATCH_DIR as usize..LOW_END as usize]);
+    let (from, to) = gex_abi::dispatch_dir_range();
+    gex_kernel::zero_dirty_bytes(&mut data[from as usize..to as usize]);
     // And forget which spans were asked for: `FILL_ASKED` avoids re-asking a
     // span, which is only safe while the fill's answer is reachable -- and
     // clearing the directory above made it unreachable, so a stale mark would
@@ -10195,7 +10203,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
             kept += 1;
             h.jit.page_table.assign(*page, *base);
-            let at = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            let at = (gex_abi::dispatch_dir() + page * 4) as usize;
             if at + 4 <= data.len() {
                 data[at..at + 4].copy_from_slice(&base.to_le_bytes());
             }
@@ -13525,11 +13533,11 @@ fn heal_dirs(start: u64) {
         let mut gm = GuestMem::new(guest_bytes());
         let mut out = Vec::new();
         for page in [first, first + 1] {
-            if page >= gex_abi::DISPATCH_MAX_PAGES {
+            if page >= gex_abi::dispatch_max_pages() {
                 continue;
             }
             let Some(base) = j.page_table.lookup(page) else { continue };
-            let at = gex_abi::DISPATCH_DIR + page * 4;
+            let at = gex_abi::dispatch_dir() + page * 4;
             let dir = gm.read_u32(at).unwrap_or(u32::MAX);
             if dir != base {
                 dense::note_entry(base);
@@ -13752,7 +13760,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 &gex_kernel::RetireWhy { start: addr as u64, end: addr as u64 + 1, why: "guard", prot: 0, pc: _pc as u64 },
             );
             let mut gm = GuestMem::new(guest_bytes());
-            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
+            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
             let hi = lo + gex_abi::DISPATCH_PAGE;
             j.translated.retain(|&a| a < lo || a >= hi);
@@ -14036,7 +14044,7 @@ fn remiss(pc: u64) {
         }
         let page = pc / gex_abi::DISPATCH_PAGE;
         pwatch_arm(page);
-        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
         Some(format!(
             "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {} ({} times), {} translations so far\n",
             j.page_table.lookup(page),
@@ -14096,7 +14104,7 @@ fn pwatch_say(page: u64, what: impl FnOnce() -> String) {
     if PWATCH_LEFT.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
         return;
     }
-    let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+    let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
     warn_line(&format!("gex: watch page {page:#x} pid {} worker {}: {} (dir {dir:#x})\n", my_pid(), jit_me(), what()));
 }
 
@@ -14163,7 +14171,7 @@ fn livelock_note(pc: u64) {
     let way = if wpc == pc { format!("{} ({wn} times running)", MISS_WAYS.get(way as usize).unwrap_or(&"?")) } else { format!("last miss here was not dealt with; the last one was at {wpc:#x}") };
     let mut pages = Vec::new();
     for page in [gex_abi::dispatch_page(pc), gex_abi::dispatch_page(pc) + 1] {
-        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
         let (pt, retired) = with_jit_only(|j| (j.page_table.lookup(page), j.retired_pages.contains(&page)));
         pages.push(format!("page {page:#x}: directory {dir:#x}, page table {pt:x?}, retired {retired}"));
     }
@@ -15029,7 +15037,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // the branch misses again next instruction.
                         let mut gm = GuestMem::new(guest_bytes());
                         dir_note(page, base, "miss-shared-slot");
-                        let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                        let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
                     }
                 }
             }
@@ -15281,8 +15289,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         {
             let gm = GuestMem::new(guest_bytes());
             for &(p, b) in &unit.covered {
-                if p < gex_abi::DISPATCH_MAX_PAGES
-                    && gm.read_u32(gex_abi::DISPATCH_DIR + p * 4).unwrap_or(1) == 0
+                if p < gex_abi::dispatch_max_pages()
+                    && gm.read_u32(gex_abi::dispatch_dir() + p * 4).unwrap_or(1) == 0
                     && !dirs.iter().any(|(q, _)| *q == p)
                 {
                     dirs.push((p, b));
@@ -15297,7 +15305,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // dispatch path load-bearing for apt/closures). Only when it differs.
         if let Some(base) = fault_base {
             let mut gm = GuestMem::new(guest_bytes());
-            let at = gex_abi::DISPATCH_DIR + page * 4;
+            let at = gex_abi::dispatch_dir() + page * 4;
             if gm.read_u32(at).unwrap_or(0) != base {
                 dir_note(page, base, "miss-reconcile-covered");
                 let _ = gm.write_u32(at, base);
@@ -15599,7 +15607,7 @@ fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u6
         with_jit_only(|j| {
             for w in &why {
                 for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
-                    if page < gex_abi::DISPATCH_MAX_PAGES && j.page_table.lookup(page).is_some() {
+                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() {
                         note_page_retired(Some(mm), page, w);
                     }
                 }
@@ -15740,7 +15748,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
         j.stale_again.retain(|&a, _| a.saturating_add(gex_abi::DISPATCH_PAGE) <= start || a >= end);
         xlate_add(5, 1);
         for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
-            if page >= gex_abi::DISPATCH_MAX_PAGES {
+            if page >= gex_abi::dispatch_max_pages() {
                 break;
             }
             if j.page_table.lookup(page).is_some() {
@@ -15749,7 +15757,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
-            let at = gex_abi::DISPATCH_DIR + page * 4;
+            let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte
             // aligned, and every Worker's dispatch reads it as a word.
             unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
@@ -15951,7 +15959,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
                     j.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
                     let mut gm = GuestMem::new(guest_bytes());
-                    let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                    let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
                 }
                 None => missing += 1,
             }
@@ -16954,7 +16962,7 @@ pub extern "C" fn gex_jit_installed() {
                 }
             }
             dir_note(page, base, "install-done");
-            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+            let _ = gm.write_u32(gex_abi::dispatch_dir() + page * 4, base);
         }
         // Kept only for a process that has run a second thread-Worker: the
         // registry exists solely so a joining Worker can instantiate every

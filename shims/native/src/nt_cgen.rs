@@ -1063,7 +1063,7 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)], go
             let at = page * gex_abi::DISPATCH_PAGE;
             let unmapped = gone.iter().any(|&(s, e)| s <= at && at < e);
             if unmapped || page_hash(memory, page) != built {
-                let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
+                let off = (gex_abi::patched_pages() + page / 8) as usize;
                 if let Some(b) = memory.get_mut(off) {
                     *b |= 1 << (page % 8);
                 }
@@ -1128,7 +1128,7 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     let map = guard.get_or_insert_with(Default::default);
     for &(page, h) in pages {
         map.insert(page, h);
-        let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
+        let off = (gex_abi::patched_pages() + page / 8) as usize;
         if let Some(b) = memory.get_mut(off) {
             *b &= !(1 << (page % 8));
         }

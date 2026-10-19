@@ -36,6 +36,8 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # thread itself at its safepoints, without the kernel lock (step 8): masks
 # and targets per thread, a process-directed signal taken exactly once.
 # exec-signals: the mask, ignored signals and pending ones survive execve.
+# mem64-wx: a W^X JIT's high pages made executable (mprotect, and a fixed
+# executable mapping at 11 GiB): the M64 dense directory (refused before).
 # mem64-console: console output from above 4 GiB (a thread's stack, a
 # mapping); the address used to be cut to 32 bits.
 # clock-monotonic: the page's CLOCK_MONOTONIC never goes back, within a thread
@@ -177,7 +179,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # writing a directory entry is a bug report).
 # xattr: user.* extended attributes (Wine's DOS attributes), in the page's
 # shared tmpfs (the global kernel's) as natively in the host's.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

@@ -436,6 +436,12 @@ function writeSparse(dst, src, at) {
 
 const DISPATCH_DIR = 0x00100000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
+// An M64 memory's dense directory, one word per page of all 16 GiB, and its
+// patched-page bits (gex_abi::DISPATCH_DIR64 .. HIGH_TABLES_END).
+const DISPATCH_DIR64 = 2 ** 32;
+const HIGH_TABLES_END = DISPATCH_DIR64 + 17 * 2 ** 20;
+const dispatchDir = () => (m64() ? DISPATCH_DIR64 : DISPATCH_DIR);
+const dispatchPages = () => (m64() ? LIMIT64_BYTES / 4096 : 0x80000);
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
@@ -2350,6 +2356,7 @@ export class Gex {
       return zeros;
     });
     out.push({ at: 0, bytes: new Uint8Array(0), zeros: runs(0, LOW_END) });
+    if (m64()) out.push({ at: DISPATCH_DIR64, bytes: new Uint8Array(0), zeros: runs(DISPATCH_DIR64, HIGH_TABLES_END) });
     // The map read once, as the blob the child rebuilds its map from
     // (`#vmaBlob`), and the regions copied are that blob's: read a region at
     // a time (`gex_vma_count`, then `gex_vma_at`), other threads mapping and
@@ -5841,7 +5848,7 @@ export class Gex {
             const raw = BigInt(entered);
             const guest = raw < 0n ? raw + (1n << 64n) : raw;
             const page = Number(guest >> 12n);
-            const dir = new DataView(this.#memory.buffer).getUint32(DISPATCH_DIR + page * 4, true);
+            const dir = new DataView(this.#memory.buffer).getUint32(dispatchDir() + page * 4, true);
             const tables = this.#dispatchTables();
             const packed = dir >>> 0;
             const idx = packed >>> 24;
@@ -5869,8 +5876,8 @@ export class Gex {
             let highTable = 0;
             const sample = [];
             const dv = new DataView(this.#memory.buffer);
-            for (let p = 0; p < 0x80000; p++) {
-              const v = dv.getUint32(DISPATCH_DIR + p * 4, true) >>> 0;
+            for (let p = 0, n = dispatchPages(); p < n; p++) {
+              const v = dv.getUint32(dispatchDir() + p * 4, true) >>> 0;
               if (v === 0) continue;
               const t = v >>> 24;
               const b = v & 0xffffff;
@@ -7299,7 +7306,7 @@ export class Gex {
           what = f === stub ? `STUB at table ${t} slot ${sl} (len ${tabs[t]?.length})` : f === 'past-end' ? `PAST END table ${t} slot ${sl} len ${tabs[t]?.length}` : null;
         }
         const dv = new DataView(this.#memory.buffer);
-        const dir = dv.getUint32(DISPATCH_DIR + Number(mpc >> 12n) * 4, true) >>> 0;
+        const dir = dv.getUint32(dispatchDir() + Number(mpc >> 12n) * 4, true) >>> 0;
         if (what) console.error(`[install-check] pid ${e.gex_my_pid?.() ?? '?'} miss pc 0x${mpc.toString(16)}: ${what}; dir entry t${dir >>> 24} s${dir & 0xffffff}, pt ${packed >= 0 ? `t${packed >>> 24} s${(packed & 0xffffff) - Number(mpc & 0xfffn)}` : '-'}`);
       } catch (err) { console.error(`[install-check] failed: ${err}`); }
     }

@@ -17,7 +17,7 @@
 
 use crate::wasm::{FuncBody, ValType};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR};
+use gex_abi::{ctx, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR};
 use gex_ir::*;
 use std::collections::HashMap;
 
@@ -5003,10 +5003,10 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(4);
         self.f.byte(0x6c); // i32.mul
         self.f.addr_i32();
-        self.f.load(0x28, 2, DISPATCH_DIR as u32);
+        self.f.load64(0x28, 2, gex_abi::dispatch_dir());
         self.f.i32_const(0);
         self.f.local_get(self.scratch_page);
-        self.f.i64_const(DISPATCH_MAX_PAGES as i64);
+        self.f.i64_const(gex_abi::dispatch_max_pages() as i64);
         self.f.byte(code::I64_LT_U);
         self.f.select();
     }
@@ -5141,7 +5141,7 @@ impl<'a> Emitter<'a> {
             return;
         }
         for (k, (page, base)) in pages.iter().enumerate() {
-            self.f.addr_const(gex_abi::DISPATCH_DIR + page * 4);
+            self.f.addr_const(gex_abi::dispatch_dir() + page * 4);
             self.f.load(0x28, 2, 0); // i32.load
             self.f.i32_const(*base as i32);
             self.f.byte(0x47); // i32.ne
@@ -5232,7 +5232,7 @@ impl<'a> Emitter<'a> {
             self.f.i32_const(4);
             self.f.byte(0x6c); // i32.mul
             self.f.addr_i32();
-            self.f.load(0x28, 2, DISPATCH_DIR as u32 + 4 * (i as u32 + 1));
+            self.f.load64(0x28, 2, gex_abi::dispatch_dir() + 4 * (i as u64 + 1));
             self.f.store(0x36, 2, ctx::BALLAST as u32);
         }
     }

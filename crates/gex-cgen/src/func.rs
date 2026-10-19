@@ -657,7 +657,7 @@ impl FnUnit {
             let cb = &mut g.blocks[i];
             let mut patched = None;
             for a in pages {
-                let at = def(cb, Expr::ConstI64(gex_abi::PATCHED_PAGES + (a >> 15)));
+                let at = def(cb, Expr::ConstI64(gex_abi::patched_pages() + (a >> 15)));
                 let byte = def(cb, Expr::Load { addr: at, offset: 0, sz: MemSz::B1, signed: false, ty: Ty::I32, order: Order::Relaxed });
                 let sh = def(cb, Expr::ConstI32(((a >> 12) & 7) as u32));
                 let bits = def(cb, Expr::Bin { op: BinOp::ShrU, ty: Ty::I32, a: byte, b: sh });

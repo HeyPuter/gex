@@ -237,16 +237,16 @@ pub(crate) fn current(install: u32) -> bool {
     lock(&CHECKS)
         .as_ref()
         .and_then(|c| c.get(&install))
-        .is_none_or(|c| c.iter().all(|&(p, g)| word(gex_abi::PAGE_GEN + 4 * p) == g))
+        .is_none_or(|c| c.iter().all(|&(p, g)| word(gex_abi::page_gen() + 4 * p) == g))
 }
 
 /// The `PAGE_GEN` value of `page`, numbering it (its directory written when
 /// the translation is installed: `fresh`) if it has no translation yet.
 fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
-    if page >= gex_abi::DISPATCH_MAX_PAGES {
+    if page >= gex_abi::dispatch_max_pages() {
         return u32::MAX;
     }
-    let have = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::PAGE_GEN + 4 * page).unwrap_or(0);
+    let have = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::page_gen() + 4 * page).unwrap_or(0);
     if have != 0 {
         return have;
     }
@@ -504,7 +504,7 @@ fn translate_root(addr: u64) -> Option<u32> {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (p, b) in fresh {
-            let at = gex_abi::DISPATCH_DIR + p * 4;
+            let at = gex_abi::dispatch_dir() + p * 4;
             if gm.read_u32(at).unwrap_or(0) == 0 {
                 let _ = gm.write_u32(at, b);
             }

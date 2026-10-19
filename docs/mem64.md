@@ -97,12 +97,19 @@ non-executable data:
   protection, and without `zero_bits` or an address that forces it low, goes
   to the high arena. `MEM_TOP_DOWN` and `PAGE_EXECUTE*` stay low. Images and
   sections stay low.
-- So the dispatch directory, PAGE_GEN and PATCHED_PAGES keep their 2 GiB
-  reach: code never lives high. **Open:** `mprotect`/`NtProtectVirtualMemory`
-  that makes a high page executable. It is rare (a JIT allocating data then
-  flipping it), and at first it fails loudly with the address. The general
-  answer is a sparse page-generation table for pages above the directory,
-  which the function-table path (hash address map, §9.8.1) needs anyway.
+- Code normally stays low, but a high page may become code: a W^X JIT
+  (Mono, V8, LuaJIT) maps data read-write, which lands high, then flips it
+  with `mprotect`/`NtProtectVirtualMemory`, and a fixed executable mapping
+  may name any address. So an M64 process has its own **dense tables** at
+  the bottom of the high region (`gex_abi::DISPATCH_DIR64`): one directory
+  word (also its PAGE_GEN) for every page of `[0, LIMIT64)`, 16 MiB, and its
+  PATCHED_PAGES bits, 512 KiB, up to `HIGH_TABLES_END`; the high arena starts
+  there. Every emitter and host path takes the flavour's tables
+  (`gex_abi::dispatch_dir()`, `dispatch_max_pages()`, `patched_pages()`); an
+  M32 process's tables and modules are unchanged. The browser grows an M64
+  memory over the tables at its first Worker (V8 commits lazily). The probe
+  cache (`FCACHE`) keys on the low 32 bits, so a call to a function above
+  4 GiB always misses it and resolves through the host: correct, slower.
 
 Keeping code low also keeps every per-page array in the low region the same
 size, so M64 costs nothing there.
@@ -255,7 +262,7 @@ learned record is not enough there.
   measured first; a browser that cannot do it keeps level 1 off.
 - **wasm64 PIC in clang and wasm-ld** for units: least exercised path; if it
   falls short, M64 processes use fjit only until it is fixed (correct, slower).
-- **Code in the high arena** (§3): fails loudly at first.
+- **Code in the high arena** (§3): covered by the M64 dense tables (KC, 2026-10-18).
 - **Two shims in the browser** double the shim build and its cache.
 
 ## 9. Order of work (each step gated by tests; shared files sequenced by the coordinator)
@@ -301,7 +308,8 @@ browser shim; the coordinator sequences them.
   mappings the dynamic loader asks for (an `mmap` whose pc is in ld.so's
   text at `INTERP_BASE`: glibc reserves `PROT_NONE` memory for an
   over-aligned library such as UnityPlayer.so). `MAP_FIXED` or `mprotect`
-  that would put code above 4 GiB fails loudly (EACCES).
+  that put code above 4 GiB failed with EACCES until the M64 dense tables
+  (§3, 2026-10-18).
 - **Code generation:** `FuncBody` address helpers that emit today's bytes
   for M32; the context stays an i32 everywhere (F_body and every host
   import keep their signatures) and is widened where it is an address; no
