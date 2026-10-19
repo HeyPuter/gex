@@ -388,12 +388,12 @@ ship the function-tier units built for those bases by the page's own gexc
 | 4414 | Geometry Dash | w64 | **menu** |
 | 4415 | 5D Chess | w64 | gooner: asks for GL 3.3 core, SwiftShader gives 3.2 (no dual-source blending). edger (GL 4.2): past that, then mmap runs out of address space near 4 GiB: needs memory64 (W64.7) |
 | 4416 | Mosa Lina | w64 | gooner: "OpenGL 3.2+ is required" (SwiftShader's limit); edger (GL 4.2): runs, its window drawn |
-| 4417 | Spelunky 2 | w64 | gooner: needs D3D11 feature level 11.0, wined3d on GL 3.2 gives 10.1. edger: past that; a blank window (the loader lock, as natively) and mmap out of address space near 4 GiB: needs memory64 (W64.7) |
-| 4418 | Hades | w64 | **menu background renders**; the headless tab stops answering after about 4 minutes |
+| 4417 | Spelunky 2 | w64 | needs memory64 (W64.7): fixed allocations at 7-8 TiB, so the page runs out of address space at about 120 s; recorded, not a bug. (gooner also lacks D3D11 feature level 11.0 on GL 3.2) |
+| 4418 | Hades | w64 | **menu background renders** (240 s); the screen is black by 420 s, still running. Between 1017y and 1019b W64 took W3's compact space and Hades trapped at 120-180 s out of address space; fixed by 839dad7d (W64 takes the split, 1019b) |
 | 4419 | Baba Is You | w64 | **renders** (credits screen) |
 | 4420 | Warfork | w64 | **main menu** by 301 s (gooner; G2's g2/page-inet-carry, in round 1019b; before it, an error dialog: "Couldn't open UDP socket: setsockopt: Unknown error") |
 | 4435 | Celeste | w3 | starfield backdrop renders at 1200 s, still loading (GFX load 281 s, mountain load 137 s); needs `page=w3split` (in the compact space the shim's heap reached 1296 MiB and it ran out at 240 s) |
-| 4436 | TowerFall Ascension | w3 | "Couldn't find Steam!": its site has no Steam stand-in yet |
+| 4436 | TowerFall Ascension | blocked | needs a Steam client ("Couldn't find Steam!" without one); recorded as blocked, no stand-in (the no-DRM rule) |
 | 4437 | Antichamber | w3 | with `page=w3split` no out-of-memory; Wine Mono then crashes (c0000005) at about 420 s |
 | - | TUNIC | w64 | no page: needs memory64 |
 | - | blocked, idea and dotnet rows | | no page: listed only |
@@ -415,7 +415,7 @@ correctness only; edger is used for checks that need a GPU.
 | Retrocycles | w3 | **gameplay** (a match) | |
 | Momodora | w3 | **title** ("Press Any Button") | no input script yet |
 | Celeste | w3 | **title** (the mountain, frame ~4500; G2, 1200 s and more) | XNA on Wine Mono 11.2.0 (FNA on d3d11); loading takes about 6 minutes on gooner; celeste-w3.wl starts at frame 4800 |
-| TowerFall Ascension | w3 | **title menu** (frame 9900; G2) | needed a Steam stand-in (it showed "Couldn't find Steam!" without one) |
+| TowerFall Ascension | blocked | title menu only with a Steam stand-in (frame 9900; G2) | needs a Steam client: "Couldn't find Steam!" without one. Blocked (2026-10-18): no stand-in for it |
 | Antichamber | w3 | not yet known | UDK.exe, mixed-mode CLR on Wine Mono; G2's run in progress |
 | N++ | w3 | **title** ("Press Any Key") | no window ever gets the keyboard; on gooner (llvmpipe) its clears are missing, on edger's GPU it draws right |
 | Hades (x86) | w3 | no frame | EngineWin32s imports BasecampBugReporter.Native.dll, mixed-mode C++/CLI (stub=basecamp stands in); then an `unreachable` trap in ucrtbase's rewind, which has no wasm32 body (Wine g/wine-rewind; test tests/w3/rewind.sh); in the page it needs `page=w3split` (the shim's heap above 2 GiB) |
