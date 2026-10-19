@@ -861,9 +861,10 @@ function launchBuild(m, at) {
       aot: p.aot ?? null,
       // Wine's opengl32 reaches Mesa through /dev/gex-gl. Started by the
       // first process that asks, so a visit whose programs draw no GL does
-      // not download it (`glLazy`).
+      // not download it (`glLazy`; nt.json `gl_lazy: false` starts it at
+      // boot, to compare).
       gl: !(m.features_off ?? []).includes('gl'),
-      glLazy: true,
+      glLazy: m.gl_lazy ?? true,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
