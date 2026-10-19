@@ -254,6 +254,12 @@ of address space.
   game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
   an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
   title screen natively without Steam; Rain World gets through EOS errors.
+- **Muck page staging (2026-10-19, G2):** `scratch/G2/muck/` holds `dnc/` (the .NET provider,
+  `tools/unity-dotnet/mono/build.sh` output), `bcl/` (.NET 10 framework assemblies, this build's CoreLib,
+  BinaryFormatter and the two framework natives, as tests/games/muck-dotnet.sh makes it, plus
+  `mono.wasm`), `muck-files.txt` (the host files a native `--strace` run opened under /etc, /lib, /usr)
+  and `gl64/` (guest GL). `tools/unity-dotnet/page/muck-page.sh` takes them as `BCL=` and `FILES=`.
+  The old staging (`scratch/unity/page/muck-bcl`, `muck-files.txt`) is gone.
 - **Status (2026-10-04, later):** Muck reaches its main menu natively
   under `--fjit --mem64` (Host Lobby, Join Lobby, Settings, Achievements,
   About, Quit over the 3D island; work/games/screens/muck-menu-gex-fjit-mem64.png)

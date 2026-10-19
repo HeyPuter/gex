@@ -62,9 +62,12 @@ geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe      
 # 5d-chess: in the page, mmap runs out of address space near 4 GiB (try_map_free_area
 # 0xfff40000-0xffff0000) and it stalls: needs memory64 (W64.7). Natively gameplay.
 5d-chess     |w64  |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |290|4640|5d-chess-w64.wl
-# mosa-lina: needs GL compute (it fails "OpenGL 3.2+ is required" when wglGetProcAddress
-# has no glDispatchCompute), so its page asks for GL 4.3's WebGPU limits (gllimits=43: 4.6
-# on edger). Title screen on edger by 202 s (G2 10-19). Not the default: Muck drew black at 4.6.
+# mosa-lina: needs gllimits=43 (compute): it fails "OpenGL 3.2+ is required" when
+# wglGetProcAddress has no glDispatchCompute, and st/mesa offers compute only at 1024
+# invocations a workgroup (4.6 on edger). Title screen on edger by 202 s (G2 10-19). Its
+# Worker heap grew ~9 MiB/s on page JS older than g2/callout-leak 7a599a4a: fixed by
+# rebuilding the site (largest Worker 50-60 MiB to 364 s). Not the default yet: Muck drew
+# black at 4.6.
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-|page=gllimits=43
 # spelunky2: needs memory64 (W64.7): it makes fixed allocations at 7-8 TiB, which a wasm32
 # guest cannot place; in the page it runs out of address space at about 120 s. Not a bug.
