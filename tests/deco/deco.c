@@ -14,6 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Each line in one write: unbuffered printf writes a line in pieces, and the
+ * compositor's stderr, in the same log, lands between them. */
+#define printf(...) do { char line_[256]; snprintf(line_, sizeof(line_), __VA_ARGS__); fputs(line_, stdout); } while (0)
+
 static HWND p, o, c;
 static int moved_c;
 
