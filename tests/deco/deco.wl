@@ -1,10 +1,11 @@
-# tests/deco/deco.sh: drag deco.exe's popup P by its own caption, +200,+150
-# (from the first frame; the windows are up well before 30 s).
-frames 1
-30    move 150 115
-31    button 272 1
-31.5  move 170 130
-32    move 230 175
-32.5  move 290 220
-33    move 350 265
-34    button 272 0
+# tests/deco/deco.sh: drag deco.exe's popup P by its own caption, +200,+150,
+# in seconds from deco.exe's last window (C, 200x100) being up: a fixed delay
+# from the first frame was too short on a loaded machine.
+window 200 100
+5     move 150 115
+6     button 272 1
+6.5   move 170 130
+7     move 230 175
+7.5   move 290 220
+8     move 350 265
+9     button 272 0

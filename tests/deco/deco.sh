@@ -40,11 +40,11 @@ leg() { # NAME DIST PREFIX WINE EXE
 		extra=(--env WINEGEX_DOOR=1 --env "WINEDLLOVERRIDES=mscoree=;mshtml=")
 	fi
 	mkdir -p "$w/wl-$name" "$w/frames-$name"
-	(cd "$p/drive_c" && GEX_PPM_EVERY=1 GEX_WL_INPUT="$here/deco.wl" timeout -k 10 "${TMO:-300}" "$gexc" run \
+	(cd "$p/drive_c" && GEX_PPM_EVERY=1 GEX_WL_INPUT="$here/deco.wl" timeout -k 10 "${TMO:-400}" "$gexc" run \
 		--wayland "$w/wl-$name" --wayland-size 1024x768 --wayland-out "$w/frames-$name/f" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all "${extra[@]}" \
-		"$dist/lib/wine/$4/wine" "C:\\$5" 120) > "$log" 2>&1
-	if python3 - "$log" "$w/frames-$name" <<'PY'
+		"$dist/lib/wine/$4/wine" "C:\\$5" 300) > "$log" 2>&1
+	if python3 - "$log" "$w/frames-$name" > "$w/$name.why" <<'PY'
 import os, re, sys
 log = open(sys.argv[1], errors="replace").read()
 fails = []
@@ -89,7 +89,10 @@ check(seen_o, "O's buffer: Wine's caption over its blue client")
 sys.exit(1 if fails else 0)
 PY
 	then pass=$((pass + 1)); echo "ok   deco $name"
-	else fail=$((fail + 1)); echo "FAIL deco $name"; grep -a '^P \|^O \|^moved\|^deco\|^\[wl-place\]' "$log" | tail -6 | sed 's/^/  | /'; fi
+	else fail=$((fail + 1))
+		# The reason on the FAIL line itself: a gate keeps only that line.
+		echo "FAIL deco $name: $(sed 's/^  missing: //' "$w/$name.why" | paste -sd';') ($(grep -aq "script's clock starts" "$log" && echo 'input clock started' || echo 'input clock never started'); $(grep -a '^deco \(ok\|FAIL\)' "$log" | tail -1 | grep . || echo 'no result line'))"
+		grep -a '^P \|^O \|^moved\|^deco\|^\[wl-place\]' "$log" | tail -6 | sed 's/^/  | /'; fi
 }
 leg w3 "$w3dist" "$w3prefix" i386-unix deco32.exe
 if [ -n "${W64_DIST:-}" ] && [ -n "${W64_PREFIX:-}" ] && [ -n "${W64_NATIVE:-}" ]; then
