@@ -3188,6 +3188,10 @@ fn push_pending(j: &mut Jit, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8
     j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
+/// `GEX_JIT_DIAG`: stale checks from a module numbered elsewhere whose id one
+/// of this process's own modules has too (`PAGE_STALE`).
+static STALE_FOREIGN_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// How many times a stale page check may translate one block start again
 /// (`Jit::stale_again`).
 const STALE_AGAIN_MAX: u32 = 64;
@@ -3196,7 +3200,10 @@ const STALE_AGAIN_MAX: u32 = 64;
 /// (`Jit::module_dense`).
 fn note_module_dense(j: &mut Jit, module_id: u64) {
     if let Some(d) = j.pending.back().and_then(|p| p.dense.as_ref()) {
-        j.module_dense.insert(module_id, (d.base, d.entries.len() as u32));
+        j.module_dense.insert(d.base, d.entries.len() as u32);
+        if jit_diag() {
+            j.own_ids.insert(module_id as u32);
+        }
     }
 }
 
@@ -3354,10 +3361,18 @@ struct Jit {
     /// store keeps the bytes as built, and `backfill_registry` must keep
     /// them as installed (`dense`).
     dense_base: std::collections::HashMap<u32, u32>,
-    /// The `blocks` range (base, count) each runtime translation was given
-    /// (`dense::register`), by its `module_id`: which module a slot's index
-    /// is in, for `PAGE_STALE` (does dispatch still reach the stale block?).
-    module_dense: std::collections::HashMap<u64, (u32, u32)>,
+    /// The `blocks` range each runtime translation was given
+    /// (`dense::register`): its count, by its base. Which module a slot's
+    /// index is in, for `PAGE_STALE` (does dispatch still reach the stale
+    /// block?). Keyed by base, not module id: a stale block passes the base
+    /// its module was instantiated at here, and bases in one process never
+    /// overlap, while ids are compiled in and repeat across processes and
+    /// runs (a module restored from the translation cache).
+    module_dense: std::collections::HashMap<u32, u32>,
+    /// `GEX_JIT_DIAG`: the module ids (low halves) this process's own
+    /// translations were given, to say when a stale check comes from a
+    /// module numbered elsewhere whose id is also one of these.
+    own_ids: std::collections::HashSet<u32>,
     /// Times a stale page check translated each block start again
     /// (`PAGE_STALE`), for its bound ([`STALE_AGAIN_MAX`]).
     stale_again: std::collections::HashMap<u64, u32>,
@@ -9467,6 +9482,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         obj_cursor: Default::default(),
         dense_base: Default::default(),
         module_dense: Default::default(),
+        own_ids: Default::default(),
         stale_again: Default::default(),
         retired_pages: Default::default(),
         remiss: Default::default(),
@@ -13529,11 +13545,34 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             // Resuming from JavaScript (below) reaches the slot's block; only
             // a stale block dispatch itself comes back to needs translating
             // again (the `repeat` case).
-            let elsewhere = dense::on() && {
+            //
+            // `addr` is the stale module's dense base (high half, 0 for none)
+            // and its id (low half; tier1 `emit_page_check`). Only the base,
+            // where the module really is in this process, can say
+            // "elsewhere": a base this process did not number (an adopted or
+            // restored module) or none says no, and the block is translated
+            // again, bounded below. The id, compiled in, repeats across
+            // processes and runs; it only picks between translating again and
+            // the bound (gate 1019f: a module restored from the translation
+            // cache had the id of one of the process's own, `elsewhere` read
+            // that one's range, and the block resumed from JavaScript for
+            // ever).
+            let (stale_base, stale_id) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
+            let ours = j.module_dense.get(&stale_base).copied();
+            let elsewhere = dense::on() && stale_base != 0 && {
                 let d = dense::lookup(start);
-                d != 0 && j.module_dense.get(&(addr as u64)).is_some_and(|&(b, n)| d < b || d >= b + n)
+                d != 0 && ours.is_some_and(|n| d < stale_base || d >= stale_base + n)
             };
-            let mut again = !elsewhere && (repeat || j.provider.get(&start).map_or(true, |&m| m == addr as u64));
+            if jit_diag() && ours.is_none() && j.own_ids.contains(&(stale_id as u32)) {
+                let n = STALE_FOREIGN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 {
+                    warn_line(&format!(
+                        "gex: pid {} stale block {start:#x} of a module this process did not number (base {stale_base:#x}), whose id {stale_id} one of its own has too; not taken for elsewhere\n",
+                        my_pid()
+                    ));
+                }
+            }
+            let mut again = !elsewhere && (repeat || j.provider.get(&start).map_or(true, |&m| m & 0xffff_ffff == stale_id));
             // The bound: a block start a stale check has translated again
             // this many times (since its code last changed) is not translated
             // again for it, and resumes from JavaScript (below), correct and
@@ -13643,7 +13682,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 return;
             }
             j.retired_pages.insert(page);
-            let home = sigs::home();
+            let home = if jit_diag() { sigs::home() } else { None };
             note_page_retired(
                 home.as_ref().map(|h| h.mm()),
                 page,

@@ -45,7 +45,13 @@ c=$(run); check "a replaced library is not served stale" "$(expect 2)" 'libt.so 
 d=$(run); check "and the next run restores the new one" "$(expect 2)" 'restored [1-9][0-9]* modules' "$d"
 sleep 1.1
 lib 3 libt.new
-e=$(run /bin/swap); check "a library replaced after the restore is not served stale" "$(expect 3)" 'libt.so changed since the save' "$e"
+# GEX_JIT_DIAG: this run also says when a stale block of a module it did not
+# number (restored here) has the id of one of its own. Ids are compiled into
+# the code and count from 1 in every run, so the restored modules' ids are
+# this run's fresh ones; taking the id for the module (gate 1019f) sent the
+# stale block back to JavaScript for ever, and this run hung before exec.
+e=$(GEX_JIT_DIAG=1 run /bin/swap); check "a library replaced after the restore is not served stale" "$(expect 3)" 'libt.so changed since the save' "$e"
+check "  a restored stale block whose id one of the run's own has is not sent elsewhere" "$(expect 3)" 'whose id [0-9]+ one of its own has too; not taken for elsewhere' "$e"
 # The guest's rename stays in that run's filesystem (run-node copies --dir),
 # so the next run has the old libt.so again, which the cache (saved with the
 # new one) must not serve either.
