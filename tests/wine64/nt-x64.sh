@@ -22,6 +22,8 @@
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
+# The authattrs case: crypt32 verifies a signature over authenticated
+# attributes as encoded, not in DER order (authattrs.c).
 # The display case (W64.4), when the loader has winewayland.drv's Unix side
 # (link-w64.sh with W64_DEPS) and the driver's PE side is there (native:
 # NATIVE= with W64_NATIVE_DLLS' winewayland.drv): window.exe under gexc's
@@ -205,6 +207,15 @@ elif x86_64-w64-mingw32-gcc -O1 -o "$w/audio.exe" "$here/audio.c" -lwinmm -lole3
 	check audio 0 "waveout ok${nl}mmdevapi ok" "$w/audio.exe"
 else
 	fail=$((fail + 1)); echo "FAIL x64/audio ($tag): x86_64-w64-mingw32-gcc"
+fi
+# crypt32: a signed message whose authenticated attributes are not in DER
+# order verifies (authattrs.c; vectors from authattrs-gen.py). FL Studio's
+# check of its engine DLL's Authenticode signature needs it.
+if x86_64-w64-mingw32-gcc -O1 -o "$w/authattrs.exe" "$here/authattrs.c" -lcrypt32; then
+	check authattrs 0 "$allok" "$w/authattrs.exe"
+else
+	case " ${CASES:-authattrs} " in *" authattrs "*)
+		fail=$((fail + 1)); echo "FAIL x64/authattrs ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c). Not in the page:
 # there the shim's heap is the upper 2 GiB of the process's memory, and the
