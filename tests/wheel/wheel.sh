@@ -4,8 +4,13 @@
 # of -120, a trackpad's 40 small deltas add up to another -120
 # (none rounded to nothing), and a horizontal notch is WM_MOUSEHWHEEL +120.
 # winewayland reads only wl_pointer.axis_discrete / axis_value120, never the
-# continuous axis, so the compositor has to send wheel units. Prints
-# "ok   wheel w3" / "ok   wheel w64" or FAIL with the program's output.
+# continuous axis, so the compositor has to send wheel units. Each leg
+# runs again as `slow` (wheel-slow.wl): the program's WH_MOUSE hook sleeps
+# on every wheel message, between the server's hand-over and win32u's
+# accept, and the sums must still come out (the Wine server once merged a
+# delta into the message the app already had); a burst of 20 moves must
+# still coalesce. Prints "ok   wheel w3", "ok   wheel w3-slow", w64 and
+# w64-slow likewise, or FAIL with the program's output.
 #
 #   tests/wheel/wheel.sh W3_DIST W3_PREFIX [gexc]
 #
@@ -25,10 +30,10 @@ rm -rf "$w"; mkdir -p "$w"
 i686-w64-mingw32-gcc -O1 -Wall -o "$w/wheel32.exe" "$here/wheel.c" -lgdi32 || exit 1
 x86_64-w64-mingw32-gcc -O1 -Wall -o "$w/wheel64.exe" "$here/wheel.c" -lgdi32 || exit 1
 pass=0 fail=0
-leg() { # NAME DIST PREFIX WINE EXE
-	local name=$1 dist=$2 p=$w/pfx-$1 log=$w/$1.log extra=()
+leg() { # NAME DIST PREFIX WINE EXE [slow]
+	local name=$1${6:+-$6} dist=$2 p=$w/pfx-$1${6:+-$6} log=$w/$1${6:+-$6}.log extra=() wl=$here/wheel${6:+-$6}.wl
 	cp -a "$3" "$p"; cp "$w/$5" "$p/drive_c/"
-	if [ "$name" = w64 ]; then
+	if [ "$1" = w64 ]; then
 		# as tests/wine64/nt-x64.sh WL=1: the Wayland driver (the prefix is
 		# made without a display)
 		printf '\n[Software\\\\Wine\\\\Drivers] 1791289000\n"Graphics"="wayland"\n' >> "$p/user.reg"
@@ -38,19 +43,24 @@ leg() { # NAME DIST PREFIX WINE EXE
 		extra=(--env WINEGEX_DOOR=1 --env "WINEDLLOVERRIDES=mscoree=;mshtml=")
 	fi
 	mkdir -p "$w/wl-$name"
-	(cd "$p/drive_c" && GEX_WL_INPUT="$here/wheel.wl" timeout -k 10 "${TMO:-400}" "$gexc" run \
+	(cd "$p/drive_c" && GEX_WL_INPUT="$wl" timeout -k 10 "${TMO:-400}" "$gexc" run \
 		--wayland "$w/wl-$name" --wayland-size 640x480 --wayland-out null \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all "${extra[@]}" \
-		"$dist/lib/wine/$4/wine" "C:\\$5" 300) > "$log" 2>&1
+		"$dist/lib/wine/$4/wine" "C:\\$5" 300 ${6:-}) > "$log" 2>&1
 	if grep -aq '^wheel ok' "$log"; then pass=$((pass + 1)); echo "ok   wheel $name"
 	else fail=$((fail + 1))
 		# The reason on the FAIL line itself: a gate keeps only that line.
 		why=$(grep -a '^wheel: vertical' "$log" | tail -1)
+		# What the compositor did with the scrolls: sent (the script's), and
+		# any it had nowhere to deliver (a short sum with none dropped was
+		# lost past the compositor, in Wine).
+		[ -n "$why" ] && why="$why; compositor: $(grep -ac '\[gex\] input at .*Axis(' "$log") scrolls sent, $(grep -ac 'scroll dropped' "$log") dropped$(grep -a 'scroll dropped' "$log" | head -1 | sed 's/^/ (/; s/$/)/')"
 		[ -n "$why" ] || why="no result line ($(grep -aq '^wheel: window up' "$log" && echo 'window up' || echo 'window never up'), $(grep -aq "script's clock starts" "$log" && echo 'input clock started' || echo 'input clock never started'), $(grep -ac '^\[gex\] input at' "$log") input events sent)"
 		echo "FAIL wheel $name: $why"; grep -a '^wheel\|^hwheel' "$log" | tail -6 | sed 's/^/  /'
 		grep -av '^wheel\|^hwheel\|^\[gex\] loaded' "$log" | tail -6 | sed 's/^/  | /'; fi
 }
 leg w3 "$w3dist" "$w3prefix" i386-unix wheel32.exe
+leg w3 "$w3dist" "$w3prefix" i386-unix wheel32.exe slow
 if [ -n "${W64_DIST:-}" ] && [ -n "${W64_PREFIX:-}" ] && [ -n "${W64_NATIVE:-}" ]; then
 	# W64_DIST with W64_NATIVE's files in place (the native PE core, which
 	# has winewayland.drv), as tests/games/matrix.sh runs W64 games
@@ -61,6 +71,7 @@ if [ -n "${W64_DIST:-}" ] && [ -n "${W64_PREFIX:-}" ] && [ -n "${W64_NATIVE:-}" 
 	for f in "$d"/lib/wine/x86_64-windows/*; do ln -s "$f" "$o/lib/wine/x86_64-windows/"; done
 	for f in "$(realpath "$W64_NATIVE")"/*; do rm -f "$o/lib/wine/x86_64-windows/${f##*/}"; cp "$f" "$o/lib/wine/x86_64-windows/"; done
 	leg w64 "$o" "$(realpath "$W64_PREFIX")" x86_64-unix wheel64.exe
+	leg w64 "$o" "$(realpath "$W64_PREFIX")" x86_64-unix wheel64.exe slow
 else
 	echo "skip wheel w64: no W64_DIST/W64_PREFIX/W64_NATIVE"
 fi
