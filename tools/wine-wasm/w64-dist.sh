@@ -26,6 +26,8 @@
 #               wineoss.drv (audio, against gex-kernel's /dev/dsp, as W3's)
 #               in the loader; W64_TLS=0 leaves GnuTLS out (S gets -notls)
 #   srv-K       the wasm32 wineserver (link-wineserver.sh over W3_BUILD)
+#   dist64-K-S-twin  with W64_TWIN=1, that install plus the memory64
+#               loader as x86_64-unix/wine.m64 (the W64_MEM64=1 build's)
 #   dist64-K-S  the install: x86_64-unix/{wine,wineserver}, x86_64-windows,
 #               share/wine, and etc/ssl/certs/ca-certificates.crt (crypt32's
 #               root store; natively the host's /etc is the guest's)
@@ -224,7 +226,24 @@ pe_native() {
 	nice -n 10 "$here/stage-native64.sh" "$b" "$W" "$PWD/native" $D
 }
 log "native PE core ($K, $NK)"; step pen64-$K-$NK pe_native
-echo "W64_DIST=$C/dist64-$K-$S"
+DIST=$C/dist64-$K-$S
+# W64_TWIN=1: a twin install (docs/mem64.md §5, per program): the default
+# install with the memory64 loader beside the lowered one, as
+# x86_64-unix/wine.m64 (the W64_MEM64=1 build's wine; one PE side, one
+# prefix). An exec of the loader that asks for a 64-bit memory (GEX_MEM64=1)
+# runs the twin (shim vfork.rs `exec_route`); every other exec, the default.
+# Off by default: the default install and its downloads do not grow.
+if [ "${W64_TWIN:-0}" != 0 ]; then
+	MD=$(W64_TWIN=0 W64_MEM64=1 "$0" "$W" "$C" | sed -n 's/^W64_DIST=//p') && [ -n "$MD" ] || { log "the memory64 build for the twin failed"; exit 1; }
+	twin_make() {
+		cp -a "$DIST/." .
+		rm -f .done
+		cp -p "$MD/lib/wine/x86_64-unix/wine" lib/wine/x86_64-unix/wine.m64
+	}
+	log "twin install ($K, $S)"; step dist64-$K-$S-twin twin_make
+	DIST=$C/dist64-$K-$S-twin
+fi
+echo "W64_DIST=$DIST"
 echo "W64_PREFIX=$C/pfs64-$P-$R/pfx"
 echo "W64_TOOLS=$T"
 echo "W64_SRC=$W"

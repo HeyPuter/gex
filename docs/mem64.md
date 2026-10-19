@@ -475,8 +475,40 @@ browser shim; the coordinator sequences them.
 - Test: tests/browser-mem64-pick.sh (the asked program is 64-bit; its fork
   and posix_spawn children, a sibling, and the program after its record
   is removed are 32-bit; the record and `GEX_MEM64=0` over it).
-- Not yet: W64 per program needs the W64_MEM64 dist's loader beside the
-  default one in one prefix, with Wine's exec of a PE resolved to an image
-  for the record (Wine passes the Windows command line, not a path). The
+- An exec of the caller's own command line (the arguments after the
+  first, the same) keeps the caller's flavour unless it asks otherwise
+  (vfork.rs `exec_relaunch`): the same program started again. W64's first
+  Wine process starts the program it was given as a process of its own, so
+  this is what carries an asked-for 64-bit memory to the program itself.
+- W64 per program (twin install): `W64_TWIN=1 tools/wine-wasm/w64-dist.sh`
+  (off by default; the default install does not grow) adds the memory64
+  loader as `x86_64-unix/wine.m64` beside the lowered `wine`, sharing the PE
+  side and the prefix. Of a program and its twin `<path>.m64`, an exec runs
+  the one of the memory it wants (vfork.rs `exec_route`): `wine` asked for a
+  64-bit memory runs `wine.m64`; a 64-bit Wine's own children, which Wine
+  starts from its loader (`/proc/self/exe`, so `wine.m64`), go back to
+  `wine` unless they ask or relaunch. Test: tests/wine64/nt-x64.sh TWIN=1
+  PAGE=mp (the loader exec'd by a launcher with GEX_MEM64=1): the W64 cases,
+  highdata's 5 GiB, and `childtwin` (the program's CreateProcess child is
+  32-bit: highdata's 5 GiB fail in it).
+- Not yet: the record for a Windows program (Wine passes the Windows
+  command line to the loader, not the image's path: options below), the
   overflow detection that writes the record (§5), and native per-process
   flavours (OPTIMIZATION-BACKLOG.md).
+- The record for a Windows program, options (not built; a Wine change
+  needs the coordinator's approval):
+  - (b1) The shim resolves the command line's first word at a loader exec:
+    a drive path through `$WINEPREFIX/dosdevices/<x>:`, a bare name in the
+    exec's cwd and then `system32`, case-insensitively, and reads the
+    attribute there. No Wine change, but a second copy of Wine's search
+    (PATH, App Paths, a missing `.exe`, quoting, `z:` and other drive
+    overrides, an unset WINEPREFIX); a miss leaves the program 32-bit.
+  - (b2) Wine names the image: `prepare_wineloader_exec` (and
+    `exec_wineloader`) put `WINEGEX_IMAGE=<unix path of the PE>` in the new
+    process's environment, which Wine already resolved, as it puts
+    `WINEPRELOADRESERVE`. The kernel reads the record from that path at
+    execve and strips the variable, as it does GEX_MEM64. Exact, and a few
+    lines in ntdll's process.c under `__wasm__`; the overflow detection
+    gets the same path to write the record to.
+  - (b3) The new process asks for the switch itself after mapping its main
+    image: that is the live switch (§6), far more work.
