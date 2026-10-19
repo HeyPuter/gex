@@ -223,6 +223,16 @@ elif x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 else
 	fail=$((fail + 1)); echo "FAIL x64/highdata (W64): x86_64-w64-mingw32-gcc"
 fi
+# A skeleton's view unmapped and its addresses reused for the program's own
+# code (stalebind.c): the native bindings must not outlive the view. Only
+# with the native PE core, whose DLLs are skeletons (NATIVE=).
+if [ -n "${NATIVE:-}" ]; then
+	if x86_64-w64-mingw32-gcc -O1 -o "$w/stalebind.exe" "$here/stalebind.c"; then
+		check stalebind 0 "$allok" "$w/stalebind.exe"
+	else
+		fail=$((fail + 1)); echo "FAIL x64/stalebind ($tag): x86_64-w64-mingw32-gcc"
+	fi
+fi
 # W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
 # called from x64 code through every kind of Win64 entry adapter, and
 # calling back (tests/wasm64/dll)

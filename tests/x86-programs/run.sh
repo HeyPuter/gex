@@ -54,6 +54,9 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # retired; in the page with GEX_TEST_UNPUBLISHED_RETIRE, which leaves a
 # retired page numbered with no directory entry (a publisher that never
 # installed), the block's page check must converge (Paint's startup stall).
+# stale-cross-page: a block across a page boundary whose second page is
+# rewritten 150 times (past the stale check's bound of 64); the bound once
+# counted for the whole run and stranded the block (FL's ACM codecs).
 # stale-loop-head: a loop whose head page is rewritten while its body's page
 # is not; the body's old translation jumps straight to the old head, whose
 # page check fails, and the page must resume through dispatch rather than
@@ -166,7 +169,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # poll-timeout: poll, ppoll, select and epoll_wait ended only by their
 # 100 ms deadline, after the stack went back to the page (the clock scope a
 # trap left open froze the clock, and they never returned).
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry stale-loop-head tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"spawn-threads served-entries page-cross-entry stale-loop-head stale-cross-page tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.

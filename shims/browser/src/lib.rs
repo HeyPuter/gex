@@ -13535,10 +13535,14 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             };
             let mut again = !elsewhere && (repeat || j.provider.get(&start).map_or(true, |&m| m == addr as u64));
             // The bound: a block start a stale check has translated again
-            // this many times is not translated again for it. Whatever reaches
-            // the stale block there, more translations have not stopped it;
-            // resuming from JavaScript (below) is correct, only slower.
-            if again {
+            // this many times (since its code last changed) is not translated
+            // again for it, and resumes from JavaScript (below), correct and
+            // only slower -- unless it is the same block asking again
+            // (`repeat`): then resuming came straight back to it, and only a
+            // translation moves this Worker on. Bounded that too, FL Studio's
+            // loader thread ran one ACM codec's stale block for ever, the
+            // loader lock held.
+            if again && !repeat {
                 let n = j.stale_again.entry(start).or_insert(0);
                 *n += 1;
                 if *n > STALE_AGAIN_MAX {
@@ -15608,6 +15612,12 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             continue;
         }
         j.translated.retain(|a| *a < start || *a >= end);
+        // The stale-check bound counts translations of one code's block, so
+        // new code at those addresses starts from 0 (a block a page before
+        // `start` may run onto it): Wine's ACM codecs, loaded and unloaded
+        // one after another at one base, took a block there past the bound
+        // in 64 rounds, and it was never translated again.
+        j.stale_again.retain(|&a, _| a.saturating_add(gex_abi::DISPATCH_PAGE) <= start || a >= end);
         xlate_add(5, 1);
         for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
             if page >= gex_abi::DISPATCH_MAX_PAGES {
