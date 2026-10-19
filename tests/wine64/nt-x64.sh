@@ -25,6 +25,11 @@
 # page's ?mem64=1) with the wasm32 server in a 32-bit memory beside it;
 # highdata then allocates 5 GiB (`highdata mem64`). Not natively: a gexc
 # run's processes share one flavour (OPTIMIZATION-BACKLOG.md).
+# TWIN=1 (PAGE=mp) runs them per program instead (docs/mem64.md §5): the
+# default 32-bit page and a W64_TWIN=1 install, each case's loader exec'd by
+# a launcher with GEX_MEM64=1, which runs the install's memory64 twin
+# (wine.m64) in a 64-bit memory; the server, and the launcher, stay 32-bit.
+# highdata allocates 5 GiB as under MEM64=1.
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
@@ -63,6 +68,9 @@ door=0; [ "${DOOR:-0}" = 1 ] && door=1
 single=; [ "${PAGE:-}" = sp ] && single=1
 m64=; [ "${MEM64:-0}" = 1 ] && m64=1
 [ -z "$m64" ] || [ "${PAGE:-}" = mp ] || { echo "MEM64=1 runs in the page: PAGE=mp" >&2; exit 2; }
+twin=; [ "${TWIN:-0}" = 1 ] && twin=1
+[ -z "$twin" ] || { [ "${PAGE:-}" = mp ] && [ -z "$m64" ]; } || { echo "TWIN=1 runs in the default page: PAGE=mp, no MEM64" >&2; exit 2; }
+[ -z "$twin" ] || [ -f "$dist/lib/wine/x86_64-unix/wine.m64" ] || { echo "no wine.m64 in $dist: a W64_TWIN=1 install" >&2; exit 2; }
 w=${WORK:-$(mktemp -d)}
 mkdir -p "$w"
 tag=W64${m64:+ mem64}
@@ -83,7 +91,14 @@ if [ -n "$page" ]; then
 	"$root/tools/wine-wasm/page-prefix.sh" "$prefix" "$dist" "$w/page-pfx" > "$w/page-pfx.log" 2>&1 ||
 		{ echo "FAIL page prefix template"; tail -5 "$w/page-pfx.log"; exit 1; }
 	prefix=$w/page-pfx
-	tag="W64 page $page${m64:+ mem64}"
+	tag="W64 page $page${m64:+ mem64}${twin:+ twin}"
+	if [ -n "$twin" ]; then
+		# the launcher: the loader exec'd with GEX_MEM64=1 (the kernel takes
+		# it out again), so the twin runs in a 64-bit memory
+		printf '%s\n' '#include <stdlib.h>' '#include <unistd.h>' \
+			'int main(int c, char **v) { (void)c; setenv("GEX_MEM64", "1", 1); execv(v[1], v + 1); return 127; }' > "$w/launch.c"
+		zig cc -target x86_64-linux-musl -O1 -static -o "$w/launch" "$w/launch.c" || { echo "FAIL the twin's launcher (zig)"; exit 1; }
+	fi
 	# the door off in the single-thread build (it has none: the pipes)
 	[ "$page" = sp ] && door=0
 fi
@@ -142,13 +157,15 @@ check() {
 	fi
 	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
 	if [ -n "$page" ]; then
+		# the loader as the process, or exec'd by the twin's launcher
+		local run=(--argv0 /w64/lib/wine/x86_64-unix/wine "$seed" "$wine")
+		[ -z "$twin" ] || run=(--file /launch="$w/launch" --argv0 /launch "$seed" "$w/launch" /w64/lib/wine/x86_64-unix/wine)
 		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
 			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
 			--env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
-			--cwd /pfx/drive_c --argv0 /w64/lib/wine/x86_64-unix/wine \
-			"$seed" "$wine" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
+			--cwd /pfx/drive_c "${run[@]}" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
 	else
 	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${gl[@]}" "${wl[@]}" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
@@ -240,8 +257,8 @@ fi
 # memory's page: there the shim's heap is the upper 2 GiB of the process's
 # memory, and the guest gets just under 2 GiB (GUEST_LIMIT 0x7fff0000;
 # about 1975 MiB allocates). In the memory64 page (MEM64=1) 5 GiB, code
-# anywhere (`highdata mem64`).
-if [ -n "$m64" ]; then
+# anywhere (`highdata mem64`). So per program (TWIN=1).
+if [ -n "$m64$twin" ]; then
 	if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
 		check highdata 0 "$allok" "$w/highdata.exe" mem64
 	else
@@ -270,6 +287,13 @@ if [ -n "${NATIVE:-}" ]; then
 		fail=$((fail + 1)); echo "FAIL x64/stalebind ($tag): x86_64-w64-mingw32-gcc"
 	fi
 fi
+# TWIN=1: the 64-bit program's own child (CreateProcess, which Wine execs
+# from its loader, so wine.m64) is a 32-bit process again, run by `wine`:
+# highdata's 5 GiB, which its parent could have, fail in it.
+if [ -n "$twin" ] && [ -f "$w/highdata.exe" ]; then
+	EXTRA="$w/highdata.exe" check childtwin 4 "([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4" childcon.exe "highdata.exe mem64"
+fi
+
 # W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
 # called from x64 code through every kind of Win64 entry adapter, and
 # calling back (tests/wasm64/dll)

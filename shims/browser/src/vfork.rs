@@ -369,6 +369,41 @@ pub(crate) fn exec_target(h: &Host, path: &str) -> bool {
     }
 }
 
+/// An exec of the caller's own command line (its arguments after the
+/// first, the same) keeps the caller's memory flavour unless the exec asks
+/// otherwise (docs/mem64.md §5): it is the same program started again, as
+/// W64's first Wine process starts the program it was given as a process
+/// of its own. Any other child is the page's flavour unless it asks.
+pub(crate) fn exec_relaunch(h: &mut Host, argv: &[String]) {
+    if h.kernel.exec_mem64.is_none() && page_flavours() & 3 != 0 && argv.len() > 1 && argv.get(1..) == h.kernel.argv.get(1..) {
+        h.kernel.exec_mem64 = Some(gex_abi::mem64());
+    }
+}
+
+/// The program an exec of `path` runs instead (docs/mem64.md §5): of a
+/// program and its memory64 twin `<path>.m64` side by side, the one of the
+/// memory the exec wants (`exec_mem64`, else the page's). W64's loader in a
+/// twin dist (w64-dist.sh W64_TWIN=1) is the case: an exec of `wine` that
+/// asked for a 64-bit memory runs `wine.m64`, and the 64-bit Wine's own
+/// children, which Wine starts from its loader (`/proc/self/exe`, so
+/// `wine.m64`), go back to `wine` unless they ask too.
+pub(crate) fn exec_route(h: &Host, path: &str) -> Option<String> {
+    let page = page_flavours();
+    if page & 3 == 0 {
+        return None;
+    }
+    let want = h.kernel.exec_mem64.unwrap_or(page & 1 != 0);
+    let (other, need) = match path.strip_suffix(".m64") {
+        Some(base) if !want => (base.to_string(), false),
+        None if want => (format!("{path}.m64"), true),
+        _ => return None,
+    };
+    if exec_memory_of(h, path) != Need::Is(!need) {
+        return None;
+    }
+    (exec_memory_of(h, &other) == Need::Is(need)).then_some(other)
+}
+
 /// Whether this process's exec of `path` goes on in another Worker: its
 /// program's memory flavour ([`exec_target`]) is not this Worker's (lib.rs
 /// `exec_away`).

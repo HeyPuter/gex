@@ -7653,6 +7653,16 @@ fn syscall_entry(ctx: i32, pc: i64) {
         if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
             stderr_capture(&gm, a0, nr == 66, a1, a2, ret);
         }
+        // An exec that asked for a 64-bit memory of a program that has a
+        // memory64 twin beside it (`<path>.m64`, W64's loader in a twin dist):
+        // the twin runs (vfork.rs `exec_route`, docs/mem64.md §5).
+        let outcome = match outcome {
+            SyscallOutcome::Exec { path, argv, envp } => {
+                vfork::exec_relaunch(h, &argv);
+                SyscallOutcome::Exec { path: vfork::exec_route(h, &path).unwrap_or(path), argv, envp }
+            }
+            o => o,
+        };
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
