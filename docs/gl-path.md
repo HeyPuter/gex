@@ -40,21 +40,23 @@ push** (rebased onto upstream wink 0dd84167; nothing pushed):
   web/build-mesa-wasm.sh on emdawnwebgpu v20250822 (wink/build.sh fetches it).
 
 **Open items:**
-1. *Device limits leave black silhouettes.* With the adapter's limits
-   (e204fa1b's web/src/gpu-device.js and mesa-wgpu-replay.html) the context
-   is GL 4.6, but Muck's 3D scene is black with a cyan sea (U mp26, and mp28
-   with the -0.0 fix: 0 Tint rejections, 30 presents/s against 47 at GL 4.0).
-   This is not rejected programs. Suspect Unity's 4.x lighting/shadow
-   variants (compute or image paths that only 4.3+ enables).
-   Resume:
-   - capture a GL 4.6 Muck trace (`?glcapture=`);
-   - replay it with `replay-run.mjs gpu TRACE --query readback=1`;
-   - bisect the shader variants with `shaders.mjs`;
-   - then re-apply e204fa1b's two web files.
+1. *Device limits left black silhouettes* -- fixed (G2, 2026-10-19, mesa
+   g2/msvo-unformatted). The trigger was GL 4.3, not the limits as such:
+   with `?gllimits=43` and MESA_GL_VERSION_OVERRIDE=4.2 Muck renders, at
+   4.3 and 4.4 it is black. At 4.3 Unity enables PostProcessing's
+   MultiScaleVO, a compute AO pass whose RWTexture2D<float> outputs have no
+   format qualifier and are bound to r16f and r8 textures. gex_wgpu declined
+   those dispatches ("declared no format to store through"), so AO stayed 0
+   and multiplied every lit surface to black. Such an image is now served
+   through the packed-buffer path in that dispatch's variant (dyn_packed).
+   `tests/gl43-msvo-probe-page.sh` covers the shapes (17/21 before, 21/21
+   after, edger). Muck at gllimits=43 (context level 4.5) now renders its
+   menu correctly at 22.7-24.1 presents/s, against 32.6 at 4.2 (g2mf43
+   vs g2mv42, edger), so the AO pass costs about a quarter of the frame rate.
 2. *Grass:* fixed at GL 4.2 by GL 4.1's texture limits with mesa-wink
    60202246 (U mpg3: blades, 36.6-38.1 presents/s). gex's pin is 60202246
    and `?gllimits=41` is the default since U's pin commit on merge/unity
-   (`?gllimits=0` turns it off; 43 stays per run, item 1).
+   (`?gllimits=0` turns it off; 43 stays per run).
 3. *Noita's world fps* is bound by its job hand-off, not by GL: the main
    thread is parked about 37% waiting on job threads, and KLock is 0.14%
    (stream F's area). The page's GL submit is no longer the limit
