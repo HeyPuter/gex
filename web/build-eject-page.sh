@@ -3,7 +3,8 @@
 # library (web/src/app.js) built with vite into DIR as app.mjs, its chunks
 # under assets/, and beside it under gex/ the x86 shared-memory shim, kernel
 # and seed, Mesa (the wgpu replay, web/build-mesa-wasm.sh) for programs with
-# OpenGL, and under vendor/ the zstd decoder. The page is the user's
+# OpenGL, the X server (web/build-xwayland-wasm.sh) for X11 programs, and
+# under vendor/ the zstd decoder. The page is the user's
 # (user/index.html imports app.mjs); there is no nt.html, and the build
 # fails if anything in DIR names it.
 #
@@ -39,6 +40,14 @@ done
 for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
     if [ -f "$WEB/public/gex/$f" ]; then cp "$WEB/public/gex/$f" "$OUT/gex/$f"
     else echo "build-eject-page: no web/public/gex/$f (web/build-mesa-wasm.sh): the build has no OpenGL" >&2; fi
+done
+# The X server for X11 programs (runtime.js: gex/xwayland/, and
+# gex/xwayland-st/ in the single-thread build; web/build-xwayland-wasm.sh).
+# Without it an X11 program stops at "x11 not available".
+for d in xwayland xwayland-st; do
+    rm -rf "$OUT/gex/$d"
+    if [ -f "$WEB/public/gex/$d/Xwayland.mjs" ]; then cp -R "$WEB/public/gex/$d" "$OUT/gex/$d"
+    elif [ "$d" = xwayland ]; then echo "build-eject-page: no web/public/gex/$d (web/build-xwayland-wasm.sh): the build runs no X11 programs" >&2; fi
 done
 # Mesa's cold part, when the build split one off (docs/mesa-wasm-size.md).
 rm -f "$OUT/gex/gex-wgpu-replay.deferred.wasm"
