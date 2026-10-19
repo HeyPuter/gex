@@ -343,10 +343,11 @@ let kernelSpec = null;
  * a session with one thing missing from it, and the reason was in a console
  * message rather than anywhere a person would look.
  *
- * The guest is told nothing: its `/dev/gex-gl` still exists and its ring is
- * still there, so a GL client blocks on a device that never answers rather
- * than failing at `eglInitialize`. That is the same shape as a machine whose
- * GPU has fallen over, and better than pretending the session is broken.
+ * The guest's `/dev/gex-gl` still exists and its ring is still there; the
+ * ring is marked as having no device (gl-bridge.mjs `failGlChannel`), so a
+ * GL client's request fails at once rather than at its timeout. That is the
+ * same shape as a machine whose GPU has fallen over, and better than
+ * pretending the session is broken.
  */
 async function startHostGl(compositor, glChannel, opts, term) {
   try {
@@ -361,6 +362,7 @@ async function startHostGl(compositor, glChannel, opts, term) {
     term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
     term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
+    if (glChannel?.control) (await import('@gex/gl-bridge.mjs')).failGlChannel(glChannel);
     return null;
   }
 }
