@@ -25,22 +25,47 @@ mod wait;
 /// memory but has its own `__stack_pointer`, all initialised to the same
 /// address by wasm-ld -- so without a distinct slice each, two Workers here at
 /// once overwrite each other's locals. Each gets a slice and points its stack
-/// pointer at the top. In `.bss`, so it costs address space until written.
+/// pointer at the top.
 pub const STACK_BYTES: u32 = 256 * 1024;
-/// Bounds Workers running *at once* (a slice is handed back when one ends).
-/// `.bss` counts towards the module's declared initial memory, so each slice is
-/// memory a host must provide before the kernel links. 32 was too few once
-/// threads existed.
-pub const STACK_COUNT: u32 = 128;
-static mut STACKS: [u8; (STACK_BYTES * STACK_COUNT) as usize] =
-    [0; (STACK_BYTES * STACK_COUNT) as usize];
+/// Bounds Workers running *at once* (a slice is handed back when one ends),
+/// in every process of the page together. 32 was too few once threads
+/// existed, and 128 once the Win7 shell opened its Games folder ("the global
+/// kernel has 128 stacks and this is Worker 129"); the slices are no longer
+/// in `.bss` (memory every host had to provide before the kernel linked) but
+/// taken from the heap on first use: a reservation of address space in the
+/// kernel's memory (256 MiB of its 4 GiB), whose pages only a stack that
+/// reaches them ever touches. Wait slots follow (`wait::SLOTS`).
+pub const STACK_COUNT: u32 = 1024;
+
+/// The stacks' area, 0 until [`k_stack_area`] first takes it.
+static STACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Where the stacks start, and how big each is. Asked by the first Worker (the
 /// only one that safely can); the host then assigns every later Worker a slice.
+/// The first ask takes the area (two at once: one keeps it, the other gives
+/// its copy back), with no lock but the allocator's own.
 #[no_mangle]
 pub extern "C" fn k_stack_area() -> u32 {
-    // SAFETY: an address, not a read.
-    unsafe { core::ptr::addr_of!(STACKS) as u32 }
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let at = STACKS.load(Acquire);
+    if at != 0 {
+        return at;
+    }
+    let layout = std::alloc::Layout::from_size_align((STACK_BYTES * STACK_COUNT) as usize, 16).expect("stack area layout");
+    // Not zeroed: a stack needs no zeros, and zeroing would touch every page.
+    // SAFETY: a nonzero size.
+    let p = unsafe { std::alloc::alloc(layout) };
+    if p.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    match STACKS.compare_exchange(0, p as u32, AcqRel, Acquire) {
+        Ok(_) => p as u32,
+        Err(won) => {
+            // SAFETY: ours, never handed out.
+            unsafe { std::alloc::dealloc(p, layout) };
+            won
+        }
+    }
 }
 
 #[no_mangle]
