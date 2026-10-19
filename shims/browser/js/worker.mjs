@@ -333,6 +333,13 @@ async function handle(msg) {
     workerGex?.addSharedModule(msg.key, msg.mod);
     return;
   }
+  // A sibling's dead modules (`Gex#reapDead`), or the page's units the host
+  // let go of: dropped here as well.
+  if (msg?.kind === 'droppedModules') {
+    workerGex?.dropSharedModules(msg.keys);
+    for (const k of msg.keys ?? []) pooled.delete(k);
+    return;
+  }
   if (msg?.kind === 'pooledModules') {
     for (const [key, mod] of msg.entries ?? []) pooled.set(key, mod);
     return;
@@ -520,6 +527,11 @@ async function handle(msg) {
     // reference -- no byte copy. See `Gex#sharedModules`.
     shareModule(key, mod) {
       port.post({ kind: 'compiledModule', key, mod });
+    }
+    // Modules of this process no dispatch reaches any more (`Gex#reapDead`):
+    // the host forgets them too, or its relay keeps their code alive.
+    dropModules(keys) {
+      port.post({ kind: 'droppedModules', keys });
     }
     // The wineserver published its door (docs/wineserver-kernel.md): up to
     // the host, which hands it to every Worker of the session.

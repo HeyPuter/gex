@@ -244,6 +244,25 @@ pub(crate) fn missing(pc: u64) -> bool {
     TRIED.with(|t| t.replace((pc, d)) != (pc, d))
 }
 
+/// The slot map of the table `entry` names, if there is one (never made here).
+fn existing_map(entry: u32) -> Option<u64> {
+    let k = gex_abi::dispatch_entry_table(entry);
+    if !on() || !dense::table(k) {
+        return None;
+    }
+    let m = word(dense::MAPS + 4 * (k - dense::FIRST_TABLE) as u64).load(Ordering::Acquire);
+    (m != 0).then_some(m as u64)
+}
+
+/// A retired page's slots (its directory entry `entry`) name nothing.
+pub(crate) fn clear_page(entry: u32) {
+    let Some(m) = existing_map(entry) else { return };
+    let base = gex_abi::dispatch_entry_base(entry) as u64;
+    for slot in base..(base + gex_abi::SLOTS_PER_PAGE).min(dense::MAP_SLOTS) {
+        word(m + 4 * slot).store(0, Ordering::Release);
+    }
+}
+
 /// Allocate `n` indices outside any module (bridges into the function table).
 pub(crate) fn alloc(n: u32) -> u32 {
     let w = word(NEXT);

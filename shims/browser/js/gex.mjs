@@ -988,6 +988,8 @@ export class Gex {
    * idle Workers in the page: ~2.2 s of KLock each over a 13 s run).
    */
   #netWait(e, snap) {
+    // A waiting thread installs nothing, so it lets go of dead modules here.
+    this.#reapDead();
     const ms = e.gex_wait_bound_ms ? e.gex_wait_bound_ms(50) : 1;
     const waits = [new Promise((r) => { this.#netWake = r; })];
     const word = e.gex_wait_word?.() >>> 0;
@@ -3673,6 +3675,7 @@ export class Gex {
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
       if (mod && key) {
         this.#sharedModules.set(key, mod);
+        this.#deadKeys.delete(key);
         this.#env.shareModule?.(key, mod);
       }
       n++;
@@ -3688,8 +3691,18 @@ export class Gex {
    * by registry index so this Worker's `#catchUp` reuses it instead of
    * recompiling the same bytes. See `#sharedModules`.
    */
+  /** A sibling Worker's dead modules (`#reapDead` there, relayed by the
+   *  host): this Worker lets go of them too, so their code can go. */
+  dropSharedModules(keys) {
+    for (const k of keys ?? []) {
+      if (typeof k !== 'string') continue;
+      this.#sharedModules.delete(k);
+      this.#deadKeys.add(k);
+    }
+  }
+
   addSharedModule(key, mod) {
-    if (typeof key === 'string' && mod instanceof WebAssembly.Module && !this.#sharedModules.has(key)) {
+    if (typeof key === 'string' && mod instanceof WebAssembly.Module && !this.#sharedModules.has(key) && !this.#deadKeys.has(key)) {
       this.#sharedModules.set(key, mod);
     }
   }
@@ -7243,6 +7256,7 @@ export class Gex {
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
+        this.#deadKeys.delete(key);
         this.#env.shareModule?.(key, mod);
       }
     }
@@ -7281,6 +7295,7 @@ export class Gex {
     const mod = this.#compiled[this.#compiled.length - 1]?.mod;
     if (!mod) return;
     this.#sharedModules.set(ukey, mod);
+    this.#deadKeys.delete(ukey);
     this.#env.shareModule?.(ukey, mod);
   }
 
@@ -7301,6 +7316,7 @@ export class Gex {
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
       if (mod && key) {
         this.#sharedModules.set(key, mod);
+        this.#deadKeys.delete(key);
         this.#env.shareModule?.(key, mod);
       }
     }
@@ -7369,6 +7385,7 @@ export class Gex {
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
+        this.#deadKeys.delete(key);
         this.#env.shareModule?.(key, mod);
       }
     }
@@ -7415,6 +7432,7 @@ export class Gex {
   async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
+    this.#reapDead();
     const tg = performance.now();
     const tables = this.#growTables(need, 'install');
     this.#growMs += performance.now() - tg;
@@ -8053,11 +8071,59 @@ export class Gex {
     const mod = this.#compiled[this.#compiled.length - 1]?.mod;
     if (mod && key) {
       this.#sharedModules.set(key, mod);
+      this.#deadKeys.delete(key);
       this.#env.shareModule?.(key, mod);
     }
   }
 
   #denseCatchUps = 0;
+
+  /** Dead modules of the process (`gex_dense_dead_*`) this Worker has let go of. */
+  #deadSeen = 0;
+  /** Their content keys, so a sibling's relay does not bring one back. */
+  #deadKeys = new Set();
+
+  /** Runtime modules of this process no dispatch can reach any more (all
+   *  their pages retired: an unloaded image's, FL Studio's plugin scan loads
+   *  and unloads dozens), let go of here: their `blocks` entries back to the
+   *  miss stub, which kept each one's instance (and with it its code) alive in
+   *  every Worker, and this Worker's own references dropped, so V8 frees them.
+   *  Cheap when nothing died: one call. */
+  #reapDead() {
+    const e = this.#shim.exports;
+    if (!this.#dense || !e.gex_dense_dead_len) return;
+    const n = e.gex_dense_dead_len() >>> 0;
+    // A new program (execve) numbers its dead from 0 again.
+    if (n < this.#deadSeen) this.#deadSeen = 0;
+    if (n <= this.#deadSeen) return;
+    const b = this.#guest?.exports?.blocks;
+    const stub = b?.get(0);
+    const dead = new Set();
+    for (; this.#deadSeen < n; this.#deadSeen++) {
+      const base = e.gex_dense_dead_at(this.#deadSeen, 0) >>> 0;
+      const count = e.gex_dense_dead_at(this.#deadSeen, 1) >>> 0;
+      dead.add(base);
+      if (b) for (let i = base, end = Math.min(base + count, b.length); i < end; i++) b.set(i, stub);
+    }
+    const mods = new Set();
+    this.#compiled = this.#compiled.filter((c) => {
+      const ds = c.dense;
+      if (!ds || ds.byteLength < 4) return true;
+      const base = new DataView(ds.buffer, ds.byteOffset, ds.byteLength).getUint32(0, true);
+      if (!dead.has(base)) return true;
+      mods.add(c.mod);
+      return false;
+    });
+    if (!mods.size) return;
+    const keys = [];
+    for (const [k, m] of this.#sharedModules) {
+      if (mods.has(m)) {
+        this.#sharedModules.delete(k);
+        if (typeof k === 'string') { keys.push(k); this.#deadKeys.add(k); }
+      }
+    }
+    if (keys.length) this.#env.dropModules?.(keys);
+  }
 
   /** Whether dispatch table `t` is dense here (gex_emit::dense::FIRST_TABLE
    *  and up): its slots are the process's slot maps, never this table. */
