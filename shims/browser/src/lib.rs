@@ -14219,9 +14219,14 @@ thread_local! {
     /// The pcs warned about already.
     static LIVE_SAID: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
-    /// How the miss path last dealt with a miss, per pc, for the warning:
-    /// (pc, way, how many times running).
+    /// How the miss path last dealt with a miss, for the warning: (pc,
+    /// way, how many times running), and per pc in this window (way, times
+    /// that way running). The warning is made at the way in, before this
+    /// miss is dealt with, so it reads the pc's own entry: the last miss
+    /// overall is another pc's whenever the guest goes round several.
     static MISS_WAY: std::cell::Cell<(u64, u8, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+    static MISS_WAY_AT: std::cell::RefCell<std::collections::HashMap<u64, (u8, u32)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// The ways out of `gex_dispatch_miss`, for the livelock warning.
@@ -14241,6 +14246,11 @@ fn miss_way(pc: u64, way: u8) {
         let (p, w, n) = c.get();
         c.set((pc, way, if p == pc && w == way { n.saturating_add(1) } else { 1 }));
     });
+    MISS_WAY_AT.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(pc).or_insert((way, 0));
+        *e = if e.0 == way { (way, e.1.saturating_add(1)) } else { (way, 1) };
+    });
 }
 
 fn livelock_note(pc: u64) {
@@ -14250,6 +14260,7 @@ fn livelock_note(pc: u64) {
         if w.0 > LIVELOCK_WINDOW {
             w.0 = 1;
             w.1.clear();
+            MISS_WAY_AT.with(|m| m.borrow_mut().clear());
         }
         let n = w.1.entry(pc).or_insert(0);
         *n += 1;
@@ -14259,8 +14270,11 @@ fn livelock_note(pc: u64) {
         return;
     }
     LIVELOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (wpc, way, wn) = MISS_WAY.with(|c| c.get());
-    let way = if wpc == pc { format!("{} ({wn} times running)", MISS_WAYS.get(way as usize).unwrap_or(&"?")) } else { format!("last miss here was not dealt with; the last one was at {wpc:#x}") };
+    let (wpc, _, _) = MISS_WAY.with(|c| c.get());
+    let way = match MISS_WAY_AT.with(|m| m.borrow().get(&pc).copied()) {
+        Some((w, n)) => format!("{} ({n} times running here; the last miss was at {wpc:#x})", MISS_WAYS.get(w as usize).unwrap_or(&"?")),
+        None => format!("no way out recorded here in this window (the last miss was at {wpc:#x})"),
+    };
     let mut pages = Vec::new();
     for page in [gex_abi::dispatch_page(pc), gex_abi::dispatch_page(pc) + 1] {
         let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(u32::MAX);
