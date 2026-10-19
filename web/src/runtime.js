@@ -1136,7 +1136,7 @@ async function runProgramHere(
       // Pid 1 has copied `files` into the kernel's filesystem.
       else if (m.kind === 'files-loaded') onFilesLoaded?.();
       // Where `/dev/dsp`'s output is: played from the first gesture on.
-      else if (m.kind === 'audio') startAudio(m);
+      else if (m.kind === 'audio') startAudio({ ...m, clock: flag('audioclock') !== '0' });
     },
   });
 

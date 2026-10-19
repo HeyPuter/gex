@@ -18,16 +18,22 @@
 //
 // Latency, measured: each report (`__gexAudio.last`) has `backlog` (ms of
 // frames in the ring when a quantum starts: avg, min, max over the report),
-// and the context's own `base` and `output` latencies (ms).
+// and the context's own `base` and `output` latencies (ms). `?audioclock=0`
+// leaves the device on the wall clock, as it was, to compare.
 
 const WORKLET = `
-const LOW = 0.01, HIGH = 0.3, BACK = 0.08;
+let LOW = 0.01;
+const HIGH = 0.3, BACK = 0.08;
 class GexDsp extends AudioWorkletProcessor {
   constructor() {
     super();
     this.words = null;
     this.port.onmessage = (e) => {
-      const { buffer, at } = e.data;
+      const { buffer, at, clock } = e.data;
+      // ?audioclock=0: not the device's clock (it keeps the wall clock), and
+      // the larger start the drift needs: as before, for measuring.
+      this.clock = clock !== false;
+      if (!this.clock) LOW = 0.04;
       this.words = new Uint32Array(buffer, at, 8);
       this.cap = this.words[3];
       this.frames = new Float32Array(buffer, at + 32, this.cap * 2);
@@ -42,7 +48,7 @@ class GexDsp extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const L = outputs[0][0], R = outputs[0][1] ?? L, n = L.length;
     if (!this.words) return true;
-    Atomics.add(this.words, 7, 1);
+    if (this.clock) Atomics.add(this.words, 7, 1);
     const w = Atomics.load(this.words, 1);
     const rate = this.words[2] || sampleRate;
     const gen = Atomics.load(this.words, 5);
@@ -89,7 +95,7 @@ let started = false;
 
 /** Play the ring at `at` in the global kernel's `memory` (a shared
  *  WebAssembly.Memory). Once per page; later calls do nothing. */
-export function startAudio({ memory, at }) {
+export function startAudio({ memory, at, clock = true }) {
   if (started || !at || !memory || typeof AudioContext !== 'function' || typeof AudioWorkletNode !== 'function') return;
   if (typeof SharedArrayBuffer !== 'function' || !(memory.buffer instanceof SharedArrayBuffer)) return;
   started = true;
@@ -113,7 +119,7 @@ export function startAudio({ memory, at }) {
       info.history.push(e.data);
       if (info.history.length > 64) info.history.shift();
     };
-    node.port.postMessage({ buffer: memory.buffer, at });
+    node.port.postMessage({ buffer: memory.buffer, at, clock });
     node.connect(ctx.destination);
     info.node = node;
   }).catch((err) => console.warn('[gex] audio: the player did not start:', err?.message ?? err));
