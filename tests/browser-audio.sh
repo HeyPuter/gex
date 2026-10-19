@@ -8,6 +8,12 @@
 # (rate 48000, four generations: two owners, two rates) and its newest
 # quarter second is the 882 Hz tone at half amplitude (RMS 0.354).
 #
+# tests/audio/dsp-pace.c writes a second of audio as fast as the device
+# takes it, under run-node's stand-in player (GEX_AUDIO_PLAYER) at four
+# times and at half the real rate: the device must pace its writer to the
+# player, not the wall clock (the 186 ms buffer aside, about 0.2 s and
+# 1.6 s; by the wall clock both would take about 0.8 s).
+#
 #   tests/browser-audio.sh
 #
 # Needs gcc and the page's x86-64 shared build (`GEX_ARCH=x86 GEX_MEM64=1
@@ -45,3 +51,19 @@ else
     head -5 "$WORK/out" "$WORK/err"
     exit 1
 fi
+pace="$WORK/dsp-pace"
+gcc -O1 -static -o "$pace" tests/audio/dsp-pace.c || exit 1
+for speed in 4 0.5; do
+    env GEX_ARCH=x86 GEX_MEM64=$m64 GEX_SHARED=1 GEX_AUDIO_PLAYER=$speed timeout 120 node $jspi shims/browser/js/run-node.mjs "$SEED" "$pace" \
+        </dev/null >"$WORK/pace-$speed" 2>"$WORK/pace-$speed.err"
+    st=$?
+    ms=$(sed -n 's/^dsp-pace ms //p' "$WORK/pace-$speed")
+    case $speed in 4) lo=0; hi=600 ;; *) lo=1200; hi=100000 ;; esac
+    if [ $st = 0 ] && [ -n "$ms" ] && [ "$ms" -ge $lo ] && [ "$ms" -lt $hi ]; then
+        echo "ok   dsp-pace (page, player at ${speed}x): a second of audio taken in $ms ms"
+    else
+        echo "FAIL dsp-pace (page, player at ${speed}x): exit $st, ${ms:-no} ms (want $lo-$hi)"
+        head -5 "$WORK/pace-$speed" "$WORK/pace-$speed.err"
+        exit 1
+    fi
+done

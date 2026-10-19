@@ -1,21 +1,27 @@
 // /dev/dsp's output in the page: the global kernel's audio ring
 // (shims/kernel/src/audio.rs) played by an AudioWorklet.
 //
-// The kernel's OSS device is the clock (it drains by the wall clock whether
-// or not anything plays), so nothing here paces the guest: the worklet reads
-// what was written, resampled from the stream's rate to the context's, and
-// plays silence when the ring runs dry. It keeps its own read position and
-// never writes the ring: a reader that falls behind by more than the ring
-// (a background tab) skips to the newest frames, and one that is far ahead
-// of what it needs drops back to a short latency.
+// The worklet is the clock while it plays: it publishes its read position
+// (word 6) and a heartbeat (word 7) each render quantum, and the kernel's
+// OSS device counts what it has not read yet as queued, so the guest writes
+// at the audio hardware's pace. It reads what was written, resampled from
+// the stream's rate to the context's, and plays silence when the ring runs
+// dry. When it stops (no gesture yet, a background tab) the device goes
+// back to the wall clock; a reader that then falls behind by more than the
+// ring skips to the newest frames, and one far behind what it needs drops
+// back to a short latency.
 //
 // Browsers start an AudioContext suspended until the page has a user
 // gesture: the first pointer or key event anywhere resumes it.
 //
 // The single-thread (no SharedArrayBuffer) build plays nothing yet.
+//
+// Latency, measured: each report (`__gexAudio.last`) has `backlog` (ms of
+// frames in the ring when a quantum starts: avg, min, max over the report),
+// and the context's own `base` and `output` latencies (ms).
 
 const WORKLET = `
-const LOW = 0.04, HIGH = 0.3, BACK = 0.08;
+const LOW = 0.01, HIGH = 0.3, BACK = 0.08;
 class GexDsp extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -29,10 +35,14 @@ class GexDsp extends AudioWorkletProcessor {
     };
     this.fr = 0; this.gen = -1; this.waiting = true;
     this.played = 0; this.under = 0; this.sumsq = 0; this.n = 0; this.cross = 0; this.last = 0; this.tick = 0;
+    // The ring's backlog when a quantum starts (frames written and not yet
+    // played): the software part of the output latency, measured.
+    this.bsum = 0; this.bmin = Infinity; this.bmax = 0; this.bn = 0;
   }
   process(_inputs, outputs) {
     const L = outputs[0][0], R = outputs[0][1] ?? L, n = L.length;
     if (!this.words) return true;
+    Atomics.add(this.words, 7, 1);
     const w = Atomics.load(this.words, 1);
     const rate = this.words[2] || sampleRate;
     const gen = Atomics.load(this.words, 5);
@@ -42,8 +52,10 @@ class GexDsp extends AudioWorkletProcessor {
     if (avail > this.cap) { this.ri = (w - Math.floor(BACK * rate)) >>> 0; avail = (w - this.ri) >>> 0; }
     // Far behind the writer: back to a short latency.
     if (avail > HIGH * rate) { this.ri = (w - Math.floor(BACK * rate)) >>> 0; avail = (w - this.ri) >>> 0; this.fr = 0; }
-    if (this.waiting && avail < LOW * rate) { L.fill(0); R.fill(0); return true; }
+    if (this.waiting && avail < LOW * rate) { Atomics.store(this.words, 6, this.ri); L.fill(0); R.fill(0); return true; }
     this.waiting = false;
+    const ms = avail * 1000 / rate;
+    this.bsum += ms; this.bn++; if (ms < this.bmin) this.bmin = ms; if (ms > this.bmax) this.bmax = ms;
     const step = rate / sampleRate, f = this.frames, cap = this.cap;
     for (let i = 0; i < n; i++) {
       if (((w - this.ri) >>> 0) < 2) {
@@ -58,11 +70,14 @@ class GexDsp extends AudioWorkletProcessor {
       this.fr += step;
       while (this.fr >= 1) { this.fr -= 1; this.ri = (this.ri + 1) >>> 0; }
     }
+    Atomics.store(this.words, 6, this.ri);
     this.played += n;
     // About twice a second: what was played, for the page's checks.
     if (++this.tick % 200 === 0 && this.n) {
-      this.port.postMessage({ rms: Math.sqrt(this.sumsq / this.n), hz: this.cross / 2 / (this.n / sampleRate), frames: this.n, underruns: this.under, rate, played: this.played });
+      const backlog = this.bn ? { avg: +(this.bsum / this.bn).toFixed(1), min: +this.bmin.toFixed(1), max: +this.bmax.toFixed(1) } : null;
+      this.port.postMessage({ rms: Math.sqrt(this.sumsq / this.n), hz: this.cross / 2 / (this.n / sampleRate), frames: this.n, underruns: this.under, rate, played: this.played, backlog });
       this.sumsq = 0; this.n = 0; this.cross = 0;
+      this.bsum = 0; this.bmin = Infinity; this.bmax = 0; this.bn = 0;
     }
     return true;
   }
@@ -91,6 +106,9 @@ export function startAudio({ memory, at }) {
     URL.revokeObjectURL(url);
     const node = new AudioWorkletNode(ctx, 'gex-dsp', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
     node.port.onmessage = (e) => {
+      // The browser's part of the latency, as it reports it (s -> ms).
+      e.data.base = +(1000 * (ctx.baseLatency ?? 0)).toFixed(1);
+      e.data.output = +(1000 * (ctx.outputLatency ?? 0)).toFixed(1);
       info.last = e.data;
       info.history.push(e.data);
       if (info.history.length > 64) info.history.shift();

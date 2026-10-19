@@ -7,7 +7,10 @@
 //! with the wall clock, so a program that paces itself by the device (as
 //! mmdevapi's clients do, by the padding it reports) runs at the right
 //! speed. No capture. A device that plays (the browser's WebAudio, the
-//! host's) replaces the drain, not the interface.
+//! host's) replaces the drain, not the interface: while a player is taking
+//! this stream's frames ([`set_audio_pending`]), what is queued is what it
+//! has not played yet, so writers pace to the player's clock (the audio
+//! hardware's) and the two clocks never drift apart.
 //!
 //! The requests are Linux's OSSv4 numbers (`_IOR`/`_IOWR` of Linux's
 //! `sys/ioctl.h`), and the structs `oss_sysinfo` (1248 bytes),
@@ -73,6 +76,10 @@ struct Stream {
     /// When `queued` was last brought up to date, in nanoseconds of the
     /// host's clock (`tmpfs::now_ns`: the browser has no `std::time`).
     at: u64,
+    /// The open's number ([`OssHandle`]'s), for the player.
+    id: u32,
+    /// Whether the player paced the last drain.
+    played_by_player: bool,
 }
 
 impl Stream {
@@ -84,9 +91,18 @@ impl Stream {
         self.rate as u64 * self.frame_bytes()
     }
 
-    /// Play what the time since the last look has played.
+    /// Play what the player has played since the last look, or (no player
+    /// taking this stream's frames) what the time since then has.
     fn drain(&mut self) {
         let now = super::tmpfs::now_ns();
+        if let Some(pending) = AUDIO_PENDING.get().and_then(|f| f(self.id, (now / 1_000_000) as u32)) {
+            // Only ever less: what was written and is not played yet.
+            self.queued = self.queued.min(pending as u64 * self.frame_bytes());
+            self.at = now;
+            self.played_by_player = true;
+            return;
+        }
+        self.played_by_player = false;
         let ns = now.saturating_sub(self.at);
         let played = (ns as u128 * self.bytes_per_second() as u128 / 1_000_000_000) as u64;
         if played > 0 || self.queued == 0 {
@@ -150,6 +166,23 @@ pub fn set_audio_out(f: AudioOut) {
     let _ = AUDIO_OUT.set(f);
 }
 
+/// The player's clock: `(stream, ms)` -> the frames of `stream` written to
+/// the player and not played yet, or `None` when the player is not taking
+/// that stream's frames now (another stream has it, or it has not played
+/// for a while: no gesture yet, a background tab). `ms` the device's clock.
+pub type AudioPending = fn(u32, u32) -> Option<u32>;
+
+static AUDIO_PENDING: std::sync::OnceLock<AudioPending> = std::sync::OnceLock::new();
+
+/// Set the player's clock (once; later calls are ignored).
+pub fn set_audio_pending(f: AudioPending) {
+    let _ = AUDIO_PENDING.set(f);
+}
+
+/// How often a writer waiting on a full buffer the player drains looks
+/// again: one render quantum of the page's AudioWorklet (128 frames).
+const PLAYER_QUANTUM_FRAMES: u64 = 128;
+
 /// Each open `/dev/dsp`'s number, for the player to tell streams apart.
 static NEXT_STREAM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -166,8 +199,14 @@ impl OssHandle {
         OssHandle {
             node,
             id: NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: super::tmpfs::now_ns() }),
+            stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: super::tmpfs::now_ns(), id: 0, played_by_player: false }),
         }
+        .numbered()
+    }
+
+    fn numbered(self) -> OssHandle {
+        self.stream.lock().unwrap_or_else(|e| e.into_inner()).id = self.id;
+        self
     }
 }
 
@@ -281,6 +320,10 @@ impl FileHandle for OssHandle {
         if s.queued < BUFSIZE {
             // Room now: a writer is ready, and a reader never is.
             return None;
+        }
+        if s.played_by_player {
+            // The player takes a quantum at a time.
+            return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
         }
         let bps = s.bytes_per_second().max(1);
         Some((1_000_000_000 / bps).max(1))
@@ -449,6 +492,42 @@ mod tests {
         // 6 bytes of room: one 4-byte frame of the 8 offered, then none.
         assert_eq!(h.write_at(0, &[0u8; 8]).unwrap(), 4);
         assert_eq!(h.write_at(0, &[0u8; 8]), Err(Errno::EAGAIN));
+    }
+
+    /// The test player: what it has not played, by stream (absent: not
+    /// taking that stream). Other tests' streams stay on the clock.
+    static PLAYER: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+    fn test_player(stream: u32, _ms: u32) -> Option<u32> {
+        PLAYER.lock().unwrap().iter().find(|e| e.0 == stream).map(|e| e.1)
+    }
+
+    #[test]
+    fn a_player_taking_the_stream_is_its_clock() {
+        set_audio_pending(test_player);
+        let h = OssHandle::new(OssNode::Dsp);
+        {
+            let mut s = h.stream.lock().unwrap();
+            s.format = AFMT_S16_LE;
+            s.rate = 48000;
+            s.channels = 2;
+        }
+        // Full, and the player has played none of it: however long that
+        // takes, no room, and a waiter looks again in a quantum (128
+        // frames at 48 kHz, 2.67 ms), not a byte's time.
+        PLAYER.lock().unwrap().push((h.id, (BUFSIZE / 4) as u32));
+        assert_eq!(h.write_at(0, &vec![0u8; 100_000]).unwrap(), BUFSIZE);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
+        assert_eq!(h.ready_in_ns(), Some(128 * 1_000_000_000 / 48000));
+        // It played 100 frames: 400 bytes of room, exactly.
+        PLAYER.lock().unwrap()[0].1 = (BUFSIZE / 4) as u32 - 100;
+        assert_eq!(h.write_at(0, &vec![0u8; 1000]).unwrap(), 400);
+        // It lets the stream go (another took the device, or it stopped):
+        // back on the clock, which drains it.
+        PLAYER.lock().unwrap().clear();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
     }
 
     #[test]

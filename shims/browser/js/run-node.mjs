@@ -572,6 +572,29 @@ function audioTap() {
   process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)}\n`);
 }
 
+// GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that
+// plays the ring at SPEED times its rate (1: real time), publishing its read
+// position and heartbeat as the worklet does, so the OSS device paces its
+// writers to it (tests/browser-audio.sh's dsp-pace).
+if (process.env.GEX_AUDIO_PLAYER) {
+  const speed = Number(process.env.GEX_AUDIO_PLAYER) || 1;
+  let t = performance.now(), acc = 0, gen = -1;
+  setInterval(() => {
+    const now = performance.now(), dt = now - t;
+    t = now;
+    if (!audioRing) return;
+    const words = new Uint32Array(audioRing.memory.buffer, audioRing.at, 8);
+    const w = Atomics.load(words, 1), g = Atomics.load(words, 5);
+    if (g !== gen) { gen = g; Atomics.store(words, 6, w); acc = 0; }
+    acc += dt / 1000 * (words[2] || 44100) * speed;
+    const k = Math.floor(acc);
+    acc -= k;
+    const r = Atomics.load(words, 6);
+    Atomics.store(words, 6, ((w - r) >>> 0) < k ? w : (r + k) >>> 0);
+    Atomics.add(words, 7, 1);
+  }, 2).unref();
+}
+
 let status;
 // GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
 // process (every Worker) in `rss`, this isolate's wasm memories in

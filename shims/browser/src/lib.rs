@@ -461,6 +461,7 @@ extern "C" {
     fn k_pipe_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_audio_write(stream: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32, now_ms: u32) -> i32;
     fn k_audio_ring() -> u32;
+    fn k_audio_pending(stream: u32, now_ms: u32) -> i32;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
@@ -1112,6 +1113,12 @@ fn audio_out(stream: u32, pcm: &[u8], format: u32, rate: u32, channels: u32, ms:
     unsafe { k_audio_write(stream, pcm.as_ptr() as usize as gex_kernel::PAddr, pcm.len() as u32, format, rate, channels, ms) };
 }
 
+/// The player's clock for `/dev/dsp` (`gex_kernel::vfs::oss::AudioPending`).
+fn audio_pending(stream: u32, ms: u32) -> Option<u32> {
+    let stream = (my_pid() as u32).wrapping_shl(16).wrapping_add(stream & 0xffff);
+    u32::try_from(unsafe { k_audio_pending(stream, ms) }).ok()
+}
+
 /// Where the audio ring is in the global kernel's memory (0 with none), for
 /// the page's player (web/src/audio.js).
 #[no_mangle]
@@ -1128,6 +1135,7 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         return None;
     }
     gex_kernel::vfs::oss::set_audio_out(audio_out);
+    gex_kernel::vfs::oss::set_audio_pending(audio_pending);
     Some(gex_kernel::pipe::Remote {
         queue: rp_queue,
         new: rp_new,
