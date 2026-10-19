@@ -687,6 +687,11 @@ async function runProgramHere(
     // (handed to `onSystem`) is called -- a desktop whose first windows
     // draw no GL does not download it.
     glLazy = false,
+    // Where the page compositor's Mesa comes from (DomDesktop only): `(name)
+    // => Promise<Uint8Array|null>` for 'gex-wgpu-replay.js', '.wasm' and
+    // '.deferred.wasm', null for "fetch it as a file". app.js answers from
+    // the site's packed files and the page's cache (mesa-gl.js `source`).
+    glSource = null,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -810,7 +815,7 @@ async function runProgramHere(
       // The GL goes onto the window's own canvas here rather than into a
       // scene: see `DomDesktop.hostGl`.
       if (gl === 'compositor' && glChannel) {
-        const opts = { api: 'core', backend: glBackend };
+        const opts = { api: 'core', backend: glBackend, source: glSource };
         startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
         if (!glLazy) await startGl();
         else startGlOnFirstRequest();

@@ -366,6 +366,7 @@ export class DomDesktop {
     const { MesaGlDevice } = await import('./mesa-gl.js');
     const device = await MesaGlDevice.create(canvas, {
       url: opts.url,
+      source: opts.source,
       api: opts.api || 'core',
       // This canvas is composited by the page, so keep what was presented
       // into it: a client that draws slower than the page composites would

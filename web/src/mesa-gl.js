@@ -65,6 +65,67 @@ async function loadGlue(url) {
   }
 }
 
+/**
+ * Mesa from the caller's `source` (`(name) => Promise<Uint8Array|null>`, the
+ * eject page's packed files and its Cache Storage, app.js `mesaSource`)
+ * instead of three plain fetches: the glue, the module and its cold part
+ * (web/gex-wgpu-split.js), each fetched once and compressed.
+ *
+ * The glue is imported from a blob with `import.meta.url` written as its real
+ * URL, so it finds its files as if imported from there, and its pthread
+ * Workers start from the same blob (`mainScriptUrlOrBlob`) rather than each
+ * fetching it again. The module and its cold part are instantiated here, the
+ * cold part over the module's table at once, which is what the split's own
+ * hook does on a page's main thread; nothing is left for a miss.
+ *
+ * Null when the source has no glue: Mesa is then loaded as files.
+ */
+async function loadFromSource(url, source) {
+  const href = new URL(url, location.href).href;
+  const base = href.split('/').pop().replace(/\.js$/, '');
+  const got = (name) => Promise.resolve().then(() => source(name)).catch((e) => {
+    console.warn(`[mesa-gl] ${name}: ${e?.message ?? e}; fetched as a file`);
+    return null;
+  });
+  const [js, main, cold] = await Promise.all([`${base}.js`, `${base}.wasm`, `${base}.deferred.wasm`].map(got));
+  if (!js) return null;
+  const text = new TextDecoder().decode(js).replaceAll('import.meta.url', JSON.stringify(href));
+  const blob = new Blob([text], { type: 'text/javascript' });
+  const at = URL.createObjectURL(blob);
+  let factory;
+  try {
+    factory = (await import(/* @vite-ignore */ at)).default;
+  } finally {
+    URL.revokeObjectURL(at);
+  }
+  const extra = { mainScriptUrlOrBlob: blob };
+  // A failed instantiation fails the device rather than leaving the glue's
+  // promise pending for ever.
+  let fail;
+  const failed = new Promise((_, reject) => { fail = reject; });
+  if (main) {
+    const module = await WebAssembly.compile(main);
+    const split = WebAssembly.Module.imports(module).some((i) => i.module === 'gexcold');
+    // A split module without its cold part is left to the glue, which
+    // fetches the part itself.
+    if (!split || cold) {
+      const coldModule = split ? await WebAssembly.compile(cold) : null;
+      extra.gexNoColdPrefetch = true;
+      extra.instantiateWasm = (imports, done) => {
+        const load = () => { throw new Error("Mesa's cold part was not instantiated with the module"); };
+        const all = new Proxy(imports, { get: (t, ns) => (ns === 'gexcold' ? { load } : t[ns]) });
+        (async () => {
+          const instance = await WebAssembly.instantiate(module, all);
+          if (coldModule) await WebAssembly.instantiate(coldModule, { primary: instance.exports });
+          done(instance, module);
+        })().catch((e) => fail(new Error(`instantiating Mesa failed: ${e?.message ?? e}`)));
+        return {};
+      };
+    }
+  }
+  return { factory, extra, failed };
+}
+
 /** The driver's WebGPU calls by name: [calls, ms inside, bytes, ms waited]
  *  ("waited" is a promise's time to settle: mapAsync, onSubmittedWorkDone).
  *  `glState` reports them per frame since it was last asked. Only when asked
@@ -286,8 +347,10 @@ export class MesaGlDevice {
         out.#validation.note(event.error?.message || String(event.error));
       });
 
-      const Module = await loadGlue(url);
-      out.#module = await Module({
+      const t0 = performance.now();
+      const fromSource = options.source ? await loadFromSource(url, options.source) : null;
+      const Module = fromSource?.factory ?? await loadGlue(url);
+      const made = Module({
         preinitializedWebGPUDevice: device,
         // Where the glue really lives, for the blob fallback above: Emscripten
         // starts its pthread workers from this rather than `import.meta.url`.
@@ -296,7 +359,10 @@ export class MesaGlDevice {
         // Mesa's stdout is its chatter; its stderr (below) stays.
         print: (line) => logOn('debug') && console.log('[mesa-gl]', line),
         printErr: quietReports((line) => console.warn('[mesa-gl]', line)),
+        ...fromSource?.extra,
       });
+      out.#module = await (fromSource ? Promise.race([made, fromSource.failed]) : made);
+      console.warn(`[mesa-gl] Mesa loaded${fromSource ? ' from the page\'s files' : ''} in ${Math.round(performance.now() - t0)} ms`);
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
