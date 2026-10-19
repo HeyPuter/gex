@@ -2973,6 +2973,10 @@ fn mount_filesystems(
         "/proc",
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(proc_state)))),
     );
+    // The processors `gex_kernel::cpus` reports, over the host's own sysfs
+    // (whose count `GEX_CPUS` may differ from), as glibc's get_nprocs and
+    // Wine's topology read them.
+    kernel.vfs.mount("/sys/devices/system/cpu", Arc::new(gex_kernel::vfs::SysCpuFs));
     if opts.sysroot.is_some() {
         // A sysroot has no host /tmp behind it, so give the guest one.
         kernel.vfs.mount("/tmp", Arc::new(TmpFs::new()));

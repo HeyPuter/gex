@@ -209,8 +209,8 @@ impl ProcFs {
             )
             .as_bytes()
             .to_vec(),
-            "cpuinfo" if gex_abi::X86 => crate::x86::CPUINFO.as_bytes().to_vec(),
-            "cpuinfo" => concat!(
+            "cpuinfo" if gex_abi::X86 => crate::cpus::proc_cpuinfo(crate::x86::CPUINFO).into_bytes(),
+            "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(
                 "processor\t: 0\n",
                 "BogoMIPS\t: 100.00\n",
                 "Features\t: fp asimd atomics cpuid\n",
@@ -219,20 +219,14 @@ impl ProcFs {
                 "CPU variant\t: 0x0\n",
                 "CPU part\t: 0xd08\n",
                 "CPU revision\t: 3\n\n",
-            )
-            .as_bytes()
-            .to_vec(),
+            ))
+            .into_bytes(),
             "version" => b"Linux version 6.1.0-gex (gex@puter) #1 SMP\n".to_vec(),
             "uptime" => b"1000.00 1000.00\n".to_vec(),
-            // One CPU (as sched_getaffinity says), idle, booted at a fixed
-            // time. Boehm's GC counts the cpu lines to size its markers.
-            "stat" => concat!(
-                "cpu  0 0 0 100000 0 0 0 0 0 0\n",
-                "cpu0 0 0 0 100000 0 0 0 0 0 0\n",
-                "intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
-            )
-            .as_bytes()
-            .to_vec(),
+            // One cpu line per processor (`crate::cpus`), all idle, booted at a
+            // fixed time. Boehm's GC counts the cpu lines to size its markers,
+            // and glibc's get_nprocs falls back to them when there is no sysfs.
+            "stat" => crate::cpus::proc_stat().into_bytes(),
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
@@ -542,5 +536,132 @@ mod tests {
         assert_eq!(&buf, b"0040");
         f.read_at(4, &mut buf).unwrap();
         assert_eq!(&buf, b"0000");
+    }
+}
+
+/// `/sys/devices/system/cpu`, for the processors `crate::cpus` reports: the
+/// `online`, `possible` and `present` lists, and each `cpuN/topology` as one
+/// package where every processor is a core of its own. glibc's `get_nprocs`
+/// reads `online` first. Wine's `GetLogicalProcessorInformation` needs
+/// `online` and reads the topology (it is `STATUS_NOT_IMPLEMENTED` without
+/// them), and engines size their thread pools from that.
+pub struct SysCpuFs;
+
+impl SysCpuFs {
+    fn list(n: u32) -> String {
+        if n == 1 { "0\n".into() } else { format!("0-{}\n", n - 1) }
+    }
+
+    /// The processor a `cpuN...` path names, and what follows it.
+    fn cpu(path: &str) -> Option<(u32, &str)> {
+        let rest = path.strip_prefix("cpu")?;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let i: u32 = rest[..end].parse().ok()?;
+        (i < crate::cpus::count()).then_some((i, &rest[end..]))
+    }
+
+    fn generate(path: &str) -> Option<Vec<u8>> {
+        let n = crate::cpus::count();
+        if matches!(path, "online" | "possible" | "present") {
+            return Some(Self::list(n).into_bytes());
+        }
+        let (i, rest) = Self::cpu(path)?;
+        let all = crate::cpus::mask();
+        Some(
+            match rest {
+                "/online" => "1\n".to_string(),
+                "/topology/physical_package_id" | "/topology/die_id" => "0\n".to_string(),
+                "/topology/core_id" | "/topology/cluster_id" => format!("{i}\n"),
+                "/topology/thread_siblings" | "/topology/core_cpus" => format!("{:x}\n", 1u64 << i),
+                "/topology/thread_siblings_list" | "/topology/core_cpus_list" => format!("{i}\n"),
+                "/topology/core_siblings" | "/topology/package_cpus" => format!("{all:x}\n"),
+                "/topology/core_siblings_list" | "/topology/package_cpus_list" => Self::list(n),
+                _ => return None,
+            }
+            .into_bytes(),
+        )
+    }
+
+    fn dir(path: &str) -> Option<Vec<(String, FileType)>> {
+        let f = |names: &[&str]| names.iter().map(|s| (s.to_string(), FileType::Regular)).collect::<Vec<_>>();
+        if path.is_empty() {
+            let mut v = f(&["online", "possible", "present"]);
+            for i in 0..crate::cpus::count() {
+                v.push((format!("cpu{i}"), FileType::Directory));
+            }
+            return Some(v);
+        }
+        match Self::cpu(path)?.1 {
+            "" => Some(vec![("online".into(), FileType::Regular), ("topology".into(), FileType::Directory)]),
+            "/topology" => Some(f(&[
+                "physical_package_id", "die_id", "core_id", "cluster_id", "thread_siblings",
+                "thread_siblings_list", "core_cpus", "core_cpus_list", "core_siblings",
+                "core_siblings_list", "package_cpus", "package_cpus_list",
+            ])),
+            _ => None,
+        }
+    }
+}
+
+impl FileSystem for SysCpuFs {
+    fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        let path = path.trim_matches('/');
+        if let Some(data) = Self::generate(path) {
+            if super::writes(flags) {
+                return Err(Errno::EACCES);
+            }
+            return Ok(Arc::new(Generated { data }));
+        }
+        let names = Self::dir(path).ok_or(Errno::ENOENT)?;
+        if super::writes(flags) {
+            return Err(Errno::EISDIR);
+        }
+        let mut entries = base_entries();
+        entries.extend(names.into_iter().map(|(name, file_type)| DirEntry { name, file_type, ino: 1 }));
+        Ok(Arc::new(GenDir { entries }))
+    }
+
+    fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
+        let path = path.trim_matches('/');
+        if Self::generate(path).is_some() {
+            return Ok(Metadata {
+                file_type: FileType::Regular,
+                size: 4096,
+                mode: 0o444,
+                ino: 1,
+                mtime: 0,
+                nlink: 1,
+                rdev: 0,
+                times: Default::default(),
+            });
+        }
+        Self::dir(path).map(|_| Metadata::dir()).ok_or(Errno::ENOENT)
+    }
+}
+
+#[cfg(test)]
+mod syscpu_tests {
+    use super::*;
+
+    fn read(p: &str) -> String {
+        let h = SysCpuFs.open(p, 0, 0).unwrap();
+        let mut b = vec![0u8; 256];
+        let n = h.read_at(0, &mut b).unwrap() as usize;
+        String::from_utf8(b[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn lists_and_topology_follow_the_count() {
+        let _g = crate::cpus::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::cpus::set(4);
+        assert_eq!(read("online"), "0-3\n");
+        assert_eq!(read("/present"), "0-3\n");
+        assert_eq!(read("cpu2/topology/thread_siblings"), "4\n");
+        assert_eq!(read("cpu2/topology/thread_siblings_list"), "2\n");
+        assert_eq!(read("cpu3/topology/core_siblings"), "f\n");
+        assert_eq!(read("cpu0/topology/physical_package_id"), "0\n");
+        assert!(SysCpuFs.metadata("cpu3/topology").is_ok());
+        assert_eq!(SysCpuFs.metadata("cpu4").unwrap_err(), Errno::ENOENT);
+        assert!(SysCpuFs.open("cpu9/topology/core_id", 0, 0).is_err());
     }
 }
