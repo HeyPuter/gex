@@ -1152,6 +1152,9 @@ pub struct FdIo<'a> {
     pub file_locks: &'a Arc<unix::FileLocks>,
     /// The global kernel's pipes, when there is one (`Kernel::pipes`).
     pub pipes: Option<crate::pipe::Remote>,
+    /// The process's shared file mappings, which its reads and writes of a
+    /// mapped file keep up with (`Mm::shared_maps`).
+    pub shared: Option<&'a SharedMapView>,
 }
 
 impl FdIo<'_> {
@@ -1511,8 +1514,17 @@ impl FdIo<'_> {
     }
 
     /// `ftruncate`.
-    pub fn ftruncate(&self, fd: i32, len: u64) -> SysResult {
-        self.fds.get(fd).and_then(|f| f.handle.truncate(len).map(|_| 0))
+    pub fn ftruncate(&self, m: &mut GuestMem<'_>, fd: i32, len: u64) -> SysResult {
+        let f = self.fds.get(fd)?;
+        f.handle.truncate(len)?;
+        // A shared mapping's bytes past the new end are no longer the file's:
+        // zero, as the file now reads there once it grows again.
+        if any_shared(self.shared) {
+            for (at, _, k) in shared_spans(self.shared, &f, len, u64::MAX - len) {
+                let _ = m.zero(at, k as usize);
+            }
+        }
+        Ok(0)
     }
 
     /// `fadvise64(fd, offset, len, advice)`: [`crate::vfs::FileHandle::advise`]
@@ -2242,12 +2254,12 @@ impl FdIo<'_> {
     fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         let fds = self.fds;
         Some(match n {
-            nr::READ => io_read(fds, m, a[0] as i32, a[1], a[2]),
-            nr::WRITE => io_write(fds, m, a[0] as i32, a[1], a[2]),
-            nr::READV => io_readv(fds, m, a[0] as i32, a[1], a[2], self.compat),
-            nr::WRITEV => io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat),
-            nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3]),
-            nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3]),
+            nr::READ => io_read(fds, m, a[0] as i32, a[1], a[2], self.shared),
+            nr::WRITE => io_write(fds, m, a[0] as i32, a[1], a[2], self.shared),
+            nr::READV => io_readv(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared),
+            nr::WRITEV => io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared),
+            nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
+            nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
             nr::CLOSE => self.close(a[0] as i32),
             nr::CLOSE_RANGE => self.close_range(a[0], a[1], a[2]),
@@ -3589,6 +3601,14 @@ impl MapIo<'_> {
             }
             nr::MMAP => self.mmap(m, a),
             nr::MUNMAP => {
+                // An alias's unmap: another mapping still holds the pages;
+                // the last holder's unmaps all of them.
+                let mut a = a;
+                match self.mem.lock().log.shared_maps.unalias(a[0], crate::mem::page_align_up(a[1])) {
+                    Unalias::Keep => return Some(Ok(0)),
+                    Unalias::Whole(s, l) => (a[0], a[1]) = (s, l),
+                    Unalias::Plain => {}
+                }
                 let flushed = self.flush_shared(m, a[0], a[1]);
                 self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
                 self.retire_code_why(a[0], a[1], "munmap", 0);
@@ -3751,16 +3771,31 @@ impl MapIo<'_> {
             // A second `MAP_SHARED` of the same open file must see the first
             // one's writes, so hand back the same pages -- a Wayland client
             // maps a buffer and sends the descriptor, and the next mapper must
-            // see the same pixels, not a zeroed copy. Not reference counted:
-            // unmapping one alias unmaps both, and nothing here unmaps early.
+            // see the same pixels, not a zeroed copy. Counted (`holders`): an
+            // alias's `munmap` leaves the pages to the mappings still holding
+            // them.
             if flags & crate::mem::flags::SHARED != 0 {
                 // (or any part of one: a window into a mapping another
-                // view holds whole, as win32u maps the session's blocks)
-                let mm = self.mem.lock();
-                if let Some(existing) = mm.log.shared_maps.iter().find(|s| {
-                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
+                // view holds whole, as win32u maps the session's blocks).
+                // Another `open` of the same file too, as Linux's page cache
+                // makes it one set of pages (two sqlite connections to one
+                // database map its `-shm` index each). Counted, so the
+                // first `munmap` leaves the other's pages.
+                let _ = file.ino(); // asked outside the lock (file I/O)
+                let mut mm = self.mem.lock();
+                if let Some(i) = mm.log.shared_maps.iter().position(|s| {
+                    s.file.same_file(&file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
                 }) {
-                    return Ok(existing.start + (offset - existing.offset));
+                    let existing = &mm.log.shared_maps[i];
+                    let at = existing.start + (offset - existing.offset);
+                    // Not for a fixed mapping elsewhere: the caller uses the
+                    // address it named (Wine maps every view into its own
+                    // reserved range), so that one is a mapping of its own,
+                    // read from the file the others are written back to.
+                    if flags & crate::mem::flags::FIXED == 0 || addr == at {
+                        mm.log.shared_maps.alias(i, at, len_aligned);
+                        return Ok(at);
+                    }
                 }
             }
             // The path and offset travel with the mapping. Two processes
@@ -3797,7 +3832,7 @@ impl MapIo<'_> {
                 .log
                 .shared_maps
                 .iter()
-                .filter(|s| Arc::ptr_eq(&s.file, &file) && s.offset < offset + len_aligned && offset < s.offset + s.len)
+                .filter(|s| s.file.same_file(&file) && s.offset < offset + len_aligned && offset < s.offset + s.len)
                 .map(|s| (s.start, s.len))
                 .collect();
             for (at, n) in behind {
@@ -3819,11 +3854,14 @@ impl MapIo<'_> {
                 });
             }
             if flags & crate::mem::flags::SHARED != 0 {
+                let pages = page_hashes(m.read(start, len_aligned as usize)?);
                 self.mem.lock().log.shared_maps.push(SharedMap {
                     start,
                     len: len_aligned,
                     file,
                     offset,
+                    holders: vec![(start, len_aligned)],
+                    pages,
                 });
             }
             return Ok(start);
@@ -3911,6 +3949,16 @@ impl MapIo<'_> {
     }
 
 
+    /// Write every shared mapping back (the changed pages): at `exit` and
+    /// `execve`, where Linux's page cache keeps a mapping's stores for the
+    /// file though nobody called `msync` or `munmap`.
+    pub fn flush_all_shared(&self, m: &GuestMem<'_>) {
+        if self.mem.lock().log.shared_maps.is_empty() {
+            return;
+        }
+        let _ = self.flush_shared(m, 0, u64::MAX);
+    }
+
     /// Write a shared mapping's bytes back to the file behind it.
     pub fn flush_shared(&self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
         let (lo, hi) = (addr, addr.saturating_add(len));
@@ -3923,18 +3971,55 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
+            // A mapping of a descriptor opened read-only has nothing to
+            // write back (Linux refuses it PROT_WRITE): its stores are
+            // the process's own, as Wine's relocations of an image view
+            // are. Writing them was EBADF, and failed the next mmap.
+            if !map.file.writable {
+                continue;
+            }
             let from = map.start.max(lo);
             let to = (map.start + map.len).min(hi);
             // Only what the file holds: a shared mapping's page past the
             // end of the file is not the file's (Linux never extends it).
-            let at = map.offset + (from - map.start);
             let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
-            let n = (to - from).min(size.saturating_sub(at));
-            if n == 0 {
-                continue;
+            let to = to.min(map.start + size.saturating_sub(map.offset));
+            // Only the pages that changed since the file last had them, in
+            // runs: another process's writes to the other pages stand.
+            const P: u64 = crate::mem::PAGE_SIZE;
+            let mut run: Option<u64> = None;
+            let mut page = (from - map.start) / P;
+            loop {
+                let ps = (map.start + page * P).max(from);
+                let changed = ps < to && {
+                    let pe = (map.start + (page + 1) * P).min(to);
+                    let whole = map.start + page * P;
+                    let h = page_hash(m.read(whole, (P as usize).min((map.start + map.len - whole) as usize))?);
+                    let slot = map.pages.get(page as usize);
+                    let was = slot.map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+                    // A partial range writes back only its part, so the page's
+                    // hash is the file's only when the whole page went.
+                    if was != Some(h) && ps == whole && pe == (whole + P).min(map.start + map.len) {
+                        if let Some(s) = slot {
+                            s.store(h, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    was != Some(h)
+                };
+                match (changed, run) {
+                    (true, None) => run = Some(ps),
+                    (false, Some(rs)) => {
+                        let at = map.offset + (rs - map.start);
+                        map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
+                        run = None;
+                    }
+                    _ => {}
+                }
+                if ps >= to {
+                    break;
+                }
+                page += 1;
             }
-            let bytes = m.read(from, n as usize)?;
-            map.file.pwrite(at, bytes)?;
         }
         Ok(())
     }
@@ -5925,7 +6010,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         }
     } else if is_lifecycle_end(n) {
         match n {
-            nr::EXIT_GROUP => return FreeOutcome::Exit((a[0] & 0xff) as i32),
+            nr::EXIT_GROUP => {
+                f.map.flush_all_shared(m);
+                return FreeOutcome::Exit((a[0] & 0xff) as i32);
+            }
             nr::EXIT if one_of_several(f.live) => {
                 let tid = f.futex.tid as i32;
                 let end = ThreadEnd { thread: f.signals.thread(), threads: f.threads, thread_fs: f.thread_fs, futexes: f.futex.table, procs: f.procs };
@@ -5933,7 +6021,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
                 return FreeOutcome::ThreadExit;
             }
             // The last thread's `exit` is the process's.
-            nr::EXIT => return FreeOutcome::Exit((a[0] & 0xff) as i32),
+            nr::EXIT => {
+                f.map.flush_all_shared(m);
+                return FreeOutcome::Exit((a[0] & 0xff) as i32);
+            }
             nr::WAIT4 => return FreeOutcome::Blocking(wait_child(f.procs, f.pid, a), None),
             _ => match reboot_halts(a[2]) {
                 Some(_) => {
@@ -5995,7 +6086,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         match n {
             nr::EPOLL_CTL => f.io.epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::PIPE2 => f.io.pipe2(m, a[0], a[1]),
-            nr::FTRUNCATE => f.io.ftruncate(a[0] as i32, a[1]),
+            nr::FTRUNCATE => f.io.ftruncate(m, a[0] as i32, a[1]),
             nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
             nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
             // As the kernel's arms: nice 0, and a change taken and ignored.
@@ -6461,16 +6552,74 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
 // they need the descriptor table and nothing else of the kernel, so the full
 // call and any caller holding only the table run the same code.
 
-fn io_write(fds: &FdTable, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+// -- coherence with shared file mappings (scratch/KC/map-shared.md, A) -------
+//
+// A `MAP_SHARED` mapping is an eager copy of the file, written back at
+// `msync` and `munmap`. Within the process the two must still agree: a
+// `read` of a mapped range returns what the mapping holds (its stores not yet
+// written back), and a `write` lands in the mapping as well as the file.
+// One empty-list test when the process has no shared mappings.
+
+/// The process's shared mappings over `[off, off + n)` of `file`: for each,
+/// the guest address of its first byte there, where that is in the range,
+/// and how long.
+fn shared_spans(shared: Option<&SharedMapView>, file: &OpenFile, off: u64, n: u64) -> Vec<(u64, u64, u64)> {
+    let Some(view) = shared else { return Vec::new() };
+    if n == 0 || file.handle.is_stream() {
+        return Vec::new();
+    }
+    let maps = view.get();
+    let mut out = Vec::new();
+    let end = off.saturating_add(n);
+    for s in maps.iter().filter(|s| s.file.same_file(file)) {
+        let (lo, hi) = (off.max(s.offset), end.min(s.offset + s.len));
+        if lo < hi {
+            out.push((s.start + (lo - s.offset), lo - off, hi - lo));
+        }
+    }
+    out
+}
+
+/// After a read of `n` bytes at `off` into `buf`: the mapped parts as the
+/// mappings hold them.
+fn shared_after_read(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, off: u64, buf: u64, n: u64) {
+    for (at, r, k) in shared_spans(shared, file, off, n) {
+        let _ = m.copy_within(at, buf + r, k as usize);
+    }
+}
+
+/// After a write of `n` bytes at `off` from `buf`: the same bytes in the
+/// mappings.
+fn shared_after_write(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, off: u64, buf: u64, n: u64) {
+    for (at, r, k) in shared_spans(shared, file, off, n) {
+        let _ = m.copy_within(buf + r, at, k as usize);
+    }
+}
+
+/// Whether `shared` has any mapping (the fast path's one test).
+fn any_shared(shared: Option<&SharedMapView>) -> bool {
+    shared.is_some_and(|v| !v.get().is_empty())
+}
+
+fn io_write(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, shared: Option<&SharedMapView>) -> SysResult {
     // Straight out of the guest's memory: a guest address is already a
     // linear-memory offset, so the bytes are a slice and a copy would be
     // pure overhead.
     let data = m.read(buf, len as usize)?;
     let file = fds.get(fd)?;
-    file.write(data)
+    if !any_shared(shared) || file.handle.is_stream() {
+        return file.write(data);
+    }
+    let (n, off) = {
+        let _pos = file.pos_lock();
+        let n = file.write_here(data)?;
+        (n, file.offset() - n)
+    };
+    shared_after_write(shared, m, &file, off, buf, n);
+    Ok(n)
 }
 
-fn io_read(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+fn io_read(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, shared: Option<&SharedMapView>) -> SysResult {
     // Straight into the guest's memory, no intermediate buffer: the guest
     // picks the length and a copy would allocate that much on every call.
     // Capped as Linux caps it (MAX_RW_COUNT): a regular file gives every
@@ -6478,23 +6627,39 @@ fn io_read(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> 
     // image's sections with one pread each; a 16 MiB cap left the rest of
     // a 24 MiB .text zero).
     let len = rw_len(m, buf, len);
+    let file = fds.get(fd)?;
     let dst = m.read_mut(buf, len)?;
-    fds.get(fd)?.read(dst)
+    if !any_shared(shared) || file.handle.is_stream() {
+        return file.read(dst);
+    }
+    let (n, off) = {
+        let _pos = file.pos_lock();
+        let n = file.read_here(dst)?;
+        (n, file.offset() - n)
+    };
+    shared_after_read(shared, m, &file, off, buf, n);
+    Ok(n)
 }
 
-fn io_pread(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+fn io_pread(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64, shared: Option<&SharedMapView>) -> SysResult {
     // As `io_read`: the guest's buffer is the destination already.
     let len = rw_len(m, buf, len);
+    let file = fds.get(fd)?;
     let dst = m.read_mut(buf, len)?;
-    fds.get(fd)?.pread(off, dst)
+    let n = file.pread(off, dst)?;
+    shared_after_read(shared, m, &file, off, buf, n);
+    Ok(n)
 }
 
-fn io_pwrite(fds: &FdTable, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+fn io_pwrite(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64, shared: Option<&SharedMapView>) -> SysResult {
     let data = m.read(buf, len as usize)?.to_vec();
-    fds.get(fd)?.pwrite(off, &data)
+    let file = fds.get(fd)?;
+    let n = file.pwrite(off, &data)?;
+    shared_after_write(shared, m, &file, off, buf, n);
+    Ok(n)
 }
 
-fn io_writev(fds: &FdTable, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool) -> SysResult {
+fn io_writev(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool, shared: Option<&SharedMapView>) -> SysResult {
     let vecs = Kernel::read_iovecs(m, iov, count, compat)?;
     let file = fds.get(fd)?;
     // At most PIPE_BUF bytes to a stream go as one write, which a pipe
@@ -6519,7 +6684,12 @@ fn io_writev(fds: &FdTable, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64, com
             Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
         };
         let n = match file.write_here(data) {
-            Ok(n) => n,
+            Ok(n) => {
+                if !file.handle.is_stream() {
+                    shared_after_write(shared, m, &file, file.offset() - n, base, n);
+                }
+                n
+            }
             // A pipe or socket that has filled up answers `EAGAIN`. If
             // earlier vectors were already accepted, the call has
             // succeeded partially and must say so: returning the error
@@ -6569,7 +6739,7 @@ pub fn scatter(m: &mut GuestMem<'_>, vectors: &[(u64, u64)], bytes: &[u8]) -> Re
     Ok(())
 }
 
-fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool) -> SysResult {
+fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, compat: bool, shared: Option<&SharedMapView>) -> SysResult {
     let vecs = Kernel::read_iovecs(m, iov, count, compat)?;
     let file = fds.get(fd)?;
     // A stream is read once for all the vectors and the bytes scattered:
@@ -6606,6 +6776,9 @@ fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, 
             Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
         };
         m.write(base, &tmp[..n as usize])?;
+        if !file.handle.is_stream() {
+            shared_after_read(shared, m, &file, file.offset() - n, base, n);
+        }
         total += n;
         if n < len {
             break;
@@ -7016,6 +7189,46 @@ pub struct SharedMap {
     pub len: u64,
     pub file: Arc<OpenFile>,
     pub offset: u64,
+    /// The `mmap`s handed these pages, as (address, length): a second
+    /// mapping of the same file (the same description, or another `open` of
+    /// it) aliases the first, and its `munmap` only drops it
+    /// ([`SharedMaps::unalias`]); the last one's unmaps them all.
+    pub holders: Vec<(u64, u64)>,
+    /// A hash of each page as the file last had it (read at `mmap`, written
+    /// back since): a write-back writes only the pages that differ, so two
+    /// processes' mappings of one file, each written back whole before,
+    /// stop undoing each other's pages (scratch/KC/map-shared.md, B).
+    pub pages: Arc<[std::sync::atomic::AtomicU64]>,
+}
+
+/// [`SharedMaps::unalias`]'s answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unalias {
+    Keep,
+    Whole(u64, u64),
+    Plain,
+}
+
+/// The hash a [`SharedMap`] keeps of a page.
+pub fn page_hash(bytes: &[u8]) -> u64 {
+    // FNV-style over 8-byte words, then a final mix: fast, and only ever
+    // compared with itself.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x100_0000_01b3);
+    }
+    for &b in words.remainder() {
+        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^ (h >> 33)
+}
+
+/// The page hashes of `bytes`, one per 4 KiB.
+pub fn page_hashes(bytes: &[u8]) -> Arc<[std::sync::atomic::AtomicU64]> {
+    bytes.chunks(crate::mem::PAGE_SIZE as usize).map(|p| std::sync::atomic::AtomicU64::new(page_hash(p))).collect()
 }
 
 /// A process's shared file mappings ([`SharedMap`]), and their published
@@ -7075,6 +7288,79 @@ impl SharedMaps {
     pub fn push(&mut self, map: SharedMap) {
         self.list.push(map);
         self.publish();
+    }
+
+    /// A forked child's list: the same mappings, with their own view and
+    /// their own copy of the page hashes.
+    pub fn fork_copy(&self) -> SharedMaps {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let list: Vec<SharedMap> = self
+            .list
+            .iter()
+            .map(|s| SharedMap { pages: s.pages.iter().map(|h| AtomicU64::new(h.load(Ordering::Relaxed))).collect(), ..s.clone() })
+            .collect();
+        let view = Arc::new(SharedMapView::new(&list));
+        SharedMaps { list, view }
+    }
+
+    /// Mapping `s` as text, all but its file, for a fork's child in another
+    /// memory (the page's Worker) to rebuild with [`SharedMaps::adopt`]:
+    /// `start len offset holders hashes`, holders as `addr:len` and the page
+    /// hashes in hex, each comma-separated.
+    pub fn carry(s: &SharedMap) -> String {
+        let holders: Vec<String> = s.holders.iter().map(|(a, l)| format!("{a}:{l}")).collect();
+        let pages: Vec<String> = s.pages.iter().map(|h| format!("{:x}", h.load(std::sync::atomic::Ordering::Relaxed))).collect();
+        format!("{} {} {} {} {}", s.start, s.len, s.offset, holders.join(","), pages.join(","))
+    }
+
+    /// The other half of [`SharedMaps::carry`]: the mapping `text` names,
+    /// of `file`. `None` for text that is not [`SharedMaps::carry`]'s.
+    pub fn adopt(&mut self, text: &str, file: Arc<OpenFile>) -> Option<()> {
+        let mut p = text.split(' ');
+        let start = p.next()?.parse().ok()?;
+        let len = p.next()?.parse().ok()?;
+        let offset = p.next()?.parse().ok()?;
+        let holders = p
+            .next()?
+            .split(',')
+            .map(|h| {
+                let (a, l) = h.split_once(':')?;
+                Some((a.parse().ok()?, l.parse().ok()?))
+            })
+            .collect::<Option<Vec<(u64, u64)>>>()?;
+        let pages = p
+            .next()?
+            .split(',')
+            .filter(|h| !h.is_empty())
+            .map(|h| u64::from_str_radix(h, 16).ok().map(std::sync::atomic::AtomicU64::new))
+            .collect::<Option<Arc<[std::sync::atomic::AtomicU64]>>>()?;
+        self.push(SharedMap { start, len, file, offset, holders, pages });
+        Some(())
+    }
+
+    /// One more holder of mapping `i`'s pages (an aliasing `mmap` of
+    /// `[at, at + len)`).
+    pub fn alias(&mut self, i: usize, at: u64, len: u64) {
+        self.list[i].holders.push((at, len));
+        self.publish();
+    }
+
+    /// What an `munmap` of `[addr, addr + len)` (page-aligned) is to the
+    /// mappings it names exactly: one holder's of several ([`Unalias::Keep`]:
+    /// nothing to unmap), the last holder's ([`Unalias::Whole`]: unmap the
+    /// whole mapping, which earlier holders' unmaps left), or neither.
+    pub fn unalias(&mut self, addr: u64, len: u64) -> Unalias {
+        let Some(i) = self.list.iter().position(|s| s.holders.contains(&(addr, len))) else {
+            return Unalias::Plain;
+        };
+        let s = &mut self.list[i];
+        if s.holders.len() == 1 {
+            return Unalias::Whole(s.start, s.len);
+        }
+        let h = s.holders.iter().position(|&h| h == (addr, len)).unwrap();
+        s.holders.remove(h);
+        self.publish();
+        Unalias::Keep
     }
 
     /// Keep the mappings `keep` says to; publishes only on a change.
@@ -7912,6 +8198,7 @@ impl Kernel {
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, envp)) => {
+                    self.map_io().flush_all_shared(m);
                     if self.trace {
                         eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());
                     }
@@ -8196,7 +8483,15 @@ impl Kernel {
 
     /// The descriptor half of this kernel ([`FdIo`]).
     pub fn fd_io(&self) -> FdIo<'_> {
-        FdIo { fds: &self.fds, compat: self.compat, ns: &self.vfs, pid: self.pid, file_locks: &self.file_locks, pipes: self.pipes }
+        FdIo {
+            fds: &self.fds,
+            compat: self.compat,
+            ns: &self.vfs,
+            pid: self.pid,
+            file_locks: &self.file_locks,
+            pipes: self.pipes,
+            shared: Some(self.mem.shared_maps()),
+        }
     }
 
     /// The socket calls' part of this kernel ([`NetIo`]).
@@ -8444,7 +8739,10 @@ impl Kernel {
     /// The dispatch table. `Err(code)` means the process is exiting.
     fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
         let r: SysResult = match n {
-            nr::EXIT | nr::EXIT_GROUP => return Err((a[0] & 0xff) as i32),
+            nr::EXIT | nr::EXIT_GROUP => {
+                self.map_io().flush_all_shared(m);
+                return Err((a[0] & 0xff) as i32);
+            }
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
             n if is_quiet(n, self.compat) => quiet_call(&self.fd_io(), &self.procs, m, self.ctx_addr, n, a),
@@ -8480,7 +8778,7 @@ impl Kernel {
             // flock64, x86-64's, wasm32's).
             nr::FCNTL => self.fd_io().fcntl_call(m, a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
-            nr::FTRUNCATE => self.fd_io().ftruncate(a[0] as i32, a[1]),
+            nr::FTRUNCATE => self.fd_io().ftruncate(m, a[0] as i32, a[1]),
             nr::FADVISE64 => self.fd_io().fadvise(a[0] as i32, a[1], a[2], a[3]),
             // `set_tid_address` and `unshare` (L22e).
             n if is_thread_own(n) => {
@@ -8766,12 +9064,12 @@ impl Kernel {
 
     // -- I/O -----------------------------------------------------------------
 
-    fn sys_write(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        io_write(&self.fds, m, fd, buf, len)
+    fn sys_write(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+        io_write(&self.fds, m, fd, buf, len, Some(self.mem.shared_maps()))
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        io_read(&self.fds, m, fd, buf, len)
+        io_read(&self.fds, m, fd, buf, len, Some(self.mem.shared_maps()))
     }
 
     fn sys_pread(
@@ -8782,11 +9080,11 @@ impl Kernel {
         len: u64,
         off: u64,
     ) -> SysResult {
-        io_pread(&self.fds, m, fd, buf, len, off)
+        io_pread(&self.fds, m, fd, buf, len, off, Some(self.mem.shared_maps()))
     }
 
-    fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
-        io_pwrite(&self.fds, m, fd, buf, len, off)
+    fn sys_pwrite(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+        io_pwrite(&self.fds, m, fd, buf, len, off, Some(self.mem.shared_maps()))
     }
 
 
@@ -8817,12 +9115,12 @@ impl Kernel {
         Ok(v)
     }
 
-    fn sys_writev(&mut self, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        io_writev(&self.fds, m, fd, iov, count, self.compat)
+    fn sys_writev(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
+        io_writev(&self.fds, m, fd, iov, count, self.compat, Some(self.mem.shared_maps()))
     }
 
     fn sys_readv(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        io_readv(&self.fds, m, fd, iov, count, self.compat)
+        io_readv(&self.fds, m, fd, iov, count, self.compat, Some(self.mem.shared_maps()))
     }
 
 
@@ -13052,8 +13350,8 @@ mod tests {
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         assert!(view.of(&a).is_none());
-        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0 });
-        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0 });
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]) });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]) });
         let held = view.get();
         assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
         assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));

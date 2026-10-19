@@ -182,12 +182,22 @@ pub struct Mm {
     /// The map's published view, the same one for the map's life (`renew`
     /// keeps it): read without the lock.
     view: std::sync::Arc<MapView>,
+    /// The published list of its shared file mappings
+    /// (`MapLog::shared_maps`), the same for the map's life: what a `read`
+    /// or `write` without the lock looks at to stay coherent with them.
+    shared: std::sync::Arc<crate::syscalls::SharedMapView>,
 }
 
 impl Mm {
     pub fn new(map: MemoryMap) -> Mm {
         let view = std::sync::Arc::clone(map.view());
-        Mm { map: std::sync::Arc::new(crate::sync::Mutex::ranked(map, crate::sync::rank::MM)), view }
+        let shared = std::sync::Arc::clone(map.log.shared_maps.view());
+        Mm { map: std::sync::Arc::new(crate::sync::Mutex::ranked(map, crate::sync::rank::MM)), view, shared }
+    }
+
+    /// The published shared file mappings ([`Mm::shared`]'s too).
+    pub fn shared_maps(&self) -> &std::sync::Arc<crate::syscalls::SharedMapView> {
+        &self.shared
     }
 
     pub fn lock(&self) -> crate::sync::MutexGuard<'_, MemoryMap> {
@@ -196,7 +206,7 @@ impl Mm {
 
     /// The same map, not a copy.
     pub fn shared(&self) -> Mm {
-        Mm { map: std::sync::Arc::clone(&self.map), view: std::sync::Arc::clone(&self.view) }
+        Mm { map: std::sync::Arc::clone(&self.map), view: std::sync::Arc::clone(&self.view), shared: std::sync::Arc::clone(&self.shared) }
     }
 
     /// The map's published view.
@@ -370,7 +380,10 @@ pub struct MapLog {
 
 impl Clone for MapLog {
     fn clone(&self) -> MapLog {
-        MapLog::default()
+        // A fork's copy keeps only its shared file mappings: the child's
+        // stores to them still belong in the file (its own copy of each
+        // page's hash, so each process writes back what it changed).
+        MapLog { shared_maps: self.shared_maps.fork_copy(), ..MapLog::default() }
     }
 }
 

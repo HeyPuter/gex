@@ -49,6 +49,10 @@ pub struct OpenFile {
     /// once each still hold one, and a descriptor table's replaced copies
     /// hold one until their readers move on.
     locks: OnceLock<Arc<crate::unix::FileLocks>>,
+    /// The regular file's inode number, 0 for anything else: with the path,
+    /// which file a description is, so a second `open` of a file finds the
+    /// first one's shared mappings ([`OpenFile::same_file`]). Read once.
+    ino: OnceLock<u64>,
 }
 
 /// An `O_TMPFILE`'s name, and the namespace it was made in.
@@ -119,6 +123,7 @@ impl OpenFile {
             writable,
             unlink_on_close: None,
             locks: OnceLock::new(),
+            ino: OnceLock::new(),
         })
     }
 
@@ -138,6 +143,7 @@ impl OpenFile {
             flags: AtomicU64::new(flags),
             unlink_on_close: Some(TmpName { path: path.clone(), ns }),
             locks: OnceLock::new(),
+            ino: OnceLock::new(),
             path,
             pos: Mutex::new(()),
             dir_pos: AtomicUsize::new(0),
@@ -294,6 +300,27 @@ impl OpenFile {
 
     pub fn metadata(&self) -> Result<Metadata, Errno> {
         self.handle.metadata()
+    }
+
+    /// A regular file's inode number (0 for anything else), asked once.
+    pub fn ino(&self) -> u64 {
+        *self.ino.get_or_init(|| {
+            if self.handle.is_stream() {
+                return 0;
+            }
+            match self.handle.metadata() {
+                Ok(md) if md.file_type == crate::vfs::FileType::Regular => md.ino,
+                _ => 0,
+            }
+        })
+    }
+
+    /// Whether `other` is a description of the same file: the same
+    /// description, or a regular file with the same inode at the same path
+    /// (the device is not known here, so the path stands in for it; a hard
+    /// link under another name is taken as another file).
+    pub fn same_file(&self, other: &OpenFile) -> bool {
+        std::ptr::eq(self, other) || (self.path == other.path && self.ino() != 0 && self.ino() == other.ino())
     }
 
     /// Fill `buf` with `getdents64` records, advancing the cursor.
