@@ -356,6 +356,9 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     if exe.is_dll() {
         return Err(format!("{} is a DLL, not a program", req.exe_path));
     }
+    if exe.subsystem == 1 {
+        return Err(format!("{}: unsupported PE feature: native-subsystem images (drivers)", req.exe_path));
+    }
     let image_dos = dos_path(&p.cfg.prefix, req.exe_path);
     let exe_nt = to_w(&format!("\\??\\{image_dos}"));
     let (exe_base, _) = section::map_image(p, &k.mem, &mut g, &exe, 0, req.exe_path, &exe_nt)

@@ -619,8 +619,11 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     if headers_size as usize > d.len() || headers_size > image_size {
         return Err(PeError::malformed("SizeOfHeaders exceeds the file or the image"));
     }
+    // A native-subsystem image (a driver: Wine's mountmgr.sys, ntoskrnl.exe's
+    // own) parses like any other; it is a program's loader that refuses to
+    // start one (nt/boot.rs). Under W3 Wine's winedevice.exe loads them, and
+    // their units are built and placed from this parse.
     match subsystem {
-        1 => return Err(PeError::unsupported("native-subsystem images (drivers)")),
         10..=13 => return Err(PeError::unsupported(format!("EFI images (subsystem {subsystem})"))),
         _ => {}
     }
