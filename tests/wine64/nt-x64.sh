@@ -198,6 +198,7 @@ check() {
 	if [ -n "$page" ] && grep -aq "mmap() error Out of memory" "$w/$name.err"; then
 		code="$code, $(grep -ac "mmap() error Out of memory" "$w/$name.err") mmap ENOMEM ERR lines"
 	fi
+	printf '%s\n' "$out" > "$w/$name.out"
 	local fr=""
 	# (WL=- : the display without a frame check)
 	[ -z "${WL:-}" ] || [ "$WL" = - ] || fr=$(python3 "$here/frame.py" "$w/$name" "${WL_MIN:-1000}" $WL 2>&1) || code="$code, $fr"
@@ -309,6 +310,23 @@ if x86_64-w64-mingw32-gcc -O1 -o "$w/dllcycle.exe" "$here/dllcycle.c" &&
 else
 	case " ${CASES:-dllcycle} " in *" dllcycle "*)
 		fail=$((fail + 1)); echo "FAIL x64/dllcycle ($tag): x86_64-w64-mingw32-gcc" ;; esac
+fi
+# The ASIO host (asiohost.c): gex audio (ASIO), Wine's dlls/gexasio, its
+# Unix side in the loader (link-w64.sh), registered, created by its class id
+# and run for 10 s of bufferSwitch at 256 frames, the switch count within
+# 10% of 10 s's. In the page with GEX_AUDIO_LOOP=1 (run-node's player and
+# its loopback: ASIO_LOOP=1) the inputs bring an impulse back, timed.
+if ! grep -q gexasio.so "$wine" || [ ! -e "$dist/lib/wine/x86_64-windows/gexasio.dll" ]; then
+	case " ${CASES:-asio} " in *" asio "*)
+		echo "skip x64/asio ($tag): no gexasio in this dist (Wine's dlls/gexasio)" ;; esac
+elif x86_64-w64-mingw32-gcc -O1 -o "$w/asiohost.exe" "$here/asiohost.c" -lole32 -ladvapi32; then
+	rt=; [ -n "$page" ] && [ "${ASIO_LOOP:-0}" = 1 ] && rt="${nl}asio rt frames [0-9 ]+\\([0-9]+\\) ms [0-9.]+"
+	inputs='[02]'
+	# (beside the program: the prefix predates the DLL, and Wine loads a
+	# builtin only through its file in the prefix, as wineboot installs it)
+	EXTRA="$dist/lib/wine/x86_64-windows/gexasio.dll" check asio 0 "asio driver gex audio${nl}asio rate [0-9]+ buffer 256 \\(min 64 max 2048\\) inputs $inputs outputs 2 latency in [0-9]+ out [0-9]+${nl}asio switches [0-9]+ want [0-9]+, position ok, time info steady$rt" "$w/asiohost.exe"
+else
+	fail=$((fail + 1)); echo "FAIL x64/asio ($tag): x86_64-w64-mingw32-gcc"
 fi
 # W64.1b: data above 2 GiB, code below it (highdata.c). Not in a 32-bit
 # memory's page: there the shim's heap is the upper 2 GiB of the process's
