@@ -66,6 +66,8 @@ const PIECES = {
  *   compositor, gl, translation, hostx, mem64
  *              true asks for a runtime piece; an error if the build left it out.
  *              compositor: false draws windows straight into the page.
+ *   glLazy     start Mesa at the first GL request instead of at boot (a W3
+ *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
@@ -342,6 +344,8 @@ async function begin(opts, base, at, state, meter) {
   }
   const compositor = has.compositor && opts.compositor !== false && b.compositor !== false;
   const gl = b.gl && opts.gl !== false;
+  // Mesa started by the first GL request rather than at boot.
+  const glLazy = gl && (opts.glLazy ?? b.glLazy ?? false);
 
   // The runtime's switches: the build's, then the options'. The deep readers
   // (runtime.js, compositor.js, mesa-gl.js) see these, never the page's URL.
@@ -368,7 +372,9 @@ async function begin(opts, base, at, state, meter) {
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
   }
-  if ((compositor || gl) && !navigator.gpu) {
+  // A lazy GL needs WebGPU only once a program asks for it, and fails then
+  // as a GL device that will not start (runtime.js `startHostGl`).
+  if ((compositor || (gl && !glLazy)) && !navigator.gpu) {
     throw new Error('This browser has no WebGPU, which this build draws with. Use a recent desktop Chrome or Edge with hardware acceleration on.');
   }
 
@@ -712,6 +718,7 @@ async function begin(opts, base, at, state, meter) {
     cwd,
     tty: false,
     gl: gl ? 'compositor' : null,
+    glLazy,
     glBackend: b.glBackend ?? 'wgpu',
     wl: desk ?? canvas,
     wlInput: desk ?? canvas,
@@ -852,7 +859,11 @@ function launchBuild(m, at) {
       mtimes: !!m.mtimes,
       featuresOff: m.features_off ?? [],
       aot: p.aot ?? null,
-      gl: false,
+      // Wine's opengl32 reaches Mesa through /dev/gex-gl. Started by the
+      // first process that asks, so a visit whose programs draw no GL does
+      // not download it (`glLazy`).
+      gl: !(m.features_off ?? []).includes('gl'),
+      glLazy: true,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
