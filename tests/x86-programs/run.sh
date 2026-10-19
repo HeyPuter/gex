@@ -175,7 +175,7 @@ for src in "$HERE"/*.c; do
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
-    case $name in spawn-threads | exec-dethread) tiers=${tiers#t1} ;; esac
+    case $name in spawn-threads) tiers=${tiers#t1} ;; esac
     for target in $targets; do
     for tier in $tiers; do
         [ $tier = page ] && [ "$target" != x86_64-linux-musl ] && continue
