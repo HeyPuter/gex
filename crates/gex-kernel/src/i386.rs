@@ -207,6 +207,19 @@ pub mod raw {
     pub const SYMLINKAT: u64 = 304;
     pub const READLINKAT: u64 = 305;
     pub const FCHMODAT: u64 = 306;
+    // The extended-attribute calls, 226..=237 in canonical order.
+    pub const SETXATTR: u64 = 226;
+    pub const LSETXATTR: u64 = 227;
+    pub const FSETXATTR: u64 = 228;
+    pub const GETXATTR: u64 = 229;
+    pub const LGETXATTR: u64 = 230;
+    pub const FGETXATTR: u64 = 231;
+    pub const LISTXATTR: u64 = 232;
+    pub const LLISTXATTR: u64 = 233;
+    pub const FLISTXATTR: u64 = 234;
+    pub const REMOVEXATTR: u64 = 235;
+    pub const LREMOVEXATTR: u64 = 236;
+    pub const FREMOVEXATTR: u64 = 237;
     pub const FACCESSAT: u64 = 307;
     pub const PSELECT6: u64 = 308;
     pub const PPOLL: u64 = 309;
@@ -458,6 +471,13 @@ pub fn translate(
         x::FCHMODAT => {
             a[0] = sext(a[0]);
             nr::FCHMODAT
+        }
+        x::SETXATTR..=x::FREMOVEXATTR => {
+            // The f- forms take a descriptor.
+            if (n - x::SETXATTR) % 3 == 2 {
+                a[0] = sext(a[0]);
+            }
+            nr::SETXATTR + (n - x::SETXATTR)
         }
         x::LCHOWN | x::LCHOWN16 => {
             *a = [AT_FDCWD, a[0], a[1], a[2], AT_SYMLINK_NOFOLLOW, 0];

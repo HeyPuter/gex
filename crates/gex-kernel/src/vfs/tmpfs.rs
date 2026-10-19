@@ -303,6 +303,10 @@ struct Inner {
     /// How many times each directory that has moved has moved, itself or
     /// with a directory above it ([`super::Moved::epoch`]). Sparse.
     moves: BTreeMap<u64, u64>,
+    /// Extended attributes (`user.*`), by inode, so they follow a rename
+    /// and every hard link; dropped with the inode's last name. Sparse:
+    /// Wine's DOS attributes (`user.DOSATTRIB`) are on a few files.
+    xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
 }
 
 impl Inner {
@@ -342,8 +346,27 @@ impl Inner {
             *n -= 1;
             if *n == 0 {
                 self.links.remove(&ino);
+                self.xattrs.remove(&ino);
             }
         }
+    }
+
+    /// An extended-attribute call on inode `ino` (`symlink`: the node is a
+    /// link, whose `user.` attributes Linux refuses to set).
+    fn xattr(&mut self, ino: u64, symlink: bool, op: super::XattrOp<'_>) -> Result<usize, Errno> {
+        if symlink && matches!(op, super::XattrOp::Set { .. }) {
+            return Err(Errno::EPERM);
+        }
+        let mut none = BTreeMap::new();
+        let attrs = match &op {
+            super::XattrOp::Set { .. } => self.xattrs.entry(ino).or_default(),
+            _ => self.xattrs.get_mut(&ino).unwrap_or(&mut none),
+        };
+        let r = super::xattr_apply(attrs, op);
+        if self.xattrs.get(&ino).is_some_and(|a| a.is_empty()) {
+            self.xattrs.remove(&ino);
+        }
+        r
     }
 
     fn nlink(&self, ino: u64) -> u32 {
@@ -945,6 +968,21 @@ impl FileHandle for TmpHandle {
         Some(inner.chmod(&path, mode))
     }
 
+    fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        let mut inner = self.inner.lock().unwrap();
+        // The node itself: a file's inode goes with its contents (an
+        // unlinked file keeps none), a directory's as it moved.
+        let ino = match (&self.file, self.dir) {
+            (Some(f), _) => f.ino,
+            (None, Some(d)) => d,
+            (None, None) => {
+                let path = self.here(&inner)?;
+                *inner.inos.get(&path)?
+            }
+        };
+        Some(inner.xattr(ino, false, op))
+    }
+
     fn rename_epoch(&self) -> Option<u64> {
         Some(self.inner.gate.epoch())
     }
@@ -1049,6 +1087,16 @@ impl FileSystem for TmpFs {
             dir: None,
         };
         handle.metadata()
+    }
+
+    fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        let symlink = match inner.nodes.get(path) {
+            None => return Err(Errno::ENOENT),
+            Some(n) => matches!(n, Node::Symlink(_)),
+        };
+        let ino = TmpFs::ino_of(&inner, path);
+        inner.xattr(ino, symlink, op)
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {

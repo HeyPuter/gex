@@ -244,6 +244,19 @@ pub mod raw {
     pub const SYMLINKAT: u64 = 266;
     pub const READLINKAT: u64 = 267;
     pub const FCHMODAT: u64 = 268;
+    // The extended-attribute calls, 188..=199 in canonical order.
+    pub const SETXATTR: u64 = 188;
+    pub const LSETXATTR: u64 = 189;
+    pub const FSETXATTR: u64 = 190;
+    pub const GETXATTR: u64 = 191;
+    pub const LGETXATTR: u64 = 192;
+    pub const FGETXATTR: u64 = 193;
+    pub const LISTXATTR: u64 = 194;
+    pub const LLISTXATTR: u64 = 195;
+    pub const FLISTXATTR: u64 = 196;
+    pub const REMOVEXATTR: u64 = 197;
+    pub const LREMOVEXATTR: u64 = 198;
+    pub const FREMOVEXATTR: u64 = 199;
     pub const FACCESSAT: u64 = 269;
     pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
@@ -552,6 +565,7 @@ pub fn translate(
         x::SYMLINKAT => nr::SYMLINKAT,
         x::READLINKAT => nr::READLINKAT,
         x::FCHMODAT => nr::FCHMODAT,
+        x::SETXATTR..=x::FREMOVEXATTR => nr::SETXATTR + (n - x::SETXATTR),
         x::FACCESSAT => nr::FACCESSAT,
         x::PSELECT6 => nr::PSELECT6,
         x::PPOLL => nr::PPOLL,

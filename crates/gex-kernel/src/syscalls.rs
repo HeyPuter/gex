@@ -49,6 +49,18 @@ pub mod nr {
     pub const UNSHARE: u64 = 97;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
+    pub const SETXATTR: u64 = 5;
+    pub const LSETXATTR: u64 = 6;
+    pub const FSETXATTR: u64 = 7;
+    pub const GETXATTR: u64 = 8;
+    pub const LGETXATTR: u64 = 9;
+    pub const FGETXATTR: u64 = 10;
+    pub const LISTXATTR: u64 = 11;
+    pub const LLISTXATTR: u64 = 12;
+    pub const FLISTXATTR: u64 = 13;
+    pub const REMOVEXATTR: u64 = 14;
+    pub const LREMOVEXATTR: u64 = 15;
+    pub const FREMOVEXATTR: u64 = 16;
     pub const OPENAT: u64 = 56;
     pub const OPENAT2: u64 = 437;
     pub const CLOSE: u64 = 57;
@@ -2726,6 +2738,7 @@ impl PathIo<'_> {
             // Permission bits are not modelled; reporting success keeps
             // installers and build systems moving.
             nr::FCHMOD | nr::FCHMODAT => self.sys_chmod(m, n, a),
+            nr::SETXATTR..=nr::FREMOVEXATTR => self.sys_xattr(m, n, a),
             // Ownership is not modelled: there is one user and the guest is
             // it. Refusing would be worse than accepting -- tar treats a
             // failed chown while unpacking as a failure to unpack.
@@ -3361,6 +3374,39 @@ impl PathIo<'_> {
 
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
     /// descriptor kept; the second names a path directly.
+    /// The extended-attribute calls: `{,l,f}{set,get,list,remove}xattr`.
+    /// Only `user.` attributes are kept (`vfs::xattr_name`); a filesystem
+    /// that keeps none says `EOPNOTSUPP`.
+    pub fn sys_xattr(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let kind = (n - nr::SETXATTR) / 3; // 0 set, 1 get, 2 list, 3 remove
+        let form = (n - nr::SETXATTR) % 3; // 0 path, 1 lpath, 2 fd
+        let name = if kind == 2 {
+            String::new()
+        } else {
+            let raw = m.read_cstr(a[1], crate::vfs::XATTR_NAME_MAX + 1)?;
+            if raw.len() > crate::vfs::XATTR_NAME_MAX {
+                return Err(Errno::ERANGE);
+            }
+            String::from_utf8(raw).map_err(|_| Errno::EINVAL)?
+        };
+        let x = Xattr { kind, name: &name, flags: a[4] as u32, at: if kind == 2 { a[1] } else { a[2] }, size: if kind == 2 { a[2] } else { a[3] } };
+        if form == 2 {
+            let f = self.map.fds.get(a[0] as i32)?;
+            if let Some(r) = x.run(m, |op| f.handle.xattr(op)) {
+                return r;
+            }
+            // No node of its own here: by the name it was opened under, as
+            // `fchmod` falls back. A pipe or socket has no name, and no
+            // attributes.
+            if f.path.is_empty() {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            return x.run(m, |op| Some(self.ns.xattr(&f.path, true, op))).unwrap_or(Err(Errno::EOPNOTSUPP));
+        }
+        let path = self.at_path(m, AT_FDCWD, a[0])?;
+        x.run(m, |op| Some(self.ns.xattr(&path, form == 0, op))).unwrap_or(Err(Errno::EOPNOTSUPP))
+    }
+
     pub fn sys_chmod(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
         let (path, mode, flags) = if n == nr::FCHMOD {
             let f = self.map.fds.get(a[0] as i32)?;
@@ -4558,6 +4604,50 @@ pub enum FreeOutcome {
     Again,
 }
 
+/// One extended-attribute call's arguments ([`PathIo::sys_xattr`]): which
+/// kind (0 set, 1 get, 2 list, 3 remove), the name, `setxattr`'s flags,
+/// and the guest buffer (the value going in, or room for what comes out).
+struct Xattr<'a> {
+    kind: u64,
+    name: &'a str,
+    flags: u32,
+    at: u64,
+    size: u64,
+}
+
+impl Xattr<'_> {
+    /// Make the call with `call`, copying the value in or the answer out;
+    /// `None` when `call` has nowhere to make it.
+    fn run(&self, m: &mut GuestMem<'_>, call: impl FnOnce(crate::vfs::XattrOp<'_>) -> Option<Result<usize, Errno>>) -> Option<SysResult> {
+        use crate::vfs::XattrOp;
+        // Linux caps both at XATTR_SIZE_MAX (a value one past it is E2BIG).
+        let mut bytes = match self.kind {
+            0 => match m.read(self.at, (self.size as usize).min(crate::vfs::XATTR_SIZE_MAX + 1)) {
+                Ok(b) => b.to_vec(),
+                Err(e) => return Some(Err(e)),
+            },
+            1 | 2 => vec![0u8; (self.size as usize).min(crate::vfs::XATTR_SIZE_MAX)],
+            _ => Vec::new(),
+        };
+        let op = match self.kind {
+            0 => XattrOp::Set { name: self.name, value: &bytes, flags: self.flags },
+            1 => XattrOp::Get { name: self.name, buf: &mut bytes },
+            2 => XattrOp::List { buf: &mut bytes },
+            _ => XattrOp::Remove { name: self.name },
+        };
+        let got = match call(op)? {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
+        if (self.kind == 1 || self.kind == 2) && self.size > 0 {
+            if let Err(e) = m.write(self.at, &bytes[..got]) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(got as u64))
+    }
+}
+
 /// `ppoll`, `pselect6`, `epoll_pwait` or `epoll_pwait2` (canonical).
 fn is_poll(n: u64) -> bool {
     matches!(n, nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2)
@@ -4587,6 +4677,7 @@ fn is_path(n: u64) -> bool {
             | nr::UTIMENSAT
             | nr::FCHMOD
             | nr::FCHMODAT
+            | nr::SETXATTR..=nr::FREMOVEXATTR
             | nr::FCHOWN
             | nr::FCHOWNAT
             | nr::CHDIR
@@ -5382,6 +5473,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHDIR => nr::FCHDIR,
             x::UMASK => nr::UMASK,
             x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
+            x::SETXATTR..=x::FREMOVEXATTR => nr::SETXATTR + (raw - x::SETXATTR),
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::LCHOWN16 | x::FCHOWNAT => nr::FCHOWNAT,
             x::FCHOWN | x::FCHOWN16 => nr::FCHOWN,
@@ -5483,6 +5575,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FCHDIR => nr::FCHDIR,
             x::UMASK => nr::UMASK,
             x::CHMOD | x::FCHMODAT => nr::FCHMODAT,
+            x::SETXATTR..=x::FREMOVEXATTR => nr::SETXATTR + (raw - x::SETXATTR),
             x::FCHMOD => nr::FCHMOD,
             x::CHOWN | x::LCHOWN | x::FCHOWNAT => nr::FCHOWNAT,
             x::FCHOWN => nr::FCHOWN,
@@ -9991,6 +10084,18 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::UNSHARE => "unshare",
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
+        nr::SETXATTR => "setxattr",
+        nr::LSETXATTR => "lsetxattr",
+        nr::FSETXATTR => "fsetxattr",
+        nr::GETXATTR => "getxattr",
+        nr::LGETXATTR => "lgetxattr",
+        nr::FGETXATTR => "fgetxattr",
+        nr::LISTXATTR => "listxattr",
+        nr::LLISTXATTR => "llistxattr",
+        nr::FLISTXATTR => "flistxattr",
+        nr::REMOVEXATTR => "removexattr",
+        nr::LREMOVEXATTR => "lremovexattr",
+        nr::FREMOVEXATTR => "fremovexattr",
         nr::OPENAT => "openat",
         nr::OPENAT2 => "openat2",
         nr::CLOSE => "close",
@@ -13344,6 +13449,83 @@ mod tests {
             assert_eq!(fl & oflags::ACCMODE, oflags::O_RDWR);
             assert_eq!(fl & g(oflags::O_DIRECTORY | oflags::O_NOFOLLOW), 0, "F_GETFL {fl:#o}");
         }
+    }
+
+    /// Extended attributes (`user.` only) on the root tmpfs, through the
+    /// lock-free path and the full call alike: kept by inode (through a
+    /// rename and a hard link, and on a descriptor), the `l` forms on a
+    /// symlink itself, and Linux's errors.
+    #[test]
+    fn xattrs_are_kept_by_inode() {
+        let mut seen = Vec::new();
+        for lock_free in [true, false] {
+            let (_, mut k) = setup();
+            let mut buf = vec![0u8; 0x40000];
+            let at = k.ctx_addr;
+            let mut m = GuestMem::new(&mut buf);
+            let sys = |m: &mut GuestMem<'_>, k: &mut Kernel, n: u64, a: &[u64]| {
+                set_args(m, at, n, a);
+                if lock_free {
+                    let call = free_class(m, at, false).expect("in the class");
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
+                    assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
+                } else {
+                    k.syscall(m, 0);
+                }
+                ret(m, at)
+            };
+            let cwd = (-100i64) as u64;
+            let strs: [&[u8]; 9] = [b"/a\0", b"/b\0", b"/c\0", b"/l\0", b"/dir\0", b"user.DOSATTRIB\0", b"0x22", b"trusted.x\0", b"user.none\0"];
+            let ptr = |i: usize| 0x20000u64 + 0x100 * i as u64;
+            for (i, t) in strs.iter().enumerate() {
+                m.write(ptr(i), t).unwrap();
+            }
+            let (a, b, c, l, dir, name, value, trusted, none) = (ptr(0), ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7), ptr(8));
+            let out = 0x24000u64;
+            let mut got = Vec::new();
+            let f = sys(&mut m, &mut k, nr::OPENAT, &[cwd, a, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
+            got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, dir, 0o755]));
+            got.push(sys(&mut m, &mut k, nr::SYMLINKAT, &[a, cwd, l]));
+            got.push(sys(&mut m, &mut k, nr::SETXATTR, &[a, name, value, 4, 0]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[a, name, out, 0]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[a, name, out, 64]));
+            got.extend(m.read(out, 4).unwrap().iter().map(|&x| x as i64));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[a, name, out, 2]));
+            got.push(sys(&mut m, &mut k, nr::SETXATTR, &[a, name, value, 4, 1]));
+            got.push(sys(&mut m, &mut k, nr::SETXATTR, &[a, none, value, 4, 2]));
+            got.push(sys(&mut m, &mut k, nr::SETXATTR, &[a, trusted, value, 4, 0]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[a, none, out, 64]));
+            // Through the symlink, and on the link itself.
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[l, name, out, 64]));
+            got.push(sys(&mut m, &mut k, nr::LGETXATTR, &[l, name, out, 64]));
+            got.push(sys(&mut m, &mut k, nr::LSETXATTR, &[l, name, value, 4, 0]));
+            // The inode keeps them: renamed, linked, on a descriptor.
+            got.push(sys(&mut m, &mut k, nr::RENAMEAT, &[cwd, a, cwd, b]));
+            got.push(sys(&mut m, &mut k, nr::LINKAT, &[cwd, b, cwd, c, 0]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[c, name, out, 64]));
+            got.push(sys(&mut m, &mut k, nr::FGETXATTR, &[f as u64, name, out, 64]));
+            got.push(sys(&mut m, &mut k, nr::LISTXATTR, &[b, out, 64]));
+            got.extend(m.read(out, 15).unwrap().iter().map(|&x| x as i64));
+            let d = sys(&mut m, &mut k, nr::OPENAT, &[cwd, dir, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);
+            got.push(sys(&mut m, &mut k, nr::FSETXATTR, &[d as u64, name, value, 2, 0]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[dir, name, out, 0]));
+            got.push(sys(&mut m, &mut k, nr::FREMOVEXATTR, &[f as u64, name]));
+            got.push(sys(&mut m, &mut k, nr::GETXATTR, &[b, name, out, 64]));
+            got.push(sys(&mut m, &mut k, nr::REMOVEXATTR, &[b, name]));
+            got.push(sys(&mut m, &mut k, nr::LISTXATTR, &[c, out, 64]));
+            seen.push(got);
+        }
+        assert_eq!(seen[0], seen[1]);
+        let e = |x: Errno| -(x.0 as i64);
+        let mut want = vec![0, 0, 0, 4, 4];
+        want.extend(b"0x22".iter().map(|&x| x as i64));
+        want.extend([e(Errno::ERANGE), e(Errno::EEXIST), e(Errno::ENODATA), e(Errno::EOPNOTSUPP), e(Errno::ENODATA)]);
+        want.extend([4, e(Errno::ENODATA), e(Errno::EPERM)]);
+        want.extend([0, 0, 4, 4, 15]);
+        want.extend(b"user.DOSATTRIB\0".iter().map(|&x| x as i64));
+        want.extend([0, 2, 0, e(Errno::ENODATA), e(Errno::ENODATA), 0]);
+        assert_eq!(seen[0], want);
     }
 
     /// The path writers through the lock-free path ([`PathIo`], L14c)

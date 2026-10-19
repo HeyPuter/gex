@@ -88,6 +88,42 @@ pub struct Remote {
     pub set_times: extern "C" fn(path: crate::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32,
     /// `futimens`, likewise.
     pub set_times_fd: extern "C" fn(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32,
+    /// An extended-attribute call ([`super::XattrOp`]; `op` one of
+    /// [`xattr_op`]) on open `handle`, or on `path` when `handle` is
+    /// negative. `buf` is the value to set, or where a value or the name
+    /// list goes (`len` 0: only the size). A count, or a negated errno.
+    pub xattr: extern "C" fn(handle: i32, path: crate::PAddr, path_len: u32, op: u32, name: crate::PAddr, name_len: u32, buf: crate::PAddr, len: u32, flags: u32) -> i32,
+}
+
+/// `Remote::xattr`'s `op`.
+pub mod xattr_op {
+    pub const GET: u32 = 0;
+    pub const SET: u32 = 1;
+    pub const LIST: u32 = 2;
+    pub const REMOVE: u32 = 3;
+}
+
+/// [`super::XattrOp`] as `Remote::xattr`'s arguments, called on `handle`
+/// (or the path when negative): the one encoding both sides share.
+fn xattr_call(remote: &Remote, handle: i32, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
+    use super::XattrOp;
+    let (pa, pn) = at(path.as_bytes());
+    let r = match op {
+        XattrOp::Get { name, buf } => {
+            let (na, nn) = at(name.as_bytes());
+            (remote.xattr)(handle, pa, pn, xattr_op::GET, na, nn, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32, 0)
+        }
+        XattrOp::Set { name, value, flags } => {
+            let (na, nn) = at(name.as_bytes());
+            (remote.xattr)(handle, pa, pn, xattr_op::SET, na, nn, value.as_ptr() as crate::PAddr, value.len() as u32, flags)
+        }
+        XattrOp::List { buf } => (remote.xattr)(handle, pa, pn, xattr_op::LIST, 0 as crate::PAddr, 0, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32, 0),
+        XattrOp::Remove { name } => {
+            let (na, nn) = at(name.as_bytes());
+            (remote.xattr)(handle, pa, pn, xattr_op::REMOVE, na, nn, 0 as crate::PAddr, 0, 0)
+        }
+    };
+    ok(r).map(|n| n as usize)
 }
 
 /// The nanoseconds of a time `set_times` leaves alone.
@@ -339,6 +375,10 @@ impl FileSystem for RemoteFs {
         ok((self.remote.chmod)(a, n, mode)).map(|_| ())
     }
 
+    fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
+        xattr_call(&self.remote, -1, path, op)
+    }
+
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         let (a, n) = at(path.as_bytes());
         ok((self.remote.set_mtime)(a, n, secs)).map(|_| ())
@@ -453,6 +493,10 @@ impl FileHandle for RemoteHandle {
 
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         Some(ok((self.remote.fchmod)(self.id, mode)).map(|_| ()))
+    }
+
+    fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        Some(xattr_call(&self.remote, self.id, "", op))
     }
 
     fn rename_epoch(&self) -> Option<u64> {

@@ -1,6 +1,8 @@
 // Just enough tar to unpack a root filesystem in one request. Handles what GNU
-// tar emits for a directory tree: ustar, the two GNU long-name extensions, and
-// the `prefix` field (how ustar stores a path over 100 characters).
+// tar emits for a directory tree: ustar, the two GNU long-name extensions, the
+// `prefix` field (how ustar stores a path over 100 characters), and a pax
+// extended header's path, link target and extended attributes (`tar --xattrs`:
+// `SCHILY.xattr.user.*`, how Wine's DOS attributes travel in a prefix).
 
 const BLOCK = 512;
 
@@ -48,8 +50,14 @@ export function untar(buf, root = '') {
   // Each file's modification time (seconds), for a page that hands them on
   // (nt-page's `mtimes=1`).
   const mtimes = Object.create(null);
+  // Extended attributes (`user.*`), path to { name: bytes }: what the pax
+  // headers carry, for `gex_set_xattr`.
+  const xattrs = Object.create(null);
   let off = 0;
   let longName = null;
+  let longLink = null;
+  // The pax extended header for the next entry: { path, linkpath, xattrs }.
+  let pax = null;
 
   const path = (name) => {
     let p = name.replace(/^\.\//, '').replace(/\/+$/, '');
@@ -72,15 +80,40 @@ export function untar(buf, root = '') {
       name = longName;
       longName = null;
     }
+    let linkTarget = null;
+    if (longLink !== null) {
+      linkTarget = longLink;
+      longLink = null;
+    }
     const body = off + BLOCK;
     const next = body + Math.ceil(size / BLOCK) * BLOCK;
+    // This entry's pax header, used up by it (a header's own type is next).
+    let ext = null;
+    if (pax && type !== 'x' && type !== 'g' && type !== 'L' && type !== 'K') {
+      ext = pax;
+      pax = null;
+      if (ext.path !== undefined) name = ext.path;
+      if (ext.linkpath !== undefined) linkTarget = ext.linkpath;
+    }
+    const linkOf = () => linkTarget ?? str(b, off + 157, 100);
+    const keepXattrs = (p) => {
+      if (p && ext && ext.xattrs) xattrs[p] = ext.xattrs;
+    };
 
-    if (type === 'L') {
+    if (type === 'x') {
+      pax = paxRecords(b.subarray(body, body + size));
+    } else if (type === 'g') {
+      // A global header: nothing here needs one.
+    } else if (type === 'K') {
+      // GNU long link target, for the next entry.
+      longLink = str(b, body, size);
+    } else if (type === 'L') {
       // GNU long name: this entry's body is the name of the next entry.
       longName = str(b, body, size);
     } else if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
+      keepXattrs(p);
       // A directory's mode, when it is not the VFS's 0755: a read-only one
       // (no write bits) is what Wine reports as FILE_ATTRIBUTE_READONLY, and
       // the Windows shell reads a folder's desktop.ini names only then.
@@ -88,14 +121,14 @@ export function untar(buf, root = '') {
       if (p && mode && mode !== 0o755) modes[p] = mode;
     } else if (type === '2') {
       const p = path(name);
-      const target = str(b, off + 157, 100);
+      const target = linkOf();
       if (p) links[p] = target;
     } else if (type === '1') {
       // A hard link's target is relative to the root of the archive, not the
       // link's directory (a symlink's is). Resolving it like a symlink would
       // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
       const p = path(name);
-      const target = str(b, off + 157, 100);
+      const target = linkOf();
       if (p && target) hard[p] = `/${target.replace(/^\.\//, '')}`;
     } else if (type === '0' || type === '\0' || type === '7') {
       const p = path(name);
@@ -109,9 +142,41 @@ export function untar(buf, root = '') {
         const mode = octal(b, off + 100, 8) & 0o7777;
         if (mode & 0o111) modes[p] = mode;
         mtimes[p] = octal(b, off + 136, 12);
+        keepXattrs(p);
       }
     }
     off = next;
   }
-  return { files, dirs, links, hard, modes, mtimes };
+  return { files, dirs, links, hard, modes, mtimes, xattrs };
+}
+
+/**
+ * A pax extended header's records (`LEN key=value\n`, LEN counting the whole
+ * record): the path, the link target and the `user.` extended attributes,
+ * GNU tar's (`SCHILY.xattr.NAME`, raw bytes) and libarchive's
+ * (`LIBARCHIVE.xattr.NAME`, base64). Values are bytes, not text.
+ */
+function paxRecords(rec) {
+  const out = {};
+  let at = 0;
+  while (at < rec.length) {
+    let sp = at;
+    while (sp < rec.length && rec[sp] !== 0x20) sp++;
+    const len = parseInt(new TextDecoder().decode(rec.slice(at, sp)), 10);
+    if (!(len > 0) || at + len > rec.length) break;
+    const end = at + len - 1; // the record's newline
+    let eq = sp + 1;
+    while (eq < end && rec[eq] !== 0x3d) eq++;
+    const key = new TextDecoder().decode(rec.slice(sp + 1, eq));
+    const value = rec.slice(eq + 1, end);
+    if (key === 'path') out.path = new TextDecoder().decode(value);
+    else if (key === 'linkpath') out.linkpath = new TextDecoder().decode(value);
+    else if (key.startsWith('SCHILY.xattr.user.')) (out.xattrs ??= {})[key.slice(13)] = value;
+    else if (key.startsWith('LIBARCHIVE.xattr.user.')) {
+      const raw = atob(new TextDecoder().decode(value));
+      (out.xattrs ??= {})[decodeURIComponent(key.slice(17))] = Uint8Array.from(raw, (c) => c.charCodeAt(0));
+    }
+    at += len;
+  }
+  return out;
 }

@@ -120,7 +120,9 @@ if [ -n "$page" ]; then
   st=$(mktemp -d "$pg/stage.XXXXXX"); trap 'rm -rf "$st"' EXIT
   cp -a "$prefix" "$st/pfx"; mkdir -p "$st/usr/share/X11"; cp -rL /usr/share/X11/xkb "$st/usr/share/X11/"
   cp -al "$(dirname "$exe")" "$st/g" 2>/dev/null || cp -a "$(dirname "$exe")" "$st/g"
-  tar -C "$st" -cf "$rt/web/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"
+  # With the prefix's extended attributes (Wine's DOS attributes: a
+  # desktop.ini hidden and system), which web/src/tar.js reads back.
+  tar -C "$st" --xattrs --xattrs-include='user.*' -cf "$rt/web/public/gex/nt/app.tar" pfx usr g; rm -rf "$st"
   env=() ; for ((i = 1; i < ${#envs[@]}; i += 2)); do env+=("${envs[i]}"); done
   log=$pg/$name.log
   BENCH_TIMEOUT=${BENCH_TIMEOUT:-20m} "${BENCH_SH:-$HOME/gex-sandbox/scratch/bench/bench.sh}" -s "$rt" -s "$units" -- \

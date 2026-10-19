@@ -128,6 +128,12 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 }
 
 impl FileHandle for HostHandle {
+    fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        use std::os::unix::io::AsRawFd;
+        let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+    }
+
     fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
         self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
     }
@@ -191,6 +197,12 @@ struct HostDir {
 }
 
 impl FileHandle for HostDir {
+    fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        use std::os::unix::io::AsRawFd;
+        let (f, _, _) = self.held.as_ref()?;
+        Some(host_xattr::call(host_xattr::On::Fd(f.as_raw_fd()), op))
+    }
+
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
         Err(Errno::EISDIR)
     }
@@ -410,6 +422,13 @@ impl FileSystem for HostFs {
         .map_err(|e| Errno::from_io(&e))
     }
 
+    fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
+        if self.read_only && matches!(op, super::XattrOp::Set { .. } | super::XattrOp::Remove { .. }) {
+            return Err(Errno::EROFS);
+        }
+        host_xattr::call(host_xattr::On::Path(&self.host_path(path)?), op)
+    }
+
     fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
@@ -473,6 +492,72 @@ impl FileSystem for HostFs {
 }
 
 use std::os::unix::fs::OpenOptionsExt;
+
+/// Extended attributes on the host's files, `user.` only either way: a
+/// guest neither sets nor sees the host's other namespaces. The calls
+/// themselves are the host's ([`set_host_xattr`]: this crate has no unsafe
+/// code); without one, `EOPNOTSUPP`.
+pub mod host_xattr {
+    use super::super::{xattr_name, XattrOp};
+    use crate::errno::Errno;
+
+    /// The node: a host path (its final link not followed: the guest's walk
+    /// already followed it, or was asked not to) or an open descriptor.
+    pub enum On<'a> {
+        Path(&'a std::path::Path),
+        Fd(i32),
+    }
+
+    /// The host's `l*xattr`/`f*xattr` calls, one [`XattrOp`] on `on`: what
+    /// they return, or the host's errno.
+    pub type Calls = fn(on: &On<'_>, op: XattrOp<'_>) -> Result<usize, Errno>;
+
+    static CALLS: std::sync::OnceLock<Calls> = std::sync::OnceLock::new();
+
+    /// Install the host's calls (the native shim's). The first call wins.
+    pub fn set_host_xattr(calls: Calls) {
+        let _ = CALLS.set(calls);
+    }
+
+    pub fn call(on: On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
+        let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
+        let not_user = |e: Errno| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e };
+        match op {
+            XattrOp::Get { name, buf } => {
+                xattr_name(name).map_err(not_user)?;
+                calls(&on, XattrOp::Get { name, buf })
+            }
+            XattrOp::Set { name, value, flags } => {
+                xattr_name(name)?;
+                calls(&on, XattrOp::Set { name, value, flags })
+            }
+            XattrOp::Remove { name } => {
+                xattr_name(name).map_err(not_user)?;
+                calls(&on, XattrOp::Remove { name })
+            }
+            XattrOp::List { buf } => {
+                // The host's whole list, then only its `user.` names.
+                let size = calls(&on, XattrOp::List { buf: &mut [] })?;
+                let mut all = vec![0u8; size];
+                let got = calls(&on, XattrOp::List { buf: &mut all })?;
+                all.truncate(got);
+                let mut mine = Vec::new();
+                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.")) {
+                    mine.extend_from_slice(name);
+                    mine.push(0);
+                }
+                if buf.is_empty() {
+                    return Ok(mine.len());
+                }
+                if buf.len() < mine.len() {
+                    return Err(Errno::ERANGE);
+                }
+                buf[..mine.len()].copy_from_slice(&mine);
+                Ok(mine.len())
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

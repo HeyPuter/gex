@@ -1801,6 +1801,23 @@ export class Gex {
       this.#shim.exports.gex_set_mtime(pp, p.length, BigInt(Math.trunc(secs)));
       free?.(pp, p.length);
     }
+    // The bundle's extended attributes (`web/src/tar.js`'s `xattrs`, path to
+    // { name: bytes }): Wine's DOS attributes, hidden and system, on the
+    // prefix's files and folders.
+    for (const [path, attrs] of Object.entries(opts.xattrs ?? {})) {
+      if (!this.#shim.exports.gex_set_xattr) break;
+      for (const [name, value] of Object.entries(attrs)) {
+        const p = enc.encode(path);
+        const n = enc.encode(name);
+        const v = value instanceof Uint8Array ? value : enc.encode(String(value));
+        const pp = this.#shim.exports.gex_alloc(p.length + n.length + v.length) >>> 0;
+        this.#bytes().set(p, pp);
+        this.#bytes().set(n, pp + p.length);
+        this.#bytes().set(v, pp + p.length + n.length);
+        this.#shim.exports.gex_set_xattr(pp, p.length, pp + p.length, n.length, pp + p.length + n.length, v.length);
+        free?.(pp, p.length + n.length + v.length);
+      }
+    }
 
     // Which program the image module was built from, so the shim can refuse to
     // hand its pages to a process running something else. See
