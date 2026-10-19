@@ -3573,6 +3573,10 @@ fn install_panic_hook() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // The memory map's rare diagnostics (a refused mapping explained), on
+        // the process's stderr beside the guest's own complaint: a Worker's
+        // console reaches no log a game run keeps.
+        gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
         std::panic::set_hook(Box::new(|info| {
             let text = format!("gex: panic in the shim: {info}\n");
             // Straight to the host's console, not through fd 2.

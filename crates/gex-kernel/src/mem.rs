@@ -412,6 +412,25 @@ pub fn dirty_parts(clean: &[(u64, u64)], start: u64, end: u64) -> Vec<(u64, u64)
 /// Bytes an M32 process asked for and could not be given for lack of address
 /// space (not of memory): the run that sees it records the program for a
 /// 64-bit memory next time (docs/mem64.md §5). Zero until it happens.
+/// Where this module's rare diagnostics go: stderr unless the host says
+/// otherwise (a browser has none; its shim points this at the console).
+static SAY: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+pub fn set_say(f: fn(&str)) {
+    let _ = SAY.set(f);
+}
+
+fn say(s: &str) {
+    match SAY.get() {
+        Some(f) => f(s),
+        None => eprint!("{s}"),
+    }
+}
+
+/// The smallest refused mapping [`MemoryMap::report_short`] explains (Wine
+/// probes the top of its x86-64 user space with a 1 MiB one in every process).
+const SHORT_REPORT_MIN: u64 = 4 << 20;
+
 pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Note that an M32 process ran out of address space asking for `len` bytes.
@@ -767,6 +786,87 @@ impl MemoryMap {
         }
     }
 
+    /// Say once what fills the address space below [`MMAP_TOP`] when a
+    /// large mapping is refused for want of space (Wine's x86-64 user space
+    /// is 4 GiB to it, and it asks above 2 GiB only once nothing below
+    /// fits). Totals by kind, the biggest mappings and names, the free holes
+    /// and the arena, so "the game's working set" and "our leak" can be told
+    /// apart from the log.
+    fn report_short(&self, addr: u64, len: u64) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mib = |b: u64| b as f64 / 1048576.0;
+        let low: Vec<&Vma> = self.vmas.iter().filter(|v| v.start < MMAP_TOP).collect();
+        let size = |v: &Vma| v.end.min(MMAP_TOP) - v.start;
+        let (mut file, mut none, mut anon) = (0u64, 0u64, 0u64);
+        let mut by_name: std::collections::BTreeMap<String, (u64, u32)> = Default::default();
+        for v in &low {
+            let n = size(v);
+            if v.prot == prot::NONE {
+                none += n;
+            } else if v.name.starts_with('/') {
+                file += n;
+            } else {
+                anon += n;
+            }
+            let key = format!("{} {}", if v.prot == prot::NONE { "---" } else { "rw?" }, if v.name.is_empty() { "[anon]" } else { &v.name });
+            let e = by_name.entry(key).or_default();
+            e.0 += n;
+            e.1 += 1;
+        }
+        let mut holes = Vec::new();
+        let mut at = MMAP_BOTTOM;
+        for v in &low {
+            if v.end <= MMAP_BOTTOM {
+                continue;
+            }
+            if v.start > at {
+                holes.push(v.start - at);
+            }
+            at = at.max(v.end);
+        }
+        if MMAP_TOP > at {
+            holes.push(MMAP_TOP - at);
+        }
+        holes.sort_unstable_by(|a, b| b.cmp(a));
+        let arena: u64 = self.arena.iter().map(|&(a, b)| b.min(MMAP_TOP).saturating_sub(a)).sum();
+        let mut s = format!(
+            "[gex] address space: {:.1} MiB at {addr:#x} refused (ENOMEM); below {:#x} {} mappings: files {:.1} MiB, \
+             anonymous {:.1} MiB, PROT_NONE reservations {:.1} MiB; this process's arena {:.1} MiB of {:.1} MiB \
+             ({:#x}-{:#x}; the rest is the runtime's heap or other processes'); holes in {:#x}-{:#x}: {:.1} MiB in {}, \
+             largest {:.1} MiB\n",
+            mib(len),
+            MMAP_TOP,
+            low.len(),
+            mib(file),
+            mib(anon),
+            mib(none),
+            mib(arena),
+            mib(MMAP_TOP - gex_abi::ARENA_BOTTOM),
+            gex_abi::ARENA_BOTTOM,
+            MMAP_TOP,
+            MMAP_BOTTOM,
+            MMAP_TOP,
+            mib(holes.iter().sum()),
+            holes.len(),
+            mib(holes.first().copied().unwrap_or(0)),
+        );
+        let mut names: Vec<_> = by_name.into_iter().collect();
+        names.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (n, (b, c)) in names.iter().take(16) {
+            s.push_str(&format!("[gex] address space:   {:8.1} MiB in {c:5} {n}\n", mib(*b)));
+        }
+        let mut big = low.clone();
+        big.sort_unstable_by_key(|v| std::cmp::Reverse(size(v)));
+        for v in big.iter().take(12) {
+            s.push_str(&format!("[gex] address space:   {:08x}-{:08x} {:8.1} MiB prot {} {}\n", v.start, v.end, mib(size(v)), v.prot, v.name));
+        }
+        say(&s);
+    }
+
     /// How much of the top of the arena is free: the bytes between the highest
     /// mapping and the end of the highest span. A fresh claim continues from
     /// here so the tail the last user gave back is spent first.
@@ -1067,6 +1167,9 @@ impl MemoryMap {
     /// As [`Self::mmap`], recording the file and offset the bytes came from.
     pub fn mmap_from(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str, origin: Option<(String, u64)>) -> SysResult {
         let r = self.mmap_from_unpublished(addr, len, prot, flags, name, origin);
+        if r == Err(Errno::ENOMEM) && len >= SHORT_REPORT_MIN {
+            self.report_short(addr, len);
+        }
         self.publish();
         r
     }
@@ -1459,6 +1562,18 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused large mapping explains what holds the space, once, without
+    /// tripping over mappings that straddle `MMAP_TOP` or sit below the arena.
+    #[test]
+    fn a_refused_big_mapping_is_explained() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS;
+        m.mmap(MMAP_BOTTOM, 0x10_0000, prot::READ, anon | flags::FIXED, "/lib/x.so").unwrap();
+        m.mmap(MMAP_TOP - 0x1000, 0x2000, prot::NONE, anon | flags::FIXED, "").unwrap();
+        assert_eq!(m.mmap(GUEST_LIMIT - 0x1000, 8 << 20, 3, anon | flags::FIXED, "big"), Err(Errno::ENOMEM));
+        m.report_short(0, 8 << 20);
+    }
 
     /// /proc/self/status's sizes: a reservation counts toward VmSize only,
     /// accessible memory toward VmRSS and RssAnon.
