@@ -133,6 +133,37 @@ if (pixelOffset !== 0 || pixel.join(",") !== "64,128,191,255")
 if (error !== 0) throw new Error(`GL error after replay: 0x${error.toString(16)}`);
 if (cursor !== reply.length) throw new Error(`unparsed reply bytes: ${reply.length - cursor}`);
 
+// A legacy context, then a 3.2 core one, as a WGL program makes them
+// (wglCreateContext to load wglCreateContextAttribsARB, then the context it
+// wants). A client has one backend context, so the second request gets the
+// first back: it must already report 3.2 or more, as a Windows driver's
+// legacy context does, not st/mesa's default compatibility cap of 3.1.
+function contextVersions(...requests) {
+  const parts = [command(8)];
+  for (const [major, minor, profile] of requests)
+    parts.push(command(1, new Words().u32(1).u32(major).u32(minor).u32(profile)));
+  const status = submitPacket(join(parts));
+  if (status !== 0) throw new Error(`desktop context replay failed: ${status}`);
+  const length = mesa._gex_gl_reply_len();
+  const at = mesa._gex_gl_reply_data();
+  const bytes = mesa.HEAPU8.slice(at, at + length);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const versions = [];
+  let pos = 0;
+  for (let i = 0; i < requests.length; i++) {
+    for (let field = 0; field < 3; field++) {
+      const n = dv.getUint32(pos, true);
+      if (field === 2) versions.push(decoder.decode(bytes.slice(pos + 4, pos + 4 + n)));
+      pos += 4 + ((n + 3) & ~3);
+    }
+  }
+  return versions;
+}
+const glVersion = (s) => { const m = /^(\d+)\.(\d+)/.exec(s); return m ? +m[1] * 10 + +m[2] : 0; };
+const [legacyVersion, coreVersion] = contextVersions([1, 0, 1], [3, 2, 0]);
+if (glVersion(coreVersion) < 32)
+  throw new Error(`a 3.2 core request after a legacy context got ${coreVersion} (legacy: ${legacyVersion})`);
+
 // Decoder failure poisons the graphics connection: execution and decoding are
 // intentionally not resumed afterward.  A caller must discard the worker GL
 // context on either negative status, because an operation may have consumed a
@@ -146,3 +177,4 @@ for (const [label, bytes, expected] of malformed) {
 console.log(`PASS gex-mesa-replay vendor=${vendor} renderer=${renderer}`);
 console.log(`PASS gex-mesa-replay malformed=${malformed.length}`);
 console.log(`PASS gex-mesa-replay version=${version} pixel=${pixel.join(",")}`);
+console.log(`PASS gex-mesa-replay legacy-then-core=${coreVersion}`);
