@@ -8811,6 +8811,12 @@ pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     mem.adopt_arena(gex_abi::DISPATCH_DIR_END, gex_abi::STACK_TOP - gex_abi::STACK_SIZE);
     // An access there faults, as in the NT layer.
     gex_xlate::set_guard_limit(0x8000_0000);
+    // The exe slot and pinned DLL band: once a fixed mapping has made them
+    // arena, a bottom-up anonymous mmap (Wine's 64 MiB heaps) took their
+    // holes and the next pinned DLL found its base taken and relocated
+    // (steam_api64, uxtheme, actxprxy: every one a unit miss).
+    let (lo, hi) = nt::W3_ISLAND;
+    mem.keep_fixed_only(lo, hi);
 }
 
 /// `gex.kuser_address()` (W3's Wine, at start): where this gex has i386

@@ -110,6 +110,9 @@ mod stub {
         false
     }
 
+    /// No exe slot to keep without the NT layer.
+    pub(crate) const W3_ISLAND: (u64, u64) = (0, 0);
+
     pub(crate) fn w3_kuser() {}
 
     pub(crate) fn adopt_windows_space(_lo: u64) -> Result<(), String> {
@@ -363,6 +366,9 @@ mod imp {
         }
     }
     const EXE_SLOT: u64 = 0x1000_0000;
+    /// [`keep_exe_slot`]'s island, `[EXE_SLOT, DLL_BAND_END)`: where only a
+    /// mapping that names its address goes (`w3_address_space`).
+    pub(crate) const W3_ISLAND: (u64, u64) = (EXE_SLOT, DLL_BAND_END);
     /// The pinned DLLs' band, [0x11000000, 0x20000000): soju's dll-bases.py
     /// lays them out from its start and asserts they end below its end.
     const DLL_BAND: u64 = 0x1100_0000;

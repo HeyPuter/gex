@@ -292,6 +292,9 @@ pub struct MemoryMap {
     /// The span the last [`Self::extend_arena`] took, until the caller asks
     /// ([`Self::take_fresh`]): memory nothing has been in, so zero.
     fresh: Option<(u64, u64)>,
+    /// Ranges a mapping without a fixed address is never placed in
+    /// ([`Self::keep_fixed_only`]), sorted and disjoint.
+    fixed_only: Vec<(u64, u64)>,
     /// The end of the span the cursor last handed this map (`extend_arena`):
     /// where a free tail is looked for. Not simply the highest span, which
     /// may be an island above the cursor (see `back`).
@@ -444,6 +447,7 @@ impl MemoryMap {
             clean: Vec::new(),
             fresh: None,
             take_end: 0,
+            fixed_only: Vec::new(),
             log: MapLog::default(),
         }
     }
@@ -593,6 +597,20 @@ impl MemoryMap {
             }
         }
         self.arena = merged;
+    }
+
+    /// Never place a mapping that names no address in `[lo, hi)`: it is
+    /// for mappings placed there (W3's and W64's exe slot and pinned-DLL
+    /// band, `shims/browser/src/nt.rs` `keep_exe_slot`). Once a fixed
+    /// mapping there made it arena, its holes took anonymous mappings
+    /// bottom-up (64 MiB from 0x19711000, just above lime.ndll, in W64
+    /// Dicey's game), and a DLL mapped later found its pin taken.
+    pub fn keep_fixed_only(&mut self, lo: u64, hi: u64) {
+        if lo >= hi || self.fixed_only.iter().any(|&(a, b)| a <= lo && hi <= b) {
+            return;
+        }
+        self.fixed_only.push((lo, hi));
+        self.fixed_only.sort_unstable();
     }
 
     /// The arena spans this map has been handed (sorted, disjoint).
@@ -1139,6 +1157,10 @@ impl MemoryMap {
                 return Err(Errno::ENOMEM);
             }
             let start = page_align_down(candidate - len);
+            if let Some(&(a, _)) = self.fixed_only.iter().find(|&&(a, b)| start < b && a < start + len) {
+                candidate = a;
+                continue;
+            }
             if self.is_free(start, start + len) {
                 self.mmap_next = start;
                 self.insert_from(start, start + len, prot, name, origin);
@@ -1237,6 +1259,11 @@ impl MemoryMap {
             let end = candidate.checked_add(len)?;
             if end > hi {
                 return None;
+            }
+            if let Some(&(_, b)) = self.fixed_only.iter().find(|&&(a, b)| candidate < b && a < end) {
+                candidate = page_align_up(b);
+                i = self.vmas.partition_point(|v| v.end <= candidate);
+                continue;
             }
             match self.vmas.get(i) {
                 Some(v) if v.start < end => {
@@ -1539,6 +1566,40 @@ mod tests {
             let got = m.mmap(0, len, prot::READ, 0, "c").unwrap() as u64;
             assert_eq!(got, want, "a {len:#x}-byte mapping");
         }
+    }
+
+    /// A range kept for fixed mappings (W3's exe slot and pinned-DLL band)
+    /// takes no anonymous mapping once it is arena, bottom-up or top-down;
+    /// a fixed mapping or a free hint still goes there.
+    #[test]
+    fn fixed_only_range_takes_no_placed_mapping() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x3000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(_start: u64, end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        let anon = flags::PRIVATE | flags::ANONYMOUS;
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        m.adopt_arena(0x1000_0000, 0x3000_0000);
+        m.keep_fixed_only(0x1000_0000, 0x2000_0000);
+        let dll = m.mmap(0x1100_0000, 0x10_0000, prot::READ, anon | flags::FIXED_NOREPLACE, "dll").unwrap() as u64;
+        assert_eq!(dll, 0x1100_0000);
+        let heap = m.mmap(0, 64 << 20, prot::READ | prot::WRITE, anon, "heap").unwrap() as u64;
+        assert!(heap >= 0x2000_0000, "an anonymous 64 MiB at {heap:#x}, in the band");
+        let small = m.mmap(0, PAGE_SIZE, prot::READ, anon, "small").unwrap() as u64;
+        assert!(small >= 0x2000_0000, "an anonymous page at {small:#x}, in the band");
+        let hint = m.mmap(0x1200_0000, 0x10_0000, prot::READ, anon, "hinted").unwrap() as u64;
+        assert_eq!(hint, 0x1200_0000);
+
+        // Top-down (no `take`): the search steps below the range.
+        let mut t = MemoryMap::new(0x40_1000);
+        let top = t.mmap_next;
+        t.keep_fixed_only(top - (16 << 20), top);
+        let a = t.mmap(0, 64 << 20, prot::READ, anon, "low").unwrap() as u64;
+        assert!(a + (64 << 20) <= top - (16 << 20), "a top-down 64 MiB at {a:#x}, in the range");
     }
 
     /// An exec's dead address space, donated back, is used before the arena
