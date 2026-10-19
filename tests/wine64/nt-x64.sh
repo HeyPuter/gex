@@ -143,6 +143,12 @@ check() {
 	fi
 	code=${out##*exit=}
 	out=${out%$'\n'exit=*}; out=${out%exit=*}; out=${out//$'\r'/}
+	# The page's space ends at 2 GiB: a Wine that takes it for 4 GiB tries
+	# the top first for each thread's stack, ENOMEM and an ERR each time
+	# (Wine fl/wine-addrlimit probes 2 GiB too). Quiet logs: none at all.
+	if [ -n "$page" ] && grep -aq "mmap() error Out of memory" "$w/$name.err"; then
+		code="$code, $(grep -ac "mmap() error Out of memory" "$w/$name.err") mmap ENOMEM ERR lines"
+	fi
 	local fr=""
 	# (WL=- : the display without a frame check)
 	[ -z "${WL:-}" ] || [ "$WL" = - ] || fr=$(python3 "$here/frame.py" "$w/$name" "${WL_MIN:-1000}" $WL 2>&1) || code="$code, $fr"
