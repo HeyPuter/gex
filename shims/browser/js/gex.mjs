@@ -1063,6 +1063,9 @@ export class Gex {
       // compact space (nothing grown; inherited regions become islands).
       // `?w3split=1` before the space is taken: the split, not the compact one.
       if (globalThis.GEX_W3_SPLIT || this.#w64Split) this.#shim.exports.gex_set_w3_split?.(1);
+      // Which memory flavours the page runs (docs/mem64.md §5): what an exec
+      // may ask for (vfork.rs `gex_set_page_flavours`).
+      if (globalThis.GEX_PAGE_FLAVOURS !== undefined) this.#shim.exports.gex_set_page_flavours?.(globalThis.GEX_PAGE_FLAVOURS | 0);
       if (this.#windowsSpace > 0) this.#shim.exports.gex_adopt_windows_space?.(this.#windowsSpace);
       else if (this.#windowsSpace < 0) this.#shim.exports.gex_split_windows_space?.();
       // A forked child's memory carries its parent's slot bits (`adoptProcess`).

@@ -323,6 +323,15 @@ if (MEM64 && SHARED && kernel) {
   } catch {
     // Not built: such a process says so when it starts.
   }
+} else if (SHARED && !SINGLE && kernel && ARCH_INFIX) {
+  // Without it, the 64-bit memory's runtime, for a program an exec asks one
+  // for (docs/mem64.md §5: GEX_MEM64=1 in the exec's environment, or the
+  // image's user.gex.mem64 record). Read only then.
+  other = async () => ({
+    shim: readFileSync(new URL(`gex_browser${ARCH_INFIX}.m64.shared.wasm`, PUB)),
+    guest: readFileSync(new URL(`seed${ARCH_INFIX}.m64.shared.wasm`, PUB)),
+    kernel: kernel.module,
+  });
 }
 
 const host = new ProcessHost({

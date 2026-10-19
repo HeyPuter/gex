@@ -526,6 +526,14 @@ pub struct Kernel {
     pub tid: i32,
     /// Guest path of the running program.
     pub exe_path: String,
+    /// The memory flavour the last `execve` asked for (docs/mem64.md §5):
+    /// `Some(true)` a 64-bit memory, `Some(false)` a 32-bit one, `None`
+    /// the page's own. From the call's `GEX_MEM64` entry, which the kernel
+    /// takes out of the new program's environment so that it applies to
+    /// that exec alone and no child inherits it, else from the image's
+    /// `user.gex.mem64` attribute (the learned record). The shim takes it
+    /// when it places the exec.
+    pub exec_mem64: Option<bool>,
     /// The argument and environment vectors, for `/proc/self/cmdline`.
     pub argv: Vec<String>,
     pub envp: Vec<String>,
@@ -7618,6 +7626,7 @@ impl Kernel {
             pid: 1,
             tid: 1,
             exe_path,
+            exec_mem64: None,
             argv: Vec::new(),
             envp: Vec::new(),
             creds: Creds::new(1000, 1000),
@@ -7666,6 +7675,31 @@ impl Kernel {
             file_locks: Arc::new(unix::FileLocks::new()),
             tty: Arc::new(crate::tty::TtyRef::new()),
         }
+    }
+
+    /// The memory flavour an exec of `path` asks for (`exec_mem64`): its
+    /// `GEX_MEM64=1` or `=0` entry, removed from `envp` (every one, so none
+    /// reaches the program or its children), else the image's
+    /// `user.gex.mem64` attribute, `1` or `0`. `None`: neither says.
+    pub fn exec_flavour(&self, path: &str, envp: &mut Vec<String>) -> Option<bool> {
+        let mut flag = None;
+        envp.retain(|e| match e.strip_prefix("GEX_MEM64=") {
+            Some(v) => {
+                flag = Some(v == "1");
+                false
+            }
+            None => true,
+        });
+        flag.or_else(|| {
+            let mut b = [0u8; 8];
+            let op = crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
+            let n = self.vfs.xattr(path, true, op).ok()?;
+            match &b[..n] {
+                b"1" | b"1\n" => Some(true),
+                b"0" | b"0\n" => Some(false),
+                _ => None,
+            }
+        })
     }
 
     /// Read one range of a file into `out`, returning bytes filled; the rest
@@ -7925,6 +7959,7 @@ impl Kernel {
             pid: self.pid,
             tid: self.tid,
             exe_path: self.exe_path.clone(),
+            exec_mem64: None,
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             // The child's own ids from here on: a set in either is not the
@@ -8197,7 +8232,8 @@ impl Kernel {
         }
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
-                Ok((path, argv, envp)) => {
+                Ok((path, argv, mut envp)) => {
+                    self.exec_mem64 = self.exec_flavour(&path, &mut envp);
                     self.map_io().flush_all_shared(m);
                     if self.trace {
                         eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());

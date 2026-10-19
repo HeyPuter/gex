@@ -913,10 +913,18 @@ async function runProgramHere(
     kernel,
     // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
     // needs it (host.mjs `#other`: W64's wineserver, a wasm32 module).
+    // Otherwise, with the global kernel, the 64-bit memory's runtime, for a
+    // program an exec asks one for (docs/mem64.md §5: its GEX_MEM64=1, or its
+    // image's user.gex.mem64 record); the page itself stays 32-bit. Fetched
+    // only then, so a page that never asks loads nothing more.
     other: m64Infix() ? async () => ({
       shim: await fetchBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
       guest: await fetchBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
       // the one kernel module serves both flavours (gex-kmem)
+      kernel: kernel.module,
+    }) : kernel && guestArch() === 'x86' ? async () => ({
+      shim: await fetchBytes(assetUrl(`/gex/gex_browser${archInfix()}.m64.shared.wasm`)),
+      guest: await fetchBytes(assetUrl(`/gex/seed${archInfix()}.m64.shared.wasm`)),
       kernel: kernel.module,
     }) : null,
     extra: {

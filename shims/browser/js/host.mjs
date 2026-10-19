@@ -255,6 +255,7 @@ export class ProcessHost {
       // The process memory's index type: the page's (`?mem64=1`, run-node's
       // GEX_MEM64), which every pooled Worker has (`#other`).
       mem64: !!this.#extra?.mem64,
+      pageFlavours: this.#pageFlavours(),
     }));
   }
   #poolSeq = 0;
@@ -371,6 +372,14 @@ export class ProcessHost {
   #mem64(pid) {
     const f = this.#flavourOf.get(Number(String(pid).split(':')[0]));
     return f ?? !!this.#extra?.mem64;
+  }
+
+  /** The page's memory flavours, for the shim (vfork.rs
+   *  `gex_set_page_flavours`): bit 0 its own is a 64-bit memory, bit 1 it
+   *  runs the other too (`#other`), so that an exec may ask for that one
+   *  (docs/mem64.md §5). */
+  #pageFlavours() {
+    return (this.#extra?.mem64 ? 1 : 0) | (this.#other && this.#kernel ? 2 : 0);
   }
 
   /** Whether `pid` runs on the other flavour's runtime (`#other`). */
@@ -819,6 +828,7 @@ export class ProcessHost {
             guest: rt.guest,
             kernel: rt.kernel,
             mem64: rt.mem64,
+            pageFlavours: this.#pageFlavours(),
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all
             // again (each Noita thread spent ~3 s doing that, one after the
@@ -1049,6 +1059,7 @@ export class ProcessHost {
             guest: rt.guest,
             kernel: rt.kernel,
             mem64: rt.mem64,
+            pageFlavours: this.#pageFlavours(),
             // Every module the process's Workers have compiled so far, so this
             // thread reuses them instead of recompiling from bytes in its own
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
