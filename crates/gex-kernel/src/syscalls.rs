@@ -3545,7 +3545,7 @@ impl MapIo<'_> {
             nr::MUNMAP => {
                 let flushed = self.flush_shared(m, a[0], a[1]);
                 self.mem.lock().log.shared_maps.retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
-                self.retire_code(a[0], a[1]);
+                self.retire_code_why(a[0], a[1], "munmap", 0);
                 flushed.and_then(|_| self.mem.lock().unmap(a[0], a[1])).map(|_| 0)
             }
             nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
@@ -3565,7 +3565,7 @@ impl MapIo<'_> {
         // Making code writable is the other half (a patch, a
         // detour), which x86 needs no cache flush to see.
         if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
-            self.retire_code(a[0], a[1]);
+            self.retire_code_why(a[0], a[1], "mprotect", a[2] as u32);
         }
         let mut mm = self.mem.lock();
         let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);
@@ -3672,7 +3672,7 @@ impl MapIo<'_> {
         // A fixed mapping over code replaces it, as an unmap would (Wine's
         // VirtualFree decommits by mapping over the range).
         if flags & mflags::FIXED != 0 {
-            self.retire_code(addr, len);
+            self.retire_code_why(addr, len, "mmap-fixed", prot_bits);
             // And a shared file mapping it replaces ends as an unmap ends
             // it: written back, and no longer handed to the next mapper.
             self.flush_shared(m, addr, len)?;
@@ -3899,6 +3899,12 @@ impl MapIo<'_> {
     /// unmapping the heap or a data file happens constantly and has no
     /// translations behind it.
     pub fn retire_code(&self, addr: u64, len: u64) {
+        self.retire_code_why(addr, len, "retire", 0)
+    }
+
+    /// [`Self::retire_code`], saying which call it was for the host's
+    /// retire-storm diagnostic ([`crate::note_retire_why`]).
+    pub fn retire_code_why(&self, addr: u64, len: u64, why: &'static str, prot: u32) {
         let (start, end) = (
             crate::mem::page_align_down(addr),
             crate::mem::page_align_up(addr.saturating_add(len)),
@@ -3910,6 +3916,7 @@ impl MapIo<'_> {
         let executable = mm.vmas().iter().any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
         if executable {
             mm.log.retired_code.push((start, end));
+            crate::note_retire_why(crate::RetireWhy { start, end, why, prot, pc: self.pc });
             crate::note_code_change();
         }
     }

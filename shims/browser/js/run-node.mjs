@@ -422,6 +422,8 @@ const host = new ProcessHost({
     // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
+    // GEX_JIT_DIAG: retire counts by page and call, and the watch on a page that keeps translating.
+    jitDiag: !!process.env.GEX_JIT_DIAG,
     // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
     traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
     watchMem: process.env.GEX_WATCH_MEM || undefined,
@@ -574,6 +576,7 @@ try {
       // message: `opts` is what a fork record carries to a child's Worker.
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
       traceMisses: !!process.env.GEX_TRACE_MISSES,
+      jitDiag: !!process.env.GEX_JIT_DIAG,
       checkSp: !!process.env.GEX_CHECK_SP,
       watchMem: process.env.GEX_WATCH_MEM || undefined,
       noIntrinsics: !!process.env.GEX_NO_INTRINSICS,

@@ -1047,6 +1047,7 @@ async function handle(msg) {
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.vforkTrace ?? msg.opts?.vforkTrace) globalThis.GEX_VFORK_TRACE = 1;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.jitDiag) ex.gex_set_jit_diag?.(1);
     if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));
     if (msg.checkSp) ex.gex_set_check_sp?.(1);

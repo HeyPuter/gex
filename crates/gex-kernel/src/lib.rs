@@ -399,6 +399,49 @@ pub fn note_code_change() {
     CODE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Why a range of code was retired, for the host's retire-storm diagnostic
+/// (a page whose translations are thrown away again and again). Diagnostic
+/// only: nothing reads it to decide what to retire.
+#[derive(Clone, Copy, Debug)]
+pub struct RetireWhy {
+    pub start: u64,
+    pub end: u64,
+    /// The call that retired it: `munmap`, `mprotect`, `mmap-fixed`, `nt-*`.
+    pub why: &'static str,
+    /// The new protection, for `mprotect`.
+    pub prot: u32,
+    /// The guest pc of the syscall, 0 when unknown.
+    pub pc: u64,
+}
+
+static RETIRE_WHY: std::sync::Mutex<Vec<RetireWhy>> = std::sync::Mutex::new(Vec::new());
+static RETIRE_WHY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep [`RetireWhy`]s for the host to take (its JIT diagnostics switch);
+/// off, [`note_retire_why`] does nothing.
+pub fn set_retire_why(on: bool) {
+    RETIRE_WHY_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Note why `[start, end)` is retired (beside its `retired_code` push). Kept
+/// to the last 1024 not yet taken, so a host that never takes them (native)
+/// holds a fixed few KiB.
+pub fn note_retire_why(w: RetireWhy) {
+    if !RETIRE_WHY_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut v = RETIRE_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    if v.len() >= 1024 {
+        v.remove(0);
+    }
+    v.push(w);
+}
+
+/// The reasons noted since the last call.
+pub fn take_retire_why() -> Vec<RetireWhy> {
+    std::mem::take(&mut *RETIRE_WHY.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// The process is i386 (a 32-bit guest on x86): its GPRs live in 64-bit
 /// context slots whose high halves must stay zero, as a 32-bit write leaves
 /// them on hardware, so that compiled code may keep and store only the low

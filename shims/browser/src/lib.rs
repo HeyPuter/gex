@@ -3166,6 +3166,18 @@ fn push_pending(j: &mut Jit, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8
     j.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
+/// How many times a stale page check may translate one block start again
+/// (`Jit::stale_again`).
+const STALE_AGAIN_MAX: u32 = 64;
+
+/// Remember the `blocks` range the module just queued was numbered
+/// (`Jit::module_dense`).
+fn note_module_dense(j: &mut Jit, module_id: u64) {
+    if let Some(d) = j.pending.back().and_then(|p| p.dense.as_ref()) {
+        j.module_dense.insert(module_id, (d.base, d.entries.len() as u32));
+    }
+}
+
 /// A process's translation state, behind its own lock (docs/kernel-locking.md
 /// §4.3, step L13) rather than inside the `Host` the kernel lock guards.
 ///
@@ -3320,6 +3332,13 @@ struct Jit {
     /// store keeps the bytes as built, and `backfill_registry` must keep
     /// them as installed (`dense`).
     dense_base: std::collections::HashMap<u32, u32>,
+    /// The `blocks` range (base, count) each runtime translation was given
+    /// (`dense::register`), by its `module_id`: which module a slot's index
+    /// is in, for `PAGE_STALE` (does dispatch still reach the stale block?).
+    module_dense: std::collections::HashMap<u64, (u32, u32)>,
+    /// Times a stale page check translated each block start again
+    /// (`PAGE_STALE`), for its bound ([`STALE_AGAIN_MAX`]).
+    stale_again: std::collections::HashMap<u64, u32>,
     /// Pages whose translations were retired (code unmapped, reprotected or
     /// flushed: Detours patching noita.exe). A stored module covering one may
     /// predate the change, so it is never served here again; see
@@ -6291,6 +6310,9 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     // sibling Worker can grow its table to cover this page. See `DIR_HIGH`.
     note_dir_high(entry);
     dense::note_entry(entry);
+    if pwatched(page) {
+        pwatch_say(page, || format!("directory {entry:#x} by {who}"));
+    }
     let want = DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed);
     if want < 0 || want as u64 != page {
         return;
@@ -9422,6 +9444,8 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         installed_mods: Default::default(),
         obj_cursor: Default::default(),
         dense_base: Default::default(),
+        module_dense: Default::default(),
+        stale_again: Default::default(),
         retired_pages: Default::default(),
         remiss: Default::default(),
         reuse_have: 0,
@@ -13472,7 +13496,49 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // translated about 155 times a second for minutes.
         heal_dirs(start);
         let again = with_jit_only(|j| {
-            let again = repeat || j.provider.get(&start).map_or(true, |&m| m == addr as u64);
+            // Dispatch at `start` no longer reaches the stale block: its slot
+            // names a block outside the stale module's range of `blocks`. Then
+            // the stale block was entered by a direct jump from a sibling in
+            // its own module (a loop whose head is on a retired page and whose
+            // body is on one that is not), and the sibling will jump to it
+            // again, however often `start` is translated: FL Studio's page
+            // startup translated one such head about 100 times a second, 34k
+            // translations in 290 s, until the renderer ran out of memory.
+            // Resuming from JavaScript (below) reaches the slot's block; only
+            // a stale block dispatch itself comes back to needs translating
+            // again (the `repeat` case).
+            let elsewhere = dense::on() && {
+                let d = dense::lookup(start);
+                d != 0 && j.module_dense.get(&(addr as u64)).is_some_and(|&(b, n)| d < b || d >= b + n)
+            };
+            let mut again = !elsewhere && (repeat || j.provider.get(&start).map_or(true, |&m| m == addr as u64));
+            // The bound: a block start a stale check has translated again
+            // this many times is not translated again for it. Whatever reaches
+            // the stale block there, more translations have not stopped it;
+            // resuming from JavaScript (below) is correct, only slower.
+            if again {
+                let n = j.stale_again.entry(start).or_insert(0);
+                *n += 1;
+                if *n > STALE_AGAIN_MAX {
+                    again = false;
+                    if *n == STALE_AGAIN_MAX + 1 {
+                        warn_line(&format!(
+                            "gex: pid {} block {start:#x} failed its page check and was translated again {STALE_AGAIN_MAX} times; resumed from JavaScript from now on\n",
+                            my_pid()
+                        ));
+                    }
+                }
+            }
+            if pwatched(gex_abi::dispatch_page(start)) {
+                let pg = gex_abi::dispatch_page(start);
+                let pt = (j.page_table.lookup(pg), j.page_table.lookup(pg + 1));
+                pwatch_say(pg, || {
+                    format!(
+                        "stale page check at {start:#x}, module {addr:#x}, provider {:?}, repeat {repeat}, elsewhere {elsewhere}, again {again}, page table {pt:x?}",
+                        j.provider.get(&start)
+                    )
+                });
+            }
             if again {
                 j.translated.remove(&start);
                 j.provider.remove(&start);
@@ -13494,6 +13560,16 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         return;
     }
     if op == gex_abi::cache_op::FTAB_TIER1 || op == gex_abi::cache_op::SLOT_CONFLICT {
+        if pwatched(gex_abi::dispatch_page(addr as u64)) {
+            pwatch_say(gex_abi::dispatch_page(addr as u64), || {
+                format!(
+                    "{} at {:#x} (block {:#x})",
+                    if op == gex_abi::cache_op::FTAB_TIER1 { "tier-1 hand-over" } else { "slot conflict" },
+                    addr as u64,
+                    _pc as u64
+                )
+            });
+        }
         // The dispatch miss that follows ignores its answer.
         NO_LEAVE.with(|c| c.set(true));
     }
@@ -13541,6 +13617,12 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
                 return;
             }
             j.retired_pages.insert(page);
+            let home = sigs::home();
+            note_page_retired(
+                home.as_ref().map(|h| h.mm()),
+                page,
+                &gex_kernel::RetireWhy { start: addr as u64, end: addr as u64 + 1, why: "guard", prot: 0, pc: _pc as u64 },
+            );
             let mut gm = GuestMem::new(guest_bytes());
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
@@ -13825,17 +13907,69 @@ fn remiss(pc: u64) {
             return None;
         }
         let page = pc / gex_abi::DISPATCH_PAGE;
+        pwatch_arm(page);
         let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
         Some(format!(
-            "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} translations so far\n",
+            "gex: {pc:#x} came to translation 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {} ({} times), {} translations so far\n",
             j.page_table.lookup(page),
             j.retired_pages.contains(&page),
+            RETIRE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).get(&page).copied().unwrap_or(0),
             j.remiss.values().sum::<u32>()
         ))
     });
     if let Some(s) = said {
         warn_line(&s);
     }
+}
+
+/// The dispatch page of the first pc to come to translation 64 times
+/// (`remiss`): the next [`PWATCH_LINES`] events on that page (misses and how
+/// they went, translations, directory writes, stale checks, retires) are
+/// said, to show where a retranslation loop goes. Armed once a run, by the
+/// loop itself; a diagnostic that changes nothing.
+static JIT_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The JIT's loop diagnostics (`?jitdiag=1`, `GEX_JIT_DIAG` under node): the
+/// retire counts by page and call (`note_page_retired`) and the page watch.
+#[no_mangle]
+pub extern "C" fn gex_set_jit_diag(on: i32) {
+    JIT_DIAG.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    gex_kernel::set_retire_why(on != 0);
+}
+
+fn jit_diag() -> bool {
+    JIT_DIAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static PWATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static PWATCH_LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const PWATCH_LINES: u32 = 96;
+
+fn pwatch_arm(page: u64) {
+    use std::sync::atomic::Ordering;
+    if !jit_diag() {
+        return;
+    }
+    if PWATCH.compare_exchange(u64::MAX, page, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        PWATCH_LEFT.store(PWATCH_LINES, Ordering::Release);
+    }
+}
+
+fn pwatched(page: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    PWATCH.load(Ordering::Relaxed) == page && PWATCH_LEFT.load(Ordering::Relaxed) != 0
+}
+
+fn pwatch_say(page: u64, what: impl FnOnce() -> String) {
+    use std::sync::atomic::Ordering;
+    if PWATCH.load(Ordering::Relaxed) != page {
+        return;
+    }
+    if PWATCH_LEFT.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1)).is_err() {
+        return;
+    }
+    let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+    warn_line(&format!("gex: watch page {page:#x} pid {} worker {}: {} (dir {dir:#x})\n", my_pid(), jit_me(), what()));
 }
 
 /// Misses at one pc this many times within [`LIVELOCK_WINDOW`] misses of a
@@ -13870,6 +14004,11 @@ const MISS_WAYS: [&str; 14] = [
 ];
 
 fn miss_way(pc: u64, way: u8) {
+    if pwatched(gex_abi::dispatch_page(pc)) {
+        pwatch_say(gex_abi::dispatch_page(pc), || {
+            format!("miss at {pc:#x}: {}, dense index {}", MISS_WAYS.get(way as usize).unwrap_or(&"?"), dense::lookup(pc))
+        });
+    }
     MISS_WAY.with(|c| {
         let (p, w, n) = c.get();
         c.set((pc, way, if p == pc && w == way { n.saturating_add(1) } else { 1 }));
@@ -14829,6 +14968,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             &intr,
         );
         note_kuser_folds(pc);
+        if pwatched(gex_abi::dispatch_page(pc)) {
+            let pg = gex_abi::dispatch_page(pc);
+            pwatch_say(pg, || {
+                format!(
+                    "translated {pc:#x}: {} blocks, has it {}, known before {}, covers {:x?}, numbers {:x?}",
+                    stats.blocks,
+                    unit.exported_blocks.iter().any(|(a, _)| *a == pc),
+                    known.contains(&pc),
+                    unit.covered.iter().filter(|(p, _)| *p == pg || *p == pg + 1).collect::<Vec<_>>(),
+                    unit.dir_entries.iter().filter(|(p, _)| *p == pg || *p == pg + 1).collect::<Vec<_>>(),
+                )
+            });
+        }
         // The blocks are counted translated before the set goes back, so a
         // sibling that takes it up first does not lift them again; taken out
         // again below if the unit is dropped.
@@ -14992,6 +15144,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
         note_live(&unit.covered);
         push_pending(j, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
+        note_module_dense(j, unit.module_id);
         publish_pending(j);
         // Point the guest directory at the slot this unit's block actually
         // lives in, for the faulting page only (minimal, to keep the shared
@@ -15296,13 +15449,65 @@ fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u6
     if !retired.is_empty() {
         crate::cgen::on_retire(retired, &gone_code(mm, retired));
         crate::fjit::on_retire(retired);
-        with_jit_only(|j| retire_code(j, retired));
+        let why = gex_kernel::take_retire_why();
+        with_jit_only(|j| {
+            for w in &why {
+                for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
+                    if page < gex_abi::DISPATCH_MAX_PAGES && j.page_table.lookup(page).is_some() {
+                        note_page_retired(Some(mm), page, w);
+                    }
+                }
+            }
+            retire_code(j, retired)
+        });
     }
     // Made executable again: the units' pages are compared, nothing is
     // forgotten (`MapLog::recheck_code`).
     if !recheck.is_empty() {
         crate::cgen::on_retire(recheck, &[]);
     }
+}
+
+/// Times each page with translations was retired (a page retired again and
+/// again is translated again and again: FL Studio's page startup came to
+/// 34k translations in 290 s on a few pages). Said once a page reaches each
+/// of a few counts, with the call and the module of the page and of the
+/// caller, so a storm names its writer. A diagnostic: nothing here changes
+/// what is retired.
+static RETIRE_COUNTS: std::sync::Mutex<std::collections::BTreeMap<u64, u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn vma_label(mm: &gex_kernel::mem::Mm, a: u64) -> String {
+    mm.lock()
+        .vmas()
+        .iter()
+        .find(|v| a >= v.start && a < v.end)
+        .map(|v| v.code.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| v.name.clone()))
+        .unwrap_or_else(|| "unmapped".into())
+}
+
+pub(crate) fn note_page_retired(mm: Option<&gex_kernel::mem::Mm>, page: u64, w: &gex_kernel::RetireWhy) {
+    if !jit_diag() {
+        return;
+    }
+    let n = {
+        let mut c = RETIRE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = c.entry(page).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if !matches!(n, 8 | 64 | 512 | 4096 | 32768) {
+        return;
+    }
+    let at = page * gex_abi::DISPATCH_PAGE;
+    let (here, from) = match mm {
+        Some(mm) => (vma_label(mm, at), if w.pc != 0 { vma_label(mm, w.pc) } else { "-".into() }),
+        None => ("?".into(), "?".into()),
+    };
+    warn_line(&format!(
+        "gex: code page {at:#x} ({here}) retired {n} times; this time by {} of [{:#x}, {:#x}) prot {:#x}, from pc {:#x} ({from})\n",
+        w.why, w.start, w.end, w.prot, w.pc
+    ));
 }
 
 /// The pages of `ranges` no longer mapped executable (an unmapped object,
@@ -15389,6 +15594,7 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             if j.page_table.lookup(page).is_some() {
                 xlate_add(4, 1);
             }
+            pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
             let at = gex_abi::DISPATCH_DIR + page * 4;
@@ -15733,6 +15939,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         }
         for m in modules {
             push_pending(j, m.dir_entries, m.table_slots, m.wasm, 0);
+            note_module_dense(j, m.module_id);
         }
         publish_pending(j);
         if let Some(r) = retired.filter(|r| !r.is_empty()) {
