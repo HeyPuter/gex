@@ -115,6 +115,8 @@ cat $A/units-for.txt
 [ -f $A/base/web/public/gex/nt/noita.tar ] || { echo "FAIL noita page: no $A/base/web/public/gex/nt/noita.tar (--make-tar)"; exit 1; }
 # The run tree, at one path so the bench box's copy updates by difference.
 T=$A/tree; rm -rf $T; cp -al $A/base $T
+# The set's image list, for the page's check (noita-page.mjs \`covered\`).
+[ -f $A/units.list ] && cp $A/units.list $T/units.list
 for d in crates shims web/src web/index.html web/nt.html tests tools; do
   [ -e $W/$d ] || continue
   rm -rf $T/$d
