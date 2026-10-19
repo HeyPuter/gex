@@ -294,7 +294,12 @@ export class GlProxy {
     const t0 = Date.now();
     while (Atomics.load(ctl, STATE) === REQUEST) {
       const host = Atomics.load(ctl, HOST);
-      if (host < 0) throw new Error('the GL device did not start');
+      // No device: the request fails (the guest's ioctl returns an error)
+      // rather than the guest's whole runtime. Nothing will serve it.
+      if (host < 0) {
+        Atomics.store(ctl, STATE, IDLE);
+        return -1;
+      }
       if (Atomics.wait(ctl, STATE, REQUEST, 30000) !== 'timed-out') continue;
       const starting = Atomics.load(ctl, HOST) === 0;
       if (!starting) throw new Error('the GL device did not answer in thirty seconds');
