@@ -79,6 +79,15 @@ set -u
 # MATRIX_HERE: tests/games of the tree to use (for a copy of this script run
 # while the tree is edited: bash reads a running script as it goes).
 here=${MATRIX_HERE:-$(cd "$(dirname "$0")" && pwd)}
+# A game's W64 or W3 prefix gets tools/wine-wasm/game-session.reg on top of
+# its session (explorer /desktop from RunServices, so the desktop comes up
+# beside the services instead of at the game's first window), as the page's
+# game sites do. A prefix without one (an older tree) is left as is.
+game_session() { # PFX
+    local w=$here/../../tools/wine-wasm
+    [ -f "$w/game-session.reg" ] || return 0
+    python3 "$w/reg-apply.py" "$1/system.reg" "$w/game-session.reg"
+}
 root=$(cd "$here/../.." && pwd)
 onlyhost= limit=300 only= out= keep=0 keepframes=0 listed=1 table= flags=(--no-cgen)
 while [ $# -gt 0 ]; do
@@ -341,6 +350,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
             printf '\n[Software\\\\Wine\\\\X11 Driver] 1791289000\n"EmulateModeset"="Y"\n' >> "$pfx/user.reg"
             [ -e "$pfx/drive_c/windows/system32/winewayland.drv" ] ||
                 cp "$w64g/lib/wine/x86_64-windows/winewayland.drv" "$pfx/drive_c/windows/system32/"
+            game_session "$pfx"
         fi
         mkdir -p "$state/wl-$slug"
         run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}" --env WINEGEX_DOOR=1
@@ -353,6 +363,7 @@ while IFS='|' read -r -u 3 slug kind dir prog args menu play input extra; do
         [ -x "$w3dist/lib/wine/i386-unix/wine" ] || { echo "$slug: no W3 dist at $w3dist (W3_DIST)" >&2; continue; }
         if [ $keep = 0 ] || [ ! -d "$pfx/drive_c" ]; then
             rm -rf "$pfx"; cp -a "$w3prefix" "$pfx"
+            game_session "$pfx"
         fi
         mkdir -p "$state/wl-$slug"
         run+=(--env WINEPREFIX="$pfx" --env WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}"
