@@ -65,9 +65,9 @@ geometry-dash|w64  |Geometry Dash                        |GeometryDash.exe      
 # mosa-lina: needs GL 3.2+; the page on gooner's SwiftShader is 3.2 compat and refused, on
 # edger's GPU (GL 4.2) it runs.
 mosa-lina    |w64  |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
-# spelunky2: needs D3D11 feature level 11.0: on SwiftShader (GL 3.2) wined3d gives 10.1, on edger's
-# GPU it passes. Then natively a blank window (loader lock), and in the page also the mmap OOM
-# near 4 GiB: needs memory64 (W64.7).
+# spelunky2: needs memory64 (W64.7): it makes fixed allocations at 7-8 TiB, which a wasm32
+# guest cannot place; in the page it runs out of address space at about 120 s. Not a bug.
+# (Also: D3D11 feature level 11.0, which SwiftShader's GL 3.2 does not give; edger's GPU does.)
 spelunky2    |w64  |Spelunky 2                           |Spel2.exe                           | |-|-|-
 hades        |w64  |Hades                                |x64/Hades.exe                       | |-|-|-|stub=basecamp@x64/BasecampBugReporter.Native.dll host=edger
 baba         |w64  |Baba Is You                          |Baba Is You.exe                     | |-|-|-
@@ -91,7 +91,8 @@ gungeon      |dotnet|Enter the Gungeon                  |Unity Mono (x64 and i38
 stardew      |dotnet|Stardew Valley                     |MonoGame on .NET 6: stream U (also games-linux)| |-|-|-
 
 # i386 Windows games on W3, added 10-18 (G2), last so the served ports above keep their numbers.
-# celeste, towerfall, antichamber: .NET (XNA/FNA) and UDK on Wine Mono (W3 dist -mono11.2.0, 1018a).
+# celeste, antichamber: .NET (XNA/FNA) and UDK on Wine Mono (W3 dist -mono11.2.0, 1018a).
+# towerfall: blocked in place (its row keeps its port number).
 celeste      |w3   |Celeste                             |Celeste.exe                         | |4530|-|celeste-w3.wl|page=w3split
-towerfall    |w3   |TowerFall Ascension                 |TowerFall.exe                       | |9900|-|-
+towerfall    |blocked|TowerFall Ascension               |needs a Steam client: without one it stops at "Couldn't find Steam!" (no stand-in, the no-DRM rule)| |-|-|-
 antichamber  |w3   |Antichamber                         |Binaries/Win32/UDK.exe              | |-|-|-|page=w3split
