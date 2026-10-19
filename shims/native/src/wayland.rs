@@ -106,6 +106,10 @@ enum Ev {
 /// 44    hscroll -100         # pixels right (negative: left), `x N` as scroll
 /// ```
 ///
+/// `window W H` in place of `frames N` starts the clock once a placed window
+/// of W x H is on the screen: what a test waits for when a loaded machine
+/// makes any fixed delay after the first frame too short.
+///
 /// Coordinates are the focused surface's pixels.
 struct Input {
     events: Vec<(f64, Ev, String)>,
@@ -114,6 +118,8 @@ struct Input {
     /// Frames to see before the clock starts, and how many have been.
     after: u64,
     seen: u64,
+    /// `window W H`: the clock starts once a placed window this size is up.
+    window: Option<(u32, u32)>,
 }
 
 /// Linux `KEY_*` codes for the names a script may use (else a number).
@@ -140,6 +146,7 @@ impl Input {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let mut events = Vec::new();
         let mut after = 1;
+        let mut window = None;
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -149,6 +156,11 @@ impl Input {
             let bad = || format!("{path}:{}: cannot read `{line}`", n + 1);
             if w[0] == "frames" {
                 after = w.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                continue;
+            }
+            if w[0] == "window" {
+                let n = |i: usize| -> Result<u32, String> { w.get(i).and_then(|v| v.parse().ok()).ok_or_else(bad) };
+                window = Some((n(1)?, n(2)?));
                 continue;
             }
             let t: f64 = w[0].parse().map_err(|_| bad())?;
@@ -186,8 +198,8 @@ impl Input {
         }
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
         // `frames 0`: from the compositor's start.
-        let start = if after == 0 { Some(std::time::Instant::now()) } else { None };
-        Ok(Input { events, next: 0, start, after, seen: 0 })
+        let start = if after == 0 && window.is_none() { Some(std::time::Instant::now()) } else { None };
+        Ok(Input { events, next: 0, start, after, seen: 0, window })
     }
 }
 
@@ -224,10 +236,27 @@ impl Wayland {
         crate::stall::frame();
         if let Some(inp) = self.inner.input.lock().unwrap().as_mut() {
             inp.seen += 1;
-            if inp.seen >= inp.after && inp.start.is_none() {
+            if inp.window.is_none() && inp.seen >= inp.after && inp.start.is_none() {
                 eprintln!("[gex] input: the script's clock starts at frame {}", inp.seen);
                 inp.start = Some(std::time::Instant::now());
             }
+        }
+    }
+
+    /// The screen changed: the input script's clock starts once its
+    /// `window W H` is up.
+    fn note_screen(&self) {
+        let mut g = self.inner.input.lock().unwrap();
+        let Some(inp) = g.as_mut() else { return };
+        let (Some((w, h)), None) = (inp.window, inp.start) else { return };
+        let screen = self.inner.screen.lock().unwrap();
+        let up = screen
+            .placed
+            .keys()
+            .any(|k| screen.frames.get(k).is_some_and(|f| f.width as u32 == w && f.height as u32 == h));
+        if up {
+            eprintln!("[gex] input: the script's clock starts with a {w}x{h} window up");
+            inp.start = Some(std::time::Instant::now());
         }
     }
 
@@ -499,6 +528,7 @@ impl Wayland {
             self.note_frame();
             // One screen per batch of commits, not one per surface.
             self.save(&produced);
+            self.note_screen();
             self.inner.frames.lock().unwrap().extend(produced);
         }
     }

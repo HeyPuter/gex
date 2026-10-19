@@ -38,12 +38,16 @@ leg() { # NAME DIST PREFIX WINE EXE
 		extra=(--env WINEGEX_DOOR=1 --env "WINEDLLOVERRIDES=mscoree=;mshtml=")
 	fi
 	mkdir -p "$w/wl-$name"
-	(cd "$p/drive_c" && GEX_WL_INPUT="$here/wheel.wl" timeout -k 10 "${TMO:-300}" "$gexc" run \
+	(cd "$p/drive_c" && GEX_WL_INPUT="$here/wheel.wl" timeout -k 10 "${TMO:-400}" "$gexc" run \
 		--wayland "$w/wl-$name" --wayland-size 640x480 --wayland-out null \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all "${extra[@]}" \
-		"$dist/lib/wine/$4/wine" "C:\\$5" 120) > "$log" 2>&1
+		"$dist/lib/wine/$4/wine" "C:\\$5" 300) > "$log" 2>&1
 	if grep -aq '^wheel ok' "$log"; then pass=$((pass + 1)); echo "ok   wheel $name"
-	else fail=$((fail + 1)); echo "FAIL wheel $name"; grep -a '^wheel\|^hwheel' "$log" | tail -6 | sed 's/^/  /'
+	else fail=$((fail + 1))
+		# The reason on the FAIL line itself: a gate keeps only that line.
+		why=$(grep -a '^wheel: vertical' "$log" | tail -1)
+		[ -n "$why" ] || why="no result line ($(grep -aq '^wheel: window up' "$log" && echo 'window up' || echo 'window never up'), $(grep -aq "script's clock starts" "$log" && echo 'input clock started' || echo 'input clock never started'), $(grep -ac '^\[gex\] input at' "$log") input events sent)"
+		echo "FAIL wheel $name: $why"; grep -a '^wheel\|^hwheel' "$log" | tail -6 | sed 's/^/  /'
 		grep -av '^wheel\|^hwheel\|^\[gex\] loaded' "$log" | tail -6 | sed 's/^/  | /'; fi
 }
 leg w3 "$w3dist" "$w3prefix" i386-unix wheel32.exe
