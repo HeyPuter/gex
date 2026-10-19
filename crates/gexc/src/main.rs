@@ -18,6 +18,7 @@ mod prof;
 mod eject;
 mod nt_run;
 mod pe_info;
+mod host_xattr;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode> {
+    host_xattr::install();
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
         usage();

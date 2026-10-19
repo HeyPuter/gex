@@ -19,9 +19,12 @@ src=$1 dist=$2 out=$3; shift 3
 rm -rf "$out"
 # Real files, without following dosdevices (z: is /): the page bundles the
 # tree, and a run writes its own copy. Links elsewhere (a staged prefix's
-# DLLs into the master prefix) are copied as what they point at.
+# DLLs into the master prefix) are copied as what they point at. The user.
+# extended attributes go too: Wine keeps a file's DOS attributes in
+# user.DOSATTRIB (a folder's desktop.ini is hidden and system).
 mkdir -p "$out"; out=$(cd "$out" && pwd)
-(cd "$src" && find . -path ./dosdevices -prune -o -print0 | cpio -0pdmL --quiet "$out")
+tar -C "$src" --exclude=./dosdevices -h --xattrs --xattrs-include='user.*' -cf - . |
+    tar -C "$out" --xattrs --xattrs-include='user.*' -xpf -
 mkdir -p "$out/dosdevices"
 ln -s ../drive_c "$out/dosdevices/c:" && ln -s / "$out/dosdevices/z:"
 regs=("$@"); [ ${#regs[@]} -gt 0 ] || regs=("$here/w3-session.reg")

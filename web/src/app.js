@@ -478,6 +478,7 @@ async function begin(opts, base, at, state, meter) {
     hard: Object.assign(a.hard ?? {}, t.hard),
     links: Object.assign(a.links ?? {}, t.links),
     mtimes: Object.assign(a.mtimes ?? {}, t.mtimes),
+    xattrs: Object.assign(a.xattrs ?? {}, t.xattrs),
   }));
   if (pieceBufs) {
     // The archive holds each such file empty (its mode, its time); its bytes
@@ -704,6 +705,8 @@ async function begin(opts, base, at, state, meter) {
     // A Wine prefix's `dosdevices/c:`, which Wine opens by that name.
     symlinks: tree.links ?? {},
     mtimes: mtimes ? { ...lazyMtimes, ...tree.mtimes } : undefined,
+    // Wine's DOS attributes on the prefix (`tar --xattrs`).
+    xattrs: tree.xattrs,
     env,
     args,
     cwd,

@@ -72,6 +72,8 @@ const files = {};
 const lazy = [];
 // Each bundled file's modification time, as the host has it (seconds).
 const mtimes = {};
+// Extended attributes from a `--tar`'s pax headers: path to { name: bytes }.
+const xattrs = {};
 let strace = false;
 let cwd = null;
 const extract = [];
@@ -175,6 +177,7 @@ const rest = [];
       const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
       Object.assign(files, tree.files);
       Object.assign(modes, tree.modes ?? {});
+      Object.assign(xattrs, tree.xattrs ?? {});
       Object.assign(hard, tree.hard ?? {});
       Object.assign(symlinks, tree.links ?? {});
       dirs.push(...(tree.dirs ?? []));
@@ -619,6 +622,7 @@ try {
       // GEX_STRACE_PID=N: narrate that one process (a forked child too).
       stracePid: process.env.GEX_STRACE_PID ? Number(process.env.GEX_STRACE_PID) : undefined,
       mtimes,
+      xattrs,
       // The debugging switches, in the run's own options as well as the boot
       // message: `opts` is what a fork record carries to a child's Worker.
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,

@@ -2888,6 +2888,61 @@ pub extern "C" fn k_fs_chmod(path: gex_kmem::PAddr, path_len: u32, mode: u32) ->
     as_unit(rootfs().chmod(&path_of(path, path_len), mode))
 }
 
+/// An extended-attribute call (`remote::Remote::xattr`): on open `handle`,
+/// or on `path` when `handle` is negative.
+#[no_mangle]
+pub extern "C" fn k_fs_xattr(
+    handle: i32,
+    path: gex_kmem::PAddr,
+    path_len: u32,
+    op: u32,
+    name: gex_kmem::PAddr,
+    name_len: u32,
+    buf: gex_kmem::PAddr,
+    len: u32,
+    flags: u32,
+) -> i32 {
+    use gex_kernel::vfs::{remote::xattr_op, XattrOp};
+    let name = String::from_utf8_lossy(&{
+        let mut b = vec![0u8; name_len as usize];
+        if name_len > 0 {
+            unsafe { gex_kmem::pull_checked(b.as_mut_ptr(), name, name_len) };
+        }
+        b
+    })
+    .into_owned();
+    let mut bytes = vec![0u8; len as usize];
+    if op == xattr_op::SET && len > 0 {
+        unsafe { gex_kmem::pull_checked(bytes.as_mut_ptr(), buf, len) };
+    }
+    let call = |o: XattrOp<'_>| -> Result<usize, gex_kernel::errno::Errno> {
+        if handle >= 0 {
+            let Some(h) = handle_at(handle) else { return Err(gex_kernel::errno::Errno::EBADF) };
+            if let Some(r) = h.xattr(o) {
+                return r;
+            }
+            return Err(gex_kernel::errno::Errno::EOPNOTSUPP);
+        }
+        rootfs().xattr(&path_of(path, path_len), o)
+    };
+    let r = match op {
+        xattr_op::GET => call(XattrOp::Get { name: &name, buf: &mut bytes }),
+        xattr_op::SET => call(XattrOp::Set { name: &name, value: &bytes, flags }),
+        xattr_op::LIST => call(XattrOp::List { buf: &mut bytes }),
+        xattr_op::REMOVE => call(XattrOp::Remove { name: &name }),
+        _ => Err(gex_kernel::errno::Errno::EINVAL),
+    };
+    match r {
+        Ok(n) => {
+            if (op == xattr_op::GET || op == xattr_op::LIST) && len > 0 && n > 0 {
+                unsafe { gex_kmem::push_checked(buf, bytes.as_ptr(), n as u32) };
+            }
+            n as i32
+        }
+        Err(e) => -e.0,
+    }
+}
+
 /// A path's modification time: `utimensat`, or a bundle's file times.
 #[no_mangle]
 pub extern "C" fn k_fs_set_mtime(path: gex_kmem::PAddr, path_len: u32, secs: i64) -> i32 {

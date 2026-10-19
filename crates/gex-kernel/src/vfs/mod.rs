@@ -152,6 +152,92 @@ pub const FADV_WILLNEED: u32 = 3;
 /// A W3 client advises this before `create_mapping` (ntdll's `NtCreateSection`).
 pub const FADV_GEX_IMAGE: u32 = 0x4745_0001;
 
+/// One extended-attribute call (`getxattr` and its kin), path or handle.
+/// Names are whole (`user.foo`); only the `user.` namespace is kept
+/// ([`xattr_name`]). Every form answers a byte count.
+#[derive(Debug)]
+pub enum XattrOp<'a> {
+    /// The value into `buf`, or its size when `buf` is empty; `ENODATA`
+    /// for an attribute that is not there, `ERANGE` when `buf` is short.
+    Get { name: &'a str, buf: &'a mut [u8] },
+    /// `flags`: `XATTR_CREATE` (1, `EEXIST` if it is there) and
+    /// `XATTR_REPLACE` (2, `ENODATA` if it is not).
+    Set { name: &'a str, value: &'a [u8], flags: u32 },
+    /// Every name, each NUL-terminated, into `buf` (or the size, as `Get`).
+    List { buf: &'a mut [u8] },
+    /// `ENODATA` if it is not there.
+    Remove { name: &'a str },
+}
+
+/// `XATTR_CREATE` and `XATTR_REPLACE`.
+pub const XATTR_CREATE: u32 = 1;
+pub const XATTR_REPLACE: u32 = 2;
+/// Linux's limits: a name of at most 255 bytes, a value of at most 64 KiB.
+pub const XATTR_NAME_MAX: usize = 255;
+pub const XATTR_SIZE_MAX: usize = 65536;
+
+/// Check an attribute name: `ERANGE` past [`XATTR_NAME_MAX`] or empty, and
+/// `EOPNOTSUPP` outside `user.` (the trusted, security and system
+/// namespaces are the kernel's own, which a tmpfs here does not model).
+pub fn xattr_name(name: &str) -> Result<(), Errno> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(Errno::ERANGE);
+    }
+    if !name.starts_with("user.") || name.len() == 5 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// One node's attributes, kept by a filesystem: the work every
+/// [`XattrOp`] does on them.
+pub fn xattr_apply(attrs: &mut std::collections::BTreeMap<String, Vec<u8>>, op: XattrOp<'_>) -> Result<usize, Errno> {
+    fn out(buf: &mut [u8], bytes: &[u8]) -> Result<usize, Errno> {
+        if buf.is_empty() {
+            return Ok(bytes.len());
+        }
+        if buf.len() < bytes.len() {
+            return Err(Errno::ERANGE);
+        }
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    match op {
+        XattrOp::Get { name, buf } => {
+            xattr_name(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
+            let v = attrs.get(name).ok_or(Errno::ENODATA)?;
+            out(buf, v)
+        }
+        XattrOp::Set { name, value, flags } => {
+            xattr_name(name)?;
+            if value.len() > XATTR_SIZE_MAX {
+                return Err(Errno::E2BIG);
+            }
+            let there = attrs.contains_key(name);
+            if flags & XATTR_CREATE != 0 && there {
+                return Err(Errno::EEXIST);
+            }
+            if flags & XATTR_REPLACE != 0 && !there {
+                return Err(Errno::ENODATA);
+            }
+            attrs.insert(name.to_string(), value.to_vec());
+            Ok(0)
+        }
+        XattrOp::List { buf } => {
+            let mut all = Vec::new();
+            for k in attrs.keys() {
+                all.extend_from_slice(k.as_bytes());
+                all.push(0);
+            }
+            out(buf, &all)
+        }
+        XattrOp::Remove { name } => {
+            xattr_name(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
+            attrs.remove(name).map(|_| 0).ok_or(Errno::ENODATA)
+        }
+    }
+}
+
 pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// Read at `offset`, returning the bytes read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult;
@@ -232,6 +318,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         let _ = mode;
+        None
+    }
+
+    /// An extended-attribute call on the open file itself (`fgetxattr` and
+    /// its kin); `None` where the handle has no node of its own to keep
+    /// them on, and the caller goes by its path.
+    fn xattr(&self, op: XattrOp<'_>) -> Option<Result<usize, Errno>> {
+        let _ = op;
         None
     }
     /// True when reads and writes ignore the offset, as for a terminal or
@@ -679,6 +773,13 @@ pub trait FileSystem: Send + Sync {
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         let _ = path;
         Err(Errno::EROFS)
+    }
+    /// An extended-attribute call on `path` (the node it names: a final
+    /// symlink is the link's own, the caller follows it first). A
+    /// filesystem that keeps none answers `EOPNOTSUPP`, as Linux's do.
+    fn xattr(&self, path: &str, op: XattrOp<'_>) -> Result<usize, Errno> {
+        let _ = (path, op);
+        Err(Errno::EOPNOTSUPP)
     }
 }
 
@@ -1170,6 +1271,17 @@ impl Namespace {
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.chmod(&rel, mode)
+    }
+
+    /// An extended-attribute call on `path`, following a final symlink when
+    /// `follow` (`getxattr`; `lgetxattr` does not).
+    pub fn xattr(&self, path: &str, follow: bool, op: XattrOp<'_>) -> Result<usize, Errno> {
+        let abs = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_walked(&abs, follow)? {
+            return fs.xattr(&rel, op);
+        }
+        let (fs, rel) = self.resolve(&abs)?;
+        fs.xattr(&rel, op)
     }
 
     /// Set the modification time of `path`, following a final symlink when

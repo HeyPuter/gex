@@ -853,6 +853,7 @@ pub(crate) fn i386_number(n: u64) -> Option<u64> {
         p::SYMLINKAT => x::SYMLINKAT,
         p::READLINKAT => x::READLINKAT,
         p::FCHMODAT => x::FCHMODAT,
+        p::SETXATTR..=p::FREMOVEXATTR => x::SETXATTR + (n - p::SETXATTR),
         p::FACCESSAT => x::FACCESSAT,
         p::GET_ROBUST_LIST => x::GET_ROBUST_LIST,
         p::SET_ROBUST_LIST => x::SET_ROBUST_LIST,

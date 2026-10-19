@@ -365,6 +365,7 @@ extern "C" {
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
     fn k_fs_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
+    fn k_fs_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -911,6 +912,9 @@ extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_n
 }
 extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
     unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
+}
+extern "C" fn rf_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32 {
+    unsafe { k_fs_xattr(handle, path, path_len, op, name, name_len, buf, len, flags) }
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
@@ -1500,6 +1504,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             touch: rf_touch,
             set_times: rf_set_times,
             set_times_fd: rf_set_times_fd,
+            xattr: rf_xattr,
         },
     )))
 }
@@ -1514,6 +1519,7 @@ fn install_bundle_remote() {
     DIRS.0.borrow_mut().clear();
     MODES.0.borrow_mut().clear();
     MTIMES.0.borrow_mut().clear();
+    XATTRS.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -5748,6 +5754,41 @@ static MTIMES: SingleThreaded<Vec<(String, i64)>> =
 static MODES: SingleThreaded<Vec<(String, u32)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
 
+/// Bundled files' extended attributes (a tar's `SCHILY.xattr.user.*`
+/// records: Wine's DOS attributes). See `gex_set_xattr`.
+static XATTRS: SingleThreaded<Vec<(String, String, Vec<u8>)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// A bundled file's (or directory's) extended attribute `name` (`user.`
+/// only), set once the bundle is in, as its mode is.
+#[no_mangle]
+pub extern "C" fn gex_set_xattr(path: u32, path_len: u32, name: u32, name_len: u32, value: u32, value_len: u32) {
+    let (Ok(p), Ok(n)) = (std::str::from_utf8(shim_slice(path, path_len)), std::str::from_utf8(shim_slice(name, name_len))) else {
+        return;
+    };
+    let v = shim_slice(value, value_len).to_vec();
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe {
+                k_fs_xattr(
+                    -1,
+                    gex_kernel::PAddr::from(path),
+                    path_len,
+                    gex_kernel::vfs::remote::xattr_op::SET,
+                    gex_kernel::PAddr::from(name),
+                    name_len,
+                    gex_kernel::PAddr::from(value),
+                    value_len,
+                    0,
+                )
+            };
+        }
+        return;
+    }
+    XATTRS.0.borrow_mut().push((p.to_string(), n.to_string(), v));
+}
+
 /// Put the staged bundle into a filesystem, creating the directories on the
 /// way to each file.
 fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
@@ -5786,6 +5827,10 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
     }
     for (name, secs) in std::mem::take(&mut *MTIMES.0.borrow_mut()) {
         let _ = gex_kernel::vfs::FileSystem::set_mtime(root, name.trim_start_matches('/'), secs);
+    }
+    for (path, name, value) in std::mem::take(&mut *XATTRS.0.borrow_mut()) {
+        let op = gex_kernel::vfs::XattrOp::Set { name: &name, value: &value, flags: 0 };
+        let _ = gex_kernel::vfs::FileSystem::xattr(root, path.trim_start_matches('/'), op);
     }
 }
 
