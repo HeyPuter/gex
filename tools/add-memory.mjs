@@ -151,12 +151,14 @@ const result = new Uint8Array(total);
 // Compile it here rather than discovering at run time that the surgery was
 // wrong. This is the only check that the appended entry is well formed and
 // that the `memory.copy` instructions referring to it now validate.
+// `ADD_MEMORY_MORE=1`: another memory is still to be added (the kernel's
+// `process64`), whose instructions do not validate until it is.
 try {
-  await WebAssembly.compile(result);
+  if (!process.env.ADD_MEMORY_MORE) await WebAssembly.compile(result);
 } catch (err) {
   console.error(`add-memory: the result does not compile: ${err.message}`);
   process.exit(1);
 }
 
 writeFileSync(outPath, result);
-console.log(`  ${outPath}: ${result.length} bytes, imports ${mod}.${name} as memory 1`);
+console.log(`  ${outPath}: ${result.length} bytes, imports ${mod}.${name} as its last memory`);

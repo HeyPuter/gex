@@ -12,7 +12,7 @@
 //
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
-import { lazyFetch } from './lazy-fetch.mjs';
+import { lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { single, sched } from './single.mjs';
 
 /** The single-thread build's fibers park on the scheduler, not on their
@@ -60,12 +60,12 @@ export class PageTty {
       try {
         scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared: true });
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory) },
         });
       } catch {
         scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
         inst = await WebAssembly.instantiate(mod, {
-          env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
+          env: { memory: spec.memory, ...processMemories(scratch), lazy_fetch: lazyFetch(spec.memory) },
         });
       }
     } catch (e) {
@@ -128,7 +128,7 @@ export class PageTty {
     for (let at = 0; at < bytes.length; at += SCRATCH_BYTES - SCRATCH) {
       const chunk = bytes.subarray(at, at + SCRATCH_BYTES - SCRATCH);
       this.#bytes().set(chunk, SCRATCH);
-      queued = this.#k.k_tty_input(SCRATCH, chunk.length);
+      queued = this.#k.k_tty_input(BigInt(SCRATCH), chunk.length);
     }
     poke();
     return queued;
@@ -138,7 +138,7 @@ export class PageTty {
   drainEcho() {
     const out = [];
     for (;;) {
-      const n = this.#k.k_tty_echo(SCRATCH, SCRATCH_BYTES - SCRATCH);
+      const n = this.#k.k_tty_echo(BigInt(SCRATCH), SCRATCH_BYTES - SCRATCH);
       if (n <= 0) break;
       out.push(this.#bytes().slice(SCRATCH, SCRATCH + n));
       if (n < SCRATCH_BYTES - SCRATCH) break;
@@ -171,7 +171,7 @@ export class PageTty {
 
   /** `c_lflag`, which says whether the guest has taken over line editing. */
   lflag() {
-    const n = this.#k.k_tty_get_termios(SCRATCH, 60);
+    const n = this.#k.k_tty_get_termios(BigInt(SCRATCH), 60);
     if (n < 16) return 0;
     const b = this.#bytes();
     return (b[SCRATCH + 12] | (b[SCRATCH + 13] << 8)

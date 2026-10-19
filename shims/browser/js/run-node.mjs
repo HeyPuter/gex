@@ -40,6 +40,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
+import { spareMemories } from './lazy-fetch.mjs';
 // GEX_SINGLE=1: the single-thread build (docs/single-thread.md) -- every
 // process and thread a fiber on this thread, no SharedArrayBuffer, the shared
 // build's binaries on plain memories. Before anything is compiled.
@@ -255,6 +256,8 @@ try {
     // a run can have -- at one gigabyte a full Debian arm64 image did not fit
     // (#91). `maximum` reserves address space, not pages, so raising it is free.
     memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
+    // Made once for every Worker (lazy-fetch.mjs `spareMemories`).
+    spare: spareMemories(),
   };
 } catch {
   // Not built. `shims/kernel/build.sh` makes it; a run that never forks will
@@ -305,6 +308,23 @@ function readClosure() {
   return names.map((n) => readFileSync(join(dir, n)));
 }
 
+// With GEX_MEM64, the 32-bit memory's runtime too, for a process whose
+// program cannot run in a 64-bit one (host.mjs `#other`: a wasm32 module,
+// such as W64's wineserver, or a 32-bit ELF). Optional, as the kernel.
+let other = null;
+if (MEM64 && SHARED && kernel) {
+  try {
+    other = {
+      shim: readFileSync(new URL(`gex_browser${ARCH_INFIX}.shared.wasm`, PUB)),
+      guest: readFileSync(new URL(`seed${ARCH_INFIX}.shared.wasm`, PUB)),
+      // the one kernel module serves both flavours (gex-kmem)
+      kernel: kernel.module,
+    };
+  } catch {
+    // Not built: such a process says so when it starts.
+  }
+}
+
 const host = new ProcessHost({
   makeWorker: SINGLE ? () => new FiberWorker() : () => new Worker(new URL('./worker.mjs', import.meta.url),
     // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
@@ -316,6 +336,7 @@ const host = new ProcessHost({
   shim: shimWasm,
   guest: guestWasm,
   kernel,
+  other,
   // Merged into every process's start message, because on a real machine
   // every process gets the same of all of this.
   extra: {

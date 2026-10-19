@@ -5,8 +5,3 @@ edition.workspace = true
 
 [lib]
 crate-type = ["rlib"]
-
-[features]
-# The process memory is a memory64 (an x86-64 guest with a 64-bit memory,
-# docs/mem64.md step 6): its addresses are i64 in `memory.copy`/`memory.size`.
-process64 = []

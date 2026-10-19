@@ -428,3 +428,22 @@ browser shim; the coordinator sequences them.
   (muck.sh, rw/rw.sh after the copy below); muck.sh's cores default to
   1,7, and the coordinator assigns cores.
 
+
+### State at 2026-10-19: W64 in the memory64 page (opt-in)
+
+- Memory64 is never the default. The default for every 64-bit program,
+  W64 included, is the lowered wasm32 build in a 32-bit memory. W64 in a
+  64-bit memory is opt-in twice over: the page's `?mem64=1` and a
+  `W64_MEM64=1` dist (tools/wine-wasm/w64-dist.sh, default off). Nothing in
+  the page, eject or the gate turns either on.
+- In such a page the wasm32 wineserver (and any 32-bit ELF) still runs in a
+  32-bit memory: the exec record names the program's flavour (vfork.rs
+  `exec_memory`), and a fork+exec of the other flavour goes on in a fresh
+  Worker (lib.rs `exec_away`, host.mjs `other`). One kernel module serves
+  both flavours (gex-kmem memories 1 and 2).
+- tests/wine64/nt-x64.sh `MEM64=1 PAGE=mp` passes the gate's W64 cases plus
+  `highdata mem64` (5 GiB). Not natively: a gexc run's processes share one
+  flavour (OPTIMIZATION-BACKLOG.md).
+- Next: the per-program choice of §5 (a flag at exec, or the learned
+  per-binary record), so that one game (Hades x64) runs in M64 while the
+  rest of the same page stays M32. Until then the choice is page-wide.

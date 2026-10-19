@@ -19,6 +19,12 @@
 # W64_TOOLS (w64-dist.sh's: a native build of the fork's tools) and W64_SRC
 # (the Wine tree) add the native PE side's entry-adapter case, `dll`
 # (tests/wasm64/dll, W64.2; needs GEX_WASM64_SYSROOT).
+# MEM64=1 runs them in the memory64 flavour (W64.7, §0.1), in the page only
+# (PAGE=mp): DIST is then a W64_MEM64=1 install (w64-dist.sh), run on the
+# 64-bit memory's shim and seed (GEX_MEM64=1 shims/browser/build.sh, the
+# page's ?mem64=1) with the wasm32 server in a 32-bit memory beside it;
+# highdata then allocates 5 GiB (`highdata mem64`). Not natively: a gexc
+# run's processes share one flavour (OPTIMIZATION-BACKLOG.md).
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
@@ -55,9 +61,11 @@ wine=$dist/lib/wine/x86_64-unix/wine
 bin=$root/tests/nt/bin/x64
 door=0; [ "${DOOR:-0}" = 1 ] && door=1
 single=; [ "${PAGE:-}" = sp ] && single=1
+m64=; [ "${MEM64:-0}" = 1 ] && m64=1
+[ -z "$m64" ] || [ "${PAGE:-}" = mp ] || { echo "MEM64=1 runs in the page: PAGE=mp" >&2; exit 2; }
 w=${WORK:-$(mktemp -d)}
 mkdir -p "$w"
-tag=W64
+tag=W64${m64:+ mem64}
 page=${PAGE:-}
 if [ -n "$page" ]; then
 	case $page in mp|sp) ;; *) echo "PAGE is mp or sp" >&2; exit 2 ;; esac
@@ -65,12 +73,17 @@ if [ -n "$page" ]; then
 	seed=$root/web/public/gex/seed.x86.shared.wasm
 	[ -f "$seed" ] && [ -f "$root/web/public/gex/gex_browser.x86.shared.wasm" ] ||
 		{ echo "no x86 shared shim and seed in web/public/gex; GEX_ARCH=x86 shims/browser/build.sh" >&2; exit 2; }
+	if [ -n "$m64" ]; then
+		seed=$root/web/public/gex/seed.x86.m64.shared.wasm
+		[ -f "$seed" ] && [ -f "$root/web/public/gex/gex_browser.x86.m64.shared.wasm" ] ||
+			{ echo "no x86 m64 shim and seed in web/public/gex; GEX_ARCH=x86 GEX_MEM64=1 shims/browser/build.sh" >&2; exit 2; }
+	fi
 	# the single-thread build needs JSPI (on by default from node 25)
 	jspi=; node -e 'process.exit(typeof WebAssembly.Suspending === "function" ? 0 : 1)' 2>/dev/null || jspi=--experimental-wasm-jspi
 	"$root/tools/wine-wasm/page-prefix.sh" "$prefix" "$dist" "$w/page-pfx" > "$w/page-pfx.log" 2>&1 ||
 		{ echo "FAIL page prefix template"; tail -5 "$w/page-pfx.log"; exit 1; }
 	prefix=$w/page-pfx
-	tag="W64 page $page"
+	tag="W64 page $page${m64:+ mem64}"
 	# the door off in the single-thread build (it has none: the pipes)
 	[ "$page" = sp ] && door=0
 fi
@@ -129,7 +142,7 @@ check() {
 	fi
 	local gl=(); [ -z "${GL:-}" ] || gl=(--gl)
 	if [ -n "$page" ]; then
-		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
+		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
 			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
@@ -223,11 +236,18 @@ else
 	case " ${CASES:-authattrs} " in *" authattrs "*)
 		fail=$((fail + 1)); echo "FAIL x64/authattrs ($tag): x86_64-w64-mingw32-gcc" ;; esac
 fi
-# W64.1b: data above 2 GiB, code below it (highdata.c). Not in the page:
-# there the shim's heap is the upper 2 GiB of the process's memory, and the
-# guest gets just under 2 GiB (GUEST_LIMIT 0x7fff0000; about 1975 MiB
-# allocates). It needs the memory64 page (W64.7).
-if [ -n "$page" ]; then
+# W64.1b: data above 2 GiB, code below it (highdata.c). Not in a 32-bit
+# memory's page: there the shim's heap is the upper 2 GiB of the process's
+# memory, and the guest gets just under 2 GiB (GUEST_LIMIT 0x7fff0000;
+# about 1975 MiB allocates). In the memory64 page (MEM64=1) 5 GiB, code
+# anywhere (`highdata mem64`).
+if [ -n "$m64" ]; then
+	if x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then
+		check highdata 0 "$allok" "$w/highdata.exe" mem64
+	else
+		fail=$((fail + 1)); echo "FAIL x64/highdata ($tag): x86_64-w64-mingw32-gcc"
+	fi
+elif [ -n "$page" ]; then
 	case " ${CASES:-highdata} " in *" highdata "*)
 		echo "skip x64/highdata ($tag): the page's guest has under 2 GiB until W64.7" ;; esac
 elif x86_64-w64-mingw32-gcc -O1 -o "$w/highdata.exe" "$here/highdata.c"; then

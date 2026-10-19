@@ -361,10 +361,10 @@ fn pe_head(b: &[u8]) -> Option<(u64, bool)> {
 /// and `gex_wasmdll_installed`), -2 when bound into the install (bridges
 /// to write), -3 for an i386 image with a function-tier unit to serve
 /// (`super::w3_mapped`), -1 for anything else (an i386 image stays on
-/// tier-1).
+/// tier-1). `base` is 64-bit for a memory64 program's (JS widens a 32-bit
+/// one's).
 #[no_mangle]
-pub extern "C" fn gex_image_mapped(base: u32, fd: i32) -> i32 {
-    let base = base as u64;
+pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     // The table needs no kernel lock (step 3), and the read is the file's.
     let Some((path, file)) = crate::fds_free().and_then(|fds| {
         let f = fds.get(fd).ok()?;
@@ -682,8 +682,8 @@ pub extern "C" fn gex_wine_pe_slot(ptr: u32, len: u32) -> u32 {
 /// `gex.code_changed(addr, len)` (W3: Wine's NtFlushInstructionCache): the
 /// translations of `[addr, addr + len)` are retired, as natively.
 #[no_mangle]
-pub extern "C" fn gex_code_changed(addr: u32, len: u32) {
-    let (addr, len) = (addr as u64, len as u64);
+pub extern "C" fn gex_code_changed(addr: u64, len: u32) {
+    let len = len as u64;
     let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
     if end > start {
         crate::sigs::proc_home().mm().lock().log.retired_code.push((start, end));

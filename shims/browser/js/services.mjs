@@ -6,7 +6,7 @@
 //
 // It holds a process memory of its own only because the kernel imports one and
 // `k_pipe_write` reads bytes from there; it is a staging buffer, nothing more.
-import { lazyFetch } from './lazy-fetch.mjs';
+import { lazyFetch, processMemories } from './lazy-fetch.mjs';
 import { single, sched } from './single.mjs';
 let k = null;
 let stage = null; // Uint8Array over this Worker's dummy process memory
@@ -29,7 +29,7 @@ self.onmessage = async (e) => {
       shared: true,
     });
     const inst = await WebAssembly.instantiate(mod, {
-      env: { memory: msg.kernel.memory, process, lazy_fetch: lazyFetch(msg.kernel.memory) },
+      env: { memory: msg.kernel.memory, ...processMemories(process), lazy_fetch: lazyFetch(msg.kernel.memory) },
     });
     k = inst.exports;
     // A stack of this Worker's own: each instance's `__stack_pointer` starts at
@@ -47,7 +47,7 @@ self.onmessage = async (e) => {
     while (off < bytes.length) {
       const n = Math.min(bytes.length - off, 0x10000);
       stage.set(bytes.subarray(off, off + n), STAGE_AT);
-      const wrote = k.k_pipe_write(msg.pipe, STAGE_AT, n);
+      const wrote = k.k_pipe_write(msg.pipe, BigInt(STAGE_AT), n);
       if (wrote <= 0) break;
       off += wrote;
     }

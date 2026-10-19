@@ -77,23 +77,27 @@ RUSTFLAGS="-C link-arg=--import-memory \
 #
 # A Worker still hands over the guest's memory, which is far larger than one
 # page and satisfies the minimum as it always did.
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.wasm env process 1 1
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.plain.wasm env process 1 0
+#
+# Then a second one, `process64`, a memory64 (gex-kmem's memory 2): one module
+# serves processes of both flavours, a 32-bit memory and a 64-bit one
+# (docs/mem64.md step 6), each Worker giving its own as the one of its type
+# and an empty memory as the other (lazy-fetch.mjs `processMemories`). Two
+# builds, one per flavour, laid their statics out 16 bytes apart and could
+# not share one kernel memory: in a page whose processes differ (W64's
+# wasm32 server beside a 64-bit memory's loader, or the X server under
+# `?mem64=1`), the second to start read the first's state wrong. Minimum 0
+# for both: the empty one has no pages.
+P64=$(((16 << 30) / 65536))
+ADD_MEMORY_MORE=1 node tools/add-memory.mjs "$OUT" "$OUT.p32" env process 0 1
+node tools/add-memory.mjs "$OUT.p32" web/public/gex/gex_kernel$INFIX.wasm env process64 0 1 $P64 64
+ADD_MEMORY_MORE=1 node tools/add-memory.mjs "$OUT" "$OUT.p32" env process 0 0
+node tools/add-memory.mjs "$OUT.p32" web/public/gex/gex_kernel$INFIX.plain.wasm env process64 0 0 $P64 64
+rm -f "$OUT.p32"
 
-# GEX_MEM64=1 (x86 only): also the kernel for processes with a 64-bit memory
-# (the wasm64 shim, docs/mem64.md step 6): its process memory is a memory64 of
-# 16 GiB, and gex-kmem addresses it with i64.
-if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEATURES" ]; then
-    RUSTFLAGS="-C link-arg=--import-memory \
-      -C link-arg=--shared-memory \
-      -C link-arg=--max-memory=4294967296 \
-      -C link-arg=--export-table \
-      -C link-arg=--export=__stack_pointer \
-      -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
-      cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
-        --release -Z build-std=std,panic_abort --target-dir $TDIR-m64 --features x86,process64
-    node tools/add-memory.mjs $TDIR-m64/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm \
-      web/public/gex/gex_kernel$INFIX.m64.wasm env process 1 1 $(((16 << 30) / 65536)) 64
+# The `.m64` name a 64-bit memory's page loads (runtime.js, run-node.mjs):
+# the same module, since it serves both flavours.
+if [ -n "$ARCH_FEATURES" ]; then
+    cp web/public/gex/gex_kernel$INFIX.wasm web/public/gex/gex_kernel$INFIX.m64.wasm
 fi
 
 # And the site, which is a copy of public/ and will otherwise keep serving

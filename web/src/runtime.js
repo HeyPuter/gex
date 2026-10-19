@@ -12,6 +12,7 @@ import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { PageTty } from '../../shims/browser/js/tty.mjs';
 import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
+import { spareMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
@@ -386,6 +387,9 @@ async function loadKernel() {
       // arrive.
       module: await WebAssembly.compile(bytes),
       memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
+      // The empty process memories every Worker's instance imports for the
+      // flavour it does not use, made once (lazy-fetch.mjs `spareMemories`).
+      spare: spareMemories(!single.on),
     };
   } catch {
     kernelSpec = false;
@@ -875,9 +879,9 @@ async function runProgramHere(
       xwaylandUrl: new URL(`${xDir}Xwayland.mjs`, location.href).href,
       hostwlUrl: new URL(`${xDir}gexhostwl.wasm`, location.href).href,
       keymapUrl: new URL(`${xDir}gex.xkm`, location.href).href,
-      // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
-      // wasm32 build of the kernel (same kernel memory, other process-memory type).
-      kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(assetUrl(`/gex/gex_kernel${archInfix()}.wasm`))) : kernel.module, memory: kernel.memory },
+      // Its memory is a wasm32 one, also under `?mem64=1`: the kernel module
+      // serves both (gex-kmem, lazy-fetch.mjs `processMemories`).
+      kernel: { module: kernel.module, memory: kernel.memory, spare: kernel.spare },
       wlChannel,
       // A name in the scene arena that no guest pid can collide with: pids
       // count up from 1, and this is 'xwl1' as ASCII.
@@ -907,6 +911,14 @@ async function runProgramHere(
     // own text, already lifted.
     guest: closure?.image ?? seedBytes,
     kernel,
+    // `?mem64=1`: the 32-bit memory's runtime, fetched when a process first
+    // needs it (host.mjs `#other`: W64's wineserver, a wasm32 module).
+    other: m64Infix() ? async () => ({
+      shim: await fetchBytes(assetUrl(`/gex/gex_browser${archInfix()}.shared.wasm`)),
+      guest: await fetchBytes(assetUrl(`/gex/seed${archInfix()}.shared.wasm`)),
+      // the one kernel module serves both flavours (gex-kmem)
+      kernel: kernel.module,
+    }) : null,
     extra: {
       // In `extra` so every Worker gets it, not only pid 1: the interesting
       // process is the X server and the client it forks, not the demo's shell.

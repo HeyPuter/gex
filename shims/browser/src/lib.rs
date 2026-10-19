@@ -3531,7 +3531,10 @@ static mut HOST: Option<Host> = None;
 /// takes what is above through ordinary pointers. The guest's stack, its
 /// highest thing, is placed here rather than at `STACK_TOP`.
 #[cfg(target_arch = "wasm32")]
-const GUEST_LIMIT: u64 = 0x7fff_0000;
+const GUEST_LIMIT: u64 = W3_SPLIT_TOP;
+/// The wasm32 slice's end, and the top of the NT split's Windows space in
+/// either shim (`w3_address_space`).
+const W3_SPLIT_TOP: u64 = 0x7fff_0000;
 /// A wasm64 shim's slice may span the whole memory64, high arena included
 /// (docs/mem64.md step 6).
 #[cfg(target_arch = "wasm64")]
@@ -7891,6 +7894,13 @@ fn syscall_entry(ctx: i32, pc: i64) {
                 waitq::leave();
                 3
             }
+            // A program of the other memory flavour (a wasm32 one, W64's
+            // wineserver, in a 64-bit memory's page): the exec goes on in a
+            // new Worker, and this one ends without the process.
+            SyscallOutcome::Exec { path, argv, envp } if vfork::exec_elsewhere(h, &path) => {
+                h.exec_waited_since = None;
+                exec_away(h, &path, &argv, &envp)
+            }
             SyscallOutcome::Exec { path, argv, envp } => {
                 h.exec_waited_since = None;
                 let entry = do_exec(h, &path, &argv, &envp);
@@ -8955,7 +8965,11 @@ pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
 pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     mem.set_mmap_top(0x7ffe_0000);
     if !nt::w3_compact() {
-        mem.adopt_arena(gex_kernel::mem::page_align_up(lo), GUEST_LIMIT);
+        // Up to the split's top, which is all the split grew: the wasm32
+        // slice's end. A wasm64 shim's slice runs to 16 GiB, and taking all
+        // of it as arena let W64's mappings above 4 GiB in a 64-bit memory
+        // skip the high arena's growth -- EFAULT zeroing them.
+        mem.adopt_arena(gex_kernel::mem::page_align_up(lo), W3_SPLIT_TOP);
     }
     // And the low space a wasm32 program leaves free, between the dispatch
     // directory and its stack (its image and break are above, in the
@@ -9779,6 +9793,51 @@ fn exit_process(code: i32) -> i32 {
     set_resume_none();
     set_resume_ctx_none();
     2
+}
+
+thread_local! {
+    /// This process's exec went to another Worker (`exec_away`): its pid
+    /// and the exec'ing thread's context, for the record JS sends.
+    static EXEC_AWAY: Cell<Option<(i32, u32)>> = const { Cell::new(None) };
+}
+
+/// The exec of a program this Worker's memory cannot run (in a 64-bit
+/// memory's page, a wasm32 program or a 32-bit ELF: `vfork::exec_memory`),
+/// handed to a new Worker as a posix_spawn child's is (`vfork::stage_exec`):
+/// the record staged, and this Worker's run ended with the process's end
+/// claimed, so nothing of it is torn down or published -- the process goes
+/// on, its descriptors and signal state carried, in the Worker the host
+/// starts with the other flavour's runtime (host.mjs `execAway`).
+fn exec_away(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> i32 {
+    let ctx = h.threads[cur()].ctx_addr() as u32;
+    vfork::stage_exec_parts(h, path, argv, envp);
+    EXEC_AWAY.with(|c| c.set(Some((h.kernel.pid, ctx))));
+    if let Some(home) = sigs::home() {
+        home.exit().claim();
+        for (_, t) in home.table().iter() {
+            let mut r = t.run();
+            r.waiting = Waiting::Exited;
+            r.blocked_on = None;
+        }
+    }
+    set_exited(true);
+    waitq::wake_process();
+    set_resume_none();
+    set_resume_ctx_none();
+    2
+}
+
+/// Whether this process's exec went to another Worker (`exec_away`): its
+/// run ended, and the process did not.
+#[no_mangle]
+pub extern "C" fn gex_exec_away() -> i32 {
+    EXEC_AWAY.with(|c| c.get().is_some()) as i32
+}
+
+/// The pid (`which` 0) and context (1) of the exec `exec_away` handed on.
+#[no_mangle]
+pub extern "C" fn gex_exec_away_of(which: u32) -> u32 {
+    EXEC_AWAY.with(|c| c.get()).map_or(0, |(pid, ctx)| if which == 0 { pid as u32 } else { ctx })
 }
 
 /// The end [`exit_process`] claimed for its caller, run once per process.

@@ -1178,6 +1178,23 @@ else
     echo "skip pipe-shared: no node, or shims/kernel/build.sh has not been run"
 fi
 
+# One kernel memory serving a 32-bit and a 64-bit memory's process, in both
+# start orders (gex-kmem: one kernel module for both flavours).
+if [ -n "$NODE" ] && { [ -f web/public/gex/gex_kernel.wasm ] || [ -f web/public/gex/gex_kernel.x86.wasm ]; }; then
+    out=$("$NODE" web/test/kernel-flavours.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL kernel-flavours: one kernel does not serve both memory flavours"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip kernel-flavours: no node, or shims/kernel/build.sh has not been run"
+fi
+
 # A unix socket whose two ends are in different processes -- which is what a
 # unix socket is for, and what stopped working the moment each process got a
 # Worker of its own. An X server binds a name in its own address space and its

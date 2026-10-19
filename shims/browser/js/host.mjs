@@ -144,6 +144,17 @@ const keyBytes = (k) => Number(String(k).split(':')[1]) || 0;
 
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
+  /// The other memory flavour's runtime, `{ shim, guest, kernel }` (a
+  /// kernel module, on the same kernel memory), for a page whose processes
+  /// do not all have one kind of memory: in a 64-bit memory's page
+  /// (`?mem64=1`), a program that is a wasm32 module (W64's wineserver,
+  /// docs/wine-native-x64.md §4) or a 32-bit ELF runs in a 32-bit memory.
+  /// What a process gets: the exec record says (`mem64`, vfork.rs
+  /// `exec_memory`), a fork child has its parent's, and anything else the
+  /// page's. As the X server's (runtime.js), which takes the wasm32 kernel.
+  #other; #otherShim = null; #otherLoading = null;
+  /// Each process's memory flavour, by pid, where it is not the page's.
+  #flavourOf = new Map();
   /// Per Worker, a shared counter of the output messages this host has
   /// delivered. A Worker about to publish its process's exit waits until the
   /// count reaches what it sent (see `drainOutput` in worker.mjs): output from
@@ -241,8 +252,8 @@ export class ProcessHost {
       kernel: this.#kernel,
       kernelStack: stack,
       shared: true,
-      // The process memory's index type, which every Worker of this host
-      // makes or joins the same way (`?mem64=1`, run-node's GEX_MEM64).
+      // The process memory's index type: the page's (`?mem64=1`, run-node's
+      // GEX_MEM64), which every pooled Worker has (`#other`).
       mem64: !!this.#extra?.mem64,
     }));
   }
@@ -326,7 +337,11 @@ export class ProcessHost {
     readStdin = null,
     // Anything a Worker posts that this file has no meaning for.
     onMessage = () => {},
+    // The other memory flavour's `{ shim, guest, kernel }` (`#other`), or
+    // an async function that fetches it.
+    other = null,
   }) {
+    this.#other = other;
     this.#makeWorker = makeWorker;
     this.#shim = shim;
     this.#guest = guest;
@@ -350,6 +365,36 @@ export class ProcessHost {
     // passed every test here and killed the page at boot.
     this.#shimCompiling ??= WebAssembly.compile(this.#shim).then((m) => (this.#shim = m));
     return this.#shimCompiling;
+  }
+
+  /** Whether process `pid` (or a thread's `pid:tid`) has a 64-bit memory. */
+  #mem64(pid) {
+    const f = this.#flavourOf.get(Number(String(pid).split(':')[0]));
+    return f ?? !!this.#extra?.mem64;
+  }
+
+  /** Whether `pid` runs on the other flavour's runtime (`#other`). */
+  #foreign(pid) {
+    return this.#mem64(pid) !== !!this.#extra?.mem64;
+  }
+
+  /** What a Worker of process `pid` starts on: `{ shim, guest, kernel,
+   *  mem64 }`, the shim compiled. */
+  async #runtimeFor(pid) {
+    const mem64 = this.#mem64(pid);
+    if (!this.#foreign(pid)) {
+      return { shim: await this.#shimModule(), guest: this.#guest, kernel: this.#kernel ?? undefined, mem64 };
+    }
+    // Fetched on first use when given as a function: few pages run one.
+    const o = typeof this.#other === 'function' ? await (this.#otherLoading ??= this.#other()) : this.#other;
+    if (!o) throw new Error(`process ${pid} needs a ${mem64 ? '64' : '32'}-bit memory, which this page does not run`);
+    this.#otherShim ??= o.shim instanceof WebAssembly.Module ? Promise.resolve(o.shim) : WebAssembly.compile(o.shim);
+    return {
+      shim: await this.#otherShim,
+      guest: o.guest,
+      kernel: this.#kernel ? { ...this.#kernel, module: o.kernel } : undefined,
+      mem64,
+    };
   }
 
   /** How many children the guest has forked. */
@@ -415,7 +460,9 @@ export class ProcessHost {
     // When this process was asked for, to measure the gap before it runs.
     this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
-      const w = this.#takeWorker(msg.kind === 'adopt' && !!msg.child?.exec);
+      // A pooled Worker holds the page flavour's runtime and modules: one of
+      // the other flavour starts in a Worker of its own.
+      const w = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker(msg.kind === 'adopt' && !!msg.child?.exec);
       this.#workers.set(pid, w);
       if (pid === 1) this.#first = w;
       const onEvent = (e) => this.#onMessage(pid, w, e.data, resolve, reject);
@@ -701,7 +748,8 @@ export class ProcessHost {
       this.#stackOf.delete(key);
       this.#stacksFree.push(slice);
     }
-    if (reuse && this.#giveBack(w)) return;
+    // Not the other flavour's: the pool is the page flavour's (`#other`).
+    if (reuse && !this.#foreign(key) && this.#giveBack(w)) return;
     w.terminate();
   }
 
@@ -752,7 +800,7 @@ export class ProcessHost {
         narrate(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
           // Awaited: compiling the shim cannot be synchronous in a browser.
-          this.#shimModule().then((shimMod) => {
+          this.#runtimeFor(pid).then((rt) => {
           // The closure goes after, one library per message: all at once does
           // not cross (Chromium `DataCloneError, out of memory`). The guest
           // runs while they arrive -- the miss path forgives a module not yet
@@ -767,9 +815,10 @@ export class ProcessHost {
             outputAck: this.#outputAck(w),
             kernelStack: this.#stackFor(w, pid),
             // Compiled once here, not from bytes in every Worker.
-            shim: shimMod,
-            guest: this.#guest,
-            kernel: this.#kernel ?? undefined,
+            shim: rt.shim,
+            guest: rt.guest,
+            kernel: rt.kernel,
+            mem64: rt.mem64,
             // A thread joins its process: every module the process's Workers
             // have compiled so far, so it does not fetch and compile them all
             // again (each Noita thread spent ~3 s doing that, one after the
@@ -780,7 +829,7 @@ export class ProcessHost {
             // the wineserver's door, if one is up (`doorPublish`)
             door: this.#door ?? undefined,
             // A fork child's memory: an exited process's, zeroed, if one fits.
-            recycledMemory: msg.kind === 'adopt' && msg.child && !msg.child.exec
+            recycledMemory: msg.kind === 'adopt' && msg.child && !msg.child.exec && !this.#foreign(pid)
               ? this.#takeMemory(imageExtent(msg.child))
               : undefined,
           // `transfer`: buffers the caller gives up (the page's bundle), moved
@@ -898,6 +947,12 @@ export class ProcessHost {
           c.atHost = performance.now();
         }
         this.#forked++;
+        {
+          // The exec'd program's memory, or the parent's.
+          const f = m.child.mem64 ?? this.#mem64(pid);
+          if (f !== !!this.#extra?.mem64) this.#flavourOf.set(m.child.pid, f);
+          else this.#flavourOf.delete(m.child.pid);
+        }
         this.#onFork(m.child, pid);
         // Started and let run -- nobody waits for a child.
         this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).catch((e) => {
@@ -906,6 +961,19 @@ export class ProcessHost {
           // may miss the line above. See task 146.
           crashed(`pid ${m.child.pid}: ${e.message}`);
         });
+        break;
+      }
+      case 'execAway': {
+        // The process's exec of a program of the other memory flavour (a
+        // wasm32 one in a 64-bit memory's page: shim lib.rs `exec_away`):
+        // its Worker has ended without the process, which goes on in a new
+        // one with that flavour's runtime, as a posix_spawn child's exec
+        // does, and ends there.
+        const child = m.child;
+        if (child.mem64 !== undefined && child.mem64 !== !!this.#extra?.mem64) this.#flavourOf.set(Number(pid), child.mem64);
+        else this.#flavourOf.delete(Number(pid));
+        this.#releaseNow(pid, w);
+        this.#spawn(pid, { kind: 'adopt', child }).then(resolve, reject);
         break;
       }
       case 'thread': {
@@ -925,7 +993,7 @@ export class ProcessHost {
         // script load and shim instantiation before the thread could start,
         // and a starting Wine process makes its threads one after another
         // (61 of them before Paint's window, 13.5 s in all).
-        const w2 = this.#takeWorker();
+        const w2 = this.#foreign(pid) ? this.#makeWorker() : this.#takeWorker();
         this.#workers.set(key, w2);
         // Keyed by the thread, so its end stops the right Worker and frees the
         // right kernel stack.
@@ -960,7 +1028,7 @@ export class ProcessHost {
           // promise is not structured-cloneable. A count instead; the Worker
           // asks for what it needs.
           const { closure: _closure, ...extra } = this.#extra ?? {};
-          this.#shimModule().then((shimMod) =>
+          this.#runtimeFor(pid).then((rt) =>
           w2.postMessage({
             ...extra,
             closureCount: (this.#extra?.closure ?? []).length,
@@ -977,9 +1045,10 @@ export class ProcessHost {
             moduleStore: m.thread.moduleStore,
             procOpts: m.thread.procOpts,
             kernelStack: this.#stackFor(w2, key),
-            shim: shimMod,
-            guest: this.#guest,
-            kernel: this.#kernel ?? undefined,
+            shim: rt.shim,
+            guest: rt.guest,
+            kernel: rt.kernel,
+            mem64: rt.mem64,
             // Every module the process's Workers have compiled so far, so this
             // thread reuses them instead of recompiling from bytes in its own
             // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
@@ -1039,7 +1108,8 @@ export class ProcessHost {
           }
           break;
         }
-        if (m.recycle instanceof WebAssembly.Memory) this.#keepMemory(m.recycle);
+        // Kept for the page flavour's fork children only.
+        if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {
           this.#onOutput(
             2,

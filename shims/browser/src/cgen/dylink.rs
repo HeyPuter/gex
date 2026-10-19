@@ -296,7 +296,7 @@ pub extern "C" fn gex_wasmprog_adopt_link(ptr: u32, len: u32) {
     *lock(&ADOPT) = Some(String::from_utf8_lossy(&b).into_owned());
 }
 
-fn guest_str(ptr: u32) -> Option<String> {
+fn guest_str(ptr: u64) -> Option<String> {
     let s = crate::guest_bytes().get(ptr as usize..)?;
     let n = s.iter().position(|&c| c == 0)?;
     Some(String::from_utf8_lossy(&s[..n]).into_owned())
@@ -336,9 +336,10 @@ fn dlopen(path: &str) -> Result<u32, String> {
 /// `gex.dlopen(path, err, errlen)` (libgex's dl.c), the shim's half: load a
 /// library and what it needs; its handle, or 0 with the message in `err`.
 /// JS then catches up (instantiating them) and runs their constructors
-/// ([`gex_wasmprog_dl_new`]).
+/// ([`gex_wasmprog_dl_new`]). Addresses are 64-bit for a memory64
+/// program's (libgex built with GEX_MEMORY64); JS widens a 32-bit one's.
 #[no_mangle]
-pub extern "C" fn gex_wasmprog_dlopen(path: u32, err: u32, errlen: u32) -> u32 {
+pub extern "C" fn gex_wasmprog_dlopen(path: u64, err: u64, errlen: u32) -> u32 {
     lock(&DL_NEW).clear();
     let r = guest_str(path).ok_or_else(|| "dlopen: bad path".to_string()).and_then(|p| dlopen(&p));
     match r {
@@ -363,7 +364,7 @@ pub extern "C" fn gex_wasmprog_dl_new(k: u32) -> i32 {
 /// `gex.dlsym(handle, name)`: a function's table index or a datum's
 /// address, 0 when not found (handle 0: the global scope).
 #[no_mangle]
-pub extern "C" fn gex_wasmprog_dlsym(handle: u32, name: u32) -> u32 {
+pub extern "C" fn gex_wasmprog_dlsym(handle: u32, name: u64) -> u32 {
     let Some(name) = guest_str(name) else { return 0 };
     lock(&DYPROC).as_ref().map_or(0, |p| p.link.dlsym(handle, &name))
 }

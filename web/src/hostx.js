@@ -27,7 +27,7 @@
 // turn left to do it in.
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
-import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
+import { lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
@@ -230,7 +230,7 @@ export class HostX {
         ? msg.kernel.module
         : await WebAssembly.compile(msg.kernel.module);
       const inst = await WebAssembly.instantiate(mod, {
-        env: { memory: msg.kernel.memory, process: this.#x.wasmMemory, lazy_fetch: lazyFetch(msg.kernel.memory) },
+        env: { memory: msg.kernel.memory, ...processMemories(this.#x.wasmMemory, false, msg.kernel.spare), lazy_fetch: lazyFetch(msg.kernel.memory) },
       });
       // Every Worker in the kernel needs its own stack slice: wasm-ld gives
       // each instance the same `__stack_pointer`, so two Workers sharing one
@@ -399,7 +399,7 @@ export class HostX {
     const bytes = new TextEncoder().encode(name);
     const p = this.#x._malloc(bytes.length);
     this.#x.HEAPU8.set(bytes, p);
-    const id = this.#k.k_sock_bind(p, bytes.length);
+    const id = this.#k.k_sock_bind(BigInt(p), bytes.length);
     this.#x._free(p);
     return id;
   }
@@ -486,7 +486,7 @@ export class HostX {
       },
 
       connect(fd, path, len) {
-        const id = self.#k.k_sock_connect(path, len);
+        const id = self.#k.k_sock_connect(BigInt(path), len);
         if (id < 0) return id;
         self.#watch(id);
         self.#fds.set(fd, { kind: 'kernel', id });
@@ -565,7 +565,7 @@ export class HostX {
         const ep = self.#fds.get(fd);
         if (!ep) return -EBADF;
         if (ep.kind === 'kernel') {
-          const r = self.#k.k_sock_write(ep.id, buf, len);
+          const r = self.#k.k_sock_write(ep.id, BigInt(buf), len);
           if (self.#count && r > 0) self.#bump(`out${fd}`, r);
           return r;
         }
@@ -609,7 +609,7 @@ export class HostX {
         if (!ep) return -EBADF;
         if (nfds) self.#x.HEAP32[nfds >> 2] = 0;
         if (ep.kind === 'kernel') {
-          const n = self.#k.k_sock_read(ep.id, buf, len);
+          const n = self.#k.k_sock_read(ep.id, BigInt(buf), len);
           if (self.#count && n > 0) self.#bump(`in${fd}`, n);
           return n;
         }

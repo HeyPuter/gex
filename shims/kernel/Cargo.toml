@@ -14,7 +14,5 @@ gex-kernel.workspace = true
 [features]
 # Serve an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-kernel/x86"]
-# Processes with a 64-bit memory (the wasm64 browser shim, docs/mem64.md step 6).
-process64 = ["gex-kmem/process64", "gex-kernel/process64"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).
 ppc = ["gex-abi/ppc", "gex-kernel/ppc"]
