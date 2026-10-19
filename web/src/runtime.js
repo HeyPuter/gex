@@ -345,10 +345,11 @@ let kernelSpec = null;
  * a session with one thing missing from it, and the reason was in a console
  * message rather than anywhere a person would look.
  *
- * The guest is told nothing: its `/dev/gex-gl` still exists and its ring is
- * still there, so a GL client blocks on a device that never answers rather
- * than failing at `eglInitialize`. That is the same shape as a machine whose
- * GPU has fallen over, and better than pretending the session is broken.
+ * The guest's `/dev/gex-gl` still exists and its ring is still there; the
+ * ring is marked as having no device (gl-bridge.mjs `failGlChannel`), so a
+ * GL client's request fails at once rather than at its timeout. That is the
+ * same shape as a machine whose GPU has fallen over, and better than
+ * pretending the session is broken.
  */
 async function startHostGl(compositor, glChannel, opts, term) {
   try {
@@ -363,6 +364,7 @@ async function startHostGl(compositor, glChannel, opts, term) {
     term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
     term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
+    if (glChannel?.control) (await import('@gex/gl-bridge.mjs')).failGlChannel(glChannel);
     return null;
   }
 }
@@ -687,6 +689,11 @@ async function runProgramHere(
     // (handed to `onSystem`) is called -- a desktop whose first windows
     // draw no GL does not download it.
     glLazy = false,
+    // Where the page compositor's Mesa comes from (DomDesktop only): `(name)
+    // => Promise<Uint8Array|null>` for 'gex-wgpu-replay.js', '.wasm' and
+    // '.deferred.wasm', null for "fetch it as a file". app.js answers from
+    // the site's packed files and the page's cache (mesa-gl.js `source`).
+    glSource = null,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -720,6 +727,26 @@ async function runProgramHere(
   let glServe = null;
   let startGl = null;
   let glStarted = null;
+  // `glLazy`, and the guest asks first: a GL program started from a shell,
+  // not from the embedder's launcher, makes its first request into a ring
+  // nothing serves yet -- and waits thirty seconds for the answer, then
+  // dies. Its first request starts Mesa (gl-bridge.mjs STATE).
+  const startGlOnFirstRequest = () => {
+    if (!glChannel?.control || typeof Atomics.waitAsync !== 'function') return;
+    const ctl = new Int32Array(glChannel.control);
+    (async () => {
+      while (!glStarted) {
+        const st = Atomics.load(ctl, 0);
+        if (st === 1) {
+          console.warn('[gex] the guest opened its GL: starting Mesa');
+          startGl();
+          break;
+        }
+        const w = Atomics.waitAsync(ctl, 0, st, 5000);
+        if (w.async) await w.value;
+      }
+    })();
+  };
   if (gl && single.on) {
     // The single-thread build: no ring. Each process's `gl_submit` calls the
     // compositor's Mesa in this realm on its own memory (compositor-worker.js
@@ -790,7 +817,10 @@ async function runProgramHere(
       // The GL goes onto the window's own canvas here rather than into a
       // scene: see `DomDesktop.hostGl`.
       if (gl === 'compositor' && glChannel) {
-        await startHostGl(compositor, glChannel, { api: 'core', backend: glBackend }, term);
+        const opts = { api: 'core', backend: glBackend, source: glSource };
+        startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
+        if (!glLazy) await startGl();
+        else startGlOnFirstRequest();
       }
     }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
@@ -812,24 +842,7 @@ async function runProgramHere(
         // the embedder first asks (`onSystem`'s `startGl`), not at boot.
         startGl = () => (glStarted ??= startHostGl(compositor, glChannel, opts, term));
         if (!glLazy) await startGl();
-        else if (glChannel.control && typeof Atomics.waitAsync === 'function') {
-          // And by the guest: a GL program started from a shell, not from
-          // the embedder's launcher, makes its first request into a ring
-          // nothing serves yet -- and waits thirty seconds for the answer,
-          // then dies. Its first request starts Mesa (gl-bridge.mjs STATE).
-          const ctl = new Int32Array(glChannel.control);
-          (async () => {
-            while (!glStarted) {
-              const st = Atomics.load(ctl, 0);
-              if (st === 1) {
-                startGl();
-                break;
-              }
-              const w = Atomics.waitAsync(ctl, 0, st, 5000);
-              if (w.async) await w.value;
-            }
-          })();
-        }
+        else startGlOnFirstRequest();
       }
     }
   }

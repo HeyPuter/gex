@@ -465,8 +465,7 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     let what = crate::project::PROJECT_FILE;
     let (config, config_bytes) = Config::load(dir)?;
     crate::features::check(&config.features_off)?;
-    let off = config.features_off.clone();
-    let has = |f: &str| !off.iter().any(|x| x == f);
+    let mut off = config.features_off.clone();
 
     let web = dir.join("build/web");
     if web.exists() {
@@ -494,6 +493,15 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         let _ = std::fs::remove_file(&to);
         link_or_copy(&dir.join("runtime/web/gex").join(f), &to)?;
     }
+    // GL kept, but the checkout has no Mesa built (web/build-mesa-wasm.sh):
+    // the page would answer the guest's first GL request with a device that
+    // cannot start. The build is one without GL instead, which the guest
+    // sees as no /dev/gex-gl at all.
+    if !off.iter().any(|x| x == "gl") && !page.join("gex/gex-wgpu-replay.js").is_file() {
+        eprintln!("gexc eject build: {} has no Mesa (web/build-mesa-wasm.sh): the page is built without GL", src.display());
+        off.push("gl".to_string());
+    }
+    let has = |f: &str| !off.iter().any(|x| x == f);
     if !has("gl") {
         for e in std::fs::read_dir(page.join("gex"))? {
             let e = e?;

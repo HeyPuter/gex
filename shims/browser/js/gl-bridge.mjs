@@ -27,6 +27,13 @@ const LOCK = 3;
 // client next submits, which for a program that swaps and then sleeps was
 // never, and every other GL client waited thirty seconds to steal it.
 const ASYNC = 4;
+// Whether anything serves the ring: 0 not yet (a lazy device still being
+// fetched and started), 1 served (`serveGl`), -1 never will be (the device
+// did not start, `failGlChannel`). A client waits for a device that is still
+// starting however long its download takes on a slow link, and fails at once
+// on one that will not come.
+const HOST = 5;
+const HOST_WAIT_MS = 600000;
 // Per client, what its last unwaited batch left to say: one slot of
 // SLOT_WORDS words per `client % SLOTS` (key = the client's number + 1,
 // the frames that client's surface has shown as of that batch's PRESENT, and
@@ -77,6 +84,7 @@ export function makeGlChannel() {
  */
 export function serveGl(glDevice, channel) {
   const ctl = new Int32Array(channel.control);
+  Atomics.store(ctl, HOST, 1);
   // `GlDevice.submit` wants a `{buffer}` and a ring offset; the ring sits at 0
   // of the shared data buffer, so the buffer *is* the "memory" and 0 the ring.
   const asMemory = { buffer: channel.data };
@@ -160,6 +168,16 @@ export function serveGl(glDevice, channel) {
   return serve;
 }
 
+/** The page's device for `channel` did not start: its clients' waits fail
+ *  now rather than at their timeout. */
+export function failGlChannel(channel) {
+  if (!channel?.control) return;
+  const ctl = new Int32Array(channel.control);
+  Atomics.store(ctl, HOST, -1);
+  Atomics.notify(ctl, STATE);
+  Atomics.notify(ctl, LOCK);
+}
+
 /** The Worker's half: `submit`, what `Gex.useGl` calls from `gl_submit`. */
 export class GlProxy {
   #ctl;
@@ -205,7 +223,7 @@ export class GlProxy {
     // finished in that time is a process that died inside its ioctl, and
     // waiting for it for ever would take every other GL client with it.
     const mine = client || 1;
-    const until = Date.now() + 30000;
+    let until = Date.now() + 30000;
     let t0 = 0;
     for (;;) {
       const held = Atomics.compareExchange(ctl, LOCK, 0, mine);
@@ -216,6 +234,9 @@ export class GlProxy {
       // and the loop becomes a spin that eats the core its guest runs on --
       // which with two GL clients starves the very page they are waiting for.
       Atomics.wait(ctl, LOCK, held, 50);
+      // The holder may be waiting for a device that is still starting: not a
+      // dead holder, so the thirty seconds count from the device's start.
+      if (Atomics.load(ctl, HOST) === 0) until = Date.now() + 30000;
       if (Date.now() > until) {
         console.warn(`[gl] taking the ring from client ${held}`);
         Atomics.store(ctl, LOCK, mine);
@@ -268,10 +289,21 @@ export class GlProxy {
     Atomics.notify(ctl, STATE);
     this.#wake();
     // A timeout, so a dead page ends the guest rather than wedging its Worker.
+    // Not while the device is still starting (HOST 0): a lazy Mesa's download
+    // on a slow link takes as long as it takes.
+    const t0 = Date.now();
     while (Atomics.load(ctl, STATE) === REQUEST) {
-      if (Atomics.wait(ctl, STATE, REQUEST, 30000) === 'timed-out') {
-        throw new Error('the GL device did not answer in thirty seconds');
+      const host = Atomics.load(ctl, HOST);
+      // No device: the request fails (the guest's ioctl returns an error)
+      // rather than the guest's whole runtime. Nothing will serve it.
+      if (host < 0) {
+        Atomics.store(ctl, STATE, IDLE);
+        return -1;
       }
+      if (Atomics.wait(ctl, STATE, REQUEST, 30000) !== 'timed-out') continue;
+      const starting = Atomics.load(ctl, HOST) === 0;
+      if (!starting) throw new Error('the GL device did not answer in thirty seconds');
+      if (Date.now() - t0 > HOST_WAIT_MS) throw new Error('the GL device did not start in ten minutes');
     }
     Atomics.store(ctl, STATE, IDLE);
     Atomics.notify(ctl, STATE);

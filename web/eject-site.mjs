@@ -64,8 +64,10 @@ mkdirSync(zcache, { recursive: true });
 const files = {}; // site path -> { size, zsize }
 const sha = (b) => createHash('sha256').update(b).digest('hex');
 
-/** Put `src` at site path `path`: compressed (FILE.zst) when large. */
-function place(src, path) {
+/** Put `src` at site path `path`: compressed (FILE.zst) when large.
+ *  `plain` keeps the file itself beside its .zst, for a reader that does not
+ *  go through the pack. */
+function place(src, path, { plain = false } = {}) {
   const dst = join(out, path);
   mkdirSync(dirname(dst), { recursive: true });
   const size = statSync(src).size;
@@ -79,7 +81,9 @@ function place(src, path) {
   const z = join(zcache, `${sha(bytes)}-${level}.zst`);
   if (!existsSync(z)) execFileSync('zstd', [`-${level}`, '--long=27', '-T4', '-q', '-f', src, '-o', z], { stdio: 'inherit' });
   copyFileSync(z, `${dst}.zst`);
-  files[`/${path}`] = { size, zsize: statSync(z).size };
+  if (plain) copyFileSync(src, dst);
+  // `h`: the content, by which the page keeps the file across builds.
+  files[`/${path}`] = { size, zsize: statSync(z).size, h: sha(bytes).slice(0, 16) };
 }
 
 /** A split unit's cold clusters (`gexc eject build` with "cold": DIR/N.wasm)
@@ -503,6 +507,13 @@ function w3Site() {
     // (app.js primes runtime.js with it): packed, as the units are.
     if (/^gex\/(gex_browser|gex_kernel|seed)[^/]*\.wasm$/.test(rel)) {
       place(stripped(p), rel);
+      return;
+    }
+    // Mesa (the page compositor's GL, app.js `mesaSource`): packed, and
+    // plain as well for the scene compositor's Worker, whose glue fetches its
+    // files itself. Not stripped: the split's two halves are one program.
+    if (/^gex\/gex-wgpu-replay(\.deferred)?\.(wasm|js)$/.test(rel)) {
+      place(p, rel, { plain: true });
       return;
     }
     const dst = join(out, rel);

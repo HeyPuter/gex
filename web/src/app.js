@@ -66,6 +66,8 @@ const PIECES = {
  *   compositor, gl, translation, hostx, mem64
  *              true asks for a runtime piece; an error if the build left it out.
  *              compositor: false draws windows straight into the page.
+ *   glLazy     start Mesa at the first GL request instead of at boot (a W3
+ *              build's default)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
@@ -342,6 +344,8 @@ async function begin(opts, base, at, state, meter) {
   }
   const compositor = has.compositor && opts.compositor !== false && b.compositor !== false;
   const gl = b.gl && opts.gl !== false;
+  // Mesa started by the first GL request rather than at boot.
+  const glLazy = gl && (opts.glLazy ?? b.glLazy ?? false);
 
   // The runtime's switches: the build's, then the options'. The deep readers
   // (runtime.js, compositor.js, mesa-gl.js) see these, never the page's URL.
@@ -368,7 +372,9 @@ async function begin(opts, base, at, state, meter) {
   if (!globalThis.crossOriginIsolated && !singleMode()) {
     throw new Error('This page needs cross-origin isolation for its threads: serve it with the headers Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp (the build\'s serve.mjs and _headers do).');
   }
-  if ((compositor || gl) && !navigator.gpu) {
+  // A lazy GL needs WebGPU only once a program asks for it, and fails then
+  // as a GL device that will not start (runtime.js `startHostGl`).
+  if ((compositor || (gl && !glLazy)) && !navigator.gpu) {
     throw new Error('This browser has no WebGPU, which this build draws with. Use a recent desktop Chrome or Edge with hardware acceleration on.');
   }
 
@@ -415,7 +421,25 @@ async function begin(opts, base, at, state, meter) {
   // The background fill's list (eject-site.mjs --late): lazy files the page
   // downloads once the boot's files are in, while the guest runs.
   const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
-  const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore() };
+  const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore(), files: fileStore() };
+  // The page compositor's Mesa, packed and kept (`mesaSource`); fetched in
+  // the background once the boot's and the fill's downloads are done.
+  // Not before the start-up is over (\`ready\`) and the boot's downloads,
+  // the fill's included, are done, and then after a pause: the program's
+  // first seconds after its first frame (the shell's taskbar, its tray)
+  // still read lazy files, which the download would share the link with.
+  const mesa = gl && !compositor ? mesaSource(fetcher, at) : null;
+  const mesaWait = { ready: false, fetched: false, started: false };
+  const prefetchMesa = (why) => {
+    mesaWait[why] = true;
+    if (!mesa || !glLazy || sq.get('glprefetch') === '0') return;
+    if (!mesaWait.ready || !mesaWait.fetched || mesaWait.started) return;
+    mesaWait.started = true;
+    setTimeout(() => {
+      const t0 = performance.now();
+      mesa.prefetch().then((n) => n && mark(`Mesa prefetched: ${n} files in ${Math.round(performance.now() - t0)} ms`));
+    }, MESA_PREFETCH_PAUSE_MS);
+  };
   // The bundle's file bytes in pieces, kept in the page's cache.
   const pieceList = b.pieces ? await fetchJson(at(b.pieces), 'the pieces\' list') : null;
   // What is to come, for the progress: the bundle's files and the units'.
@@ -596,6 +620,7 @@ async function begin(opts, base, at, state, meter) {
         if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`);
       } else if (m.kind === 'done') {
         mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`);
+        prefetchMesa('fetched');
         // Its late units may still be compiling: it ends with the page.
       } else if (m.kind === 'failed') {
         failed(m.error);
@@ -654,6 +679,9 @@ async function begin(opts, base, at, state, meter) {
     ...lazy.map(([, , u]) => u),
     ...(fl ? [fl.url] : []),
   ]).catch(() => {});
+  pruneFiles(fetcher).catch(() => {});
+  // No fill to wait for: the boot's downloads are done.
+  if (!fl) prefetchMesa('fetched');
   if (keep) {
     const p = persist(keep.db, keep.dir, await globalKernel(), {
       every: Number(sw.persistms || 30000),
@@ -712,6 +740,8 @@ async function begin(opts, base, at, state, meter) {
     cwd,
     tty: false,
     gl: gl ? 'compositor' : null,
+    glLazy,
+    glSource: mesa,
     glBackend: b.glBackend ?? 'wgpu',
     wl: desk ?? canvas,
     wlInput: desk ?? canvas,
@@ -762,7 +792,10 @@ async function begin(opts, base, at, state, meter) {
     } else if (shown()) {
       clearInterval(watch);
       meter.phase('first-frame');
-      if (!manual) meter.phase('ready');
+      if (!manual) {
+        meter.phase('ready');
+        prefetchMesa('ready');
+      }
     }
   }, 50);
   return {
@@ -790,6 +823,7 @@ async function begin(opts, base, at, state, meter) {
     ready() {
       meter.phase('first-frame');
       meter.phase('ready');
+      prefetchMesa('ready');
     },
   };
 }
@@ -852,7 +886,12 @@ function launchBuild(m, at) {
       mtimes: !!m.mtimes,
       featuresOff: m.features_off ?? [],
       aot: p.aot ?? null,
-      gl: false,
+      // Wine's opengl32 reaches Mesa through /dev/gex-gl. Started by the
+      // first process that asks, so a visit whose programs draw no GL does
+      // not download it (`glLazy`; nt.json `gl_lazy: false` starts it at
+      // boot, to compare).
+      gl: !(m.features_off ?? []).includes('gl'),
+      glLazy: m.gl_lazy ?? true,
       pack,
       preload: 'project/build/web/units/preload.json',
       lazy,
@@ -1024,6 +1063,88 @@ async function prunePieces(f, keep) {
   } catch { /* kept */ }
 }
 
+/*
+ * The site's other packed files that carry their content's hash (pack.json
+ * `h`: the runtime's wasm, Mesa) kept in the page's Cache Storage under their
+ * URL with the hash for its query: a rebuild that did not change one is not
+ * a download of it. The pieces' cache is not the place: it is pruned to the
+ * pieces' list.
+ */
+const FILE_CACHE = 'gex-files-v1';
+function fileStore() {
+  let p = null;
+  return () => (p ??= (async () => {
+    try { return typeof caches === 'object' && caches ? await caches.open(FILE_CACHE) : null; } catch { return null; }
+  })());
+}
+/** `href` (FILE.zst?v=BUILD) from the cache by its hash, or the network (then
+ *  kept; `put` settles once it is). */
+async function fileFetch(href, h, f, init) {
+  const u = new URL(href);
+  u.search = `h=${h}`;
+  const cache = await f.files?.();
+  if (cache) {
+    try {
+      const r = await cache.match(u.href);
+      if (r?.ok) return { res: r, cached: true, key: u.href, cache };
+    } catch { /* fetched */ }
+  }
+  const res = await fetch(href, init);
+  const put = res.ok && cache ? cache.put(u.href, res.clone()).catch(() => {}) : Promise.resolve();
+  return { res, cached: false, key: u.href, cache, put };
+}
+/** Kept files this build does not have (another hash, or gone). */
+async function pruneFiles(f) {
+  const cache = await f.files?.();
+  if (!cache) return;
+  const { files = {} } = await f.pack;
+  const want = new Set();
+  for (const [path, e] of Object.entries(files)) if (e.h) want.add(`${new URL(`${path.replace(/^\//, '')}.zst`, f.base).pathname}?h=${e.h}`);
+  for (const r of await cache.keys()) {
+    const u = new URL(r.url);
+    if (!want.has(`${u.pathname}${u.search}`)) await cache.delete(r);
+  }
+}
+
+/** Mesa's three files (mesa-gl.js `loadFromSource`) from the site's pack and
+ *  the page's cache: null for one that is not packed, which Mesa then
+ *  fetches as a file. `prefetch()` puts them in the cache without decoding,
+ *  and a request for one already on its way waits for that download. */
+const MESA_PREFETCH_PAUSE_MS = 20000;
+const MESA_FILES = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'];
+function mesaSource(f, at) {
+  const busy = new Map();
+  const source = async (name) => {
+    await busy.get(name);
+    const href = at(`gex/${name}`);
+    const z = await packedEntry(href, f);
+    return z ? fetchPacked(href, z, false, f) : null;
+  };
+  source.prefetch = async () => {
+    let n = 0;
+    await Promise.all(MESA_FILES.map((name) => {
+      const p = (async () => {
+        const href = at(`gex/${name}`);
+        const z = await packedEntry(href, f);
+        if (!z?.h) return;
+        const u = new URL(href);
+        u.search = z.build ? `v=${z.build}` : '';
+        u.pathname += '.zst';
+        const got = await fileFetch(u.href, z.h, f, { priority: 'low' });
+        if (got.cached) return;
+        const bytes = (await got.res.arrayBuffer()).byteLength;
+        f.state.downloaded = (f.state.downloaded ?? 0) + bytes;
+        await got.put;
+        n++;
+      })().catch(() => {});
+      busy.set(name, p);
+      return p;
+    }));
+    return n;
+  };
+  return source;
+}
+
 /**
  * A file in one ArrayBuffer, which is moved (not cloned) to pid 1's Worker:
  * a clone would copy it, and a SharedArrayBuffer stays resident for the
@@ -1067,12 +1188,14 @@ async function fetchPacked(url, z, shared, f, opt = {}) {
   }
 }
 
-async function fetchPackedOnce(url, { size, zsize, build }, shared, f, { into = null, progress = null, priority = 'auto', noCache = false } = {}) {
+async function fetchPackedOnce(url, { size, zsize, build, h }, shared, f, { into = null, progress = null, priority = 'auto', noCache = false } = {}) {
   const u = new URL(url);
   u.search = build ? `v=${build}` : '';
   u.pathname += '.zst';
   const piece = isPiece(u.href);
-  const got = piece ? await pieceFetch(u.href, noCache ? { ...f, pieces: null } : f, { priority }) : { res: await fetch(u.href, { priority }), cached: false };
+  const got = piece ? await pieceFetch(u.href, noCache ? { ...f, pieces: null } : f, { priority })
+    : h ? await fileFetch(u.href, h, noCache ? { ...f, files: null } : f, { priority })
+    : { res: await fetch(u.href, { priority }), cached: false };
   const res = got.res;
   if (!res.ok) throw new Error(`${u.href}: ${res.status} ${res.statusText}`);
   const bad = (msg) => Object.assign(new Error(msg), got.cached ? { fromCache: got } : {});
