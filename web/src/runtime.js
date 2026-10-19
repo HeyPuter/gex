@@ -129,7 +129,9 @@ function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
   const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
-    .join('&');
+    .join('&')
+    // Named only when on: the cache of a page without it keeps its name.
+    + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
   return `xc-${xcHash(shimBytes, kernelBytes, switches, flavour, globalThis.location?.pathname ?? '')}`;
 }
@@ -984,6 +986,8 @@ async function runProgramHere(
       strayTrap: globalThis.GEX_STRAY_TRAP || undefined,
       // `?w3split=1`: W3's address space split at 2 GiB (nt::w3_space), in every process.
       w3Split: globalThis.GEX_W3_SPLIT || undefined,
+      // `?nullguard=1`: the null guard, a debugging opt-in (gex_abi::null_guard).
+      nullGuard: globalThis.GEX_NULL_GUARD || undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for

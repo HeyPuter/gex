@@ -348,6 +348,30 @@ pub(crate) fn deliver(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Delivery {
     dispatch(&view, gm, ctx_addr)
 }
 
+/// A synchronous fault against this Worker's thread (the kernel's
+/// `raise_fault`, without it): the handler's frame on the context at
+/// `ctx_addr`, entered at `pc`, or the process ends when there is none, it
+/// is ignored, or the signal is blocked. No kernel lock.
+pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, addr: u64) -> Delivery {
+    let end = Delivery::Terminate { signal: signo, core: true };
+    let Some(home) = home() else { return end };
+    let Some(view) = view(home) else { return end };
+    let action = view.action(signo);
+    let blocked = view.blocked() & (1u64 << (signo - 1)) != 0;
+    if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN || blocked {
+        return end;
+    }
+    if gm.write_u64(ctx_addr + gex_abi::ctx::PC as u64, pc).is_err() {
+        return end;
+    }
+    view.forget_source(signo);
+    let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
+    match signal::setup_frame(&view, gm, ctx_addr, signo, addr, compat) {
+        Ok(target) => Delivery::Resume(target),
+        Err(_) => end,
+    }
+}
+
 /// This Worker's thread's signal state as one `Signals`.
 fn view(home: &Home) -> Option<Signals> {
     MINE.with(|m| m.borrow().as_ref().map(|(_, t)| Signals::view(Arc::clone(&home.sig), Arc::clone(t))))

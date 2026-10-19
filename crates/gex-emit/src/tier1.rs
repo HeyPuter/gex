@@ -250,7 +250,18 @@ fn t1_fold() -> bool {
 /// natively they are read from the environment, which the module cache's key
 /// did not see, so a run with one set served its modules to runs without.
 pub fn knobs() -> u8 {
-    inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2
+    inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
+}
+
+/// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
+/// guest accesses: a debugging opt-in, `gex_abi::set_null_guard` (the
+/// page's `?nullguard=1`) or GEX_NULL_GUARD=1 natively, and never with
+/// GEX_UNSAFE_NO_GUARD. Off, tier-1's and the C units' output is
+/// byte-identical to a build without it, and their keys do not name it.
+pub fn null_guard_on() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| std::env::var_os("GEX_NULL_GUARD").is_some_and(|v| v != "0"));
+    (env || gex_abi::null_guard()) && !Emitter::no_guard()
 }
 
 /// The end of a tier-1 block's function with [`t1_fold`]: its dead tees
@@ -691,6 +702,13 @@ struct Emitter<'a> {
     /// bits, as addresses below 2^32 that need no bounds guard
     /// (`emit_address`). Empty elsewhere.
     pub(crate) value_u32: Vec<bool>,
+    /// Of those, the ones a load or register read feeds (fmode's `block`).
+    pub(crate) value_chase: Vec<bool>,
+    /// The values that are the thread's context address plus offsets
+    /// (`GuestReg::CtxAddr`: the x87 stack, `EFLAGS_SYS`). The context is
+    /// below the null guard (`gex_abi::NULL_GUARD`), so these accesses skip
+    /// it. Indexed like `value_const`; every `def` sets its entry.
+    pub(crate) value_ctx: Vec<bool>,
     /// The locals `alloc` made: block-local temporaries, never holding a
     /// value from one block to another (fmode's `strip_dead_tees`).
     pub(crate) temps: Vec<u32>,
@@ -774,6 +792,8 @@ impl<'a> Emitter<'a> {
             value_local: Vec::new(),
             value_const: Vec::new(),
             value_u32: Vec::new(),
+            value_chase: Vec::new(),
+            value_ctx: Vec::new(),
             temps: Vec::new(),
             value_ty: Vec::new(),
             free_i32: Vec::new(),
@@ -974,6 +994,7 @@ impl<'a> Emitter<'a> {
         let n = block.n_values as usize;
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
+        self.value_ctx = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
         let dying = dying_after(block);
         self.prof_entry(block);
@@ -1047,6 +1068,7 @@ impl<'a> Emitter<'a> {
         let n = block.n_values as usize;
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
+        self.value_ctx = vec![false; n];
         self.value_ty = vec![Ty::I64; n];
 
         let dying = dying_after(block);
@@ -1472,6 +1494,33 @@ impl<'a> Emitter<'a> {
     /// makes the access trap and become SIGSEGV rather than silently aliasing
     /// low memory.
     fn emit_address(&mut self, addr: Value, offset: i64) -> u32 {
+        self.emit_address_in(addr, offset, true)
+    }
+
+    /// [`Self::emit_address`] for an operand with no memarg (a bulk
+    /// operation's): the address itself, the static offset always 0.
+    fn emit_address_flat(&mut self, addr: Value) {
+        let off = self.emit_address_in(addr, 0, false);
+        debug_assert_eq!(off, 0);
+    }
+
+    /// Whether `v` is the context address plus offsets (`value_ctx`).
+    fn is_ctx(&self, v: Value) -> bool {
+        self.value_ctx.get(v.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// `biased`: the caller adds the returned static offset in a memarg, so
+    /// the null guard may ride on it (`gex_abi::NULL_GUARD`): the address
+    /// less the guard, the guard added back in the memarg, and an address
+    /// below the guard wraps past 2^32 and traps (or, where tier-1 guards
+    /// the bounds anyway, the bounds check's range starts at the guard).
+    /// Otherwise there is no null guard.
+    fn emit_address_in(&mut self, addr: Value, offset: i64, biased: bool) -> u32 {
+        // Not for the thread's own context, which is below the guard, nor a
+        // bulk operand: a zero-length copy from a null pointer touches
+        // nothing, and the engine traps any bulk address past the end.
+        let on = null_guard_on();
+        let null_guard = on && biased && !self.is_ctx(addr);
         // A 32-bit guest's effective address (PowerPC): already wrapped by the
         // guest's own arithmetic, and below 2^32, so it needs no guard -- an
         // address at or past `GUEST_LIMIT` is past the end of memory and traps
@@ -1496,16 +1545,34 @@ impl<'a> Emitter<'a> {
         // static offset follows the same rule as the guarded path.
         if gex_abi::mem64() {
             if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
-                self.f.i64_const(c.wrapping_add(offset as u64) as i64);
+                let ea = c.wrapping_add(offset as u64);
+                // Below the null guard: an address past every memory's end.
+                let ea = if null_guard && ea < gex_abi::NULL_GUARD { u64::MAX - 15 } else { ea };
+                self.f.i64_const(ea as i64);
                 return 0;
             }
             self.push(addr);
-            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
-            if (0..=max_static).contains(&offset) {
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
+            if null_guard {
+                // memory64's effective address does not wrap: (a - G) + G
+                // past 2^64 is out of bounds. One add, the offset's if any.
+                let g = gex_abi::NULL_GUARD as i64;
+                if (0..=max_static).contains(&offset) {
+                    self.f.i64_const(-g);
+                    self.f.byte(0x7c); // i64.add
+                    return (offset + g) as u32;
+                }
+                self.f.i64_const(offset.wrapping_sub(g));
+                self.f.byte(0x7c); // i64.add
+                return g as u32;
+            }
+            if biased && (0..=max_static).contains(&offset) {
                 return offset as u32;
             }
-            self.f.i64_const(offset);
-            self.f.byte(0x7c); // i64.add
+            if offset != 0 {
+                self.f.i64_const(offset);
+                self.f.byte(0x7c); // i64.add
+            }
             return 0;
         }
         // Constant addresses are extremely common (literal pools, absolute
@@ -1516,6 +1583,17 @@ impl<'a> Emitter<'a> {
             if let Some(f) = gex_abi::fold_kuser(ea) {
                 gex_ir::note_kuser_fold();
                 ea = f;
+            }
+            // Below the null guard: the poisoned address, as past the end
+            // (W3 with folding on: the named fault, as for a pointer).
+            if null_guard && ea < gex_abi::NULL_GUARD {
+                if gex_abi::kuser_fold() {
+                    self.f.i64_const(ea as i64);
+                    self.guard_to_i32();
+                    return 0;
+                }
+                self.f.i32_const(POISON_ADDR as i32);
+                return 0;
             }
             if ea < guard_limit() {
                 self.f.i32_const(ea as i32);
@@ -1537,10 +1615,39 @@ impl<'a> Emitter<'a> {
         // browser's NT layer keeps its heap above a lower one). The static
         // offset is no different from the guarded case.
         if self.value_u32.get(addr.0 as usize).copied().unwrap_or(false) && guard_limit() >= GUEST_LIMIT && !Self::no_guard() {
-            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
             if (0..=max_static).contains(&offset) {
                 self.push(addr);
+                if !null_guard {
+                    self.f.byte(code::I32_WRAP_I64);
+                    return offset as u32;
+                }
+                if !self.value_chase.get(addr.0 as usize).copied().unwrap_or(false) {
+                    // A computed address (an index, a sum): the guard rides
+                    // on the memarg, (a - G) mod 2^32 plus G in the static
+                    // offset past 2^32 for an `a` below G. One add, off any
+                    // load's latency, where a branch costs throughput.
+                    self.f.byte(code::I32_WRAP_I64);
+                    self.f.i32_const(-(gex_abi::NULL_GUARD as i32));
+                    self.f.byte(0x6a); // i32.add
+                    return offset as u32 + gex_abi::NULL_GUARD as u32;
+                }
+                // The null guard as a branch beside the access, not on the
+                // address: an `a` below G takes an access at POISON_ADDR,
+                // which traps as the guard's would. Kept off the address's
+                // dependency chain, where a bias (one more add before every
+                // load) slowed pointer chasing by a fifth.
+                let t = self.scratch_i64;
+                self.f.local_tee(t);
                 self.f.byte(code::I32_WRAP_I64);
+                self.f.local_get(t);
+                self.f.i64_const(gex_abi::NULL_GUARD as i64);
+                self.f.byte(code::I64_LT_U);
+                self.f.if_void();
+                self.f.i32_const(POISON_ADDR as i32);
+                self.f.load(0x2d, 0, 0); // i32.load8_u
+                self.f.byte(0x1a); // drop
+                self.f.end();
                 return offset as u32;
             }
         }
@@ -1556,16 +1663,22 @@ impl<'a> Emitter<'a> {
         // go through the add below instead. A64's immediate offsets are
         // bounded by the encoding, so it keeps the full u32 range.
         let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
-        let static_off = if (0..=max_static).contains(&offset) {
+        let static_off = if biased && (0..=max_static).contains(&offset) {
             self.push(addr);
             offset as u32
         } else {
             self.push(addr);
-            self.f.i64_const(offset);
-            self.f.byte(0x7c); // i64.add
+            if offset != 0 {
+                self.f.i64_const(offset);
+                self.f.byte(0x7c); // i64.add
+            }
             0
         };
-        self.guard_to_i32();
+        if null_guard {
+            self.guard_to_i32();
+        } else {
+            self.guard_to_i32_above(0);
+        }
         static_off
     }
 
@@ -1616,7 +1729,16 @@ impl<'a> Emitter<'a> {
 
     /// Consume an `i64` effective address and leave a bounds-safe `i32`; for
     /// a memory64 guest memory, leave the `i64` (the engine checks it).
+    ///
+    /// An address below the null guard (`gex_abi::NULL_GUARD`) is steered
+    /// the same way: one subtraction turns the bound into a range.
     fn guard_to_i32(&mut self) {
+        self.guard_to_i32_above(if null_guard_on() { gex_abi::NULL_GUARD } else { 0 });
+    }
+
+    /// [`Self::guard_to_i32`] with the range's floor given: 0 for an access
+    /// the null guard leaves out (the thread's context).
+    fn guard_to_i32_above(&mut self, floor: u64) {
         if gex_abi::mem64() {
             return;
         }
@@ -1625,11 +1747,23 @@ impl<'a> Emitter<'a> {
             return;
         }
         let before = self.f.code.len();
-        self.guard_to_i32_inner();
+        self.guard_to_i32_inner(floor);
         GUARD_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
-    fn guard_to_i32_inner(&mut self) {
+    /// `t - floor <u limit - floor`, with `t` (the i64 address) in the
+    /// scratch local and the comparison's operands pushed.
+    fn guard_range(&mut self, floor: u64) {
+        let t = self.scratch_i64;
+        self.f.local_get(t);
+        if floor != 0 {
+            self.f.i64_const(floor as i64);
+            self.f.byte(0x7d); // i64.sub
+        }
+        self.f.i64_const(guard_limit().saturating_sub(floor) as i64);
+    }
+
+    fn guard_to_i32_inner(&mut self, floor: u64) {
         let t = self.scratch_i64;
         // W3 with KUSER_SHARED_DATA folded: an address at or above the old
         // page is a pointer the translator could not fold. A branch to the
@@ -1638,8 +1772,13 @@ impl<'a> Emitter<'a> {
         // what the block last wrote back, at its start's pc, as natively for
         // an out-of-bounds access.
         if gex_abi::kuser_fold() {
-            self.f.local_tee(t);
-            self.f.i64_const(guard_limit() as i64);
+            if floor == 0 {
+                self.f.local_tee(t);
+                self.f.i64_const(guard_limit() as i64);
+            } else {
+                self.f.local_set(t);
+                self.guard_range(floor);
+            }
             self.f.byte(code::I64_GE_U);
             self.f.if_void();
             self.store_pc(self.block_start);
@@ -1661,8 +1800,7 @@ impl<'a> Emitter<'a> {
         self.f.local_get(t);
         self.f.byte(code::I32_WRAP_I64);
         self.f.i32_const(POISON_ADDR as i32);
-        self.f.local_get(t);
-        self.f.i64_const(guard_limit() as i64);
+        self.guard_range(floor);
         self.f.byte(code::I64_LT_U);
         self.f.select();
     }
@@ -1743,9 +1881,9 @@ impl<'a> Emitter<'a> {
                 // Both addresses first: `guard_to_i32` borrows the i64
                 // scratch, and the length wants it afterwards.
                 let (d, s) = if gex_abi::mem64() { self.scratch_addr } else { (self.scratch_i32, self.scratch_entry) };
-                self.emit_address(*dst, 0);
+                self.emit_address_flat(*dst);
                 self.f.local_set(d);
-                self.emit_address(*src, 0);
+                self.emit_address_flat(*src);
                 self.f.local_set(s);
                 self.clamp_len(*len, &[d, s]);
                 self.f.local_get(d);
@@ -1759,7 +1897,7 @@ impl<'a> Emitter<'a> {
             }
             Stmt::MemFill { dst, val, len } => {
                 let d = if gex_abi::mem64() { self.scratch_addr.0 } else { self.scratch_i32 };
-                self.emit_address(*dst, 0);
+                self.emit_address_flat(*dst);
                 self.f.local_set(d);
                 self.clamp_len(*len, &[d]);
                 self.f.local_get(d);
@@ -1893,10 +2031,10 @@ impl<'a> Emitter<'a> {
                     self.f.br_if(0);
                     // memory.copy(dst, src, count*bytes)
                     self.f.local_get(ld);
-                    self.guard_to_i32();
+                    self.guard_to_i32_above(0);
                     self.f.local_set(d32);
                     self.f.local_get(ls);
-                    self.guard_to_i32();
+                    self.guard_to_i32_above(0);
                     self.f.local_set(s32);
                     self.f.local_get(lc);
                     self.f.i64_const(bytes);
@@ -1939,7 +2077,7 @@ impl<'a> Emitter<'a> {
                         self.f.br_if(0);
                     }
                     self.f.local_get(ld);
-                    self.guard_to_i32();
+                    self.guard_to_i32_above(0);
                     self.f.local_set(d32);
                     self.f.local_get(lc);
                     self.f.i64_const(bytes);
@@ -1986,10 +2124,10 @@ impl<'a> Emitter<'a> {
         match kind {
             StrKind::Movs => {
                 self.f.local_get(ld);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.local_set(d32);
                 self.f.local_get(ls);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.load(load_op, 0, 0);
                 self.f.local_set(la);
                 self.f.local_get(d32);
@@ -1998,7 +2136,7 @@ impl<'a> Emitter<'a> {
             }
             StrKind::Stos => {
                 self.f.local_get(ld);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.local_get(lv);
                 self.f.store(store_op, 0, 0);
             }
@@ -2010,17 +2148,17 @@ impl<'a> Emitter<'a> {
                 }
                 self.f.local_set(la);
                 self.f.local_get(ld);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.load(load_op, 0, 0);
                 self.f.local_set(lb);
             }
             StrKind::Cmps => {
                 self.f.local_get(ls);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.load(load_op, 0, 0);
                 self.f.local_set(la);
                 self.f.local_get(ld);
-                self.guard_to_i32();
+                self.guard_to_i32_above(0);
                 self.f.load(load_op, 0, 0);
                 self.f.local_set(lb);
             }
@@ -2128,11 +2266,11 @@ impl<'a> Emitter<'a> {
         self.f.local_get(ld);
         self.f.local_get(idx);
         self.f.byte(0x7c); // i64.add
-        self.guard_to_i32();
+        self.guard_to_i32_above(0);
         self.f.local_get(ls);
         self.f.local_get(idx);
         self.f.byte(0x7c); // i64.add
-        self.guard_to_i32();
+        self.guard_to_i32_above(0);
         self.f.load(0x2d, 0, 0); // i32.load8_u
         self.f.byte(0x3a); // i32.store8
         self.f.byte(0); // align
@@ -2554,12 +2692,12 @@ impl<'a> Emitter<'a> {
         self.f.local_get(la);
         self.f.local_get(idx);
         self.f.byte(0x7c); // i64.add
-        self.guard_to_i32();
+        self.guard_to_i32_above(0);
         self.f.load(0x2d, 0, 0); // i32.load8_u
         self.f.local_get(lb);
         self.f.local_get(idx);
         self.f.byte(0x7c);
-        self.guard_to_i32();
+        self.guard_to_i32_above(0);
         self.f.load(0x2d, 0, 0);
         self.f.local_set(tb);
 
@@ -2591,6 +2729,15 @@ impl<'a> Emitter<'a> {
         let ty = expr.ty();
         let idx = dst.0 as usize;
         self.value_ty[idx] = ty;
+        let is_ctx = match expr {
+            Expr::ReadReg(GuestReg::CtxAddr) => true,
+            Expr::Bin { op: BinOp::Add, a, b, .. } => self.is_ctx(*a) || self.is_ctx(*b),
+            _ => false,
+        };
+        if self.value_ctx.len() <= idx {
+            self.value_ctx.resize(idx + 1, false);
+        }
+        self.value_ctx[idx] = is_ctx;
         if let Some(f) = self.value_fp.get_mut(idx) {
             *f = None;
         }

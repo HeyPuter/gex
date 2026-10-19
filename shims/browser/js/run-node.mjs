@@ -365,6 +365,8 @@ const host = new ProcessHost({
     strayTrap: !!process.env.GEX_STRAY_TRAP,
     // GEX_W3_SPLIT=1: as the page's ?w3split=1 (nt::w3_space).
     w3Split: !!process.env.GEX_W3_SPLIT,
+    // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
+    nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).

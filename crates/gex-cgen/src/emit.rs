@@ -55,6 +55,11 @@ fn no_guard() -> bool {
     std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some()
 }
 
+/// The null guard, a debugging opt-in (gex-emit `null_guard_on`).
+fn null_on() -> bool {
+    gex_emit::tier1::null_guard_on()
+}
+
 pub(crate) fn cty(ty: Ty) -> &'static str {
     match ty {
         Ty::I32 => "uint32_t",
@@ -271,6 +276,10 @@ pub(crate) struct Emitter<'a> {
     /// base plus a static offset (tier-1's shape, and the guard of one base
     /// shared by every displacement from it).
     value_disp: Vec<Option<(Value, u64, u8)>>,
+    /// The values that are the context address plus offsets
+    /// (`GuestReg::CtxAddr`: the x87 stack, `EFLAGS_SYS`), whose accesses
+    /// the null guard leaves out: the context is below it.
+    value_ctx: Vec<bool>,
 }
 
 impl<'a> Emitter<'a> {
@@ -293,6 +302,7 @@ impl<'a> Emitter<'a> {
             fault_next: None,
             value_zext: vec![false; n],
             value_disp: vec![None; n],
+            value_ctx: vec![false; n],
         }
     }
 
@@ -304,6 +314,7 @@ impl<'a> Emitter<'a> {
         self.value_half = vec![false; n];
         self.value_zext = vec![false; n];
         self.value_disp = vec![None; n];
+        self.value_ctx = vec![false; n];
     }
 
     /// The C emitted so far, leaving the emitter empty.
@@ -704,15 +715,45 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Whether `v` is the context address plus offsets (`value_ctx`).
+    fn is_ctx(&self, v: Value) -> bool {
+        self.value_ctx.get(v.0 as usize).copied().unwrap_or(false)
+    }
+
     fn address(&self, addr: Value, offset: i64) -> String {
+        // The null guard (`gex_abi::NULL_GUARD`, tier-1's `emit_address`):
+        // every access below it traps. Unguarded, the address less the guard
+        // (`gex_n`) with the guard added back in the access's constant
+        // offset, which clang folds into the memarg: one add. Guarded, the
+        // bounds check's range starts at the guard. The thread's own
+        // context, below the guard, is reached as before.
+        let g = gex_abi::NULL_GUARD;
+        let on = null_on();
+        if on && self.is_ctx(addr) && (0..=0xffff).contains(&offset) {
+            let a = self.v(addr);
+            return if gex_abi::mem64() {
+                format!("(GEX_P({a}) + {offset}u)")
+            } else {
+                format!("(GEX_P((uint32_t)({a})) + {offset}u)")
+            };
+        }
         // A memory64 guest memory (docs/mem64.md): the guest address as it
         // stands, as tier-1 does; the engine's check traps past the end.
         if gex_abi::mem64() {
             if let Some(c) = self.value_const[addr.0 as usize] {
-                return format!("GEX_P(0x{:x}ull)", c.wrapping_add(offset as u64));
+                let ea = c.wrapping_add(offset as u64);
+                let ea = if ea < g && on { u64::MAX - 15 } else { ea };
+                return format!("GEX_P(0x{ea:x}ull)");
             }
             let a = self.v(addr);
-            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - g as i64 } else { u32::MAX as i64 };
+            if on {
+                return if (0..=max_static).contains(&offset) {
+                    format!("(gex_n({a}) + {}u)", offset as u64 + g)
+                } else {
+                    format!("(gex_n({a} + (uint64_t){offset}ll) + {g}u)")
+                };
+            }
             return if offset == 0 {
                 format!("GEX_P({a})")
             } else if (0..=max_static).contains(&offset) {
@@ -737,7 +778,7 @@ impl<'a> Emitter<'a> {
                     gex_ir::note_kuser_fold();
                     return format!("GEX_P(0x{f:x}u)");
                 }
-                if ea < gex_abi::KUSER_GUARD {
+                if (ea >= g || !on) && ea < gex_abi::KUSER_GUARD {
                     return format!("GEX_P(0x{ea:x}u)");
                 }
                 return format!("GEX_P(gex_k(ctx, 0x{pc:x}ull, 0x{ea:x}ull))");
@@ -755,8 +796,10 @@ impl<'a> Emitter<'a> {
         // memory) differs: it traps.
         if offset == 0 && (!no_guard() || self.unguarded()) {
             if let Some((b, c, 2)) = self.value_disp.get(addr.0 as usize).copied().flatten() {
-                return if self.unguarded() {
+                return if self.unguarded() && !on {
                     format!("(GEX_P((uint32_t){}) + {c}u)", self.v(b))
+                } else if self.unguarded() {
+                    format!("(gex_n((uint32_t){}) + {}u)", self.v(b), c + g)
                 } else {
                     format!("(gex_gb({}) + {c}u)", self.v(b))
                 };
@@ -764,7 +807,7 @@ impl<'a> Emitter<'a> {
         }
         if let Some(c) = self.value_const[addr.0 as usize] {
             let ea = c.wrapping_add(offset as u64);
-            return if ea < GUEST_LIMIT {
+            return if ea < GUEST_LIMIT && (ea >= g || !on) {
                 format!("GEX_P(0x{ea:x}u)")
             } else {
                 "GEX_P(GEX_POISON_ADDR)".into()
@@ -772,11 +815,17 @@ impl<'a> Emitter<'a> {
         }
         let a = self.v(addr);
         let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
-        if no_guard() || self.unguarded() {
+        if no_guard() || (self.unguarded() && !on) {
             if (0..=max_static).contains(&offset) {
                 return format!("(GEX_P((uint32_t){a}) + {offset}u)");
             }
             return format!("GEX_P((uint32_t)({a} + (uint64_t){offset}ll))");
+        }
+        if self.unguarded() {
+            if (0..=max_static).contains(&offset) {
+                return format!("(gex_n((uint32_t){a}) + {}u)", offset as u64 + g);
+            }
+            return format!("(gex_n((uint32_t)({a} + (uint64_t){offset}ll)) + {g}u)");
         }
         if (0..=0xffff).contains(&offset) {
             if offset == 0 && self.class32 && !disp_off() {
@@ -1185,6 +1234,14 @@ impl<'a> Emitter<'a> {
         }
         if let Some(p) = self.value_disp.get_mut(idx) {
             *p = None;
+        }
+        let is_ctx = match expr {
+            Expr::ReadReg(GuestReg::CtxAddr) => true,
+            Expr::Bin { op: BinOp::Add, a, b, .. } => self.is_ctx(*a) || self.is_ctx(*b),
+            _ => false,
+        };
+        if let Some(c) = self.value_ctx.get_mut(idx) {
+            *c = is_ctx;
         }
         self.note_disp(idx, expr);
         let rhs: String = match expr {
