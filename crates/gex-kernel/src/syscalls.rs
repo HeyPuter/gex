@@ -7681,19 +7681,29 @@ impl Kernel {
     /// `GEX_MEM64=1` or `=0` entry, removed from `envp` (every one, so none
     /// reaches the program or its children), else the image's
     /// `user.gex.mem64` attribute, `1` or `0`. `None`: neither says.
+    ///
+    /// The image is `path`, unless the exec names another with a
+    /// `WINEGEX_IMAGE=<path>` entry: Wine execs its loader for every Windows
+    /// program, and names the program's `.exe` there, so the attribute on
+    /// the `.exe` applies to that program's process alone. That entry is
+    /// removed too.
     pub fn exec_flavour(&self, path: &str, envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
-        envp.retain(|e| match e.strip_prefix("GEX_MEM64=") {
-            Some(v) => {
+        let mut image = None;
+        envp.retain(|e| {
+            if let Some(v) = e.strip_prefix("GEX_MEM64=") {
                 flag = Some(v == "1");
-                false
+            } else if let Some(v) = e.strip_prefix("WINEGEX_IMAGE=") {
+                image = Some(v.to_string());
+            } else {
+                return true;
             }
-            None => true,
+            false
         });
         flag.or_else(|| {
             let mut b = [0u8; 8];
             let op = crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
-            let n = self.vfs.xattr(path, true, op).ok()?;
+            let n = self.vfs.xattr(image.as_deref().unwrap_or(path), true, op).ok()?;
             match &b[..n] {
                 b"1" | b"1\n" => Some(true),
                 b"0" | b"0\n" => Some(false),

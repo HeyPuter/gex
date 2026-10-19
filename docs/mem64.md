@@ -491,24 +491,21 @@ browser shim; the coordinator sequences them.
   PAGE=mp (the loader exec'd by a launcher with GEX_MEM64=1): the W64 cases,
   highdata's 5 GiB, and `childtwin` (the program's CreateProcess child is
   32-bit: highdata's 5 GiB fail in it).
-- Not yet: the record for a Windows program (Wine passes the Windows
-  command line to the loader, not the image's path: options below), the
-  overflow detection that writes the record (§5), and native per-process
-  flavours (OPTIMIZATION-BACKLOG.md).
-- The record for a Windows program, options (not built; a Wine change
-  needs the coordinator's approval):
-  - (b1) The shim resolves the command line's first word at a loader exec:
-    a drive path through `$WINEPREFIX/dosdevices/<x>:`, a bare name in the
-    exec's cwd and then `system32`, case-insensitively, and reads the
-    attribute there. No Wine change, but a second copy of Wine's search
-    (PATH, App Paths, a missing `.exe`, quoting, `z:` and other drive
-    overrides, an unset WINEPREFIX); a miss leaves the program 32-bit.
-  - (b2) Wine names the image: `prepare_wineloader_exec` (and
-    `exec_wineloader`) put `WINEGEX_IMAGE=<unix path of the PE>` in the new
-    process's environment, which Wine already resolved, as it puts
-    `WINEPRELOADRESERVE`. The kernel reads the record from that path at
-    execve and strips the variable, as it does GEX_MEM64. Exact, and a few
-    lines in ntdll's process.c under `__wasm__`; the overflow detection
-    gets the same path to write the record to.
-  - (b3) The new process asks for the switch itself after mapping its main
-    image: that is the live switch (§6), far more work.
+- The record for a Windows program: Wine's exec of the loader names only
+  the loader, so Wine names the program as well. Under `__wasm__`,
+  `prepare_wineloader_exec` (ntdll unix loader.c, called by `spawn_process`
+  with the `.exe`'s Unix path) puts `WINEGEX_IMAGE=<that path>` in the new
+  process's environment, as it puts `WINEPRELOADRESERVE`. It is a name, not
+  a switch. At execve the kernel reads the `user.gex.mem64` record of the
+  file it names in place of the exec's own path, after a `GEX_MEM64`
+  entry, and takes the variable out, so no process sees it. The Wine
+  branch is mw `kc/wine-image` (off `w64/desktop-proc`). Test:
+  tests/wine64/nt-x64.sh TWIN=1 `image`, the Hades case. A 32-bit parent
+  (siblings.exe) starts hades.exe, whose `.exe` carries the record and
+  which gets 5 GiB. Its own child is 32-bit, and so is its sibling.
+  Rejected: (b1) the shim resolving the command line's first word through
+  `$WINEPREFIX/dosdevices` (a second copy of Wine's search: PATH, App
+  Paths, quoting, drive overrides); (b3) the process asking for the
+  switch itself after mapping its main image (the live switch, §6).
+- Not yet: the overflow detection that writes the record (§5; it gets the
+  same path), and native per-process flavours (OPTIMIZATION-BACKLOG.md).

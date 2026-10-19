@@ -30,6 +30,9 @@
 # a launcher with GEX_MEM64=1, which runs the install's memory64 twin
 # (wine.m64) in a 64-bit memory; the server, and the launcher, stay 32-bit.
 # highdata allocates 5 GiB as under MEM64=1.
+# Its `image` case is a program's own record instead (the Hades case): the
+# user.gex.mem64 attribute on one .exe, its parent, its child and its
+# sibling 32-bit (Wine's WINEGEX_IMAGE names the .exe at the exec).
 # NTDLL=FILE runs the cases with that ntdll.dll in place of DIST's (W64.2's
 # native PE ntdll, w64-dist.sh's W64_NTDLL; the other DLLs translated).
 # The audio case: waveOut and mmdevapi through wineoss.drv (audio.c).
@@ -94,9 +97,17 @@ if [ -n "$page" ]; then
 	tag="W64 page $page${m64:+ mem64}${twin:+ twin}"
 	if [ -n "$twin" ]; then
 		# the launcher: the loader exec'd with GEX_MEM64=1 (the kernel takes
-		# it out again), so the twin runs in a 64-bit memory
-		printf '%s\n' '#include <stdlib.h>' '#include <unistd.h>' \
-			'int main(int c, char **v) { (void)c; setenv("GEX_MEM64", "1", 1); execv(v[1], v + 1); return 127; }' > "$w/launch.c"
+		# it out again), so the twin runs in a 64-bit memory. `-x FILE`
+		# instead: FILE's user.gex.mem64 record set to 1, and the loader
+		# exec'd with nothing asked (a Windows program's own record, which
+		# Wine names to the kernel at its exec: WINEGEX_IMAGE)
+		printf '%s\n' '#include <stdio.h>' '#include <stdlib.h>' '#include <string.h>' '#include <unistd.h>' '#include <sys/xattr.h>' \
+			'int main(int c, char **v) {' \
+			'  if (c > 3 && !strcmp(v[1], "-x")) {' \
+			'    if (setxattr(v[2], "user.gex.mem64", "1", 1, 0)) { perror("setxattr"); return 126; }' \
+			'    v += 2;' \
+			'  } else setenv("GEX_MEM64", "1", 1);' \
+			'  execv(v[1], v + 1); return 127; }' > "$w/launch.c"
 		zig cc -target x86_64-linux-musl -O1 -static -o "$w/launch" "$w/launch.c" || { echo "FAIL the twin's launcher (zig)"; exit 1; }
 	fi
 	# the door off in the single-thread build (it has none: the pipes)
@@ -159,7 +170,7 @@ check() {
 	if [ -n "$page" ]; then
 		# the loader as the process, or exec'd by the twin's launcher
 		local run=(--argv0 /w64/lib/wine/x86_64-unix/wine "$seed" "$wine")
-		[ -z "$twin" ] || run=(--file /launch="$w/launch" --argv0 /launch "$seed" "$w/launch" /w64/lib/wine/x86_64-unix/wine)
+		[ -z "$twin" ] || run=(--file /launch="$w/launch" --argv0 /launch "$seed" "$w/launch" ${MARK:+-x "/pfx/drive_c/$MARK"} /w64/lib/wine/x86_64-unix/wine)
 		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
@@ -292,6 +303,20 @@ fi
 # highdata's 5 GiB, which its parent could have, fail in it.
 if [ -n "$twin" ] && [ -f "$w/highdata.exe" ]; then
 	EXTRA="$w/highdata.exe" check childtwin 4 "([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4" childcon.exe "highdata.exe mem64"
+fi
+# TWIN=1, the Hades case: a Windows program's own record (user.gex.mem64 on
+# its .exe; Wine names the .exe to the kernel at the loader's exec) makes it
+# alone a 64-bit process. Started by a 32-bit parent (siblings.exe, nothing
+# asked), hades.exe (highdata.exe under another name, the record on it) has
+# 5 GiB; its own child, highdata.exe, and its sibling, highdata.exe again,
+# are 32-bit processes (exit 4: no data above 4 GiB).
+if [ -n "$twin" ] && [ -f "$w/highdata.exe" ] && x86_64-w64-mingw32-gcc -O1 -o "$w/siblings.exe" "$here/siblings.c"; then
+	cp "$w/highdata.exe" "$w/hades.exe"
+	MARK=hades.exe EXTRA="$w/highdata.exe $w/hades.exe" check image 0 \
+		"(ok [^$nl]*$nl)+0 failures$nl([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4${nl}child exit 0$nl([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4" \
+		"$w/siblings.exe" "hades.exe mem64 highdata.exe mem64" "highdata.exe mem64"
+elif [ -n "$twin" ]; then
+	case " ${CASES:-image} " in *" image "*) fail=$((fail + 1)); echo "FAIL x64/image ($tag): build" ;; esac
 fi
 
 # W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
