@@ -309,12 +309,12 @@ fi
 # alone a 64-bit process. Started by a 32-bit parent (siblings.exe, nothing
 # asked), hades.exe (highdata.exe under another name, the record on it) has
 # 5 GiB; its own child, highdata.exe, and its sibling, highdata.exe again,
-# are 32-bit processes (exit 4: no data above 4 GiB).
+# are 32-bit processes (`highdata where`: a top-down allocation below 4 GiB).
 if [ -n "$twin" ] && [ -f "$w/highdata.exe" ] && x86_64-w64-mingw32-gcc -O1 -o "$w/siblings.exe" "$here/siblings.c"; then
 	cp "$w/highdata.exe" "$w/hades.exe"
 	MARK=hades.exe EXTRA="$w/highdata.exe $w/hades.exe" check image 0 \
-		"(ok [^$nl]*$nl)+0 failures$nl([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4${nl}child exit 0$nl([^$nl]*$nl)*FAIL data above 4 GiB$nl([^$nl]*$nl)*child exit 4" \
-		"$w/siblings.exe" "hades.exe mem64 highdata.exe mem64" "highdata.exe mem64"
+		"(ok [^$nl]*$nl)+0 failures${nl}flavour 32${nl}child exit 0${nl}child exit 0${nl}flavour 32${nl}child exit 0" \
+		"$w/siblings.exe" "hades.exe mem64 highdata.exe where" "highdata.exe where"
 elif [ -n "$twin" ]; then
 	case " ${CASES:-image} " in *" image "*) fail=$((fail + 1)); echo "FAIL x64/image ($tag): build" ;; esac
 fi

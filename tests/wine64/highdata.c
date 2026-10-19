@@ -8,6 +8,9 @@
  * limit: 5 GiB of data, some of it above 4 GiB, executable memory runs
  * wherever it lands, and a high data page made executable runs.
  *
+ * `highdata where`: only which flavour this process is ("flavour 64" when
+ * a top-down allocation lands above 4 GiB, else "flavour 32"), exit 0.
+ *
  * Any arguments after the first are a command line run as a child process
  * once the checks are done, waited for, and its exit code printed ("child
  * exit N"): the memory flavour is per program (gex docs/mem64.md §5), so a
@@ -31,6 +34,12 @@ static void check(int ok, const char *what)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "where"))
+    {
+        void *p = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+        printf("flavour %d\n", p && (ULONG_PTR)p >= LIMIT32 ? 64 : 32);
+        return 0;
+    }
     int mem64 = argc > 1 && !strcmp(argv[1], "mem64");
     /* 2560 MiB, or 5 GiB in the memory64 flavour */
     int want = mem64 ? 40 : 20;
