@@ -459,6 +459,8 @@ extern "C" {
     fn k_pipe_forget(pid: i32) -> u32;
     fn k_pipe_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_pipe_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_audio_write(stream: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32, now_ms: u32) -> i32;
+    fn k_audio_ring() -> u32;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
@@ -1101,11 +1103,31 @@ fn make_tty() -> Arc<gex_kernel::tty::TtyRef> {
     }))
 }
 
+/// `/dev/dsp`'s player: the global kernel's audio ring (shims/kernel
+/// `audio.rs`), which the page's AudioWorklet reads.
+/// A stream's number is its process's own (each process counts its opens):
+/// with the pid, one across the page.
+fn audio_out(stream: u32, pcm: &[u8], format: u32, rate: u32, channels: u32, ms: u32) {
+    let stream = (my_pid() as u32).wrapping_shl(16).wrapping_add(stream & 0xffff);
+    unsafe { k_audio_write(stream, pcm.as_ptr() as usize as gex_kernel::PAddr, pcm.len() as u32, format, rate, channels, ms) };
+}
+
+/// Where the audio ring is in the global kernel's memory (0 with none), for
+/// the page's player (web/src/audio.js).
+#[no_mangle]
+pub extern "C" fn gex_audio_ring_addr() -> u32 {
+    if unsafe { k_present() } == 0 {
+        return 0;
+    }
+    unsafe { k_audio_ring() }
+}
+
 /// Where a pipe's buffer goes, when there is a global kernel to put it in.
 fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     if unsafe { k_present() } == 0 {
         return None;
     }
+    gex_kernel::vfs::oss::set_audio_out(audio_out);
     Some(gex_kernel::pipe::Remote {
         queue: rp_queue,
         new: rp_new,

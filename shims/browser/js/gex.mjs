@@ -1155,6 +1155,16 @@ export class Gex {
    *  and where the wait slots' words start, or null: what a compositor walks
    *  to wake this process's parked threads after an input event
    *  (`wl-bridge.mjs` `sendEvent`). */
+  /** The global kernel's memory and the address in it of `/dev/dsp`'s
+   *  ring (shims/kernel/src/audio.rs), or null: what the page plays
+   *  (web/src/audio.js). */
+  audioRing() {
+    const e = this.#shim?.exports;
+    if (!this.#kernel || !e?.gex_audio_ring_addr || !this.#kernelSpec?.memory) return null;
+    const at = e.gex_audio_ring_addr() >>> 0;
+    return at ? { memory: this.#kernelSpec.memory, at } : null;
+  }
+
   kernelWake() {
     const e = this.#shim?.exports;
     if (!this.#kernel || !e?.gex_proc_queue_addr || !this.#kernelSpec?.memory) return null;

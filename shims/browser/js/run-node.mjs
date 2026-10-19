@@ -540,6 +540,7 @@ const host = new ProcessHost({
     }
   },
   onMessage: (m, pid) => {
+    if (m?.kind === 'audio') audioRing ??= m;
     // Memory before the guest runs an instruction: whether the cost is placing
     // the image or running it.
     if (m?.kind === 'loaded' && pid === 1 && process.env.GEX_DEBUG_EXIT) {
@@ -547,6 +548,29 @@ const host = new ProcessHost({
     }
   },
 });
+
+// `/dev/dsp`'s ring in the global kernel (shims/kernel/src/audio.rs), as
+// the page plays it (web/src/audio.js). GEX_AUDIO_TAP=1 reports, at exit,
+// what the newest quarter second in it sounds like: its rate, generation,
+// RMS and frequency (left channel, by zero crossings).
+let audioRing = null;
+function audioTap() {
+  if (!audioRing) { process.stderr.write('[audio] no ring\n'); return; }
+  const { memory, at } = audioRing;
+  const words = new Uint32Array(memory.buffer, at, 8);
+  const [, w, rate, cap, owner, gen] = words;
+  const n = Math.min(w, cap, Math.floor(rate / 4));
+  const f = new Float32Array(memory.buffer, at + 32, cap * 2);
+  let sq = 0, cross = 0, last = 0;
+  for (let i = w - n; i < w; i++) {
+    const l = f[((i >>> 0) % cap) * 2];
+    sq += l * l;
+    if (i > w - n && (l >= 0) !== (last >= 0)) cross++;
+    last = l;
+  }
+  const rms = n ? Math.sqrt(sq / n) : 0, hz = n ? cross / 2 / (n / rate) : 0;
+  process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)}\n`);
+}
 
 let status;
 // GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
@@ -614,4 +638,5 @@ try {
 if (SINGLE && process.env.GEX_SINGLE_STATS) {
   process.stderr.write(`[single] fibers ${FiberWorker.count}, sched ${JSON.stringify(sched.stats)}\n`);
 }
+if (process.env.GEX_AUDIO_TAP) audioTap();
 process.exitCode = status;

@@ -14,6 +14,7 @@ import { xcHash } from '../../shims/browser/js/xcache.mjs';
 import { single, singleSupported, FiberWorker } from '../../shims/browser/js/single.mjs';
 import { assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
+import { startAudio } from './audio.js';
 
 /** The guest Worker's modules: bytes fetched, bytes from the page's cache
  *  (worker-graph.js). */
@@ -1134,6 +1135,8 @@ async function runProgramHere(
       else if (m.kind === 'net') onNetEvent?.(m.event);
       // Pid 1 has copied `files` into the kernel's filesystem.
       else if (m.kind === 'files-loaded') onFilesLoaded?.();
+      // Where `/dev/dsp`'s output is: played from the first gesture on.
+      else if (m.kind === 'audio') startAudio(m);
     },
   });
 

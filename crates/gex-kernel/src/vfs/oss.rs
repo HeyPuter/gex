@@ -76,14 +76,12 @@ struct Stream {
 }
 
 impl Stream {
+    fn frame_bytes(&self) -> u64 {
+        self.channels as u64 * sample_size(self.format) as u64
+    }
+
     fn bytes_per_second(&self) -> u64 {
-        let sample = match self.format {
-            AFMT_U8 => 1,
-            AFMT_S16_LE => 2,
-            AFMT_S24_PACKED => 3,
-            _ => 4,
-        };
-        self.rate as u64 * self.channels as u64 * sample
+        self.rate as u64 * self.frame_bytes()
     }
 
     /// Play what the time since the last look has played.
@@ -98,17 +96,76 @@ impl Stream {
     }
 }
 
+/// Bytes in one sample of `format`.
+fn sample_size(format: u32) -> usize {
+    match format {
+        AFMT_U8 => 1,
+        AFMT_S16_LE => 2,
+        AFMT_S24_PACKED => 3,
+        _ => 4,
+    }
+}
+
+fn sample(format: u32, b: &[u8]) -> f32 {
+    match format {
+        AFMT_U8 => (b[0] as f32 - 128.0) / 128.0,
+        AFMT_S16_LE => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
+        AFMT_S24_PACKED => (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0,
+        AFMT_S24_LE => ((i32::from_le_bytes([b[0], b[1], b[2], b[3]]) << 8) >> 8) as f32 / 8_388_608.0,
+        AFMT_S32_LE => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
+        AFMT_F32_LE => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        _ => 0.0,
+    }
+}
+
+/// Convert whole frames of `pcm` (`channels` interleaved samples of
+/// `format`) to stereo `f32` into `out`, what the page's player plays
+/// (shims/kernel `audio.rs`); how many frames. Mono goes to both sides,
+/// more than two channels keep the first two.
+pub fn to_stereo_f32(pcm: &[u8], format: u32, channels: u32, out: &mut Vec<[f32; 2]>) -> usize {
+    let sb = sample_size(format);
+    let ch = channels.max(1) as usize;
+    let fb = sb * ch;
+    let n = pcm.len() / fb;
+    for f in 0..n {
+        let at = f * fb;
+        let l = sample(format, &pcm[at..at + sb]);
+        let r = if ch > 1 { sample(format, &pcm[at + sb..at + 2 * sb]) } else { l };
+        out.push([l, r]);
+    }
+    n
+}
+
+/// Where what `/dev/dsp` accepts is also played, when the host has a
+/// player (the page's AudioWorklet, through the global kernel's ring:
+/// shims/kernel `audio.rs`): `(stream, bytes, format, rate, channels, ms)`,
+/// `ms` the device's clock.
+/// Never blocks; the device keeps its own clock either way.
+pub type AudioOut = fn(u32, &[u8], u32, u32, u32, u32);
+
+static AUDIO_OUT: std::sync::OnceLock<AudioOut> = std::sync::OnceLock::new();
+
+/// Set the host's player (once; later calls are ignored).
+pub fn set_audio_out(f: AudioOut) {
+    let _ = AUDIO_OUT.set(f);
+}
+
+/// Each open `/dev/dsp`'s number, for the player to tell streams apart.
+static NEXT_STREAM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// An open `/dev/dsp` or `/dev/mixer`.
 #[derive(Debug)]
 pub struct OssHandle {
     node: OssNode,
     stream: Mutex<Stream>,
+    id: u32,
 }
 
 impl OssHandle {
     pub fn new(node: OssNode) -> OssHandle {
         OssHandle {
             node,
+            id: NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: super::tmpfs::now_ns() }),
         }
     }
@@ -169,8 +226,19 @@ impl FileHandle for OssHandle {
         if room == 0 {
             return Err(Errno::EAGAIN);
         }
-        let n = (buf.len() as u64).min(room);
+        // Whole frames when not all of it fits: what is played next starts
+        // on a frame (the player reads frames from each write).
+        let mut n = (buf.len() as u64).min(room);
+        if n < buf.len() as u64 {
+            n -= n % s.frame_bytes();
+            if n == 0 {
+                return Err(Errno::EAGAIN);
+            }
+        }
         s.queued += n;
+        if let Some(out) = AUDIO_OUT.get() {
+            out(self.id, &buf[..n as usize], s.format, s.rate, s.channels, (s.at / 1_000_000) as u32);
+        }
         Ok(n)
     }
 
@@ -310,6 +378,33 @@ impl FileHandle for OssHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_convert_to_stereo_floats() {
+        let mut out = Vec::new();
+        // S16 mono: one frame, both sides.
+        assert_eq!(to_stereo_f32(&16384i16.to_le_bytes(), AFMT_S16_LE, 1, &mut out), 1);
+        assert_eq!(out[0], [0.5, 0.5]);
+        out.clear();
+        // F32 stereo, and a trailing partial frame left alone.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0.25f32.to_le_bytes());
+        b.extend_from_slice(&(-1.0f32).to_le_bytes());
+        b.push(7);
+        assert_eq!(to_stereo_f32(&b, AFMT_F32_LE, 2, &mut out), 1);
+        assert_eq!(out[0], [0.25, -1.0]);
+        out.clear();
+        // U8 silence, 3 channels: the first two kept.
+        assert_eq!(to_stereo_f32(&[128, 128, 0], AFMT_U8, 3, &mut out), 1);
+        assert_eq!(out[0], [0.0, 0.0]);
+        out.clear();
+        // S24 packed and S32.
+        to_stereo_f32(&[0, 0, 0x40], AFMT_S24_PACKED, 1, &mut out);
+        assert_eq!(out[0][0], 0.5);
+        out.clear();
+        to_stereo_f32(&(i32::MIN).to_le_bytes(), AFMT_S32_LE, 1, &mut out);
+        assert_eq!(out[0][0], -1.0);
+    }
     use std::time::Instant;
 
     #[test]
@@ -337,6 +432,23 @@ mod tests {
         if played + 4 < BUFSIZE {
             assert!(n < BUFSIZE, "{n} (played {played})");
         }
+    }
+
+    #[test]
+    fn a_write_that_does_not_fit_takes_whole_frames() {
+        let h = OssHandle::new(OssNode::Dsp);
+        {
+            let mut s = h.stream.lock().unwrap();
+            s.format = AFMT_S16_LE;
+            s.channels = 2;
+        }
+        // All of a write that fits, even part of a frame.
+        assert_eq!(h.write_at(0, &vec![0u8; BUFSIZE as usize - 6]).unwrap(), BUFSIZE - 6);
+        // The clock stopped: nothing plays from here on.
+        h.stream.lock().unwrap().at = u64::MAX;
+        // 6 bytes of room: one 4-byte frame of the 8 offered, then none.
+        assert_eq!(h.write_at(0, &[0u8; 8]).unwrap(), 4);
+        assert_eq!(h.write_at(0, &[0u8; 8]), Err(Errno::EAGAIN));
     }
 
     #[test]
