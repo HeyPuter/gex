@@ -23,6 +23,8 @@ pub struct HostFs {
     /// own, and another process's, are not seen by it: a lookup racing
     /// one of those can still miss.
     gate: Arc<super::RenameGate>,
+    /// `root` held open, once a walk asks ([`host_walk`]).
+    root_dir: std::sync::OnceLock<Option<File>>,
 }
 
 impl HostFs {
@@ -32,6 +34,7 @@ impl HostFs {
             read_only: false,
             canon: Default::default(),
             gate: Default::default(),
+            root_dir: Default::default(),
         }
     }
 
@@ -41,6 +44,7 @@ impl HostFs {
             read_only: true,
             canon: Default::default(),
             gate: Default::default(),
+            root_dir: Default::default(),
         }
     }
 
@@ -74,6 +78,54 @@ fn file_type_of(md: &std::fs::Metadata) -> FileType {
     } else if t.is_socket() {
         // A bound UNIX socket. Everything that waits for a server to come up
         // stats its path and asks for exactly this.
+        FileType::Socket
+    } else if t.is_fifo() {
+        FileType::Fifo
+    } else {
+        FileType::CharDevice
+    }
+}
+
+/// A host directory's entries, `.` and `..` first; `md` is its own.
+fn list_dir(host: &Path, md: &Metadata) -> Result<Vec<DirEntry>, Errno> {
+    let mut entries = vec![
+        DirEntry {
+            name: ".".into(),
+            file_type: FileType::Directory,
+            ino: md.ino,
+        },
+        DirEntry {
+            name: "..".into(),
+            file_type: FileType::Directory,
+            ino: 1,
+        },
+    ];
+    // Each entry's type and inode as the directory read gives them
+    // (d_type, d_ino), as Linux's getdents does: no call per entry. A
+    // filesystem that gives no type is asked, by lstat.
+    for e in std::fs::read_dir(&host).map_err(|e| Errno::from_io(&e))? {
+        use std::os::unix::fs::DirEntryExt;
+        let e = e.map_err(|e| Errno::from_io(&e))?;
+        let ft = e.file_type().map_err(|e| Errno::from_io(&e))?;
+        entries.push(DirEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            file_type: entry_type(ft),
+            ino: e.ino(),
+        });
+    }
+    Ok(entries)
+}
+
+/// [`file_type_of`] for a directory entry's type.
+fn entry_type(t: std::fs::FileType) -> FileType {
+    use std::os::unix::fs::FileTypeExt;
+    if t.is_dir() {
+        FileType::Directory
+    } else if t.is_symlink() {
+        FileType::Symlink
+    } else if t.is_file() {
+        FileType::Regular
+    } else if t.is_socket() {
         FileType::Socket
     } else if t.is_fifo() {
         FileType::Fifo
@@ -186,7 +238,9 @@ impl FileHandle for HostHandle {
 /// expects a stable snapshot across a `getdents64` sequence.
 #[derive(Debug)]
 struct HostDir {
-    entries: Vec<DirEntry>,
+    /// Where it was opened, on the host: what is listed when the directory
+    /// is not held open.
+    host: PathBuf,
     md: Metadata,
     /// The directory held open, the path it was opened at (relative to the
     /// mount) and the mount's root as the host resolves it: where the
@@ -209,8 +263,16 @@ impl FileHandle for HostDir {
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(self.md.clone())
     }
+    /// Listed when asked, not at the open, as Linux reads a directory at
+    /// `getdents`: an open for `fstatfs` or an ioctl lists nothing. The
+    /// directory held open is listed, wherever it is now.
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
-        Ok(self.entries.clone())
+        use std::os::fd::AsRawFd;
+        let at = match &self.held {
+            Some((f, _, _)) if cfg!(target_os = "linux") => PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd())),
+            _ => self.host.clone(),
+        };
+        list_dir(&at, &self.md)
     }
     #[cfg(target_os = "linux")]
     fn moved(&self) -> Option<Result<super::Moved, Errno>> {
@@ -229,7 +291,10 @@ impl FileHandle for HostDir {
     }
 
     // No `rename_epoch`: the host renames directories too, so where the
-    // directory is is asked each time.
+    // directory is is asked each time it matters.
+    fn own_rename_epoch(&self) -> Option<u64> {
+        Some(self.gate.epoch())
+    }
 
     fn hold_renames(&self, owner: i32, on: bool) -> bool {
         self.gate.hold(owner, on);
@@ -238,6 +303,64 @@ impl FileHandle for HostDir {
 }
 
 impl FileSystem for HostFs {
+    /// [`super::walk_links`], which asks the host about each directory on
+    /// the path (a call per component), but with the host's word on a
+    /// whole stretch of the path at once ([`host_walk`]). No link on the
+    /// path, the common case and every miss: one call. A link: the first
+    /// one found by halving (a call per halving), followed, and the rest of
+    /// the path after it the same way. A mount on the path, or a host that
+    /// cannot say: `walk_links`.
+    fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<super::Walked, Errno> {
+        use std::os::fd::AsRawFd;
+        let long = |abs: String| super::walk_links(abs, follow_final, mounts, &|rel| self.read_link(rel));
+        let mut abs = if super::is_normal(abs) { abs.to_string() } else { super::normalize(abs, "/") };
+        let Some(no_links) = host_walk::hook() else { return long(abs) };
+        let Some(root) = self.root_dir.get_or_init(|| File::open(&self.root).ok()) else { return long(abs) };
+        let root = root.as_raw_fd();
+        for _ in 0..40 {
+            // what the walk looks at: the directories, and with
+            // `follow_final` the last component too
+            let end = if follow_final { abs.len() } else { abs.rfind('/').unwrap_or(0) };
+            let looked = &abs[..end];
+            // a mount on it resolves its own names
+            if !looked.is_empty() && mounts.split('\0').any(|m| !m.is_empty() && super::within(looked, m)) {
+                return long(abs);
+            }
+            let rel = looked.trim_start_matches('/');
+            if rel.split('/').any(|c| c == "..") {
+                return long(abs);
+            }
+            if no_links(root, rel) {
+                return Ok(super::Walked { path: abs, at_mount: false });
+            }
+            // The first component whose prefix has a link: every prefix
+            // before `lo` components has none, the one of `hi` has.
+            let ends: Vec<usize> = rel.match_indices('/').map(|(i, _)| i).chain([rel.len()]).collect();
+            let (mut lo, mut hi) = (0, ends.len());
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if no_links(root, &rel[..ends[mid - 1]]) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let link = &rel[..ends[hi - 1]];
+            let Ok(target) = self.read_link(link) else {
+                // not a link after all (a host error): the long way
+                return long(abs);
+            };
+            let prefix = format!("/{link}");
+            let base = if target.starts_with('/') {
+                super::normalize(&target, "/")
+            } else {
+                super::normalize(&target, &super::parent_of(&prefix))
+            };
+            abs = super::normalize(abs[prefix.len()..].trim_start_matches('/'), &base);
+        }
+        Err(Errno::ELOOP)
+    }
+
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let host = self.host_path(path)?;
         let md = std::fs::metadata(&host);
@@ -248,30 +371,12 @@ impl FileSystem for HostFs {
                 return Err(Errno::EISDIR);
             }
             if md.is_dir() {
-                let mut entries = vec![
-                    DirEntry {
-                        name: ".".into(),
-                        file_type: FileType::Directory,
-                        ino: md.ino(),
-                    },
-                    DirEntry {
-                        name: "..".into(),
-                        file_type: FileType::Directory,
-                        ino: 1,
-                    },
-                ];
-                for e in std::fs::read_dir(&host).map_err(|e| Errno::from_io(&e))? {
-                    let e = e.map_err(|e| Errno::from_io(&e))?;
-                    let emd = e.metadata().map_err(|e| Errno::from_io(&e))?;
-                    entries.push(DirEntry {
-                        name: e.file_name().to_string_lossy().into_owned(),
-                        file_type: file_type_of(&emd),
-                        ino: emd.ino(),
-                    });
-                }
-                let held = File::open(&host).ok().zip(self.canon.get_or_init(|| self.root.canonicalize().ok()).clone()).map(|(f, root)| (f, path.to_string(), root));
+                // one the host will not open (no read permission) fails here,
+                // as on Linux, though it is listed only later
+                let f = File::open(&host).map_err(|e| Errno::from_io(&e))?;
+                let held = self.canon.get_or_init(|| self.root.canonicalize().ok()).clone().map(|root| (f, path.to_string(), root));
                 return Ok(Arc::new(HostDir {
-                    entries,
+                    host,
                     md: convert(md),
                     held,
                     gate: Arc::clone(&self.gate),
@@ -497,6 +602,28 @@ use std::os::unix::fs::OpenOptionsExt;
 /// guest neither sets nor sees the host's other namespaces. The calls
 /// themselves are the host's ([`set_host_xattr`]: this crate has no unsafe
 /// code); without one, `EOPNOTSUPP`.
+/// The host's word on a whole path at once, for [`HostFs`]'s walk. The call
+/// is the host's (the native shim's `openat2` with `RESOLVE_NO_SYMLINKS`;
+/// this crate has no unsafe), so it is a hook.
+pub mod host_walk {
+    /// Whether the host meets no symbolic link walking `rel` (relative,
+    /// normalised, no `..`) from the directory open as `root`, up to the
+    /// end of `rel` or to its first missing component, whichever comes
+    /// first. `false` when it meets one, or cannot say.
+    pub type NoLinks = fn(root: i32, rel: &str) -> bool;
+
+    static HOOK: std::sync::OnceLock<NoLinks> = std::sync::OnceLock::new();
+
+    /// Install the host's call (the native shim's). The first call wins.
+    pub fn set_host_no_links(f: NoLinks) {
+        let _ = HOOK.set(f);
+    }
+
+    pub(super) fn hook() -> Option<NoLinks> {
+        HOOK.get().copied()
+    }
+}
+
 pub mod host_xattr {
     use super::super::{xattr_name, XattrOp};
     use crate::errno::Errno;
@@ -596,6 +723,54 @@ mod tests {
             Some(Errno::EROFS)
         );
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
+    }
+
+    /// The host's call as the native shim makes it, in safe code: a
+    /// component at a time (what `openat2(RESOLVE_NO_SYMLINKS)` answers).
+    fn emulated_no_links(root: i32, rel: &str) -> bool {
+        let mut at = PathBuf::from(format!("/proc/self/fd/{root}"));
+        for c in rel.split('/').filter(|c| !c.is_empty()) {
+            at.push(c);
+            match std::fs::symlink_metadata(&at) {
+                Ok(m) if m.is_symlink() => return false,
+                Ok(_) => {}
+                Err(e) => return matches!(e.raw_os_error(), Some(2) | Some(20)),
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn the_hosts_walk_follows_what_walk_links_follows() {
+        use crate::vfs::FileSystem;
+        let dir = scratch().join("walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::write(dir.join("a/b/c/f"), b"").unwrap();
+        let link = |t: &str, at: &str| std::os::unix::fs::symlink(t, dir.join(at)).unwrap();
+        link("a/b", "l");
+        link("/a", "abs");
+        link("../..", "a/b/up");
+        link("nothere", "dangle");
+        link("l", "l2");
+        link("loop2", "loop1");
+        link("loop1", "loop2");
+        let fs = HostFs::new(&dir);
+        host_walk::set_host_no_links(emulated_no_links);
+        let paths = [
+            "/a/b/c/f", "/l/c/f", "/l2/c/f", "/abs/b/c", "/a/b/up/l/c", "/a/b/up/a/b/up/abs/b", "/dangle",
+            "/dangle/x", "/l", "/l2", "/missing/l/c", "/a/b/c/f/g", "/loop1/x", "/loop1", "/", "/a/./b/../b/c",
+        ];
+        for mounts in ["", "\0/a/b", "\0/proc\0/a"] {
+            for p in paths {
+                for follow in [false, true] {
+                    let long = crate::vfs::walk_links(p.to_string(), follow, mounts, &|rel| fs.read_link(rel));
+                    let short = fs.walk(p, follow, mounts);
+                    let show = |w: &Result<crate::vfs::Walked, Errno>| w.as_ref().map(|w| (w.path.clone(), w.at_mount)).map_err(|e| *e);
+                    assert_eq!(show(&short), show(&long), "{p} follow {follow} mounts {mounts:?}");
+                }
+            }
+        }
     }
 }
 

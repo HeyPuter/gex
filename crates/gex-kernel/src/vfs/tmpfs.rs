@@ -680,7 +680,6 @@ impl TmpFs {
     /// directory is 2, which is what programs test to decide it has no
     /// subdirectories without reading it.
     fn dir_nlink(inner: &Inner, path: &str) -> u32 {
-        use std::ops::Bound::{Excluded, Included, Unbounded};
         let prefix = if path.is_empty() {
             String::new()
         } else {
@@ -689,25 +688,24 @@ impl TmpFs {
         // The immediate children only: past each child's own subtree in one
         // seek (a child's descendants are the keys from "child/" up to
         // "child0", '0' following '/'), where a scan of every node in the
-        // tree was a directory `stat`.
+        // tree was a directory `stat`. One pass otherwise: a seek from the
+        // top per child was most of an `fstat` of a large directory (Wine's
+        // `fdopendir` makes one per case-insensitive lookup).
+        use std::ops::Bound::{Included, Unbounded};
         let mut subdirs = 0u32;
-        let mut from = (Included(prefix.clone()), Unbounded);
-        loop {
-            let Some((k, v)) = inner.nodes.range::<String, _>(from).next() else {
-                break;
-            };
+        let mut names = inner.nodes.range::<String, _>((Included(prefix.clone()), Unbounded));
+        while let Some((k, v)) = names.next() {
             let Some(rest) = k.strip_prefix(&prefix) else {
                 break;
             };
             match rest.find('/') {
                 Some(i) => {
-                    from = (Included(format!("{prefix}{}0", &rest[..i])), Unbounded);
+                    names = inner.nodes.range::<String, _>((Included(format!("{prefix}{}0", &rest[..i])), Unbounded));
                 }
                 None => {
                     if !rest.is_empty() && matches!(v, Node::Dir) {
                         subdirs += 1;
                     }
-                    from = (Excluded(k.clone()), Unbounded);
                 }
             }
         }
@@ -892,23 +890,34 @@ impl FileHandle for TmpHandle {
         // each listing's cost: FL Studio's page start, its tree lazily
         // mounted (29,292 files), spent 43 of 60 profiled seconds here, in
         // Wine's case-insensitive lookups (each a directory read) and its
-        // directory scans, with the loader lock held.
-        use std::ops::Bound::{Excluded, Included, Unbounded};
-        let mut from = (Included(prefix.clone()), Unbounded);
-        while let Some((path, node)) = inner.nodes.range::<String, _>(from).next() {
+        // directory scans, with the loader lock held. Otherwise one pass over
+        // the names in order, the inode numbers (same keys) walked beside
+        // it: a seek from the top per entry, and another for its inode, were
+        // 48% of a page directory scan of 2,000 files.
+        use std::ops::Bound::{Included, Unbounded};
+        let from = |at: String| (Included(at), Unbounded);
+        let mut names = inner.nodes.range::<String, _>(from(prefix.clone()));
+        let mut inos = inner.inos.range::<String, _>(from(prefix.clone())).peekable();
+        while let Some((path, node)) = names.next() {
             let Some(rest) = path.strip_prefix(&prefix) else {
                 break;
             };
             if let Some(i) = rest.find('/') {
                 // A descendant whose own directory (`rest[..i]`) is listed
                 // already, or is missing: past its subtree either way.
-                from = (Included(format!("{prefix}{}0", &rest[..i])), Unbounded);
+                let past = format!("{prefix}{}0", &rest[..i]);
+                names = inner.nodes.range::<String, _>(from(past.clone()));
+                inos = inner.inos.range::<String, _>(from(past)).peekable();
                 continue;
             }
-            from = (Excluded(path.clone()), Unbounded);
             if rest.is_empty() {
                 continue;
             }
+            while inos.next_if(|(k, _)| k.as_str() < path.as_str()).is_some() {}
+            let ino = match inos.peek() {
+                Some((k, v)) if *k == path => **v,
+                _ => 1,
+            };
             out.push(DirEntry {
                 name: rest.to_string(),
                 file_type: match node {
@@ -917,7 +926,7 @@ impl FileHandle for TmpHandle {
                     Node::Symlink(_) => FileType::Symlink,
                     Node::Socket => FileType::Socket,
                 },
-                ino: TmpFs::ino_of(&inner, path),
+                ino,
             });
         }
         Ok(out)
