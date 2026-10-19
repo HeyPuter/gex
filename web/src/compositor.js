@@ -247,9 +247,13 @@ export class Compositor {
       post({ kind: 'pointer-button', button, pressed: false, time: now() });
     };
     const onWheel = (e) => {
-      // 10 units a notch, in Wayland's axis sign (down is positive).
-      const dy = Math.sign(e.deltaY) * 10;
-      const dx = Math.sign(e.deltaX) * 10;
+      // A wl_fixed number of pixels (1/256 px), in Wayland's axis sign (down
+      // is positive). The compositor makes wheel notches of it at 100 px a
+      // notch (gex-wayland WHEEL_PX, Chromium's deltaY for one): a line is a
+      // third of that, a page the canvas. A trackpad's small deltas add up there.
+      const scale = 256 * (e.deltaMode === 1 ? 100 / 3 : e.deltaMode === 2 ? (target.clientHeight || 600) : 1);
+      const dy = Math.round(e.deltaY * scale);
+      const dx = Math.round(e.deltaX * scale);
       if (dy) post({ kind: 'pointer-axis', axis: 0, value: dy, time: now() });
       if (dx) post({ kind: 'pointer-axis', axis: 1, value: dx, time: now() });
       e.preventDefault();

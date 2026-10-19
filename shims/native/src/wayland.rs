@@ -84,6 +84,8 @@ enum Ev {
     Motion(i32, i32),
     Button(u32, bool),
     Key(u32, bool),
+    /// Scroll: axis (0 vertical, 1 horizontal) and wl_fixed pixels.
+    Axis(u32, i32),
 }
 
 /// A script of input events at times (seconds) after the compositor's Nth
@@ -99,6 +101,9 @@ enum Ev {
 /// 32    button 272 1         # a Linux BTN_* code, 1 down / 0 up
 /// 40    tap enter            # key down, and up 0.1 s later
 /// 41    key z 1              # a key name or Linux KEY_* code, 1 down / 0 up
+/// 42    scroll 100           # pixels down (negative: up); 100 is a wheel notch
+/// 43    scroll 2.5 x 40      # 40 events of 2.5 px, 1/60 s apart (a trackpad)
+/// 44    hscroll -100         # pixels right (negative: left), `x N` as scroll
 /// ```
 ///
 /// Coordinates are the focused surface's pixels.
@@ -160,6 +165,18 @@ impl Input {
                 }
                 Some("button") => events.push((t, Ev::Button(num(2)? as u32, down(3)?), l)),
                 Some("key") => events.push((t, Ev::Key(key(2)?, down(3)?), l)),
+                Some(c @ ("scroll" | "hscroll")) => {
+                    let px: f64 = w.get(2).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                    let n: u32 = match w.get(3).copied() {
+                        None => 1,
+                        Some("x") => w.get(4).and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                        Some(_) => return Err(bad()),
+                    };
+                    let axis = (c == "hscroll") as u32;
+                    for i in 0..n {
+                        events.push((t + i as f64 / 60.0, Ev::Axis(axis, (px * 256.0).round() as i32), l.clone()));
+                    }
+                }
                 Some("tap") => {
                     events.push((t, Ev::Key(key(2)?, true), l.clone()));
                     events.push((t + 0.1, Ev::Key(key(2)?, false), l));
@@ -422,6 +439,7 @@ impl Wayland {
                     Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
                     Ev::Button(b, down) => s.client.pointer_button(b, down, ms),
                     Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
+                    Ev::Axis(axis, v) => s.client.pointer_axis(axis, v, ms),
                 }
             }
             for (_, ev) in routed.iter().filter(|r| r.0 == s.id) {
@@ -430,6 +448,7 @@ impl Wayland {
                     Routed::PointerTo(surface, x, y, ms) => s.client.pointer_to(surface, x, y, ms),
                     Routed::PointerClear => s.client.pointer_clear(),
                     Routed::Button(b, down, ms) => s.client.pointer_button(b, down, ms),
+                    Routed::Axis(axis, v, ms) => s.client.pointer_axis(axis, v, ms),
                     Routed::Key(k, down, ms) => s.client.keyboard_key(k, down, ms),
                     Routed::KeyboardFocus(surface) => s.client.keyboard_focus(surface),
                     Routed::KeyboardLeave => s.client.keyboard_focus(0),
@@ -529,6 +548,7 @@ enum Routed {
     PointerTo(u32, i32, i32, u32),
     PointerClear,
     Button(u32, bool, u32),
+    Axis(u32, i32, u32),
     Key(u32, bool, u32),
     /// The keyboard to this surface (the screen chose it, no client did).
     KeyboardFocus(u32),
@@ -650,6 +670,11 @@ impl Screen {
                 Ev::Button(b, down) => {
                     if let Some((sid, _)) = self.pointer {
                         out.push((sid, Routed::Button(b, down, ms)));
+                    }
+                }
+                Ev::Axis(axis, v) => {
+                    if let Some((sid, _)) = self.pointer {
+                        out.push((sid, Routed::Axis(axis, v, ms)));
                     }
                 }
                 Ev::Key(k, down) => {
