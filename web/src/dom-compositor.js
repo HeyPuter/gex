@@ -46,6 +46,7 @@
 import {
   readScene,
   ackBlock,
+  releaseToken,
   sendEvent,
   setKernelMemory,
   setOutputSize,
@@ -425,14 +426,26 @@ export class DomDesktop {
   #memoryOf(token) {
     const held = this.#memories.get(token);
     if (!held) return null;
-    if (held.view.buffer !== held.memory.buffer) {
-      held.view = new Uint8Array(held.memory.buffer);
+    // A shared memory grown by another thread can keep its buffer object and
+    // only grow its length (overlay-worker.js's check): a view from before
+    // then stops short, and the windows of a process that grew past it (the
+    // Win7 desktop and taskbar, with explorer /desktop a process of its own)
+    // were never painted again.
+    const buf = held.memory.buffer;
+    if (held.view.buffer !== buf || held.view.length !== buf.byteLength) {
+      held.view = new Uint8Array(buf);
     }
     return held.view;
   }
 
   dropMemory(token) {
     this.#memories.delete(token);
+    // Its block in the arena too, as compositor-worker.js does: a process that
+    // exited kept its block here, so on a page with more than a few window
+    // processes a new one took a live, idle process's block (its heartbeat is
+    // its last publish) -- the Win7 desktop's windows were then read out of
+    // another process's memory and never painted.
+    releaseToken(this.#channel, token);
     // And whatever that process had on the host's GL: its context, its
     // windows and their frames. Nothing else will say so -- a client that
     // exits is not there to send a detach.

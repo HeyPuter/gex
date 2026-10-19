@@ -485,6 +485,11 @@ async function begin(opts, base, at, state, meter) {
     const bufs = await pieceBufs;
     for (const u of bufs) buffers.push(u.buffer);
     for (const [path, i, off, n] of pieceList.files) {
+      // A hard link's name is its target's inode (below), not a copy: a copy
+      // has no time of its own (the archive gives a link none), so Wine's
+      // wineboot saw /w3/share/wine/wine.inf from 1970, took the prefix for
+      // stale and ran wine.inf's whole install on every boot of the page.
+      if (tree.hard?.[path]) continue;
       const u = bufs[i];
       tree.files[path] = new Uint8Array(u.buffer, u.byteOffset + off, n);
     }

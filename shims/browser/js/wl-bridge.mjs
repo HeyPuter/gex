@@ -18,8 +18,9 @@
 
 import { single, sched } from './single.mjs';
 
-/** Processes that can publish surfaces at once. */
-const BLOCKS = 8;
+/** Processes that can publish surfaces at once (the Win7 shell has more
+ *  than eight: winlogon, the desktop, explorer, its COM servers). */
+const BLOCKS = 32;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
@@ -488,6 +489,14 @@ export class WlProxy {
    * frame and each carries only its own rectangle.
    */
   publish(memory, ptr, count) {
+    // A block taken over as dead (no publish for 5 s: an idle process, not
+    // only a killed one) is another process's now. Publishing into it put
+    // this process's surfaces under that process's token, and the compositor
+    // read them out of the wrong memory. Claim another and publish there.
+    if (this.#block >= 0 && Atomics.load(this.#a, this.#base + B_TOKEN) !== this.#token) {
+      this.#block = -1;
+      this.#pending.clear();
+    }
     if (!this.#ready()) return;
     const n = Math.min(count, SLOTS);
     const src = new Int32Array(memory.buffer, ptr, n * REC);
