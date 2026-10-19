@@ -504,8 +504,14 @@ class Compositor {
   #memoryOf(token) {
     const held = this.#memories.get(token);
     if (!held) return null;
-    if (held.view.buffer !== held.memory.buffer) {
-      held.view = new Uint8Array(held.memory.buffer);
+    // A shared memory grown by another thread can keep its buffer object and
+    // only grow its length (overlay-worker.js's check): a view from before
+    // then stops short, and the windows of a process that grew past it (the
+    // Win7 desktop and taskbar, with explorer /desktop a process of its own)
+    // were never painted again.
+    const buf = held.memory.buffer;
+    if (held.view.buffer !== buf || held.view.length !== buf.byteLength) {
+      held.view = new Uint8Array(buf);
     }
     return held.view;
   }
