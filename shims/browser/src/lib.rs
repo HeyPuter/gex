@@ -15001,7 +15001,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
         note_live(&unit.covered);
-        push_pending(j, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
+        // The entries the install publishes: the pages this unit numbered,
+        // and every other page it covers whose directory entry this process
+        // never wrote. A forked child is that case: its page table keeps the
+        // parent's numbering, `gex_reset_directory` erased the parent's
+        // entries, and a block running onto the next page (a numbered page
+        // with entry 0) failed its page check until `heal_dirs` wrote it.
+        let mut dirs = unit.dir_entries.clone();
+        {
+            let gm = GuestMem::new(guest_bytes());
+            for &(p, b) in &unit.covered {
+                if p < gex_abi::DISPATCH_MAX_PAGES
+                    && gm.read_u32(gex_abi::DISPATCH_DIR + p * 4).unwrap_or(1) == 0
+                    && !dirs.iter().any(|(q, _)| *q == p)
+                {
+                    dirs.push((p, b));
+                }
+            }
+        }
+        push_pending(j, dirs, unit.table_slots, unit.wasm, mod_id);
         publish_pending(j);
         // Point the guest directory at the slot this unit's block actually
         // lives in, for the faulting page only (minimal, to keep the shared
