@@ -40,7 +40,9 @@ pub struct Remote {
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
     /// [`FileHandle::advise`]: 0 or a negated errno.
     pub advise: extern "C" fn(handle: i32, offset: u64, len: u64, advice: u32) -> i32,
-    /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short.
+    /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short
+    /// (with the size it takes in the first 4 bytes, little-endian, when
+    /// `cap` holds them).
     pub read_dir: extern "C" fn(handle: i32, at: crate::PAddr, cap: u32) -> i32,
     pub path_meta: extern "C" fn(path: crate::PAddr, path_len: u32, at: crate::PAddr) -> i32,
     pub read_link: extern "C" fn(path: crate::PAddr, path_len: u32, at: crate::PAddr, cap: u32) -> i32,
@@ -485,7 +487,11 @@ impl FileHandle for RemoteHandle {
                     buf.truncate(n as usize);
                     return Ok(decode_dir(&buf));
                 }
-                n if -n == Errno::ERANGE.0 && cap < 1 << 24 => cap *= 4,
+                // the size the listing takes, when the other side says it
+                n if -n == Errno::ERANGE.0 && cap < 1 << 24 => {
+                    let need = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                    cap = if need > cap && need <= 1 << 24 { need } else { cap * 4 };
+                }
                 n => return Err(Errno(-n)),
             }
         }

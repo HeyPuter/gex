@@ -2495,13 +2495,16 @@ struct CwdAt {
     /// directory's own move count then ([`crate::vfs::Moved::epoch`]).
     epoch: Option<u64>,
     moves: Option<u64>,
+    /// The filesystem's count of its own renames (gex's, through that
+    /// mount) when `path` was last found ([`FsCwd::get_call`]).
+    own: Option<u64>,
 }
 
 impl FsCwd {
     /// At `cwd`, held by name only (until a `chdir` opens it).
     pub fn new(cwd: String) -> FsCwd {
         FsCwd {
-            at: std::sync::Mutex::new(CwdAt { opened: cwd.clone(), path: cwd, dir: None, epoch: None, moves: None }),
+            at: std::sync::Mutex::new(CwdAt { opened: cwd.clone(), path: cwd, dir: None, epoch: None, moves: None, own: None }),
             umask: std::sync::atomic::AtomicU32::new(0o022),
         }
     }
@@ -2551,6 +2554,31 @@ impl FsCwd {
         (at.path.clone(), at.moves)
     }
 
+    /// The path a call starts and ends with (`Kernel::syscall_cwd`), what
+    /// resolves outside [`PathIo`]: [`FsCwd::get`], except on a filesystem
+    /// that counts its own renames but cannot count the host's (a host
+    /// directory). There the path found stands while gex has renamed no
+    /// directory through that mount. Asking the host costs a call each
+    /// time, twice for every system call. A host process outside gex that
+    /// moves the directory is seen by the next lookup relative to it
+    /// ([`PathIo::at_path_str`] asks [`FsCwd::get_seen`]), and by `getcwd`.
+    pub fn get_call(&self) -> String {
+        let own = {
+            let at = self.lock();
+            let Some(dir) = &at.dir else { return at.path.clone() };
+            let own = dir.own_rename_epoch();
+            if own.is_some() && own == at.own {
+                return at.path.clone();
+            }
+            own
+        };
+        // Read before the path is found: a rename in between leaves the
+        // count behind, so the next call asks again.
+        let path = self.get_seen().0;
+        self.lock().own = own;
+        path
+    }
+
     /// The directory, when held by identity.
     fn dir(&self) -> Option<Arc<dyn crate::vfs::FileHandle>> {
         self.lock().dir.clone()
@@ -2562,7 +2590,7 @@ impl FsCwd {
         // Its path checked on first use: a rename between the open and now
         // is seen then.
         let dir = dir.filter(|d| d.moved().is_some());
-        *self.lock() = CwdAt { opened: path.clone(), path, dir, epoch: None, moves: None };
+        *self.lock() = CwdAt { opened: path.clone(), path, dir, epoch: None, moves: None, own: None };
     }
 
     pub fn umask(&self) -> u32 {
@@ -8097,7 +8125,7 @@ impl Kernel {
         // The mount table as it is now: a thread may have mounted or
         // unmounted without the lock since this copy's was taken.
         self.vfs.refresh();
-        self.vfs.enter_cwd(self.fs_of(me).get());
+        self.vfs.enter_cwd(self.fs_of(me).get_call());
         let out = self.syscall_inner(m, pc);
         self.vfs.leave_cwd();
         if matches!(out, SyscallOutcome::SpawnProcess { .. } | SyscallOutcome::Exec { .. }) {
@@ -8106,7 +8134,7 @@ impl Kernel {
         }
         // The namespace's own directory follows the process's, for what is
         // resolved outside a call.
-        let cwd = self.proc_fs.get();
+        let cwd = self.proc_fs.get_call();
         if cwd != self.vfs.cwd {
             self.vfs.put_cwd(cwd);
         }

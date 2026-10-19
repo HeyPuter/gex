@@ -2726,6 +2726,12 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
         Ok(entries) => {
             let b = remote::encode_dir(&entries);
             if b.len() as u32 > cap {
+                // the size it takes in the first 4 bytes, so the caller's
+                // next try is its last (each try lists the directory again)
+                if cap >= 4 {
+                    let need = (b.len() as u32).to_le_bytes();
+                    unsafe { gex_kmem::push_checked(at, need.as_ptr(), 4) };
+                }
                 return -34; // ERANGE
             }
             if !b.is_empty() {

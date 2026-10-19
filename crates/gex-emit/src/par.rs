@@ -4,18 +4,23 @@
 //! because the callers produce wasm whose bytes key a content-addressed cache,
 //! and a translation that varied with thread scheduling would never hit it.
 
-/// How wide to go, honouring `GEX_LIFT_THREADS`.
+/// How wide to go, honouring `GEX_LIFT_THREADS`. Found once: std asks the
+/// host's cgroup files each time (four calls), and every translation batch
+/// asks.
 #[cfg(feature = "parallel")]
 pub fn threads() -> usize {
-    match std::env::var("GEX_LIFT_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        Some(n) if n >= 1 => n,
-        _ => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("GEX_LIFT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n >= 1 => n,
+            _ => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        }
+    })
 }
 
 /// Apply `f` to every item, on as many cores as there are, in order.

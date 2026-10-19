@@ -269,6 +269,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn rename_epoch(&self) -> Option<u64> {
         None
     }
+    /// The count of the renames of directories made through this handle's
+    /// filesystem by gex itself, where [`FileHandle::rename_epoch`] cannot
+    /// count every rename (a host directory: the host's own are not seen).
+    /// While it stays the same, a directory's path found by
+    /// [`FileHandle::moved`] stands as far as gex can tell
+    /// (`FsCwd::get_call`).
+    fn own_rename_epoch(&self) -> Option<u64> {
+        self.rename_epoch()
+    }
     /// Hold off the renames of directories on this handle's filesystem
     /// (`on`), or let them go again, for process `owner`: its rename lock,
     /// taken shared. What a lookup through a directory descriptor that kept
