@@ -84,6 +84,17 @@ int main(void) {
     munmap(f, 8192);
     munmap(e, 8192);
 
+    /* A shared mapping of a read-only descriptor has nothing to write
+     * back: Linux refuses it PROT_WRITE; where a store lands anyway (gex
+     * lets mprotect through), the next mapping of the file still works. */
+    int ro = open(path, O_RDONLY);
+    char *r = mmap(0, 4096, PROT_READ, MAP_SHARED, ro, 0);
+    if (r != MAP_FAILED && mprotect(r, 4096, PROT_READ | PROT_WRITE) == 0) r[1] = '!';
+    char *r2 = mmap(0, 8192, PROT_READ, MAP_PRIVATE, ro, 0);
+    check("read-only descriptor", r != MAP_FAILED && r2 != MAP_FAILED && munmap(r, 4096) == 0);
+    if (r2 != MAP_FAILED) munmap(r2, 8192);
+    close(ro);
+
     close(fd);
     unlink(path);
     printf("mmap-coherent %s\n", fails ? "FAIL" : "ok");

@@ -3925,6 +3925,13 @@ impl MapIo<'_> {
             mm.log.shared_maps.iter().filter(|map| map.start.max(lo) < (map.start + map.len).min(hi)).cloned().collect()
         };
         for map in maps {
+            // A mapping of a descriptor opened read-only has nothing to
+            // write back (Linux refuses it PROT_WRITE): its stores are
+            // the process's own, as Wine's relocations of an image view
+            // are. Writing them was EBADF, and failed the next mmap.
+            if !map.file.writable {
+                continue;
+            }
             let from = map.start.max(lo);
             let to = (map.start + map.len).min(hi);
             // Only what the file holds: a shared mapping's page past the
