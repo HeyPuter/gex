@@ -864,12 +864,26 @@ impl FileHandle for TmpHandle {
                 ino: 1,
             },
         ];
-        for (path, node) in &inner.nodes {
+        // The immediate children only, each child's own subtree passed in one
+        // seek (as `dir_nlink`). A scan of every node in the filesystem was
+        // each listing's cost: FL Studio's page start, its tree lazily
+        // mounted (29,292 files), spent 43 of 60 profiled seconds here, in
+        // Wine's case-insensitive lookups (each a directory read) and its
+        // directory scans, with the loader lock held.
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let mut from = (Included(prefix.clone()), Unbounded);
+        while let Some((path, node)) = inner.nodes.range::<String, _>(from).next() {
             let Some(rest) = path.strip_prefix(&prefix) else {
-                continue;
+                break;
             };
-            // Only immediate children.
-            if rest.is_empty() || rest.contains('/') {
+            if let Some(i) = rest.find('/') {
+                // A descendant whose own directory (`rest[..i]`) is listed
+                // already, or is missing: past its subtree either way.
+                from = (Included(format!("{prefix}{}0", &rest[..i])), Unbounded);
+                continue;
+            }
+            from = (Excluded(path.clone()), Unbounded);
+            if rest.is_empty() {
                 continue;
             }
             out.push(DirEntry {
@@ -1227,6 +1241,33 @@ impl FileSystem for TmpFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing names a directory's immediate children, and only them:
+    /// names sorting around `/` ("a-b", "a.txt" between "a" and "a/x"),
+    /// a child's subtree skipped, the root, and a deep tree under a sibling.
+    #[test]
+    fn a_listing_names_the_immediate_children() {
+        let fs = TmpFs::new();
+        for d in ["a", "a/x", "a/x/y", "b", "b/a", "b/a0"] {
+            fs.mkdir(d, 0o755).unwrap();
+        }
+        for f in ["a-b", "a.txt", "a/x/y/f", "a/z", "a0", "b/a/q", "b/a-", "c"] {
+            fs.add_file(f, Vec::new());
+        }
+        for i in 0..2000 {
+            fs.add_file(&format!("a/x/y/n{i}"), Vec::new());
+        }
+        let list = |d: &str| {
+            let mut v: Vec<String> = fs.open(d, 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(list(""), [".", "..", "a", "a-b", "a.txt", "a0", "b", "c"]);
+        assert_eq!(list("a"), [".", "..", "x", "z"]);
+        assert_eq!(list("b"), [".", "..", "a", "a-", "a0"]);
+        assert_eq!(list("b/a"), [".", "..", "q"]);
+        assert_eq!(list("a/x/y").len(), 2 + 2001);
+    }
 
     /// A directory renamed takes everything under it, with its inodes,
     /// modes and times; Linux's refusals, and `RENAME_NOREPLACE`.
