@@ -1269,6 +1269,109 @@ mod tests {
         assert_eq!(list("a/x/y").len(), 2 + 2001);
     }
 
+    /// Every directory's listing, against a scan of the whole filesystem
+    /// (what `read_dir` did before it skipped subtrees).
+    fn check_listings(fs: &TmpFs) {
+        let (dirs, all): (Vec<String>, Vec<String>) = {
+            let inner = fs.inner.m.lock().unwrap();
+            let dirs = inner.nodes.iter().filter(|(_, n)| matches!(n, Node::Dir)).map(|(p, _)| p.clone());
+            (std::iter::once(String::new()).chain(dirs).collect(), inner.nodes.keys().cloned().collect())
+        };
+        for d in dirs {
+            let prefix = if d.is_empty() { String::new() } else { format!("{d}/") };
+            let mut want: Vec<String> = all
+                .iter()
+                .filter_map(|p| p.strip_prefix(&prefix))
+                .filter(|r| !r.is_empty() && !r.contains('/'))
+                .map(String::from)
+                .chain([".".into(), "..".into()])
+                .collect();
+            want.sort();
+            want.dedup();
+            let mut got: Vec<String> = fs.open(&d, 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+            got.sort();
+            assert_eq!(got, want, "listing of {d:?}");
+        }
+    }
+
+    /// Listings after renames across directories (a file, a directory with
+    /// its subtree, onto names that sort next to the old ones), and a deep
+    /// tree: each directory lists its immediate children, as a scan of
+    /// everything says.
+    #[test]
+    fn listings_follow_renames_across_directories() {
+        let fs = TmpFs::new();
+        // A deep tree, with siblings at every level sorting around '/'.
+        let mut d = String::from("deep");
+        fs.mkdir(&d, 0o755).unwrap();
+        for i in 0..40 {
+            fs.add_file(&format!("{d}-{i}"), Vec::new());
+            fs.add_file(&format!("{d}.{i}"), Vec::new());
+            fs.add_file(&format!("{d}/f{i}"), Vec::new());
+            d = format!("{d}/d{i}");
+            fs.mkdir(&d, 0o755).unwrap();
+        }
+        for x in ["a", "a/b", "a/b/c", "x", "x/y"] {
+            fs.mkdir(x, 0o755).unwrap();
+        }
+        for f in ["a/b/c/f", "a/b/g", "a/b-", "a/b0", "x/y/h"] {
+            fs.add_file(f, Vec::new());
+        }
+        check_listings(&fs);
+        fs.rename("a/b/g", "x/y/g").unwrap(); // a file, across directories
+        check_listings(&fs);
+        fs.rename("a/b", "x/y/b").unwrap(); // a directory and its subtree
+        assert_eq!(fs.metadata("x/y/b/c/f").unwrap().file_type, FileType::Regular);
+        check_listings(&fs);
+        fs.rename("x/y/b", "a/b.").unwrap(); // back, to a name sorting before '/'
+        check_listings(&fs);
+        fs.rename("deep/d0/d1", "a/b./d1").unwrap(); // 38 levels deep, moved up
+        check_listings(&fs);
+        fs.rename("a", "deep/d0/a").unwrap(); // and under where it came from
+        check_listings(&fs);
+        let list = |p: &str| fs.open(p, 0, 0).unwrap().read_dir().unwrap().len();
+        assert_eq!(list("deep/d0/a/b./d1"), 2 + 4); // f2, d2, d2-3, d2.3
+        assert_eq!(list("deep/d0"), 2 + 4); // f1, d1-2, d1.2, a
+    }
+
+    /// Unlinks while a directory is open and being listed: each later
+    /// listing of the same handle has what is left, and an entry that came
+    /// back (created again) is listed once.
+    #[test]
+    fn unlinks_during_a_listing() {
+        let fs = TmpFs::new();
+        fs.mkdir("d", 0o755).unwrap();
+        fs.mkdir("d/sub", 0o755).unwrap();
+        for i in 0..300 {
+            fs.add_file(&format!("d/f{i:03}"), Vec::new());
+            fs.add_file(&format!("d/sub/g{i}"), Vec::new());
+        }
+        let h = fs.open("d", 0, 0).unwrap();
+        let names = |h: &Arc<dyn FileHandle>| -> Vec<String> { h.read_dir().unwrap().into_iter().map(|e| e.name).collect() };
+        let first = names(&h);
+        assert_eq!(first.len(), 2 + 301);
+        // Remove every other entry the listing returned, as `rm -r` does
+        // between reads, then list again through the same descriptor.
+        for (i, n) in first.iter().enumerate().filter(|(_, n)| n.starts_with('f')) {
+            if i % 2 == 0 {
+                fs.unlink(&format!("d/{n}")).unwrap();
+            }
+        }
+        let second = names(&h);
+        assert_eq!(second.len(), 2 + 1 + 150);
+        check_listings(&fs);
+        // The subdirectory emptied and removed mid-listing; a name re-created.
+        for i in 0..300 {
+            fs.unlink(&format!("d/sub/g{i}")).unwrap();
+        }
+        fs.rmdir("d/sub").unwrap();
+        fs.add_file("d/f000", Vec::new());
+        let third = names(&h);
+        assert_eq!(third.iter().filter(|n| *n == "f000").count(), 1);
+        assert!(!third.iter().any(|n| n == "sub"));
+        check_listings(&fs);
+    }
+
     /// A directory renamed takes everything under it, with its inodes,
     /// modes and times; Linux's refusals, and `RENAME_NOREPLACE`.
     #[test]
