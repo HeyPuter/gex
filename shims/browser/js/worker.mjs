@@ -685,6 +685,7 @@ async function handle(msg) {
   if (msg.w3Split) globalThis.GEX_W3_SPLIT = 1;
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
+  if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // Lazy files the page is filling in the background (app.js `fill`): their

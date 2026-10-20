@@ -1116,6 +1116,9 @@ export class Gex {
         throw new Error('gex: no shim stack slot left for this Worker (64 instances of this process are live)');
       }
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
+      // A test's: this Worker's stack guard broken, as an overrun leaves it,
+      // for the tripwire at its next syscall (tests/browser-stack-tripwire.sh).
+      if (globalThis.GEX_TEST_BREAK_STACK_GUARD) this.#shim.exports.gex_test_break_stack_guard?.();
     }
     return this.#stackTop;
   }

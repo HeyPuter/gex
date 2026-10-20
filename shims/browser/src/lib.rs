@@ -4580,6 +4580,58 @@ pub(crate) fn stack_guard_check() -> Option<(u32, u32, u32)> {
     Some((lo, (top_bad as u32 + 1) * 4, STACK_LEAST.with(|l| l.get())))
 }
 
+/// This Worker's shim stack overran its bottom: said once per Worker, at
+/// `site`. A stack that runs down past its megabyte lands on whatever the
+/// arena handed out below it -- a heap span, another Worker's thread-locals
+/// -- and wasm has no guard page, so this check is the only one there is.
+/// Cheap enough for every syscall and translation: the guard's top words.
+#[cfg(feature = "shared-memory")]
+#[inline]
+pub(crate) fn stack_tripwire(site: &str) {
+    let lo = STACK_LO.with(|l| l.get());
+    if lo == 0 {
+        return;
+    }
+    // SAFETY: this Worker's own guard words, inside the span it claimed.
+    let top = unsafe { std::slice::from_raw_parts((lo + slots::GUARD as u32 - 64) as *const u32, 16) };
+    if top.iter().all(|w| *w == STACK_GUARD) {
+        return;
+    }
+    stack_overran(site);
+}
+
+#[cfg(not(feature = "shared-memory"))]
+#[inline]
+pub(crate) fn stack_tripwire(_site: &str) {}
+
+/// A test's: break this Worker's stack guard, as an overrun does, for the
+/// tripwire to find at the next syscall.
+#[cfg(feature = "shared-memory")]
+#[no_mangle]
+pub extern "C" fn gex_test_break_stack_guard() {
+    let lo = STACK_LO.with(|l| l.get());
+    if lo != 0 {
+        // SAFETY: this Worker's own guard words.
+        unsafe { ((lo + slots::GUARD as u32 - 8) as *mut u32).write_volatile(0) };
+    }
+}
+
+#[cfg(feature = "shared-memory")]
+#[cold]
+fn stack_overran(site: &str) {
+    // `stack_guard_check` clears `STACK_LO` once it has found the guard
+    // broken, so this is said once per Worker.
+    if let Some((lo, bad, _)) = stack_guard_check() {
+        warn_line(&format!(
+            "gex: BUG: worker {}'s shim stack overran its bottom at {lo:#x}, found at {site}: \
+             {bad} guard bytes overwritten; what lies below it is corrupt (last miss {:#x}, last syscall {})\n",
+            worker_id(),
+            LAST_MISS_PC.with(|c| c.get()),
+            LAST_SYSCALL.with(|c| c.get()),
+        ));
+    }
+}
+
 #[cfg(feature = "shared-memory")]
 pub(crate) fn stack_least() -> u32 {
     STACK_LEAST.with(|l| l.get())
@@ -7749,6 +7801,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
     }
     count_syscall(this_nr, regs.a[0], regs.a[1]);
     watch_mem("syscall");
+    stack_tripwire("a syscall");
     gex_kernel::phase::mark(13);
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
@@ -14720,6 +14773,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     }
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
+    stack_tripwire("a dispatch miss");
     miss_count(0);
     livelock_note(pc);
     // A miss a slot conflict or the bridge asks for (they drop the answer
@@ -15571,6 +15625,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             cfg!(feature = "shared-memory"),
             &intr,
         );
+        // The translator is the shim's deepest caller: recursive over the
+        // control-flow graph of up to `LIFT_MAX` blocks.
+        stack_tripwire("the end of a translation");
         note_kuser_folds(pc);
         if pwatched(gex_abi::dispatch_page(pc)) {
             let pg = gex_abi::dispatch_page(pc);
