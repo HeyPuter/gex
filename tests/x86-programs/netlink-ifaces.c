@@ -34,8 +34,8 @@ int main(void)
     }
     printf("if_nameindex: lo %s, %s one interface\n", lo ? "listed" : "missing", n > 1 ? "more than" : "only");
     /* The interface ioctls on an internet datagram socket, as Wine's nsi asks
-     * them (musl's if_nametoindex asks on an AF_UNIX datagram socket, which
-     * gex does not have). */
+     * them (musl's if_nametoindex asks on an AF_UNIX datagram socket:
+     * unix-dgram.c). */
     struct ifreq ifr = { 0 };
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     strcpy(ifr.ifr_name, "lo");
