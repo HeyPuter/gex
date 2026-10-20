@@ -201,6 +201,10 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
         "$ROOT/tests/integration/programs/gl43-msvo-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-persistent-probe" \
+        "$ROOT/tests/integration/programs/gl44-persistent-probe.c" \
+        -I "$ROOT/third_party/mesa/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     "$CC" -O2 -o "$PUB/fs/gl44-texture-sampler-probe" \
         "$ROOT/tests/integration/programs/gl44-texture-sampler-probe.c" \
         -I "$ROOT/third_party/mesa/include" \
