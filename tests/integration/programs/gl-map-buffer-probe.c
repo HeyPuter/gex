@@ -70,6 +70,18 @@ static void check_big(const char *name, GLuint buf, size_t poke, size_t poke_len
     free(got);
 }
 
+/* KiB this process has mapped (the sum of /proc/self/maps), or -1. */
+static long vmdata_kib(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[512];
+    unsigned long lo, hi;
+    long kib = f ? 0 : -1;
+    while (f && fgets(line, sizeof line, f))
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) kib += (long)((hi - lo) >> 10);
+    if (f) fclose(f);
+    return kib;
+}
+
 static GLuint fresh_big(void) {
     unsigned char *data = malloc(BIG);
     for (size_t i = 0; i < BIG; i++) data[i] = big_byte(i);
@@ -286,6 +298,27 @@ int main(void) {
         ok = ok && memcmp(w1, w2, 16) == 0;
         cases++; passed += ok;
         printf("CASE big_second_write_map %s\n", ok ? "PASS" : "FAIL");
+    }
+
+    /* A 1 MiB read map in the middle of a 40 MiB buffer shows its bytes,
+       and (GEXGL_PROBE_VMDATA=1, gex's run) maps about the 1 MiB shadow:
+       gexgl used to keep a whole-size copy of the buffer besides it, which a
+       32-bit W3 process (wined3d's 64 MiB chunks) has no room for. */
+    {
+        GLuint g = fresh_big();
+        long before = vmdata_kib();
+        const unsigned char *r = glMapBufferRange(GL_ARRAY_BUFFER, 8 << 20, 1 << 20, GL_MAP_READ_BIT);
+        long during = vmdata_kib();
+        int ok = r != NULL;
+        for (size_t i = 0; ok && i < (1u << 20); i++) ok = r[i] == big_byte((8u << 20) + i);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+        if (getenv("GEXGL_PROBE_VMDATA") && ok && (before < 0 || during < 0 || during - before > 4096)) {
+            printf("map of 1 MiB of a 40 MiB buffer took %ld KiB of address space\n", during - before);
+            ok = 0;
+        }
+        glDeleteBuffers(1, &g);
+        cases++; passed += ok;
+        printf("CASE big_range_read_map_no_copy %s\n", ok ? "PASS" : "FAIL");
     }
 
     /* glBufferSubData after a map: the next write map keeps its bytes. */

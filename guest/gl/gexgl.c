@@ -710,7 +710,11 @@ struct buffer_object_state {
     /* What the host buffer holds, once it has been mapped: kept exact by
        glBufferData/glBufferSubData and dropped by anything else that may
        change it (buffer_contents_unknown). A map copies from it instead of
-       reading the buffer back, and its unmap uploads only what changed. */
+       reading the buffer back, and its unmap uploads only what changed.
+       Only for buffers up to MIRROR_MAX: a second whole-size copy of a large
+       one costs a W3 process address space it does not have (wined3d's
+       64 MiB chunks: a 64 MiB map shadow plus a 64 MiB mirror each). A map
+       of a larger buffer reads back just its range. */
     uint8_t *mirror;
     int mapped_once;
     /* A persistent write mapping (GL_MAP_PERSISTENT_BIT): a 64-bit hash of
@@ -723,6 +727,7 @@ struct buffer_object_state {
     struct buffer_object_state *next;
 };
 static size_t persistent_live;
+#define MIRROR_MAX ((size_t)1 << 20)
 static struct buffer_target_state buffer_targets[16];
 static struct buffer_object_state *buffer_objects;
 static size_t mirrors_live;
@@ -815,7 +820,7 @@ void glBufferData(unsigned target, long size, const void *data, unsigned usage) 
     if (object) object->size = len;
     /* New storage: a mapped buffer's copy is its new contents, if given. */
     mirror_drop(object);
-    if (object && object->mapped_once && data && len && (object->mirror = malloc(len))) {
+    if (object && object->mapped_once && data && len && len <= MIRROR_MAX && (object->mirror = malloc(len))) {
         memcpy(object->mirror, data, len);
         mirrors_live++;
     }
@@ -927,10 +932,12 @@ void *glMapBufferRange(unsigned target, long offset, long length,
                     !(access & (0x4u | 0x8u | 0x10u)); /* INVALIDATE_RANGE/BUFFER, FLUSH_EXPLICIT */
     /* GL_MAP_INVALIDATE_BUFFER_BIT leaves the rest of the buffer undefined. */
     if (access & 0x8u) mirror_drop(object);
-    /* The first map that needs the buffer's bytes reads all of it once
-       and keeps the copy; later maps copy from it. */
+    /* The first map that needs a small buffer's bytes reads all of it once
+       and keeps the copy; later maps copy from it. A large buffer's map
+       reads its own range into the shadow (below), never a whole copy. */
     object->mapped_once = 1;
-    if (!object->mirror && keep && object->size && (object->mirror = malloc(object->size))) {
+    if (!object->mirror && keep && object->size && object->size <= MIRROR_MAX &&
+        (object->mirror = malloc(object->size))) {
         if (buffer_read(target, 0, (long)object->size, object->mirror)) {
             mirrors_live++;
         } else {
