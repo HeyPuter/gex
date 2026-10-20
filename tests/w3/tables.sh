@@ -6,8 +6,9 @@
 # there kept a zero directory entry (a retranslation livelock), and a tier-1
 # return to native Wine's return pad went unwatched into the pad's int3
 # filler (EXCEPTION_BREAKPOINT at 0x3ffff1). Here every table holds only
-# GEX_DISPATCH_TABLE_SLOTS slots (default below), so a small session numbers
-# most of its pages in the later tables; a run with the full tables is the
+# GEX_DISPATCH_TABLE_SLOTS slots (default below) and the pages numbered at
+# run time start in the second, so every bridge, call-out return and tier-1
+# page of the session is past the first; a run with the full tables is the
 # control. Prints "tables ok N" per run.
 #
 #   tests/w3/tables.sh DIST PREFIX [gexc]
@@ -27,8 +28,10 @@ w=${WORK:-$root/target/w3-tables}
 rm -rf "$w"; mkdir -p "$w/units"
 i686-w64-mingw32-gcc -O1 -o "$w/tables.exe" "$here/tables.c" || exit 1
 i686-w64-mingw32-gcc -O1 -shared -nostdlib -e _DllMain@12 -o "$w/tablesdll.dll" "$here/tablesdll.c" -lkernel32 || exit 1
+# With and without wine32's KUSER fold: which key a run looks for depends on
+# whether the dist's Wine folds KUSER_SHARED_DATA (wasmprog FLAG_KUSER_W3).
 (GEX_CGEN_CACHE="$w/units" "$gexc" cgen-image --providers &&
-	GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$w/tables.exe" --pe-base 0x400000 --w3-kuser --jobs 4) > "$w/build.log" 2>&1 ||
+	for k in --w3-kuser ""; do GEX_CGEN_CACHE="$w/units" GEX_CGEN_PRECOMPILE=1 "$gexc" cgen-image "$w/tables.exe" --pe-base 0x400000 $k --jobs 4 || exit 1; done) > "$w/build.log" 2>&1 ||
 	{ echo "FAIL: tables.exe's unit (tail: $(tail -2 "$w/build.log" | tr '\n' ' '))"; exit 1; }
 pass=0 fail=0
 run() { # NAME LOG [env...]
@@ -37,7 +40,7 @@ run() { # NAME LOG [env...]
 	(cd "$w/pfx/drive_c" && env GEX_CGEN_CACHE="$w/units" GEX_W3_UNITS=all GEX_W3_TRACE=1 "$@" timeout -k 10 "${TMO:-300}" "$gexc" run \
 		--env WINEPREFIX="$w/pfx" --env WINEDEBUG=err+all,fixme-all \
 		"$dist/lib/wine/i386-unix/wine" 'C:\tables.exe') > "$log" 2>&1
-	if grep -q 'no function-tier unit.*tables\.exe' "$log"; then
+	if grep -q 'tables\.exe at 0x[0-9a-f]*: no function-tier unit' "$log"; then
 		fail=$((fail + 1)); echo "FAIL $name: tables.exe ran without its unit"; grep 'tables\.exe' "$log" | head -2 | sed 's/^/  /'
 	elif grep -q '^tables ok [1-9]' "$log"; then pass=$((pass + 1)); echo "ok   $name"
 	else fail=$((fail + 1)); echo "FAIL $name"; grep -v '^\[host\]' "$log" | tail -8 | sed 's/^/  /'; fi

@@ -1226,7 +1226,7 @@ fn run_program_with(
     if opts.jit || opts.recompile_objects || !aot_shared.is_empty() {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
-                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
+                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),
                 translated: Default::default(),
                 registry: Vec::new(),
                 blocks: 0,
@@ -6074,22 +6074,40 @@ fn trace_callout_abort(
 pub(crate) static CALLOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static CALLOUT_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `GEX_DISPATCH_TABLE_SLOTS=N` (debugging): each dispatch table full after
+/// N slots, and the pages numbered at run time start in the second table,
+/// so a small program's bridges, call-out returns and tier-1 pages are all
+/// past the first. Whether the cap is on.
+fn dispatch_tables_capped() -> bool {
+    static CAPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAPPED.get_or_init(|| match std::env::var("GEX_DISPATCH_TABLE_SLOTS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(n) => {
+            gex_xlate::PageTable::set_slots_per_table(n);
+            eprintln!("gex: dispatch tables of {} slots (GEX_DISPATCH_TABLE_SLOTS)", gex_xlate::PageTable::slots_per_table());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Where a process's run-time page numbering starts: after the image
+/// module's pages (`next`), in the second table under the debugging cap.
+fn first_runtime_slot(next: u64) -> u64 {
+    if dispatch_tables_capped() {
+        next.max(gex_xlate::PageTable::slots_per_table())
+    } else {
+        next
+    }
+}
+
 /// Every dispatch table a translated image module exports, in index order.
-/// Several because V8 caps a table at 10M entries; natively tables past the
-/// first stay empty but must exist because the code names them.
+/// Several because V8 caps a table at 10M entries: a page numbered past the
+/// first table's slots lands in a later one.
 fn dispatch_tables(
     store: &mut Store<HostState>,
     instance: &wasmtime::Instance,
 ) -> Result<Vec<Table>> {
-    // `GEX_DISPATCH_TABLE_SLOTS=N` (debugging): each dispatch table full
-    // after N slots, so a small program numbers pages in the later tables.
-    static TABLE_SLOTS: std::sync::Once = std::sync::Once::new();
-    TABLE_SLOTS.call_once(|| {
-        if let Some(n) = std::env::var("GEX_DISPATCH_TABLE_SLOTS").ok().and_then(|v| v.parse::<u64>().ok()) {
-            gex_xlate::PageTable::set_slots_per_table(n);
-            eprintln!("gex: dispatch tables of {} slots (GEX_DISPATCH_TABLE_SLOTS)", gex_xlate::PageTable::slots_per_table());
-        }
-    });
+    dispatch_tables_capped();
     let mut out = Vec::new();
     for i in 0..gex_abi::DISPATCH_TABLES {
         match instance.get_export(&mut *store, exports::dispatch_table(i)) {
