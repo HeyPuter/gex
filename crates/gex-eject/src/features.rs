@@ -44,9 +44,11 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "translation",
         about: "run-time translation (tier-1 and the function JIT) behind the build's units, \
-                for code the recording never reached",
-        fixed: Some("the browser shim's translator is not yet a separate build (gex-kernel \
-                     and shim feature gating, docs/eject.md)"),
+                for code the recording never reached. Off, a wine32 page's default: the page \
+                translates nothing, and code no unit holds stops the run, naming it. Off by \
+                switch for now (the page's aot=1): the translator is still in the page. \
+                \"cold\": \"jit\" keeps the function JIT alone, and wants this left unset",
+        fixed: None,
     },
 ];
 
@@ -80,5 +82,6 @@ mod tests {
         assert!(check(&["compositor".into(), "gl".into()]).is_ok());
         assert!(check(&["compsitor".into()]).unwrap_err().to_string().contains("unknown feature"));
         assert!(check(&["multiprocess".into()]).unwrap_err().to_string().contains("cannot be switched off yet"));
+        assert!(check(&["translation".into()]).is_ok());
     }
 }
