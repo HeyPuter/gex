@@ -783,6 +783,7 @@ impl FileHandle for TmpHandle {
         let start = offset as usize;
         if start + buf.len() > data.len() {
             let was = data.capacity();
+            reserve(&mut data, start + buf.len())?;
             data.resize(start + buf.len(), 0);
             note_capacity(was, data.capacity());
         }
@@ -970,6 +971,7 @@ impl FileHandle for TmpHandle {
         {
             let mut data = file.data.lock().unwrap();
             let was = data.capacity();
+            reserve(&mut data, len as usize)?;
             data.resize(len as usize, 0);
             note_capacity(was, data.capacity());
         }
@@ -1293,6 +1295,18 @@ impl FileSystem for TmpFs {
             .insert(path.to_string(), Node::Symlink(target.to_string()));
         Ok(())
     }
+}
+
+/// Room for a file's contents to reach `len` bytes, or ENOSPC: a tmpfs file
+/// lives in the kernel's memory, and a `resize` the allocator cannot meet is an
+/// abort there, with the file's lock (and every process's kernel) held for good.
+/// The usual doubling first, then exactly `len` when doubling is what failed.
+fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
+    let more = len.saturating_sub(data.len());
+    if more == 0 || data.capacity() >= len {
+        return Ok(());
+    }
+    data.try_reserve(more).or_else(|_| data.try_reserve_exact(more)).map_err(|_| Errno::ENOSPC)
 }
 
 #[cfg(test)]
@@ -1813,3 +1827,4 @@ mod lazy_tests {
         assert_eq!(fs.open("e/g", 0, 0).unwrap().metadata().unwrap().size, 3);
     }
 }
+

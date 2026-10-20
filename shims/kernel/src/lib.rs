@@ -173,8 +173,77 @@ fn note_panics() {
 ///
 /// A host that made the memory can read it directly; nothing has to be
 /// copied. Zero length means this module has not panicked.
+/// The kernel's allocator: std's, plus a line when it runs out. Out of memory
+/// is `handle_alloc_error`, an abort that passes the panic hook, so a kernel
+/// that could not grow its memory trapped as a bare `unreachable` with no
+/// message -- and with whatever lock it held still held, every other process
+/// waiting on it. The line goes in a fixed buffer (allocating here would fail
+/// again), and `k_panic_ptr`/`k_panic_len` hand it out ahead of a panic's.
+struct Kalloc;
+static OOM_MSG: [std::sync::atomic::AtomicU8; 160] = [const { std::sync::atomic::AtomicU8::new(0) }; 160];
+static OOM_LEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cold]
+fn kernel_oom(size: usize) {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    if OOM_LEN.load(Relaxed) != 0 {
+        return;
+    }
+    use core::fmt::Write as _;
+    struct Buf([u8; 160], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 160], 0);
+    let mib = core::arch::wasm32::memory_size(0) as u64 * 65536 >> 20;
+    let _ = write!(b, "out of memory: the global kernel could not allocate {size} bytes (its memory is {mib} MiB and would not grow)");
+    for (i, c) in b.0[..b.1].iter().enumerate() {
+        OOM_MSG[i].store(*c, Relaxed);
+    }
+    OOM_LEN.store(b.1 as u32, Release);
+}
+unsafe impl std::alloc::GlobalAlloc for Kalloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        let p = unsafe { std::alloc::System.alloc(l) };
+        if p.is_null() {
+            kernel_oom(l.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        let p = unsafe { std::alloc::System.alloc_zeroed(l) };
+        if p.is_null() {
+            kernel_oom(l.size());
+        }
+        p
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        let q = unsafe { std::alloc::System.realloc(p, l, n) };
+        if q.is_null() {
+            kernel_oom(n);
+        }
+        q
+    }
+}
+#[global_allocator]
+static KALLOC: Kalloc = Kalloc;
+
 #[no_mangle]
 pub extern "C" fn k_panic_ptr() -> u32 {
+    if OOM_LEN.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return OOM_MSG.as_ptr() as u32;
+    }
     PANIC
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -183,6 +252,10 @@ pub extern "C" fn k_panic_ptr() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn k_panic_len() -> u32 {
+    let oom = OOM_LEN.load(std::sync::atomic::Ordering::Acquire);
+    if oom != 0 {
+        return oom;
+    }
     PANIC.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
