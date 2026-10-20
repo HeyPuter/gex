@@ -1966,6 +1966,10 @@ impl FdIo<'_> {
                 return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
             }
         }
+        // The read and the sender address it set, as one (`recv_turn`).
+        // Only when it asks who sent it.
+        let inet = if unix_sock.is_none() && self.msg_rd(m, msg, 0)? != 0 { self.socket_of(fd).ok() } else { None };
+        let _turn = inet.as_ref().map(|s| s.recv_turn());
         // One read for the whole vector, then scattered over it, as the
         // remote path does. Reading each iovec in turn lost data: a first
         // iovec filled exactly, with nothing left behind it, made the second
@@ -4536,6 +4540,9 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
 fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> SysResult {
     let len = (len as usize).min(1 << 22);
     let mut tmp = vec![0u8; len];
+    // The read and the sender address it set, as one (`recv_turn`).
+    let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };
+    let _turn = inet.as_ref().map(|s| s.recv_turn());
     let n = match io.socket_of(fd) {
         Ok(sock) if flags & Kernel::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
         _ => io.fds.get(fd)?.read(&mut tmp)?,
