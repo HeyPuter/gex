@@ -2478,6 +2478,9 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
         });
     }
     catch_up_table(&mut store)?;
+    if cx.opts.aot_only {
+        aot_only::bind_root(&mut store, &instance)?;
+    }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     let stopped = match stopped {
@@ -5919,7 +5922,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
     // no unit covers without the NT layer). A call-out that never returns
     // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
-    if ret != 0 {
+    // An AOT-only process translates nothing (`aot_only`).
+    if ret != 0 && !crate::aot_only::enabled() {
         let page = ret / gex_abi::DISPATCH_PAGE;
         let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::dispatch_dir() + page * 4).unwrap_or(1);
         if page < gex_abi::dispatch_max_pages() && entry(&memory) == 0 {

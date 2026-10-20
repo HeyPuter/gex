@@ -16,7 +16,11 @@
 //!   answers anything else with index 1, the fallback;
 //! * has [`missing`] at index 1, and as `gex.dispatch_miss`: a call to code
 //!   nothing built ahead of time stops the run there, naming the address;
-//! * answers `gex.call_out` (which a unit's leave path may still call) with
+//! * runs `gex.call_out` as every native wasm32 process does (native Wine
+//!   starts its threads' guest code through it), translating nothing for
+//!   it. Its dispatch tables being empty, no slot can watch a return: one
+//!   that reaches the root is a miss and stops the run. A Windows
+//!   process's units call it on their leave path only, and are answered
 //!   "leave": the root then looks the address up, and a miss stops the run.
 //!
 //! E7 (a runtime without the translator in it) deletes the code this mode
@@ -118,12 +122,15 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::DISPATCH_MISS,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { Err(missing(&mut caller, pc as u64, "a dispatch")) })()) },
     )?;
-    // Leave: the root looks the target up, and stops the run if nothing
-    // built ahead of time holds it.
     linker.func_wrap(
         IMPORT_MODULE,
         imports::CALL_OUT,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _target: i64, _ret: i64, _sp: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { Ok(0) })()) },
+        |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp: i64| -> wasmtime::Result<i32> {
+            if caller.data().nt.is_some() {
+                return crate::host((|| -> anyhow::Result<i32> { Ok(0) })());
+            }
+            crate::host(super::call_out(&mut caller, ctx, target as u64, ret as u64, sp as u64))
+        },
     )?;
     Ok(())
 }

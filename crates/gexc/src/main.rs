@@ -755,6 +755,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.aot = Some(std::sync::Arc::new(aot));
     }
     ra.opts.jit = ra.jit;
+    // GEX_AOT_ONLY=1 (debugging): run ahead-of-time code only, as an
+    // ejected project does (`gex_native::aot_only`): a wine32 session
+    // whose every image has a unit, nothing translated at run time.
+    if std::env::var_os("GEX_AOT_ONLY").is_some() {
+        ra.opts.aot_only = true;
+    }
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
     }
