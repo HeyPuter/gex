@@ -928,6 +928,8 @@ fn remembered_unit_key(id: &(String, u64, usize, u64), image: &gex_ld::Image, pv
     (gex_abi::mem64(), gex_cgen::image::unguarded(), gex_cgen::image::narrow_stores()).hash(&mut h);
     std::env::current_exe().ok().and_then(|e| stamp(&e)).hash(&mut h);
     stamp(&root.join("icall")).hash(&mut h);
+    // Which providers there are (sources from outside gex, the skip list).
+    gex_cgen::provider::settings_fingerprint().hash(&mut h);
     let memo = root.join("w3keys").join(format!("{:016x}", h.finish()));
     if let Ok(k) = std::fs::read_to_string(&memo) {
         if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
@@ -1919,6 +1921,12 @@ pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64
         Ok("all") => 2,
         _ => 1,
     });
+    // A library a stateful provider replaces (`libprov`: GEX_WASM_DLLS, an
+    // ejected project's eject.json "providers"): bound in its place, with
+    // no unit (none of its code runs), wherever it lives.
+    if !crate::libprov::for_dll(&pe.exports.dll_name).is_empty() {
+        return w3_stateful(caller, path, base, &pe);
+    }
     if which == 0 || (which == 1 && !path.contains("/lib/wine/")) || mode() == Mode::Off || is_wasm_skeleton(&pe) {
         return Ok(());
     }
@@ -1931,6 +1939,30 @@ pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64
     }
     let p = Pending { path: path.to_string(), base, pe: Arc::new(pe) };
     w3_place(caller, p, true)
+}
+
+/// Bind the stateful providers of the image at `base` (`libprov`).
+fn w3_stateful(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<()> {
+    let (shared, engine) = {
+        let Some(jit) = caller.data().jit.as_ref() else { return Ok(()) };
+        (Arc::clone(&jit.shared), jit.engine.clone())
+    };
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let mut exports = HashMap::new();
+    for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+        for n in &e.names {
+            exports.insert(n.clone(), e.rva);
+        }
+    }
+    for lp in crate::libprov::for_dll(&pe.exports.dll_name) {
+        let n = crate::libprov::install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, base, pe.entry_rva)?;
+        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
+            eprintln!("gex-w3: provider {} for {path}: {n} exports", lp.name);
+        }
+    }
+    crate::ftab::catch_up(&mut *caller)?;
+    replay_registry(caller)?;
+    Ok(())
 }
 
 /// Images [`w3_image`] left for their first miss, by the process (its

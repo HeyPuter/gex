@@ -710,10 +710,16 @@ function w3Site() {
       groupsU.get(g).push(u);
     }
     const unitTars = [];
+    // Stateful providers (user/eject.json "providers", w3.json `stateful`):
+    // files of the unit cache, in the first archive.
+    const statefulFiles = existsSync(join(web, 'units', 'stateful')) ? readdirSync(join(web, 'units', 'stateful')).map((f) => `stateful/${f}`) : [];
+    if (!groupsU.size && statefulFiles.length) groupsU.set(0, []);
+    let first = true;
     for (const g of [...groupsU.keys()].sort((a, b) => a - b)) {
       const us = groupsU.get(g).sort((a, b) => (a.key < b.key ? -1 : 1));
       const list = join(work, 'units-list');
-      writeFileSync(list, `${us.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]).join('\n')}\n`);
+      writeFileSync(list, `${[...us.flatMap((u) => [`${u.key}/c.wasm`, `${u.key}/c.entries`]), ...(first ? statefulFiles : [])].join('\n')}\n`);
+      first = false;
       const ut = join(work, `units-${g}.tar`);
       execFileSync('tar', ['-C', join(web, 'units'), '--dereference', '--owner=0', '--group=0', '--mtime=@0', '--format=gnu', '-cf', ut, '-T', list]);
       const site = piecesOn ? `project/build/web/pieces/u${sha(readFileSync(ut)).slice(0, 32)}.tar` : 'project/build/web/units.tar';
@@ -749,6 +755,12 @@ function w3Site() {
     preload.push([`cgen:${u.key}`, `/project/build/web/units/${u.key}/c.wasm`, statSync(join(d, 'c.wasm')).size]);
     preload.push([`file:${u.key}/c.entries`, `/project/build/web/units/${u.key}/c.entries`, 0]);
     if (existsSync(join(d, 'cold'))) coldPack(join(d, 'cold'), `project/build/web/units/${u.key}`);
+  }
+  if (coldUnits && existsSync(join(web, 'units', 'stateful'))) {
+    for (const f of readdirSync(join(web, 'units', 'stateful'))) {
+      place(join(web, 'units', 'stateful', f), `project/build/web/units/stateful/${f}`);
+      preload.push([`file:stateful/${f}`, `/project/build/web/units/stateful/${f}`, 0]);
+    }
   }
   preload.sort((a, b) => b[2] - a[2]);
   if (coldUnits) writeFileSync(join(out, 'project/build/web/units/preload.json'), JSON.stringify(preload.map(([a, b]) => [a, b])));

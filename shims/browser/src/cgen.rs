@@ -129,6 +129,14 @@ pub(crate) fn set_stateful(spec: &str) {
     }
 }
 
+/// `dll=file,...` (the page's `stateful`, run-node's `GEX_STATEFUL`): a
+/// wine32 or wine64 process's stateful providers, before the program
+/// starts.
+#[no_mangle]
+pub extern "C" fn gex_cgen_stateful(ptr: u32, len: u32) {
+    set_stateful(&String::from_utf8_lossy(crate::shim_slice(ptr, len)));
+}
+
 /// Exports a stateful provider does not implement, by address: for the
 /// message when the program calls one.
 static MISSING: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
