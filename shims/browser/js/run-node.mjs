@@ -395,7 +395,7 @@ const host = new ProcessHost({
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
     // GEX_STRAY_TRAP=1: as the page's ?straytrap=1 (cgen.rs STRAY_TRAP).
     strayTrap: !!process.env.GEX_STRAY_TRAP,
-    // GEX_W3_SPLIT=1: as the page's ?w3split=1 (nt::w3_space).
+    // GEX_W3_SPLIT=1: as the page's ?w3split=1 (winspace::w3_space).
     w3Split: !!process.env.GEX_W3_SPLIT,
     // GEX_NULL_GUARD=1: as the page's ?nullguard=1 (gex_abi::null_guard).
     nullGuard: process.env.GEX_NULL_GUARD === '1' || undefined,

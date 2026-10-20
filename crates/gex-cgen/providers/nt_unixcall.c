@@ -1,6 +1,6 @@
 /* PROVIDES [nt-trampolines] i386
  *
- * The i386 unix-call dispatcher (gex_kernel::nt::boot::tramp::UNIX_CALL_32,
+ * The i386 unix-call dispatcher (gex_kernel::win::tramp::UNIX_CALL_32,
  * what ntdll's __wine_unix_call_dispatcher points at), with the hottest
  * OpenGL calls written straight into the GL command ring. Wine's PE
  * opengl32 makes one unix call per GL function; Noita makes about 3,900 a
@@ -20,12 +20,12 @@
  *
  * stdcall (handle: u64, code, params), 16 bytes popped; returns NTSTATUS. */
 
-/* gex_kernel::nt::TRAMPOLINES and the i386 unix-call trampoline in it. */
+/* gex_kernel::win::TRAMPOLINES and the i386 unix-call trampoline in it. */
 #define TR 0x3f0000u
 #define TR_RET16 (TR + 0x6au)  /* the `ret 16` the inner call returns to */
 #define TR_INT80 (TR + 0x6du)  /* `int 0x80` */
 #define TR_RET (TR + 0x6fu)    /* the `ret` after it */
-#define UNIX_CALL_NR 0x7f000001u /* gex_kernel::nt::gex_nr::UNIX_CALL */
+#define UNIX_CALL_NR 0x7f000001u /* gex_kernel::win::nr::UNIX_CALL */
 
 /* gex_kernel::nt::opengl: the fast path's words and the ring's shape. */
 #define GL_FAST_RING 0x7ffe0fe0u

@@ -67,7 +67,7 @@ const FLAG_GUEST_I386: u32 = 1;
 const FLAG_GUEST_X86_64: u32 = 2;
 /// Header flag: this i386 Wine maps KUSER_SHARED_DATA at
 /// `gex_abi::W3_KUSER` (wasm-elf.py, from Wine's `gex.kuser` section), so
-/// the process folds Windows' constant addresses there (`nt::w3_kuser`).
+/// the process folds Windows' constant addresses there (`winspace::w3_kuser`).
 const FLAG_KUSER_W3: u32 = 4;
 
 /// The running program's header has [`FLAG_GUEST_X86_64`] (W64), set at
@@ -179,12 +179,12 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
     let flags = mem.get(at + 36..at + 40).map_or(0, |f| u32::from_le_bytes(f.try_into().unwrap()));
     GUEST_X86_64.store(flags & FLAG_GUEST_X86_64 != 0, Ordering::Relaxed);
     if flags & (FLAG_GUEST_I386 | FLAG_GUEST_X86_64) != 0 && relocate {
-        use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
-        let page = gex_kernel::nt::boot::trampoline_page();
+        use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
+        let page = gex_kernel::win::trampoline_page();
         if let Some(dst) = mem.get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
             dst.copy_from_slice(&page);
         }
-        // W3's compact address space (`nt::w3_windows_space`): nothing
+        // W3's compact address space (`winspace::w3_windows_space`): nothing
         // grown up front; Wine's views come from the arena bottom-up, shared
         // with the shim's heap, so the memory reaches only as high as used.
         // Or the NT layer's split, for a site that asks (`?w3split=1`), and
@@ -192,11 +192,11 @@ fn publish(entry: u64, relocate: bool, want_base: Option<u32>) -> Result<u32, St
         // and a 64-bit Wine maps past it (Hades x64's page ran out of memory
         // at 2 GiB with it).
         if flags & FLAG_GUEST_X86_64 != 0 {
-            crate::nt::set_w3_split(true);
+            crate::winspace::set_w3_split(true);
         }
-        let lo = crate::nt::w3_space().map_err(|e| format!("W3: {e}"))?;
+        let lo = crate::winspace::w3_space().map_err(|e| format!("W3: {e}"))?;
         if flags & FLAG_GUEST_I386 != 0 && flags & FLAG_KUSER_W3 != 0 {
-            crate::nt::w3_kuser();
+            crate::winspace::w3_kuser();
         }
         {
             let mut mm = crate::sigs::proc_home().mm().lock();

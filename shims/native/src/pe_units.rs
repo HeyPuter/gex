@@ -1,5 +1,5 @@
-//! The function tier for the NT layer's images (S3, M7; docs/function-tier.md
-//! §11).
+//! The function tier for a Windows program's images (PE units), and for
+//! the ELF objects named for one.
 //!
 //! Wine's loader maps every image itself, so a Windows program's code
 //! arrives through the runtime translator. With `gexc run --cgen` on a PE
@@ -354,12 +354,12 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
 }
 
 /// The NT trampoline page's region entries (at its unit `unit`): where a
-/// host resumes it after a system call ([`gex_kernel::nt::boot::trampoline_resumes`]).
+/// host resumes it after a system call ([`gex_kernel::win::trampoline_resumes`]).
 #[cfg(feature = "translate")]
 pub fn prepare_trampoline_regions(class32: bool, unit: &std::path::Path, jobs: usize) -> Result<Vec<u64>> {
     let (image, seeds) = trampoline_input(class32);
-    let pcs = gex_kernel::nt::boot::trampoline_resumes(class32);
-    regions_from(&image, &seeds.starts, &[], gex_kernel::nt::TRAMPOLINES, unit, &pcs, jobs)
+    let pcs = gex_kernel::win::trampoline_resumes(class32);
+    regions_from(&image, &seeds.starts, &[], gex_kernel::win::TRAMPOLINES, unit, &pcs, jobs)
 }
 
 #[cfg(feature = "translate")]
@@ -1135,13 +1135,13 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     }
 }
 
-/// The NT layer's trampoline page (`gex_kernel::nt::boot::trampoline_input`:
+/// The NT layer's trampoline page (`gex_kernel::win::trampoline_input`:
 /// the unix-call and syscall dispatchers every Wine DLL calls through, Wine's
 /// opengl32 once per GL call) as a recovery input. Fixed bytes at a fixed
 /// address, so its unit is built once per gex build and installed at boot
 /// like an image's: without it every such call leaves the function tier.
 fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) {
-    let (image, starts) = gex_kernel::nt::boot::trampoline_input(class32);
+    let (image, starts) = gex_kernel::win::trampoline_input(class32);
     let seeds = gex_xlate::func::PeSeeds {
         starts: starts.into_iter().map(|a| (a, gex_xlate::func::Source::Entry)).collect(),
         fdes: Vec::new(),
@@ -1201,7 +1201,7 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
     // Its providers (gex-cgen/providers/nt_unixcall.c), after the unit, at
     // the trampolines they replace.
     if class32 {
-        use gex_kernel::nt::{boot::tramp, TRAMPOLINES};
+        use gex_kernel::win::{tramp, TRAMPOLINES};
         let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
         for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
             // As every provider: built here only where there is a translator

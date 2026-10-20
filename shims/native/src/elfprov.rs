@@ -92,7 +92,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
                 }
                 continue;
             }
-            let (path, slots) = crate::nt_cgen::provider_module(p)?;
+            let (path, slots) = crate::pe_units::provider_module(p)?;
             let slot = |f: &str| slots.iter().position(|s| s.as_deref() == Some(f)).map(|k| k as u32);
             let mut pairs: Vec<(u64, u32)> = gex_cgen::provider::elf_bindings(p, &exports, bias, trace)
                 .into_iter()
@@ -116,7 +116,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
             if p.stateful {
                 // Its data in guest pages (the stack comes per thread), as a
-                // stateful PE provider's (`nt_cgen::install_providers`).
+                // stateful PE provider's (`pe_units::install_providers`).
                 let wasm = std::fs::read(&path)?;
                 let (size, align) = crate::libprov::dylink_memory(&wasm)?;
                 let a = 1u64 << align;

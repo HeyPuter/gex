@@ -121,10 +121,10 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
         // beside the other as `<module>.m64`, under the same skeletons.
         let ns = crate::sigs::proc_home().ns();
         let twin = format!("{file}.m64");
-        let (file, wasm) = match gex_abi::mem64().then(|| gex_kernel::nt::file::read_guest_file(&ns, &twin).ok()).flatten() {
+        let (file, wasm) = match gex_abi::mem64().then(|| gex_kernel::win::read_guest_file(&ns, &twin).ok()).flatten() {
             Some(w) => (twin, w),
             None => {
-                let w = gex_kernel::nt::file::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+                let w = gex_kernel::win::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
                 (file, w)
             }
         };
@@ -623,11 +623,11 @@ fn wasmref(mem: &[u8], base: u64, sec: &gex_ld::pe::Section) -> Result<(String, 
 /// As natively (`wasmdll::ntdll_variables`): what gex-kernel's NT boot
 /// fills in ntdll, in a native ntdll's own data.
 fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
-    use gex_kernel::nt::boot::tramp;
+    use gex_kernel::win::tramp;
     [
         ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
         ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
-        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
+        ("__wine_unixlib_handle", gex_kernel::win::NTDLL_HANDLE.to_le_bytes().to_vec()),
     ]
 }
 

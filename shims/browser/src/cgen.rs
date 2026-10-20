@@ -513,7 +513,7 @@ pub(crate) fn drain() -> bool {
     static TRAMPOLINES: OnceLock<()> = OnceLock::new();
     if let Some(p) = pending.first() {
         if TRAMPOLINES.set(()).is_ok() {
-            let (image, _) = gex_kernel::nt::boot::trampoline_input(!p.pe.is64);
+            let (image, _) = gex_kernel::win::trampoline_input(!p.pe.is64);
             place(&image, "[the NT trampolines]", image.bias, true, None);
         }
     }
@@ -533,7 +533,7 @@ pub(crate) fn drain() -> bool {
 
 /// W3 (Wine's own Unix side): an i386 image Wine's loader mapped
 /// (`gex.image_mapped`, not a wasm32 skeleton), placed as the NT layer's
-/// are (the native host's `nt_cgen::w3_image` with `GEX_W3_UNITS=all`).
+/// are (the native host's `pe_units::w3_image` with `GEX_W3_UNITS=all`).
 /// Never fatal: an image with no unit stays on tier-1, and one whose mapped
 /// code is not yet its bytes (Wine relocates a moved image after mapping it)
 /// waits for its first miss ([`w3_miss`]), as natively. Returns whether a
@@ -711,7 +711,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
     let (key, mut providers) = unit_key(image, pe, base, known.as_ref().map(|k| k.0.clone()));
     // The trampoline page's providers (gex-cgen/providers/nt_unixcall.c),
     // bound at its entries after its unit, as an image's at its exports.
-    if pe.is_none() && base == gex_kernel::nt::TRAMPOLINES && image.class32 {
+    if pe.is_none() && base == gex_kernel::win::TRAMPOLINES && image.class32 {
         providers.extend(trampoline_providers());
     }
     if let Some(pe) = pe {
@@ -728,7 +728,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         }
     }
     // A native wasm32 Wine DLL: its exports are Wine's PE module's, not the
-    // built-in providers' (as natively, `nt_cgen::install_providers`); the
+    // built-in providers' (as natively, `pe_units::install_providers`); the
     // key keeps them, as natively.
     if let Some(pe) = pe.filter(|pe| wasmdll::is_skeleton(pe)) {
         providers = vec![Provided {
@@ -765,7 +765,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
     }
 }
 
-/// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
+/// The key of the unit for `image` (the native host's `pe_units::unit_key`:
 /// the image's key, extended by its export providers' stubs and sources),
 /// and those providers. The indirect-call profile's part is added when JS
 /// has read `<cache>/icall/<identity>.txt` (`gex_cgen_set_icall`).
@@ -773,7 +773,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, 
     use std::hash::{Hash, Hasher};
     let mut key = known.unwrap_or_else(|| gex_cgen::image::image_key(image));
     let Some(pe) = pe else { return (key, Vec::new()) };
-    // As natively (`nt_cgen::provided`): Wine's own build of a DLL leaves out
+    // As natively (`pe_units::provided`): Wine's own build of a DLL leaves out
     // the `nowine` providers.
     let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
     if providers.is_empty() {
@@ -814,7 +814,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, 
 
 /// The NT trampoline page's providers, as [`unit_key`] gives an image's.
 fn trampoline_providers() -> Vec<Provided> {
-    use gex_kernel::nt::{boot::tramp, TRAMPOLINES};
+    use gex_kernel::win::{tramp, TRAMPOLINES};
     let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
     gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true)
         .iter()
@@ -839,7 +839,7 @@ pub extern "C" fn gex_cgen_icall_path(u: u32, buf: u32, cap: u32) -> u32 {
 }
 
 /// Unit `u`'s indirect-call profile (the `len` bytes at `ptr`, or none):
-/// its key gains the profile's part, exactly as natively (`nt_cgen::
+/// its key gains the profile's part, exactly as natively (`pe_units::
 /// icall_hints` and `unit_key`).
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
@@ -863,7 +863,7 @@ pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
     }
 }
 
-/// `nt_cgen::icall_hints` on the profile's text: a call site whose dominant
+/// `pe_units::icall_hints` on the profile's text: a call site whose dominant
 /// target takes at least 90% of at least 64 calls, by return address.
 fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
     use std::collections::HashMap;
@@ -1171,7 +1171,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
     };
     if lock(&UNITS).get(u as usize).and_then(|x| x.providers.get(i as usize)).is_some_and(|p| p.lifted) {
         // Only where its unit keeps the lifted twin it falls back to, as
-        // natively (`nt_cgen::install_providers`).
+        // natively (`pe_units::install_providers`).
         let had = binds.len();
         binds.retain(|(_, a)| ftab(|m| m.twin(*a).is_some()));
         if binds.len() < had {
@@ -1191,7 +1191,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         None => {
             if data {
                 // A built-in stateful provider's data, top down as natively
-                // (`nt_cgen::install_providers`).
+                // (`pe_units::install_providers`).
                 match builtin_data(&file, wasm) {
                     Ok(b) => memory_base = b as u64,
                     Err(e) => {
@@ -1370,7 +1370,7 @@ pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
     // game may fill them (Hades x86 with its units: no room for a Worker's
     // stack), while only wasm code runs on this one. It comes from the shim's
     // heap, above 2 GiB, zeroed, and lives as long as the process.
-    if crate::nt::w3_split() && crate::nt::process().is_none() {
+    if crate::winspace::w3_split() && crate::nt::process().is_none() {
         let layout = std::alloc::Layout::from_size_align(size as usize, 4096).expect("provider stack layout");
         // SAFETY: a non-zero size; the block is never freed (the process's stack).
         let p = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -2088,7 +2088,7 @@ pub(crate) fn native_return_stray(pc: u64, ctx: u64) -> bool {
     if STRAY_TRAP.load(Ordering::Relaxed) || CALLOUTS.with(|c| c.borrow().is_empty()) {
         return false;
     }
-    if pc == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD {
+    if pc == gex_kernel::win::tramp::NATIVE_RETURN_PAD {
         stray_keep(ctx);
         return true;
     }
@@ -2109,7 +2109,7 @@ pub extern "C" fn gex_set_stray_trap(on: i32) {
 /// ([`native_return_stray`]): the pad's int3 filler, which no function or
 /// block has. Its fallback restores the registers kept at the pad and
 /// returns as the pad.
-pub const STRAY_PC: u64 = gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD + 1;
+pub const STRAY_PC: u64 = gex_kernel::win::tramp::NATIVE_RETURN_PAD + 1;
 
 /// The context's words kept at a stray return to the pad: the registers
 /// (`ctx` from 0 to `ctx::PC`) and the flags word.
@@ -2157,7 +2157,7 @@ fn stray_restore(ctx: u64) -> bool {
         let _ = gm.write_u64(ctx + 8 * i as u64, *w);
     }
     let _ = gm.write_u64(ctx + gex_abi::ctx::NZCV as u64, v[STRAY_WORDS]);
-    let _ = gm.write_u64(ctx + gex_abi::ctx::PC as u64, gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD);
+    let _ = gm.write_u64(ctx + gex_abi::ctx::PC as u64, gex_kernel::win::tramp::NATIVE_RETURN_PAD);
     true
 }
 
@@ -2648,7 +2648,7 @@ pub extern "C" fn gex_icall_note(_ctx: i32, ret: i64, target: i64) {
 }
 
 /// Print the tally as an indirect-call profile (`icall RET TARGET N`, the
-/// lines `nt_cgen::icall_hints` reads), between `icall-dump` markers: the
+/// lines `pe_units::icall_hints` reads), between `icall-dump` markers: the
 /// last complete dump of a run is its profile.
 #[no_mangle]
 pub extern "C" fn gex_icall_dump() {

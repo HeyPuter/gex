@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::project::{rootfs_rel, Project};
 use anyhow::{anyhow, bail, Context, Result};
 use gex_kernel::nt;
-use gex_native::nt_cgen;
+use gex_native::pe_units;
 use gex_native::{Exit, RunOptions};
 use gex_xlate::profile::{NtSession, Session};
 use std::path::{Path, PathBuf};
@@ -382,7 +382,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
         let key = gex_cgen::image::image_key(&image);
         let made = reuse(&units.join(&key), &sources)?;
-        let p = nt_cgen::prepare_trampolines(class32, jobs)?;
+        let p = pe_units::prepare_trampolines(class32, jobs)?;
         compile(&p)?;
         report.units.push(("[nt trampolines]".into(), 0, 0, std::fs::metadata(&p)?.len(), if made { "reused" } else { "built" }));
     }
@@ -397,7 +397,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         let host = root.join(rootfs_rel(&m.path)?.strip_prefix("rootfs")?);
         let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?;
-        let key_dir = nt_cgen::unit_dir(&pe, m.base)?;
+        let key_dir = pe_units::unit_dir(&pe, m.base)?;
         let bias = m.base.wrapping_sub(m.preferred);
         // Entries the session reached by an indirect call: function starts
         // recovery may not find on its own (a thread start only an
@@ -426,7 +426,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             eprintln!("  building the unit for {} at {:#x} ...", m.path, m.base);
             "built"
         };
-        let p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
+        let p = pe_units::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
         compile(&p)?;
         note_left(&pe, m.base, &p, &m.path, "", &mut report)?;
         // Where code ran without a unit although the image had one (a resume
@@ -442,8 +442,8 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         interior.extend(web_entries.iter().copied().filter(|&a| a >= m.base && a < end));
         web_inputs.push((m.path.clone(), m.base, bytes.clone(), interior.clone()));
         if !interior.is_empty() {
-            let failed = nt_cgen::prepare_regions(&pe, m.base, &p, &interior, jobs)?;
-            if let Some(r) = nt_cgen::region_module(&p) {
+            let failed = pe_units::prepare_regions(&pe, m.base, &p, &interior, jobs)?;
+            if let Some(r) = pe_units::region_module(&p) {
                 compile(&r)?;
                 report.regions.push((m.path.clone(), interior.len() - failed.len()));
             }
@@ -451,7 +451,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
                 report.uncovered.push((m.path.clone(), failed.len(), failed.iter().take(8).copied().collect()));
             }
         }
-        for name in nt_cgen::prepare_providers(&pe)? {
+        for name in pe_units::prepare_providers(&pe)? {
             if !report.providers.contains(&name) {
                 report.providers.push(name);
             }
@@ -514,9 +514,9 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
             parsed.push((m.path.clone(), m.base, gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?));
         }
-        let members: Vec<nt_cgen::GroupMember<'_>> = parsed.iter().map(|(path, base, pe)| nt_cgen::GroupMember { path, pe, base: *base }).collect();
+        let members: Vec<pe_units::GroupMember<'_>> = parsed.iter().map(|(path, base, pe)| pe_units::GroupMember { path, pe, base: *base }).collect();
         eprintln!("  building the link group {} ...", names.join(" + "));
-        let g = nt_cgen::prepare_group(&members, jobs).with_context(|| format!("building the link group {}", names.join(" + ")))?;
+        let g = pe_units::prepare_group(&members, jobs).with_context(|| format!("building the link group {}", names.join(" + ")))?;
         compile(&g.module)?;
         index.push_str(&format!("{} {}\n", g.key, g.member_keys.join(" ")));
         report.groups.push((names.join(" + "), g.iat_hints, std::fs::metadata(&g.module)?.len()));
@@ -555,7 +555,7 @@ fn web_entries(dir: &Path) -> Vec<u64> {
 /// Functions a unit was built without (gex-cgen left them to tier-1):
 /// uncovered in a project that runs with no translation.
 fn note_left(pe: &gex_ld::pe::PeImage, base: u64, unit: &Path, path: &str, what: &str, report: &mut PeReport) -> Result<()> {
-    let left = nt_cgen::left_out(pe, base, unit)?;
+    let left = pe_units::left_out(pe, base, unit)?;
     if !left.is_empty() {
         report.left.push((format!("{path}{what}"), left));
     }
@@ -641,10 +641,10 @@ fn build_web(
             let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
             tramp_key = gex_cgen::image::image_key(&image);
             reuse(&web.join(&tramp_key), &sources)?;
-            let t = nt_cgen::prepare_trampolines(class32, jobs)?;
+            let t = pe_units::prepare_trampolines(class32, jobs)?;
             // The browser leaves the guest's code for a system call and
             // resumes after it, inside the trampolines.
-            let failed = nt_cgen::prepare_trampoline_regions(class32, &t, jobs)?;
+            let failed = pe_units::prepare_trampoline_regions(class32, &t, jobs)?;
             if !failed.is_empty() {
                 bail!("the trampoline page's resume points {failed:x?} have no region entry");
             }
@@ -656,7 +656,7 @@ fn build_web(
             let mut interior = interior.clone();
             interior.extend(web_entries.iter().copied().filter(|a| a >= base && *a < end));
             let interior = &interior;
-            let key_dir = nt_cgen::unit_dir(&pe, *base)?;
+            let key_dir = pe_units::unit_dir(&pe, *base)?;
             if let Ok((image, _)) = gex_xlate::func::pe_input(&pe, *base) {
                 identities.push(format!(
                     "{base:x}:{}:{}:{path}",
@@ -672,15 +672,15 @@ fn build_web(
                 eprintln!("  building the web unit for {path} at {base:#x} ...");
                 "built"
             };
-            let p = nt_cgen::prepare_pe(&pe, *base, jobs, true).with_context(|| format!("building the web unit for {path}"))?;
+            let p = pe_units::prepare_pe(&pe, *base, jobs, true).with_context(|| format!("building the web unit for {path}"))?;
             note_left(&pe, *base, &p, path, " (web)", report)?;
             if !interior.is_empty() {
-                let failed = nt_cgen::prepare_regions(&pe, *base, &p, interior, jobs)?;
-                if nt_cgen::region_module(&p).is_some() {
+                let failed = pe_units::prepare_regions(&pe, *base, &p, interior, jobs)?;
+                if pe_units::region_module(&p).is_some() {
                     report.web_regions += interior.len() - failed.len();
                 }
             }
-            nt_cgen::prepare_providers(&pe)?;
+            pe_units::prepare_providers(&pe)?;
             report.web_units.push((path.clone(), how));
         }
         Ok(())
@@ -781,7 +781,7 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
     std::env::set_var("GEX_NT_CGEN_BUILD", "0");
     gex_native::libprov::set(lib_providers(dir, &config));
     let jit = flags.jit_fallback || config.jit_fallback;
-    nt_cgen::set_mode(if jit { nt_cgen::Mode::Default } else { nt_cgen::Mode::Aot });
+    pe_units::set_mode(if jit { pe_units::Mode::Default } else { pe_units::Mode::Aot });
     let args: Vec<String> = match (&flags.args, &config.args) {
         (Some(a), _) => a.clone(),
         (None, Some(a)) => a.clone(),

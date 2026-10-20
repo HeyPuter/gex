@@ -3,7 +3,7 @@
 # function-tier units for both (GEX_ELF_UNITS): each load must run its own
 # code, and a library mapped again must get its unit again -- a unit whose
 # code was unmapped is retired, not revived by the next object's mapping
-# (nt_cgen::on_retire, ftab::on_retire; the browser's cgen::on_retire).
+# (pe_units::on_retire, ftab::on_retire; the browser's cgen::on_retire).
 # The interpreter has a unit too: gex's loader places it, and the kernel
 # announces it as the guest's own mmap would have (CodeMap::of_placed).
 #

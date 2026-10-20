@@ -13,8 +13,7 @@ use super::{st, Abi, Call, Status, R};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// ntdll's own unixlib handle.
-pub const NTDLL_HANDLE: u64 = 1;
+pub use crate::win::NTDLL_HANDLE;
 
 /// DLLs whose PE side copes with having no Unix side: they get
 /// `STATUS_DLL_NOT_FOUND`.
