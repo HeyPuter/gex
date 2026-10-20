@@ -600,13 +600,16 @@ void glPixelStorei(unsigned p, int v) {
     CMD2(GEXGL_PIXEL_STOREI, p, v);
 }
 
+static void persistent_publish(int all);
+
 void glFinish(void) {
+    persistent_publish(0);
     CMD0(GEXGL_FINISH);
     flush();
     (void)reply_u32();
 }
 
-void glFlush(void) { flush(); }
+void glFlush(void) { persistent_publish(0); flush(); }
 
 void glGenBuffers(int n, unsigned *out) {
     /* A negative count has to reach the host so GL can answer
@@ -699,8 +702,13 @@ struct buffer_object_state {
        reading the buffer back, and its unmap uploads only what changed. */
     uint8_t *mirror;
     int mapped_once;
+    /* A persistent write mapping (GL_MAP_PERSISTENT_BIT): the map's bytes as
+       the host last had them -- sent, or as the map started -- so
+       persistent_publish can find what the application wrote since. */
+    uint8_t *sent;
     struct buffer_object_state *next;
 };
+static size_t persistent_live;
 static struct buffer_target_state buffer_targets[16];
 static struct buffer_object_state *buffer_objects;
 static size_t mirrors_live;
@@ -760,6 +768,7 @@ static void forget_buffer_object(unsigned name) {
             *link = object->next;
             mirror_drop(object);
             free(object->map);
+            if (object->sent) { free(object->sent); persistent_live--; }
             free(object);
             return;
         }
@@ -883,7 +892,70 @@ void *glMapBufferRange(unsigned target, long offset, long length,
         memcpy(object->map, object->mirror + offset, object->map_length);
     else if (object->map && keep && object->map_length)
         glGetBufferSubData(target, offset, length, object->map);
+    /* What the host holds of a persistent write mapping is, as far as the
+       application can tell, what the map now shows: read back above, or
+       bytes it has said it will overwrite. Only what it changes from here is
+       sent (persistent_publish). */
+    if (object->map && (access & 0x40u) && (access & 2u) &&
+        (object->sent = malloc(object->map_length ? object->map_length : 1))) {
+        memcpy(object->sent, object->map, object->map_length);
+        persistent_live++;
+    }
     return object->map;
+}
+
+/* ARB_buffer_storage: send what the application has written into its
+   persistent mappings since the host last had it.
+
+   The mapping is a copy in this process's memory (the host's cannot be
+   exposed to it), a persistent one is never unmapped, and a coherent one is
+   never flushed either: writes to it simply become visible to later GL
+   commands. wined3d allocates the buffers of a Direct3D device out of 64 MiB
+   chunks mapped exactly so, and for one that is not D3DUSAGE_DYNAMIC it never
+   names a range -- so nothing it wrote there reached the host: Solitaire
+   drew its felt (a dynamic buffer, explicitly flushed) and no cards.
+
+   Each mapping is compared against `sent` in 4 KiB blocks and the changed
+   runs are uploaded, by name through GL_COPY_WRITE_BUFFER (no draw reads that
+   binding). Only blocks the application changed go, so a GPU write elsewhere
+   in the buffer is not sent back over. Called where GL makes such writes
+   visible -- glFlush, glFinish, glFenceSync, a swap, and glMemoryBarrier
+   (with GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT, `all`: non-coherent mappings
+   too) -- and not at every draw, which a 64 MiB comparison per draw cannot
+   afford: a coherent write is seen from the next of those points on. */
+static void persistent_send(struct buffer_object_state *o, size_t start, size_t end) {
+    glBindBuffer(0x8F37u, o->name);
+    glBufferSubData(0x8F37u, (long)(o->map_offset + start), (long)(end - start), (const uint8_t *)o->map + start);
+    memcpy(o->sent + start, (const uint8_t *)o->map + start, end - start);
+}
+
+static void persistent_publish(int all) {
+    if (!persistent_live) return;
+    const size_t block = 4096, most = 4u << 20;
+    unsigned was = bound_buffer(0x8F37u); /* GL_COPY_WRITE_BUFFER */
+    int bound = 0;
+    for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
+        if (!o->sent || !o->map || (!all && !(o->map_access & 0x80u))) continue;
+        const uint8_t *now = o->map;
+        size_t n = o->map_length, start = SIZE_MAX;
+        for (size_t at = 0; at < n; at += block) {
+            size_t len = n - at < block ? n - at : block;
+            int changed = memcmp(now + at, o->sent + at, len) != 0;
+            if (changed && start == SIZE_MAX) start = at;
+            if (start != SIZE_MAX && (!changed || at + len - start >= most)) {
+                persistent_send(o, start, changed ? at + len : at);
+                bound = 1;
+                start = SIZE_MAX;
+            }
+        }
+        if (start != SIZE_MAX) { persistent_send(o, start, n); bound = 1; }
+    }
+    if (bound) glBindBuffer(0x8F37u, was);
+}
+
+/* glMemoryBarrier's (gl44-generated.inc, via tools/gl_buffer_writers.py). */
+static void persistent_barrier(unsigned barriers) {
+    persistent_publish((barriers & 0x00004000u) != 0); /* CLIENT_MAPPED_BUFFER_BARRIER_BIT */
 }
 
 void *glMapBuffer(unsigned target, unsigned access) {
@@ -927,6 +999,7 @@ unsigned char glUnmapBuffer(unsigned target) {
         else
             glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
     }
+    if (object->sent) { free(object->sent); object->sent = NULL; persistent_live--; }
     free(object->map);
     object->map = NULL;
     object->map_offset = object->map_length = 0;
@@ -940,6 +1013,7 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
         (size_t)length > object->map_length - (size_t)offset) return;
     glBufferSubData(target, (long)(object->map_offset + (size_t)offset), length,
                     (uint8_t *)object->map + offset);
+    if (object->sent) memcpy(object->sent + offset, (uint8_t *)object->map + offset, (size_t)length);
 }
 
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
@@ -2685,6 +2759,7 @@ void *glFenceSync(unsigned condition, unsigned flags) {
         gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
         return NULL;
     }
+    persistent_publish(0);
     uintptr_t serial = atomic_fetch_add_explicit(&sync_next, 1, memory_order_relaxed);
     size_t start = serial % SYNC_SLOTS;
     uintptr_t generation = serial / SYNC_SLOTS + 1;
@@ -3884,6 +3959,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     gexgl_wl_follow_size(s);
     gexgl_x11_follow_size(s);
     gexgl_wl_commit(s);
+    persistent_publish(0);
     CMD0(GEXGL_PRESENT);
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */

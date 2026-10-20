@@ -33,6 +33,10 @@ def mark_buffer_writer(name: str, function: str) -> str:
         call = "if (bound_buffer(0x88EBu)) " + call  # GL_PIXEL_PACK_BUFFER
     elif name.startswith("glGetQueryObject"):
         call = "if (bound_buffer(0x9192u)) " + call  # GL_QUERY_BUFFER
+    # A barrier also publishes the application's writes to persistent
+    # mappings (persistent_barrier, guest/gl/gexgl.c).
+    if name == "glMemoryBarrier":
+        call += " persistent_barrier(barriers);"
     at = function.index("{\n") + 2
     return function[:at] + "    " + call + "\n" + function[at:]
 

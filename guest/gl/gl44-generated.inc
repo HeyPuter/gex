@@ -1644,7 +1644,7 @@ void glLogicOp(unsigned opcode) {
     packet[at++] = (uint32_t)(opcode);
 }
 void glMemoryBarrier(unsigned barriers) {
-    buffer_contents_unknown();
+    buffer_contents_unknown(); persistent_barrier(barriers);
     uint32_t *packet = begin(1296, 1, 0);
     if (!packet) return;
     size_t at = 0;
