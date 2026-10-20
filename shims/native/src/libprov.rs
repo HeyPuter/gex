@@ -579,7 +579,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             crate::wasmdll::apply_pending(&shared, &memory);
         } else {
             // An i386 image: its function-tier unit, if one was built.
-            crate::nt_cgen::w3_image(&mut caller, &path, base, pe)?;
+            crate::pe_units::w3_image(&mut caller, &path, base, pe)?;
         }
         Ok(())
     })()) })?;

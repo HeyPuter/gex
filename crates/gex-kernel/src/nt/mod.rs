@@ -494,28 +494,11 @@ pub struct State {
 /// Where per-thread wait words live (docs/nt-layer.md §1.2).
 pub const WAIT_WORDS: u64 = 0x003e_0000;
 pub const WAIT_WORDS_END: u64 = 0x003f_0000;
-/// The page of real code gex writes at boot.
-pub const TRAMPOLINES: u64 = 0x003f_0000;
-pub const TRAMPOLINES_END: u64 = 0x0040_0000;
+pub use crate::win::{TRAMPOLINES, TRAMPOLINES_END};
 /// `KUSER_SHARED_DATA`.
 pub const USD: u64 = 0x7ffe_0000;
 
-/// gex-private syscall numbers, issued only by gex's own trampolines.
-pub mod gex_nr {
-    /// `__wine_unix_call_dispatcher(handle, code, args)`.
-    pub const UNIX_CALL: u32 = 0x7f00_0001;
-    /// The x86-64 `__wine_syscall_dispatcher` was called, which Wine's
-    /// x86-64 stubs never do while `USD.SystemCall` is 0.
-    pub const BAD_DISPATCH: u32 = 0x7f00_0002;
-    /// From native Wine (gexrt, docs/wine-native.md §3.15): guest code
-    /// entered native code from above the innermost native entry's stack,
-    /// i.e. it left those native frames earlier (a catch block continuing
-    /// in an outer frame) and has been running nested inside them since.
-    /// The host abandons the innermost call-out (its native caller then
-    /// drops its frames), and the guest re-enters from the context's PC,
-    /// one level flatter. Handled by the hosts, never by the NT layer.
-    pub const NATIVE_LEFT: u32 = 0x7f00_0003;
-}
+pub use crate::win::nr as gex_nr;
 
 impl Process {
     /// A gex setting (`GEX_NT_INPUT` and the like): the host's environment,

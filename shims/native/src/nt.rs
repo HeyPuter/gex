@@ -83,7 +83,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
-    super::nt_cgen::enable(opts.record.is_some())?;
+    super::pe_units::enable(opts.record.is_some())?;
     let mut setup = setup.clone();
     if setup.display_out.is_none() {
         setup.display_out = opts.wayland_out.clone();
@@ -368,7 +368,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                                 format!("{} {n}", nt::syscall_name(nr))
                             }).collect();
                         eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
-                        if let Some(l) = super::nt_cgen::no_unit_line() {
+                        if let Some(l) = super::pe_units::no_unit_line() {
                             eprintln!("{l}");
                         }
                         if gl_stats {
@@ -566,7 +566,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     }
     super::await_retires();
     // An image just mapped that has a hot set gets its function-tier unit.
-    super::nt_cgen::drain_in_caller(caller)?;
+    super::pe_units::drain_in_caller(caller)?;
     let state = caller.data_mut();
     let resume_pc = || read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     match outcome {
@@ -694,7 +694,7 @@ fn nest_exceptions(mem: &[u8], next_pc: u64) -> bool {
 /// `GEX_NT_EXC_NEST=0`.
 fn nest_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) && super::nt_cgen::mode() != super::nt_cgen::Mode::Off
+    *ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) && super::pe_units::mode() != super::pe_units::Mode::Off
 }
 
 /// Has control left the innermost nested exception dispatch on this thread

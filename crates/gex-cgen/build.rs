@@ -1,5 +1,5 @@
 //! Two hashes of the sources a function-tier unit depends on (gex_native::
-//! nt_cgen keys its caches on them; docs/function-tier.md §11):
+//! pe_units keys its caches on them; docs/function-tier.md §11):
 //!
 //! * `GEX_CGEN_RECOVERY_INPUTS`: what decides an image's recovery (its GIR
 //!   and summaries) -- the IR, the lifters and decoders, gex-xlate's recovery
@@ -64,7 +64,7 @@ fn main() {
     // key hashes at run time.
     // provider.rs is not: what export providers change in a unit (the
     // addresses that become stubs, and the providers' sources) is in the
-    // unit key itself (`gex_native::nt_cgen::unit_key`), and the provider
+    // unit key itself (`gex_native::pe_units::unit_key`), and the provider
     // list must be able to grow without rebuilding every unit.
     let mut unit: Vec<PathBuf> =
         src("gex-cgen").into_iter().filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("provider.rs")).collect();

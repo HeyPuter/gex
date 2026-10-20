@@ -903,7 +903,7 @@ pub extern "C" fn gex_libprov_start() {
 
 // ---------------------------------------------------------------------------
 // Function-tier units for Linux shared objects in the page (P5 B4; the native
-// host's `nt_cgen::on_elf_maps`): an object named in `?elfunits=` gets the
+// host's `pe_units::on_elf_maps`): an object named in `?elfunits=` gets the
 // unit built natively for it at the bias it maps at (`gexc cgen-image --elf
 // SO --base HEX --mem64`), found in the unit cache by the same key.
 // ---------------------------------------------------------------------------

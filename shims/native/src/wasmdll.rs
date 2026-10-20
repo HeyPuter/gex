@@ -188,11 +188,11 @@ fn bind_entry_thunks(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_m
 /// are the i386 trampolines, which guest code and native code (through the
 /// ICALL check, whose floor they sit at) both call.
 fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
-    use gex_kernel::nt::boot::tramp;
+    use gex_kernel::win::tramp;
     [
         ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
         ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
-        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
+        ("__wine_unixlib_handle", gex_kernel::win::NTDLL_HANDLE.to_le_bytes().to_vec()),
     ]
 }
 

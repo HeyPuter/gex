@@ -7343,7 +7343,7 @@ pub struct CodeMap {
     /// The file it came from, for the trace.
     pub path: String,
     /// The file offset mapped at `start` (where a shared object's load bias
-    /// is worked out from: the host's ELF units, nt_cgen::on_elf_maps).
+    /// is worked out from: the host's ELF units, pe_units::on_elf_maps).
     pub offset: u64,
 }
 

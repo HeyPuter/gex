@@ -298,7 +298,7 @@ struct RunArgs {
     /// A Windows program's staged Wine prefix. See `nt_run`.
     wine_prefix: Option<String>,
     /// `--no-cgen`: a Windows program runs on tier-1 only, prebuilt units or
-    /// not (`gex_native::nt_cgen::Mode`).
+    /// not (`gex_native::pe_units::Mode`).
     no_cgen: bool,
     /// `--mem64` / `--mem32`: the guest memory, overriding the learned
     /// record (docs/mem64.md §5). `None`: the record decides.
@@ -680,15 +680,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     if gex_ld::pe::is_pe(&bytes) {
         // A Windows program: Wine's PE DLLs on gex's NT layer.
         // The function tier for the images the NT layer maps
-        // (gex_native::nt_cgen, docs/function-tier.md §11): prebuilt units
+        // (gex_native::pe_units, docs/function-tier.md §11): prebuilt units
         // are used where they exist, and an image without one runs on tier-1
         // while its unit is built for the next run; --cgen requires every
         // program image to have one; --no-cgen is tier-1 only.
-        use gex_native::nt_cgen::Mode;
+        use gex_native::pe_units::Mode;
         if ra.xlate.no_blocks {
             gex_kernel::ftab::set_translator(Box::new(FjitTranslator(gex_xlate::fjit::Jit::new(Default::default()))));
         }
-        gex_native::nt_cgen::set_mode(if ra.no_cgen || ra.xlate.no_blocks {
+        gex_native::pe_units::set_mode(if ra.no_cgen || ra.xlate.no_blocks {
             Mode::Off
         } else if ra.xlate.cgen {
             Mode::Require
@@ -2354,18 +2354,18 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut wasm_total = 0u64;
-    let _lock = gex_native::nt_cgen::build_lock()?;
+    let _lock = gex_native::pe_units::build_lock()?;
     for (path, base) in &todo {
         let bytes = std::fs::read(path)?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
         // A native wasm32 Wine DLL (tools/wine-wasm/stage-native.sh): laid
         // out like the rest, but it has no x86 code to build a unit of.
-        if gex_native::nt_cgen::is_wasm_skeleton(&pe) {
+        if gex_native::pe_units::is_wasm_skeleton(&pe) {
             eprintln!("cgen-prefix: {path}: native wasm32 skeleton; no unit");
             continue;
         }
         let t0 = std::time::Instant::now();
-        let out = gex_native::nt_cgen::prepare_pe(&pe, *base, jobs, false)
+        let out = gex_native::pe_units::prepare_pe(&pe, *base, jobs, false)
             .with_context(|| format!("building the function tier for {path} at {base:#x}"))?;
         let n = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         wasm_total += n;
@@ -2408,7 +2408,7 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             // Print where the image's indirect-call profile goes
-            // (`nt_cgen::icall_hints`) instead.
+            // (`pe_units::icall_hints`) instead.
             "--icall-path" => icall_path = true,
             // A recovery directory to use rather than this build's key's.
             "--recovery" => {
@@ -2425,17 +2425,17 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
     let base = pe_base.unwrap_or(pe.preferred_base);
     let (image, _) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     if icall_path {
-        println!("{}", gex_native::nt_cgen::icall_path(&image)?.display());
+        println!("{}", gex_native::pe_units::icall_path(&image)?.display());
         return Ok(());
     }
     let at = at.context("--at is required")?;
     let dir = match rec {
         Some(d) => d,
-        None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
+        None => gex_native::pe_units::cache_root()?.join("recovery").join(gex_native::pe_units::recovery_key(&image)),
     };
     let read = |a: u64| image.segments.iter().find_map(|s| s.byte(a));
     // The image's indirect-call profile, as its unit build uses it.
-    let hints = gex_native::nt_cgen::icall_hints(&image);
+    let hints = gex_native::pe_units::icall_hints(&image);
     print!("{}", gex_cgen::image::function_c(&dir, at, &read, &hints)?);
     Ok(())
 }
@@ -2514,7 +2514,7 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             // `--elf SO --base HEX`: a Linux shared object's unit at the load
-            // bias it is mapped with (nt_cgen::on_elf_maps, GEX_ELF_UNITS).
+            // bias it is mapped with (pe_units::on_elf_maps, GEX_ELF_UNITS).
             "--elf" => elf = true,
             "--pe-base" | "--base" => {
                 i += 1;
@@ -2555,18 +2555,18 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if let Some(w) = path.strip_prefix("--nt-trampolines") {
-        let _lock = gex_native::nt_cgen::build_lock()?;
+        let _lock = gex_native::pe_units::build_lock()?;
         let t0 = std::time::Instant::now();
-        let out = gex_native::nt_cgen::prepare_trampolines(w == "32", jobs)?;
+        let out = gex_native::pe_units::prepare_trampolines(w == "32", jobs)?;
         eprintln!("the NT trampolines ({w}-bit): {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
         return Ok(());
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     if elf {
         let base = pe_base.context("--elf needs --base")?;
-        let _lock = gex_native::nt_cgen::build_lock()?;
+        let _lock = gex_native::pe_units::build_lock()?;
         let t0 = std::time::Instant::now();
-        let out = gex_native::nt_cgen::prepare_elf(&bytes, base, jobs, true)?;
+        let out = gex_native::pe_units::prepare_elf(&bytes, base, jobs, true)?;
         eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
         return Ok(());
     }
@@ -2575,9 +2575,9 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     // One build at a time per cache, across processes: a recovery's peak is
     // the machine's, and runs queue builds for the next run in the
     // background.
-    let _lock = gex_native::nt_cgen::build_lock()?;
+    let _lock = gex_native::pe_units::build_lock()?;
     let t0 = std::time::Instant::now();
-    let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
+    let out = gex_native::pe_units::prepare_pe(&pe, base, jobs, true)?;
     if gex_abi::kuser_fold() {
         // Zero for a unit the cache already held (nothing was lifted).
         eprintln!("{path}: KUSER_SHARED_DATA accesses folded: {}", gex_ir::kuser_folds_total());
@@ -2588,7 +2588,7 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     // while the guest waits (wined3d's unit: minutes).
     if std::env::var("GEX_CGEN_PRECOMPILE").as_deref() == Ok("1") {
         let t1 = std::time::Instant::now();
-        gex_native::nt_cgen::precompile_unit(&out)?;
+        gex_native::pe_units::precompile_unit(&out)?;
         eprintln!("{path} at {base:#x}: compiled in {:.1}s", t1.elapsed().as_secs_f64());
     }
     Ok(())

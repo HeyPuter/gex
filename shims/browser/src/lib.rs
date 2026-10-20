@@ -51,6 +51,7 @@ mod sigs;
 mod vfork;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
+mod winspace;
 
 use std::sync::{Arc, Mutex};
 
@@ -2765,7 +2766,7 @@ fn arena_take(len: u64) -> Option<u64> {
     let end = at.checked_add(len)?;
     // No line from here: this is the allocator's refill path (see below).
     HEAP_REACH.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
-    if end > nt::arena_ceiling() || !grow_memory_to(end) {
+    if end > winspace::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
         // printed. This is the only place that knows the arena ran out -- and
@@ -2922,7 +2923,7 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // memory to 2 GiB, the guard's limit, as the split did -- the 64 KiB
     // above it (Windows' no-access region) a fault there, not a trap past
     // the end of the memory.
-    let grow_to = if nt::w3_compact() && end > 0x7f00_0000 { end.max(0x8000_0000) } else { end };
+    let grow_to = if winspace::w3_compact() && end > 0x7f00_0000 { end.max(0x8000_0000) } else { end };
     w3_note_reach(grow_to, "a fixed mapping", start, end);
     if !grow_memory_to(grow_to) {
         return None;
@@ -2936,7 +2937,7 @@ fn arena_back(start: u64, end: u64) -> Option<u64> {
     // One inside an island already (the executables' slot, an inherited
     // region) is the guest's as it stands.
     let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
-    if nt::w3_compact()
+    if winspace::w3_compact()
         && (memmap::within_island(start, end)
             || cur != 0 && start >= cur && memmap::claim_island(start, end, &ARENA_NEXT, "guest fixed mapping above the arena"))
     {
@@ -2964,7 +2965,7 @@ fn w3_note_reach(to: u64, why: &str, start: u64, end: u64) {
     // is checked here too, at the next mapping.
     static KUSER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let reach = to.max(HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed));
-    if nt::w3_compact()
+    if winspace::w3_compact()
         && gex_abi::kuser_fold()
         && reach > gex_abi::KUSER_WINDOWS
         && !KUSER_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2976,7 +2977,7 @@ fn w3_note_reach(to: u64, why: &str, start: u64, end: u64) {
             reach,
         ));
     }
-    if !nt::w3_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
+    if !winspace::w3_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let step = (to + (256 << 20) - 1) & !((256u64 << 20) - 1);
@@ -4528,13 +4529,13 @@ pub extern "C" fn gex_worker_slots_reset() {
 /// thread-locals.
 #[no_mangle]
 pub extern "C" fn gex_note_inherited(end: u64) {
-    if end <= nt::arena_ceiling() {
+    if end <= winspace::arena_ceiling() {
         ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// [`gex_note_inherited`] with the region's start. In W3's compact space
-/// (`nt::w3_compact`, set by `gex_adopt_windows_space` just before) an
+/// (`winspace::w3_compact`, set by `gex_adopt_windows_space` just before) an
 /// inherited region in the arena is an island the child's cursor steps
 /// over, not a floor: the parent's fixed mappings reach 2 GiB
 /// (KUSER_SHARED_DATA), so a floor above them left the child's heap no room,
@@ -4543,7 +4544,7 @@ pub extern "C" fn gex_note_inherited(end: u64) {
 #[no_mangle]
 pub extern "C" fn gex_note_inherited_range(start: u64, end: u64) {
     w3_note_reach(end, "an inherited region", start, end);
-    if nt::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= nt::arena_ceiling() {
+    if winspace::w3_compact() && end > gex_abi::ARENA_BOTTOM && end <= winspace::arena_ceiling() {
         let start = start.max(gex_abi::ARENA_BOTTOM);
         if ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire) == 0
             && memmap::claim_island(start, end, &ARENA_NEXT, "inherited guest mapping")
@@ -7649,7 +7650,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         if hook != 0 {
             let gm = GuestMem::new(guest_bytes());
             let eax = gm.read_u64(ctx as u32 as u64 + ctx::x(0) as u64).unwrap_or(0) as u32;
-            if eax == gex_kernel::nt::gex_nr::UNIX_CALL {
+            if eax == gex_kernel::win::nr::UNIX_CALL {
                 // SAFETY: a host import taking scalars; no lock is held.
                 unsafe { cgen::ftab_call_vi(hook as i32, ctx) };
                 return;
@@ -9356,11 +9357,11 @@ pub(crate) fn w64_reserve_pe_data(mem: &mut gex_kernel::mem::MemoryMap) {
 /// KUSER_SHARED_DATA unless asked for there, and the i386 code kept off
 /// whatever is above 2 GiB. With the NT layer's split (`lo` its line), what
 /// the host left below 2 GiB is the process's own arena; with W3's compact
-/// space (`nt::w3_windows_space`) the arena grows on demand, shared with
+/// space (`winspace::w3_windows_space`) the arena grows on demand, shared with
 /// the shim's heap, as for any process.
 pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     mem.set_mmap_top(0x7ffe_0000);
-    if !nt::w3_compact() {
+    if !winspace::w3_compact() {
         // Up to the split's top, which is all the split grew: the wasm32
         // slice's end. A wasm64 shim's slice runs to 16 GiB, and taking all
         // of it as arena let W64's mappings above 4 GiB in a 64-bit memory
@@ -9377,7 +9378,7 @@ pub(crate) fn w3_address_space(mem: &mut gex_kernel::mem::MemoryMap, lo: u64) {
     // arena, a bottom-up anonymous mmap (Wine's 64 MiB heaps) took their
     // holes and the next pinned DLL found its base taken and relocated
     // (steam_api64, uxtheme, actxprxy: every one a unit miss).
-    let (lo, hi) = nt::W3_ISLAND;
+    let (lo, hi) = winspace::W3_ISLAND;
     mem.keep_fixed_only(lo, hi);
 }
 
@@ -9395,7 +9396,7 @@ pub extern "C" fn gex_kuser_address() -> u32 {
 /// hands its child to split at the same line.
 #[no_mangle]
 pub extern "C" fn gex_windows_space() -> u32 {
-    nt::windows_space() as u32
+    winspace::windows_space() as u32
 }
 
 /// A fresh W3 process (the host saw the program's i386 flag before loading
@@ -9404,9 +9405,9 @@ pub extern "C" fn gex_windows_space() -> u32 {
 /// space starts, or 0 on failure.
 #[no_mangle]
 pub extern "C" fn gex_split_windows_space() -> u32 {
-    // W3's compact space (see `nt::w3_windows_space`), or the split when the
+    // W3's compact space (see `winspace::w3_windows_space`), or the split when the
     // site asked (`gex_set_w3_split`); the name is the JS side's.
-    match nt::w3_space() {
+    match winspace::w3_space() {
         Ok(lo) => lo as u32,
         Err(e) => {
             warn_line(&format!("gex: W3: {e}\n"));
@@ -9416,17 +9417,17 @@ pub extern "C" fn gex_split_windows_space() -> u32 {
 }
 
 /// `?w3split=1`: this process's W3 address space is the NT layer's split, not
-/// the compact space (`nt::w3_space`). Set before the space is taken.
+/// the compact space (`winspace::w3_space`). Set before the space is taken.
 #[no_mangle]
 pub extern "C" fn gex_set_w3_split(on: u32) {
-    nt::set_w3_split(on != 0);
+    winspace::set_w3_split(on != 0);
 }
 
 /// A forked child of a W3 process: the split, first thing after
 /// instantiation, before the heap takes a span. Zero, or -1 on failure.
 #[no_mangle]
 pub extern "C" fn gex_adopt_windows_space(lo: u32) -> i32 {
-    match nt::adopt_windows_space(lo as u64) {
+    match winspace::adopt_windows_space(lo as u64) {
         Ok(()) => 0,
         Err(e) => {
             warn_line(&format!("gex: W3 child: {e}\n"));
@@ -10069,8 +10070,8 @@ fn child_host(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64, brk: i64) -> 
     kernel.creds.set_uid(unsafe { IDENTITY.0 });
     kernel.creds.set_gid(unsafe { IDENTITY.1 });
     kernel.mem.lock().grows_on_demand(arena_grow, arena_back);
-    if nt::windows_space() != 0 {
-        w3_address_space(&mut kernel.mem.lock(), nt::windows_space());
+    if winspace::windows_space() != 0 {
+        w3_address_space(&mut kernel.mem.lock(), winspace::windows_space());
     }
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
@@ -10387,7 +10388,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // inherited regions, and above its cursor is what it will take next --
     // not dead, whatever was inherited above it (KUSER_SHARED_DATA at 2 GiB).
     // Below the cursor everything is claimed, so `guest_only` sorts it.
-    if nt::w3_compact() {
+    if winspace::w3_compact() {
         inherited = inherited.min(ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire));
     }
     if inherited > gex_abi::ARENA_BOTTOM {

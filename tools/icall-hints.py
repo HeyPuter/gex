@@ -16,7 +16,7 @@ PROFILE is either
 Addresses are written for IMAGE at --base, where gex places it (noita.exe:
 0x400000). Targets in other images, and a gex site's uncounted rest, are
 written as target 0, so they still count against the dominant target. The
-output is the lines gex reads (shims/native/src/nt_cgen.rs `icall_hints`,
+output is the lines gex reads (shims/native/src/pe_units.rs `icall_hints`,
 which applies pewasm's 90%-of-64 rule); it goes where
 `gexc cgen-c IMAGE --pe-base BASE --icall-path` says, under the unit cache
 that builds the image, and the unit key includes it.

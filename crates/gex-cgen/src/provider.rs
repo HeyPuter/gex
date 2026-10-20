@@ -239,7 +239,7 @@ pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
 pub const TRAMPOLINES_DLL: &str = "[nt-trampolines]";
 
 /// The NT trampoline page's entries providers may bind, by name, as offsets
-/// from the page (gex_kernel::nt::boot::tramp): the i386 unix-call
+/// from the page (gex_kernel::win::tramp): the i386 unix-call
 /// dispatcher. `unix_call_32` is the page offset of `tramp::UNIX_CALL_32`.
 pub fn trampoline_exports(unix_call_32: u32) -> HashMap<String, u32> {
     HashMap::from([("unix_call_32".to_string(), unix_call_32)])

@@ -381,7 +381,7 @@ pub fn note_nt_entry(pc: u64) {
     let Some(rec) = recorder() else {
         return;
     };
-    if !crate::nt_cgen::unit_covers(pc) {
+    if !crate::pe_units::unit_covers(pc) {
         return;
     }
     let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());

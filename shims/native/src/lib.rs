@@ -22,7 +22,7 @@ pub mod aot_share;
 pub mod gl;
 pub mod profile;
 pub mod nt;
-pub mod nt_cgen;
+pub mod pe_units;
 pub mod wasmprog;
 pub(crate) mod dylink;
 pub mod wasmdll;
@@ -495,6 +495,9 @@ struct JitShared {
     /// space has had (`libprov::relocate_once`). With the process: a fork
     /// shares it (its memory is a copy, relocated), an exec starts empty.
     relocated: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// The trampoline page's unit is published (`pe_units`): once per
+    /// address space, with its first Windows image.
+    trampolines: bool,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -1240,6 +1243,7 @@ fn run_program_with(
                 wasm_program: false,
                 wine_pe: None,
                 relocated: Default::default(),
+                trampolines: false,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1266,7 +1270,7 @@ fn run_program_with(
     let entry = match nt_setup {
         Some(setup) => {
             let pc = nt::boot(&mut store, memory.clone(), setup)?;
-            nt_cgen::drain_in_store(&mut store)?;
+            pe_units::drain_in_store(&mut store)?;
             pc
         }
         None => {
@@ -1318,8 +1322,8 @@ fn run_program_with(
             // The NT layer's trampoline page, which native Wine's gexrt
             // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
             // wrappers): the same bytes at the same address.
-            use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
-            let page = gex_kernel::nt::boot::trampoline_page();
+            use gex_kernel::win::{TRAMPOLINES, TRAMPOLINES_END};
+            let page = gex_kernel::win::trampoline_page();
             if let Some(dst) = memory.bytes().get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
                 dst.copy_from_slice(&page);
             }
@@ -3727,7 +3731,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if pc as u64 & nt::NATIVE_SYSCALL == 0 {
                 if let Some(memory) = caller.data().memory.clone() {
                     let ctx_addr = caller.data().thread.ctx_addr;
-                    if read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32 == gex_kernel::nt::gex_nr::UNIX_CALL
+                    if read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32 == gex_kernel::win::nr::UNIX_CALL
                         && guest_unix_call(&mut caller)?
                     {
                         return Ok(());
@@ -3741,7 +3745,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if let Some(memory) = caller.data().memory.clone() {
                     let ctx_addr = caller.data().thread.ctx_addr;
                     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
-                    if nr == gex_kernel::nt::gex_nr::NATIVE_LEFT {
+                    if nr == gex_kernel::win::nr::NATIVE_LEFT {
                         let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
                         let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize) & 0xffff_ffff;
                         if innermost_native_unwound(&caller, sp) {
@@ -3977,7 +3981,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // mem*): bound before the dynamic linker relocates them.
             elfprov::on_elf_maps(&mut caller, &mapped)?;
             // Function-tier units for listed shared objects (GEX_ELF_UNITS).
-            nt_cgen::on_elf_maps(&mut caller, &mapped)?;
+            pe_units::on_elf_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
@@ -4784,7 +4788,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // entry about to run sees the guest left and leaves itself
                 // (gex_nr::NATIVE_LEFT).
                 let at_function = || {
-                    co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD
+                    co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD
                         && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
                 };
                 // A call-out that never returns (ret 0: Wine's W3 thread loop,
@@ -4906,8 +4910,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     }
 
     // W3: an image Wine relocated gets its function-tier unit at its first
-    // miss (`nt_cgen::w3_image`).
-    nt_cgen::w3_miss(caller, pc)?;
+    // miss (`pe_units::w3_image`).
+    pe_units::w3_miss(caller, pc)?;
     // A function the table holds, or the run-time translator can make,
     // serves this address: tier-1 reaches it through the bridge.
     if ftab::serve(caller, pc)? {
@@ -5474,7 +5478,7 @@ pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) 
         .data()
         .callouts
         .last()
-        .is_some_and(|co| co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
+        .is_some_and(|co| co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
 }
 
 /// The same for a guest call from native Wine (its return address is
@@ -5916,7 +5920,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
-    let unwound = if ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    let unwound = if ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
     // A return address on a page with no directory entry of its own would
     // be watched in the miss slots, which every untranslated page shares:
     // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
@@ -6121,8 +6125,8 @@ fn gone_code(k: &gex_kernel::Kernel, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         while a < end {
             let vma = k.mem.lock().vma_at(a).map(|v| v.prot);
             // A PE image's page made non-executable for a while keeps its
-            // unit (`nt_cgen::in_pe_image`).
-            let dormant = vma.is_some_and(|p| p != 0) && nt_cgen::in_pe_image(a);
+            // unit (`pe_units::in_pe_image`).
+            let dormant = vma.is_some_and(|p| p != 0) && pe_units::in_pe_image(a);
             if !vma.is_some_and(|p| p & prot::EXEC != 0) && !dormant {
                 match out.last_mut() {
                     Some(last) if last.1 == a => last.1 = a + page,
@@ -6153,7 +6157,7 @@ fn recheck_units(caller: &mut impl wasmtime::AsContextMut<Data = HostState>) {
         return;
     }
     if let Some(memory) = caller.as_context().data().memory.clone() {
-        nt_cgen::on_retire(&memory, &recheck, &[]);
+        pe_units::on_retire(&memory, &recheck, &[]);
     }
 }
 
@@ -6199,12 +6203,12 @@ fn retire_translations(
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
 
     // Pages no longer mapped executable: a unit there is dead whatever its
-    // bytes still are (`nt_cgen::on_retire`).
+    // bytes still are (`pe_units::on_retire`).
     let gone = caller.as_context_mut().data_mut().with_kernel(|k| gone_code(k, ranges));
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
-    nt_cgen::on_retire(&memory, ranges, &gone);
-    nt_cgen::provided_rewrites(&memory, ranges);
+    pe_units::on_retire(&memory, ranges, &gone);
+    pe_units::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
     for &(start, end) in ranges {
