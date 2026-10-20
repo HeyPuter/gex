@@ -702,10 +702,13 @@ struct buffer_object_state {
        reading the buffer back, and its unmap uploads only what changed. */
     uint8_t *mirror;
     int mapped_once;
-    /* A persistent write mapping (GL_MAP_PERSISTENT_BIT): the map's bytes as
-       the host last had them -- sent, or as the map started -- so
-       persistent_publish can find what the application wrote since. */
-    uint8_t *sent;
+    /* A persistent write mapping (GL_MAP_PERSISTENT_BIT): a 64-bit hash of
+       each 4 KiB block of the map as the host last had it -- sent, or as the
+       map started -- so persistent_publish can find what the application
+       wrote since. A hash, not a copy: wined3d maps 64 MiB chunks, and a copy
+       of each would double their footprint in a 32-bit process; this is
+       128 KiB a chunk. */
+    uint64_t *sent;
     struct buffer_object_state *next;
 };
 static size_t persistent_live;
@@ -858,6 +861,27 @@ static int buffer_read(unsigned target, long offset, long size, void *data);
 /* Mapped host memory cannot be exposed to an emulated guest address space.
    Return a guest shadow allocation and upload its written bytes at unmap.
    This is the same coherency boundary a remote/virtual GL driver uses. */
+/* persistent_publish's blocks and their hash: 64 bits a 4 KiB block, eight
+   bytes at a time (a multiply-xorshift mix, one multiply a word; the tail of
+   a short last block byte by byte). A collision would leave a change unsent:
+   at 2^-64 a compare, it is not the risk worth a copy's memory. */
+#define PERSIST_BLOCK 4096u
+static size_t persistent_blocks(size_t n) { return (n + PERSIST_BLOCK - 1) / PERSIST_BLOCK + !n; }
+static uint64_t persistent_block_hash(const struct buffer_object_state *o, size_t b) {
+    const uint8_t *p = (const uint8_t *)o->map + b * PERSIST_BLOCK;
+    size_t n = o->map_length - b * PERSIST_BLOCK;
+    if (n > PERSIST_BLOCK) n = PERSIST_BLOCK;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, w;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h ^ (h >> 29);
+}
+
 void *glMapBufferRange(unsigned target, long offset, long length,
                        unsigned access) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
@@ -897,8 +921,9 @@ void *glMapBufferRange(unsigned target, long offset, long length,
        bytes it has said it will overwrite. Only what it changes from here is
        sent (persistent_publish). */
     if (object->map && (access & 0x40u) && (access & 2u) &&
-        (object->sent = malloc(object->map_length ? object->map_length : 1))) {
-        memcpy(object->sent, object->map, object->map_length);
+        (object->sent = malloc(persistent_blocks(object->map_length) * sizeof(uint64_t)))) {
+        for (size_t b = 0; b < persistent_blocks(object->map_length); b++)
+            object->sent[b] = persistent_block_hash(object, b);
         persistent_live++;
     }
     return object->map;
@@ -915,7 +940,7 @@ void *glMapBufferRange(unsigned target, long offset, long length,
    names a range -- so nothing it wrote there reached the host: Solitaire
    drew its felt (a dynamic buffer, explicitly flushed) and no cards.
 
-   Each mapping is compared against `sent` in 4 KiB blocks and the changed
+   Each mapping's 4 KiB blocks are hashed and compared against `sent` and the changed
    runs are uploaded, by name through GL_COPY_WRITE_BUFFER (no draw reads that
    binding). Only blocks the application changed go, so a GPU write elsewhere
    in the buffer is not sent back over. Called where GL makes such writes
@@ -926,21 +951,21 @@ void *glMapBufferRange(unsigned target, long offset, long length,
 static void persistent_send(struct buffer_object_state *o, size_t start, size_t end) {
     glBindBuffer(0x8F37u, o->name);
     glBufferSubData(0x8F37u, (long)(o->map_offset + start), (long)(end - start), (const uint8_t *)o->map + start);
-    memcpy(o->sent + start, (const uint8_t *)o->map + start, end - start);
 }
 
 static void persistent_publish(int all) {
     if (!persistent_live) return;
-    const size_t block = 4096, most = 4u << 20;
+    const size_t block = PERSIST_BLOCK, most = 4u << 20;
     unsigned was = bound_buffer(0x8F37u); /* GL_COPY_WRITE_BUFFER */
     int bound = 0;
     for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
         if (!o->sent || !o->map || (!all && !(o->map_access & 0x80u))) continue;
-        const uint8_t *now = o->map;
         size_t n = o->map_length, start = SIZE_MAX;
         for (size_t at = 0; at < n; at += block) {
             size_t len = n - at < block ? n - at : block;
-            int changed = memcmp(now + at, o->sent + at, len) != 0;
+            uint64_t h = persistent_block_hash(o, at / block);
+            int changed = h != o->sent[at / block];
+            o->sent[at / block] = h;
             if (changed && start == SIZE_MAX) start = at;
             if (start != SIZE_MAX && (!changed || at + len - start >= most)) {
                 persistent_send(o, start, changed ? at + len : at);
@@ -1013,7 +1038,13 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
         (size_t)length > object->map_length - (size_t)offset) return;
     glBufferSubData(target, (long)(object->map_offset + (size_t)offset), length,
                     (uint8_t *)object->map + offset);
-    if (object->sent) memcpy(object->sent + offset, (uint8_t *)object->map + offset, (size_t)length);
+    /* The blocks the flush covers whole are now what the host has. One it
+       covers in part may hold other writes still to publish: left alone, it
+       is sent (again) at the next publish point. */
+    if (object->sent)
+        for (size_t b = ((size_t)offset + PERSIST_BLOCK - 1) / PERSIST_BLOCK;
+             (b + 1) * PERSIST_BLOCK <= (size_t)offset + (size_t)length; b++)
+            object->sent[b] = persistent_block_hash(object, b);
 }
 
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
