@@ -1525,6 +1525,8 @@ export class Gex {
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
+        // A buffer's address is a full one (a BigInt: the guest's buffer, in
+        // place, can be above 4 GiB in a memory64 process); addrNum takes either.
         net_open: () => (this.#net ? this.#net.open() : 0),
         net_connect: (id, host, len, port) => {
           const name = utf8(
@@ -1535,16 +1537,16 @@ export class Gex {
         net_status: (id) => (this.#net ? this.#net.status(id) : 2),
         net_send: (id, ptr, len) =>
           this.#net
-            ? this.#net.send(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            ? this.#net.send(id, this.#bytes().subarray(addrNum(ptr), addrNum(ptr) + (len >>> 0)))
             : -1,
         net_recv: (id, ptr, len) =>
           this.#net
-            ? this.#net.recv(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            ? this.#net.recv(id, this.#bytes().subarray(addrNum(ptr), addrNum(ptr) + (len >>> 0)))
             : 0,
         // `recv(MSG_PEEK)`: -2 (an error) from a network without it.
         net_peek: (id, ptr, len) =>
           this.#net?.peek
-            ? this.#net.peek(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            ? this.#net.peek(id, this.#bytes().subarray(addrNum(ptr), addrNum(ptr) + (len >>> 0)))
             : this.#net ? -2 : 0,
         net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
         net_close: (id) => this.#net?.close(id),

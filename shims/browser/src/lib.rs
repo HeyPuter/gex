@@ -100,12 +100,16 @@ extern "C" {
     fn net_connect(id: i32, host: u32, host_len: u32, port: i32);
     /// 0 connecting, 1 open, 2 closed, 3 refused.
     fn net_status(id: i32) -> i32;
-    /// Bytes taken, or -1.
-    fn net_send(id: i32, ptr: u32, len: u32) -> i32;
+    /// Bytes taken, or -1. `ptr` is often the guest's own buffer (a
+    /// `write` on a socket reads it in place), so a full address: in a
+    /// memory64 process it can be above 4 GiB.
+    fn net_send(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
     /// Bytes delivered, 0 at end of stream, -1 when nothing has arrived yet.
-    fn net_recv(id: i32, ptr: u32, len: u32) -> i32;
+    /// Into the guest's buffer in place, as `net_send`: an address cut to
+    /// 32 bits had JS write the bytes over whatever lives at the low alias.
+    fn net_recv(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
     /// `net_recv`, leaving the bytes queued (`recv(MSG_PEEK)`).
-    fn net_peek(id: i32, ptr: u32, len: u32) -> i32;
+    fn net_peek(id: i32, ptr: gex_kernel::PAddr, len: u32) -> i32;
     /// Whether `net_recv` would answer without waiting.
     fn net_avail(id: i32) -> i32;
     fn net_close(id: i32);
@@ -178,7 +182,7 @@ impl net::Transport for WispStream {
         if id == 0 {
             return Err(Errno::ENOTCONN);
         }
-        match unsafe { net_send(id, data.as_ptr() as u32, data.len() as u32) } {
+        match unsafe { net_send(id, data.as_ptr() as gex_kernel::PAddr, data.len() as u32) } {
             n if n >= 0 => Ok(n as usize),
             _ => Err(Errno::EPIPE),
         }
@@ -189,7 +193,7 @@ impl net::Transport for WispStream {
         if id == 0 {
             return Ok(0);
         }
-        match unsafe { net_recv(id, buf.as_mut_ptr() as u32, buf.len() as u32) } {
+        match unsafe { net_recv(id, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) } {
             -1 => Err(Errno::EAGAIN),
             n if n >= 0 => Ok(n as usize),
             _ => Err(Errno::ECONNRESET),
@@ -205,7 +209,7 @@ impl net::Transport for WispStream {
         if id == 0 {
             return Ok(0);
         }
-        match unsafe { net_peek(id, buf.as_mut_ptr() as u32, buf.len() as u32) } {
+        match unsafe { net_peek(id, buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) } {
             -1 => Err(Errno::EAGAIN),
             n if n >= 0 => Ok(n as usize),
             _ => Err(Errno::EOPNOTSUPP),
@@ -7049,7 +7053,13 @@ fn wait_needs_page(r: &Run) -> bool {
         // A terminal: nobody but the page can type into it. Nor a socket
         // whose far end is the page.
         Waiting::Read(h) | Waiting::Write(h) => !is_peer(h) || is_remote(h),
-        Waiting::Accept(h) => is_remote(h),
+        // Also a blocking `recv`/`recvfrom`/`recvmsg`, which parks as this
+        // (`BlockOp::AcceptWait`). A socket with no wait queue (a Wisp one:
+        // its bytes arrive on this Worker's own event loop) has nothing that
+        // could notify a park in wasm, so it is the page's: parked here, a
+        // `recv` on a host TCP socket slept until its deadline, forever.
+        // One with a queue is ended by another Worker's notify, as before.
+        Waiting::Accept(h) => is_remote(h) || h.wait_queue() == 0,
         // Every timed wait and every `poll` parks as this, whatever it is
         // watching -- a Wisp socket whose bytes arrive on this thread, a
         // descriptor the page serves, or a pipe between two guests. So look
