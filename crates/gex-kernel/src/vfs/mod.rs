@@ -858,6 +858,13 @@ impl VfsView {
         self.cur.read(crate::sync::me() as usize, Arc::clone)
     }
 
+    /// Which namespace [`Self::get`] gives: it changes with each one
+    /// published. A caller that keeps what `get` gave, with the epoch read
+    /// before it, keeps the current namespace while this reads the same.
+    pub fn epoch(&self) -> u64 {
+        self.cur.epoch()
+    }
+
     /// How many times the mount table has changed, now.
     pub fn mounts(&self) -> u64 {
         self.mounts.load(std::sync::atomic::Ordering::Acquire)

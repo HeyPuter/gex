@@ -16,6 +16,7 @@ use gex_kernel::mem::MapView;
 use gex_kernel::syscalls::{self, ClockFn, FdIo, Free, FreeCall, FreeOutcome, FutexCx, MapIo, PathIo};
 use gex_kernel::{GuestMem, Kernel};
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
@@ -94,6 +95,16 @@ thread_local! {
     /// `k_signal_seq` (or the table's own sequence) as this Worker last
     /// collected at.
     static SEQ_SEEN: Cell<u32> = const { Cell::new(0) };
+    /// [`view`] as last built, and the `Home` it was built from: this
+    /// Worker's own, so a call takes no count on the signal state that
+    /// every Worker of the process shares. Forgotten when the thread or the
+    /// process changes (`bind`, `bind_free`, `publish_here`).
+    static VIEW: RefCell<Option<(*const Home, Rc<Signals>)>> = const { RefCell::new(None) };
+    /// The namespace this Worker's calls last read (`Home::vfs`), from which
+    /// view and at which epoch ([`namespace`]): kept while the view's epoch
+    /// stays, so a call takes no count on it. Forgotten with the process
+    /// (`publish_here`).
+    static NS: RefCell<Option<(*const gex_kernel::vfs::VfsView, u64, Rc<Arc<gex_kernel::vfs::Namespace>>)>> = const { RefCell::new(None) };
 }
 
 /// Publish `k`'s process as this memory's (`set_host`).
@@ -264,8 +275,11 @@ pub(crate) fn publish_here(k: Option<(&Kernel, &Arc<crate::Threads>, &Arc<gex_ke
         // it, never across a call to here.
         drop(unsafe { Box::from_raw(old) });
     }
-    // The next collection is the new process's.
+    // The next collection is the new process's, and so are the view and
+    // the namespace (the old `Home` is gone, and its address may come back).
     SEQ_SEEN.with(|c| c.set(0));
+    VIEW.with(|v| v.borrow_mut().take());
+    NS.with(|n| n.borrow_mut().take());
 }
 
 pub(crate) fn home() -> Option<&'static Home> {
@@ -286,6 +300,7 @@ pub(crate) fn bind(k: &mut Kernel, tid: i32) {
             return;
         }
         *m = Some((tid, k.thread_sig(tid)));
+        VIEW.with(|v| v.borrow_mut().take());
     });
 }
 
@@ -301,6 +316,7 @@ pub(crate) fn bind_free(home: &Home, tid: i32) {
         }
         let own = home.threads.get_or_insert_with(tid, || Arc::new(ThreadSig::new_thread(0)));
         *m = Some((tid, own));
+        VIEW.with(|v| v.borrow_mut().take());
     });
 }
 
@@ -373,8 +389,29 @@ pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, a
 }
 
 /// This Worker's thread's signal state as one `Signals`.
-fn view(home: &Home) -> Option<Signals> {
-    MINE.with(|m| m.borrow().as_ref().map(|(_, t)| Signals::view(Arc::clone(&home.sig), Arc::clone(t))))
+fn view(home: &Home) -> Option<Rc<Signals>> {
+    let at = home as *const Home;
+    if let Some(v) = VIEW.with(|v| v.borrow().as_ref().filter(|(h, _)| *h == at).map(|(_, s)| Rc::clone(s))) {
+        return Some(v);
+    }
+    let v = Rc::new(MINE.with(|m| m.borrow().as_ref().map(|(_, t)| Signals::view(Arc::clone(&home.sig), Arc::clone(t))))?);
+    VIEW.with(|c| *c.borrow_mut() = Some((at, Rc::clone(&v))));
+    Some(v)
+}
+
+/// The process's namespace as published (`Home::vfs`), as this Worker last
+/// read it while that is still the current one (`NS`).
+fn namespace(home: &Home) -> Rc<Arc<gex_kernel::vfs::Namespace>> {
+    let at = Arc::as_ptr(&home.vfs);
+    let epoch = home.vfs.epoch();
+    if let Some(ns) = NS.with(|n| n.borrow().as_ref().filter(|(v, e, _)| *v == at && *e == epoch).map(|(_, _, ns)| Rc::clone(ns))) {
+        return ns;
+    }
+    // The epoch read before the namespace: one published between them is
+    // read again next time.
+    let ns = Rc::new(home.vfs.get());
+    NS.with(|n| *n.borrow_mut() = Some((at, epoch, Rc::clone(&ns))));
+    ns
 }
 
 fn dispatch(view: &Signals, gm: &mut GuestMem<'_>, ctx_addr: u64) -> Delivery {
@@ -434,7 +471,7 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
     // build, which keeps no view.
     #[cfg(not(feature = "shared-memory"))]
     let by_kernel = |addr: u64, len: u64| home.mm.lock().vma_at(addr).is_some_and(|v| addr + len <= v.end);
-    let ns = home.vfs.get();
+    let ns = namespace(home);
     let futex = FutexCx {
         table: &home.futexes,
         #[cfg(feature = "shared-memory")]
@@ -448,8 +485,12 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         tid: crate::my_tid() as u32,
         clock: home.clock,
     };
-    // This thread's fs_struct: its own, or the process's.
-    let fs = home.thread_fs.of(ctx_addr).unwrap_or_else(|| Arc::clone(&home.proc_fs));
+    // This thread's fs_struct: its own, or the process's (borrowed: no
+    // count taken on what every thread shares).
+    let fs = match home.thread_fs.of(ctx_addr) {
+        Some(own) => std::borrow::Cow::Owned(own),
+        None => std::borrow::Cow::Borrowed(&home.proc_fs),
+    };
     let map = || MapIo { mem: &home.mm, fds, pins: &home.pins, place: home.place.as_ref(), pc };
     let f = Free {
         io: FdIo { fds, compat, ns: &ns, pid: home.pid, file_locks: &home.file_locks, pipes: home.pipes, shared: Some(home.mm.shared_maps()) },
