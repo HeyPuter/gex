@@ -24,7 +24,7 @@ const BLOCKS = 32;
 /** Surfaces one process can have on screen. */
 export const SLOTS = 64;
 /** Words in one surface record. Must match `REC` in `shims/browser/src/wl.rs`. */
-export const REC = 37;
+export const REC = 38;
 /** Words in one input event. Must match `EV` in `shims/browser/src/wl.rs`. */
 export const EV = 8;
 /** Events a process's input ring holds before the oldest is dropped. */
@@ -77,6 +77,10 @@ export const R_INPUT_X = 33;
 export const R_INPUT_Y = 34;
 export const R_INPUT_W = 35;
 export const R_INPUT_H = 36;
+/** `R_ADDR`'s high half: a memory64 process's pool may sit above 4 GiB. */
+export const R_ADDR_HI = 37;
+/** A record's pixel address, both halves, as a Number (exact below 2^53). */
+export const recordAddr = (a, r) => (a[r + R_ADDR] >>> 0) + (a[r + R_ADDR_HI] >>> 0) * 0x100000000;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
 
@@ -240,7 +244,7 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         relY: a[r + R_REL_Y],
         width: a[r + R_WIDTH],
         height: a[r + R_HEIGHT],
-        addr: a[r + R_ADDR] >>> 0,
+        addr: recordAddr(a, r),
         stride: a[r + R_STRIDE],
         format: a[r + R_FORMAT],
         serial: a[r + R_SERIAL] >>> 0,
