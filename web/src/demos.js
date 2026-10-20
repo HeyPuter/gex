@@ -558,7 +558,7 @@ const gears = {
     ctx.onLeave(() => wrap.remove());
 
     // st/mesa and the gex_wgpu Gallium driver below the decoder: the only
-    // browser GL backend (there is no WebGL path).
+    // browser GL backend.
     //
     // The single-thread build (docs/single-thread.md) has no device on the
     // page: the canvas becomes the compositor's output, and the non-pthread

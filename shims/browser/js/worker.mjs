@@ -798,7 +798,7 @@ async function handle(msg) {
     // A headless compositor for node: the shim's gex-wayland runs and binds
     // `wayland-0`, so a guest connects and inits exactly as in the browser, but
     // there is no canvas and no input. What the browser's compositor worker
-    // does in WebGL, this does in software -- painter's algorithm over the
+    // does on WebGPU, this does in software -- painter's algorithm over the
     // published scene -- which is enough to prove a client rendered.
     //
     // GEX_WL_DUMP=<path>: composite the scene to a PPM so a render can be

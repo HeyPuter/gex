@@ -14,7 +14,7 @@ a trace replays against whatever the guest actually asked for; there is no
 
 | trace | what it covers |
 | --- | --- |
-| `gles-gears-frames.gexgltr` | 210 batches of `gles-gears` recorded in a real browser through the page's WebGL 2 device. The cross-backend workload: `tests/mesa-wgpu-replay.sh` runs it through softpipe and through Mesa + `gex_wgpu` on WebGPU and compares per-channel means. |
+| `gles-gears-frames.gexgltr` | 210 batches of `gles-gears` recorded in a real browser through the page's GL device. The cross-backend workload: `tests/mesa-wgpu-replay.sh` runs it through softpipe and through Mesa + `gex_wgpu` on WebGPU and compares per-channel means. |
 | `gles-program-setup.gexgltr` | The first three batches of that capture: context creation, shader create/source/compile, program link, and the shader queries. Guards the defect where the backend created a desktop core profile, which cannot compile the `precision`-qualified GLES source a guest emits. |
 
 A reduced trace from `tests/gl-reduce.mjs` is usually *not* a good fixture here:

@@ -4065,9 +4065,8 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     struct gexgl_egl_surface *s = egl_surface_of(surface);
     if (s) egl_surface_use(s);
     else s = egl_surface;
-    /* Preserve the swap boundary in the wire stream. WebGL displays its
-       default framebuffer automatically, while explicit APIs such as WebGPU
-       must acquire and submit a surface image here. */
+    /* Preserve the swap boundary in the wire stream: the host's WebGPU
+       surface acquires and submits a surface image here. */
     // What a real EGL does here as well as presenting: notice a resize, and
     // commit -- the commit is what carries the frame callback this client is
     // waiting for.

@@ -78,7 +78,7 @@ export function makeGlChannel() {
 }
 
 /**
- * The page's half: run the WebGL device when a Worker asks. Call the returned
+ * The page's half: run the GL device when a Worker asks. Call the returned
  * function with each `{kind:'gl'}` message; the ring is already in shared
  * memory by the time it arrives.
  */

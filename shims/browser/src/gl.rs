@@ -13,13 +13,13 @@ use std::sync::Arc;
 #[link(wasm_import_module = "gex_env")]
 extern "C" {
     /// Run the batch whose header is at `ring` (an address in this module's
-    /// memory). Returns zero, or negative when the page has no WebGL. The reply
+    /// memory). Returns zero, or negative when the page has no GL device. The reply
     /// is written back into the buffer, not through the return value.
     ///
     /// The address is an `f64` (exact below 2^53): in a 64-bit memory the
     /// guest's ring is commonly above 4 GiB (the high arena takes a
-    /// non-executable mapping), and a `u32` sent the page to the wrong bytes
-    /// -- Hades' GL in its M64 process got status 0 and no version string.
+    /// non-executable mapping), where a `u32` would send the page to the
+    /// wrong bytes.
     fn gl_submit(ring: f64) -> i32;
     /// `gl_submit` without waiting for the batch to run: the page copies the
     /// ring and returns; the next submit waits for this one first. Returns
@@ -28,12 +28,12 @@ extern "C" {
     fn gl_submit_async(ring: f64) -> i32;
 }
 
-/// Set when the page said it has a canvas with WebGL on it. Off by default, so
+/// Set when the page said it has a GL device (Mesa on WebGPU). Off by default, so
 /// a page without one has its guest see no graphics device (a clean `open`
 /// failure) rather than one whose draw calls silently disappear.
 static mut HAVE_GL: bool = false;
 
-/// Say that the page has WebGL behind the import above.
+/// Say that the page has a GL device behind the import above.
 ///
 /// # Safety
 /// Called from JS before the guest runs, on the one thread a page has.
