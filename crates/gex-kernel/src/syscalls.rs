@@ -1851,7 +1851,11 @@ impl FdIo<'_> {
         if control != 0 && controllen >= self.cmsg_hdr() {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
-                sock.stage_send(files);
+                if !self.fds.get(fd)?.writable {
+                    return Err(Errno::EBADF);
+                }
+                // The bytes and their descriptors in one step (`send_with`).
+                return sock.send_with(&data, files);
             } else if let Ok(sock) = self.remote_unix_of(fd) {
                 // The far end is in another memory, where an `OpenFile` means
                 // nothing: each descriptor goes as a description the host
@@ -1962,6 +1966,10 @@ impl FdIo<'_> {
                 return self.recvmsg_remote(m, &sock, msg, iov, iovlen, control, controllen, room, peek);
             }
         }
+        // The read and the sender address it set, as one (`recv_turn`).
+        // Only when it asks who sent it.
+        let inet = if unix_sock.is_none() && self.msg_rd(m, msg, 0)? != 0 { self.socket_of(fd).ok() } else { None };
+        let _turn = inet.as_ref().map(|s| s.recv_turn());
         // One read for the whole vector, then scattered over it, as the
         // remote path does. Reading each iovec in turn lost data: a first
         // iovec filled exactly, with nothing left behind it, made the second
@@ -1982,12 +1990,18 @@ impl FdIo<'_> {
                 want += len;
             }
         }
+        let mut received = Vec::new();
         let total = if want == 0 {
             0
         } else {
             let mut tmp = vec![0u8; want];
             let n = match &unix_sock {
-                Some(sock) => sock.recv(&mut tmp, room, peek)?,
+                // The bytes and their descriptors in one step (`recv_with`).
+                Some(sock) => {
+                    let (n, fds) = sock.recv_with(&mut tmp, room, peek)?;
+                    received = fds;
+                    n
+                }
                 None if peek => match self.socket_of(fd) {
                     Ok(sock) => sock.peek(&mut tmp)?,
                     Err(_) => self.fds.get(fd)?.read(&mut tmp)?,
@@ -2018,7 +2032,6 @@ impl FdIo<'_> {
                 self.write_sockaddr(m, ip, port, name, namelen_at)?;
             }
         }
-        let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
         // msg_flags (int): nothing truncated
@@ -4531,6 +4544,9 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
 fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> SysResult {
     let len = (len as usize).min(1 << 22);
     let mut tmp = vec![0u8; len];
+    // The read and the sender address it set, as one (`recv_turn`).
+    let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };
+    let _turn = inet.as_ref().map(|s| s.recv_turn());
     let n = match io.socket_of(fd) {
         Ok(sock) if flags & Kernel::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
         _ => io.fds.get(fd)?.read(&mut tmp)?,

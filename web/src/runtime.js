@@ -128,7 +128,7 @@ let kernelBytes = null;
  */
 function xcacheName() {
   if (!flag('xcache') || flag('xcache') === '0' || !shimBytes || !kernelBytes) return undefined;
-  const switches = ['arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
+  const switches = ['tso', 'coherentloads', 'arch', 'mem64', 'fjit', 'fjitlibs', 'dense', 'dual', 'cgen', 'providers', 'elfunits', 'provskip', 'pins', 'sp', 'inlinedispatch', 't1fold', 'liftmax', 'unitcache']
     .map((n) => `${n}=${flag(n) ?? ''}`)
     .join('&')
     // Named only when on: the cache of a page without it keeps its name.
@@ -158,6 +158,21 @@ export { fetchBytes };
 /** Where the runtime's three modules are (an ejected site packs them). */
 export function runtimeUrls() {
   return { shimBytes: SHIM_URL(), seedBytes: SEED_URL(), kernelBytes: KERNEL_URL() };
+}
+
+/**
+ * `?tso=1`: x86 ordering on a weakly ordered host (an arm64 machine). Guest
+ * loads and stores are emitted as atomic wasm accesses where aligned
+ * (`?coherentloads=1`, the same thing by its older name), which V8 on arm64
+ * makes `ldar`/`stlr`; plain ones there reorder, and x86 code relies on them
+ * not doing so. Translated code only: tier 1 and the function JIT. Function-
+ * tier units and closures, compiled ahead with plain accesses, are not used
+ * (the shim refuses units too). Off by default, and never wanted on x86,
+ * where an atomic store is an `xchg`.
+ */
+function tso() {
+  const v = flag('tso') ?? flag('coherentloads');
+  return !!v && v !== '0';
 }
 
 /**
@@ -696,6 +711,11 @@ async function runProgramHere(
     glSource = null,
   },
 ) {
+  // A closure's code was translated ahead with plain accesses (`tso`).
+  if (tso() && closure) {
+    console.warn('[gex] tso: the closure is translated with plain accesses; translating instead');
+    closure = null;
+  }
   const { shimBytes, seedBytes } = await loadRuntime();
   const kernel = await loadKernel();
   const makeGuestWorker = await guestWorkerFactory();
@@ -1031,7 +1051,7 @@ async function runProgramHere(
       // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
       // own code translated instead.
       // Absolute: a Worker started from a blob URL has no base to resolve a path against.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD) }
+      cgen: globalThis.GEX_CGEN && !tso() ? { mode: globalThis.GEX_CGEN, url: absUrl(globalThis.GEX_CGEN_URL ?? '/gex-cgen'), zstd: globalThis.GEX_CGEN_ZSTD && absUrl(globalThis.GEX_CGEN_ZSTD) }
         : flag('providers') === '0' ? undefined
         : { mode: 8, url: assetUrl('/gex/cgen') },
       // `?aot=1`: an ejected project's run, with no run-time translation (a
@@ -1127,7 +1147,7 @@ async function runProgramHere(
       // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
       // where aligned, so V8 cannot move them across the guest's fences. In
       // `extra` for every Worker.
-      coherentLoads: flag('coherentloads') ? 1 : undefined,
+      coherentLoads: tso() ? 1 : undefined,
       // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
       // "produced no frame") to debug why a client's window is not shown.
       wlTrace: flag('wltrace') ? 1 : undefined,

@@ -3775,11 +3775,9 @@ pub extern "C" fn k_sock_write_fds(
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
-    s.stage_send(files);
-    let r = s.send(&buf);
-    // A send that wrote nothing attached nothing; what is still staged goes
-    // back (and its references with it) rather than riding a later send.
-    s.stage_send(Vec::new());
+    // One step (`send_with`): staged, another sender could take them. A send
+    // that wrote nothing attached nothing, and their references go back.
+    let r = s.send_with(&buf, files);
     match r {
         Ok(n) => n as i32,
         Err(e) => -e.0,
@@ -3802,15 +3800,16 @@ pub extern "C" fn k_sock_read_fds(
 ) -> i32 {
     let Some(s) = sock_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
-    let n = match s.recv(&mut buf, max_fds as usize, peek != 0) {
-        Ok(n) => n as usize,
+    // One step (`recv_with`), so a second reader cannot take these.
+    let (n, received) = match s.recv_with(&mut buf, max_fds as usize, peek != 0) {
+        Ok((n, fds)) => (n as usize, fds),
         Err(e) => return -e.0,
     };
     if n > 0 {
         unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
     }
     let mut text = String::new();
-    for f in s.take_received() {
+    for f in received {
         let Some((serial, desc)) = f.path.split_once(' ') else { continue };
         let Ok(serial) = serial.parse::<u64>() else { continue };
         if 4 + text.len() + desc.len() + 1 > out_cap as usize {

@@ -554,6 +554,11 @@ pub struct Socket {
     dgrams: Mutex<VecDeque<(Vec<u8>, (u32, u16))>>,
     /// Where the last datagram read came from, for `recvfrom`.
     last_from: Mutex<Option<(u32, u16)>>,
+    /// Held by a `recvfrom`/`recvmsg` from its read until it has read
+    /// `last_from` ([`Self::recv_turn`]): the address is set by the read and
+    /// asked for after it, so two threads receiving on one socket could each
+    /// report the other's sender.
+    recv_turn: Mutex<()>,
     /// This socket, for registering itself (a UDP port's table entry).
     me: Mutex<std::sync::Weak<Socket>>,
     nonblocking: AtomicBool,
@@ -594,6 +599,7 @@ impl Socket {
             peer: Mutex::new(None),
             dgrams: Mutex::new(VecDeque::new()),
             last_from: Mutex::new(None),
+            recv_turn: Mutex::new(()),
             me: Mutex::new(std::sync::Weak::new()),
             nonblocking: AtomicBool::new(false),
             ports,
@@ -610,6 +616,12 @@ impl Socket {
     /// Remember the `Arc` this socket lives in (made right after `new`).
     pub fn set_self(self: &Arc<Self>) {
         *self.me.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// One receiver at a time, from its read to its `last_from`: a guard
+    /// the syscall layer holds across both.
+    pub fn recv_turn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.recv_turn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Where the last datagram read came from.

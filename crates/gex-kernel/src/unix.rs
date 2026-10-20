@@ -372,12 +372,16 @@ impl UnixSocket {
         }
     }
 
-    /// Descriptors to attach to the next write.
+    /// Descriptors to attach to the next write. For a socket with one owner
+    /// (the compositor's end of a Wayland connection): between this and the
+    /// `send`, anyone else writing the socket takes them. The guest's
+    /// `sendmsg` uses [`Self::send_with`], one step.
     pub fn stage_send(&self, fds: Vec<Arc<OpenFile>>) {
         *self.pending_send.lock().unwrap() = fds;
     }
 
-    /// Descriptors the last read collected.
+    /// Descriptors the last read collected. One owner only, as
+    /// [`Self::stage_send`]; the guest's `recvmsg` uses [`Self::recv_with`].
     pub fn take_received(&self) -> Vec<Arc<OpenFile>> {
         std::mem::take(&mut *self.pending_recv.lock().unwrap())
     }
@@ -393,6 +397,34 @@ impl UnixSocket {
             self.pending_recv.lock().unwrap().extend(fds);
         }
         Ok(n)
+    }
+
+    /// Read, and hand back the descriptors that came with the bytes, in one
+    /// step: two threads of a process reading one socket (every Wine thread
+    /// shares the process's server socket) each get their own message's
+    /// descriptors, which [`Self::recv`] then [`Self::take_received`] could
+    /// swap.
+    pub fn recv_with(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
+        let role = self.role.lock().unwrap();
+        let Role::Connected { rx, .. } = &*role else {
+            return Err(Errno::ENOTCONN);
+        };
+        rx.recv(buf, max_fds, peek)
+    }
+
+    /// Write `buf` with `fds` attached to its first byte, in one step: the
+    /// guest's `sendmsg`. Staging them first ([`Self::stage_send`]) let a
+    /// second thread's `sendmsg` on the same socket replace them or carry them
+    /// off with its own bytes in between -- Wine's threads all send their
+    /// reply and wait pipes on the one server socket, and the server then
+    /// found a thread's `init_thread` with no reply fd ("request 6 without a
+    /// reply fd: killed") or with another thread's.
+    pub fn send_with(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> SysResult {
+        let role = self.role.lock().unwrap();
+        let Role::Connected { tx, .. } = &*role else {
+            return Err(Errno::ENOTCONN);
+        };
+        tx.send(buf, fds)
     }
 
     pub fn send(&self, buf: &[u8]) -> SysResult {
@@ -697,6 +729,48 @@ mod tests {
         let mut rest = [0u8; 8];
         b.recv(&mut rest, 1, false).unwrap();
         assert!(b.take_received().is_empty());
+    }
+
+    #[test]
+    fn concurrent_senders_each_keep_their_own_descriptors() {
+        // Wine's shape: many threads, one socket, each sending a message
+        // naming itself with its own descriptor.
+        let (a, b) = UnixSocket::pair();
+        let a = Arc::new(a);
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let a = Arc::clone(&a);
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        let (x, _y) = UnixSocket::pair();
+                        let f = open_file(x);
+                        let tag = Arc::as_ptr(&f) as usize;
+                        let mut msg = vec![t];
+                        msg.extend_from_slice(&tag.to_le_bytes());
+                        assert_eq!(a.send_with(&msg, vec![f]).unwrap(), msg.len() as u64);
+                    }
+                })
+            })
+            .collect();
+        let per = 1 + std::mem::size_of::<usize>();
+        let mut got = 0;
+        while got < 8 * 500 {
+            let mut buf = vec![0u8; per];
+            match b.recv_with(&mut buf, 1, false) {
+                Ok((n, fds)) => {
+                    assert_eq!(n as usize, per, "a message split");
+                    assert_eq!(fds.len(), 1, "message {got} came with {} descriptors", fds.len());
+                    let tag = usize::from_le_bytes(buf[1..].try_into().unwrap());
+                    assert_eq!(Arc::as_ptr(&fds[0]) as usize, tag, "another sender's descriptor");
+                    got += 1;
+                }
+                Err(Errno::EAGAIN) => std::thread::yield_now(),
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 
     #[test]
