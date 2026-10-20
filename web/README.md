@@ -31,8 +31,7 @@ The page has two builds, each with its own dist:
 - **MP** (`web/dist`), the multi-process build, is the default. Every guest
   thread is its own Worker on a shared memory. It needs SharedArrayBuffer, so
   it needs COOP/COEP.
-- **SP** (`web/dist-sp`), the single-thread build
-  (`docs/single-thread.md`), runs on any static host. Every guest thread is
+- **SP** (`web/dist-sp`), the single-thread build, runs on any static host. Every guest thread is
   a JSPI fiber in one Worker.
 
 Both load the same shim, kernel and seed, which are built once and copied
@@ -53,8 +52,7 @@ Serve both at once:
 node web/serve-dist.mjs 8088 --sp-port 8089
 ```
 
-This serves MP on 8088 and SP on 8089. Directory layout, sizes and flags are
-in `docs/single-thread.md` §9.
+This serves MP on 8088 and SP on 8089.
 
 Tests:
 - the MP page smoke test: `node web/test/site.mjs`;
