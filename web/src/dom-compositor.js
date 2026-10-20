@@ -66,6 +66,7 @@ import {
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
 } from '@gex/wl-bridge.mjs';
+import { pageParams } from './page-env.js';
 
 /** `KeyboardEvent.code` -> Linux evdev keycode, which is what Wayland carries. */
 const EVDEV = {
@@ -368,6 +369,10 @@ export class DomDesktop {
       url: opts.url,
       source: opts.source,
       api: opts.api || 'core',
+      // `?mesaenv=K=V,K=V` and `?wgslcache=`, as compositor.js passes them to
+      // the GL worker: without them this path never saw Mesa's switches.
+      env: pageParams().get('mesaenv') ?? undefined,
+      wgslCache: pageParams().get('wgslcache') ?? undefined,
       // This canvas is composited by the page, so keep what was presented
       // into it: a client that draws slower than the page composites would
       // otherwise show black between its own frames.
