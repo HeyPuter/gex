@@ -3718,7 +3718,7 @@ export class Gex {
       if (mod && key) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(i, key, mod);
       }
       n++;
     }
@@ -3726,6 +3726,7 @@ export class Gex {
       console.error(`[catchup] installed ${n + reused} modules in ${Math.round(performance.now() - t0)}ms`
         + ` (${Math.round(this.#compileMs - comp0)}ms compile, ${reused} reused from siblings)`);
     }
+    if (globalThis.GEX_FILL_TIME) console.warn(`[gex] ${this.#whoFills()}: caught up, ${this.#fillCounts()}`);
   }
 
   /**
@@ -7268,7 +7269,7 @@ export class Gex {
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(count - 1, key, mod);
       }
     }
   }
@@ -7333,7 +7334,7 @@ export class Gex {
       if (mod && key) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(i, key, mod);
       }
     }
   }
@@ -7402,7 +7403,7 @@ export class Gex {
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(count - 1, key, mod);
       }
     }
   }
@@ -8091,7 +8092,7 @@ export class Gex {
       if (mod && key) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(i, key, mod);
       }
     }
     const ms = performance.now() - t0;
@@ -8099,8 +8100,8 @@ export class Gex {
     if (ms > this.#denseFillWorst) {
       this.#denseFillWorst = ms;
       if (globalThis.GEX_FILL_TIME && ms >= 1) {
-        console.warn(`[gex] ${this.#threadTid ? `tid ${this.#threadTid}` : 'main thread'}: dense module ${i} took ${ms.toFixed(2)} ms, the longest here ` +
-          `(${this.#denseCatchUps} of ${this.#denseLeft} left, ${this.#denseFillMs.toFixed(1)} ms in all)`);
+        console.warn(`[gex] ${this.#whoFills()}: dense module ${i} took ${ms.toFixed(2)} ms, the longest here; ` +
+          `${this.#fillCounts()}, ${this.#denseFillMs.toFixed(1)} ms filling`);
       }
     }
   }
@@ -8114,8 +8115,28 @@ export class Gex {
   #denseFillWorst = 0;
   /** The thread this Worker runs, when it was spawned for one (`adoptThread`). */
   #threadTid = 0;
+  #whoFills() {
+    return `pid ${this.#shim.exports.gex_my_pid?.() ?? '?'} ${this.#threadTid ? `tid ${this.#threadTid}` : 'main thread'}`;
+  }
+  /** What this Worker holds, for `?filltime=1`. */
+  #fillCounts() {
+    return `${this.#installs} modules installed (${this.#compiles} compiled here), ` +
+      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left, blocks ${this.#guest?.exports?.blocks?.length ?? 0}`;
+  }
   /** Dense registry modules this Worker's catch-up left to a miss. */
   #denseLeft = 0;
+
+  /** Registry module `i`, compiled here, to the host's relay for this
+   *  process's other Workers -- unless it is a dense module those Workers
+   *  instantiate on a miss (`#leaveDense`): relayed, every module would be
+   *  posted through the page's main thread to every Worker and kept there,
+   *  for Workers most of which never run it. A miss compiling the same bytes
+   *  again gets the engine's code for them while any Worker holds it. */
+  #shareRegistry(i, key, mod) {
+    const e = this.#shim.exports;
+    if (this.#dense && !globalThis.GEX_EAGER_BLOCKS && e.gex_registry_dense_n && (e.gex_registry_dense_n(i) >>> 0)) return;
+    this.#env.shareModule?.(key, mod);
+  }
 
   /** Whether catching up skips registry module `i`: a dense module, which
    *  the first dispatch that wants one of its blocks instantiates here
