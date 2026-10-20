@@ -148,8 +148,11 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i
     // A branch to memory that is not executable is the guest's own fault
     // (DEP: an access violation, ExceptionInformation[0] = 8), delivered as
     // the translator's miss path delivers it. Not a gap in the build.
-    if caller.data().nt.is_some() && !caller.data_mut().with_kernel(|k| k.mem.lock().check_access(target, 1, prot::EXEC)) {
-        return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
+    if !caller.data_mut().with_kernel(|k| k.mem.lock().check_access(target, 1, prot::EXEC)) {
+        if caller.data().nt.is_some() {
+            return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
+        }
+        return crate::branch_not_executable(caller, target);
     }
     Err(missing(caller, target, "a call or jump"))
 }
@@ -158,7 +161,7 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i
 pub(crate) fn missing(caller: &mut Caller<'_, HostState>, addr: u64, how: &str) -> anyhow::Error {
     let what = match caller.data().nt.as_ref() {
         Some(p) => p.describe_addr(addr),
-        None => format!("{addr:#x}"),
+        None => describe(caller, addr),
     };
     let exec = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::EXEC));
     let why = if !exec {
@@ -174,6 +177,36 @@ pub(crate) fn missing(caller: &mut Caller<'_, HostState>, addr: u64, how: &str) 
          \"seeds\" in user/eject.json, or run with --jit-fallback"
     );
     stop(caller, addr, &detail)
+}
+
+/// `addr` as `name+offset` in the mapping (file) it is in, from the
+/// kernel's map: the offset from the lowest of the adjacent mappings with
+/// that name, which for an image is its base.
+fn describe(caller: &mut Caller<'_, HostState>, addr: u64) -> String {
+    let named = caller.data_mut().with_kernel(|k| {
+        let mem = k.mem.lock();
+        let vmas = mem.vmas();
+        let i = vmas.iter().position(|v| v.start <= addr && addr < v.end)?;
+        let name = vmas[i].name.clone();
+        if name.is_empty() {
+            return None;
+        }
+        let mut base = vmas[i].start;
+        for v in vmas[..i].iter().rev() {
+            if v.end != base || v.name != name {
+                break;
+            }
+            base = v.start;
+        }
+        Some((name, base))
+    });
+    match named {
+        Some((name, base)) => {
+            let short = name.rsplit(['/', '\\']).next().unwrap_or(&name);
+            format!("{addr:#x} ({short}+{:#x})", addr - base)
+        }
+        None => format!("{addr:#x}"),
+    }
 }
 
 /// Stop the run with `detail`, from any thread (an ejected project's loud
