@@ -689,6 +689,11 @@ async function runProgramHere(
     // Units' keys and identities (`base:key:identity:path;...`), so a Worker
     // takes them instead of hashing each image it maps (cgen.rs `known`).
     identities = null,
+    // Stateful providers (`dll=file,...`, files under the unit cache: cgen.rs
+    // `set_stateful`), an ejected project's.
+    stateful = null,
+    // Provider sources from outside gex (`name\ntext`, NUL between).
+    providerSources = null,
     // KiB of mapped text per object to statically recompile once hot; 0 leaves
     // the guest to arrive one dispatch miss at a time. A parameter because the
     // page and `run-node.mjs` used to disagree, so a host-specific fault could
@@ -1125,6 +1130,12 @@ async function runProgramHere(
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
       // `?provskip=export,...`: exports no provider binds (gex-cgen `set_skip`).
       providerSkip: globalThis.GEX_PROVIDER_SKIP || undefined,
+      // Provider sources from outside gex (`name\ntext` entries, NUL
+      // between): an ejected project's, as GEX_PROVIDER_DIRS natively.
+      providerSources: providerSources || globalThis.GEX_PROVIDER_SOURCES || undefined,
+      // `dll=file,...`: stateful providers replacing Windows libraries, their
+      // modules under the unit cache (cgen.rs `set_stateful`).
+      stateful: stateful || globalThis.GEX_STATEFUL || undefined,
       // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
       fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,

@@ -763,6 +763,22 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         params.retain(|(k, _)| k != "identities");
         params.push(("identities".to_string(), s(&identities)));
     }
+    // user/eject.json "providers": stateful providers in place of those
+    // libraries, built from their sources into the units the page loads
+    // (cgen.rs `set_stateful`).
+    if !config.providers.is_empty() {
+        let gen = dir.join("build/gen");
+        write_file(&gen.join("provider.h"), crate::pe::PROVIDER_H.as_bytes(), false)?;
+        write_file(&gen.join("gex_abi.h"), gex_cgen::header::header().as_bytes(), false)?;
+        let mut spec = Vec::new();
+        for p in &config.providers {
+            let rel = format!("stateful/{}", p.library.to_ascii_lowercase().replace(".dll", ".wasm"));
+            crate::pe::build_stateful(dir, p, &web.join("units").join(&rel), &gen)?;
+            spec.push(format!("{}={rel}", p.library.to_ascii_lowercase()));
+        }
+        params.retain(|(k, _)| k != "stateful");
+        params.push(("stateful".to_string(), s(&spec.join(","))));
+    }
     if cold_units > 0 {
         params.push(("cold".to_string(), s("1")));
     }

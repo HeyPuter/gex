@@ -763,6 +763,8 @@ async function begin(opts, base, at, state, meter) {
     fill,
     lazyCache,
     identities: b.identities ?? null,
+    stateful: b.stateful ?? null,
+    providerSources: b.providerSources ?? null,
     transfer: buffers,
     // Once the kernel has its own copy of every file, nothing here may view
     // the bundle's buffer, or it stays resident beside that copy.
@@ -884,6 +886,9 @@ function launchBuild(m, at) {
     delete p.fill;
     const identities = p.identities ?? null;
     delete p.identities;
+    // Stateful providers (`dll=file,...` under the units).
+    const stateful = p.stateful ?? null;
+    delete p.stateful;
     // The bundle's file bytes in pieces (eject-site.mjs --pieces).
     const pieces = p.pieces ?? null;
     delete p.pieces;
@@ -908,6 +913,7 @@ function launchBuild(m, at) {
       lazy,
       fill,
       identities,
+      stateful,
       pieces,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),

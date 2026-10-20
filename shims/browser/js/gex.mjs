@@ -1179,6 +1179,10 @@ export class Gex {
   static elfUnits = '';
   /** `export,...` (the page's `?provskip=`): exports no provider binds (`GEX_PROVIDER_SKIP`). */
   static providerSkip = '';
+  /** Provider sources from outside gex, `name\ntext` entries separated by NUL (`GEX_PROVIDER_DIRS` natively). */
+  static providerSources = '';
+  /** `dll=file,...`: stateful providers replacing Windows libraries, files under the unit cache (`libprov` natively). */
+  static stateful = '';
   /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
   static fjitLibs = '';
   /** `base:key:identity:path;...` (cgen.rs `gex_cgen_identities`). */
@@ -3837,6 +3841,14 @@ export class Gex {
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
       this.#bytes().set(b, p);
       e.gex_fjit_libs(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
+    for (const [v, f] of [[Gex.providerSources, e.gex_provider_sources], [Gex.stateful, e.gex_cgen_stateful]]) {
+      if (!v || !f) continue;
+      const b = new TextEncoder().encode(v);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      f(p, b.length);
       e.gex_free?.(p, Math.max(8, b.length));
     }
     if (Gex.providerSkip && e.gex_provider_skip) {

@@ -41,6 +41,18 @@ import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 import { enableSingle, FiberWorker, sched } from './single.mjs';
 import { spareMemories } from './lazy-fetch.mjs';
+
+/** GEX_PROVIDER_DIRS as the shim takes it (`gex_provider_sources`). */
+function providerSources(dirs) {
+  if (!dirs) return undefined;
+  const out = [];
+  for (const d of dirs.split(':').filter(Boolean)) {
+    for (const f of readdirSync(d).filter((f) => f.endsWith('.c')).sort()) {
+      out.push(`${f.slice(0, -2)}\n${readFileSync(join(d, f), 'utf8')}`);
+    }
+  }
+  return out.join('\0') || undefined;
+}
 // GEX_SINGLE=1: the single-thread build (docs/single-thread.md) -- every
 // process and thread a fiber on this thread, no SharedArrayBuffer, the shared
 // build's binaries on plain memories. Before anything is compiled.
@@ -439,6 +451,12 @@ const host = new ProcessHost({
     providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
     eagerBlocks: !!process.env.GEX_EAGER_BLOCKS,
     fillTime: !!process.env.GEX_FILL_TIME,
+    // GEX_PROVIDER_DIRS=dir[:dir...]: provider sources from outside gex, as
+    // natively (gex-cgen `add_sources`): every dir's *.c, named by stem.
+    providerSources: providerSources(process.env.GEX_PROVIDER_DIRS),
+    // GEX_STATEFUL=dll=file,...: stateful providers replacing Windows
+    // libraries, their modules under the unit cache (cgen.rs `set_stateful`).
+    stateful: process.env.GEX_STATEFUL || undefined,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
     trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,

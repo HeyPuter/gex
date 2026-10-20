@@ -31,6 +31,12 @@
 //! `gexp__ifunc` (`GEX_ELF_IFUNC`). `GEX_GROUP("a,b,...")` lines name
 //! exports that bind together or not at all.
 //!
+//! Sources from outside gex: every `*.c` in the directories
+//! `GEX_PROVIDER_DIRS` names (`dir[:dir...]`), named by their file stem, or
+//! given by a host with no environment (the browser) through
+//! [`add_sources`]. They take part in unit keys as the built-in ones do; a
+//! name already taken is an error.
+//!
 //! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep);
 //! `GEX_PROVIDER_SKIP=<export>[,<export>...]` leaves those exports to the
 //! guest's own code (in the browser, which has no environment, the page's
@@ -74,9 +80,6 @@ const SOURCES: &[(&str, &str)] = &[
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
     ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
-    // Noita's FMOD, silent until FMOD's own wasm build binds there instead.
-    ("fmodstudio_silent", include_str!("../providers/fmodstudio_silent.c")),
-    ("fmod_silent", include_str!("../providers/fmod_silent.c")),
     ("glibc_mem", include_str!("../providers/glibc_mem.c")),
     ("glibc_printf", include_str!("../providers/glibc_printf.c")),
     ("glibc_math", include_str!("../providers/glibc_math.c")),
@@ -96,6 +99,97 @@ const SOURCES: &[(&str, &str)] = &[
         concat!("/* PROVIDES libm.so.6 aarch64 */\n", include_str!("../providers/aapcs64.inc"), include_str!("../providers/glibc_math.c")),
     ),
 ];
+
+/// Sources [`add_sources`] gave.
+static ADDED: RwLock<Vec<(&'static str, &'static str)>> = RwLock::new(Vec::new());
+
+/// Add provider sources (name, text) from outside gex, as `GEX_PROVIDER_DIRS`
+/// does: for a host with no environment. Before any unit key is made, or
+/// keys disagree.
+pub fn add_sources(v: Vec<(String, String)>) {
+    let mut a = ADDED.write().unwrap_or_else(|e| e.into_inner());
+    for (n, t) in v {
+        if a.iter().any(|(m, _)| *m == n) {
+            continue;
+        }
+        if SOURCES.iter().any(|(m, _)| *m == n) {
+            eprintln!("gex-cgen: provider {n} exists already; the one from outside gex is left out");
+            continue;
+        }
+        let (n, t): (&'static str, &'static str) = (Box::leak(n.into_boxed_str()), Box::leak(t.into_boxed_str()));
+        match parse(n, t) {
+            Ok(_) => a.push((n, t)),
+            Err(e) => eprintln!("gex-cgen: {e:#}; left out"),
+        }
+    }
+}
+
+/// The sources in `GEX_PROVIDER_DIRS`, read once.
+fn dir_sources() -> &'static [(&'static str, &'static str)] {
+    static DIRS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut v: Vec<(&'static str, &'static str)> = Vec::new();
+        let Ok(dirs) = std::env::var("GEX_PROVIDER_DIRS") else { return v };
+        for d in dirs.split(':').filter(|d| !d.is_empty()) {
+            let mut files: Vec<PathBuf> = match std::fs::read_dir(d) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "c")).collect(),
+                Err(e) => {
+                    eprintln!("gex-cgen: GEX_PROVIDER_DIRS: {d}: {e}");
+                    continue;
+                }
+            };
+            files.sort();
+            for f in files {
+                let (Some(name), Ok(text)) = (f.file_stem().and_then(|s| s.to_str()), std::fs::read_to_string(&f)) else {
+                    eprintln!("gex-cgen: GEX_PROVIDER_DIRS: cannot read {}", f.display());
+                    continue;
+                };
+                let (name, text): (&'static str, &'static str) = (Box::leak(name.to_string().into_boxed_str()), Box::leak(text.into_boxed_str()));
+                if let Err(e) = parse(name, text) {
+                    eprintln!("gex-cgen: GEX_PROVIDER_DIRS: {}: {e:#}; left out", f.display());
+                    continue;
+                }
+                if SOURCES.iter().chain(v.iter()).any(|(m, _)| *m == name) {
+                    eprintln!("gex-cgen: GEX_PROVIDER_DIRS: {}: provider {name} exists already; left out", f.display());
+                    continue;
+                }
+                v.push((name, text));
+            }
+        }
+        v
+    })
+}
+
+/// Every provider source: gex's own, then those from outside it.
+fn sources() -> Vec<(&'static str, &'static str)> {
+    let mut v: Vec<(&'static str, &'static str)> = SOURCES.to_vec();
+    let added = ADDED.read().unwrap_or_else(|e| e.into_inner()).clone();
+    for (n, t) in dir_sources().iter().copied().chain(added) {
+        if v.iter().any(|(m, _)| *m == n) {
+            continue;
+        }
+        v.push((n, t));
+    }
+    v
+}
+
+/// A hash of what decides which providers there are besides gex's build:
+/// the sources from outside it, `GEX_PROVIDER_SKIP` and `GEX_PROVIDERS`.
+/// For a host that remembers keys across runs.
+pub fn settings_fingerprint() -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (enabled(), skip_list()).hash(&mut h);
+    for (n, t) in sources().iter().skip(SOURCES.len()) {
+        (n, t).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Parse a source: gex's own are checked by a test, and those from outside
+/// it when they are added.
+fn parse_ok(n: &'static str, t: &'static str) -> Option<Provider> {
+    parse(n, t).ok()
+}
 
 /// Files a stateful provider may `#include` (written beside it when built).
 const INCLUDES: &[(&str, &str)] = &[("dlmalloc.inc", include_str!("../providers/dlmalloc.inc"))];
@@ -148,16 +242,12 @@ pub struct Provider {
     pub build_ids: Vec<String>,
 }
 
-/// Every provider gex carries for this build's guest (`gexc cgen-image
+/// Every provider for this build's guest, gex's and those from outside it (`gexc cgen-image
 /// --providers` builds them all into a unit cache, for a host that cannot
 /// build them at run time).
 pub fn all() -> Vec<Provider> {
     let archs = [guest_arch(true), guest_arch(false)];
-    SOURCES
-        .iter()
-        .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
-        .filter(|p| archs.contains(&Some(p.arch)))
-        .collect()
+    sources().into_iter().filter_map(|(n, t)| parse_ok(n, t)).filter(|p| archs.contains(&Some(p.arch))).collect()
 }
 
 /// Whether providers are on (`GEX_PROVIDERS=0` turns them off).
@@ -226,11 +316,7 @@ pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
         return Vec::new();
     };
     let dll = dll.to_ascii_lowercase();
-    SOURCES
-        .iter()
-        .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
-        .filter(|p| p.dlls.contains(&dll) && p.arch == arch)
-        .collect()
+    sources().into_iter().filter_map(|(n, t)| parse_ok(n, t)).filter(|p| p.dlls.contains(&dll) && p.arch == arch).collect()
 }
 
 /// The library name the NT trampoline page has for providers
@@ -498,6 +584,21 @@ mod tests {
         let b = super::elf_bindings(&p, &ex, 0x1000, false);
         let want: Vec<(u64, String)> = vec![(0x1100, "gexp__ifunc".into()), (0x1101, "p_memcpy".into()), (0x1200, "p_strlen".into())];
         assert_eq!(b, want, "free is missing, so the malloc group binds nothing");
+    }
+
+    #[test]
+    fn added_sources() {
+        let text = "/* PROVIDES gextest.dll i386 */\nstatic GEX_PROVIDER(p_one) { return 0; }\nGEX_PROVIDE(p_one, \"one\")\n";
+        super::add_sources(vec![("gextest_added".into(), text.into()), ("crt_mem".into(), text.into())]);
+        let v = super::sources();
+        let added: Vec<_> = v.iter().filter(|(n, _)| *n == "gextest_added").collect();
+        assert_eq!(added.len(), 1);
+        let p = super::parse(added[0].0, added[0].1).unwrap();
+        assert_eq!(p.dlls, vec!["gextest.dll".to_string()]);
+        assert_eq!(p.binds, vec![("p_one".to_string(), "one".to_string())]);
+        // A built-in name is not taken over.
+        assert_eq!(v.iter().filter(|(n, _)| *n == "crt_mem").count(), 1);
+        assert!(v.iter().any(|(n, t)| *n == "crt_mem" && *t != text));
     }
 
     #[test]

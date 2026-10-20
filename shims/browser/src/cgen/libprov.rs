@@ -950,6 +950,22 @@ pub extern "C" fn gex_provider_skip(ptr: u32, len: u32) {
     gex_cgen::provider::set_skip(spec.trim());
 }
 
+/// Provider sources from outside gex (the page's `providerSources`, natively
+/// `GEX_PROVIDER_DIRS`): entries `name\ntext` separated by NUL. Before the
+/// program starts, so every unit key sees them.
+#[no_mangle]
+pub extern "C" fn gex_provider_sources(ptr: u32, len: u32) {
+    // SAFETY: JS wrote `len` bytes at `ptr`, a live `gex_alloc` allocation.
+    let spec = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr as usize as *const u8, len as usize) }).into_owned();
+    let v = spec
+        .split('\0')
+        .filter_map(|e| e.split_once('\n'))
+        .filter(|(n, _)| !n.trim().is_empty())
+        .map(|(n, t)| (n.trim().to_string(), t.to_string()))
+        .collect();
+    gex_cgen::provider::add_sources(v);
+}
+
 /// `name,name,...` (the page's `?elfunits=`), before the program starts.
 #[no_mangle]
 pub extern "C" fn gex_cgen_elf_units(ptr: u32, len: u32) {

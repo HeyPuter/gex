@@ -24,15 +24,6 @@ use std::path::{Path, PathBuf};
 pub const PROVIDER_H: &str = include_str!("../../gex-cgen/providers/provider.h");
 
 #[cfg(feature = "build")]
-/// Whether the PE file at `path` is LuaJIT's lua51.dll (it exports
-/// `luaJIT_setmode`): its trace compiler writes x86 at run time, which an
-/// ejected project cannot run, so it gets the Lua provider.
-pub fn is_luajit(path: &Path) -> Result<bool> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    Ok(pe.exports.entries.iter().any(|e| e.names.iter().any(|n| n == "luaJIT_setmode")))
-}
-
 /// Where a configured provider's module goes.
 fn provider_wasm(dir: &Path, p: &crate::config::Provider) -> PathBuf {
     dir.join("build/providers").join(p.library.to_ascii_lowercase().replace(".dll", ".wasm"))
@@ -57,6 +48,26 @@ fn check_provider_imports(wasm: &[u8], what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "build")]
+/// Build a stateful provider from its sources (`dir/build.sh OUT GEN`, GEN
+/// holding provider.h and gex_abi.h) into `out`, and check what it imports.
+pub(crate) fn build_stateful(dir: &Path, p: &crate::config::Provider, out: &Path, gen: &Path) -> Result<Vec<u8>> {
+    std::fs::create_dir_all(out.parent().unwrap())?;
+    let script = dir.join(&p.dir).join("build.sh");
+    let status = std::process::Command::new("sh")
+        .arg(&script)
+        .arg(out)
+        .arg(gen)
+        .status()
+        .with_context(|| format!("running {}", script.display()))?;
+    if !status.success() {
+        bail!("building the provider for {} ({}) failed", p.library, script.display());
+    }
+    let wasm = std::fs::read(out)?;
+    check_provider_imports(&wasm, &format!("the provider for {}", p.library))?;
+    Ok(wasm)
 }
 
 /// The project's stateful providers, as the runtime takes them.
@@ -469,22 +480,10 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             bytes: std::fs::metadata(&p)?.len(),
         });
     }
-    // Stateful providers, from their sources (Lua: PUC Lua and its binding).
+    // Stateful providers, from their sources.
     for p in &config.providers {
         let out = provider_wasm(dir, p);
-        std::fs::create_dir_all(out.parent().unwrap())?;
-        let script = dir.join(&p.dir).join("build.sh");
-        let status = std::process::Command::new("sh")
-            .arg(&script)
-            .arg(&out)
-            .arg(dir.join("gen"))
-            .status()
-            .with_context(|| format!("running {}", script.display()))?;
-        if !status.success() {
-            bail!("building the provider for {} ({}) failed", p.library, script.display());
-        }
-        let wasm = std::fs::read(&out)?;
-        check_provider_imports(&wasm, &format!("the provider for {}", p.library))?;
+        let wasm = build_stateful(dir, p, &out, &dir.join("gen"))?;
         // Its compiled form, named by its content as the runtime looks it
         // up (`libprov::cwasm_path`): gex-rt has no compiler to make it.
         // Older ones beside it are stale.

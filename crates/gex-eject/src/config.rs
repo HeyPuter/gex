@@ -63,14 +63,15 @@ pub struct Replace {
     pub abi: Abi,
 }
 
-/// A stateful export provider (docs/eject-pe.md §5): a Windows library's
-/// exports served by a wasm module built from `dir` (its `build.sh`), such
-/// as the Lua provider an eject of a LuaJIT program sets up.
+/// A stateful export provider: a Windows library's exports served by a wasm
+/// module built from `dir` (its `build.sh OUT GEN`), in place of the
+/// library's own code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provider {
     /// The DLL, by file name (`lua51.dll`).
     pub library: String,
-    /// Its sources, relative to the project, with a `build.sh OUT GEN`.
+    /// Its sources, relative to the project or absolute, with a
+    /// `build.sh OUT GEN`.
     pub dir: String,
 }
 
@@ -179,19 +180,7 @@ impl Default for Config {
 
 /// The file a new project starts with.
 pub fn template() -> String {
-    template_with(&[])
-}
-
-/// [`template`], with stateful providers set up.
-pub fn template_with(providers: &[Provider]) -> String {
-    let mut fields = template_fields();
-    if !providers.is_empty() {
-        fields.push((
-            "providers",
-            Json::Arr(providers.iter().map(|p| obj(vec![("library", json::s(&p.library)), ("dir", json::s(&p.dir))])).collect()),
-        ));
-    }
-    json::write(&obj(fields))
+    json::write(&obj(template_fields()))
 }
 
 fn template_fields() -> Vec<(&'static str, Json)> {
