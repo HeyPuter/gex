@@ -418,8 +418,8 @@ async function begin(opts, base, at, state, meter) {
   const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore(), files: fileStore() };
   // The lazy files' list, beside the bundle rather than after it. Packed
   // (pack.json names it, with its bytes' hash) it comes compressed and is
-  // kept in the page's cache like the bundle: FL's is 5.8 MB of JSON, which
-  // a visit fetched again whenever the HTTP cache did not keep it.
+  // kept in the page's cache like the bundle, so a visit never fetches it
+  // again, whatever the HTTP cache keeps.
   const lazyList = b.lazy ? (async () => {
     const href = at(b.lazy);
     if (!(await packedEntry(href, fetcher))?.h) return fetchJson(href, 'the lazy files\' list');
@@ -437,8 +437,8 @@ async function begin(opts, base, at, state, meter) {
   // first seconds after its first frame (the shell's taskbar, its tray)
   // still read lazy files, which the download would share the link with.
   // The scene compositor's Mesa too: compositor.js resolves the source on
-  // the page and hands its bytes to the compositor's worker (FL: 20 MB of
-  // Mesa fetched afresh on every visit, unpacked, before this).
+  // the page and hands its bytes to the compositor's worker, so Mesa comes
+  // from the site's packed files and the page's cache, never as plain files.
   const mesa = gl ? mesaSource(fetcher, at) : null;
   const mesaWait = { ready: false, fetched: false, started: false };
   const prefetchMesa = (why) => {
