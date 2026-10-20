@@ -3418,12 +3418,38 @@ impl gex_kernel::net::Transport for HostStream {
         use gex_kernel::Errno;
         use std::net::ToSocketAddrs;
         // The host's own resolver, which is the one thing a native host has
-        // that a page does not.
-        let mut addrs = (host, port)
+        // that a page does not. Every address it gives, IPv4 first (the
+        // guest's network is IPv4): the first is often IPv6, which a host
+        // without an IPv6 route refuses at once, and taking only that one
+        // made every dual-stack name unreachable there (FL Studio's news
+        // server on gooner). Each try is bounded, so an address that drops
+        // the SYN costs seconds, not the two minutes of the host's retries.
+        let mut addrs: Vec<std::net::SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|_| Errno::ENETUNREACH)?;
-        let addr = addrs.next().ok_or(Errno::ENETUNREACH)?;
-        let sock = std::net::TcpStream::connect(addr).map_err(|_| Errno::ECONNREFUSED)?;
+            .map_err(|_| Errno::ENETUNREACH)?
+            .collect();
+        addrs.sort_by_key(|a| a.is_ipv6());
+        if addrs.is_empty() {
+            return Err(Errno::ENETUNREACH);
+        }
+        let mut last = Errno::ECONNREFUSED;
+        let mut found = None;
+        for addr in &addrs {
+            match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10)) {
+                Ok(s) => {
+                    found = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    last = match e.kind() {
+                        std::io::ErrorKind::TimedOut => Errno::ETIMEDOUT,
+                        std::io::ErrorKind::ConnectionRefused => Errno::ECONNREFUSED,
+                        _ => Errno::ENETUNREACH,
+                    }
+                }
+            }
+        }
+        let sock = found.ok_or(last)?;
         sock.set_nonblocking(true)
             .map_err(|_| Errno::ENETUNREACH)?;
         *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock);
@@ -3518,6 +3544,29 @@ impl gex_kernel::net::Transport for HostStream {
             _ => Shutdown::Both,
         };
         sock.shutdown(h).map_err(|e| gex_kernel::Errno::from_io(&e))
+    }
+}
+
+#[cfg(test)]
+mod host_stream_tests {
+    use super::HostStream;
+    use gex_kernel::net::{Status, Transport};
+
+    /// A name whose first address is IPv6 and whose server listens on IPv4
+    /// only: `localhost` on most hosts (::1 first), to a listener on
+    /// 127.0.0.1. The connection must come up on the IPv4 address.
+    #[test]
+    fn a_name_connects_on_any_of_its_addresses() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s = HostStream::default();
+        s.connect("localhost", port).unwrap();
+        let (_peer, _) = l.accept().unwrap();
+        let t0 = std::time::Instant::now();
+        while s.status() == Status::Connecting && t0.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(s.status(), Status::Open);
     }
 }
 

@@ -4174,8 +4174,10 @@ impl NetIo<'_> {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
                 io.write_sockaddr(m, ip, port, a[1], a[2])
             }
-            // One interface, unnamed. A guest that asks where it is calling
-            // from gets 0.0.0.0, which is what an unbound socket reports.
+            // An unbound, unconnected socket is at 0.0.0.0; a connected one
+            // not bound to an address is on the interface its peer is
+            // reached by: lo for a loopback peer, else eth0 (crate::netlink,
+            // the interfaces the route socket and SIOCGIF* list).
             //
             // A unix socket is AF_UNIX and unnamed: libuv's
             // `uv_guess_handle` decides from the family whether a socket on
@@ -4185,7 +4187,13 @@ impl NetIo<'_> {
                 // AF_UNIX
                 Ok((1, _)) => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
                 _ => {
-                    let (ip, port) = io.socket_of(fd).map(|s| s.local()).unwrap_or((0, 0));
+                    let (ip, port) = io
+                        .socket_of(fd)
+                        .map(|s| match (s.local(), s.peer()) {
+                            ((0, port), Some((peer, _))) => (crate::netlink::local_for(peer), port),
+                            (local, _) => local,
+                        })
+                        .unwrap_or((0, 0));
                     io.write_sockaddr(m, ip, port, a[1], a[2])
                 }
             },
@@ -4298,13 +4306,20 @@ impl NetIo<'_> {
         // its video subsystem too, and Unity 6 then saw no display). There
         // are no devices to announce, so the socket binds, takes its options
         // and never has a message: an empty eventfd behind the descriptor.
-        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
-        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
-        // request with the 8-byte counter its own send wrote, which glibc
-        // aborts on (apt's http method). Without a route socket it assumes
-        // IPv4 and IPv6 are there.
+        // NETLINK_ROUTE answers its interface and address dumps
+        // (crate::netlink): musl's if_nameindex and getifaddrs, and Wine's
+        // nsi through them, and glibc's getaddrinfo (AI_ADDRCONFIG), which
+        // an eventfd here once answered with the 8-byte counter its own send
+        // wrote, and aborted on (apt's http method). No other family.
         const AF_NETLINK: u64 = 16;
+        const NETLINK_ROUTE: u64 = 0;
         const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        if domain == AF_NETLINK && protocol == NETLINK_ROUTE {
+            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::netlink::NetlinkRoute::new());
+            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
+            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
+        }
         if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
             return Err(Errno::EAFNOSUPPORT);
         }
@@ -9627,6 +9642,14 @@ impl FdIo<'_> {
                     Ok(0)
                 }
                 FIOASYNC => Ok(0),
+                // An interface's index, name, flags, MTU or addresses
+                // (crate::netlink), asked of any socket.
+                r if crate::netlink::is_iface_ioctl(r) => {
+                    let mut ifr: [u8; 32] = m.read(arg, 32)?.try_into().unwrap();
+                    crate::netlink::iface_ioctl(r, &mut ifr)?;
+                    m.write(arg, &ifr)?;
+                    Ok(0)
+                }
                 _ => Err(Errno::ENOTTY),
             };
         }
