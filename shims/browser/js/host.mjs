@@ -24,6 +24,7 @@ function narrate(text) {
  * scraping, which fails open. See task 146.
  */
 import { single } from './single.mjs';
+import { HELPER_STACK_COUNT } from './lazy-fetch.mjs';
 import { logOn, logQuiet } from './log.mjs';
 
 /** A line gex says by default (log.mjs): to stderr under Node, else the
@@ -672,9 +673,12 @@ export class ProcessHost {
     // Slice 0 belongs to nobody: the first Worker uses the linked-in stack.
     const n = ++this.#stacksTaken;
     this.#stackOf.set(key, n);
-    // The top slice (and the one below it: hostx.js) are the helpers' that
-    // take a stack of their own (tty.mjs, persist-worker.js, fs-opened-worker.js).
-    if (n >= this.#stacks.count - 1) {
+    // The top slices are the page helpers' that take a stack of their own,
+    // one each (lazy-fetch.mjs `HELPER_STACKS`: tty.mjs, hostx.js,
+    // persist-worker.js, fs-opened-worker.js). Slice n's stack is the one
+    // below the top `area + n * size`, so the highest a Worker may have is
+    // the one under the lowest helper's.
+    if (n > this.#stacks.count - HELPER_STACK_COUNT) {
       throw new Error(
         `the global kernel has ${this.#stacks.count} stacks and this is Worker ${n + 1}. ` +
           'Raise STACK_COUNT in shims/kernel.',

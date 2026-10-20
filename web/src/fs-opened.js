@@ -7,8 +7,18 @@
 // A Worker asks, not the page: the kernel's locks may wait
 // (memory.atomic.wait), which the main thread may not.
 
+/** One ask at a time: every one runs on the same kernel stack slot
+ *  (fs-opened-worker.js), so two at once would share a stack. */
+let asking = Promise.resolve();
+
 /** The opened paths, sorted; `spec` is runtime.js's `globalKernel()`. */
 export function openedFiles(spec) {
+  const ask = asking.then(() => askOnce(spec));
+  asking = ask.catch(() => {});
+  return ask;
+}
+
+function askOnce(spec) {
   if (!spec?.module || !spec?.memory) return Promise.reject(new Error('no global kernel (no SharedArrayBuffer)'));
   const worker = new Worker(new URL('./fs-opened-worker.js', import.meta.url), { type: 'module' });
   return new Promise((resolve, reject) => {

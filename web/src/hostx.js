@@ -27,7 +27,7 @@
 // turn left to do it in.
 
 import { WlProxy, outputSize, REC, EV, SLOTS } from '../../shims/browser/js/wl-bridge.mjs';
-import { kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../shims/browser/js/lazy-fetch.mjs';
 import { single, sched } from '../../shims/browser/js/single.mjs';
 
 /** Events taken from the page in one turn. */
@@ -235,12 +235,9 @@ export class HostX {
       // Every Worker in the kernel needs its own stack slice: wasm-ld gives
       // each instance the same `__stack_pointer`, so two Workers sharing one
       // would overwrite each other's locals mid-syscall. The page hands slices
-      // out from the bottom (see host.mjs) and this takes the top one, which is
-      // only contended by a page running 126 guest processes at once.
-      const top = msg.kernel.stackTop ?? (inst.exports.k_stack_area
-        ? (inst.exports.k_stack_area() >>> 0)
-          + (inst.exports.k_stack_size() >>> 0) * ((inst.exports.k_stack_count() >>> 0) - 1)
-        : 0);
+      // out from the bottom (see host.mjs) and this takes its own helper slot
+      // at the top (`HELPER_STACKS`), which the host never hands out.
+      const top = msg.kernel.stackTop ?? (inst.exports.k_stack_area ? helperStackTop(inst.exports, 'hostx') : 0);
       // And thread-locals of its own at the top of it (`kernelThread`).
       if (top) kernelThread(inst.exports, top);
       this.#k = inst.exports;
