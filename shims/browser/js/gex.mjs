@@ -205,7 +205,7 @@ let storeFullSaid = false;
 /** Append `bytes` to a module store: their offset, or -1 when it is full.
  *  Any Worker of the process may append at once: the cursor is atomic and a
  *  grow that loses a race to a bigger one is simply retried. */
-function storeAppend(sab, bytes) {
+export function storeAppend(sab, bytes) {
   const len = bytes.length;
   const off = Number(Atomics.add(new BigInt64Array(sab, 0, 1), 0, BigInt((len + 7) & ~7)));
   const end = off + len;
@@ -218,11 +218,24 @@ function storeAppend(sab, bytes) {
     }
     return -1;
   }
-  while (sab.byteLength < end) {
+  // A grow throws both when a sibling grew past it meanwhile (a lost race, so
+  // retried) and when the engine will give no more (out of memory). The second
+  // used to spin here for good, every Worker of the process that appended
+  // after it with it. Doubling first, then exactly what this needs, then the
+  // registry keeps the bytes itself (-1), as it does when the store is full.
+  for (let tries = 0; sab.byteLength < end; tries++) {
+    const to = tries === 0 ? Math.min(sab.maxByteLength, Math.max(end, sab.byteLength * 2)) : end;
     try {
-      sab.grow(Math.min(sab.maxByteLength, Math.max(end, sab.byteLength * 2)));
-    } catch {
-      // A sibling grew past what this asked for meanwhile; the loop rechecks.
+      sab.grow(to);
+    } catch (e) {
+      if (sab.byteLength >= end) break;
+      if (tries >= 1) {
+        if (!storeFullSaid) {
+          storeFullSaid = true;
+          console.error(`[gex] module store would not grow to ${(end / 1048576).toFixed(0)} MiB (${e?.message ?? e}): the translated-module registry keeps its bytes in the shim heap from here`);
+        }
+        return -1;
+      }
     }
   }
   new Uint8Array(sab, off, len).set(bytes);
@@ -449,6 +462,14 @@ const HIGH_TABLES_END = DISPATCH_DIR64 + 17 * 2 ** 20;
 const dispatchDir = () => (m64() ? DISPATCH_DIR64 : DISPATCH_DIR);
 const dispatchPages = () => (m64() ? LIMIT64_BYTES / 4096 : 0x80000);
 const PAGES = GUEST_BYTES / 65536;
+/** GEX_MEM_MAX_MIB (a test switch): a new wasm32 process memory's maximum, in
+ *  MiB, so a grow past it fails the way an engine out of memory fails one
+ *  (`memory.grow` -1 in wasm, a RangeError in JavaScript). Undefined when off. */
+function memCapPages() {
+  const v = globalThis.GEX_MEM_MAX_MIB ?? globalThis.process?.env?.GEX_MEM_MAX_MIB;
+  if (!v) return undefined;
+  return Math.max(INITIAL_PAGES, Math.min(PAGES, Math.floor(Number(v) * 16)));
+}
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
 /** The spans of a map blob (`vma_blob` in the shim: u32 count, then per
@@ -1033,7 +1054,7 @@ export class Gex {
       memory ??
       (m64()
         ? new WebAssembly.Memory({ address: 'i64', initial: BigInt(INITIAL_PAGES), maximum: BigInt(LIMIT64_BYTES / 65536), shared })
-        : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared }));
+        : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: memCapPages() ?? PAGES, shared }));
     this.#kernelSpec = kernel;
   }
 
@@ -1109,7 +1130,12 @@ export class Gex {
     if (end <= have) return;
     // A 64-bit memory counts its pages in BigInt, here as everywhere else.
     const pages = Math.ceil((end - have) / 65536);
-    this.#memory.grow(m64() ? BigInt(pages) : pages);
+    try {
+      this.#memory.grow(m64() ? BigInt(pages) : pages);
+    } catch (e) {
+      // Said for what it is: the engine's RangeError names no process and no size.
+      throw new Error(`gex: out of memory: this process's memory would not grow from ${(have / 1048576) | 0} to ${Math.ceil(end / 1048576)} MiB (${e?.message ?? e})`);
+    }
     this.#u8 = null;
   }
 

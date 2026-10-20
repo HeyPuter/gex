@@ -255,7 +255,9 @@ try {
     // filesystem belongs to the kernel), so this ceiling is the largest rootfs
     // a run can have -- at one gigabyte a full Debian arm64 image did not fit
     // (#91). `maximum` reserves address space, not pages, so raising it is free.
-    memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
+    // GEX_KERNEL_MAX_MIB (a test switch, tests/browser-oom.sh): a smaller
+    // ceiling, so the kernel's memory runs out the way an engine's does.
+    memory: new WebAssembly.Memory({ initial: 2048, maximum: process.env.GEX_KERNEL_MAX_MIB ? Math.max(2048, Math.min(65536, Number(process.env.GEX_KERNEL_MAX_MIB) * 16)) : 65536, shared: true }),
     // Made once for every Worker (lazy-fetch.mjs `spareMemories`).
     spare: spareMemories(),
   };

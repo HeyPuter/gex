@@ -2301,6 +2301,7 @@ fn grow_memory_to(end: u64) -> bool {
     let want = (target - have).div_ceil(PAGE).max(16);
     let prev = warch::memory_grow(0, want as usize);
     if prev == usize::MAX {
+        grow_failed(have, have + want * PAGE);
         return false;
     }
     // Whoever grew between the read above and this grow owns what they grew.
@@ -2310,6 +2311,32 @@ fn grow_memory_to(end: u64) -> bool {
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
     true
+}
+
+/// A grow the engine refused, said (the first few): a failed `memory.grow`
+/// is a -1 and nothing else, so without this a page out of memory showed only
+/// whatever its caller failed with next. No allocation: this is under the
+/// heap's refill path.
+#[cold]
+fn grow_failed(have: u64, to: u64) {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4 {
+        return;
+    }
+    use core::fmt::Write as _;
+    struct Buf([u8; 200], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 200], 0);
+    let _ = write!(b, "gex: out of memory: the engine would not grow this process's memory from {} to {} MiB\n", have >> 20, to.div_ceil(1 << 20));
+    // SAFETY: `warn` reads the bytes and keeps none.
+    unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
 }
 
 static GROW_LOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
