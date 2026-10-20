@@ -409,6 +409,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a unix datagram socket, when it is one.
+    fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<crate::unix::UnixDgram>> {
+        None
+    }
+
     /// This handle as a unix socket in the global kernel, when it is one.
     fn as_remote_unix(self: Arc<Self>) -> Option<Arc<crate::unix::RemoteUnix>> {
         None

@@ -15,7 +15,7 @@ use crate::file::OpenFile;
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// How much a stream socket buffers before a write blocks. Sized so a slow
 /// Wayland compositor cannot deadlock a client still sending.
@@ -573,6 +573,8 @@ pub struct SocketNames {
     /// Sockets the host (e.g. the compositor), not a guest, listens on.
     hosted: Mutex<Vec<(String, Arc<dyn HostListener>)>>,
     next_inode: AtomicUsize,
+    /// Datagram sockets by the name they are bound to ([`UnixDgram`]).
+    dgram: Mutex<std::collections::HashMap<String, Weak<UnixDgram>>>,
 }
 
 /// A listener the host implements: the Wayland compositor lives in the host, so
@@ -657,6 +659,229 @@ impl SocketNames {
     pub fn exists(&self, path: &str) -> bool {
         self.bound.lock().unwrap().iter().any(|(p, _)| p == path)
             || self.hosted.lock().unwrap().iter().any(|(p, _)| p == path)
+    }
+
+    /// The datagram socket bound to `path`: `ECONNREFUSED` when the name is
+    /// a stream socket's or its socket has closed, `ENOENT` when nothing has
+    /// it (Linux's answers for a name with no socket file).
+    pub fn dgram_target(&self, path: &str) -> Result<Arc<UnixDgram>, Errno> {
+        let mut d = self.dgram.lock().unwrap();
+        match d.get(path).map(|w| w.upgrade()) {
+            Some(Some(s)) => Ok(s),
+            Some(None) => {
+                d.remove(path);
+                Err(Errno::ECONNREFUSED)
+            }
+            None if self.exists(path) => Err(Errno::EPROTOTYPE),
+            None => Err(Errno::ENOENT),
+        }
+    }
+}
+
+/// The most a datagram socket holds unread: datagrams, and bytes. A send
+/// past either is `EAGAIN` (Linux would block a blocking sender; nothing here
+/// fills one that fast).
+const DGRAM_QUEUE: usize = 1024;
+const DGRAM_BYTES: usize = 4 << 20;
+
+/// An `AF_UNIX` `SOCK_DGRAM` socket: whole messages, each with the name of
+/// the socket that sent it, to a name (`sendto`) or to the one socket it is
+/// connected to (`connect`, `socketpair`). musl's `if_nametoindex` opens one
+/// only to ask an interface ioctl; syslog sends to `/dev/log` through one.
+///
+/// Names are this kernel's ([`SocketNames`]): natively every process's, in a
+/// page those of the process's own Worker, so a page's datagram sockets do
+/// not reach another process (its stream sockets do, through the global
+/// kernel).
+#[derive(Debug)]
+pub struct UnixDgram {
+    me: Weak<UnixDgram>,
+    /// The names it binds in and sends to.
+    names: Arc<SocketNames>,
+    /// The name it is bound to.
+    name: Mutex<Option<String>>,
+    /// Where `send` goes: a socketpair's other end, or the socket bound to
+    /// the name `connect` gave (the name too, for `getpeername`).
+    peer: Mutex<Option<(Weak<UnixDgram>, Option<String>)>>,
+    /// Datagrams waiting to be read, each with its sender's name.
+    inbox: Mutex<VecDeque<(Vec<u8>, Option<String>)>>,
+    nonblocking: AtomicBool,
+    /// Who waits on it (`crate::wait`): readers.
+    queue: crate::wait::Queue,
+}
+
+impl UnixDgram {
+    pub fn new(names: &Arc<SocketNames>) -> Arc<UnixDgram> {
+        Arc::new_cyclic(|me| UnixDgram {
+            me: me.clone(),
+            names: Arc::clone(names),
+            name: Mutex::new(None),
+            peer: Mutex::new(None),
+            inbox: Mutex::new(VecDeque::new()),
+            nonblocking: AtomicBool::new(false),
+            queue: crate::wait::Queue::new(),
+        })
+    }
+
+    /// `socketpair(AF_UNIX, SOCK_DGRAM)`: two sockets connected to each other.
+    pub fn pair(names: &Arc<SocketNames>) -> (Arc<UnixDgram>, Arc<UnixDgram>) {
+        let (a, b) = (UnixDgram::new(names), UnixDgram::new(names));
+        *a.peer.lock().unwrap() = Some((Arc::downgrade(&b), None));
+        *b.peer.lock().unwrap() = Some((Arc::downgrade(&a), None));
+        (a, b)
+    }
+
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking.store(on, Ordering::Relaxed);
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.name.lock().unwrap().clone()
+    }
+
+    /// The name `connect` gave, for `getpeername`; `ENOTCONN` when it was
+    /// not connected (a socketpair's end has an unnamed peer: `Ok(None)`).
+    pub fn peer_name(&self) -> Result<Option<String>, Errno> {
+        match &*self.peer.lock().unwrap() {
+            Some((_, name)) => Ok(name.clone()),
+            None => Err(Errno::ENOTCONN),
+        }
+    }
+
+    pub fn bind(&self, path: &str) -> SysResult {
+        let names = &self.names;
+        let mut name = self.name.lock().unwrap();
+        if name.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        let mut d = names.dgram.lock().unwrap();
+        d.retain(|_, w| w.strong_count() > 0);
+        if d.contains_key(path) || names.exists(path) {
+            return Err(Errno::EADDRINUSE);
+        }
+        d.insert(path.to_string(), self.me.clone());
+        *name = Some(path.to_string());
+        Ok(0)
+    }
+
+    pub fn connect(&self, path: &str) -> SysResult {
+        let target = self.names.dgram_target(path)?;
+        *self.peer.lock().unwrap() = Some((Arc::downgrade(&target), Some(path.to_string())));
+        Ok(0)
+    }
+
+    /// Queue `data` for this socket from `from`.
+    fn deliver(&self, data: &[u8], from: Option<String>) -> SysResult {
+        let mut inbox = self.inbox.lock().unwrap();
+        let held: usize = inbox.iter().map(|(d, _)| d.len()).sum();
+        if inbox.len() >= DGRAM_QUEUE || held + data.len() > DGRAM_BYTES {
+            return Err(Errno::EAGAIN);
+        }
+        inbox.push_back((data.to_vec(), from));
+        drop(inbox);
+        self.queue.notify();
+        Ok(data.len() as u64)
+    }
+
+    /// `sendto`: to the socket bound to `to`, or (`None`) to the connected one.
+    pub fn send_to(&self, data: &[u8], to: Option<&str>) -> SysResult {
+        if data.len() > DGRAM_BYTES {
+            return Err(Errno::EMSGSIZE);
+        }
+        let target = match to {
+            Some(path) => self.names.dgram_target(path)?,
+            None => match &*self.peer.lock().unwrap() {
+                Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
+                None => return Err(Errno::ENOTCONN),
+            },
+        };
+        target.deliver(data, self.name())
+    }
+
+    /// `recvfrom`: the next datagram (what does not fit in `buf` is lost) and
+    /// who sent it; its whole length too, for `MSG_TRUNC`.
+    pub fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Option<String>), Errno> {
+        let mut inbox = self.inbox.lock().unwrap();
+        let (data, from) = if peek {
+            inbox.front().cloned().ok_or(Errno::EAGAIN)?
+        } else {
+            inbox.pop_front().ok_or(Errno::EAGAIN)?
+        };
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok((n, data.len(), from))
+    }
+}
+
+impl Drop for UnixDgram {
+    fn drop(&mut self) {
+        // Its name is free again (a filesystem name's node stays, as on Linux).
+        if let Some(n) = self.name.get_mut().unwrap().take() {
+            self.names.dgram.lock().unwrap().retain(|p, w| !(p == &n && w.strong_count() == 0));
+        }
+        // A socketpair's other end is woken: a reader waiting on it is told
+        // the far end is gone (poll_hup) rather than waiting for good.
+        if let Some((w, _)) = self.peer.get_mut().unwrap().take() {
+            if let Some(p) = w.upgrade() {
+                p.queue.notify();
+            }
+        }
+    }
+}
+
+impl FileHandle for UnixDgram {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        self.recv_from(buf, false).map(|(n, _, _)| n as u64)
+    }
+
+    /// `write` and `send` with no address: to the connected socket. The
+    /// syscalls that carry a name call [`UnixDgram::send_to`] themselves.
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if buf.len() > DGRAM_BYTES {
+            return Err(Errno::EMSGSIZE);
+        }
+        let target = match &*self.peer.lock().unwrap() {
+            Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
+            None => return Err(Errno::ENOTCONN),
+        };
+        target.deliver(buf, self.name())
+    }
+
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata {
+            file_type: crate::vfs::FileType::Socket,
+            size: 0,
+            mode: 0o777,
+            ino: 0,
+            mtime: 0,
+            nlink: 1,
+            rdev: 0,
+            times: Default::default(),
+        })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    fn poll_readable(&self) -> bool {
+        !self.inbox.lock().unwrap().is_empty()
+    }
+
+    fn poll_writable(&self) -> bool {
+        true
+    }
+
+    fn wait_queue(&self) -> u32 {
+        self.queue.id()
+    }
+
+    fn available(&self) -> Option<u64> {
+        Some(self.inbox.lock().unwrap().front().map_or(0, |(d, _)| d.len() as u64))
+    }
+
+    fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
+        Some(self)
     }
 }
 

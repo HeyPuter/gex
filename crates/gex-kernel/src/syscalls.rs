@@ -1825,6 +1825,29 @@ impl FdIo<'_> {
         // `msg_name` is where this one goes, and a reply has to be reported
         // as having come from there or a resolver drops it as spoofed.
         let name = self.msg_rd(m, msg, 0)?;
+        if let Ok(d) = self.dgram_of(fd) {
+            // A datagram, to `msg_name` when there is one (resolved as the
+            // socket's own names are: an abstract name, or a path from `/`;
+            // a relative one is taken from `/`), else to the connected peer.
+            let namelen = m.read_u32(msg + if self.compat { 4 } else { 8 })? as u64;
+            let to = if name != 0 {
+                let p = Kernel::sockaddr_un(m, name, namelen)?;
+                Some(if p.starts_with('\0') { p } else { crate::vfs::normalize(&p, "/") })
+            } else {
+                None
+            };
+            let iov = self.msg_rd(m, msg, 2)?;
+            let iovlen = self.msg_rd(m, msg, 3)?;
+            let mut data = Vec::new();
+            for i in 0..iovlen.min(1024) {
+                let base = self.msg_rd(m, iov, 2 * i)?;
+                let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
+                if len > 0 {
+                    data.extend_from_slice(m.read(base, len.min(1 << 22))?);
+                }
+            }
+            return d.send_to(&data, to.as_deref());
+        }
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
                 let bytes = m.read(name, 16)?.to_vec();
@@ -1875,6 +1898,48 @@ impl FdIo<'_> {
             }
         }
         self.fds.get(fd)?.write(&data)
+    }
+
+    /// `recvmsg` on a unix datagram socket: one datagram scattered over the
+    /// vector, its sender in `msg_name`, `MSG_TRUNC` in `msg_flags` when it
+    /// did not fit, and no ancillary data.
+    fn recvmsg_dgram(&self, m: &mut GuestMem<'_>, d: &Arc<unix::UnixDgram>, msg: u64, iov: u64, iovlen: u64, peek: bool) -> SysResult {
+        let mut parts = Vec::new();
+        let mut want = 0usize;
+        for i in 0..iovlen.min(1024) {
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
+            let len = len.min((1 << 22) - want);
+            if len > 0 {
+                parts.push((base, len));
+                want += len;
+            }
+        }
+        let mut tmp = vec![0u8; want];
+        let (n, whole, from) = d.recv_from(&mut tmp, peek)?;
+        let mut at = 0usize;
+        for (base, len) in parts {
+            if at >= n {
+                break;
+            }
+            let take = len.min(n - at);
+            m.write(base, &tmp[at..at + take])?;
+            at += take;
+        }
+        let name = self.msg_rd(m, msg, 0)?;
+        let namelen_at = msg + if self.compat { 4 } else { 8 };
+        if name != 0 {
+            match from {
+                Some(p) => Kernel::write_sockaddr_un(m, name, namelen_at, &p)?,
+                None => {
+                    Kernel::write_sockaddr_unnamed(m, name, namelen_at)?;
+                }
+            }
+        }
+        self.msg_wr(m, msg, 5, 0)?;
+        const MSG_TRUNC: u32 = 0x20;
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, if whole > n { MSG_TRUNC } else { 0 })?;
+        Ok(n as u64)
     }
 
     /// `recvmsg` on a socket in the global kernel: one read for the whole
@@ -1960,6 +2025,9 @@ impl FdIo<'_> {
         } else {
             0
         };
+        if let Ok(d) = self.dgram_of(fd) {
+            return self.recvmsg_dgram(m, &d, msg, iov, iovlen, peek);
+        }
         let unix_sock = self.unix_of(fd).ok();
         if unix_sock.is_none() {
             if let Ok(sock) = self.remote_unix_of(fd) {
@@ -2077,6 +2145,11 @@ impl FdIo<'_> {
     /// The local unix socket behind a descriptor.
     pub(crate) fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
         Arc::clone(&self.fds.get(fd)?.handle).as_unix_socket().ok_or(Errno::ENOTSOCK)
+    }
+
+    /// The unix datagram socket behind a descriptor.
+    pub(crate) fn dgram_of(&self, fd: i32) -> Result<Arc<unix::UnixDgram>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_unix_dgram().ok_or(Errno::ENOTSOCK)
     }
 
     /// The epoll set behind a descriptor: `EINVAL` for any other.
@@ -4188,10 +4261,14 @@ impl NetIo<'_> {
                 Err(Errno::ENOTSOCK) => inet_connect(io, m, fd, a[1], a[2]),
                 other => other,
             },
-            nr::SENDTO => sendto(io, m, fd, a[1], a[2], a[4]),
+            nr::SENDTO => sendto(io, m, fd, a[1], a[2], a[4], a[5], cwd),
             nr::RECVFROM => recvfrom(io, m, fd, a[1], a[2], a[3], a[4], a[5]),
             nr::SENDMMSG => sendmmsg(io, m, fd, a[1], a[2]),
             nr::RECVMMSG => recvmmsg(io, m, fd, a[1], a[2], a[3]),
+            nr::GETPEERNAME if io.dgram_of(fd).is_ok() => match io.dgram_of(fd)?.peer_name()? {
+                Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
+                None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
+            },
             nr::GETPEERNAME => {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
                 io.write_sockaddr(m, ip, port, a[1], a[2])
@@ -4206,6 +4283,10 @@ impl NetIo<'_> {
             // stdout is a pipe or TCP, and node made the stdout of every
             // child it spawned a black hole when told AF_INET.
             nr::GETSOCKNAME => match socket_family_type(io, fd) {
+                // A bound datagram socket has its name.
+                Ok((1, 2)) if io.dgram_of(fd)?.name().is_some() => {
+                    Kernel::write_sockaddr_un(m, a[1], a[2], &io.dgram_of(fd)?.name().unwrap()).map(|_| 0)
+                }
                 // AF_UNIX
                 Ok((1, _)) => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
                 _ => {
@@ -4312,9 +4393,17 @@ impl NetIo<'_> {
         // machine, and one of them may be the host rather than a guest.
         if domain == AF_UNIX {
             let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if kind == SOCK_DGRAM {
+                let sock = unix::UnixDgram::new(self.socket_names);
+                let nonblock = ty & SOCK_NONBLOCK != 0;
+                sock.set_nonblocking(nonblock);
+                let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+                let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
+                return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
+            }
             if kind != SOCK_STREAM && kind != 5 {
                 // SOCK_SEQPACKET is 5 and behaves closely enough to a stream
-                // for what uses it here; datagram unix sockets are not.
+                // for what uses it here.
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let sock = Arc::new(unix::UnixSocket::new(true));
@@ -4401,6 +4490,22 @@ impl NetIo<'_> {
             m.write_u32(out + 4, fds[1] as u32)?;
             return Ok(0);
         }
+        // A datagram pair: this kernel's (in a page, the process's own
+        // Worker; see unix::UnixDgram).
+        const SOCK_DGRAM: u64 = 2;
+        if ty & 0xf == SOCK_DGRAM {
+            let (a, b) = unix::UnixDgram::pair(self.socket_names);
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let cloexec = ty & SOCK_CLOEXEC != 0;
+            let mut fds = [0i32; 2];
+            for (fd, s) in fds.iter_mut().zip([a, b]) {
+                s.set_nonblocking(nonblock);
+                *fd = io.fds.insert(OpenFile::new(s, "socket".to_string(), flags, true, true), cloexec)? as i32;
+            }
+            m.write_u32(out, fds[0] as u32)?;
+            m.write_u32(out + 4, fds[1] as u32)?;
+            return Ok(0);
+        }
         let (a, b) = unix::UnixSocket::pair();
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
@@ -4414,6 +4519,15 @@ impl NetIo<'_> {
     }
 
     pub fn unix_bind(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
+        if let Ok(d) = io.dgram_of(fd) {
+            let path = Kernel::sockaddr_un(m, addr, len)?;
+            let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+            d.bind(&path)?;
+            if !path.starts_with('\0') {
+                let _ = io.ns.mksocket(&path);
+            }
+            return Ok(0);
+        }
         let sock = io.unix_of(fd)?;
         let path = Kernel::sockaddr_un(m, addr, len)?;
         // A filesystem socket resolves against the guest's root the way any
@@ -4457,6 +4571,11 @@ impl NetIo<'_> {
     }
 
     pub fn unix_connect(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
+        if let Ok(d) = io.dgram_of(fd) {
+            let path = Kernel::sockaddr_un(m, addr, len)?;
+            let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
+            return d.connect(&path);
+        }
         let sock = io.unix_of(fd)?;
         let path = Kernel::sockaddr_un(m, addr, len)?;
         let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
@@ -4564,7 +4683,18 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     install_unix(io, session, oflag, flags & SOCK_CLOEXEC != 0)
 }
 
-fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u64) -> SysResult {
+#[allow(clippy::too_many_arguments)]
+fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u64, dest_len: u64, cwd: &str) -> SysResult {
+    if let Ok(d) = io.dgram_of(fd) {
+        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        let to = if dest != 0 {
+            let path = Kernel::sockaddr_un(m, dest, dest_len)?;
+            Some(if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) })
+        } else {
+            None
+        };
+        return d.send_to(&data, to.as_deref());
+    }
     if dest != 0 {
         if let Ok(sock) = io.socket_of(fd) {
             let bytes = m.read(dest, 16)?.to_vec();
@@ -4581,6 +4711,20 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
 fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> SysResult {
     let len = (len as usize).min(1 << 22);
     let mut tmp = vec![0u8; len];
+    if let Ok(d) = io.dgram_of(fd) {
+        let (n, whole, from) = d.recv_from(&mut tmp, flags & Kernel::MSG_PEEK != 0)?;
+        m.write(buf, &tmp[..n])?;
+        if addr != 0 {
+            match from {
+                Some(p) => Kernel::write_sockaddr_un(m, addr, addrlen, &p)?,
+                None => {
+                    Kernel::write_sockaddr_unnamed(m, addr, addrlen)?;
+                }
+            }
+        }
+        const MSG_TRUNC: u64 = 0x20;
+        return Ok(if flags & MSG_TRUNC != 0 { whole } else { n } as u64);
+    }
     // The read and the sender address it set, as one (`recv_turn`).
     let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };
     let _turn = inet.as_ref().map(|s| s.recv_turn());
@@ -4607,6 +4751,9 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     const SOCK_DGRAM: u32 = 2;
     if let Ok(s) = io.socket_of(fd) {
         return Ok((AF_INET, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
+    }
+    if io.dgram_of(fd).is_ok() {
+        return Ok((AF_UNIX, SOCK_DGRAM));
     }
     if io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_STREAM));
@@ -10171,16 +10318,19 @@ impl Kernel {
         path: &str,
     ) -> Result<(), Errno> {
         const AF_UNIX: u16 = 1;
+        let abstract_name = path.starts_with('\0');
         if addr != 0 {
             let mut buf = vec![0u8; 110];
             buf[..2].copy_from_slice(&AF_UNIX.to_ge_bytes());
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
-            m.write(addr, &buf[..2 + n + 1])?;
+            m.write(addr, &buf[..2 + n + usize::from(!abstract_name)])?;
         }
+        // An abstract name's length is exactly its bytes (no terminating NUL:
+        // the name may hold NULs), as Linux reports it; a path's counts one.
         if len_out != 0 {
-            m.write_u32(len_out, (2 + path.len().min(107) + 1) as u32)?;
+            m.write_u32(len_out, (2 + path.len().min(107) + usize::from(!abstract_name)) as u32)?;
         }
         Ok(())
     }
