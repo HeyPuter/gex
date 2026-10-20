@@ -23,6 +23,91 @@ pub fn threads() -> usize {
     })
 }
 
+/// Helper threads running now, across every caller in the process. One
+/// budget of [`threads`] for them all: each translating guest thread asked
+/// for `threads()` of its own, so FL Studio's 125 threads could ask for some
+/// 3000 at once, and a spawn refused under a task limit (`TasksMax`)
+/// panicked the guest thread that asked (`scope.spawn`).
+#[cfg(feature = "parallel")]
+static HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most helpers that have run at once (tests only).
+#[cfg(all(feature = "parallel", test))]
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Refuse every spawn, as a host out of tasks does (tests only).
+#[cfg(all(feature = "parallel", test))]
+static REFUSE_SPAWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One helper's place in the budget, given back when it ends.
+#[cfg(feature = "parallel")]
+struct Helper;
+
+#[cfg(feature = "parallel")]
+impl Helper {
+    /// A place, if the budget has one left.
+    fn take() -> Option<Helper> {
+        use std::sync::atomic::Ordering;
+        let cap = threads();
+        let mut n = HELPERS.load(Ordering::Relaxed);
+        loop {
+            if n >= cap {
+                return None;
+            }
+            match HELPERS.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => {
+                    #[cfg(test)]
+                    PEAK.fetch_max(n + 1, Ordering::Relaxed);
+                    return Some(Helper);
+                }
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Drop for Helper {
+    fn drop(&mut self) {
+        HELPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Run `work` on the calling thread and on up to `want - 1` helpers, as
+/// many as the process-wide budget has room for and the host will start: a
+/// refused spawn means less width, never a failure. `work` takes its pieces
+/// from a shared queue until it is empty, so which thread did a piece does
+/// not matter to the result.
+#[cfg(feature = "parallel")]
+fn spread(want: usize, work: &(dyn Fn() + Sync)) {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 1..want {
+            let Some(place) = Helper::take() else { break };
+            #[cfg(test)]
+            if REFUSE_SPAWN.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match std::thread::Builder::new().name("gex-lift".into()).spawn_scoped(scope, move || {
+                let _place = place;
+                work();
+            }) {
+                Ok(h) => handles.push(h),
+                // The closure, and the place in it, are dropped with the error.
+                Err(_) => break,
+            }
+        }
+        work();
+        for h in handles {
+            // A panic in the lifter or the emitter is a bug: let it out rather
+            // than quietly translating less than was asked for.
+            if let Err(e) = h.join() {
+                std::panic::resume_unwind(e);
+            }
+        }
+    });
+}
+
 /// Apply `f` to every item, on as many cores as there are, in order.
 #[cfg(feature = "parallel")]
 pub fn map<T, R, F>(items: &[T], f: &F) -> Vec<R>
@@ -47,28 +132,12 @@ where
     let results: Vec<std::sync::Mutex<Vec<R>>> = (0..chunks.len())
         .map(|_| std::sync::Mutex::new(Vec::new()))
         .collect();
-
-    std::thread::scope(|scope| {
-        let (next, chunks, results) = (&next, &chunks, &results);
-        let handles: Vec<_> = (0..threads.min(chunks.len()))
-            .map(|_| {
-                scope.spawn(move || loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(part) = chunks.get(i) else { return };
-                    let done: Vec<R> = part.iter().map(f).collect();
-                    *results[i].lock().unwrap_or_else(|e| e.into_inner()) = done;
-                })
-            })
-            .collect();
-        for h in handles {
-            // A panic in the lifter or the emitter is a bug: let it out rather
-            // than quietly translating less than was asked for.
-            if let Err(e) = h.join() {
-                std::panic::resume_unwind(e);
-            }
-        }
+    spread(threads.min(chunks.len()), &|| loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(part) = chunks.get(i) else { return };
+        let done: Vec<R> = part.iter().map(f).collect();
+        *results[i].lock().unwrap_or_else(|e| e.into_inner()) = done;
     });
-
     results
         .into_iter()
         .flat_map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
@@ -95,41 +164,28 @@ where
 
     let chunk = items.len().div_ceil(threads * 8).max(1);
     let mut out: Vec<R> = vec![R::default(); items.len()];
-    // Chunks of both, taken in step, handed out to whichever thread is free.
-    // A `&mut` slice cannot be shared, so the queue owns them and a thread
-    // takes one out rather than borrowing it.
-    let queue: std::sync::Mutex<Vec<(usize, &mut [T], &mut [R])>> = std::sync::Mutex::new(
-        items
-            .chunks_mut(chunk)
-            .zip(out.chunks_mut(chunk))
-            .enumerate()
-            .map(|(n, (a, b))| (n * chunk, a, b))
-            .rev()
-            .collect(),
-    );
-
-    std::thread::scope(|scope| {
-        let queue = &queue;
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(move || loop {
-                    let Some((base, part, dst)) =
-                        queue.lock().unwrap_or_else(|e| e.into_inner()).pop()
-                    else {
-                        return;
-                    };
-                    for (k, item) in part.iter_mut().enumerate() {
-                        dst[k] = f(base + k, item);
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            if let Err(e) = h.join() {
-                std::panic::resume_unwind(e);
+    {
+        // Chunks of both, taken in step, handed out to whichever thread is
+        // free. A `&mut` slice cannot be shared, so the queue owns them and a
+        // thread takes one out rather than borrowing it.
+        let queue: std::sync::Mutex<Vec<(usize, &mut [T], &mut [R])>> = std::sync::Mutex::new(
+            items
+                .chunks_mut(chunk)
+                .zip(out.chunks_mut(chunk))
+                .enumerate()
+                .map(|(n, (a, b))| (n * chunk, a, b))
+                .rev()
+                .collect(),
+        );
+        spread(threads, &|| loop {
+            let Some((base, part, dst)) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
+                return;
+            };
+            for (k, item) in part.iter_mut().enumerate() {
+                dst[k] = f(base + k, item);
             }
-        }
-    });
+        });
+    }
     out
 }
 
@@ -163,6 +219,39 @@ mod tests {
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, i * 2, "item {i} came back out of order");
         }
+    }
+
+    /// Many callers at once share one budget of helpers, never more than
+    /// `threads()` running in all; and with every spawn refused (a host out
+    /// of tasks) each caller does its own work: the same results, no panic.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn many_callers_share_one_budget_and_survive_refused_spawns() {
+        use std::sync::atomic::Ordering;
+        let items: Vec<u64> = (0..20_000).collect();
+        let want: Vec<u64> = items.iter().map(|n| n * n + 7).collect();
+        let mut_want: Vec<usize> = (0..items.len()).map(|i| i * 3).collect();
+        for refuse in [false, true] {
+            super::REFUSE_SPAWN.store(refuse, Ordering::Relaxed);
+            std::thread::scope(|s| {
+                for _ in 0..32 {
+                    s.spawn(|| {
+                        for _ in 0..4 {
+                            assert_eq!(super::map(&items, &|n: &u64| n * n + 7), want);
+                            let mut v = items.clone();
+                            let r = super::map_mut(&mut v, &|i: usize, x: &mut u64| {
+                                *x += 1;
+                                i * 3
+                            });
+                            assert_eq!(r, mut_want);
+                            assert!(v.iter().zip(&items).all(|(a, b)| *a == b + 1));
+                        }
+                    });
+                }
+            });
+        }
+        super::REFUSE_SPAWN.store(false, Ordering::Relaxed);
+        assert!(super::PEAK.load(Ordering::Relaxed) <= super::threads());
     }
 
     /// A list too short to be worth threads still comes back complete.
