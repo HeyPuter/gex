@@ -421,6 +421,9 @@ gex_surface* surface_for(uint32_t handle) {
 /* Told to whatever is decoding for us, when it keeps anything per surface.
  * Defined per backend below; a no-op for the ones that do not. */
 void note_surface_to_backend(unsigned uid);
+/* This surface is gone: let go of any window canvas it was shown in.
+ * Defined per backend below. */
+void forget_window_canvas(unsigned uid);
 
 /* Draw into this handle from here on: `op::SURFACE_CURRENT`, and what an
  * attach does as well. */
@@ -462,6 +465,7 @@ void drop_surface(uint32_t handle, bool repoint = true) {
     st_api_destroy_drawable(&found->second.drawable.base);
     const unsigned uid = found->second.uid;
     surfaces.erase(found);
+    forget_window_canvas(uid);
     surface_gone_handle = uid;
     ++surface_gone_generation;
     if (current_surface != handle || !repoint) return;
@@ -1370,9 +1374,87 @@ void configure_present_surface() {
     GEX_PRESENT_MARK(configure_done);
 }
 
-/* Nothing keeps a frame per surface on this backend: it presents into the one
- * canvas it was configured with. */
+/* Nothing keeps a frame per surface on this backend: it presents into a
+ * canvas, the window's own or the shared one. */
 void note_surface_to_backend(unsigned uid) { (void)uid; }
+
+/* A canvas of the window's own, by surface uid.
+ *
+ * The shared `#gex-gl` canvas holds one frame, so the page used to copy it
+ * into each window's 2D canvas with `drawImage`. That read of a WebGPU
+ * canvas through 2D came back fully transparent on Chromium on Linux
+ * (edger) -- a red clear included -- so Solitaire counted every frame
+ * presented and showed none. A page that can give the window a canvas
+ * names it `#gex-gl-<uid>` (`gex_gl_surface_canvas`), and the frame is
+ * copied there texture to texture: on the GPU all the way, nothing read
+ * back, and one frame per window rather than whichever presented last.
+ *
+ * `reshow` is a frame owed to a canvas that arrived after the frame did:
+ * a client that draws only when something changes (Solitaire) would
+ * otherwise leave its new canvas empty until the next click. */
+struct window_canvas {
+    WGPUSurface surface = nullptr;
+    unsigned width = 0, height = 0;
+    bool reshow = false;
+};
+std::map<unsigned, window_canvas> window_canvases;
+
+void forget_window_canvas(unsigned uid) {
+    auto found = window_canvases.find(uid);
+    if (found == window_canvases.end()) return;
+    if (found->second.surface) wgpuSurfaceRelease(found->second.surface);
+    window_canvases.erase(found);
+}
+
+/* The surface to present the current window into, configured at its size:
+ * its own canvas when the page gave it one, the shared canvas otherwise. */
+WGPUSurface present_target(WGPUDevice device) {
+    auto found = window_canvases.find(sur->uid);
+    if (found == window_canvases.end()) {
+        configure_present_surface();
+        return mesa_surface;
+    }
+    window_canvas& wc = found->second;
+    const unsigned w = sur->drawable.width, h = sur->drawable.height;
+    if (wc.surface && wc.width == w && wc.height == h) return wc.surface;
+    char selector[32];
+    snprintf(selector, sizeof selector, "#gex-gl-%u", sur->uid);
+    if (!wc.surface) {
+        static WGPUInstance instance = wgpuCreateInstance(nullptr);
+        if (!instance) return nullptr;
+        WGPUEmscriptenSurfaceSourceCanvasHTMLSelector source{};
+        source.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
+        source.selector = WGPUStringView{selector, WGPU_STRLEN};
+        WGPUSurfaceDescriptor descriptor{};
+        descriptor.nextInChain = &source.chain;
+        wc.surface = wgpuInstanceCreateSurface(instance, &descriptor);
+        if (!wc.surface) {
+            static bool said;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "gex-wgpu: no surface for %s; that window "
+                        "falls back to the shared canvas\n", selector);
+            }
+            window_canvases.erase(found);
+            configure_present_surface();
+            return mesa_surface;
+        }
+    }
+    emscripten_set_canvas_element_size(selector, (int)w, (int)h);
+    WGPUSurfaceConfiguration cfg{};
+    cfg.device = device;
+    cfg.format = WGPUTextureFormat_RGBA8Unorm;
+    /* Written only: nothing reads this canvas back. */
+    cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+    cfg.width = w;
+    cfg.height = h;
+    cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
+    cfg.presentMode = WGPUPresentMode_Fifo;
+    wgpuSurfaceConfigure(wc.surface, &cfg);
+    wc.width = w;
+    wc.height = h;
+    return wc.surface;
+}
 
 void present_backend() {
     glFinish();
@@ -1380,15 +1462,30 @@ void present_backend() {
     if (sur) ++sur->produced;
 }
 
+/* True when this surface has something to show: a new frame, or its last one
+ * owed to a canvas that arrived after it. */
+bool display_pending(const gex_surface& s) {
+    if (s.displayed < s.produced) return true;
+    if (!s.produced) return false;
+    auto found = window_canvases.find(s.uid);
+    return found != window_canvases.end() && found->second.reshow;
+}
+
 bool display_backend() {
-    if (!sur || sur->displayed >= sur->produced) return false;
-    configure_present_surface();
+    if (!sur || !display_pending(*sur)) return false;
+    /* A reshow repeats a frame already counted: it moves no counter. */
+    const bool fresh = sur->displayed < sur->produced;
+    {
+        auto found = window_canvases.find(sur->uid);
+        if (found != window_canvases.end()) found->second.reshow = false;
+    }
     struct pipe_resource *source =
         sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
     WGPUTexture from = source ? gex_wgpu_resource_texture(source) : nullptr;
     WGPUDevice device = mesa_frontend_screen.screen
         ? gex_wgpu_screen_device(mesa_frontend_screen.screen) : nullptr;
-    if (!mesa_surface || !from || !device) {
+    WGPUSurface target = device ? present_target(device) : nullptr;
+    if (!target || !from || !device) {
         /* Counted anyway: the frame really was produced, and reporting
          * otherwise would stall a caller that waits for the count to move.
          * Said out loud once, because counting a frame nobody copied is
@@ -1400,11 +1497,14 @@ bool display_backend() {
             fprintf(stderr,
                     "gex-wgpu: display copies nothing (%s); the canvas will "
                     "not change while frames keep counting\n",
-                    !mesa_surface ? "no canvas surface"
+                    !target ? "no canvas surface"
                         : !from ? "no back-left drawable texture"
                                 : "no device");
         }
-        ++displayed;
+        if (fresh) {
+            ++displayed;
+            ++sur->displayed;
+        }
         return true;
     }
     /* Tell the driver which texture reaches the canvas, so it can count the
@@ -1412,7 +1512,7 @@ bool display_backend() {
     gex_wgpu_presented_texture = from;
     WGPUSurfaceTexture surface_texture{};
     GEX_PRESENT_MARK(get_current_texture);
-    wgpuSurfaceGetCurrentTexture(mesa_surface, &surface_texture);
+    wgpuSurfaceGetCurrentTexture(target, &surface_texture);
     if (surface_texture.status !=
             WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
         surface_texture.status !=
@@ -1425,7 +1525,10 @@ bool display_backend() {
                     "canvas will not change while frames keep counting\n",
                     (unsigned)surface_texture.status);
         }
-        ++displayed;
+        if (fresh) {
+            ++displayed;
+            ++sur->displayed;
+        }
         return true;
     }
     {
@@ -1455,7 +1558,14 @@ bool display_backend() {
         src.texture = from;
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = surface_texture.texture;
-        WGPUExtent3D size{sur->drawable.width, sur->drawable.height, 1};
+        /* The smaller of the two: a window canvas is sized to its drawable,
+         * the shared one may still be at its old size for a frame. */
+        WGPUExtent3D size{
+            std::min(sur->drawable.width,
+                     wgpuTextureGetWidth(surface_texture.texture)),
+            std::min(sur->drawable.height,
+                     wgpuTextureGetHeight(surface_texture.texture)),
+            1};
         wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &size);
         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, nullptr);
         if (commands) {
@@ -1468,12 +1578,36 @@ bool display_backend() {
     GEX_PRESENT_MARK(texture_release);
     wgpuTextureRelease(surface_texture.texture);
     GEX_PRESENT_MARK(done);
-    ++displayed;
-    if (sur) ++sur->displayed;
+    if (fresh) {
+        ++displayed;
+        ++sur->displayed;
+    }
     return true;
+}
+
+/* The page has given surface `uid` a canvas of its own, `#gex-gl-<uid>`, or
+ * (`on` zero) taken it away. Its last frame is shown there at the next
+ * display, without counting as a new one. */
+void set_window_canvas(unsigned uid, bool on) {
+    if (!on) {
+        forget_window_canvas(uid);
+        return;
+    }
+    window_canvas& wc = window_canvases[uid];
+    /* A canvas named again may be a new element under the old id: build its
+     * surface afresh. */
+    if (wc.surface) {
+        wgpuSurfaceRelease(wc.surface);
+        wc.surface = nullptr;
+    }
+    wc.width = wc.height = 0;
+    wc.reshow = true;
 }
 #else
 void note_surface_to_backend(unsigned uid) { (void)uid; }
+void forget_window_canvas(unsigned uid) { (void)uid; }
+void set_window_canvas(unsigned uid, bool on) { (void)uid; (void)on; }
+bool display_pending(const gex_surface& s) { return s.displayed < s.produced; }
 
 void present_backend() {
     glFinish();
@@ -2832,7 +2966,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_display() {
         if (!mesa_context) continue;
         std::vector<uint32_t> pending;
         for (const auto& entry : surfaces)
-            if (entry.second.displayed < entry.second.produced)
+            if (display_pending(entry.second))
                 pending.push_back(entry.first);
         for (uint32_t handle : pending) {
             use_surface(handle);
@@ -2954,5 +3088,10 @@ EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_id() { return attached_id; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_token() { return attached_token; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_generation() { return attached_generation; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_presented() { return displayed; }
+/* Surface `uid` (`gex_gl_surface_frame`) has a canvas of its own in the page,
+ * with the id `gex-gl-<uid>`; `on` zero when it is gone. */
+EMSCRIPTEN_KEEPALIVE void gex_gl_surface_canvas(uint32_t uid, uint32_t on) {
+    set_window_canvas(uid, on != 0);
+}
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_produced() { return produced; }
 }

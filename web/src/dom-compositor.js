@@ -39,9 +39,9 @@
 // terminal's cursor blink copies a few hundred bytes.
 //
 // A window whose pixels are the host's OpenGL (see `F_EXTERNAL`) has no
-// address to copy from: its frames are a texture in the worker that runs the
-// guest's GL. Such a window gets its canvas handed to that worker instead --
-// see `hostGlWindow` below -- and is drawn there.
+// address to copy from: its frames are a texture in the renderer that runs
+// the guest's GL. Such a window gets a WebGPU canvas of its own, laid over its
+// 2D one, and the renderer presents into it -- see `#drawGl` below.
 
 import {
   readScene,
@@ -135,6 +135,11 @@ class DomWindow {
     this.external = !!s.external;
     /** The X window this is, or zero. */
     this.xid = s.xid || 0;
+    /** The host GL's own canvas for this window, laid over `canvas`, and the
+     * renderer's surface uid it shows (`frame` in the device's list); see
+     * `showGlCanvas`. */
+    this.glCanvas = null;
+    this.glFrame = 0;
     this.canvas = document.createElement('canvas');
     this.canvas.width = Math.max(1, s.width);
     this.canvas.height = Math.max(1, s.height);
@@ -191,18 +196,62 @@ class DomWindow {
     this.#desktop.focus(this);
   }
 
-  /** Copy this window's OpenGL frame in, from wherever the renderer put it.
+  /** Give this window a WebGPU canvas of its own for surface `uid`, which the
+   * renderer presents into directly (`#gex-gl-<uid>`).
    *
-   * `source` is the renderer's own canvas with this window's frame in its
-   * top-left corner, at `w` by `h`; the copy is a canvas-to-canvas draw,
-   * which the browser does on the GPU. Scaled only when the window and the
-   * frame disagree about the size, which happens for a frame or two after a
-   * resize. */
-  showGl(source, w, h) {
-    if (w <= 0 || h <= 0) return;
-    const ctx = this.#context();
-    ctx.drawImage(source, 0, 0, w, h,
-                  0, 0, this.canvas.width, this.canvas.height);
+   * Laid over `canvas` as its next sibling, the same size, and transparent to
+   * the pointer, so input still lands on `canvas` with the same offsets. Not
+   * `canvas` itself: that one may already have its 2D context -- a Wine
+   * window is painted from memory before its GL starts -- and a canvas keeps
+   * the first context it was given.
+   *
+   * This used to be a 2D `drawImage` of the renderer's shared canvas into
+   * `canvas`. On Chromium on Linux that read of a WebGPU canvas came back
+   * fully transparent (a red clear too), so a GL window counted every frame
+   * presented and showed nothing. Presenting into the window's own canvas
+   * keeps the frame on the GPU end to end, with no copy through 2D at all.
+   *
+   * False while `canvas` is not in the document: the renderer finds the
+   * canvas by its id, and one outside the document is not found. */
+  showGlCanvas(uid) {
+    if (!this.canvas.isConnected) return false;
+    let c = this.glCanvas;
+    if (!c) {
+      c = document.createElement('canvas');
+      c.style.position = 'absolute';
+      c.style.pointerEvents = 'none';
+      c.style.touchAction = 'none';
+      this.glCanvas = c;
+    }
+    c.id = `gex-gl-${uid}`;
+    this.glFrame = uid;
+    this.placeGl();
+    return true;
+  }
+
+  /** Keep the GL canvas over `canvas`, wherever the page has put that. */
+  placeGl() {
+    const c = this.glCanvas;
+    if (!c) return;
+    const under = this.canvas;
+    if (c.previousSibling !== under && under.isConnected) under.after(c);
+    const hidden = !under.isConnected || under.style.display === 'none' ||
+      under.style.visibility === 'hidden';
+    c.style.display = hidden ? 'none' : 'block';
+    if (hidden) return;
+    const left = `${under.offsetLeft}px`, top = `${under.offsetTop}px`;
+    const width = `${under.offsetWidth}px`, height = `${under.offsetHeight}px`;
+    if (c.style.left !== left) c.style.left = left;
+    if (c.style.top !== top) c.style.top = top;
+    if (c.style.width !== width) c.style.width = width;
+    if (c.style.height !== height) c.style.height = height;
+  }
+
+  /** The window is no longer the host's GL, or is gone. */
+  dropGl() {
+    this.glCanvas?.remove();
+    this.glCanvas = null;
+    this.glFrame = 0;
   }
 
   /** The 2D context, taken on first paint rather than at construction.
@@ -298,12 +347,10 @@ export class DomDesktop {
   #glCanvas = null;
   #glServed = false;
   #glServe = null;
-  /* The window frames already copied, by serial, so a still picture is
-   * copied once rather than every frame. */
-  #glShown = new Map();
   #glList = [];
   #glLooks = 0;
-  #glCopies = 0;
+  /* Windows given a GL canvas of their own (see `DomWindow.showGlCanvas`). */
+  #glWindows = 0;
   #glGone = false;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
@@ -333,12 +380,10 @@ export class DomDesktop {
    * first GL call is an ioctl that waits for an answer, and a device built
    * later than that is a thirty-second stall and a trap.
    *
-   * It draws on a canvas of this desktop's own, which is never shown: it is
-   * where the renderer puts whichever window's frame is being asked for, and
-   * each window's canvas is copied out of it (see `#drawGl`). That is one
-   * canvas-to-canvas copy per window per frame -- on the GPU, with no
-   * readback -- and it is what lets several GL windows be drawn at once by
-   * one renderer.
+   * The device is given a canvas of this desktop's own, which is never
+   * shown: the renderer needs one to start, and presents there only a
+   * surface no window has claimed yet. Each window that is the host's GL
+   * gets a canvas of its own, presented into directly (see `#drawGl`).
    */
   async hostGl(channel, opts = {}) {
     const canvas = document.createElement('canvas');
@@ -378,8 +423,6 @@ export class DomDesktop {
       throw new Error(device.error || 'the GL device would not start');
     }
     this.#gl = device;
-    // Presented straight onto that canvas, which `#drawGl` copies into the
-    // window's own.
     const { serveGl } = await import('@gex/gl-bridge.mjs');
     this.#glServe = serveGl(device, channel);
     this.#glServed = true;
@@ -392,13 +435,13 @@ export class DomDesktop {
   onglfailed = null;
 
   /** What this desktop has done about the host's OpenGL: how often it looked,
-   *  how many frames it copied into a window, and what its list of windows
+   *  how many windows it gave a GL canvas, and what its list of windows
    *  says. For diagnosis -- a window that stays black is either not being
    *  looked at, not matched, or matched and drawn from an empty frame. */
   glStats() {
     return {
       looks: this.#glLooks,
-      copies: this.#glCopies,
+      windows: this.#glWindows,
       list: this.#glList.length,
       served: this.#glServed,
     };
@@ -469,7 +512,7 @@ export class DomDesktop {
     this.#glServed = false;
     const gl = this.#gl;
     this.#gl = null;
-    this.#glShown.clear();
+    for (const win of this.#windows.values()) win.dropGl();
     this.#glList = [];
     gl?.dispose?.();
     const canvas = this.#glCanvas;
@@ -503,9 +546,11 @@ export class DomDesktop {
     try {
       // A guest paces itself against frames displayed, not produced: its
       // `eglSwapBuffers` waits for this count to move.
+      // Windows are paired with their GL canvases first, so a frame that
+      // arrives in the same page frame as its window goes straight there.
       if (this.#glServed) {
-        this.#gl?.display?.();
         this.#drawGl();
+        this.#gl?.display?.();
       }
       this.#reconcile();
     } catch (e) {
@@ -557,6 +602,8 @@ export class DomDesktop {
         this.#cursorShown = -1;
         this.#mount.style.cursor = 'default';
       }
+      if (win.glFrame) this.#gl?.surfaceCanvas?.(win.glFrame, false);
+      win.dropGl();
       win.onclosed?.();
       this.onwindowgone?.(win);
     }
@@ -690,17 +737,12 @@ export class DomDesktop {
 
   /** Every window's canvas listens for itself, which is what makes the
    *  browser's hit-testing ours: `offsetX`/`offsetY` is surface-local. */
-  /* Draw every window whose pixels are the host's OpenGL.
+  /* Pair every window whose pixels are the host's OpenGL with its frame.
    *
-   * One renderer, several windows: the renderer keeps a frame per surface and
-   * puts the one asked for on its own canvas, which is then copied into that
-   * window's canvas. One GPU blit and one canvas copy per window per frame,
-   * and no readback -- the pixels never come back to JavaScript.
-   *
-   * The canvas the window adopted used to be the renderer's own, which is one
-   * copy fewer and exactly one window: a second GL client had nowhere to be
-   * drawn, and closing the first took the renderer's canvas out of the page
-   * with the frame it was inside.
+   * One renderer, several windows: each window gets a WebGPU canvas of its
+   * own (`DomWindow.showGlCanvas`) and the renderer presents that window's
+   * surface into it, texture to texture. Nothing is copied here and nothing
+   * comes back to JavaScript.
    *
    * Which window is which comes from the device rather than from the surface
    * record: a Wayland client names its own surface, an X client names a
@@ -724,8 +766,6 @@ export class DomDesktop {
       }
       return;
     }
-    // gex_wgpu presents into the canvas it was configured with, so the frame
-    // is simply *there* and the copy takes it as it is.
     // Read every frame rather than when a counter says it changed. The
     // counter was an optimisation worth a handful of wasm calls per frame,
     // and it was wrong once -- a list captured while only one client had
@@ -733,29 +773,30 @@ export class DomDesktop {
     // never drawn at all. A window that is missing is much more expensive
     // than sixteen calls.
     this.#glList = device.surfaces();
-    if (!this.#glList.length) return;
-    for (const [key, win] of this.#windows) {
+    for (const win of this.#windows.values()) {
       const found = this.#glList.find((s) => s.id && (s.kind === 0
         ? win.token === s.token && win.surface === s.id
         : win.xid === s.id));
-      if (!found) continue;
+      if (!found) {
+        // Its surface went away (the client recreated it, or exited): the
+        // window is painted from memory again until a new one turns up.
+        if (win.glFrame) {
+          device.surfaceCanvas?.(win.glFrame, false);
+          win.dropGl();
+        }
+        continue;
+      }
       // Its pixels are the host's from now on: nothing paints this window
       // out of the guest's memory any more. See `#update`.
       win.external = true;
-      // The frame is already on this desktop's canvas: that is where the
-      // backend presents. One canvas, so one frame -- with several GL
-      // windows they would all show whichever presented last.
-      const serial = device.presentedCount?.() ?? 0;
-      if (this.#glShown.get(key) === serial) continue;
-      const w = this.#glCanvas.width;
-      const h = this.#glCanvas.height;
-      if (w < 2 || h < 2) continue;   // still at its placeholder size
-      this.#glShown.set(key, serial);
-      this.#glCopies++;
-      win.showGl(this.#glCanvas, w, h);
+      if (win.glFrame !== found.frame) {
+        if (win.glFrame) device.surfaceCanvas?.(win.glFrame, false);
+        if (!win.showGlCanvas(found.frame)) continue;
+        device.surfaceCanvas?.(found.frame, true);
+        this.#glWindows++;
+      }
+      win.placeGl();
     }
-    for (const key of [...this.#glShown.keys()])
-      if (!this.#windows.has(key)) this.#glShown.delete(key);
   }
 
   #attach(win) {
