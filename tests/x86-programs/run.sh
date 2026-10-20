@@ -184,20 +184,26 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # mmap-writeback: a fork's child writes its pages of a shared mapping back
 # at exit, and only those (B; the page carries the mapping to the child's
 # Worker with its descriptors).
+# sig-regs-threads: SIGUSR1 sent to spinning threads (a back edge, an
+# indirect jump, a call, a system call, a loop across a page) reports every
+# live register in the handler's ucontext, at whatever safepoint it lands
+# (Wine's suspend sends the frame's context to the server and resumes from
+# it). x86-64 only (its loops are assembly); under the function JIT too.
 # null-access (with GEX_NULL_GUARD=1, the debug opt-in): loads and stores
 # through null pointers (and below 64 KiB) fault: a SIGSEGV handler runs and
 # jumps back out, and with no handler the process dies of SIGSEGV.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access sig-regs-threads"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
     gexflags=""
     targets="x86_64-linux-musl x86-linux-musl"
     case $name in mem64-*) gexflags=--mem64; targets=x86_64-linux-musl ;; esac
+    case $name in sig-regs-threads) targets=x86_64-linux-musl ;; esac
     # *smc*: self-modifying code, under the function JIT as well (which
     # must leave writable-and-executable code to tier-1's guards).
     tiers="t1"
-    case $name in *smc* | copy-loop | null-access) tiers="t1 fjit" ;; esac
+    case $name in *smc* | copy-loop | null-access | sig-regs-threads) tiers="t1 fjit" ;; esac
     case " $PAGE_PROGRAMS " in *" $name "*)
         if [ -f "$SEED64" ] && command -v node >/dev/null; then tiers="$tiers page"; fi ;;
     esac
