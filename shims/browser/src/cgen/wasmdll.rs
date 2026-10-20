@@ -116,7 +116,31 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             Some((dir, _)) => format!("{dir}/{module_name}"),
             None => module_name.clone(),
         };
-        let wasm = gex_kernel::nt::file::read_guest_file(&crate::sigs::proc_home().ns(), &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+        // A twin install (w64-dist.sh W64_TWIN=1, docs/mem64.md §5): a
+        // process with a 64-bit memory loads the memory64 build's module,
+        // beside the other as `<module>.m64`, under the same skeletons.
+        let ns = crate::sigs::proc_home().ns();
+        let twin = format!("{file}.m64");
+        let (file, wasm) = match gex_abi::mem64().then(|| gex_kernel::nt::file::read_guest_file(&ns, &twin).ok()).flatten() {
+            Some(w) => (twin, w),
+            None => {
+                let w = gex_kernel::nt::file::read_guest_file(&ns, &file).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+                (file, w)
+            }
+        };
+        // The module's memory must be this process's: a wasm32 one in a
+        // 64-bit memory fails to instantiate (a LinkError, deep in the
+        // runtime), so it is said here, with what is missing.
+        if let Some(m64) = crate::vfork::wasm_memory64(&wasm[..wasm.len().min(4 << 20)]) {
+            if m64 != gex_abi::mem64() {
+                return Err(format!(
+                    "Wine's PE module {file} is for a {}-bit memory and this process has a {}-bit one{}",
+                    if m64 { 64 } else { 32 },
+                    if m64 { 32 } else { 64 },
+                    if m64 { "" } else { " (a twin install's memory64 module, winepe.wasm.m64 beside it, is missing: w64-dist.sh W64_TWIN=1)" }
+                ));
+            }
+        }
         let (size, align) = dylink_memory(&wasm)?;
         let a = 1u64 << align;
         // (an LLP64 module's above the images: see `crate::W64_PE_DATA`)

@@ -371,6 +371,9 @@ fn install_shared(
         None => {
             let t0 = std::time::Instant::now();
             let file = std::path::Path::new(path).with_file_name(&module_name);
+            // a twin install's memory64 module, beside it (docs/mem64.md §5)
+            let twin = std::path::Path::new(path).with_file_name(format!("{module_name}.m64"));
+            let file = if gex_abi::mem64() && twin.is_file() { twin } else { file };
             let pm = parsed_module(&file, engine, t0)?;
             let (size, align) = (pm.size, pm.align);
             let a = 1u64 << align;

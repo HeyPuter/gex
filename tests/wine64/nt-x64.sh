@@ -174,12 +174,17 @@ check() {
 		# the loader as the process, or exec'd by the twin's launcher
 		local run=(--argv0 /w64/lib/wine/x86_64-unix/wine "$seed" "$wine")
 		[ -z "$twin" ] || run=(--file /launch="$w/launch" --argv0 /launch "$seed" "$w/launch" ${MARK:+-x "/pfx/drive_c/$MARK"} /w64/lib/wine/x86_64-unix/wine)
+		# DIRECT=1: the loader as the process, with GEX_MEM64=1 in its
+		# environment (a game's page that asks for it so)
+		[ "${DIRECT:-0}" = 0 ] || run=(--env GEX_MEM64=1 --argv0 /w64/lib/wine/x86_64-unix/wine "$seed" "$wine")
+		# UNIX=1: the program named by its Unix path (wine /game/x.exe)
+		local prog="C:\\$exe"; [ "${UNIX:-0}" = 0 ] || prog=/pfx/drive_c/$exe
 		out=$(cd "$root" && env ${single:+GEX_SINGLE=1} ${m64:+GEX_MEM64=1} GEX_ARCH=x86 GEX_SHARED=1 "${rss[@]}" timeout -k 10 "${TMO:-300}" \
 			node $jspi --max-old-space-size=8192 \
 			--import 'data:text/javascript,if(process.env.GEX_SINGLE)delete globalThis.SharedArrayBuffer' \
 			shims/browser/js/run-node.mjs --dir /w64="$dist" --dir /pfx="$p" \
 			--env WINEPREFIX=/pfx --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
-			--cwd /pfx/drive_c "${run[@]}" "C:\\$exe" "$@" 2>"$w/$name.err"; echo "exit=$?")
+			--cwd /pfx/drive_c "${run[@]}" "$prog" "$@" 2>"$w/$name.err"; echo "exit=$?")
 	else
 	out=$(cd "$p/drive_c" && timeout -k 10 "${TMO:-300}" "$gexc" run "${gl[@]}" "${wl[@]}" \
 		--env WINEPREFIX="$p" --env WINEDEBUG=err+all,fixme-all --env WINEGEX_DOOR=$door \
@@ -358,6 +363,19 @@ if [ -n "$twin" ] && [ -f "$w/highdata.exe" ] && x86_64-w64-mingw32-gcc -O1 -o "
 		"$w/siblings.exe" "hades.exe mem64 highdata.exe where" "highdata.exe where"
 elif [ -n "$twin" ]; then
 	case " ${CASES:-image} " in *" image "*) fail=$((fail + 1)); echo "FAIL x64/image ($tag): build" ;; esac
+fi
+# TWIN=1, a game started directly (game.json exe=wine, argv the .exe): the
+# loader is the first process, and the program runs in its relaunch (the
+# server starter's child, Wine loader.c wineserver_relaunch).
+# - `direct-env`: GEX_MEM64=1 in the loader's environment; the relaunch
+#   asks for a 64-bit memory, so it runs wine.m64 (vfork.rs `exec_route`).
+# - `direct-image`: the .exe named by its Unix path, with its record
+#   (user.gex.mem64), nothing else asked; the relaunch names it
+#   (WINEGEX_IMAGE), so it alone is 64-bit.
+if [ -n "$twin" ] && [ -f "$w/highdata.exe" ]; then
+	DIRECT=1 check direct-env 0 "flavour 64" "$w/highdata.exe" where
+	cp "$w/highdata.exe" "$w/hades.exe"
+	UNIX=1 MARK=hades.exe check direct-image 0 "flavour 64" "$w/hades.exe" where
 fi
 
 # W64.2: a native DLL (a lowered wasm64 module behind a PE32+ skeleton)
