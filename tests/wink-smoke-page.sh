@@ -25,6 +25,10 @@ if [ "${1:-}" = --build ]; then
     EMSDK_ROOT=${EMSDK:-$HOME/emsdk}
     CACHE=${GEX_MESA_WINK_CACHE:-${TMPDIR:-/tmp}/gex-mesa-wink-cache}
     mkdir -p "$OUT"
+    # The three Tint warnings the newer clang makes errors, silenced as in
+    # web/build-mesa-wasm.sh: without them this passed only when a Mesa build
+    # had filled the shared cache's Tint first (1020e: it hadn't).
+    EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma -Wno-lifetime-safety-intra-tu-suggestions" \
     PATH=$EMSDK_ROOT/upstream/emscripten:$EMSDK_ROOT/upstream/bin:$PATH WINK_ALLOW_ANY_EMSDK=1 \
         bash "$MESA/wink/build.sh" --variant=mt --until=package --cache="$CACHE" \
         --build-dir="$BUILD" --emsdk="$EMSDK_ROOT" --jobs="${JOBS:-16}" > "$BUILD.log" 2>&1 \
