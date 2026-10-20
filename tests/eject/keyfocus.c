@@ -9,13 +9,17 @@
  * The page's compositor has no window with the keyboard. The first key must reach A (the topmost toplevel on the output),
  * never OFF. Then B (320x240 at 500,100) is shown and activated
  * (SetForegroundWindow), and A is raised over it without activation: B has
- * the keyboard and A is on top, and the next key must reach B.
+ * the keyboard and A is on top, and the next key must reach B. Then A and B
+ * are destroyed and N (320x200 at 100,400) is shown without activation:
+ * nothing is active in Win32 and no window has the keyboard, and the next key
+ * must reach N (winewayland activates a placed window that is given the
+ * keyboard while nothing is active).
  *   keyfocus [SECONDS]   exits after SECONDS (default 300) */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-static HWND a, off, b;
+static HWND a, off, b, n;
 
 static void say(const char *f, ...)
 {
@@ -30,7 +34,7 @@ static void say(const char *f, ...)
 
 static const char *name(HWND w)
 {
-	return !w ? "none" : w == a ? "A" : w == off ? "OFF" : w == b ? "B" : "?";
+	return !w ? "none" : w == a ? "A" : w == off ? "OFF" : w == b ? "B" : w == n ? "N" : "?";
 }
 
 static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -44,6 +48,19 @@ static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 			SetForegroundWindow(b);
 			SetWindowPos(a, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 			say("B up, foreground %s", name(GetForegroundWindow()));
+		} else if (w == b && wp == 'C' && !n) {
+			/* All three go, so nothing is active (Wine would activate
+			 * OFF, the next in z-order, if it stayed); N comes up
+			 * without activation: inactive in Win32, and no window has
+			 * the keyboard. */
+			DestroyWindow(off);
+			DestroyWindow(b);
+			DestroyWindow(a);
+			a = b = off = (HWND)1;
+			n = CreateWindowExA(0, "kf", "kf-n", WS_OVERLAPPEDWINDOW, 100, 400, 320, 200, NULL, NULL, NULL, NULL);
+			ShowWindow(n, SW_SHOWNOACTIVATE);
+			UpdateWindow(n);
+			say("N up, foreground %s", name(GetForegroundWindow()));
 		}
 		return 0;
 	case WM_ACTIVATE:
@@ -76,7 +93,7 @@ int main(int argc, char **argv)
 	SetForegroundWindow(a);
 	SetActiveWindow(a);
 	ShowWindow(a, SW_SHOWNA);
-	off = CreateWindowExA(0, "kf", "kf-off", WS_POPUP, -32000, -32000, 160, 40, NULL, NULL, NULL, NULL);
+	off = CreateWindowExA(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, "kf", "kf-off", WS_POPUP, -32000, -32000, 160, 40, NULL, NULL, NULL, NULL);
 	ShowWindow(off, SW_SHOWNOACTIVATE);
 	UpdateWindow(a);
 	UpdateWindow(off);
