@@ -434,9 +434,8 @@ const host = new ProcessHost({
     elfUnits: process.env.GEX_ELF_UNITS || undefined,
     // GEX_PROVIDER_SKIP=export,...: as natively (gex-cgen `set_skip`).
     providerSkip: process.env.GEX_PROVIDER_SKIP || undefined,
-    // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
-    // (instance on first branch) instead of installing them all up front.
-    lazyThread: !!process.env.GEX_LAZY_THREAD,
+    eagerBlocks: !!process.env.GEX_EAGER_BLOCKS,
+    fillTime: !!process.env.GEX_FILL_TIME,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
     trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,
@@ -532,8 +531,10 @@ const host = new ProcessHost({
           // as nofill (tests/gexcc/exec-reuse.sh).
           (m.liftWhy && m.liftWhy.some((n) => n) ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]` : '') +
           (m.byObject ? ` [${m.byObject}]` : '') +
+          (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
+          (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
-            ` (${m.compileMs}ms compile${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+            ` (${m.compileMs}ms compile${m.compiles !== undefined ? ` of ${m.compiles}` : ''}${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
           // Where the shared-slot lookup went, to say why a forked and exec'd
           // child lifts its parent's libraries again.

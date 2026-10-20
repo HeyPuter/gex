@@ -11582,7 +11582,7 @@ fn backfill_registry(j: &mut Jit) {
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         j.registry_sums.push(chunk_sums(&wasm));
-        regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
+        regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None, content_key(&wasm));
         j.registry.push(wasm);
         j.registry_ext.push(None);
     }
@@ -17657,7 +17657,7 @@ pub extern "C" fn gex_jit_installed() {
             if let Some((off, len, key)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
                 EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 j.registry_sums.push(Vec::new());
-                regview::publish_module(j.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some((off, key)));
+                regview::publish_module(j.registry.len(), Vec::<u8>::new().as_ptr() as u32, len, Some(off), key);
                 j.registry.push(Vec::new());
                 j.registry_ext.push(Some((off, len, key)));
                 j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -17675,7 +17675,7 @@ pub extern "C" fn gex_jit_installed() {
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             j.registry_sums.push(chunk_sums(&wasm));
-            regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None);
+            regview::publish_module(j.registry.len(), wasm.as_ptr() as u32, wasm.len() as u32, None, content_key(&wasm));
             j.registry.push(wasm);
             j.registry_ext.push(None);
             j.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
@@ -18070,9 +18070,9 @@ pub extern "C" fn gex_module_ext(i: u32) -> u64 {
     regview::row(i).map_or(0, |r| r.ext.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Registry module `i`'s content key, high half (`which` 0) or low (1), when
-/// it is in the JS-side store (whose writer gave it); 0 and 0 otherwise. So a
-/// Worker catching up names the module without hashing its bytes.
+/// Registry module `i`'s content key, high half (`which` 0) or low (1); 0
+/// and 0 for a row that holds nothing. So a Worker catching up, or filling a
+/// dispatch's miss, names the module without hashing its bytes.
 #[no_mangle]
 pub extern "C" fn gex_module_key(i: u32, which: u32) -> u32 {
     regview::row(i).map_or(0, |r| {
@@ -18184,8 +18184,9 @@ pub(crate) mod regview {
 
     /// Row `i` (the registry's length before the push), under the kernel's
     /// lock; visible to readers once written. `ext` is the JS-side store's
-    /// offset and the content key, for a module kept there.
-    pub fn publish_module(i: usize, ptr: u32, len: u32, ext: Option<(u64, u64)>) {
+    /// offset, for a module kept there; `key` is the bytes' content key,
+    /// wherever they are, so a Worker names the module without hashing it.
+    pub fn publish_module(i: usize, ptr: u32, len: u32, ext: Option<u64>, key: u64) {
         let Some(slot) = SEGMENTS.get(i / SEG) else { return };
         let mut seg = slot.load(Ordering::Acquire);
         if seg.is_null() {
@@ -18199,8 +18200,8 @@ pub(crate) mod regview {
         let r = unsafe { &*seg.add(i % SEG) };
         r.ptr.store(ptr, Ordering::Relaxed);
         r.len.store(len, Ordering::Relaxed);
-        r.ext.store(ext.map_or(0, |(off, _)| off + 1), Ordering::Relaxed);
-        r.key.store(ext.map_or(0, |(_, k)| k), Ordering::Relaxed);
+        r.ext.store(ext.map_or(0, |off| off + 1), Ordering::Relaxed);
+        r.key.store(key, Ordering::Relaxed);
         COUNT.store(i as u32 + 1, Ordering::Release);
     }
 
