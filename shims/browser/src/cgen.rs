@@ -1814,8 +1814,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // The awaited return itself, reached with the stack moved: a callee that
     // returns having changed `esp` (MSVC's `__chkstk`, `__SEH_prolog4`), whose
     // `ret` goes through the table. A call-out from there would wait for a
-    // second return to the place it starts and never end (uiribbon's
-    // `__chkstk` call at 0x2f157b02, docs/mspaint.md §8). Leave instead: the
+    // second return to the place it starts and never end. Leave instead: the
     // caller's return check sees its return address with the stack moved and
     // resumes there (`gex_resume`).
     if ret as u64 == gex_abi::ftab::NO_RETURN || t == ret as u64 || !CALLOUT_ON.load(Ordering::Relaxed) {

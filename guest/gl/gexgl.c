@@ -2436,8 +2436,8 @@ unsigned glGetError(void) {
  * message is late: it arrives at the next submit that waits, which may be
  * several calls after the one that failed. GL allows that unless
  * GL_DEBUG_OUTPUT_SYNCHRONOUS is enabled; with it enabled the message is
- * still delivered at the next waiting submit (a deviation, said in
- * docs/gl.md), not at the call.
+ * still delivered at the next waiting submit, not at the call (a deviation
+ * from the spec).
  *
  * Why it exists: wined3d checks every GL call with glGetError
  * (checkGLcall) whenever Wine's d3d ERR channel is on, which is the

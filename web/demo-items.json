@@ -1,5 +1,5 @@
 {
- "comment": "The demo desktop's launcher (docs/gexcc.md §9). Each item is an overlay built by web/demo-pkgs.sh: mkrootfs.py with the base's packages plus `ours` (gexcc-built, from the pool) and `extra` (Debian arm64, translated), minus the base. `auto` items are fetched in the background once the desktop is up. `pkg` shares another item's overlay.",
+ "comment": "The demo desktop's launcher. Each item is an overlay built by web/build-demo.sh: mkrootfs.py with the base's packages plus `ours` (gexcc-built, from the pool) and `extra` (Debian arm64, translated), minus the base. `auto` items are fetched in the background once the desktop is up. `pkg` shares another item's overlay.",
  "items": [
   {
    "id": "moretools",

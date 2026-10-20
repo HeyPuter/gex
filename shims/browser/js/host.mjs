@@ -690,7 +690,7 @@ export class ProcessHost {
   /**
    * A kernel stack slice for something that is not a guest Worker but calls
    * into the global kernel from a realm of its own (the demo's overlay
-   * Worker, `web/src/overlay.js`). Undefined until the first Worker has said
+   * Worker, `web/src/overlay-worker.js`). Undefined until the first Worker has said
    * where the stacks are. Give it back with `releaseKernelStack(key)`.
    */
   takeKernelStack(key) {
