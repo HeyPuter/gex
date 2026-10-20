@@ -13,8 +13,12 @@
  *      the copy's bytes are not sent back over        -> B from that range
  *   5. not coherent: write B, glMemoryBarrier(CLIENT_MAPPED_BUFFER_BARRIER) -> B
  *   6. not coherent, explicit flush: write A, glFlushMappedBufferRange -> A
- * Each write is followed by one of the points at which this layer publishes
- * persistent writes (it compares the copy at those, not at every draw).
+ *   7. coherent: write B, draw at once; write A, draw again  -> B, then A
+ *   8. coherent indices and colours, glDrawElements and
+ *      glDrawRangeElementsBaseVertex at once                -> A, then B
+ * Steps 1-6 put a flush, swap, fence, copy, barrier or explicit flush
+ * between each write and the draw that reads it; 7 and 8 put nothing there:
+ * a coherent write is visible to the next draw.
  * One "ok"/"FAIL" line a step; "glpersist ok" when all passed. Natively and
  * in the page. */
 #include <windows.h>
@@ -81,6 +85,7 @@ PROC(void, glEnableVertexAttribArray, (GLuint))
 PROC(void *, glFenceSync, (GLenum, GLbitfield))
 PROC(void, glDeleteSync, (void *))
 PROC(void, glMemoryBarrier, (GLbitfield))
+PROC(void, glDrawRangeElementsBaseVertex, (GLenum, GLuint, GLuint, GLsizei, GLenum, const void *, GLint))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static const char *vs_src = "#version 150 core\nin vec2 p;\nin vec4 col;\nflat out vec4 c0;\n"
@@ -150,6 +155,7 @@ int main(void) {
     LOAD(glBindBuffer); LOAD(glBufferData); LOAD(glBufferStorage); LOAD(glMapBufferRange);
     LOAD(glFlushMappedBufferRange); LOAD(glCopyBufferSubData); LOAD(glVertexAttribPointer);
     LOAD(glEnableVertexAttribArray); LOAD(glFenceSync); LOAD(glDeleteSync); LOAD(glMemoryBarrier);
+    LOAD(glDrawRangeElementsBaseVertex);
     CHECK("entry points", pglBufferStorage && pglMapBufferRange && pglFlushMappedBufferRange &&
                           pglFenceSync && pglMemoryBarrier && pglCopyBufferSubData);
     if (failures) return 1;
@@ -249,6 +255,58 @@ int main(void) {
         memcpy(e + RANGE_OFF, colA, RANGE_SIZE);
         pglFlushMappedBufferRange(GL_ARRAY_BUFFER, RANGE_OFF, RANGE_SIZE);
         expect("6. explicit flush", ex, RANGE_OFF, 0);
+    }
+
+    /* Coherent, and nothing between the write and the draw. */
+    memcpy(m + RANGE_OFF, colB, RANGE_SIZE);
+    expect("7. coherent write, then a draw", coh, RANGE_OFF, 1);
+    memcpy(m + RANGE_OFF, colA, RANGE_SIZE);
+    expect("7. another write, then a draw", coh, RANGE_OFF, 0);
+
+    /* Indexed: the indices and the colours both in the coherent buffer,
+     * written just before each draw. The colours go at vertices 100..102
+     * (named by the indices, then by base vertex 100), the indices well
+     * past them. */
+    {
+        const long idx_off = (2 << 20) + 64, col_off = RANGE2_OFF + RANGE_SIZE;
+        unsigned short idx[3] = {100, 101, 102};
+        unsigned char px[4] = {0};
+        char what[200];
+        pglBindBuffer(GL_ARRAY_BUFFER, coh);
+        pglVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, (const void *)(uintptr_t)col_off);
+        pglEnableVertexAttribArray(1);
+        /* glDrawElements reads position 100..102 too: put the triangle there. */
+        GLuint pos2 = 0;
+        float tri2[103 * 2] = {0};
+        memcpy(tri2 + 200, tri, sizeof(tri));
+        pglGenBuffers(1, &pos2);
+        pglBindBuffer(GL_ARRAY_BUFFER, pos2);
+        pglBufferData(GL_ARRAY_BUFFER, sizeof(tri2), tri2, GL_STATIC_DRAW);
+        pglVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        pglBindBuffer(0x8893 /* GL_ELEMENT_ARRAY_BUFFER */, coh);
+        for (int step = 0; step < 2; step++) {
+            memcpy(m + col_off + 100 * 16, step ? colB : colA, 3 * 16);
+            if (step) {
+                unsigned short zero[3] = {0, 1, 2};
+                memcpy(m + idx_off, zero, sizeof(zero));
+            } else {
+                memcpy(m + idx_off, idx, sizeof(idx));
+            }
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            if (step)
+                pglDrawRangeElementsBaseVertex(GL_TRIANGLES, 0, 2, 3, GL_UNSIGNED_SHORT,
+                                               (const void *)(uintptr_t)idx_off, 100);
+            else
+                glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)idx_off);
+            glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            GLenum err = glGetError();
+            int ok = step ? (px[0] < 50 && px[1] > 200 && px[2] < 50) : (px[0] > 200 && px[1] < 50 && px[2] < 50);
+            snprintf(what, sizeof(what), "8. coherent indices and colours, %s: reads %s (%u %u %u %u, error %#x)",
+                     step ? "glDrawRangeElementsBaseVertex" : "glDrawElements", step ? "B" : "A",
+                     px[0], px[1], px[2], px[3], err);
+            CHECK(what, ok && err == GL_NO_ERROR);
+        }
     }
 
     if (failures) { printf("glpersist FAIL (%d)\n", failures); return 1; }
