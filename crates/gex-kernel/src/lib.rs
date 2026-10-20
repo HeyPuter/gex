@@ -263,6 +263,27 @@ impl<'a> GuestMem<'a> {
     }
 
     /// Read a NUL-terminated guest string, bounded by `max` bytes.
+    /// [`Self::read_cstr`] into `buf`: the string's length, or `None` when
+    /// no NUL ends it within `buf` (and memory goes on), for the caller to
+    /// read it whole.
+    pub fn read_cstr_into(&self, addr: u64, buf: &mut [u8]) -> Result<Option<usize>, Errno> {
+        let start = addr as usize;
+        let limit = self.limit();
+        if start >= limit {
+            return Err(Errno::EFAULT);
+        }
+        let end = (start + buf.len()).min(limit);
+        let slice = &self.view()[start..end];
+        match slice.iter().position(|b| *b == 0) {
+            Some(n) => {
+                buf[..n].copy_from_slice(&slice[..n]);
+                Ok(Some(n))
+            }
+            None if end == limit => Err(Errno::ENAMETOOLONG),
+            None => Ok(None),
+        }
+    }
+
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let start = addr as usize;
         let limit = self.limit();
