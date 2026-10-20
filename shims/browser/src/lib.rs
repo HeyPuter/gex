@@ -353,6 +353,7 @@ extern "C" {
     fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
@@ -839,91 +840,184 @@ extern "C" fn rpty_queue(id: i32) -> u32 {
 }
 
 extern "C" fn rf_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
-    unsafe { k_fs_open_now(path, path_len, flags, mode, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_open_now(path, path_len, flags, mode, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_close(handle: i32) {
-    unsafe { k_fs_close(handle) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_close(handle) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_dup(handle: i32) -> i32 {
-    unsafe { k_fs_dup(handle) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_dup(handle) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
-    unsafe { k_fs_read(handle, offset, at, len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read(handle, offset, at, len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32, now: i64) -> i32 {
-    unsafe { k_fs_write_now(handle, offset, at, len, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_write_now(handle, offset, at, len, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_meta(handle: i32, at: gex_kernel::PAddr) -> i32 {
-    unsafe { k_fs_meta(handle, at) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_meta(handle, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
-    unsafe { k_fs_truncate(handle, len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_truncate(handle, len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
-    unsafe { k_fs_advise(handle, offset, len, advice) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_advise(handle, offset, len, advice) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_read_dir(handle, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read_dir(handle, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32 {
-    unsafe { k_fs_path_meta(path, path_len, at) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_path_meta(path, path_len, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_read_link(path, path_len, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_read_link(path, path_len, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_walk(path, path_len, mounts, mounts_len, follow, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_walk(path, path_len, mounts, mounts_len, follow, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
+}
+extern "C" fn rf_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32 {
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_walk_meta(path, path_len, mounts, mounts_len, at) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_unlink(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_unlink(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_mkdir(path, path_len, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_mkdir(path, path_len, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_rmdir(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rmdir(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32 {
-    unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
-    unsafe { k_fs_moved(handle, at, cap) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_moved(handle, at, cap) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_rename_epoch() -> i32 {
-    unsafe { k_fs_rename_epoch() }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_rename_epoch() };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_hold_renames(handle: i32, owner: i32, on: u32) -> i32 {
-    unsafe { k_fs_hold_renames(handle, owner, on) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_hold_renames(handle, owner, on) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_fchmod(handle: i32, mode: u32) -> i32 {
-    unsafe { k_fs_fchmod(handle, mode) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_fchmod(handle, mode) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32 {
-    unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
-    unsafe { k_fs_touch(handle, secs) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_touch(handle, secs) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_times(path: gex_kernel::PAddr, path_len: u32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
-    unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_times(path, path_len, a_s, a_ns, m_s, m_ns, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32 {
-    unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_set_times_fd(handle, a_s, a_ns, m_s, m_ns, now) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32 {
-    unsafe { k_fs_xattr(handle, path, path_len, op, name, name_len, buf, len, flags) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_xattr(handle, path, path_len, op, name, name_len, buf, len, flags) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_symlink(target, target_len, path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_symlink(target, target_len, path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
-    unsafe { k_fs_link(from, from_len, to, to_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_link(from, from_len, to, to_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
-    unsafe { k_fs_mksocket(path, path_len) }
+    gex_kernel::phase::mark(7);
+    let r = unsafe { k_fs_mksocket(path, path_len) };
+    gex_kernel::phase::mark(8);
+    r
 }
 
 extern "C" fn rp_new(pid: i32) -> i32 {
@@ -1488,6 +1582,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             path_meta: rf_path_meta,
             read_link: rf_read_link,
             walk: rf_walk,
+            walk_meta: rf_walk_meta,
             unlink: rf_unlink,
             mkdir: rf_mkdir,
             rmdir: rf_rmdir,
@@ -2490,20 +2585,18 @@ static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
 /// Where `clock_gettime` was told to write, so the trace can read it back.
 // Per Worker: set on the way into a trap or a check and read back by the
 // same Worker (see `CTX_ADDR` for what a process-wide one did).
+// Both kept only under `GEX_TRACE`, which reads them back.
 thread_local! {
     static CLOCK_ARG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SELECT_ARGS: [std::cell::Cell<u64>; 3] = const { [const { std::cell::Cell::new(0) }; 3] };
 }
 
-static SELECT_ARGS: [std::sync::atomic::AtomicU64; 3] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-/// The syscall number this thread is inside, or `u64::MAX` between calls.
-/// Distinct from `IN_SYSCALL`, which is a bool about re-entry.
-static SYSCALL_NR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
+thread_local! {
+    /// The syscall number this thread is inside (canonical), for the
+    /// allocator to name who asked. This Worker's own: every Worker's every
+    /// call wrote one word all of them shared.
+    static SYSCALL_NR: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
 
 /// Which syscall each counter in `HEAP_BY_CALL` is for; `u64::MAX - 1` is
 /// an unused slot.
@@ -2926,7 +3019,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 my_pid(),
                 _layout.size() >> 20,
                 phase_name(PHASE.load(std::sync::atomic::Ordering::Relaxed)),
-                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+                LAST_SYSCALL.with(|c| c.get()) as i32,
                 HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
             );
             said = Some(b);
@@ -2938,7 +3031,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
         {
             // Exact syscall numbers, not folded: `nr % 15` collided `read`,
             // `readlinkat` and `socket`. Eight pairs, first come first served.
-            let n = SYSCALL_NR.load(std::sync::atomic::Ordering::Relaxed);
+            let n = SYSCALL_NR.with(|c| c.get());
             HEAP_LAST_CALL.store(n, std::sync::atomic::Ordering::Relaxed);
             for i in 0..8 {
                 let who = HEAP_CALL_NR[i].load(std::sync::atomic::Ordering::Relaxed);
@@ -2969,7 +3062,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 HEAP_BIGGEST.fetch_max(sz, std::sync::atomic::Ordering::Relaxed);
             if sz > prev {
                 HEAP_BIGGEST_CALL.store(
-                    SYSCALL_NR.load(std::sync::atomic::Ordering::Relaxed),
+                    SYSCALL_NR.with(|c| c.get()),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 HEAP_BIGGEST_AT.store(
@@ -3811,23 +3904,22 @@ static HOST_HOLDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// that returned something it did not expect -- and that was not recorded
 /// anywhere.
 ///
-/// Four words an entry, packed into one atomic each: number, first two
-/// arguments, and what came back. Costs four stores on a path that already
-/// does far more than that, so it is always on -- the run worth recording is
-/// never the one you thought to ask about beforehand.
+/// Four words an entry: number, first two arguments, and what came back.
+/// Costs four stores on a path that already does far more than that, so it
+/// is always on -- the run worth recording is never the one you thought to
+/// ask about beforehand.
 ///
 /// Long enough to hold a process's whole conversation with the kernel when
-/// the process is short, which the ones that die usually are.
+/// the process is short, which the ones that die usually are. Each Worker
+/// keeps its own thread's (the report is made by the thread that dies): one
+/// ring for the process had every Worker's every call take its cursor and
+/// write the words all of them shared.
 const SYS_RING: usize = 256;
-static SYS_NR: [std::sync::atomic::AtomicU64; SYS_RING] =
-    [const { std::sync::atomic::AtomicU64::new(!0) }; SYS_RING];
-static SYS_A0: [std::sync::atomic::AtomicU64; SYS_RING] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
-static SYS_A1: [std::sync::atomic::AtomicU64; SYS_RING] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
-static SYS_RET: [std::sync::atomic::AtomicU64; SYS_RING] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
-static SYS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SYS_LOG: [std::cell::Cell<(u64, u64, u64, u64)>; SYS_RING] =
+        const { [const { std::cell::Cell::new((!0, 0, 0, 0)) }; SYS_RING] };
+    static SYS_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The last few things a process did to its address space.
 ///
@@ -4043,39 +4135,30 @@ fn mem_recent() -> String {
 
 /// Record a syscall on entry, and return where to put its result.
 fn sys_note(nr: u64, a0: u64, a1: u64) -> usize {
-    use std::sync::atomic::Ordering::Relaxed;
-    let i = SYS_AT.fetch_add(1, Relaxed) % SYS_RING;
-    SYS_NR[i].store(nr, Relaxed);
-    SYS_A0[i].store(a0, Relaxed);
-    SYS_A1[i].store(a1, Relaxed);
-    SYS_RET[i].store(!0, Relaxed);
+    let i = SYS_AT.with(|c| c.replace(c.get().wrapping_add(1))) % SYS_RING;
+    SYS_LOG.with(|l| l[i].set((nr, a0, a1, !0)));
     i
 }
 
 fn sys_ret(i: usize, ret: u64) {
-    SYS_RET[i].store(ret, std::sync::atomic::Ordering::Relaxed);
+    SYS_LOG.with(|l| {
+        let (nr, a0, a1, _) = l[i].get();
+        l[i].set((nr, a0, a1, ret));
+    });
 }
 
 /// The ring, oldest first, as `name(a0, a1) = ret`.
 fn sys_recent() -> String {
-    use std::sync::atomic::Ordering::Relaxed;
-    let n = SYS_AT.load(Relaxed);
+    let n = SYS_AT.with(|c| c.get());
     let mut out = String::new();
     // From the oldest entry still held: before the ring wraps that is 0, not
     // `n % RING`, or an unwrapped ring reads nothing but empty slots.
     for j in n.saturating_sub(SYS_RING)..n {
-        let i = j % SYS_RING;
-        let nr = SYS_NR[i].load(Relaxed);
+        let (nr, a0, a1, ret) = SYS_LOG.with(|l| l[j % SYS_RING].get());
         if nr == !0 {
             continue;
         }
-        out.push_str(&format!(
-            " {}({:#x}, {:#x})={:#x}",
-            gex_kernel::syscalls::syscall_name(nr),
-            SYS_A0[i].load(Relaxed),
-            SYS_A1[i].load(Relaxed),
-            SYS_RET[i].load(Relaxed),
-        ));
+        out.push_str(&format!(" {}({a0:#x}, {a1:#x})={ret:#x}", gex_kernel::syscalls::syscall_name(nr)));
     }
     out
 }
@@ -7170,9 +7253,9 @@ pub extern "C" fn gex_sys_calls() -> u64 {
 static mut SYS_NS: [u64; 512] = [0; 512];
 
 /// `nr` is the call's canonical number (`gex_syscall`'s `this_nr`: an
-/// i386-ABI process's own numbers mapped too), `ctx` the calling thread's
-/// context: no kernel lock to find either.
-fn count_syscall(nr: u64, ctx: u64) {
+/// i386-ABI process's own numbers mapped too), `a0` and `a1` its first two
+/// arguments, as the entry read them.
+fn count_syscall(nr: u64, a0: u64, a1: u64) {
     if unsafe { HEARTBEAT } == 0 {
         return;
     }
@@ -7180,13 +7263,6 @@ fn count_syscall(nr: u64, ctx: u64) {
     // past it is a guest asking for something that does not exist.
     static mut COUNTS: [u32; 512] = [0; 512];
     static mut TOTAL: u32 = 0;
-    let (a0, a1) = {
-        let gm = GuestMem::new(guest_bytes());
-        (
-            gm.read_u64(ctx + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
-            gm.read_u64(ctx + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
-        )
-    };
     let total = unsafe {
         if (nr as usize) < COUNTS.len() {
             COUNTS[nr as usize] = COUNTS[nr as usize].saturating_add(1);
@@ -7257,11 +7333,115 @@ fn count_syscall(nr: u64, ctx: u64) {
 /// the clicks meant for the window under it, while explorer ran).
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    gex_kernel::phase::begin();
     syscall_entry(ctx, pc);
+    gex_kernel::phase::mark(16);
     cgen::ftab_resume();
     if gex_kernel::unix::take_host_sent() {
         pump_compositor();
     }
+    phases_end();
+}
+
+/// Which call [`gex_set_phases`] measures: its canonical number.
+static PHASES_NR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(gex_kernel::syscalls::nr::NEWFSTATAT);
+
+/// `GEX_PHASES` (a debug switch): a call's time by phase, from the shim's
+/// entry to its return ([`gex_kernel::phase`]). `1` measures `newfstatat`;
+/// a larger value is the canonical number of the call to measure.
+#[no_mangle]
+pub extern "C" fn gex_set_phases(on: i32) {
+    if on > 1 {
+        PHASES_NR.store(on as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if on != 0 {
+        if !cfg!(feature = "phases") {
+            warn_line("[gex] GEX_PHASES: this shim has no phase marks (build it with GEX_PHASE_MARKS=1)\n");
+        }
+        gex_kernel::phase::set_clock(now_ns);
+    }
+}
+
+/// The phases' names (`gex_kernel::phase` slots), in call order.
+const PHASES: [(usize, &str); 17] = [
+    (0, "entry checks"),
+    (1, "number, trace"),
+    (13, "census, watch"),
+    (14, "last syscall, process note"),
+    (2, "preamble"),
+    (3, "free_class"),
+    (4, "free_call setup"),
+    (5, "kernel dispatch"),
+    (6, "path read, at_path"),
+    (7, "vfs (kernel)"),
+    (8, "global kernel calls"),
+    (9, "stat encode, write"),
+    (10, "back to free_syscall"),
+    (11, "free_syscall after"),
+    (15, "gl, mapped code"),
+    (16, "syscall_entry tail"),
+    (12, "exit to guest"),
+];
+
+/// A call's end: every 20,000 stats measured, their mean by phase.
+fn phases_end() {
+    if !gex_kernel::phase::enabled() {
+        return;
+    }
+    let calls = gex_kernel::phase::end(12);
+    if calls == 0 || calls % 20_000 != 0 {
+        return;
+    }
+    let (v, calls) = gex_kernel::phase::take();
+    // What a mark costs (a clock read), to read the phases against.
+    let t0 = now_ns();
+    for _ in 0..999 {
+        now_ns();
+    }
+    let clock = (now_ns() - t0) / 1000;
+    // What a call into the global kernel costs by itself (one atomic load
+    // there), and a root path's metadata and walk (the stat of `/tmp`).
+    let probe = |f: &dyn Fn()| {
+        let t0 = now_ns();
+        for _ in 0..2000 {
+            f();
+        }
+        (now_ns() - t0) as f64 / 2000.0
+    };
+    let p = b"/tmp";
+    let mut out = [0u8; 256];
+    let k_epoch = probe(&|| {
+        unsafe { k_fs_rename_epoch() };
+    });
+    let k_meta = probe(&|| {
+        unsafe { k_fs_path_meta(p.as_ptr() as gex_kernel::PAddr, 4, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let k_walk = probe(&|| {
+        unsafe { k_fs_walk(p.as_ptr() as gex_kernel::PAddr, 4, out.as_ptr() as gex_kernel::PAddr, 0, 1, out.as_ptr() as gex_kernel::PAddr, 128) };
+    });
+    let q = b"/nonexistent-name";
+    let k_miss = probe(&|| {
+        unsafe { k_fs_path_meta(q.as_ptr() as gex_kernel::PAddr, q.len() as u32, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let r = b"/tmp/missing.txt";
+    let k_wm = probe(&|| {
+        unsafe { k_fs_walk_meta(r.as_ptr() as gex_kernel::PAddr, r.len() as u32, out.as_ptr() as gex_kernel::PAddr, 0, out.as_ptr() as gex_kernel::PAddr) };
+    });
+    let line0 = format!("[gex] global kernel calls: rename_epoch {k_epoch:.0} ns, path_meta /tmp {k_meta:.0} ns, walk /tmp {k_walk:.0} ns, path_meta_miss {k_miss:.0} ns, walk_meta_miss {k_wm:.0} ns each\n");
+    warn_line(&line0);
+    let total: u64 = v.iter().map(|p| p.0).sum();
+    let mut line = format!("[gex] phases of {calls} calls ({}):", gex_kernel::syscalls::syscall_name(PHASES_NR.load(std::sync::atomic::Ordering::Relaxed)));
+    line.push_str(&format!(" total {:.2} us, clock read {clock} ns:", total as f64 / calls as f64 / 1e3));
+    for (i, name) in PHASES {
+        let (ns, marks) = v[i];
+        line.push_str(&format!(" {name} {:.2} us", ns as f64 / calls as f64 / 1e3));
+        if marks != calls {
+            line.push_str(&format!(" ({:.1}/call)", marks as f64 / calls as f64));
+        }
+        line.push(';');
+    }
+    line.push('\n');
+    warn_line(&line);
 }
 
 fn syscall_entry(ctx: i32, pc: i64) {
@@ -7301,6 +7481,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
             }
         }
     }
+    gex_kernel::phase::mark(0);
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
         // A wasm32 program has no safepoints of its own: its loops reach
@@ -7337,49 +7518,47 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if stop_tracked {
         cgen::libprov::syscall_enter(tracked_tid);
     }
-    // Which syscall is running, so the allocator can name who was asking (wasm
-    // has no backtrace). See `HEAP_BY_CALL`. Kept here too: `SYSCALL_NR` is
-    // shared by every Worker of the process.
-    let this_nr = {
+    // The call, read from its context once: its number and arguments as
+    // its ABI gives them, and its canonical number. `ctx` is this thread's
+    // context (the locked section below checks it against the thread's own
+    // and says so if not): no lock to find it. Everything below that asks
+    // what the call is asks this.
+    let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1;
+    let base = ctx as u32 as u64;
+    let (regs, slot_nr) = {
         let gm = GuestMem::new(guest_bytes());
-        // `ctx` is this thread's context (the locked section below checks it
-        // against the thread's own and says so if not): no lock to find it.
-        let base = ctx as u32 as u64;
-        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
-        // An i386-ABI process (W3's Wine): its number, in `x(0)`, is i386's.
-        let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Relaxed) == 1;
-        let n = if compat && !gex_abi::PPC {
-            let raw = gm.read_u64(base + ctx::x(0) as u64).unwrap_or(u64::MAX);
-            gex_kernel::i386::canonical_number(raw)
-        } else if gex_abi::X86 {
-            gex_kernel::x86::canonical_number(n)
-        } else if gex_abi::PPC {
-            gex_kernel::ppc::canonical_number(n)
+        let regs = gex_kernel::syscalls::call_regs(&gm, base, compat);
+        // The number slot itself, which `LAST_SYSCALL` and the stub entry's
+        // check read raw: an i386-ABI process's number is in `x(0)`.
+        let slot = if compat || gex_abi::PPC {
+            gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX)
         } else {
-            n
+            regs.raw
         };
-        SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
-        // And a select's arguments, to read the answer back from the guest's
-        // own sets afterwards.
-        if n == gex_kernel::syscalls::nr::CLOCK_GETTIME {
-            // Where the answer lands, so the trace shows the time the guest was
-            // given: apt's stall is a pselect6/clock_gettime loop recomputing a
-            // deadline that never arrives if the clock does not move.
-            let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
-            CLOCK_ARG.with(|c| c.set(g(1)));
-        } else {
-            CLOCK_ARG.with(|c| c.set(0));
-        }
-        if n == gex_kernel::syscalls::nr::PSELECT6 {
-            let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
-            SELECT_ARGS[0].store(g(0), std::sync::atomic::Ordering::Relaxed);
-            SELECT_ARGS[1].store(g(1), std::sync::atomic::Ordering::Relaxed);
-            SELECT_ARGS[2].store(g(2), std::sync::atomic::Ordering::Relaxed);
-        } else {
-            SELECT_ARGS[0].store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-        n
+        (regs, slot)
     };
+    // Which syscall is running, so the allocator can name who was asking (wasm
+    // has no backtrace). See `HEAP_BY_CALL`.
+    let this_nr = regs.canonical(compat);
+    SYSCALL_NR.with(|c| c.set(this_nr));
+    // Under a trace, where `clock_gettime` writes its answer and a select's
+    // sets, to read them back afterwards: apt's stall is a pselect6/
+    // clock_gettime loop recomputing a deadline that never arrives if the
+    // clock does not move.
+    if tracing() {
+        let clock = this_nr == gex_kernel::syscalls::nr::CLOCK_GETTIME;
+        CLOCK_ARG.with(|c| c.set(if clock { regs.a[1] } else { 0 }));
+        let select = this_nr == gex_kernel::syscalls::nr::PSELECT6;
+        SELECT_ARGS.with(|s| {
+            for (i, v) in s.iter().enumerate() {
+                v.set(if select { regs.a[i] } else { 0 });
+            }
+        });
+    }
+    if gex_kernel::phase::enabled() && this_nr == PHASES_NR.load(std::sync::atomic::Ordering::Relaxed) {
+        gex_kernel::phase::keep();
+    }
+    gex_kernel::phase::mark(1);
     // posix_spawn's child running in its parent's Worker: not the calls
     // that would change the memory map it shares (vfork.rs).
     if vfork::active() {
@@ -7473,25 +7652,22 @@ fn syscall_entry(ctx: i32, pc: i64) {
             }
         }
     }
-    count_syscall(this_nr, ctx as u32 as u64);
+    count_syscall(this_nr, regs.a[0], regs.a[1]);
     watch_mem("syscall");
+    gex_kernel::phase::mark(13);
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
     // what survives to narrow a crash to a single handler.
-    LAST_SYSCALL.store(
-        GuestMem::new(guest_bytes())
-            .read_u64(ctx as u32 as u64 + ctx::SYSCALL_NR as u64)
-            .unwrap_or(!0) as u32,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
+    LAST_SYSCALL.with(|c| c.set(slot_nr as u32));
+    IN_SYSCALL.with(|c| c.set(true));
     let _in_syscall = InSyscall;
     ctx_addr_set(ctx as u32 as u64);
     // The process tree, always. Stood down under `GEX_TRACE`, which narrates
     // these along with everything else.
     if !tracing() {
-        note_process_syscall(ctx as u32 as u64, pc);
+        note_process_syscall(this_nr, &regs.a, pc);
     }
+    gex_kernel::phase::mark(14);
     // The host's integrity check, the process's pid and the pin report are
     // done inside the locked section below: each took the host lock on its
     // own, and with a W3 game's ~25 Wine Workers contending for it every take
@@ -7515,7 +7691,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if gone_now {
         stop_gone();
     }
-    let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped) } {
+    gex_kernel::phase::mark(2);
+    let stop = match if gone_now { Some(3) } else { free_syscall(ctx, pc, &mut mapped, compat, regs, slot_nr) } {
     Some(stop) => stop,
     None => with_exec_lock(|h| {
         let stop = (|h: &mut Host| -> i32 {
@@ -8007,6 +8184,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         stop
     };
     recompile_objects(mapped);
+    gex_kernel::phase::mark(15);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
     let stop = if stop == 3 && frames_stay() {
@@ -8058,7 +8236,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // descriptors are readable or writable, which decides where a
         // never-reading spin's fault is.
         let split = {
-            let nfds = SELECT_ARGS[0].load(std::sync::atomic::Ordering::Relaxed);
+            let nfds = SELECT_ARGS.with(|a| a[0].get());
             if nfds == 0 || nfds > 1024 {
                 String::new()
             } else {
@@ -8083,8 +8261,8 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     }
                     v
                 };
-                let rv = list(SELECT_ARGS[1].load(std::sync::atomic::Ordering::Relaxed));
-                let wv = list(SELECT_ARGS[2].load(std::sync::atomic::Ordering::Relaxed));
+                let rv = list(SELECT_ARGS.with(|a| a[1].get()));
+                let wv = list(SELECT_ARGS.with(|a| a[2].get()));
                 let join = |v: &[u32]| {
                     v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
                 };
@@ -12280,19 +12458,22 @@ fn finish_mine(signalled: bool) -> i32 {
 /// `rt_sigprocmask` and the poll family), made with no kernel lock, blocking included
 /// (docs/kernel-locking.md step 9); `None` for any other call, decided by
 /// its number before anything is done. `gex_syscall`'s stop value.
-fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Option<i32> {
+///
+/// `compat` is whether the process has the i386 ABI, `regs` the call as the
+/// entry read it from the context (`syscalls::call_regs`) and `slot_nr` the
+/// context's number slot.
+fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat: bool, regs: gex_kernel::syscalls::CallRegs, slot_nr: u64) -> Option<i32> {
     use gex_kernel::signal::Delivery;
     use gex_kernel::syscalls::{nr, FreeOutcome};
     let ctx_addr = ctx as u32 as u64;
     let mut gm = GuestMem::new(guest_bytes());
-    let compat = CLOCK_ABI.load(std::sync::atomic::Ordering::Acquire) == 1;
     // The dynamic linker's jump to gex's stub entry, at a process's start
     // (`SNAP_SYSCALL`): what it built is kept as an exec's image is made,
     // under the exec lock.
-    if gm.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(0) == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
+    if slot_nr == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
         return None;
     }
-    let call = gex_kernel::syscalls::free_class(&gm, ctx_addr, compat)?;
+    let call = gex_kernel::syscalls::free_class_of(&gm, regs, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.
     if exited() {
@@ -12318,7 +12499,10 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
             o
         })
     } else {
-        sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64)
+        gex_kernel::phase::mark(3);
+        let o = sigs::free_call(&mut gm, ctx_addr, call, compat, pc as u64);
+        gex_kernel::phase::mark(10);
+        o
     };
     if n == nr::FUTEX || n == nr::EXIT {
         // Every futex this call woke (an `exit` wakes its thread's joiner),
@@ -12384,8 +12568,13 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>) -> Opt
         // A wasm32 program's sigreturn put back a call its handler
         // interrupted: that call, made now as a syscall of its own (without
         // the lock if it is a class call, as any other).
-        FreeOutcome::Again => return free_syscall(ctx, pc, mapped),
+        FreeOutcome::Again => {
+            let regs = gex_kernel::syscalls::call_regs(&gm, ctx_addr, compat);
+            let slot_nr = gm.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+            return free_syscall(ctx, pc, mapped, compat, regs, slot_nr);
+        }
     })
+    .inspect(|_| gex_kernel::phase::mark(11))
 }
 
 /// Park a class call ([`free_syscall`]) on its stream, without the kernel:
@@ -12599,7 +12788,7 @@ fn killed(signal: i32, at: u64) -> i32 {
     } else {
     warn_line(&format!(
         "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
-         last calls:{}\n  address space:{}\n  futexes:{}",
+         last calls (this thread):{}\n  address space:{}\n  futexes:{}",
         pid,
         signal,
         last_stderr(),
@@ -12978,7 +13167,7 @@ fn trap() -> ! {
     if jit_holds() {
         warn_line(&format!(
             "[gex] BUG: trapped out to JS holding the JIT lock, in syscall {}, taken at {}; given back (docs/kernel-locking.md §4.1)\n",
-            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+            LAST_SYSCALL.with(|c| c.get()) as i32,
             JIT_TAKER.with(|t| t.get()).map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line())),
         ));
         jit_give();
@@ -12999,7 +13188,7 @@ fn trap() -> ! {
     // a thread switch. Left unset, every crash after the first `execve`
     // reported itself as being inside syscall 221, and that sent the hunt for
     // the demo site's crash into `do_exec` twice.
-    IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
+    IN_SYSCALL.with(|c| c.set(false));
     // Nor in a pass of the clock (`NowScope`), whose `Drop` this skips as
     // well: left set, every later clock question on this Worker got the
     // reading the trapping syscall took, and a timed `poll` or `epoll_wait`
@@ -13036,7 +13225,7 @@ fn check_scopes_at_trap() {
             "[gex] BUG: trapped out to JS with{}{} still open, in syscall {} (docs/kernel-locking.md §4.1)\n",
             if kernel { " the kernel" } else { "" },
             if defer { " a GL deferral" } else { "" },
-            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+            LAST_SYSCALL.with(|c| c.get()) as i32,
         ));
     }
 }
@@ -13075,35 +13264,43 @@ fn phase(n: u32) {
 
 /// The syscall number the guest is inside, or the last one it was inside.
 ///
-/// A plain static, deliberately: it is read after a crash, when the kernel
+/// A plain cell, deliberately: it is read after a crash, when the kernel
 /// may still be borrowed by whatever crashed, and anything that took the
-/// kernel to answer would panic instead of answering.
-static LAST_SYSCALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(!0);
+/// kernel to answer would panic instead of answering. This Worker's own:
+/// what its reports and its JS ask is its own thread's call (one word every
+/// Worker wrote at every call named another thread's in a report).
+thread_local! {
+    static LAST_SYSCALL: std::cell::Cell<u32> = const { std::cell::Cell::new(!0) };
+}
 
-/// Whether the guest is *still* inside that syscall, rather than past it:
-/// `LAST_SYSCALL` alone reads the same for a crash in a handler and a crash in
-/// translated code after a harmless call. Cleared by dropping [`InSyscall`],
-/// which a trap does not run, so a crash truly inside a handler leaves this set.
-static IN_SYSCALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Whether the guest is *still* inside that syscall, rather than past it:
+    /// `LAST_SYSCALL` alone reads the same for a crash in a handler and a crash in
+    /// translated code after a harmless call. Cleared by dropping [`InSyscall`],
+    /// which a trap does not run, so a crash truly inside a handler leaves this set.
+    /// This Worker's own, as `LAST_SYSCALL`: another Worker inside a call
+    /// made this one's guest fault read as the shim's (`gex_guest_oob`).
+    static IN_SYSCALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 struct InSyscall;
 
 impl Drop for InSyscall {
     fn drop(&mut self) {
-        IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
+        IN_SYSCALL.with(|c| c.set(false));
     }
 }
 
 /// Which syscall the guest was in. `0xffffffff` if it has made none.
 #[no_mangle]
 pub extern "C" fn gex_last_syscall() -> u32 {
-    LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed)
+    LAST_SYSCALL.with(|c| c.get())
 }
 
 /// Whether [`gex_last_syscall`] names a call still on the stack.
 #[no_mangle]
 pub extern "C" fn gex_in_syscall() -> u32 {
-    IN_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as u32
+    IN_SYSCALL.with(|c| c.get()) as u32
 }
 
 /// The address of the last indirect branch the guest took.
@@ -14382,7 +14579,7 @@ fn watch_mem(where_: &str) {
         warn_line(&format!(
             "[watch] pid {} [{addr:#x}] = {now:#x} (was {last:#x}) at {where_}, last syscall {}\n",
             my_pid(),
-            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+            LAST_SYSCALL.with(|c| c.get()),
         ));
     }
 }
@@ -14627,7 +14824,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 object_off_at(last),
                 object_off_at(src),
                 stack.join(", "),
-                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+                LAST_SYSCALL.with(|c| c.get()),
             ));
             // A return a call-out should have caught: the call-outs open, and
             // the callback depth this Worker is at.
@@ -15568,7 +15765,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 "gex: running {:?}, {} vmas, last syscall {}, ctx pc={:#x}\n",
                 home.exe(),
                 home.mm().lock().vmas().len(),
-                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+                LAST_SYSCALL.with(|c| c.get()),
                 gm.read_u64(c + ctx::PC as u64).unwrap_or(0),
             ));
         })();
@@ -15663,7 +15860,7 @@ fn kuser_unfolded(arg: i64) -> ! {
 /// process ended.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
-    if IN_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) || jit_holds() || sigs::home().is_none() {
+    if IN_SYSCALL.with(|c| c.get()) || jit_holds() || sigs::home().is_none() {
         return 0;
     }
     let c = match my_ctx() {
@@ -16600,24 +16797,34 @@ pub extern "C" fn gex_loader_done_ms() -> u64 {
 /// When this process began, for the measurement above.
 static PROCESS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The path of the most recent `openat`, for the crash report: its own
-/// lock, since `openat` takes no other (L14b).
-static LAST_OPEN: gex_kernel::sync::Mutex<String> = gex_kernel::sync::Mutex::new(String::new());
+/// The longest prefix of a path [`LAST_OPEN`] keeps.
+const LAST_OPEN_MAX: usize = 256;
+
+thread_local! {
+    /// The path of this thread's most recent `openat` (its first
+    /// [`LAST_OPEN_MAX`] bytes, and how many), for the crash report. The
+    /// thread's own: written by its `openat`, read by the report its Worker
+    /// makes (`gex_last_open`, on the same thread). No lock, and nothing
+    /// allocated per open: a global under its own lock was taken by every
+    /// Worker's every `openat`.
+    static LAST_OPEN: (Cell<[u8; LAST_OPEN_MAX]>, Cell<usize>) = const { (Cell::new([0; LAST_OPEN_MAX]), Cell::new(0)) };
+}
 
 /// How many bytes of it there are, written into the shim's own buffer.
 #[no_mangle]
 pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
-    let s = LAST_OPEN.lock();
-    let n = s.len().min(max as usize);
-    shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
+    let (bytes, len) = LAST_OPEN.with(|(b, l)| (b.get(), l.get()));
+    let n = len.min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&bytes[..n]);
     n as u32
 }
 
-fn note_process_syscall(base: u64, pc: i64) {
+/// `n` is the call's canonical number and `a` its arguments, as the entry
+/// read them (an x86 process's too: its number is not in `x(8)`).
+fn note_process_syscall(n: u64, a: &[u64; 6], pc: i64) {
     use gex_kernel::syscalls::{clone_flags, nr};
     let gm = GuestMem::new(guest_bytes());
-    let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
-    let n = g(8);
+    let g = |i: usize| a[i];
     // How much of a process is its dynamic linker: `ld.so` links in translated
     // code once per process, recomputing an answer a closure pins at build
     // time. Counting its syscalls says what avoiding it is worth.
@@ -16630,12 +16837,26 @@ fn note_process_syscall(base: u64, pc: i64) {
     // inside `openat` says nothing about which file, one bounded string read
     // away.
     if n == nr::OPENAT {
-        if let Ok(b) = gm.read_cstr(g(1), 256) {
-            // Its own lock: every Worker's openat writes it, and two at once
-            // through a bare cell was a wild store (the browser's stack
-            // smash).
-            let path = String::from_utf8_lossy(&b).into_owned();
-            *LAST_OPEN.lock() = path;
+        // This thread's own copy (`LAST_OPEN`): no other Worker writes it,
+        // so no lock. Up to the NUL, or the first `LAST_OPEN_MAX` bytes.
+        // (A path within `LAST_OPEN_MAX` of memory's end: the bounded
+        // string read, which copies.)
+        let keep = |b: &[u8]| {
+            let len = b.iter().position(|&c| c == 0).unwrap_or(b.len()).min(LAST_OPEN_MAX);
+            let mut buf = [0u8; LAST_OPEN_MAX];
+            buf[..len].copy_from_slice(&b[..len]);
+            LAST_OPEN.with(|(p, l)| {
+                p.set(buf);
+                l.set(len);
+            });
+        };
+        match gm.read(g(1), LAST_OPEN_MAX) {
+            Ok(b) => keep(b),
+            Err(_) => {
+                if let Ok(b) = gm.read_cstr(g(1), LAST_OPEN_MAX) {
+                    keep(&b);
+                }
+            }
         }
     }
     if n != nr::CLONE && n != nr::EXECVE {
@@ -16679,6 +16900,9 @@ fn note_process_syscall(base: u64, pc: i64) {
                 named.push(name);
             }
         }
+        // x86-64's `clone` has the child's tid word before the TLS.
+        let x86_64 = gex_abi::X86 && CLOCK_ABI.load(std::sync::atomic::Ordering::Relaxed) != 1;
+        let (tls, ctid) = if x86_64 { (g(4), g(3)) } else { (g(3), g(4)) };
         let kind = if f & clone_flags::THREAD != 0 {
             "clone/thread"
         } else {
@@ -16690,8 +16914,8 @@ fn note_process_syscall(base: u64, pc: i64) {
             f & 0xff,
             g(1),
             g(2),
-            g(3),
-            g(4),
+            tls,
+            ctid,
         )
     };
     trace_line(&format!("[gex:{pid}] t{} pc={pc:#x} {what}\n", cur()));

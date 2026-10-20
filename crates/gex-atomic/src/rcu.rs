@@ -181,6 +181,14 @@ impl<T> Published<T> {
         empty
     }
 
+    /// Which value is current: it changes when a write replaces it, after
+    /// the new one is in. A reader that kept a copy of the value it read
+    /// along with this, and finds it unchanged, holds the current value (or
+    /// the one a write in progress is replacing).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(SeqCst)
+    }
+
     /// The value, for its only owner.
     pub fn get_mut(&mut self) -> &mut T {
         // SAFETY: `&mut self`: nobody else can be reading or writing.

@@ -1044,6 +1044,8 @@ async function handle(msg) {
     if (beat) {
       gex.shim.exports.gex_set_heartbeat?.(BigInt(beat));
     }
+    // GEX_PHASES: one call's time by phase (gex_kernel::phase), said every 20,000 stats.
+    if (msg.phases || msg.opts?.phases) gex.shim.exports.gex_set_phases?.(msg.phases || msg.opts.phases);
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.winsize) {

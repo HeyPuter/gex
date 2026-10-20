@@ -716,6 +716,18 @@ pub trait FileSystem: Send + Sync {
     fn walk(&self, abs: &str, follow_final: bool, mounts: &str) -> Result<Walked, Errno> {
         walk_links(abs.to_string(), follow_final, mounts, &|rel| self.read_link(rel))
     }
+    /// [`FileSystem::walk`] with the final link followed, and the metadata
+    /// of where it ends: `None` when the walk reached one of `mounts`, which
+    /// names its own. A `stat` of a path in the root, in one step: one round
+    /// trip where this filesystem's calls are ([`remote::RemoteFs`]), one
+    /// lock where they take one ([`TmpFs`]).
+    fn walk_metadata(&self, abs: &str, mounts: &str) -> Result<Option<Metadata>, Errno> {
+        let w = self.walk(abs, true, mounts)?;
+        if w.at_mount {
+            return Ok(None);
+        }
+        self.metadata(w.path.trim_start_matches('/')).map(Some)
+    }
     fn unlink(&self, path: &str) -> Result<(), Errno> {
         let _ = path;
         Err(Errno::EROFS)
@@ -844,6 +856,13 @@ impl VfsView {
     /// The namespace as it stands.
     pub fn get(&self) -> Arc<Namespace> {
         self.cur.read(crate::sync::me() as usize, Arc::clone)
+    }
+
+    /// Which namespace [`Self::get`] gives: it changes with each one
+    /// published. A caller that keeps what `get` gave, with the epoch read
+    /// before it, keeps the current namespace while this reads the same.
+    pub fn epoch(&self) -> u64 {
+        self.cur.epoch()
     }
 
     /// How many times the mount table has changed, now.
@@ -1194,8 +1213,12 @@ impl Namespace {
 
     pub fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let mut current = normalize(path, &self.cwd);
-        if let Some((fs, rel)) = self.resolve_final(&current)? {
-            return fs.metadata(&rel);
+        // In the root, all links followed (`resolve_final`, then the
+        // metadata there): one step.
+        if let Some(root) = self.mounts.get("/") {
+            if let Some(md) = root.walk_metadata(&current, &self.others)? {
+                return Ok(md);
+            }
         }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
@@ -1452,6 +1475,50 @@ pub fn walk_links(
     Err(Errno::ELOOP)
 }
 
+/// [`walk_links`] where `abs` (normalised) has no link on it, without
+/// building anything: `Some(at_mount)` for the walk's answer (`abs` itself,
+/// stopped at one of `mounts` or not), `None` when it meets a link (or
+/// `abs` is not normal), for `walk_links` to follow. The same questions in
+/// the same order, so the same answer; most lookups meet no link, and the
+/// walk's copy of the path was an allocation on every one.
+pub fn walk_plain(abs: &str, follow_final: bool, mounts: &str, is_link: &dyn Fn(&str) -> bool) -> Option<bool> {
+    if !is_normal(abs) {
+        return None;
+    }
+    let under = |p: &str| mounts.split('\0').any(|m| !m.is_empty() && within(p, m));
+    let last = abs.rfind('/').unwrap_or(0);
+    let mut end = 0;
+    while end < last {
+        end = abs[end + 1..].find('/').map_or(abs.len(), |i| end + 1 + i);
+        if end > last {
+            break;
+        }
+        let prefix = &abs[..end];
+        if under(prefix) {
+            return Some(true);
+        }
+        if is_link(&prefix[1..]) {
+            return None;
+        }
+    }
+    if !follow_final {
+        return Some(false);
+    }
+    if under(abs) {
+        return Some(true);
+    }
+    if is_link(abs.trim_start_matches('/')) {
+        return None;
+    }
+    Some(false)
+}
+
+/// Whether `abs` is within one of `mounts` (NUL-separated, as
+/// [`walk_links`] takes them).
+pub fn within_any(abs: &str, mounts: &str) -> bool {
+    mounts.split('\0').any(|m| !m.is_empty() && within(abs, m))
+}
+
 /// Make a path absolute and remove `.`, `..` and redundant separators.
 ///
 /// Purely lexical, like `realpath -m`: symlinks are resolved separately, by
@@ -1577,6 +1644,30 @@ mod tests {
         assert_eq!(w("//bin/./sh", true), Walked { path: "/usr/bin/dash".into(), at_mount: false });
     }
 
+    /// TmpFs's one-lock `walk_metadata` answers as a walk and then a
+    /// metadata do (the trait's own `walk_metadata`).
+    #[test]
+    fn tmpfs_walk_metadata_is_walk_then_metadata() {
+        let fs = TmpFs::new();
+        fs.add_dir("usr");
+        fs.add_dir("usr/bin");
+        fs.add_file("usr/bin/dash", vec![1, 2, 3]);
+        fs.symlink("usr/bin", "bin").unwrap();
+        fs.symlink("dash", "usr/bin/sh").unwrap();
+        fs.symlink("nowhere", "usr/dangling").unwrap();
+        fs.symlink("/proc/self", "self").unwrap();
+        let mounts = "/proc\0/w";
+        for p in ["/", "/usr", "/usr/bin", "/usr/bin/dash", "/usr/bin/sh", "/bin", "/bin/sh", "/bin/dash", "/usr/dangling",
+                  "/usr/missing", "/missing/x", "/proc", "/proc/1", "/w", "/w/x", "/self", "/self/exe", "//usr/./bin/sh",
+                  "/usr/bin/dash/x"] {
+            let fast = fs.walk_metadata(p, mounts);
+            let slow = fs.walk(p, true, mounts).and_then(|w| {
+                if w.at_mount { Ok(None) } else { fs.metadata(w.path.trim_start_matches('/')).map(Some) }
+            });
+            assert_eq!(fast.map(|m| m.map(|m| (m.file_type, m.size, m.ino))), slow.map(|m| m.map(|m| (m.file_type, m.size, m.ino))), "{p}");
+        }
+    }
+
     #[test]
     fn parent_and_basename() {
         assert_eq!(parent_of("/a/b/c"), "/a/b");
@@ -1691,5 +1782,42 @@ mod tests {
         assert_eq!(w("/run", true).unwrap(), Walked { path: "/run".into(), at_mount: true });
         assert_eq!(w("/loop", true), Err(Errno::ELOOP));
         assert_eq!(w("/", true).unwrap(), Walked { path: "/".into(), at_mount: false });
+    }
+
+    /// `walk_plain` answers as `walk_links` wherever it answers, and hands
+    /// every path with a link on it (or not normal) to `walk_links`.
+    #[test]
+    fn walk_plain_answers_as_walk_links_or_not_at_all() {
+        let links = |rel: &str| match rel {
+            "bin" => Ok("usr/bin".to_string()),
+            "usr/bin/sh" => Ok("dash".to_string()),
+            "var/run" => Ok("/run".to_string()),
+            "proc2" => Ok("/proc".to_string()),
+            _ => Err(Errno::EINVAL),
+        };
+        let mounts = "/proc\0/run\0/w";
+        let paths = [
+            "/", "/usr", "/usr/bin", "/usr/bin/dash", "/usr/bin/sh", "/bin", "/bin/sh", "/var/run", "/var/run/x",
+            "/proc", "/proc/self/exe", "/procession/x", "/run", "/w", "/w/a/b", "/tmp/missing.txt", "/a/b/c/d/e/f",
+            "/proc2/x", "/usr//bin", "/usr/./bin", "/usr/../bin/sh", "relative",
+        ];
+        let mut answered = 0;
+        for p in paths {
+            for f in [false, true] {
+                let plain = walk_plain(p, f, mounts, &|rel| links(rel).is_ok());
+                if let Some(at_mount) = plain {
+                    answered += 1;
+                    assert_eq!(Ok(Walked { path: p.to_string(), at_mount }), walk_links(p.to_string(), f, mounts, &links), "{p} {f}");
+                } else {
+                    // a link on the path (a directory's, or the last's when
+                    // followed), or a path to normalise first
+                    let comps: Vec<&str> = p.split('/').filter(|c| !c.is_empty()).collect();
+                    let upto = if f { comps.len() } else { comps.len().saturating_sub(1) };
+                    let link = (1..=upto).any(|n| links(&comps[..n].join("/")).is_ok());
+                    assert!(!is_normal(p) || link, "{p} {f}: no answer, with no link on it");
+                }
+            }
+        }
+        assert!(answered > 20, "{answered}");
     }
 }

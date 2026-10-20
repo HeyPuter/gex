@@ -464,6 +464,13 @@ impl TmpFs {
         }
     }
 
+    /// [`super::walk_plain`] here: the walk's answer for `abs` with no link
+    /// on it, `None` for [`FileSystem::walk`] to follow them.
+    pub fn walk_plain(&self, abs: &str, follow_final: bool, mounts: &str) -> Option<bool> {
+        let inner = self.inner.lock().unwrap();
+        super::walk_plain(abs, follow_final, mounts, &|rel| matches!(inner.nodes.get(rel), Some(Node::Symlink(_))))
+    }
+
     /// How many directories have been renamed here
     /// ([`FileHandle::rename_epoch`]).
     pub fn renames(&self) -> u64 {
@@ -671,6 +678,64 @@ impl TmpFs {
         }
     }
 
+    /// The metadata of the node at `path` (relative), from the tree.
+    /// The node first: a miss (most of a lookup's answers) asks no more.
+    fn meta_at(inner: &Inner, path: &str) -> Result<Metadata, Errno> {
+        let Some(node) = inner.nodes.get(path) else {
+            return Err(Errno::ENOENT);
+        };
+        TmpFs::meta_of(inner, path, node)
+    }
+
+    /// [`TmpFs::meta_at`] of `node`, found at `path`.
+    fn meta_of(inner: &Inner, path: &str, node: &Node) -> Result<Metadata, Errno> {
+        let ino = TmpFs::ino_of(inner, path);
+        let mtime = || inner.mtimes.get(path).copied().unwrap_or(0);
+        match node {
+            Node::File(f) => Ok(Metadata {
+                file_type: FileType::Regular,
+                size: f.size(),
+                mode: inner.modes.get(path).copied().unwrap_or(0o644),
+                ino,
+                mtime: f.mtime.load(Ordering::Relaxed),
+                // Every name that maps to this inode is a hard link to it.
+                nlink: inner.nlink(ino),
+                rdev: 0,
+                times: f.times(),
+            }),
+            Node::Dir => {
+                let d = Metadata::dir();
+                Ok(Metadata {
+                    ino,
+                    mtime: mtime(),
+                    nlink: TmpFs::dir_nlink(inner, path),
+                    mode: inner.modes.get(path).copied().unwrap_or(d.mode),
+                    ..d
+                })
+            }
+            Node::Symlink(t) => Ok(Metadata {
+                file_type: FileType::Symlink,
+                size: t.len() as u64,
+                mode: 0o777,
+                ino,
+                mtime: mtime(),
+                nlink: 1,
+                rdev: 0,
+                times: Default::default(),
+            }),
+            Node::Socket => Ok(Metadata {
+                file_type: FileType::Socket,
+                size: 0,
+                mode: 0o755,
+                ino,
+                mtime: mtime(),
+                nlink: 1,
+                rdev: 0,
+                times: Default::default(),
+            }),
+        }
+    }
+
     fn ino_of(inner: &Inner, path: &str) -> u64 {
         inner.inos.get(path).copied().unwrap_or(1)
     }
@@ -812,53 +877,7 @@ impl FileHandle for TmpHandle {
             // names left, as `fstat` of one says on Linux.
             return Ok(Metadata { ino: self.dir.unwrap_or(1), nlink: 0, ..Metadata::dir() });
         };
-        let path = &path;
-        let ino = TmpFs::ino_of(&inner, path);
-        let mtime = inner.mtimes.get(path).copied().unwrap_or(0);
-        match inner.nodes.get(path) {
-            Some(Node::File(f)) => Ok(Metadata {
-                file_type: FileType::Regular,
-                size: f.size(),
-                mode: inner.modes.get(path).copied().unwrap_or(0o644),
-                ino,
-                mtime: f.mtime.load(Ordering::Relaxed),
-                // Every name that maps to this inode is a hard link to it.
-                nlink: inner.nlink(ino),
-                rdev: 0,
-                times: f.times(),
-            }),
-            Some(Node::Dir) => {
-                let d = Metadata::dir();
-                Ok(Metadata {
-                    ino,
-                    mtime,
-                    nlink: TmpFs::dir_nlink(&inner, path),
-                    mode: inner.modes.get(path).copied().unwrap_or(d.mode),
-                    ..d
-                })
-            }
-            Some(Node::Symlink(t)) => Ok(Metadata {
-                file_type: FileType::Symlink,
-                size: t.len() as u64,
-                mode: 0o777,
-                ino,
-                mtime,
-                nlink: 1,
-                rdev: 0,
-                times: Default::default(),
-            }),
-            Some(Node::Socket) => Ok(Metadata {
-                file_type: FileType::Socket,
-                size: 0,
-                mode: 0o755,
-                ino,
-                mtime,
-                nlink: 1,
-                rdev: 0,
-                times: Default::default(),
-            }),
-            None => Err(Errno::ENOENT),
-        }
+        TmpFs::meta_at(&inner, &path)
     }
 
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
@@ -1102,14 +1121,10 @@ impl FileSystem for TmpFs {
         }))
     }
 
+    /// From the tree, under one lock: no handle made (with its own copy of
+    /// the path) for one question.
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        let handle = TmpHandle {
-            inner: Arc::clone(&self.inner),
-            path: path.to_string(),
-            file: None,
-            dir: None,
-        };
-        handle.metadata()
+        TmpFs::meta_at(&self.inner.lock().unwrap(), path)
     }
 
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
@@ -1155,6 +1170,34 @@ impl FileSystem for TmpFs {
             Some(Node::Symlink(t)) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    /// The walk and the metadata under one lock.
+    fn walk_metadata(&self, abs: &str, mounts: &str) -> Result<Option<Metadata>, Errno> {
+        let inner = self.inner.lock().unwrap();
+        let is_link = |rel: &str| matches!(inner.nodes.get(rel), Some(Node::Symlink(_)));
+        // The directories without a link (or a mount) on them: the last
+        // name's node is then looked up once, for its link and its metadata.
+        match super::walk_plain(abs, false, mounts, &is_link) {
+            Some(true) => return Ok(None),
+            Some(false) if !super::within_any(abs, mounts) => {
+                let rel = abs.trim_start_matches('/');
+                match inner.nodes.get(rel) {
+                    None => return Err(Errno::ENOENT),
+                    Some(Node::Symlink(_)) => {}
+                    Some(node) => return TmpFs::meta_of(&inner, rel, node).map(Some),
+                }
+            }
+            _ => {}
+        }
+        let w = super::walk_links(abs.to_string(), true, mounts, &|rel| match inner.nodes.get(rel) {
+            Some(Node::Symlink(t)) => Ok(t.clone()),
+            _ => Err(Errno::EINVAL),
+        })?;
+        if w.at_mount {
+            return Ok(None);
+        }
+        TmpFs::meta_at(&inner, w.path.trim_start_matches('/')).map(Some)
     }
 
     /// One lock for the whole walk, not one per component.

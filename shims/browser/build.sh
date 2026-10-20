@@ -81,6 +81,9 @@ EXTRA=""
 # GEX_LOCK_RANKS=1: check the lock order (docs/kernel-locking.md §4.3) in this
 # release build. A test build, not a shipping one.
 [ -n "${GEX_LOCK_RANKS:-}" ] && { FEATURES="${FEATURES:---features }${FEATURES:+,}lock-ranks"; EXTRA="$EXTRA,lock-ranks"; }
+# GEX_PHASE_MARKS=1: a syscall's time by phase (gex_kernel::phase), read with
+# the run's GEX_PHASES=1. A measuring build, not a shipping one.
+[ -n "${GEX_PHASE_MARKS:-}" ] && { FEATURES="${FEATURES:---features }${FEATURES:+,}phases"; EXTRA="$EXTRA,phases"; }
 
 OUT=target/wasm32-unknown-unknown$TSUF/release/gex_browser.wasm
 RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES --target-dir target${TSUF:+/x86-browser}

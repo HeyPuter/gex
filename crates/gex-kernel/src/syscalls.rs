@@ -2663,8 +2663,9 @@ pub struct PathIo<'a> {
     /// `O_TMPFILE`'s names, numbered per process.
     pub tmpfiles: &'a std::sync::atomic::AtomicU64,
     /// The calling thread's fs_struct: `chdir`'s, `umask`'s, and what
-    /// `mkdir` leaves out of the mode it is asked for.
-    pub fs: Arc<FsCwd>,
+    /// `mkdir` leaves out of the mode it is asked for. Borrowed where the
+    /// caller holds it (a page Worker's call: no count taken per call).
+    pub fs: std::borrow::Cow<'a, Arc<FsCwd>>,
     /// For `utimensat`'s "now".
     pub clock: ClockFn,
 }
@@ -3095,18 +3096,23 @@ impl PathIo<'_> {
         buf: u64,
         flags: u64,
     ) -> SysResult {
+        crate::phase::mark(5);
         let raw = m.read_cstr(path, 4096)?;
         if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
             return self.fstat(m, dirfd, buf);
         }
-        let p = self.at_path(m, dirfd, path)?;
+        // The path as read: not read again (`at_path`).
+        let p = self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)?;
+        crate::phase::mark(6);
         let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             self.ns.metadata_nofollow(&p)
         } else {
             self.ns.metadata(&p)
         };
+        crate::phase::mark(7);
         let md = md?;
         m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        crate::phase::mark(9);
         Ok(0)
     }
 
@@ -3535,12 +3541,10 @@ impl PathIo<'_> {
 
     pub fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
-        let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
-        self.at_path_str(dirfd, &p)
+        self.at_path_str(dirfd, std::str::from_utf8(&raw).map_err(|_| Errno::EINVAL)?)
     }
 
     pub fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
-        let p = p.to_string();
         // An empty path names nothing (the AT_EMPTY_PATH forms check for it
         // before they get here), as on Linux.
         if p.is_empty() {
@@ -5789,15 +5793,47 @@ pub struct FreeCall {
 /// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
 /// call translates them.
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
-    if gex_abi::PPC {
-        return free_class_ppc(m, ctx_addr);
+    free_class_of(m, call_regs(m, ctx_addr, compat), compat)
+}
+
+/// A call's number and arguments as its ABI gives them, read from the
+/// context once ([`call_regs`]): what [`free_class_of`] classes, and what a
+/// host's own bookkeeping of the call reads instead of the context again.
+#[derive(Clone, Copy, Debug)]
+pub struct CallRegs {
+    /// The number in the ABI's own numbering (an i386 process's from `x(0)`,
+    /// 32 bits; a ppc32 process's 32 bits of `SYSCALL_NR`).
+    pub raw: u64,
+    /// The six arguments (an i386 process's 32 bits each, unextended).
+    pub a: [u64; 6],
+}
+
+impl CallRegs {
+    /// The canonical number (the kernel's own, AArch64's).
+    pub fn canonical(&self, compat: bool) -> u64 {
+        if gex_abi::PPC {
+            crate::ppc::canonical_number(self.raw)
+        } else if compat {
+            crate::i386::canonical_number(self.raw)
+        } else if gex_abi::X86 {
+            crate::x86::canonical_number(self.raw)
+        } else {
+            self.raw
+        }
     }
+}
+
+/// The call in the context at `ctx_addr`: its number and arguments, where
+/// [`free_class`] and the full call read them.
+pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
+    let compat = compat && !gex_abi::PPC;
     let raw = if compat {
         m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) & 0xffff_ffff
+    } else if gex_abi::PPC {
+        m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff
     } else {
         m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     };
-    let Some(n) = free_number(raw, compat) else { return nosys_call(raw, compat) };
     let mut a = [0u64; 6];
     for (i, v) in a.iter_mut().enumerate() {
         *v = if compat {
@@ -5806,6 +5842,17 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
             m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0)
         };
     }
+    CallRegs { raw, a }
+}
+
+/// [`free_class`] of a call already read ([`call_regs`] of the same
+/// context and ABI).
+pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<FreeCall> {
+    if gex_abi::PPC {
+        return free_class_ppc(m, regs);
+    }
+    let CallRegs { raw, mut a } = regs;
+    let Some(n) = free_number(raw, compat) else { return nosys_call(raw, compat) };
     // A `clone` that makes a process (no `CLONE_THREAD`) is the host's, and
     // so are `fork` and `vfork`, which are `clone` canonically: only the
     // ABI's own `clone` and `clone3` carry their flags in the first argument.
@@ -5836,8 +5883,8 @@ pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeC
 /// full call reads them (`SYSCALL_NR`, `SYSCALL_ARGS`), the class decided on
 /// the canonical number [`crate::ppc::translate`] gives, and the arguments
 /// left raw, for [`free_call`] to translate as the full call does.
-fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
-    let raw = m.read_u64(ctx_addr + ctx::SYSCALL_NR as u64).unwrap_or(!0) & 0xffff_ffff;
+fn free_class_ppc(m: &GuestMem<'_>, regs: CallRegs) -> Option<FreeCall> {
+    let CallRegs { raw, a } = regs;
     let n = crate::ppc::canonical_number(raw);
     let admitted = match n {
         crate::ppc::UNKNOWN => false,
@@ -5848,10 +5895,6 @@ fn free_class_ppc(m: &GuestMem<'_>, ctx_addr: u64) -> Option<FreeCall> {
     };
     if !admitted {
         return nosys_call(raw, false);
-    }
-    let mut a = [0u64; 6];
-    for (i, v) in a.iter_mut().enumerate() {
-        *v = m.read_u64(ctx_addr + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
     }
     // As for the other ABIs: only a thread's `clone` is the free path's.
     if is_thread_clone(n) {
@@ -8596,7 +8639,7 @@ impl Kernel {
             procs: &self.procs,
             ptys: self.ptys,
             tmpfiles: &self.tmpfiles,
-            fs: self.fs_of(self.ctx_addr),
+            fs: std::borrow::Cow::Owned(self.fs_of(self.ctx_addr)),
             clock: self.clock,
         }
     }

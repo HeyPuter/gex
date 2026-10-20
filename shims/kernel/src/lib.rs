@@ -2554,6 +2554,26 @@ fn path_of(at: gex_kmem::PAddr, len: u32) -> String {
         .to_string()
 }
 
+/// [`path_of`] (`trim`) or [`path_of_raw`] without the allocations: the path
+/// read onto this call's stack, as `f` sees it. Every lookup crosses here,
+/// most several times (a stat is a walk and a metadata), and each copy made
+/// two allocations in this module's heap.
+fn with_path<R>(at: gex_kmem::PAddr, len: u32, trim: bool, f: impl FnOnce(&str) -> R) -> R {
+    let mut stack = [0u8; 512];
+    let mut heap = Vec::new();
+    let buf: &mut [u8] = if len as usize <= stack.len() {
+        &mut stack[..len as usize]
+    } else {
+        heap.resize(len as usize, 0);
+        &mut heap
+    };
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    let s = String::from_utf8_lossy(buf);
+    f(if trim { s.trim_start_matches('/') } else { &s })
+}
+
 /// A `Result` as the caller reads it: a count, or a negated errno.
 fn as_ret(r: Result<u64, gex_kernel::errno::Errno>) -> i32 {
     match r {
@@ -2766,8 +2786,7 @@ pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
 /// for anything an open would refuse.
 #[no_mangle]
 pub extern "C" fn k_fs_path_meta(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr) -> i32 {
-    let p = path_of(path, path_len);
-    match rootfs().metadata(&p) {
+    match with_path(path, path_len, true, |p| rootfs().metadata(p)) {
         Ok(m) => {
             let b = remote::encode_meta(&m);
             unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
@@ -2792,9 +2811,24 @@ pub extern "C" fn k_fs_walk(
     at: gex_kmem::PAddr,
     cap: u32,
 ) -> i32 {
-    let abs = path_of_raw(path, path_len);
-    let mounts = path_of_raw(mounts, mounts_len);
-    match rootfs().walk(&abs, follow != 0, &mounts) {
+    // No link on the path (most lookups): the answer is the path itself,
+    // written back as it came, with nothing built.
+    let plain = with_path(path, path_len, false, |abs| {
+        with_path(mounts, mounts_len, false, |m| match rootfs().walk_plain(abs, follow != 0, m) {
+            Some(at_mount) if abs.len() as u32 <= cap => {
+                if !abs.is_empty() {
+                    unsafe { gex_kmem::push_checked(at, abs.as_ptr(), abs.len() as u32) };
+                }
+                Some(abs.len() as i32 | if at_mount { gex_kernel::vfs::remote::WALK_AT_MOUNT } else { 0 })
+            }
+            _ => None,
+        })
+    });
+    if let Some(r) = plain {
+        return r;
+    }
+    let walked = with_path(path, path_len, false, |abs| with_path(mounts, mounts_len, false, |mounts| rootfs().walk(abs, follow != 0, mounts)));
+    match walked {
         Ok(w) => {
             let b = w.path.as_bytes();
             if b.len() as u32 > cap {
@@ -2810,10 +2844,28 @@ pub extern "C" fn k_fs_walk(
     }
 }
 
+/// [`gex_kernel::vfs::FileSystem::walk_metadata`] through the root: a
+/// `stat` of a path in it in one call (it was a walk and then a metadata).
+/// The metadata into `at` and 0, a negated errno, or
+/// `remote::WALK_META_AT_MOUNT` (nothing written) when the walk reached one
+/// of the caller's `mounts`.
+#[no_mangle]
+pub extern "C" fn k_fs_walk_meta(path: gex_kmem::PAddr, path_len: u32, mounts: gex_kmem::PAddr, mounts_len: u32, at: gex_kmem::PAddr) -> i32 {
+    let r = with_path(path, path_len, false, |abs| with_path(mounts, mounts_len, false, |mounts| rootfs().walk_metadata(abs, mounts)));
+    match r {
+        Ok(Some(m)) => {
+            let b = remote::encode_meta(&m);
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
+            0
+        }
+        Ok(None) => remote::WALK_META_AT_MOUNT,
+        Err(e) => -e.0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr, cap: u32) -> i32 {
-    let p = path_of(path, path_len);
-    match rootfs().read_link(&p) {
+    match with_path(path, path_len, true, |p| rootfs().read_link(p)) {
         Ok(t) => {
             let b = t.as_bytes();
             if b.len() as u32 > cap {
