@@ -7049,7 +7049,13 @@ fn wait_needs_page(r: &Run) -> bool {
         // A terminal: nobody but the page can type into it. Nor a socket
         // whose far end is the page.
         Waiting::Read(h) | Waiting::Write(h) => !is_peer(h) || is_remote(h),
-        Waiting::Accept(h) => is_remote(h),
+        // Also a blocking `recv`/`recvfrom`/`recvmsg`, which parks as this
+        // (`BlockOp::AcceptWait`). A socket with no wait queue (a Wisp one:
+        // its bytes arrive on this Worker's own event loop) has nothing that
+        // could notify a park in wasm, so it is the page's: parked here, a
+        // `recv` on a host TCP socket slept until its deadline, forever.
+        // One with a queue is ended by another Worker's notify, as before.
+        Waiting::Accept(h) => is_remote(h) || h.wait_queue() == 0,
         // Every timed wait and every `poll` parks as this, whatever it is
         // watching -- a Wisp socket whose bytes arrive on this thread, a
         // descriptor the page serves, or a pipe between two guests. So look
