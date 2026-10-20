@@ -227,13 +227,29 @@ fn template(off: &[String]) -> String {
         ),
         (
             "features",
-            obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(!off.iter().any(|x| x == f.name)))).collect()),
+            obj(crate::features::FEATURES.iter().map(|f| (f.name, json::b(f.name != "translation" && !off.iter().any(|x| x == f.name)))).collect()),
         ),
         ("bundle", s("split")),
         ("cold", s(COLD_DEFAULT)),
         ("resources", s("trim")),
         ("start", obj(vec![])),
     ]))
+}
+
+/// Whether the page runs ahead-of-time code only: `"translation"` off, the
+/// default unless `"cold": "jit"` (the function JIT's cold code) or an
+/// explicit `"translation": true` keeps a translator.
+fn aot_only(config: &Config) -> Result<bool> {
+    let on = config.features_on.iter().any(|x| x == "translation");
+    let off = config.features_off.iter().any(|x| x == "translation");
+    let cold_jit = config.cold.as_deref() == Some("jit");
+    if off && cold_jit {
+        bail!(
+            "user/eject.json: \"translation\": false, and \"cold\": \"jit\" leaves the cold code to the \
+             function JIT: leave \"translation\" unset for the function JIT alone, or pick another \"cold\""
+        );
+    }
+    Ok(!on && !cold_jit)
 }
 
 /// The site's `identities` (`base:key:identity:path;...`): for each unit, its
@@ -466,6 +482,10 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     let (config, config_bytes) = Config::load(dir)?;
     crate::features::check(&config.features_off)?;
     let mut off = config.features_off.clone();
+    let aot = aot_only(&config)?;
+    if aot && !off.iter().any(|x| x == "translation") {
+        off.push("translation".to_string());
+    }
 
     let web = dir.join("build/web");
     if web.exists() {
@@ -730,6 +750,11 @@ pub fn build(dir: &Path) -> Result<W3Report> {
     };
     // Split units: the page fetches their cold clusters (gex.mjs `gex.cold`).
     let mut params = params;
+    // Translation off: nothing is translated at run time (app.js `aot`).
+    params.retain(|(k, _)| k != "aot");
+    if aot {
+        params.push(("aot".to_string(), s("1")));
+    }
     // Each unit's image key and identity as the page computes them for the
     // image it ships (cgen.rs `known`), which the page takes instead of
     // hashing every byte of each image it maps.
@@ -810,4 +835,29 @@ pub fn build(dir: &Path) -> Result<W3Report> {
         false,
     )?;
     Ok(W3Report { features_off: off, page_files, units: units.len() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(features: &str, cold: Option<&str>) -> Config {
+        let dir = std::env::temp_dir().join(format!("gex-eject-wine32-aot-{}-{}", std::process::id(), features.len() + cold.map_or(0, |c| c.len() * 7)));
+        std::fs::create_dir_all(dir.join("user")).unwrap();
+        let cold = cold.map(|c| format!(", \"cold\": \"{c}\"")).unwrap_or_default();
+        std::fs::write(dir.join(crate::config::CONFIG_FILE), format!("{{\"features\": {{{features}}}{cold}}}")).unwrap();
+        let c = Config::load(&dir).unwrap().0;
+        std::fs::remove_dir_all(&dir).unwrap();
+        c
+    }
+
+    #[test]
+    fn translation_is_off_unless_kept() {
+        assert!(aot_only(&config("", None)).unwrap());
+        assert!(aot_only(&config("\"translation\": false", None)).unwrap());
+        assert!(!aot_only(&config("\"translation\": true", None)).unwrap());
+        // The function JIT's cold code keeps a translator, and contradicts an explicit off.
+        assert!(!aot_only(&config("", Some("jit"))).unwrap());
+        assert!(aot_only(&config("\"translation\": false", Some("jit"))).is_err());
+    }
 }

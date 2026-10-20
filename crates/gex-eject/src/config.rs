@@ -101,6 +101,9 @@ pub struct Config {
     /// The runtime's features this build leaves out (`"features"`, each
     /// `false`; see [`crate::features`]). Empty: everything in.
     pub features_off: Vec<String>,
+    /// The features `"features"` names `true`: kept by choice, where a
+    /// build's default would leave one out (a wine32 page's `"translation"`).
+    pub features_on: Vec<String>,
     /// W3 pages: `"bundle": "split"` ships only the files the recorded run
     /// opened in the site's bundle and serves the rest as lazy files, read
     /// from the host when a guest first reads them; `"whole"` (the default
@@ -163,6 +166,7 @@ impl Default for Config {
             jit_fallback: false,
             link_groups: Vec::new(),
             features_off: Vec::new(),
+            features_on: Vec::new(),
             bundle_split: false,
             cold: None,
             prune: None,
@@ -360,13 +364,13 @@ impl Config {
             }
             Some(_) => bail!("{what}: \"start\" is not an object"),
         };
-        c.features_off = match v.get("features") {
-            None | Some(Json::Null) => Vec::new(),
+        (c.features_off, c.features_on) = match v.get("features") {
+            None | Some(Json::Null) => (Vec::new(), Vec::new()),
             Some(Json::Obj(kv)) => {
-                let mut off = Vec::new();
+                let (mut off, mut on) = (Vec::new(), Vec::new());
                 for (k, x) in kv {
                     match x {
-                        Json::Bool(true) => {}
+                        Json::Bool(true) => on.push(k.clone()),
                         Json::Bool(false) => off.push(k.clone()),
                         _ => bail!("{what}: features: \"{k}\" is not true or false"),
                     }
@@ -374,7 +378,7 @@ impl Config {
                         crate::features::check(&[k.clone()])?;
                     }
                 }
-                off
+                (off, on)
             }
             Some(_) => bail!("{what}: \"features\" is not an object of true and false"),
         };
@@ -455,7 +459,9 @@ mod tests {
 
     #[test]
     fn the_template_is_the_default() {
-        assert_eq!(Config::from_json(&template()).unwrap(), Config::default());
+        // Every feature named kept, which is what a config without them means.
+        let all = crate::features::FEATURES.iter().map(|f| f.name.to_string()).collect();
+        assert_eq!(Config::from_json(&template()).unwrap(), Config { features_on: all, ..Config::default() });
     }
 
     #[test]
