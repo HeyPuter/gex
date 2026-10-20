@@ -686,7 +686,8 @@ async function handle(msg) {
   // `?nullguard=1`: the null guard (gex_abi::null_guard), a debugging opt-in.
   if (msg.nullGuard) globalThis.GEX_NULL_GUARD = 1;
   if (msg.testBreakStackGuard) globalThis.GEX_TEST_BREAK_STACK_GUARD = 1;
-  if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
+  if (msg.eagerBlocks) globalThis.GEX_EAGER_BLOCKS = 1;
+  if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // Lazy files the page is filling in the background (app.js `fill`): their
   // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
@@ -1245,6 +1246,7 @@ async function handle(msg) {
       // is per module and paid every time.
       compileMs: gex.compileMillis,
       unitHits: gex.unitHits,
+      compiles: gex.compileCount,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
       byObject: gex.blocksByObject,

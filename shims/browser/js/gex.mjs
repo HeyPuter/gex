@@ -245,11 +245,14 @@ function moduleContentKey(bytes) {
   if (!(bytes instanceof Uint8Array)) return null;
   // A little-endian word at a time, then the tail bytes (the shim's
   // `content_key` is the same function): a byte at a time was 0.65 s of a
-  // node start-up per Worker.
+  // node start-up per Worker. Bytes in a shared memory too: a registry
+  // module's are written before the row naming them and never again, and
+  // read a byte at a time they held a dispatch waiting on its module 20 ms
+  // per 500 KB.
   let a = 0x811c9dc5;
   let b = 0x9e3779b9;
   const n = bytes.length >>> 2;
-  const words = (bytes.byteOffset & 3) === 0 && !isShared(bytes.buffer)
+  const words = (bytes.byteOffset & 3) === 0
     ? new Uint32Array(bytes.buffer, bytes.byteOffset, n)
     : null;
   for (let i = 0; i < n; i++) {
@@ -880,11 +883,6 @@ export class Gex {
   /// carries no byte copies. Only the compile is shared -- each Worker still
   /// instantiates against its own tables.
   #sharedModules = new Map();
-  /// A spawned thread that registers the process's modules lazily (directory +
-  /// tables now, instance on the branch that wants it) instead of installing
-  /// them all up front. Set in `adoptThread` from `GEX_LAZY_THREAD`. See
-  /// `#catchUpLazy` and gtk-startup-is-per-thread-install.
-  #lazyCatchUp = false;
   /** Whether this process numbers its blocks densely (gex_emit::dense): a
    *  dense table's slots live in the process's slot maps, and this Worker's
    *  only table for them is `blocks`, one entry per block. */
@@ -1389,6 +1387,15 @@ export class Gex {
       // await, which is a whole event-loop turn), separated because neither
       // showed in the other counters.
       now: this.#nowFills,
+      // Dense modules this Worker's catch-up left alone, and the ones a miss
+      // then instantiated (`#leaveDense`).
+      denseLeft: this.#denseLeft,
+      denseWanted: this.#denseCatchUps,
+      denseAsks: this.#denseAsks,
+      denseFillMs: this.#denseFillMs,
+      denseFillWorst: this.#denseFillWorst,
+      blocksLen: this.#guest?.exports?.blocks?.length ?? 0,
+      ftabLen: Number(this.#cgen?.ftab?.length ?? 0),
       nowMs: Math.round(this.#nowMs),
       sysMs: Math.round(Number(this.#shim.exports.gex_sys_us?.() ?? 0n) / 1000),
       sysN: Number(this.#shim.exports.gex_sys_calls?.() ?? 0n),
@@ -3321,6 +3328,7 @@ export class Gex {
    */
   async adoptThread(shimWasm, guestWasm, thread) {
     this.#threaded();
+    this.#threadTid = thread.tid;
     await this.attach(shimWasm, guestWasm, { devices: false });
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
@@ -3333,11 +3341,6 @@ export class Gex {
     // (`gex_set_compat`) are process constants in the shared memory, set
     // once by the process's own Worker before its first guest instruction.
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
-    // A spawned thread runs almost none of the process's modules, so registering
-    // them lazily (instance on the branch that wants it) skips compiling and
-    // instantiating the rest -- the dominant startup cost for a threaded app.
-    // Opt-in while it proves out; the eager path below is the safe default.
-    this.#lazyCatchUp = !!globalThis.GEX_LAZY_THREAD;
     // Install every already-translated module into this Worker's own tables
     // before it runs an instruction. The funcref tables are per-thread (a wasm
     // table is not shareable) while the directory naming their slots is shared
@@ -3678,21 +3681,12 @@ export class Gex {
     // Every slot the *process* has claimed, not the pending module's -- this
     // Worker is catching up on all of them at once.
     const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
-    // A spawned thread branches into almost none of the process's modules (a
-    // GLib pool worker runs `start_thread` and then sits in a condvar), yet
-    // eager catch-up compiles+instantiates every one -- ~48% of an idle helper
-    // thread's whole startup, on code it never runs (see gtk-startup profile).
-    // The lazy path registers each module's directory the same way a fork's
-    // inherited modules are (`gex_add_lazy_module`) but defers the instance to
-    // the branch that wants it (`fillSlot`). Off unless the thread opted in.
-    if (this.#lazyCatchUp && e.gex_add_lazy_module) {
-      return this.#catchUpLazy(have, need);
-    }
     const t0 = globalThis.GEX_ATTACH_TRACE ? performance.now() : 0;
     const comp0 = this.#compileMs;
     let n = 0, reused = 0;
     for (; this.#installed < have; this.#installed++) {
       const i = this.#installed;
+      if (this.#leaveDense(i)) continue;
       // Copied out before compiling: the registry is in the guest's memory,
       // and another thread allocating can move it.
       const bytes = this.#registryBytes(i);
@@ -3727,7 +3721,7 @@ export class Gex {
       if (mod && key) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(i, key, mod);
       }
       n++;
     }
@@ -3735,6 +3729,7 @@ export class Gex {
       console.error(`[catchup] installed ${n + reused} modules in ${Math.round(performance.now() - t0)}ms`
         + ` (${Math.round(this.#compileMs - comp0)}ms compile, ${reused} reused from siblings)`);
     }
+    if (globalThis.GEX_FILL_TIME) console.warn(`[gex] ${this.#whoFills()}: caught up, ${this.#fillCounts()}`);
   }
 
   /**
@@ -3755,56 +3750,6 @@ export class Gex {
   addSharedModule(key, mod) {
     if (typeof key === 'string' && mod instanceof WebAssembly.Module && !this.#sharedModules.has(key) && !this.#deadKeys.has(key)) {
       this.#sharedModules.set(key, mod);
-    }
-  }
-
-  /**
-   * Catch up on the process's modules the lazy way: register each one's
-   * directory and grow the tables, but leave the instance for the branch that
-   * wants it -- exactly how a fork's inherited modules and closure libraries
-   * are handled (`#adoptModule`, `#lazyClosure`), and through the same
-   * `gex_add_lazy_module`/`gex_lazy_owner`/`fillSlot` path. A spawned thread
-   * runs a handful of the process's ~thousands of modules, so this skips
-   * compiling and instantiating the rest. The registry bytes carry the same
-   * directory the main thread already published, so re-registering is
-   * idempotent; it only fills in *this* Worker's own `LAZY_OWNER` map so its
-   * miss path can find the module.
-   */
-  async #catchUpLazy(have, need) {
-    const e = this.#shim.exports;
-    // Grow the funcref tables once to the whole claimed range, so any branch
-    // resolves to a slot (its instance is written when the branch faults).
-    if (need) this.#growTables(need, 'lazy-catchup');
-    let lazy = 0, eager = 0;
-    for (; this.#installed < have; this.#installed++) {
-      const i = this.#installed;
-      const bytes = this.#registryBytes(i);
-      if (!bytes) continue;
-      const meta = metadataSection(bytes);
-      // No metadata means nothing to key a later fill on -- install it eagerly,
-      // as the fork path does (`#adoptModule`), reusing a sibling's compile.
-      if (!meta || !meta.length) {
-        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(this.#registryKey(i, bytes)));
-        eager++;
-        continue;
-      }
-      const gp = e.gex_alloc(meta.length) >>> 0;
-      this.#bytes().set(meta, gp);
-      const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
-      e.gex_free?.(gp, meta.length);
-      if (!got) {
-        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(this.#registryKey(i, bytes)));
-        eager++;
-        continue;
-      }
-      // Keep a sibling's compiled Module when we have it, so the on-demand
-      // instantiate skips the compile too; otherwise the raw bytes. The push
-      // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(this.#registryKey(i, bytes)) ?? bytes, need, inst: null, meta });
-      lazy++;
-    }
-    if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
-      console.error(`[catchup] lazy-registered ${lazy} modules (${eager} eager, deferred instantiation)`);
     }
   }
 
@@ -7234,12 +7179,14 @@ export class Gex {
    *  bytes a sibling already hashed; computed from `bytes` otherwise. */
   #registryKey(i, bytes) {
     const r = this.#registryRow(i);
-    if (r.ext) return `${bytes.length}:${r.keyHi}:${r.keyLo}`;
+    // The shim keys every row as it publishes it (`content_key`, the same
+    // function); hashing here is for a shim that keys only the store's.
+    if (r.ext || r.keyHi || r.keyLo) return `${bytes.length}:${r.keyHi}:${r.keyLo}`;
     return moduleContentKey(bytes);
   }
 
   /** Registry module `i`'s row: where its bytes are (`ptr`, or `ext`, the
-   *  module store's offset plus one), how many, and the store writer's key.
+   *  module store's offset plus one), how many, and the bytes' content key.
    *  One call and a read of the row (`gex_module_row`), which the shim
    *  publishes for readers holding no lock; the getters one field at a time
    *  for a shim without it. Remembered for the last `i` asked, since a
@@ -7259,8 +7206,8 @@ export class Gex {
     } else {
       const ext = e.gex_module_ext ? Number(e.gex_module_ext(i)) : 0;
       r = { i, ptr: e.gex_module_ptr(i) >>> 0, len: e.gex_module_len(i) >>> 0, ext,
-        keyHi: ext && e.gex_module_key ? e.gex_module_key(i, 0) >>> 0 : 0,
-        keyLo: ext && e.gex_module_key ? e.gex_module_key(i, 1) >>> 0 : 0 };
+        keyHi: e.gex_module_key ? e.gex_module_key(i, 0) >>> 0 : 0,
+        keyLo: e.gex_module_key ? e.gex_module_key(i, 1) >>> 0 : 0 };
     }
     this.#rowMemo = r;
     return r;
@@ -7325,7 +7272,7 @@ export class Gex {
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(count - 1, key, mod);
       }
     }
   }
@@ -7356,6 +7303,10 @@ export class Gex {
   }
   #unitHits = 0;
   get unitHits() { return this.#unitHits; }
+  /** Modules this Worker compiled from bytes rather than took compiled: the
+   *  engine may still find the code of the same bytes compiled elsewhere. */
+  #compiles = 0;
+  get compileCount() { return this.#compiles; }
 
   /** The module just installed, to the page's unit cache under `ukey`. */
   #unitShare(ukey) {
@@ -7375,6 +7326,7 @@ export class Gex {
     const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
     for (; this.#installed < have; this.#installed++) {
       const i = this.#installed;
+      if (this.#leaveDense(i)) continue;
       const bytes = this.#registryBytes(i);
       if (!bytes) continue;
       const key = this.#registryKey(i, bytes);
@@ -7385,7 +7337,7 @@ export class Gex {
       if (mod && key) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(i, key, mod);
       }
     }
   }
@@ -7454,7 +7406,7 @@ export class Gex {
       if (mod && key && !this.#sharedModules.has(key)) {
         this.#sharedModules.set(key, mod);
         this.#deadKeys.delete(key);
-        this.#env.shareModule?.(key, mod);
+        this.#shareRegistry(count - 1, key, mod);
       }
     }
   }
@@ -7500,7 +7452,9 @@ export class Gex {
   async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
+    const P = [performance.now()];
     this.#reapDead();
+    P.push(performance.now());
     const tg = performance.now();
     const tables = this.#growTables(need, 'install');
     this.#growMs += performance.now() - tg;
@@ -7544,6 +7498,7 @@ export class Gex {
       throw err;
     }
     this.#compileMs += performance.now() - tc;
+    if (mod !== precompiled && mod !== bytes) this.#compiles++;
     // Under Node, `GEX_DUMP_WASM=DIR` keeps every unit compiled, for
     // looking at what a translation is made of (docs/jit-guest.md).
     if (bytes instanceof Uint8Array && globalThis.process?.env?.GEX_DUMP_WASM) {
@@ -7595,8 +7550,11 @@ export class Gex {
     // is one running total that cannot say which tables absolute segments fall
     // in; the segments (or `Metadata` for an already-compiled module) can, which
     // avoids the strict-grow retry below.
+    P.push(performance.now());
     const own = meta ?? (bytes instanceof Uint8Array ? metadataSection(bytes) : null);
+    P.push(performance.now());
     const seg = elementTableNeeds(bytes);
+    P.push(performance.now());
     const needs = seg.length ? seg : own ? metaTableNeeds(own) : [];
     for (let t = 0; t < needs.length; t++) if (needs[t]) this.#reach(t, needs[t]);
     let inst;
@@ -7678,6 +7636,8 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
+    P.push(performance.now());
+    this.#installSplit = P;
     // The instance, so the caller can remember which library it belongs to.
     return inst;
   }
@@ -8127,24 +8087,93 @@ export class Gex {
     const e = this.#shim.exports;
     const d = e.gex_dense_want ? e.gex_dense_want() >>> 0 : 0;
     if (!d) return;
+    this.#denseAsks++;
     const i = e.gex_dense_owner(d);
     if (i < 0) return;
     const bytes = this.#registryBytes(i);
     if (!bytes) return;
+    const t0 = performance.now();
+    const c0 = this.#compileMs, i0 = this.#instantiateMs, g0 = this.#growMs;
     const key = this.#registryKey(i, bytes);
     const cached = key ? this.#sharedModules.get(key) : undefined;
     this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
     this.#denseCatchUps++;
-    if (cached) return;
-    const mod = this.#compiled[this.#compiled.length - 1]?.mod;
-    if (mod && key) {
-      this.#sharedModules.set(key, mod);
-      this.#deadKeys.delete(key);
-      this.#env.shareModule?.(key, mod);
+    if (!cached) {
+      const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+      if (mod && key) {
+        this.#sharedModules.set(key, mod);
+        this.#deadKeys.delete(key);
+        this.#shareRegistry(i, key, mod);
+      }
+    }
+    const ms = performance.now() - t0;
+    this.#denseFillMs += ms;
+    if (ms > this.#denseFillWorst) {
+      this.#denseFillWorst = ms;
+      if (globalThis.GEX_FILL_TIME && ms >= 1) {
+        console.warn(`[gex] ${this.#whoFills()}: dense module ${i} (${bytes.length} bytes${cached ? ', compiled elsewhere' : ''}) took ${ms.toFixed(2)} ms, ` +
+          `${(this.#compileMs - c0).toFixed(1)} compiling, ${(this.#instantiateMs - i0).toFixed(1)} instantiating, ${(this.#growMs - g0).toFixed(1)} growing (${this.#splitText()}), the longest here; ` +
+          `${this.#fillCounts()}, ${this.#denseFillMs.toFixed(1)} ms filling`);
+      }
     }
   }
 
+  /** The last install's times (`#installModuleInner`): its start, then the
+   *  end of reaping, of growing and compiling, of reading its metadata, of
+   *  reading its segments, and of instantiating and filling. */
+  #installSplit = null;
+  #splitText() {
+    const P = this.#installSplit;
+    if (!P || P.length < 6) return '';
+    const d = (k) => (P[k] - P[k - 1]).toFixed(1);
+    return `reap ${d(1)}, grow+compile ${d(2)}, meta ${d(3)}, segments ${d(4)}, instantiate+fill ${d(5)}`;
+  }
+
+  /** Dense modules a miss instantiated here, and the misses that asked. */
   #denseCatchUps = 0;
+  #denseAsks = 0;
+  /** Their instantiate time in this Worker: the total, and the longest one
+   *  (a dispatch waits for it, whichever thread it is). */
+  #denseFillMs = 0;
+  #denseFillWorst = 0;
+  /** The thread this Worker runs, when it was spawned for one (`adoptThread`). */
+  #threadTid = 0;
+  #whoFills() {
+    return `pid ${this.#shim.exports.gex_my_pid?.() ?? '?'} ${this.#threadTid ? `tid ${this.#threadTid}` : 'main thread'}`;
+  }
+  /** What this Worker holds, for `?filltime=1`. */
+  #fillCounts() {
+    return `${this.#installs} modules installed (${this.#compiles} compiled here), ` +
+      `dense ${this.#denseCatchUps} filled of ${this.#denseLeft} left, blocks ${this.#guest?.exports?.blocks?.length ?? 0}`;
+  }
+  /** Dense registry modules this Worker's catch-up left to a miss. */
+  #denseLeft = 0;
+
+  /** Registry module `i`, compiled here, to the host's relay for this
+   *  process's other Workers -- unless it is a dense module those Workers
+   *  instantiate on a miss (`#leaveDense`): relayed, every module would be
+   *  posted through the page's main thread to every Worker and kept there,
+   *  for Workers most of which never run it. A miss compiling the same bytes
+   *  again gets the engine's code for them while any Worker holds it. */
+  #shareRegistry(i, key, mod) {
+    const e = this.#shim.exports;
+    if (this.#dense && !globalThis.GEX_EAGER_BLOCKS && e.gex_registry_dense_n && (e.gex_registry_dense_n(i) >>> 0)) return;
+    this.#env.shareModule?.(key, mod);
+  }
+
+  /** Whether catching up skips registry module `i`: a dense module, which
+   *  the first dispatch that wants one of its blocks instantiates here
+   *  (`#denseCatchUp`), so a Worker holds only what its thread runs.
+   *  `blocks` is grown for it all the same, its entries the miss stub.
+   *  `?eagerblocks=1` instantiates everything as before. */
+  #leaveDense(i) {
+    const e = this.#shim.exports;
+    if (!this.#dense || globalThis.GEX_EAGER_BLOCKS || !e.gex_registry_dense_n) return false;
+    if (!(e.gex_registry_dense_n(i) >>> 0)) return false;
+    this.#denseLeft++;
+    this.#growBlocks();
+    return true;
+  }
 
   /** Dead modules of the process (`gex_dense_dead_*`) this Worker has let go of. */
   #deadSeen = 0;

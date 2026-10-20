@@ -1169,11 +1169,14 @@ async function runProgramHere(
       // value rather than the later one that dereferences it and traps. In
       // `extra` so every Worker enables it.
       checkSp: flag('checksp') ? 1 : undefined,
-      // `?lazythread=1`: a spawned thread's Worker instantiates the process's
-      // modules when a branch reaches them, not all up front -- a memory saver
-      // for a threaded program with many modules (x86-64's denser slots make
-      // each Worker's tables and modules dearer). In `extra` for every Worker.
-      lazyThread: flag('lazythread') ? 1 : undefined,
+      // `?eagerblocks=1` (debugging): every Worker instantiates every dense
+      // module of its process as it catches up, instead of each one when a
+      // dispatch first wants a block of it. In `extra` for every Worker.
+      eagerBlocks: flag('eagerblocks') ? 1 : undefined,
+      // `?filltime=1` (debugging): every Worker says when a dense module a
+      // dispatch waited for took longer than any before it. In `extra` for
+      // every Worker.
+      fillTime: flag('filltime') ? 1 : undefined,
       // `?claimpages=0`: publish closure dir entries at the build's slot numbers
       // instead of per-process demand numbering — a diagnostic for the
       // many-object-closure wrong-dispatch crash. In `extra` for every Worker.

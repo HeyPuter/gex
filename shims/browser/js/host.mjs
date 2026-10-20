@@ -1194,6 +1194,9 @@ export class ProcessHost {
               // And what that memory went on, which is the only way to tell a
               // guest that really maps a lot from a runtime spending it.
               (m.arena ? ` (maps ${m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
+              // Dense modules this Worker left for a miss, and those a miss took.
+              (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
+              (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +
               // The one memory every process shares: the filesystem and the
               // store of translated modules live in it, and it only grows.
               (this.#kernel?.memory
@@ -1227,7 +1230,7 @@ export class ProcessHost {
               (m.byObject ? ` [${m.byObject}]` : '') +
               (m.xlate ? ` xlate[insns=${m.xlate[0]} wasmKiB=${Math.round(m.xlate[1] / 1024)} units=${m.xlate[2]} smc=${m.xlate[3]} retiredPages=${m.xlate[4]} retires=${m.xlate[5]} relift=${m.xlate[6]}blk/${Math.round((m.xlate[8] ?? 0) / 1024)}KiB anon=${m.xlate[7]}blk/${Math.round((m.xlate[9] ?? 0) / 1024)}KiB]` : '') +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
-            ` (${m.compileMs}ms compile${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+            ` (${m.compileMs}ms compile${m.compiles !== undefined ? ` of ${m.compiles}` : ''}${m.unitHits ? `, ${m.unitHits} from the unit cache` : ''}, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
               (m.loader && m.loader.calls
                 ? `, ld.so ${m.loader.calls} syscalls, last at ${m.loader.doneMs}ms`

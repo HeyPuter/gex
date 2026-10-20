@@ -303,6 +303,14 @@ pub extern "C" fn gex_dense_want() -> u32 {
     WANT.with(|w| w.replace(0))
 }
 
+/// How many `blocks` entries registry module `i` holds (0: not a dense
+/// module, or one that died). A Worker leaves such a module to the miss that
+/// wants one of them (`gex_dense_want`) rather than installing it to catch up.
+#[no_mangle]
+pub extern "C" fn gex_registry_dense_n(i: u32) -> u32 {
+    crate::with_jit_only(|j| j.registry_dense.get(i as usize).map_or(0, |&(_, n)| n))
+}
+
 /// The registry module (`gex_module_ptr`) holding index `d`, newest first,
 /// or -1.
 #[no_mangle]
