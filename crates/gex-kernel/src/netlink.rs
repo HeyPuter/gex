@@ -10,9 +10,13 @@
 //! the loopback one every Windows machine has.
 //!
 //! The machine here has two: `lo` (127.0.0.1/8) and `eth0` (10.0.2.15/24,
-//! the address QEMU's user network gives a guest), the interface gex's
-//! network -- the host's, or a Wisp proxy's in the browser -- goes out on.
-//! IPv4 only, as that network is. glibc's `getaddrinfo` (`AI_ADDRCONFIG`)
+//! the address QEMU's user network gives a guest). The guest's network is
+//! the kernel's own in both modes (crate::net): it answers DNS with
+//! synthetic addresses and hands each connection to the host by name -- a
+//! host TCP socket natively, a Wisp stream in a page -- so the guest never
+//! sees the host's interfaces or addresses, natively either. `eth0` is that
+//! network's interface, the address a connected socket reports
+//! (`getsockname`, [`local_for`]). IPv4 only, as that network is. glibc's `getaddrinfo` (`AI_ADDRCONFIG`)
 //! reads the same dump and counts a non-loopback IPv4 address as "IPv4 is
 //! there", so `eth0` keeps its A lookups, and with no IPv6 address it now
 //! asks for no AAAA either.
@@ -73,6 +77,20 @@ struct Iface {
     prefix: u8,
 }
 
+/// eth0's address: where a connected socket says it is (`getsockname`).
+pub const ETH0_ADDR: [u8; 4] = [10, 0, 2, 15];
+
+/// The address a socket connected to `peer` (host order) has: lo's for a
+/// loopback peer, eth0's for any other. What `getsockname` reports for a
+/// connected socket not bound to an address of its own.
+pub fn local_for(peer: u32) -> u32 {
+    if peer >> 24 == 127 {
+        0x7f00_0001
+    } else {
+        u32::from_be_bytes(ETH0_ADDR)
+    }
+}
+
 const IFACES: [Iface; 2] = [
     Iface {
         index: 1,
@@ -91,7 +109,7 @@ const IFACES: [Iface; 2] = [
         flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST | IFF_LOWER_UP,
         mtu: 1500,
         mac: [0x02, 0, 0, 0, 0, 0x01],
-        addr: [10, 0, 2, 15],
+        addr: ETH0_ADDR,
         prefix: 24,
     },
 ];
@@ -485,5 +503,12 @@ mod tests {
         iface_ioctl(ioctl::SIOCGIFMTU, &mut r).unwrap();
         assert_eq!(i32::from_ge_bytes(r[16..20].try_into().unwrap()), 65536);
         assert_eq!(iface_ioctl(ioctl::SIOCGIFINDEX, &mut ifr("wlan0")).err(), Some(Errno::ENODEV));
+    }
+
+    #[test]
+    fn a_connected_socket_is_on_lo_or_eth0() {
+        assert_eq!(local_for(0x7f00_0001), 0x7f00_0001);
+        assert_eq!(local_for(0x7f12_3456), 0x7f00_0001);
+        assert_eq!(local_for(0xf000_0001).to_be_bytes(), ETH0_ADDR);
     }
 }

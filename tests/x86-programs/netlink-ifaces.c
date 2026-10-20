@@ -12,6 +12,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -71,6 +72,25 @@ int main(void)
     }
     printf("getifaddrs: 127.0.0.1 on lo %s, another IPv4 address %s\n", lo4 ? "yes" : "no", other4 ? "yes" : "no");
     if (!lo4 || !other4) fail = 1;
+
+    /* Where a connected socket says it is: on lo for a loopback peer, on a
+     * non-loopback IPv4 interface for any other (a UDP connect sends
+     * nothing). */
+    const char *peers[] = { "127.0.0.1", "192.0.2.1" };
+    for (int i = 0; i < 2; i++) {
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(9) }, me;
+        socklen_t len = sizeof me;
+        inet_pton(AF_INET, peers[i], &to.sin_addr);
+        int u = socket(AF_INET, SOCK_DGRAM, 0);
+        const char *got = "error";
+        if (u >= 0 && !connect(u, (struct sockaddr *)&to, sizeof to) && !getsockname(u, (struct sockaddr *)&me, &len)) {
+            uint32_t a = ntohl(me.sin_addr.s_addr);
+            got = a == INADDR_LOOPBACK ? "127.0.0.1" : a >> 24 == 127 || a == 0 ? "other" : "a non-loopback IPv4 address";
+        }
+        printf("getsockname after connect to %s: %s\n", peers[i], got);
+        if (strcmp(got, i ? "a non-loopback IPv4 address" : "127.0.0.1")) fail = 1;
+        if (u >= 0) close(u);
+    }
 
     struct addrinfo hints = { 0 }, *res = NULL;
     hints.ai_family = AF_UNSPEC;

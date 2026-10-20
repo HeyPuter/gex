@@ -4174,8 +4174,10 @@ impl NetIo<'_> {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
                 io.write_sockaddr(m, ip, port, a[1], a[2])
             }
-            // One interface, unnamed. A guest that asks where it is calling
-            // from gets 0.0.0.0, which is what an unbound socket reports.
+            // An unbound, unconnected socket is at 0.0.0.0; a connected one
+            // not bound to an address is on the interface its peer is
+            // reached by: lo for a loopback peer, else eth0 (crate::netlink,
+            // the interfaces the route socket and SIOCGIF* list).
             //
             // A unix socket is AF_UNIX and unnamed: libuv's
             // `uv_guess_handle` decides from the family whether a socket on
@@ -4185,7 +4187,13 @@ impl NetIo<'_> {
                 // AF_UNIX
                 Ok((1, _)) => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
                 _ => {
-                    let (ip, port) = io.socket_of(fd).map(|s| s.local()).unwrap_or((0, 0));
+                    let (ip, port) = io
+                        .socket_of(fd)
+                        .map(|s| match (s.local(), s.peer()) {
+                            ((0, port), Some((peer, _))) => (crate::netlink::local_for(peer), port),
+                            (local, _) => local,
+                        })
+                        .unwrap_or((0, 0));
                     io.write_sockaddr(m, ip, port, a[1], a[2])
                 }
             },
