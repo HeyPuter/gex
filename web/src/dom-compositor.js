@@ -239,6 +239,13 @@ class DomWindow {
       under.style.visibility === 'hidden';
     c.style.display = hidden ? 'none' : 'block';
     if (hidden) return;
+    // The same stacking as the window: a page that stacks its windows by
+    // `z-index` (the W3 shell does) would otherwise put this canvas under
+    // the very window it belongs to. Equal z-index and later in the
+    // document is above it.
+    const z = under.style.zIndex || getComputedStyle(under).zIndex;
+    const zi = z === 'auto' ? '' : z;
+    if (c.style.zIndex !== zi) c.style.zIndex = zi;
     const left = `${under.offsetLeft}px`, top = `${under.offsetTop}px`;
     const width = `${under.offsetWidth}px`, height = `${under.offsetHeight}px`;
     if (c.style.left !== left) c.style.left = left;
