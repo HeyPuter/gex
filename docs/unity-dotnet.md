@@ -2120,6 +2120,11 @@ Not yet:
   Muck with the default and no `?gllimits` (mk2, the seed shim, no unit):
   "OpenGL 4.2" context, no "Shader Unsupported", grass blades in
   `shots/mk2/c013.png`, 36.9 presents/s at 393 s.
+  (Superseded 2026-10-19: the default is now `gllimits=43`, GL 4.6 with the
+  adapter's compute limits. Muck renders correctly there with Mesa
+  g2/msvo-unformatted, and its MultiScaleVO AO costs about a quarter of the
+  frame rate: 22.7-24.1 presents/s against 32.6 forced to 4.2, edger, G2;
+  see docs/gl-path.md.)
 - **Muck dies with SIGILL at ~25 s on merge/unity's shim (977a2236,
   4ed5cad3)**, with the unit (mpg5, mk1) and without (mk4). It does not
   with 64efd78e (mk3, 4 minutes, no unit) or 1bf5ba09 (mk2). The page asked
