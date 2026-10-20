@@ -22,6 +22,7 @@ GEXC=${1:-target/x86/release/gexc}
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 fail=0
+netpid=""
 SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # tgkill-futex: a signal sent to a thread parked on a futex must end its wait
 # (Boehm's stop-the-world; the page asked the wrong thread's signal state).
@@ -38,6 +39,13 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # exec-signals: the mask, ignored signals and pending ones survive execve.
 # mem64-wx: a W^X JIT's high pages made executable (mprotect, and a fixed
 # executable mapping at 11 GiB): the M64 dense directory (refused before).
+# mem64-net: read/write, recv/send (and MSG_PEEK), readv/writev and
+# sendto/recvfrom on a TCP connection to a host server, and getrandom, into
+# and out of buffers above 4 GiB. In the page the bytes of a host socket
+# (GEX_NETWORK) cross between JS and the guest's buffer in place, and their
+# address was cut to 32 bits: a read landed on the shim's heap. The server
+# (mem64-net-server.mjs) is started once for this program and given to every
+# run as argv[1]; it is killed by its PID afterwards.
 # mem64-console: console output from above 4 GiB (a thread's stack, a
 # mapping); the address used to be cut to 32 bits.
 # clock-monotonic: the page's CLOCK_MONOTONIC never goes back, within a thread
@@ -187,7 +195,7 @@ SEED64=web/public/gex/seed.x86.m64.shared.wasm
 # null-access (with GEX_NULL_GUARD=1, the debug opt-in): loads and stores
 # through null pointers (and below 64 KiB) fault: a SIGSEGV handler runs and
 # jumps back out, and with no handler the process dies of SIGSEGV.
-PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access"}
+PAGE_PROGRAMS=${PAGE_PROGRAMS:-"fork-dirs spawn-threads served-entries page-cross-entry tgkill-futex exec-tail mem64-io mem64-net mem64-console mem64-smc mem64-reserve retire-during-lift close-while-reading thread-signals signal-storm exec-signals clock-monotonic main-thread-exit pi-mutex tcp-loopback pwait-sigmask sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers stale-loop-head stale-cross-page xattr mem64-wx mmap-coherent mmap-writeback null-access"}
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
     # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
@@ -215,13 +223,27 @@ for src in "$HERE"/*.c; do
         if [ $name = served-entries ]; then
             [ -x "$bin-b" ] || zig cc -target "$target" -O1 -static $extra -DVAL=2 -o "$bin-b" "$src" || { fail=1; continue; }
         fi
-        native=$("$bin" 2>/dev/null); ns=$?
+        # mem64-net: the far end, outside the guest, for every run of it.
+        args=""
+        if [ $name = mem64-net ]; then
+            if [ -z "$netpid" ]; then
+                rm -f "$WORK/mem64-net.port"
+                node "$HERE/mem64-net-server.mjs" >"$WORK/mem64-net.port" &
+                netpid=$!
+                for _ in $(seq 100); do [ -s "$WORK/mem64-net.port" ] && break; sleep 0.1; done
+            fi
+            args=$(head -1 "$WORK/mem64-net.port")
+            [ -n "$args" ] || { echo "FAIL $name: its server did not start"; fail=1; continue; }
+        fi
+        native=$("$bin" $args 2>/dev/null); ns=$?
         # smc-race: the translator waits between decoding a JIT-code block
         # and fixing its guard, so the writer's stores land in between.
         envs=""
         [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
         # null-access needs the null guard, a debug opt-in (gex_abi::null_guard).
         [ $name = null-access ] && envs="GEX_NULL_GUARD=1"
+        # mem64-net reaches the host: the page gets a network of real TCP sockets.
+        [ $name = mem64-net ] && envs="GEX_NETWORK=1"
         [ $name = page-cross-entry ] && [ $tier = page ] && envs="GEX_TEST_UNPUBLISHED_RETIRE=1"
         # exec-signals and exec-futex exec themselves: in the page, from the guest's filesystem.
         pageopts=""
@@ -229,12 +251,12 @@ for src in "$HERE"/*.c; do
         [ $name = served-entries ] && [ $tier = page ] && envs="GEX_TEST_SERVE_UNMERGED=1" &&
             pageopts="--file /bin/$name=$bin --file /bin/$name-b=$bin-b --argv0 /bin/$name"
         if [ $tier = page ]; then
-            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>"$WORK/$name.page.err"; gs=$?
+            env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" $args >"$WORK/$name.page" 2>"$WORK/$name.page.err"; gs=$?
             # 125: run-node's flaky "nothing could wake it" after a threaded
             # program has finished (OPTIMIZATION-BACKLOG.md); once more.
             if [ $gs = 125 ]; then
                 echo "     $name (page): exit 125, once more"
-                env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" >"$WORK/$name.page" 2>/dev/null; gs=$?
+                env $envs GEX_ARCH=x86 GEX_SHARED=1 GEX_MEM64=1 timeout 120 node shims/browser/js/run-node.mjs $pageopts "$SEED64" "$bin" $args >"$WORK/$name.page" 2>/dev/null; gs=$?
             fi
             gex=$(grep -v '^\[host\]' "$WORK/$name.page")
             if [ $name = fork-dirs ] && grep -q 'gex: heal' "$WORK/$name.page.err"; then
@@ -242,7 +264,7 @@ for src in "$HERE"/*.c; do
                 gex="$gex (heal lines)"
             fi
         else
-            gex=$(env $envs "$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
+            gex=$(env $envs "$GEXC" run $flags "$bin" $args 2>/dev/null); gs=$?
         fi
         if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
             echo "ok   $name ($target, $tier, exit $ns)"
@@ -256,4 +278,5 @@ for src in "$HERE"/*.c; do
     done
     done
 done
+[ -n "$netpid" ] && kill "$netpid"
 exit $fail
