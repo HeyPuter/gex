@@ -1030,8 +1030,8 @@ export class ProcessHost {
         const key = `${pid}:${m.thread.tid}`;
         // Each process's memory by pid (a thread's Worker is keyed `pid:tid`), weakly (an exited process's memory
         // is not kept): what a harness reads a guest word from while the
-        // process's own Workers are busy in wasm (tests/games/noita-page.mjs,
-        // Noita's world frame counter). A threaded process registers here.
+        // process's own Workers are busy in wasm (e.g. a game's
+        // frame counter). A threaded process registers here.
         if (typeof WeakRef === 'function' && m.thread.memory) {
           (globalThis.__gexMemories ??= new Map()).set(Number(String(pid).split(':')[0]), new WeakRef(m.thread.memory));
         }

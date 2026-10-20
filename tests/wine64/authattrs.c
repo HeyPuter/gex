@@ -1,8 +1,8 @@
 /* crypt32: a signed message whose authenticated attributes are not in DER
  * order verifies (the signature covers the attributes as encoded, which
- * Authenticode signers need not sort). FL Studio checks its engine DLL's
- * signature this way, and Wine's re-encoding of the attributes failed it
- * with TRUST_E_CERT_SIGNATURE. Vectors: authattrs-gen.py. */
+ * Authenticode signers need not sort). Wine's re-encoding of the
+ * attributes failed such a check with TRUST_E_CERT_SIGNATURE. Vectors:
+ * authattrs-gen.py. */
 #include <windows.h>
 #include <wincrypt.h>
 #include <stdio.h>

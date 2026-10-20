@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Generate gex-steam's interface classes for every interface version, from
-a directory of Steamworks interface headers (docs/games.md, "gex-steam").
+a directory of Steamworks interface headers.
 
     gen_versions.py SDK_DIR STEAM_API_JSON ABI OUT.inc
 
 SDK_DIR holds the current SDK headers (isteamuser.h, ...) and one header
-per older interface version (isteamuser018.h declaring ISteamUser018, as
-the Goldberg emulator's sdk/steam keeps them). STEAM_API_JSON (the current
+per older interface version (isteamuser018.h declaring ISteamUser018). STEAM_API_JSON (the current
 SDK's steam_api.json) gives typedefs and struct layouts. ABI is msvc or
 itanium.
 

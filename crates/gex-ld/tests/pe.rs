@@ -385,8 +385,8 @@ fn bound_imports_are_rebound() {
     assert!(e.to_string().contains("bound imports from KERNEL32.dll"), "{e}");
 }
 
-/// A bound-import directory that is not one (Windows 7's mspaint.exe names
-/// header bytes that never terminate) is ignored, as Windows ignores it.
+/// A bound-import directory that is not one (header bytes that never
+/// terminate) is ignored, as Windows ignores it.
 #[test]
 fn garbage_bound_imports_are_ignored() {
     let mut files = arch_files("x86");

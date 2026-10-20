@@ -1,11 +1,11 @@
 /* Window decorations under gex's compositor (tests/deco/deco.sh): Wine draws
  * a window's frame and the compositor draws none, as on Windows.
  *   P  a WS_POPUP window at 100,100, 300x200, red, its top 30 px a yellow
- *      caption of its own (WM_NCHITTEST HTCAPTION), as FL Studio draws one;
+ *      caption of its own (WM_NCHITTEST HTCAPTION), as a skinned app draws one;
  *   O  a WS_OVERLAPPEDWINDOW at 500,100, 300x200 (Wine's caption and
  *      border), blue inside.
  *   C  a WS_POPUP window centred on the screen (GetSystemMetrics), 200x100,
- *      green, as FL Studio centres its splash; once P's drag is done
+ *      green, as an app centres its splash; once P's drag is done
  *      SetWindowPos moves it to 20,600.
  * The script (deco.wl) drags P by its caption by +200,+150; Win32's move
  * loop moves it. Prints the windows' rectangles, then "deco ok" when P is at

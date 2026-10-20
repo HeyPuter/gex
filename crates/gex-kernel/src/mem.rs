@@ -764,8 +764,7 @@ impl MemoryMap {
         // An island's range (W3's pinned DLL band, in the browser): backed and
         // the guest's, but never this map's arena. Adopted, an image's slot
         // went to the next bottom-up mapping once the image was unmapped, and
-        // the image loaded again (uxtheme, in Paint) relocated and missed its
-        // unit.
+        // the image, loaded again, relocated and missed its unit.
         if prev == BACKED_ISLAND {
             return Ok(());
         }

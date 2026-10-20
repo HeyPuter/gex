@@ -46,7 +46,7 @@ index 7d2b81fc9..56a529ae6 100644
  #endif
 +
 +/* The runtime wasm JIT's runtime half (mini-wasm.c and its interp hooks):
-+ * in the browser, and under gex (noita-wasm docs/unity-dotnet.md P5), where
++ * in the browser, and under gex, where
 + * what the browser does in JS goes through gex host imports (mini-wasm-gex.h). */
 +#if defined(HOST_BROWSER) || defined(HOST_GEX)
 +#define WJ_RUNTIME 1
@@ -3684,7 +3684,7 @@ index 000000000..a65e833e0
 @@ -0,0 +1,76 @@
 +/**
 + * \file
-+ * The runtime wasm JIT under gex (noita-wasm docs/unity-dotnet.md P5): what
++ * The runtime wasm JIT under gex: what
 + * the browser build gets from emscripten and from JS, here from the C library
 + * and from gex host imports (the provider's `gex.provider_jit_*`). Mono runs
 + * as a gex stateful provider: a wasm64 module with a 64-bit memory and a
@@ -5099,7 +5099,7 @@ index 65e95090d..c037a79de 100644
  	WASM_FUNCREF = 0x70,
  } WasmValtype;
  
-+/* A pointer-sized value: i32 on wasm32, i64 on wasm64 (gex, noita-wasm docs/unity-dotnet.md P5: Mono as a
++/* A pointer-sized value: i32 on wasm32, i64 on wasm64 (gex: Mono as a
 + * wasm64 provider with a memory64 and a table64). Addresses, references, native ints and function-table
 + * indices are all this type. */
 +#if TARGET_SIZEOF_VOID_P == 8

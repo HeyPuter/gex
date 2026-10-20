@@ -288,9 +288,9 @@ public static class T {
     }
     return sb.ToString();
   }
-  // Hollow Knight's hot interpreter legs (hg10), as shapes: Unity InputSystem's InputStateBlock.ReadFloat
-  // (ldind.* by format, uint -> float through conv.r.un), List<ref>.AddRange (checked add in shared generic code,
-  // OP_IADDCC) and a KeyCombo-style struct accessor that takes the address of a fixed buffer / local.
+  // Hot interpreter shapes: a float read by format (ldind.* by format, uint -> float through conv.r.un),
+  // List<ref>.AddRange (checked add in shared generic code, OP_IADDCC) and a struct accessor that takes the
+  // address of a fixed buffer / local.
   public class Ev { public int id; public Ev(int i) { id = i; } }
   [MethodImpl(MethodImplOptions.NoInlining)] static float UNorm(uint v, uint min, uint max) => (float)(v - min) / (max - min);
   [MethodImpl(MethodImplOptions.NoInlining)] static float INorm(int v, int min, int max) => (float)(v - min) / (max - min);
@@ -351,70 +351,57 @@ public static class T {
     h.Free();
     return "monoicalls " + acc;
   }
-  // Unity InputSystem's InputStateBlock.ReadFloat and its helpers, verbatim (decompiled), left inlinable as
-  // in the game: IntToNormalizedFloat(.., int.MinValue, ..) inlines a negative constant into a register that
-  // conv.r8 then reads, an i64 local on wasm64. hg25: invalid module, re-emitted 1195 times.
-  public static class NumH {
-    public static float IntToNormalizedFloat(int value, int minValue, int maxValue) {
-      if (value <= minValue) return 0f;
-      if (value >= maxValue) return 1f;
-      return (float)(((double)value - (double)minValue) / ((double)maxValue - (double)minValue));
+  // A sample reader by format: bit fields and integers normalised to [0,1] ([-1,1] when signed), floats
+  // as they are. The helpers stay inlinable, so a negative bound (int.MinValue, -128) is inlined into a
+  // register that conv.r8 then reads: an i64 local on wasm64.
+  public enum Fmt { Bits, SBits, I32, U32, I16, U16, U8, I8, F32, F64 }
+  public static class Norm {
+    public static float Signed(int v, int lo, int hi) {
+      if (v <= lo) return 0f;
+      if (v >= hi) return 1f;
+      return (float)(((double)v - (double)lo) / ((double)hi - (double)lo));
     }
-    public static float UIntToNormalizedFloat(uint value, uint minValue, uint maxValue) {
-      if (value <= minValue) return 0f;
-      if (value >= maxValue) return 1f;
-      return (float)(((double)value - (double)minValue) / ((double)maxValue - (double)minValue));
+    public static float Unsigned(uint v, uint lo, uint hi) {
+      if (v <= lo) return 0f;
+      if (v >= hi) return 1f;
+      return (float)(((double)v - (double)lo) / ((double)hi - (double)lo));
     }
-  }
-  public static class MemH {
-    public static unsafe bool ReadSingleBit(void* ptr, uint bitOffset) {
-      if (bitOffset >= 8) { int b = (int)bitOffset / 8; ptr = (byte*)ptr + b; bitOffset %= 8; }
-      return (*(byte*)ptr & (1 << (int)bitOffset)) != 0;
-    }
-    public static unsafe uint ReadMultipleBitsAsUInt(void* ptr, uint bitOffset, uint bitCount) {
-      ulong v = *(ulong*)ptr >> (int)bitOffset;
-      return (uint)(v & ((1UL << (int)bitCount) - 1));
-    }
-    public static unsafe float ReadMultipleBitsAsNormalizedUInt(void* ptr, uint bitOffset, uint bitCount) {
-      uint value = ReadMultipleBitsAsUInt(ptr, bitOffset, bitCount);
-      uint maxValue = (uint)((1L << (int)bitCount) - 1);
-      return NumH.UIntToNormalizedFloat(value, 0u, maxValue);
+    public static unsafe bool Bit(byte* p, uint at) => (p[at >> 3] & (1 << (int)(at & 7))) != 0;
+    public static unsafe float Field(byte* p, uint at, uint width) {
+      uint v = (uint)((*(ulong*)p >> (int)at) & ((1UL << (int)width) - 1));
+      return Unsigned(v, 0u, (uint)((1L << (int)width) - 1));
     }
   }
-  public struct StateBlock {
-    public int format; public uint byteOffset, bitOffset, sizeInBits;
-    public unsafe float ReadFloat(void* statePtr) {
-      byte* ptr = (byte*)statePtr + (int)byteOffset;
-      switch (format) {
-      case 1112101920:
-        if (sizeInBits == 1) { if (!MemH.ReadSingleBit(ptr, bitOffset)) return 0f; return 1f; }
-        return MemH.ReadMultipleBitsAsNormalizedUInt(ptr, bitOffset, sizeInBits);
-      case 1396853076:
-        if (sizeInBits == 1) { if (!MemH.ReadSingleBit(ptr, bitOffset)) return -1f; return 1f; }
-        return MemH.ReadMultipleBitsAsNormalizedUInt(ptr, bitOffset, sizeInBits) * 2f - 1f;
-      case 1229870112: return NumH.IntToNormalizedFloat(*(int*)ptr, int.MinValue, int.MaxValue) * 2f - 1f;
-      case 1430867540: return NumH.UIntToNormalizedFloat(*(uint*)ptr, 0u, uint.MaxValue);
-      case 1397248596: return NumH.IntToNormalizedFloat(*(short*)ptr, -32768, 32767) * 2f - 1f;
-      case 1431521364: return NumH.UIntToNormalizedFloat(*(ushort*)ptr, 0u, 65535u);
-      case 1113150533: return NumH.UIntToNormalizedFloat(*ptr, 0u, 255u);
-      case 1396857172: return NumH.IntToNormalizedFloat(*ptr, -128, 127) * 2f - 1f;
-      case 1179407392: return *(float*)ptr;
-      case 1145195552: return (float)(*(double*)ptr);
-      default: throw new InvalidOperationException("State format '" + format + "' is not supported as floating-point format");
+  public struct Sample {
+    public Fmt fmt; public uint byteAt, bitAt, width;
+    public unsafe float Read(void* state) {
+      byte* p = (byte*)state + (int)byteAt;
+      switch (fmt) {
+      case Fmt.Bits: return width == 1 ? (Norm.Bit(p, bitAt) ? 1f : 0f) : Norm.Field(p, bitAt, width);
+      case Fmt.SBits: return width == 1 ? (Norm.Bit(p, bitAt) ? 1f : -1f) : Norm.Field(p, bitAt, width) * 2f - 1f;
+      case Fmt.I32: return Norm.Signed(*(int*)p, int.MinValue, int.MaxValue) * 2f - 1f;
+      case Fmt.U32: return Norm.Unsigned(*(uint*)p, 0u, uint.MaxValue);
+      case Fmt.I16: return Norm.Signed(*(short*)p, -32768, 32767) * 2f - 1f;
+      case Fmt.U16: return Norm.Unsigned(*(ushort*)p, 0u, 65535u);
+      case Fmt.U8: return Norm.Unsigned(*p, 0u, 255u);
+      case Fmt.I8: return Norm.Signed(*p, -128, 127) * 2f - 1f;
+      case Fmt.F32: return *(float*)p;
+      case Fmt.F64: return (float)(*(double*)p);
+      default: throw new InvalidOperationException("format " + fmt + " is not a float format");
       }
     }
   }
   public static unsafe string ReadFloats(int n) {
-    int[] fmts = { 1112101920, 1396853076, 1229870112, 1430867540, 1397248596, 1431521364, 1113150533, 1396857172, 1179407392, 1145195552 };
+    Fmt[] fmts = { Fmt.Bits, Fmt.SBits, Fmt.I32, Fmt.U32, Fmt.I16, Fmt.U16, Fmt.U8, Fmt.I8, Fmt.F32, Fmt.F64 };
     var buf = stackalloc byte[24];
-    double acc = 0; var sb = new StateBlock();
+    double acc = 0; var sb = new Sample();
     for (int i = 0; i < n; i++) {
       *(ulong*)buf = (ulong)(uint)(i * 2654435761u) * 0x9E3779B97F4A7C15UL;
       *(ulong*)(buf + 8) = (ulong)(uint)(i * 40503u) * 0xC2B2AE3D27D4EB4FUL;
-      sb.format = fmts[i % fmts.Length]; sb.byteOffset = (uint)(i % 3); sb.bitOffset = (uint)(i % 5); sb.sizeInBits = (uint)(i % 4 == 0 ? 1 : 1 + i % 17);
-      if (sb.format == 1179407392) *(float*)(buf + sb.byteOffset) = i * 0.25f;
-      if (sb.format == 1145195552) *(double*)(buf + sb.byteOffset) = i * 0.125;
-      acc += sb.ReadFloat(buf);
+      sb.fmt = fmts[i % fmts.Length]; sb.byteAt = (uint)(i % 3); sb.bitAt = (uint)(i % 5); sb.width = (uint)(i % 4 == 0 ? 1 : 1 + i % 17);
+      if (sb.fmt == Fmt.F32) *(float*)(buf + sb.byteAt) = i * 0.25f;
+      if (sb.fmt == Fmt.F64) *(double*)(buf + sb.byteAt) = i * 0.125;
+      acc += sb.Read(buf);
     }
     return "readfloats " + acc.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
   }

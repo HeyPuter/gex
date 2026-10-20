@@ -1586,8 +1586,8 @@ pub(crate) fn unit_serves(addr: u64) -> bool {
 /// no code at all (a skeleton's `ud2` stub). A retirement of its page
 /// forgets the bridge and keeps the binding, so tier-1 must neither lift it
 /// (its discovery follows `call [iat]`) nor translate it at a miss, but
-/// bridge it again (`elfprov::rebridge`): IE8's Detours hooks beside
-/// user32's RegisterClassW ran its stub (c000001d).
+/// bridge it again (`elfprov::rebridge`): a hooking library patching code
+/// beside a bound export would otherwise run its stub (c000001d).
 pub(crate) fn provider_serves(addr: u64) -> bool {
     ftab(|m| m.get(addr).is_some_and(|f| m.install(f.install).module >= PROVIDER))
 }

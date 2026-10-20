@@ -2279,11 +2279,10 @@ pub fn minimal_writeback() -> bool {
 /// `minimal_writeback` at calls to trap-free callees as well: the live
 /// registers they never touch stay in locals across them instead of being
 /// stored before and trusted after. Off unless `GEX_CGEN_WB_TRAPFREE=1`:
-/// with both carries on (cg13, seed-pinned ABBA), Noita ran 0.92x: the
+/// with both carries on, a game measured 8% slower than with them off: the
 /// carried registers stay dirty, so every later exit (cold breakpoints and
 /// leaves included) stores them and they stay live in locals across the
-/// function (noita.exe 0x70b200 1.53x, 0x70bdc0 1.58x slower per frame),
-/// while 0x724580's hot call, the one they were for, did not get faster.
+/// function, while the hot call they were for did not get faster.
 pub fn trapfree_carry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_TRAPFREE").as_deref() == Ok("1"))

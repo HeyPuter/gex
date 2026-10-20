@@ -11,8 +11,7 @@
 #   hk        Hollow Knight on the .NET provider (DNC, default ~/gex-sandbox/scratch/unity/dnc)
 #             reaches its menu (the unload after Menu_Title) and presents a non-black frame after it.
 # Hollow Knight runs on the interpreter, its default since q81 (docs/unity-dotnet.md section 13;
-# HK_JIT=1 for the JIT). Muck is no longer a leg; Noita in the page is, as a script of its own
-# (tests/games/noita-page-leg.sh).
+# HK_JIT=1 for the JIT).
 # Each game leg keeps its summary and its last frame as PNG in OUT. Runs go through
 # scratch/bench/bench.sh (BENCH_HOST, edger by default), one at a time under its lock, with
 # tests/games/unity-bench.sh. With Muck it took about 25 min with a warm GEX_FJIT_CACHE, 40

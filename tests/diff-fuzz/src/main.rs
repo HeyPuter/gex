@@ -80,7 +80,7 @@ fn main() {
             eprintln!(
                 "\nusage: gex-difffuzz [--iters N] [--seed S] [--seq-len N] [--verbose]
                     [--simd] [--simd-fp] [--inst HEXWORD]...
-                    [--toolchain DIR] [--prefix TRIPLE-] [--qemu PATH]
+                    [--toolchain DIR (GEX_TOOLCHAIN)] [--prefix TRIPLE-] [--qemu PATH (GEX_QEMU)]
                     [--gexc PATH] [--workdir DIR]"
             );
             std::process::exit(2);
@@ -88,8 +88,8 @@ fn main() {
     };
 
     for tool in [&cfg.qemu, &cfg.gexc] {
-        if !tool.exists() {
-            eprintln!("gex-difffuzz: missing {}", tool.display());
+        if tool.as_os_str().is_empty() || !tool.exists() {
+            eprintln!("gex-difffuzz: missing {} (--qemu/GEX_QEMU, --gexc)", tool.display());
             std::process::exit(2);
         }
     }
@@ -693,8 +693,8 @@ fn parse_args() -> Result<Config, String> {
         iters: 200,
         seed: 0x2545_f491_4f6c_dd1d,
         seq_len: 1,
-        toolchain: PathBuf::from("/home/claude/toolchains/aarch64-linux-musl-cross/bin"),
-        qemu: PathBuf::from("/home/claude/toolchains/qemu-aarch64"),
+        toolchain: std::env::var_os("GEX_TOOLCHAIN").map(PathBuf::from).unwrap_or_default(),
+        qemu: std::env::var_os("GEX_QEMU").map(PathBuf::from).unwrap_or_default(),
         gexc: PathBuf::from("target/release/gexc"),
         workdir: PathBuf::from("target/difffuzz"),
         verbose: false,

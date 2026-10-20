@@ -265,8 +265,8 @@ else
 	fail=$((fail + 1)); echo "FAIL x64/audio ($tag): x86_64-w64-mingw32-gcc"
 fi
 # crypt32: a signed message whose authenticated attributes are not in DER
-# order verifies (authattrs.c; vectors from authattrs-gen.py). FL Studio's
-# check of its engine DLL's Authenticode signature needs it.
+# order verifies (authattrs.c; vectors from authattrs-gen.py), as an
+# Authenticode check of a signed DLL needs.
 if x86_64-w64-mingw32-gcc -O1 -o "$w/authattrs.exe" "$here/authattrs.c" -lcrypt32; then
 	check authattrs 0 "$allok" "$w/authattrs.exe"
 else

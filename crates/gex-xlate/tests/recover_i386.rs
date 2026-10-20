@@ -355,8 +355,7 @@ fn a_page_hash_leaves_import_slots_out() {
 /// A vtable kept in `.text` (Microsoft merges `.rdata` there): the relocated
 /// pointer to the table seeds a weak start whose decode runs on into
 /// `get_b`, which only the table names. `get_b` is a function of its own
-/// all the same, not an interior entry of that garbage (uiribbon.dll's
-/// 0x2f15153d, called through its vtable a few thousand times at start-up).
+/// all the same, not an interior entry of that garbage.
 #[test]
 fn a_virtual_tail_s_callee_after_a_vtable_in_text_is_a_function() {
     let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/vtext32.exe")).unwrap();
@@ -372,8 +371,8 @@ fn a_virtual_tail_s_callee_after_a_vtable_in_text_is_a_function() {
 /// The call's relocated operand is the slot's address, which is data: taken
 /// for a start, its bytes decoded straight into the stub and made it an
 /// interior block of a function at the slot, so the stub had no function of
-/// its own and every call through the slot left the unit (shell32.dll's
-/// lazily bound wrappers, the Win7 shell's hottest call-outs).
+/// its own and every call through the slot left the unit (the layout of a
+/// lazily bound wrapper).
 #[test]
 fn a_pointer_slot_in_text_is_not_a_function_and_its_target_is() {
     let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pe/ptext32.exe")).unwrap();

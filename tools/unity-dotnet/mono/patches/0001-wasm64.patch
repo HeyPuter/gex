@@ -8,7 +8,7 @@ index 95641492a..c62cee5e8 100644
    set(ARCH_HOST_NAME wasm)
 -  add_definitions(-DHOST_WASM -DHOST_32BIT=1)
 +  if (CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
-+    # gex: wasm64 (noita-wasm docs/unity-dotnet.md)
++    # gex: wasm64
 +    add_definitions(-DHOST_WASM -DHOST_64BIT=1)
 +  else()
 +    add_definitions(-DHOST_WASM -DHOST_32BIT=1)
@@ -47,7 +47,7 @@ index 0154f877e..87b21a777 100644
          elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL mips64)
              set(CLR_CMAKE_HOST_UNIX_MIPS64 1)
 +        elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
-+            # gex: wasm64 code in an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md)
++            # gex: wasm64 code in an x86-64 Linux guest
 +            set(CLR_CMAKE_HOST_UNIX_WASM 1)
          else()
              clr_unknown_arch()
@@ -74,7 +74,7 @@ index 781cddbfd..b761e627e 100644
 +  set(HOST_WASM 1)
 +  set(HOST_WASM64 1)
 +  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-+    # gex: a stateful provider inside an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md):
++    # gex: a stateful provider inside an x86-64 Linux guest:
 +    # wasm code, but the OS is Linux (musl, x86-64 syscalls served by gex-kernel), with real
 +    # threads, mmap and files. No JS, no emscripten.
 +    set(HOST_GEX 1)
@@ -140,7 +140,7 @@ index 8d5fba2b6..6cc1e1aad 100644
 @@ -1,4 +1,6 @@
  #ifndef HOST_WASI
 +#include <config.h>
-+#if !defined(HOST_GEX) /* gex: no browser debugger (noita-wasm docs/unity-dotnet.md) */
++#if !defined(HOST_GEX) /* gex: no browser debugger */
  #include <glib.h>
  #include <mono/mini/mini.h>
  #include <mono/mini/mini-runtime.h>
@@ -160,7 +160,7 @@ index 1a89c07ce..5fbcd696a 100644
  }
 +
 +#ifdef HOST_GEX
-+/* gex (noita-wasm docs/unity-dotnet.md): Unity's per-class pointer. */
++/* gex: Unity's per-class pointer. */
 +void *
 +gex_class_get_userdata (MonoClass *klass)
 +{
@@ -383,7 +383,7 @@ index 31c606007..14d5bdb52 100644
  
 +#ifdef HOST_GEX
 +/*
-+ * gex (noita-wasm docs/unity-dotnet.md): a native function pointer may be a
++ * gex: a native function pointer may be a
 + * guest (x86-64) address -- an internal call the guest registered, a P/Invoke
 + * resolved in the guest, a function pointer the guest handed over. Such a call
 + * is made by the guest's calling convention, through the provider's guest-call
@@ -947,7 +947,7 @@ index 5afa90dda..b80eaa9c6 100644
  		}
 +#ifdef HOST_GEX
 +	} else if (1) {
-+		/* gex (noita-wasm docs/unity-dotnet.md): Boehm-like, as Unity's native
++		/* gex: Boehm-like, as Unity's native
 +		 * code expects -- nothing moves, every collection is a full mark, so a
 +		 * raw object pointer or a store without a write barrier from guest
 +		 * code stays valid. No nursery: straight into the major heap. */
@@ -1083,7 +1083,7 @@ index 000000000..0036d0da9
 @@ -0,0 +1,65 @@
 +/**
 + * \file
-+ * gex (noita-wasm docs/unity-dotnet.md): Mono as wasm64 inside an x86-64
++ * gex: Mono as wasm64 inside an x86-64
 + * Linux guest. Threads are POSIX threads (mono-threads-posix.c, musl's
 + * pthreads over gex-kernel's clone and futex); suspension is cooperative
 + * only, as on every wasm host: no signal can interrupt wasm code.
@@ -1262,7 +1262,7 @@ index cf8b2b47f..e11de6c65 100644
      add_subdirectory(System.Native)
 -    add_subdirectory(System.Globalization.Native)
 +    if (NOT GEX_NO_GLOBALIZATION_NATIVE)
-+        # gex (noita-wasm docs/unity-dotnet.md) runs invariant globalization: no ICU.
++        # gex runs invariant globalization: no ICU.
 +        add_subdirectory(System.Globalization.Native)
 +    endif()
  

@@ -634,9 +634,9 @@ pub fn summarize(unit: &gex_split::Unit, bytes: &[u8], path: &str) -> Result<Ima
     // ---- regions ---------------------------------------------------------
     // What a decoded instruction covers is code; everything else, including
     // the jump tables, vtables and literals an image with no `.rdata` keeps
-    // between its functions and inside their block ranges, is data. (Paint's
-    // images merge their read-only data into `.text`: of mspaint.exe's
-    // 17,792 relocations, 17,396 are in an executable section.) The data is
+    // between its functions and inside their block ranges, is data (an image
+    // that merges its read-only data into `.text` can have nearly all of its
+    // relocations in an executable section). The data is
     // cut into regions at the addresses something stores a pointer to, and
     // at section bounds.
     let mut covered: Vec<(u64, u64)> = Vec::new();
@@ -1185,7 +1185,7 @@ pub fn closure(imgs: &[Image], native: &HashSet<String>) -> (Vec<Kept>, Keeps) {
         }
     }
 
-    // GEX_FANOUT_WHY=mspaint:0x101f4af,mspaint:0x10024e4 -- what the closure
+    // GEX_FANOUT_WHY=IMAGE:ADDR[,IMAGE:ADDR...] -- what the closure
     // made of an address: the function or region holding it, and whether it
     // was reached.
     if let Ok(spec) = std::env::var("GEX_FANOUT_WHY") {

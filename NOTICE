@@ -1,0 +1,44 @@
+gex
+Copyright (C) 2026 Puter Technologies Inc.
+
+gex is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License, version 3 only, as published
+by the Free Software Foundation (see LICENSE).
+
+gex includes third-party code under its own licences, listed below. Each
+keeps its original notices in its files.
+
+third_party/wasmtime-49.0.2/
+    Wasmtime, by the Bytecode Alliance and its contributors, with local
+    changes. Apache-2.0 WITH LLVM-exception (third_party/wasmtime-49.0.2/LICENSE).
+
+crates/gex-eject/libs/lua51/lua/
+    Lua 5.1, Copyright (C) 1994-2012 Lua.org, PUC-Rio. MIT licence
+    (crates/gex-eject/libs/lua51/lua/COPYRIGHT).
+
+crates/gex-cgen/providers/glibc_printf.c
+    Formatting core taken from musl libc (src/stdio/vfprintf.c),
+    Copyright (C) 2005-2020 Rich Felker et al. MIT licence.
+
+crates/gex-cgen/providers/dlmalloc.inc
+    dlmalloc by Doug Lea, released to the public domain (CC0), with
+    Emscripten's changes (Copyright the Emscripten authors, MIT licence).
+
+tools/wine-wasm/w3/oss/sys/soundcard.h
+    FreeBSD's sys/soundcard.h (OSSv4 API), Copyright Hannu Savolainen,
+    4Front Technologies, Luigi Rizzo and others. BSD-2-Clause (in the file).
+
+tools/gexcc/bench-codegen/src/a64/memcpy.S, memset.S
+    Arm Optimized Routines, Copyright (c) 2012-2020 Arm Limited. MIT licence.
+
+web/eject-site/vendor/zstddec-stream.mjs
+    zstddec, Copyright (c) 2020 Don McCurdy. MIT licence
+    (web/eject-site/vendor/zstddec-LICENSE).
+
+web/public/gl_cts/
+    Test data from the Khronos OpenGL / OpenGL ES Conformance Test Suite
+    (VK-GL-CTS), Copyright The Khronos Group Inc. Apache-2.0.
+
+guest/gl/*-generated.inc, web/mesa/*-generated-*.inc
+    Generated from the Khronos OpenGL API registry (gl.xml), Copyright
+    The Khronos Group Inc. Apache-2.0.

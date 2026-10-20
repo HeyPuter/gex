@@ -15,7 +15,7 @@ wasmtime's "validating the module". In the browser the error text is "WebAssembl
 function #N ... failed: ...", so Hollow Knight re-emitted ReadFloat 1195 times (hg25). That text is
 final now too.
 
-Test: tests/unity-dotnet T.ReadFloats (ReadFloat and its helpers verbatim), "readfloats 7507799.7418" as
+Test: tests/unity-dotnet T.ReadFloats (a sample reader by format), "readfloats 7507799.7418" as
 CoreCLR prints it; run.sh's wasm-JIT legs fail on any WASM_JIT_INVALID.
 ---
 diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc

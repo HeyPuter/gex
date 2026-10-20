@@ -1,5 +1,5 @@
-/* vtext32.exe: a vtable kept in .text, as Microsoft's linker merges .rdata
- * into .text (Win7's uiribbon.dll), and a virtual call's tail
+/* vtext32.exe: a vtable kept in .text, as an MSVC link that merges .rdata
+ * into .text lays it out, and a virtual call's tail
  * (`mov ecx, obj; mov eax, [obj]; jmp [eax + 4]`) through an object in
  * .data whose initial vtable pointer is relocated. Recovery resolves the
  * tail from the initial bytes as a one-case "switch" to `get_b`, which
