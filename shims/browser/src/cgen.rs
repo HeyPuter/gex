@@ -1780,9 +1780,16 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         if wild {
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
         }
-        // Published by another Worker and not yet installed here: catch up,
-        // then call it, as the lookup would have (leaving would lose the
-        // frames that called here).
+        // The first call into a W3 image left unplaced at its mapping
+        // (`w3_miss`; native Wine calls a DLL's entry point straight after
+        // mapping it): its unit is placed now and served below.
+        let placed = w3_miss(t);
+        // Published by another Worker and not yet installed here (or just
+        // placed): catch up, then call it, as the lookup would have (leaving
+        // would lose the frames that called here).
+        if placed {
+            crate::nt::serve_now();
+        }
         if let Some(idx) = ftab(|m| m.get(t).map(|f| f.idx)) {
             crate::nt::serve_now();
             CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
