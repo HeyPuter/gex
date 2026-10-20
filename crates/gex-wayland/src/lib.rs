@@ -51,7 +51,9 @@ pub trait Buffers {
     /// buffer's address and uploads the damaged rows to a texture, and nothing
     /// ever copies a frame on the way out. `map` stays for the host that has no
     /// such view (the native one, which composites from its own copy).
-    fn locate(&self, _fd: u32) -> Option<(u32, u32)> {
+    ///
+    /// 64 bits: a memory64 process's pool may sit above 4 GiB.
+    fn locate(&self, _fd: u32) -> Option<(u64, u64)> {
         None
     }
 }
@@ -251,7 +253,8 @@ pub struct SurfaceInfo {
     pub height: i32,
     /// Where the pixels are: an address in the guest's address space, and the
     /// row stride. Zero when the surface has no buffer the host can read.
-    pub addr: u32,
+    /// 64 bits: a memory64 process's pool may sit above 4 GiB.
+    pub addr: u64,
     pub stride: i32,
     /// A `wl_shm` format code: 0 is ARGB8888, 1 is XRGB8888.
     pub format: u32,
@@ -613,7 +616,7 @@ struct SurfaceState {
     rel_y: i32,
     /// Where the last committed buffer's pixels are and what shape they are:
     /// the descriptor the host draws from, rather than a copy of them.
-    addr: u32,
+    addr: u64,
     stride: i32,
     width: i32,
     height: i32,
@@ -1567,10 +1570,10 @@ impl Client {
                 // no such view (the native one) says None, and gets a `Frame`
                 // with the pixels in it as before.
                 let placed = buffers.locate(spec.fd).and_then(|(base, len)| {
-                    let off = u32::try_from(spec.offset).ok()?;
-                    let need = u32::try_from(spec.stride)
+                    let off = u64::try_from(spec.offset).ok()?;
+                    let need = u64::try_from(spec.stride)
                         .ok()?
-                        .checked_mul(u32::try_from(spec.height).ok()?)?;
+                        .checked_mul(u64::try_from(spec.height).ok()?)?;
                     // A client that claims more than its pool holds is refused
                     // rather than read: this is a length the guest chose.
                     if spec.stride < spec.width.checked_mul(4)? || off.checked_add(need)? > len {
@@ -3598,12 +3601,12 @@ mod tests {
 
     /// A pool whose memory the host can *place* rather than copy, which is what
     /// the browser does: the descriptor path, and the one the compositor uses.
-    struct Placed(u32, u32);
+    struct Placed(u64, u64);
     impl Buffers for Placed {
         fn map(&self, _fd: u32, size: usize) -> Option<Vec<u8>> {
             Some(vec![0u8; size])
         }
-        fn locate(&self, _fd: u32) -> Option<(u32, u32)> {
+        fn locate(&self, _fd: u32) -> Option<(u64, u64)> {
             Some((self.0, self.1))
         }
     }
@@ -3611,7 +3614,12 @@ mod tests {
     /// A client with a toplevel that has drawn, on a pool the host located
     /// rather than copied. Returns the client and the surface id.
     fn placed_window(w: i32, h: i32, stride: i32) -> (Client, u32) {
-        let pool = Placed(0x10_0000, (stride * h) as u32 + 64);
+        placed_window_at(0x10_0000, w, h, stride)
+    }
+
+    /// `placed_window`, its pool at `base`.
+    fn placed_window_at(base: u64, w: i32, h: i32, stride: i32) -> (Client, u32) {
+        let pool = Placed(base, (stride * h) as u64 + 64);
         let mut c = Client::new();
         let mut go = |c: &mut Client, bytes: Vec<u8>, fds: &[u32]| {
             c.receive(&bytes, fds, &pool);
@@ -3657,6 +3665,16 @@ mod tests {
         assert_eq!(s.addr, 0x10_0000, "the descriptor points at the pool");
         assert_eq!(s.role, Role::Toplevel);
         assert_eq!(s.title, "a window");
+    }
+
+    #[test]
+    fn a_pool_above_4_gib_keeps_its_whole_address() {
+        // A memory64 process's pool: its low half alone is somewhere else.
+        let (c, _) = placed_window_at(0x1_4000_0000, 64, 32, 256);
+        assert!(c.frames.is_empty(), "a frame was copied out of the pool");
+        let scene = c.scene();
+        assert_eq!(scene.len(), 1);
+        assert_eq!(scene[0].addr, 0x1_4000_0000);
     }
 
     #[test]

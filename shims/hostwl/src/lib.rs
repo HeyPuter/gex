@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 /// Words in one published surface record, and words in one input event. The
 /// same layout the guest shim publishes, because the page reads one arena.
-const REC: usize = 37;
+const REC: usize = 38;
 const EV: usize = 8;
 const TITLE_BYTES: usize = 32;
 
@@ -190,14 +190,14 @@ struct Pools<'a> {
 }
 
 impl Buffers for Pools<'_> {
-    fn locate(&self, fd: u32) -> Option<(u32, u32)> {
+    fn locate(&self, fd: u32) -> Option<(u64, u64)> {
         let id = *self.fds.get(fd as usize)?;
         let mut out = [0u32; 2];
         let ok = unsafe { host_locate(id, out.as_mut_ptr() as u32) };
         if ok == 0 || out[0] == 0 {
             return None;
         }
-        Some((out[0], out[1]))
+        Some((u64::from(out[0]), u64::from(out[1])))
     }
 
     fn map(&self, _fd: u32, _size: usize) -> Option<Vec<u8>> {
@@ -527,7 +527,7 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[5] = info.rel_y;
     r[6] = info.width;
     r[7] = info.height;
-    r[8] = info.addr as i32;
+    r[8] = info.addr as u32 as i32;
     r[9] = info.stride;
     r[10] = info.format as i32;
     r[11] = info.serial as i32;
@@ -552,4 +552,6 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
     r[33..37].copy_from_slice(&info.input_words());
+    // The address's high half: a memory64 process's pool may sit above 4 GiB.
+    r[37] = (info.addr >> 32) as u32 as i32;
 }

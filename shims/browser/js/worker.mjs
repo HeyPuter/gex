@@ -822,6 +822,7 @@ async function handle(msg) {
     };
     let count = 0;
     const stubLog = !!globalThis.process?.env?.GEX_WL_STUB_LOG;
+    const stubSum = !!globalThis.process?.env?.GEX_WL_STUB_SUM;
     gex.useWl({
       publish(memory, ptr, n) {
         count++;
@@ -837,7 +838,7 @@ async function handle(msg) {
             y: words[r + wlb.R_REL_Y],
             w: words[r + wlb.R_WIDTH],
             h: words[r + wlb.R_HEIGHT],
-            addr: words[r + wlb.R_ADDR] >>> 0,
+            addr: wlb.recordAddr(words, r),
             stride: words[r + wlb.R_STRIDE],
           });
         }
@@ -851,6 +852,21 @@ async function handle(msg) {
             `[wlstub] publish #${count}: ${recs.length} surfaces, ${windows.length} windows`
             + windows.map((w) => ` ${w.w}x${w.h}`).join(''),
           );
+        }
+        // GEX_WL_STUB_SUM: each window's pixels as the compositor reads them,
+        // summed, for tests/browser-wl-mem64.sh (a pool above 4 GiB).
+        if (stubSum) {
+          const px = new Uint8Array(memory.buffer);
+          for (const s of windows) {
+            let sum = 0;
+            for (let y = 0; y < s.h; y++) {
+              for (let x = 0; x < s.w; x++) {
+                const i = s.addr + y * s.stride + x * 4;
+                sum = (sum + (px[i] | px[i + 1] << 8 | px[i + 2] << 16 | px[i + 3] << 24)) >>> 0;
+              }
+            }
+            console.error(`[wlstub] window ${s.w}x${s.h} at 0x${s.addr.toString(16)} sum=${sum}`);
+          }
         }
         if (!fs || !dumpPath || !windows.length) return;
         // The output is the largest window's size, and every surface is drawn

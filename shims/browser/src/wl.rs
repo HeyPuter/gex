@@ -54,7 +54,7 @@ const PUMP_FLOOR_NS: u64 = 50_000_000;
 
 /// Words in one published surface record. Fixed so both sides can index it
 /// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
-const REC: usize = 37;
+const REC: usize = 38;
 /// Words in one input event record.
 const EV: usize = 8;
 /// The most surfaces published in one pump. A desktop session with a dozen
@@ -804,7 +804,7 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[5] = info.rel_y;
     r[6] = info.width;
     r[7] = info.height;
-    r[8] = info.addr as i32;
+    r[8] = info.addr as u32 as i32;
     r[9] = info.stride;
     r[10] = info.format as i32;
     r[11] = info.serial as i32;
@@ -832,6 +832,8 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
     r[33..37].copy_from_slice(&info.input_words());
+    // The address's high half: a memory64 process's pool may sit above 4 GiB.
+    r[37] = (info.addr >> 32) as u32 as i32;
 }
 
 impl HostListener for WaylandDevice {
@@ -872,14 +874,16 @@ struct PoolView<'a, 'm> {
 }
 
 impl Buffers for PoolView<'_, '_> {
-    fn locate(&self, fd: u32) -> Option<(u32, u32)> {
+    fn locate(&self, fd: u32) -> Option<(u64, u64)> {
         let file = self.fds.get(fd as usize)?;
         // The client mapped its pool MAP_SHARED, so the mapping *is* the
         // pool: its address in guest memory is where the pixels are, live,
         // and the compositor reads them from there. This is why a frame is
         // never copied on the way to the screen.
         let map = self.maps.of(file)?;
-        Some((u32::try_from(map.start).ok()?, u32::try_from(map.len).ok()?))
+        // Whole: a memory64 process's pool may sit above 4 GiB, and its low
+        // half alone named the shim's heap (`push_record`'s two words).
+        Some((map.start as u64, map.len as u64))
     }
 
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
