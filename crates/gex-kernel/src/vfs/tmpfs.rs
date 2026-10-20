@@ -27,6 +27,9 @@ fn note_capacity(before: usize, after: usize) {
 /// A file's contents, held apart from any name so an open descriptor survives
 /// `unlink`: SQLite unlinks its temp files at once and keeps writing through
 /// the descriptor it still holds.
+/// The time of a lazy file whose site recorded none ([`TmpFs::add_lazy`]).
+pub const LAZY_MTIME: i64 = 0;
+
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
@@ -623,6 +626,11 @@ impl TmpFs {
     /// A file of `size` bytes whose contents are fetched from `url` as they
     /// are read (`set_lazy_fetch`). A path already present is left alone:
     /// a bundled copy wins.
+    ///
+    /// Its time is [`LAZY_MTIME`] until the site's recorded one is set
+    /// (`set_mtime`): the same on every load, never the load's own clock, so
+    /// what keys on a file's size and time (the translation cache across
+    /// loads) still matches the next time the same site is loaded.
     pub fn add_lazy(&self, path: &str, size: u64, url: &str) {
         let path = path.trim_start_matches('/').to_string();
         let mut inner = self.inner.lock().unwrap();
@@ -634,6 +642,7 @@ impl TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
         let f = FileNode::new(Vec::new(), ino);
+        f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0 });
         inner.nodes.insert(path, Node::File(Arc::new(f)));
     }
@@ -1402,6 +1411,26 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lazy file's time does not come from the clock: two loads of the same
+    /// site, a second apart, see the same time for it, and a recorded time
+    /// replaces it.
+    #[test]
+    fn a_lazy_file_has_the_same_time_on_every_load() {
+        let load = || {
+            let fs = TmpFs::new();
+            fs.add_lazy("lib/a.dll", 4096, "/lazy/h/a");
+            fs
+        };
+        let a = load();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let b = load();
+        let t = |fs: &TmpFs| FileSystem::metadata(fs, "lib/a.dll").unwrap().mtime;
+        assert_eq!(t(&a), LAZY_MTIME);
+        assert_eq!(t(&a), t(&b));
+        FileSystem::set_mtime(&b, "lib/a.dll", 1_700_000_000).unwrap();
+        assert_eq!(t(&b), 1_700_000_000);
+    }
 
     /// A listing names a directory's immediate children, and only them:
     /// names sorting around `/` ("a-b", "a.txt" between "a" and "a/x"),

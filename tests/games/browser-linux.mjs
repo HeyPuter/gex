@@ -166,7 +166,7 @@ function lazyManifest() {
       const r = rel ? `${rel}/${e}` : e;
       const st = statSync(join(dir, r));
       if (st.isDirectory()) walk(r);
-      else if (st.isFile()) files.push([`/game/${r}`, st.size, r]);
+      else if (st.isFile()) files.push([`/game/${r}`, st.size, r, Math.trunc(st.mtimeMs / 1000)]);
     }
   };
   walk('');

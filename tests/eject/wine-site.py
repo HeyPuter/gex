@@ -57,7 +57,7 @@ for top in ('w3', 'pfx'):
             p = os.path.join(dp, n)
             if os.path.isfile(p) and not os.path.islink(p):
                 rel = os.path.relpath(p, lz)
-                files.append(['/' + rel, os.path.getsize(p), rel])
+                files.append(['/' + rel, os.path.getsize(p), rel, int(os.path.getmtime(p))])
 json.dump({'base': '/lazy/', 'files': files}, open(f'{site}/lazy.json', 'w'))
 json.dump({
     'tar': ['/bundle.tar'], 'lazy': '/lazy.json', 'exe': '/w3/lib/wine/i386-unix/wine',
