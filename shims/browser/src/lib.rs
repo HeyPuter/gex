@@ -3726,7 +3726,22 @@ fn install_panic_hook() {
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
         std::panic::set_hook(Box::new(|info| {
+            // Set while this hook runs: a panic inside it is not reported
+            // through it (std aborts at once, its line on a stderr that
+            // wasm32 does not have), so the trap's report asks
+            // (`gex_panic_reporting`) and says one happened.
+            PANIC_REPORTING.with(|r| r.set(true));
             let text = format!("gex: panic in the shim: {info}\n");
+            // A long message (a diagnostic's dump) first as its head, alone,
+            // so a log that drops or cuts long lines still has the panic.
+            const HEAD: usize = 1024;
+            if text.len() > 2 * HEAD {
+                let mut cut = HEAD;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                warn_line(&format!("{} ... ({} bytes; the whole message follows)\n", &text[..cut], text.len()));
+            }
             // Straight to the host's console, not through fd 2.
             //
             // `write` is a *syscall*: it takes the kernel. Almost every panic
@@ -3743,13 +3758,56 @@ fn install_panic_hook() {
             // `warn` is a direct import to `console.error` and touches no
             // kernel, so it cannot re-enter. Nothing here may take a borrow.
             warn_line(&text);
+            // TEST(gex_debug_panic 2): a panic inside the hook.
+            if DEBUG_PANIC_IN_HOOK.with(|d| d.replace(false)) {
+                panic!("gex debug panic: inside the hook");
+            }
+            // Not in the middle of this Worker's own translation, where the
+            // syscall path asks for the JIT state the translation holds
+            // (`jit_in`) and its panic would end the report.
+            if jitout::OUT.load(std::sync::atomic::Ordering::Acquire) == jit_me() {
+                PANIC_REPORTING.with(|r| r.set(false));
+                return;
+            }
             // And fd 2 as well, so a run whose output is the terminal still
             // shows it -- but only after the console has it, because this is
             // the call that can die.
             // SAFETY: the bytes are read, not kept.
             unsafe { write(2, text.as_ptr() as usize, text.len() as u32) };
+            PANIC_REPORTING.with(|r| r.set(false));
         }));
     });
+}
+
+thread_local! {
+    /// This Worker is inside the panic hook (see `install_panic_hook`).
+    static PANIC_REPORTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// TEST: the hook panics once, for `gex_debug_panic(2)`.
+    static DEBUG_PANIC_IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this Worker trapped inside the panic hook: a second panic there,
+/// whose message std drops. For the trap's report (gex.mjs).
+#[no_mangle]
+pub extern "C" fn gex_panic_reporting() -> u32 {
+    PANIC_REPORTING.with(|r| r.get()) as u32
+}
+
+/// TEST (run-node GEX_DEBUG_PANIC, tests/browser-panic.sh): panic on purpose,
+/// to check that the report reaches the console. 1 a plain panic, 2 one that
+/// panics again inside the hook, 3 one with a 4 KiB message. Only a caller
+/// that asks runs it.
+#[no_mangle]
+pub extern "C" fn gex_debug_panic(kind: u32) {
+    install_panic_hook();
+    match kind {
+        2 => {
+            DEBUG_PANIC_IN_HOOK.with(|d| d.set(true));
+            panic!("gex debug panic: outer");
+        }
+        3 => panic!("gex debug panic: long {}", "x".repeat(4096)),
+        _ => panic!("gex debug panic: plain"),
+    }
 }
 
 /// Install the kernel this Worker will run against.

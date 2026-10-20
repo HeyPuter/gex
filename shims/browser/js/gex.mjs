@@ -5994,7 +5994,9 @@ export class Gex {
           });
           throw new Error(
             `the gex runtime trapped inside the shim (${err.message}${at}${lr}${nr}` +
-              `${code}${heap}${where}). That is a crash in the runtime, not a guest exit; ` +
+              `${code}${heap}${where}` +
+              `${this.#shim.exports.gex_panic_reporting?.() ? '; it panicked again inside the panic report, whose message is lost (the first is above)' : ''}` +
+              `). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.'
               + (globalThis.GEX_TRAP_STACK ? `\n${err.stack ?? ''}` : ''),
           );

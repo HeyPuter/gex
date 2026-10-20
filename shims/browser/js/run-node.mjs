@@ -479,6 +479,9 @@ const host = new ProcessHost({
     // into the MAIN thread's stack (it would smash a canary the main thread only
     // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
     spGuard: !!process.env.GEX_SP_GUARD,
+    // TEST: GEX_DEBUG_PANIC=plain|nested|long makes the shim panic on purpose
+    // before the guest runs (tests/browser-panic.sh).
+    debugPanic: { plain: 1, nested: 2, long: 3 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
     // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
     // dumps the live registers (x30 = caller) and continues. Aimed at
     // __stack_chk_fail to name the smashed function.
