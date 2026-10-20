@@ -591,18 +591,33 @@ const host = new ProcessHost({
   },
 });
 
-// `/dev/dsp`'s ring in the global kernel (shims/kernel/src/audio.rs), as
-// the page plays it (web/src/audio.js). GEX_AUDIO_TAP=1 reports, at exit,
-// what the newest quarter second in it sounds like: its rate, generation,
-// RMS and frequency (left channel, by zero crossings).
+// `/dev/dsp`'s rings in the global kernel (shims/kernel/src/audio.rs,
+// layout 2), as the page plays them (web/src/audio.js). GEX_AUDIO_TAP=1
+// reports, at exit, what the newest quarter second of the slot written last
+// sounds like: its rate, generation, RMS and frequency (left channel, by
+// zero crossings), and how many slots were ever used.
 let audioRing = null;
+const AU_HDR = 32, AU_SW = 16, AU_OFF = (AU_HDR + 8 * AU_SW) * 4;
+function audioWords() {
+  return new Uint32Array(audioRing.memory.buffer, audioRing.at, AU_HDR + 8 * AU_SW);
+}
 function audioTap() {
   if (!audioRing) { process.stderr.write('[audio] no ring\n'); return; }
   const { memory, at } = audioRing;
-  const words = new Uint32Array(memory.buffer, at, 8);
-  const [, w, rate, cap, owner, gen] = words;
+  const W = audioWords(), cap = W[3];
+  if (process.env.GEX_AUDIO_TAP === '2') process.stderr.write(`[audio] words ${Array.from(W.slice(0, 48)).join(' ')}\n`);
+  // The slot written last: the one with the newest write time.
+  let best = -1, used = 0;
+  for (let s = 0; s < W[2]; s++) {
+    const b = AU_HDR + s * AU_SW;
+    if (W[b + 3] || W[b + 2]) used++;
+    if (W[b + 2] && (best < 0 || ((W[b + 5] - W[AU_HDR + best * AU_SW + 5]) | 0) >= 0)) best = s;
+  }
+  if (best < 0) { process.stderr.write('[audio] nothing written\n'); return; }
+  const b = AU_HDR + best * AU_SW;
+  const w = W[b + 3], rate = W[b + 1], owner = W[b], gen = W[b + 2];
   const n = Math.min(w, cap, Math.floor(rate / 4));
-  const f = new Float32Array(memory.buffer, at + 32, cap * 2);
+  const f = new Float32Array(memory.buffer, at + AU_OFF + best * cap * 8, cap * 2);
   let sq = 0, cross = 0, last = 0;
   for (let i = w - n; i < w; i++) {
     const l = f[((i >>> 0) % cap) * 2];
@@ -611,29 +626,56 @@ function audioTap() {
     last = l;
   }
   const rms = n ? Math.sqrt(sq / n) : 0, hz = n ? cross / 2 / (n / rate) : 0;
-  process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)}\n`);
+  process.stderr.write(`[audio] written ${w} rate ${rate} stream ${owner} gen ${gen} rms ${rms.toFixed(3)} hz ${hz.toFixed(0)} slots ${used}\n`);
 }
 
-// GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that
-// plays the ring at SPEED times its rate (1: real time), publishing its read
-// position and heartbeat as the worklet does, so the OSS device paces its
-// writers to it (tests/browser-audio.sh's dsp-pace).
+// GEX_AUDIO_PLAYER=SPEED: a stand-in for the page's AudioWorklet that plays
+// every slot at SPEED times its rate (1: real time), publishing read
+// positions and a heartbeat as the worklet does, so the OSS device paces
+// its writers to it (tests/browser-audio.sh's dsp-pace). It plays at a
+// context rate of GEX_AUDIO_RATE (48000), quanta of 128 frames, and with
+// GEX_AUDIO_LOOP=1 mixes the slots (nearest frame) into the capture ring,
+// as `?audioloop=1` does: the round trip (dsp-impulse).
 if (process.env.GEX_AUDIO_PLAYER) {
   const speed = Number(process.env.GEX_AUDIO_PLAYER) || 1;
-  let t = performance.now(), acc = 0, gen = -1;
+  const ctxRate = Number(process.env.GEX_AUDIO_RATE) || 48000;
+  const loop = process.env.GEX_AUDIO_LOOP === '1';
+  let t = performance.now(), acc = 0;
+  const st = [];
   setInterval(() => {
     const now = performance.now(), dt = now - t;
     t = now;
     if (!audioRing) return;
-    const words = new Uint32Array(audioRing.memory.buffer, audioRing.at, 8);
-    const w = Atomics.load(words, 1), g = Atomics.load(words, 5);
-    if (g !== gen) { gen = g; Atomics.store(words, 6, w); acc = 0; }
-    acc += dt / 1000 * (words[2] || 44100) * speed;
-    const k = Math.floor(acc);
-    acc -= k;
-    const r = Atomics.load(words, 6);
-    Atomics.store(words, 6, ((w - r) >>> 0) < k ? w : (r + k) >>> 0);
-    Atomics.add(words, 7, 1);
+    const W = audioWords(), cap = W[3], ccap = W[8];
+    if (!W[5]) { Atomics.store(W, 5, ctxRate); Atomics.store(W, 9, 128); Atomics.store(W, 6, 10000); }
+    // Whole quanta of the context's rate, as the worklet runs.
+    acc += dt / 1000 * ctxRate * speed;
+    const q = Math.floor(acc / 128);
+    acc -= q * 128;
+    if (!q) return;
+    const k = q * 128;
+    const mix = loop ? new Float32Array(k * 2) : null;
+    for (let s = 0; s < W[2]; s++) {
+      const b = AU_HDR + s * AU_SW;
+      const w = Atomics.load(W, b + 3), g = Atomics.load(W, b + 2), rate = W[b + 1] || ctxRate;
+      st[s] ??= { gen: -1, ri: 0, fr: 0 };
+      const x = st[s];
+      if (g !== x.gen) { x.gen = g; x.ri = w; x.fr = 0; }
+      const f = loop ? new Float32Array(audioRing.memory.buffer, audioRing.at + AU_OFF + s * cap * 8, cap * 2) : null;
+      for (let i = 0; i < k && x.ri !== w; i++) {
+        if (mix) { mix[i * 2] += f[(x.ri % cap) * 2]; mix[i * 2 + 1] += f[(x.ri % cap) * 2 + 1]; }
+        x.fr += rate / ctxRate;
+        while (x.fr >= 1 && x.ri !== w) { x.fr -= 1; x.ri = (x.ri + 1) >>> 0; }
+      }
+      Atomics.store(W, b + 4, x.ri);
+    }
+    if (mix) {
+      const C = new Float32Array(audioRing.memory.buffer, audioRing.at + AU_OFF + W[2] * cap * 8, ccap * 2);
+      let cw = W[7];
+      for (let i = 0; i < k; i++) { C[(cw % ccap) * 2] = mix[i * 2]; C[(cw % ccap) * 2 + 1] = mix[i * 2 + 1]; cw = (cw + 1) >>> 0; }
+      Atomics.store(W, 7, cw);
+    }
+    Atomics.add(W, 4, 1);
   }, 2).unref();
 }
 

@@ -208,6 +208,13 @@ export async function detectTso() {
  * under Node (where the terminal test drives this file), so the same switches
  * arrive there as `GEX_*` environment variables.
  */
+/** `?audiolatency=S`: the AudioContext's latency hint in seconds, else
+ *  'interactive' (web/src/audio.js). */
+function audioLatency() {
+  const v = flag('audiolatency');
+  return v !== null && v !== '' && Number.isFinite(+v) ? +v : 'interactive';
+}
+
 function flag(name) {
   // The single-thread build's system Worker is handed the page's query: its
   // own `location` is the script's.
@@ -1232,7 +1239,7 @@ async function runProgramHere(
       // Pid 1 has copied `files` into the kernel's filesystem.
       else if (m.kind === 'files-loaded') onFilesLoaded?.();
       // Where `/dev/dsp`'s output is: played from the first gesture on.
-      else if (m.kind === 'audio') startAudio({ ...m, clock: flag('audioclock') !== '0' });
+      else if (m.kind === 'audio') startAudio({ ...m, clock: flag('audioclock') !== '0', latency: audioLatency(), loop: flag('audioloop') === '1' });
     },
   });
 

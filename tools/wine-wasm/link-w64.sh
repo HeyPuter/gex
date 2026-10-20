@@ -158,20 +158,27 @@ fi
 # /dev/mixer answer). Without it an x64 game's audio device fails to open
 # (mmdevapi: "No driver from pulse,alsa,oss,coreaudio could be
 # initialized"; OpenAL Soft: "Error opening OpenAL device").
-mkdir -p gexw64/wineoss
 tmpl=$(make -n -W "$WF/dlls/crypt32/unixlib.c" dlls/crypt32/unixlib.o 2>/dev/null | sed -e ':a' -e '/\\$/N; s/\\\n//; ta' |
 	grep -- "-c -o dlls/crypt32/unixlib.o")
 [ -n "$tmpl" ] || { echo "link-w64: no compile command for crypt32's unixlib (wineoss's template)" >&2; touch "$fail"; }
-for b in midipatch oss ossmidi; do
-	out=gexw64/wineoss/$b.o; objs="$objs $out"
-	[ "$out" -nt "$WF/dlls/wineoss.drv/$b.c" ] && [ "$out" -nt "$HERE/link-w64.sh" ] && continue
-	cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/wineoss.drv\/$b.c}
-	cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/wineoss.drv -I$HERE\/w3\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
-	( eval "$cmd -D__wine_unix_call_funcs=wineoss__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=wineoss__wine_unix_call_wow64_funcs" >&2 ) ||
-		{ echo "link-w64: wineoss.drv/$b.c failed" >&2; touch "$fail"; } &
-	while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done
+# And gexasio.so, the Unix side of gex audio (ASIO) (dlls/gexasio: an ASIO
+# driver over the same /dev/dsp), the same way, when the tree has it.
+uxl="wineoss.drv:wineoss:midipatch,oss,ossmidi"
+[ -f "$WF/dlls/gexasio/unixlib.c" ] && uxl="$uxl gexasio:gexasio:unixlib"
+for spec in $uxl; do
+	dir=${spec%%:*} rest=${spec#*:}; lib=${rest%%:*}; srcs=${rest#*:}
+	mkdir -p "gexw64/$lib"
+	for b in ${srcs//,/ }; do
+		out=gexw64/$lib/$b.o; objs="$objs $out"
+		[ "$out" -nt "$WF/dlls/$dir/$b.c" ] && [ "$out" -nt "$HERE/link-w64.sh" ] && continue
+		cmd=${tmpl//-c -o dlls\/crypt32\/unixlib.o/-c -o $out}; cmd=${cmd//$WF\/dlls\/crypt32\/unixlib.c/$WF\/dlls\/$dir\/$b.c}
+		cmd=${cmd//-I$WF\/dlls\/crypt32/-I$WF\/dlls\/$dir -I$HERE\/w3\/oss}; cmd=${cmd//-Idlls\/crypt32/}; cmd=${cmd//-D_CRYPT32_/}
+		( eval "$cmd -D__wine_unix_call_funcs=${lib}__wine_unix_call_funcs -D__wine_unix_call_wow64_funcs=${lib}__wine_unix_call_wow64_funcs" >&2 ) ||
+			{ echo "link-w64: $dir/$b.c failed" >&2; touch "$fail"; } &
+		while [ "$(jobs -r | wc -l)" -ge "$J" ]; do wait -n; done
+	done
+	reg="$reg $lib.so:data:__wine_unix_call_funcs=${lib}__wine_unix_call_funcs"
 done
-reg="$reg wineoss.so:data:__wine_unix_call_funcs=wineoss__wine_unix_call_funcs"
 wait
 [ ! -e "$fail" ] || { echo "link-w64: compile failed; not linking" >&2; exit 1; }
 if [ -n "$M64" ]; then

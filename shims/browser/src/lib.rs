@@ -468,6 +468,10 @@ extern "C" {
     fn k_audio_write(stream: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32, now_ms: u32) -> i32;
     fn k_audio_ring() -> u32;
     fn k_audio_pending(stream: u32, now_ms: u32) -> i32;
+    fn k_audio_close(stream: u32);
+    fn k_audio_info(stream: u32, now_ms: u32, out: gex_kernel::PAddr) -> i32;
+    fn k_audio_capture_pos() -> u32;
+    fn k_audio_capture(pos: u32, at: gex_kernel::PAddr, len: u32, format: u32, rate: u32, channels: u32) -> i64;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
@@ -1221,6 +1225,27 @@ fn audio_pending(stream: u32, ms: u32) -> Option<u32> {
     u32::try_from(unsafe { k_audio_pending(stream, ms) }).ok()
 }
 
+/// A `/dev/dsp` closed: its slot in the player is free.
+fn audio_close(stream: u32) {
+    let stream = (my_pid() as u32).wrapping_shl(16).wrapping_add(stream & 0xffff);
+    unsafe { k_audio_close(stream) };
+}
+
+/// `SNDCTL_DSP_GEX_INFO` (`gex_kernel::vfs::oss::AudioInfo`).
+fn audio_info(stream: u32, ms: u32) -> Option<[u32; 5]> {
+    let stream = (my_pid() as u32).wrapping_shl(16).wrapping_add(stream & 0xffff);
+    let mut v = [0u32; 5];
+    (unsafe { k_audio_info(stream, ms, v.as_mut_ptr() as usize as gex_kernel::PAddr) } == 0).then_some(v)
+}
+
+/// `/dev/dsp`'s capture: the player's loopback (`gex_kernel::vfs::oss::AudioCapture`).
+fn audio_capture(pos: Option<u32>, buf: &mut [u8], format: u32, rate: u32, channels: u32) -> Option<(usize, u32)> {
+    let pos = pos.unwrap_or_else(|| unsafe { k_audio_capture_pos() });
+    let r = unsafe { k_audio_capture(pos, buf.as_mut_ptr() as usize as gex_kernel::PAddr, buf.len() as u32, format, rate, channels) };
+    let n = (r >> 32) as i32;
+    (n >= 0).then_some((n as usize, r as u32))
+}
+
 /// Where the audio ring is in the global kernel's memory (0 with none), for
 /// the page's player (web/src/audio.js).
 #[no_mangle]
@@ -1238,6 +1263,9 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     }
     gex_kernel::vfs::oss::set_audio_out(audio_out);
     gex_kernel::vfs::oss::set_audio_pending(audio_pending);
+    gex_kernel::vfs::oss::set_audio_close(audio_close);
+    gex_kernel::vfs::oss::set_audio_info(audio_info);
+    gex_kernel::vfs::oss::set_audio_capture(audio_capture);
     Some(gex_kernel::pipe::Remote {
         queue: rp_queue,
         new: rp_new,

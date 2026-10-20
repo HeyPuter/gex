@@ -45,6 +45,9 @@ const SNDCTL_DSP_GETOSPACE: u32 = 0x8010_500c;
 const SNDCTL_DSP_GETISPACE: u32 = 0x8010_500d;
 const SNDCTL_DSP_GETCAPS: u32 = 0x8004_500f;
 const SNDCTL_DSP_GETODELAY: u32 = 0x8004_5017;
+/// gex's own: `_IOR('P', 0xe0, int[5])`, what the device knows of the
+/// player behind it ([`OssHandle::ioctl`]).
+pub const SNDCTL_DSP_GEX_INFO: u32 = 0x8014_50e0;
 /// `SOUND_MIXER_READ_*` and `_WRITE_*`: `_IOR('M', n, int)`, `_IOWR('M', n, int)`.
 const MIXER_READ: u32 = 0x8004_4d00;
 const MIXER_WRITE: u32 = 0xc004_4d00;
@@ -58,13 +61,22 @@ const AFMT_S24_PACKED: u32 = 0x0004_0000;
 const AFMT_F32_LE: u32 = 0x1000_0000;
 const FORMATS: u32 = AFMT_U8 | AFMT_S16_LE | AFMT_S24_LE | AFMT_S24_PACKED | AFMT_S32_LE | AFMT_F32_LE;
 const PCM_CAP_OUTPUT: u32 = 0x0002_0000;
+const PCM_CAP_INPUT: u32 = 0x0001_0000;
+const PCM_CAP_DUPLEX: u32 = 0x0000_0100;
 const PCM_CAP_TRIGGER: u32 = 0x0000_1000;
 
-/// The playback buffer: 16 fragments of 2 KiB (about 190 ms of 44.1 kHz
-/// stereo 16-bit).
+/// The playback buffer unless a program asks for another
+/// (`SNDCTL_DSP_SETFRAGMENT`): 16 fragments of 2 KiB (about 190 ms of
+/// 44.1 kHz stereo 16-bit).
 const FRAGSIZE: u64 = 2048;
 const FRAGMENTS: u64 = 16;
 const BUFSIZE: u64 = FRAGSIZE * FRAGMENTS;
+/// What `SNDCTL_DSP_SETFRAGMENT` may ask for: fragments of 2^4 to 2^14
+/// bytes, 2 to 64 of them, no more than [`BUFSIZE`] in all (the player's
+/// rings hold that much of any format).
+const MIN_FRAG_SHIFT: u32 = 4;
+const MAX_FRAG_SHIFT: u32 = 14;
+const MAX_FRAGMENTS: u64 = 64;
 
 #[derive(Debug)]
 struct Stream {
@@ -80,9 +92,19 @@ struct Stream {
     id: u32,
     /// Whether the player paced the last drain.
     played_by_player: bool,
+    /// The buffer's fragment size and count (`SNDCTL_DSP_SETFRAGMENT`).
+    fragsize: u64,
+    fragments: u64,
+    /// Where this open reads capture from next (frames of the player's
+    /// rate), once it has read.
+    capture: Option<u32>,
 }
 
 impl Stream {
+    fn bufsize(&self) -> u64 {
+        self.fragsize * self.fragments
+    }
+
     fn frame_bytes(&self) -> u64 {
         self.channels as u64 * sample_size(self.format) as u64
     }
@@ -113,6 +135,23 @@ impl Stream {
 }
 
 /// Bytes in one sample of `format`.
+pub fn sample_bytes(format: u32) -> usize {
+    sample_size(format)
+}
+
+/// Append `v` as one sample of `format` (clamped to the format's range).
+pub fn put_sample(format: u32, v: f32, out: &mut Vec<u8>) {
+    let v = v.clamp(-1.0, 1.0);
+    match format {
+        AFMT_U8 => out.push(((v * 127.0) + 128.0).round() as u8),
+        AFMT_S16_LE => out.extend_from_slice(&((v * 32767.0).round() as i16).to_le_bytes()),
+        AFMT_S24_PACKED => out.extend_from_slice(&((v * 8_388_607.0).round() as i32).to_le_bytes()[..3]),
+        AFMT_S24_LE => out.extend_from_slice(&((v * 8_388_607.0).round() as i32).to_le_bytes()),
+        AFMT_S32_LE => out.extend_from_slice(&(((v as f64) * 2_147_483_647.0).round() as i32).to_le_bytes()),
+        _ => out.extend_from_slice(&v.to_le_bytes()),
+    }
+}
+
 fn sample_size(format: u32) -> usize {
     match format {
         AFMT_U8 => 1,
@@ -179,6 +218,41 @@ pub fn set_audio_pending(f: AudioPending) {
     let _ = AUDIO_PENDING.set(f);
 }
 
+/// Capture from the player (the page's loopback, shims/kernel `audio.rs`):
+/// `(pos, buf, format, rate, channels)` -> bytes put in `buf` and the next
+/// position; `pos` `None` for a reader that has not read yet (it starts at
+/// the newest frame). `None` when there is no capture.
+pub type AudioCapture = fn(Option<u32>, &mut [u8], u32, u32, u32) -> Option<(usize, u32)>;
+
+static AUDIO_CAPTURE: std::sync::OnceLock<AudioCapture> = std::sync::OnceLock::new();
+
+/// Set the player's capture (once).
+pub fn set_audio_capture(f: AudioCapture) {
+    let _ = AUDIO_CAPTURE.set(f);
+}
+
+/// What the player behind the device says (`SNDCTL_DSP_GEX_INFO`):
+/// `(stream, ms)` -> playing (1/0), its rate, its latency in microseconds,
+/// its render quantum in frames, and the frames of `stream` it has read.
+pub type AudioInfo = fn(u32, u32) -> Option<[u32; 5]>;
+
+static AUDIO_INFO: std::sync::OnceLock<AudioInfo> = std::sync::OnceLock::new();
+
+/// Set the player's report (once).
+pub fn set_audio_info(f: AudioInfo) {
+    let _ = AUDIO_INFO.set(f);
+}
+
+/// A stream closed (its player may give its place to another at once).
+pub type AudioClose = fn(u32);
+
+static AUDIO_CLOSE: std::sync::OnceLock<AudioClose> = std::sync::OnceLock::new();
+
+/// Set the player's close (once).
+pub fn set_audio_close(f: AudioClose) {
+    let _ = AUDIO_CLOSE.set(f);
+}
+
 /// How often a writer waiting on a full buffer the player drains looks
 /// again: one render quantum of the page's AudioWorklet (128 frames).
 const PLAYER_QUANTUM_FRAMES: u64 = 128;
@@ -199,7 +273,18 @@ impl OssHandle {
         OssHandle {
             node,
             id: NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            stream: Mutex::new(Stream { format: AFMT_U8, rate: 8000, channels: 1, queued: 0, at: super::tmpfs::now_ns(), id: 0, played_by_player: false }),
+            stream: Mutex::new(Stream {
+                format: AFMT_U8,
+                rate: 8000,
+                channels: 1,
+                queued: 0,
+                at: super::tmpfs::now_ns(),
+                id: 0,
+                played_by_player: false,
+                fragsize: FRAGSIZE,
+                fragments: FRAGMENTS,
+                capture: None,
+            }),
         }
         .numbered()
     }
@@ -207,6 +292,23 @@ impl OssHandle {
     fn numbered(self) -> OssHandle {
         self.stream.lock().unwrap_or_else(|e| e.into_inner()).id = self.id;
         self
+    }
+}
+
+/// `SNDCTL_DSP_SETFRAGMENT`'s 0xMMMMSSSS as the device sets it: fragment
+/// size and count.
+fn frag_layout(v: u32) -> (u64, u64) {
+    let shift = (v & 0xffff).clamp(MIN_FRAG_SHIFT, MAX_FRAG_SHIFT);
+    let size = 1u64 << shift;
+    let count = ((v >> 16) as u64).clamp(2, MAX_FRAGMENTS).min(BUFSIZE / size).max(2);
+    (size, count)
+}
+
+impl OssHandle {
+    /// Output, and input when the host can loop the player back.
+    fn caps(&self) -> u32 {
+        let input = if AUDIO_CAPTURE.get().is_some() { PCM_CAP_INPUT | PCM_CAP_DUPLEX } else { 0 };
+        PCM_CAP_OUTPUT | PCM_CAP_TRIGGER | input
     }
 }
 
@@ -249,10 +351,41 @@ fn audioinfo() -> Vec<u8> {
     b
 }
 
+impl Drop for OssHandle {
+    fn drop(&mut self) {
+        if self.node == OssNode::Dsp {
+            if let Some(close) = AUDIO_CLOSE.get() {
+                close(self.id);
+            }
+        }
+    }
+}
+
+impl OssHandle {
+    /// Capture into `buf`: whole frames, what the player has looped back
+    /// since this open last read.
+    fn capture(&self, buf: &mut [u8]) -> Option<usize> {
+        let f = AUDIO_CAPTURE.get()?;
+        let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        let fb = s.frame_bytes() as usize;
+        let len = buf.len() - buf.len() % fb.max(1);
+        let (n, pos) = f(s.capture, &mut buf[..len], s.format, s.rate, s.channels)?;
+        s.capture = Some(pos);
+        Some(n)
+    }
+}
+
 impl FileHandle for OssHandle {
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
-        // No capture: a reader waits for nothing.
-        Err(Errno::EAGAIN)
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if self.node != OssNode::Dsp {
+            return Err(Errno::EINVAL);
+        }
+        // Capture is the player's loopback (the page's `?audioloop=1`);
+        // without one a reader waits for nothing.
+        match self.capture(buf) {
+            Some(n) if n > 0 => Ok(n as u64),
+            _ => Err(Errno::EAGAIN),
+        }
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
@@ -261,7 +394,7 @@ impl FileHandle for OssHandle {
         }
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
-        let room = BUFSIZE - s.queued.min(BUFSIZE);
+        let room = s.bufsize() - s.queued.min(s.bufsize());
         if room == 0 {
             return Err(Errno::EAGAIN);
         }
@@ -302,11 +435,18 @@ impl FileHandle for OssHandle {
     fn poll_writable(&self) -> bool {
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
-        s.queued < BUFSIZE
+        s.queued < s.bufsize()
     }
 
     fn poll_readable(&self) -> bool {
-        false
+        // Something looped back since the last read: asked with an empty
+        // buffer, it would be no bytes, so ask for one frame's worth.
+        let fb = self.stream.lock().unwrap_or_else(|e| e.into_inner()).frame_bytes() as usize;
+        let Some(f) = AUDIO_CAPTURE.get() else { return false };
+        let s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pos) = s.capture else { return false };
+        let mut probe = vec![0u8; fb.max(1)];
+        f(Some(pos), &mut probe, s.format, s.rate, s.channels).is_some_and(|(n, _)| n > 0)
     }
 
     /// A full buffer drains by the clock, which no notify reports: a writer
@@ -317,8 +457,12 @@ impl FileHandle for OssHandle {
         }
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         s.drain();
-        if s.queued < BUFSIZE {
-            // Room now: a writer is ready, and a reader never is.
+        if s.capture.is_some() && AUDIO_CAPTURE.get().is_some() {
+            // A reader of the loopback: looked at again each quantum.
+            return Some((PLAYER_QUANTUM_FRAMES * 1_000_000_000 / s.rate.max(1) as u64).max(1));
+        }
+        if s.queued < s.bufsize() {
+            // Room now: a writer is ready.
             return None;
         }
         if s.played_by_player {
@@ -381,25 +525,53 @@ impl FileHandle for OssHandle {
                 })
             }
             SNDCTL_DSP_GETFMTS => m.write_u32(arg, FORMATS).map(|_| 0),
-            SNDCTL_DSP_GETCAPS => m.write_u32(arg, PCM_CAP_OUTPUT | PCM_CAP_TRIGGER).map(|_| 0),
-            // The fragment layout is fixed; the request is answered as made.
-            SNDCTL_DSP_SETFRAGMENT => Ok(0),
+            SNDCTL_DSP_GETCAPS => m.write_u32(arg, self.caps()).map(|_| 0),
+            // 0xMMMMSSSS: up to MMMM fragments of 2^SSSS bytes, as OSS has
+            // it, clamped to what the device holds; answered with what was set.
+            SNDCTL_DSP_SETFRAGMENT => {
+                let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+                int(m, &mut |v| {
+                    s.drain();
+                    let (size, count) = frag_layout(v as u32);
+                    s.fragsize = size;
+                    s.fragments = count;
+                    ((count as i32) << 16) | size.trailing_zeros() as i32
+                })
+            }
             SNDCTL_DSP_GETOSPACE => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
                 s.drain();
-                let free = BUFSIZE - s.queued.min(BUFSIZE);
+                let free = s.bufsize() - s.queued.min(s.bufsize());
                 let mut b = [0u8; 16];
-                put_i32(&mut b, 0, (free / FRAGSIZE) as i32);
-                put_i32(&mut b, 4, FRAGMENTS as i32);
-                put_i32(&mut b, 8, FRAGSIZE as i32);
+                put_i32(&mut b, 0, (free / s.fragsize) as i32);
+                put_i32(&mut b, 4, s.fragments as i32);
+                put_i32(&mut b, 8, s.fragsize as i32);
                 put_i32(&mut b, 12, free as i32);
                 m.write(arg, &b).map(|_| 0)
             }
             SNDCTL_DSP_GETISPACE => {
+                let s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
                 let mut b = [0u8; 16];
-                put_i32(&mut b, 4, FRAGMENTS as i32);
-                put_i32(&mut b, 8, FRAGSIZE as i32);
+                put_i32(&mut b, 4, s.fragments as i32);
+                put_i32(&mut b, 8, s.fragsize as i32);
                 m.write(arg, &b).map(|_| 0)
+            }
+            // The player behind the device: playing, its rate (a stream at it
+            // is not resampled), its latency (us), its quantum (frames), and
+            // the frames of this stream it has played (a position that wraps;
+            // GETODELAY counts from it). Not a device with a player: ENOTTY.
+            SNDCTL_DSP_GEX_INFO => {
+                let now = (super::tmpfs::now_ns() / 1_000_000) as u32;
+                match AUDIO_INFO.get().and_then(|f| f(self.id, now)) {
+                    Some(v) => {
+                        let mut b = [0u8; 20];
+                        for (i, x) in v.iter().enumerate() {
+                            put_i32(&mut b, i * 4, *x as i32);
+                        }
+                        m.write(arg, &b).map(|_| 0)
+                    }
+                    None => Err(Errno::ENOTTY),
+                }
             }
             SNDCTL_DSP_GETODELAY => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,6 +581,7 @@ impl FileHandle for OssHandle {
             SNDCTL_DSP_RESET | SNDCTL_DSP_SYNC => {
                 let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
                 s.queued = 0;
+                s.capture = None;
                 s.at = super::tmpfs::now_ns();
                 Ok(0)
             }
@@ -528,6 +701,36 @@ mod tests {
         PLAYER.lock().unwrap().clear();
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(h.write_at(0, &vec![0u8; 1000]).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_program_sets_its_fragments() {
+        // wineoss's 2 x 512 bytes, honoured; then the buffer is that small.
+        assert_eq!(frag_layout(0x0002_0009), (512, 2));
+        // Too small a fragment, too few: the least the device takes.
+        assert_eq!(frag_layout(0x0001_0002), (16, 2));
+        // "As many as you like" of 16 KiB: two, the device's whole buffer.
+        assert_eq!(frag_layout(0x7fff_000e), (16384, 2));
+        let h = OssHandle::new(OssNode::Dsp);
+        {
+            let mut s = h.stream.lock().unwrap();
+            s.format = AFMT_S16_LE;
+            s.channels = 2;
+            (s.fragsize, s.fragments) = frag_layout(0x0002_0009);
+            s.at = u64::MAX;
+        }
+        assert_eq!(h.write_at(0, &vec![0u8; 4096]).unwrap(), 1024);
+        assert_eq!(h.write_at(0, &[0u8; 4]), Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn put_sample_is_sample_inverted() {
+        for f in [AFMT_U8, AFMT_S16_LE, AFMT_S24_PACKED, AFMT_S24_LE, AFMT_S32_LE, AFMT_F32_LE] {
+            let mut b = Vec::new();
+            put_sample(f, 0.5, &mut b);
+            assert_eq!(b.len(), sample_bytes(f));
+            assert!((sample(f, &b) - 0.5).abs() < 0.01, "{f:#x}");
+        }
     }
 
     #[test]

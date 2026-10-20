@@ -16,6 +16,13 @@
 #
 #   tests/browser-audio.sh
 #
+# tests/audio/dsp-impulse.c times an impulse's round trip through the device
+# and the stand-in player's loopback (GEX_AUDIO_LOOP=1, the page's
+# `?audioloop=1`), with the 256-frame buffer it asks for
+# (SNDCTL_DSP_SETFRAGMENT): under 20 ms, where the old fixed 32 KiB buffer
+# made it about 170 ms. tests/audio/dsp-mix.c plays two streams at once and
+# reads the loopback: mixed, RMS 0.25 (one stream alone would be 0.177).
+#
 # Needs gcc and the page's x86-64 shared build (`GEX_ARCH=x86 GEX_MEM64=1
 # shims/browser/build.sh`, or without GEX_MEM64; SEED= picks one). A missing piece is a
 # skip, not a pass. The single-thread (SP) flavour has no ring yet.
@@ -67,3 +74,29 @@ for speed in 4 0.5; do
         exit 1
     fi
 done
+imp="$WORK/dsp-impulse"
+gcc -O1 -static -o "$imp" tests/audio/dsp-impulse.c || exit 1
+env GEX_ARCH=x86 GEX_MEM64=$m64 GEX_SHARED=1 GEX_AUDIO_PLAYER=1 GEX_AUDIO_LOOP=1 timeout 120 node $jspi shims/browser/js/run-node.mjs "$SEED" "$imp" 9 2 \
+    </dev/null >"$WORK/imp" 2>"$WORK/imp.err"
+st=$?
+med=$(sed -n 's/^dsp-impulse rt ms [^ ]* \([^ ]*\) .*/\1/p' "$WORK/imp")
+if [ $st = 0 ] && [ -n "$med" ] && awk -v m="$med" 'BEGIN { exit !(m > 0 && m < 20) }'; then
+    echo "ok   dsp-impulse (page, 256-frame buffer): $(sed -n 's/^dsp-impulse //p' "$WORK/imp" | tr '\n' ';')"
+else
+    echo "FAIL dsp-impulse (page): exit $st, median ${med:-none} ms (want under 20)"
+    head -5 "$WORK/imp" "$WORK/imp.err"
+    exit 1
+fi
+mix="$WORK/dsp-mix"
+gcc -O1 -static -o "$mix" tests/audio/dsp-mix.c -lm || exit 1
+env GEX_ARCH=x86 GEX_MEM64=$m64 GEX_SHARED=1 GEX_AUDIO_PLAYER=1 GEX_AUDIO_LOOP=1 timeout 120 node $jspi shims/browser/js/run-node.mjs "$SEED" "$mix" \
+    </dev/null >"$WORK/mix" 2>"$WORK/mix.err"
+st=$?
+rms=$(sed -n 's/^dsp-mix rms \([^ ]*\).*/\1/p' "$WORK/mix")
+if [ $st = 0 ] && [ -n "$rms" ] && awk -v r="$rms" 'BEGIN { exit !(r > 0.23 && r < 0.27) }'; then
+    echo "ok   dsp-mix (page): two streams mixed, loopback RMS $rms"
+else
+    echo "FAIL dsp-mix (page): exit $st, RMS ${rms:-none} (want 0.25)"
+    head -5 "$WORK/mix" "$WORK/mix.err"
+    exit 1
+fi
