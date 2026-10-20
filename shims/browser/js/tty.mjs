@@ -39,6 +39,21 @@ export class PageTty {
    */
   static async open(spec) {
     if (!spec?.module || !spec?.memory) return null;
+    // In its own Worker when the kernel's memory is shared: the kernel's locks
+    // wait (`memory.atomic.wait32`), which the page's thread may not, so a key
+    // typed while a Worker held one -- a persist snapshot, a guest's syscall --
+    // threw "Atomics.wait cannot be called in this context" here. The
+    // single-thread build has nothing else in the kernel, and stays here.
+    if (!single.on && typeof Worker === 'function' && typeof SharedArrayBuffer !== 'undefined'
+        && spec.memory.buffer instanceof SharedArrayBuffer) {
+      return RemoteTty.open(spec);
+    }
+    return PageTty.openHere(spec);
+  }
+
+  /** `open`, on this thread: what the single-thread build and tty-worker.mjs use. */
+  static async openHere(spec) {
+    if (!spec?.module || !spec?.memory) return null;
     const mod = spec.module instanceof WebAssembly.Module
       ? spec.module
       : await WebAssembly.compile(spec.module);
@@ -132,6 +147,15 @@ export class PageTty {
     return queued;
   }
 
+  /**
+   * A keystroke as the page's terminal takes it: `input`, then the echo to
+   * show (null for none) and what `ready` says after it, in one call.
+   */
+  key(data) {
+    const echo = this.input(data) ? this.drainEcho() : null;
+    return { echo, ready: this.ready() };
+  }
+
   /** What the terminal should display, as bytes. Empty when there is none. */
   drainEcho() {
     const out = [];
@@ -206,4 +230,64 @@ export class PageTty {
     poke();
     return r;
   }
+}
+
+/**
+ * `PageTty` in a Worker of its own (tty-worker.mjs), for a page whose kernel
+ * memory is shared. Every method answers a promise, in the order called (the
+ * Worker takes them one at a time), with what `PageTty`'s returns.
+ */
+class RemoteTty {
+  #w;
+  #id = 0;
+  #waiting = new Map();
+
+  static async open(spec) {
+    const w = new Worker(new URL('./tty-worker.mjs', import.meta.url), { type: 'module' });
+    const t = new RemoteTty(w);
+    const ok = await t.#call('open', { module: spec.module, memory: spec.memory }).catch((e) => {
+      console.warn(`[gex] no shared terminal: ${e?.message ?? e}`);
+      return false;
+    });
+    if (!ok) {
+      w.terminate();
+      return null;
+    }
+    return t;
+  }
+
+  constructor(w) {
+    this.#w = w;
+    w.onmessage = (e) => {
+      const { id, value, error } = e.data;
+      const p = this.#waiting.get(id);
+      this.#waiting.delete(id);
+      if (error !== undefined) p?.reject(new Error(error));
+      else p?.resolve(value);
+    };
+    w.onerror = (e) => {
+      for (const p of this.#waiting.values()) p.reject(new Error(e.message || 'the terminal Worker failed'));
+      this.#waiting.clear();
+    };
+  }
+
+  #call(op, ...args) {
+    const id = ++this.#id;
+    return new Promise((resolve, reject) => {
+      this.#waiting.set(id, { resolve, reject });
+      this.#w.postMessage({ id, op, args });
+    });
+  }
+
+  key(data) { return this.#call('key', data); }
+  input(data) { return this.#call('input', data); }
+  drainEcho() { return this.#call('drainEcho'); }
+  ready() { return this.#call('ready'); }
+  eof() { return this.#call('eof'); }
+  lflag() { return this.#call('lflag'); }
+  winsize() { return this.#call('winsize'); }
+  resize(rows, cols) { return this.#call('resize', rows, cols); }
+  fg() { return this.#call('fg'); }
+  signal(signo) { return this.#call('signal', signo); }
+  close() { this.#w.terminate(); }
 }
