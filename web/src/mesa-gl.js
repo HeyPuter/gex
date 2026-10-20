@@ -278,6 +278,8 @@ export class MesaGlDevice {
   #busy = false;
   /** Clients that exited while a submit was suspended: forgotten after it. */
   #forgetLater = [];
+  /** Window canvases named or dropped while a submit was suspended. */
+  #canvasLater = [];
   #lastPresented = 0;
   #lastProduced = 0;
   static #reported = false;
@@ -661,6 +663,21 @@ export class MesaGlDevice {
     return out;
   }
 
+  /** Surface `frame` (see `surfaces`) has a canvas of its own in the
+   * document, with the id `gex-gl-<frame>`, or (`on` false) no longer has.
+   * The renderer presents that surface there from now on, its last frame
+   * included, instead of into the shared canvas. */
+  surfaceCanvas(frame, on) {
+    const m = this.#module;
+    if (!m?._gex_gl_surface_canvas || !frame) return;
+    // Not mid-submit, for the reason `display` gives.
+    if (this.#busy) {
+      this.#canvasLater.push([frame >>> 0, on ? 1 : 0]);
+      return;
+    }
+    m._gex_gl_surface_canvas(frame >>> 0, on ? 1 : 0);
+  }
+
   /** Bumped whenever a window is attached or goes away. */
   surfaceGeneration() {
     return this.#module?._gex_gl_surface_generation?.() ?? 0;
@@ -691,6 +708,7 @@ export class MesaGlDevice {
     this.#busy = false;
     const later = this.#forgetLater.splice(0);
     for (const client of later) this.forgetClient(client);
+    for (const [frame, on] of this.#canvasLater.splice(0)) this.surfaceCanvas(frame, on);
   }
 
   /** Present whatever the guest last drew. */
