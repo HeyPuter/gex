@@ -7449,7 +7449,9 @@ export class Gex {
   async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false, dense = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
+    const P = [performance.now()];
     this.#reapDead();
+    P.push(performance.now());
     const tg = performance.now();
     const tables = this.#growTables(need, 'install');
     this.#growMs += performance.now() - tg;
@@ -7545,8 +7547,11 @@ export class Gex {
     // is one running total that cannot say which tables absolute segments fall
     // in; the segments (or `Metadata` for an already-compiled module) can, which
     // avoids the strict-grow retry below.
+    P.push(performance.now());
     const own = meta ?? (bytes instanceof Uint8Array ? metadataSection(bytes) : null);
+    P.push(performance.now());
     const seg = elementTableNeeds(bytes);
+    P.push(performance.now());
     const needs = seg.length ? seg : own ? metaTableNeeds(own) : [];
     for (let t = 0; t < needs.length; t++) if (needs[t]) this.#reach(t, needs[t]);
     let inst;
@@ -7628,6 +7633,8 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
+    P.push(performance.now());
+    this.#installSplit = P;
     // The instance, so the caller can remember which library it belongs to.
     return inst;
   }
@@ -8083,6 +8090,7 @@ export class Gex {
     const bytes = this.#registryBytes(i);
     if (!bytes) return;
     const t0 = performance.now();
+    const c0 = this.#compileMs, i0 = this.#instantiateMs, g0 = this.#growMs;
     const key = this.#registryKey(i, bytes);
     const cached = key ? this.#sharedModules.get(key) : undefined;
     this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
@@ -8100,10 +8108,22 @@ export class Gex {
     if (ms > this.#denseFillWorst) {
       this.#denseFillWorst = ms;
       if (globalThis.GEX_FILL_TIME && ms >= 1) {
-        console.warn(`[gex] ${this.#whoFills()}: dense module ${i} took ${ms.toFixed(2)} ms, the longest here; ` +
+        console.warn(`[gex] ${this.#whoFills()}: dense module ${i} (${bytes.length} bytes${cached ? ', compiled elsewhere' : ''}) took ${ms.toFixed(2)} ms, ` +
+          `${(this.#compileMs - c0).toFixed(1)} compiling, ${(this.#instantiateMs - i0).toFixed(1)} instantiating, ${(this.#growMs - g0).toFixed(1)} growing (${this.#splitText()}), the longest here; ` +
           `${this.#fillCounts()}, ${this.#denseFillMs.toFixed(1)} ms filling`);
       }
     }
+  }
+
+  /** The last install's times (`#installModuleInner`): its start, then the
+   *  end of reaping, of growing and compiling, of reading its metadata, of
+   *  reading its segments, and of instantiating and filling. */
+  #installSplit = null;
+  #splitText() {
+    const P = this.#installSplit;
+    if (!P || P.length < 6) return '';
+    const d = (k) => (P[k] - P[k - 1]).toFixed(1);
+    return `reap ${d(1)}, grow+compile ${d(2)}, meta ${d(3)}, segments ${d(4)}, instantiate+fill ${d(5)}`;
   }
 
   /** Dense modules a miss instantiated here, and the misses that asked. */
