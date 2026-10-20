@@ -430,6 +430,11 @@ static void too_big(uint32_t opcode, size_t len) {
             opcode, len, ring ? ring->capacity : 0u);
 }
 
+/* 1: a publish is pending (persistent_publish); 2: it covers non-coherent
+   mappings too. */
+static unsigned persistent_pending;
+static void persistent_settle(void);
+
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
@@ -437,6 +442,10 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
     if (!ring && ring_open() != 0) {
         return NULL;
     }
+    /* A publish asked for is done before the next command that could read
+       a buffer: neither a present nor a finish can. */
+    if (persistent_pending && opcode != GEXGL_PRESENT && opcode != GEXGL_FINISH)
+        persistent_settle();
     if (tail_bytes > SIZE_MAX - 3u || arg_words > (SIZE_MAX - 8u) / 4u)
         return NULL;
     size_t padded = (tail_bytes + 3u) & ~3u;
@@ -600,16 +609,18 @@ void glPixelStorei(unsigned p, int v) {
     CMD2(GEXGL_PIXEL_STOREI, p, v);
 }
 
-static void persistent_publish(int all);
+/* Where persistent_publish was called from, for GEXGL_PERSIST_TRACE. */
+enum { PUBLISH_FLUSH, PUBLISH_FINISH, PUBLISH_FENCE, PUBLISH_SWAP, PUBLISH_BARRIER, PUBLISH_WHY };
+static void persistent_publish(int all, int why);
 
 void glFinish(void) {
-    persistent_publish(0);
+    persistent_publish(0, PUBLISH_FINISH);
     CMD0(GEXGL_FINISH);
     flush();
     (void)reply_u32();
 }
 
-void glFlush(void) { persistent_publish(0); flush(); }
+void glFlush(void) { persistent_publish(0, PUBLISH_FLUSH); flush(); }
 
 void glGenBuffers(int n, unsigned *out) {
     /* A negative count has to reach the host so GL can answer
@@ -861,25 +872,40 @@ static int buffer_read(unsigned target, long offset, long size, void *data);
 /* Mapped host memory cannot be exposed to an emulated guest address space.
    Return a guest shadow allocation and upload its written bytes at unmap.
    This is the same coherency boundary a remote/virtual GL driver uses. */
-/* persistent_publish's blocks and their hash: 64 bits a 4 KiB block, eight
-   bytes at a time (a multiply-xorshift mix, one multiply a word; the tail of
-   a short last block byte by byte). A collision would leave a change unsent:
-   at 2^-64 a compare, it is not the risk worth a copy's memory. */
+/* persistent_publish's blocks and their hash: 64 bits a 4 KiB block. Each
+   8-byte word goes through a multiply-xorshift mix on one of four lanes in
+   turn, so four multiplies are in flight rather than one chain of 512: on
+   worldmachine (V8, wasm32) a 64 MiB mapping takes 6.0-6.5 ms to hash where
+   one lane took 12.8-13.0 ms and a memcmp against a full copy 9.7-10.3 ms;
+   just reading it takes 5.3-5.4 ms. The lanes are folded with the same mix,
+   and the tail of a short last block goes byte by byte. A collision would
+   leave a change unsent: at 2^-64 a compare, it is not the risk worth a
+   copy's memory. */
 #define PERSIST_BLOCK 4096u
+#define PERSIST_MIX(h, w) do { (h) = ((h) ^ (w)) * 0xFF51AFD7ED558CCDull; (h) ^= (h) >> 32; } while (0)
 static size_t persistent_blocks(size_t n) { return (n + PERSIST_BLOCK - 1) / PERSIST_BLOCK + !n; }
 static uint64_t persistent_block_hash(const struct buffer_object_state *o, size_t b) {
     const uint8_t *p = (const uint8_t *)o->map + b * PERSIST_BLOCK;
     size_t n = o->map_length - b * PERSIST_BLOCK;
     if (n > PERSIST_BLOCK) n = PERSIST_BLOCK;
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, w;
+    uint64_t l0 = 0x9E3779B97F4A7C15ull ^ n, l1 = 0x3C6EF372FE94F82Aull, l2 = 0xDAA66D2C7DDF743Full,
+             l3 = 0x78DDE6E5FD29F054ull, w0, w1, w2, w3;
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        memcpy(&w, p + i, 8);
-        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
-        h ^= h >> 32;
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&w0, p + i, 8);
+        memcpy(&w1, p + i + 8, 8);
+        memcpy(&w2, p + i + 16, 8);
+        memcpy(&w3, p + i + 24, 8);
+        PERSIST_MIX(l0, w0);
+        PERSIST_MIX(l1, w1);
+        PERSIST_MIX(l2, w2);
+        PERSIST_MIX(l3, w3);
     }
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
-    return h ^ (h >> 29);
+    PERSIST_MIX(l0, l1);
+    PERSIST_MIX(l0, l2);
+    PERSIST_MIX(l0, l3);
+    for (; i < n; i++) l0 = (l0 ^ p[i]) * 0x100000001B3ull;
+    return l0 ^ (l0 >> 29);
 }
 
 void *glMapBufferRange(unsigned target, long offset, long length,
@@ -943,24 +969,70 @@ void *glMapBufferRange(unsigned target, long offset, long length,
    Each mapping's 4 KiB blocks are hashed and compared against `sent` and the changed
    runs are uploaded, by name through GL_COPY_WRITE_BUFFER (no draw reads that
    binding). Only blocks the application changed go, so a GPU write elsewhere
-   in the buffer is not sent back over. Called where GL makes such writes
+   in the buffer is not sent back over. Asked for where GL makes such writes
    visible -- glFlush, glFinish, glFenceSync, a swap, and glMemoryBarrier
    (with GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT, `all`: non-coherent mappings
    too) -- and not at every draw, which a 64 MiB comparison per draw cannot
-   afford: a coherent write is seen from the next of those points on. */
+   afford: a coherent write is seen from the next of those points on.
+
+   Asked for, and done at the next command that could read a buffer (begin),
+   or at an unmap: what the host has of a buffer matters only to commands
+   that come after the point, so until one is recorded the scan can wait.
+   Points with nothing between them are then one scan, not one each. wined3d
+   ends every frame with a swap and a glFenceSync straight after it, which
+   was two 64 MiB scans a frame (Solitaire, GEXGL_PERSIST_TRACE) and is now
+   one. */
 static void persistent_send(struct buffer_object_state *o, size_t start, size_t end) {
     glBindBuffer(0x8F37u, o->name);
     glBufferSubData(0x8F37u, (long)(o->map_offset + start), (long)(end - start), (const uint8_t *)o->map + start);
 }
 
-static void persistent_publish(int all) {
+/* GEXGL_PERSIST_TRACE (debug, off by default): the publishes asked for
+   while there was a mapping to look at, by caller, the scans they came to,
+   and the bytes hashed and sent -- said at the 1st, 2nd, 4th, ... 512th
+   scan and then every 1000th. */
+static int persist_trace = -1;
+static unsigned long long persist_calls[PUBLISH_WHY], persist_scans, persist_hashed, persist_sent;
+
+static int persistent_tracing(void) {
+    if (persist_trace < 0) persist_trace = getenv("GEXGL_PERSIST_TRACE") != NULL;
+    return persist_trace;
+}
+
+static void persistent_trace(size_t hashed, size_t sent) {
+    persist_scans++;
+    persist_hashed += hashed;
+    persist_sent += sent;
+    unsigned long long n = persist_scans;
+    if (n & (n - 1) && (n < 1000u || n % 1000u)) return;
+    fprintf(stderr, "gexgl: %llu persistent publishes (flush %llu, finish %llu, fence %llu, swap %llu,"
+                    " barrier %llu), %llu scans: %llu MiB hashed, %llu KiB sent\n",
+            persist_calls[PUBLISH_FLUSH] + persist_calls[PUBLISH_FINISH] + persist_calls[PUBLISH_FENCE] +
+                persist_calls[PUBLISH_SWAP] + persist_calls[PUBLISH_BARRIER],
+            persist_calls[PUBLISH_FLUSH], persist_calls[PUBLISH_FINISH], persist_calls[PUBLISH_FENCE],
+            persist_calls[PUBLISH_SWAP], persist_calls[PUBLISH_BARRIER], n, persist_hashed >> 20,
+            persist_sent >> 10);
+}
+
+static void persistent_publish(int all, int why) {
     if (!persistent_live) return;
+    persistent_pending |= 1u | (all ? 2u : 0u);
+    if (persistent_tracing()) persist_calls[why]++;
+}
+
+static void persistent_settle(void) {
+    unsigned pending = persistent_pending;
+    persistent_pending = 0; /* before anything below records a command */
+    if (!(pending & 1u) || !persistent_live) return;
+    const int all = (pending & 2u) != 0;
     const size_t block = PERSIST_BLOCK, most = 4u << 20;
+    size_t hashed = 0, sent = 0;
     unsigned was = bound_buffer(0x8F37u); /* GL_COPY_WRITE_BUFFER */
     int bound = 0;
     for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
         if (!o->sent || !o->map || (!all && !(o->map_access & 0x80u))) continue;
         size_t n = o->map_length, start = SIZE_MAX;
+        hashed += n;
         for (size_t at = 0; at < n; at += block) {
             size_t len = n - at < block ? n - at : block;
             uint64_t h = persistent_block_hash(o, at / block);
@@ -969,18 +1041,21 @@ static void persistent_publish(int all) {
             if (changed && start == SIZE_MAX) start = at;
             if (start != SIZE_MAX && (!changed || at + len - start >= most)) {
                 persistent_send(o, start, changed ? at + len : at);
+                sent += (changed ? at + len : at) - start;
                 bound = 1;
                 start = SIZE_MAX;
             }
         }
-        if (start != SIZE_MAX) { persistent_send(o, start, n); bound = 1; }
+        if (start != SIZE_MAX) { persistent_send(o, start, n); sent += n - start; bound = 1; }
     }
     if (bound) glBindBuffer(0x8F37u, was);
+    if (persistent_tracing()) persistent_trace(hashed, sent);
 }
 
 /* glMemoryBarrier's (gl44-generated.inc, via tools/gl_buffer_writers.py). */
 static void persistent_barrier(unsigned barriers) {
-    persistent_publish((barriers & 0x00004000u) != 0); /* CLIENT_MAPPED_BUFFER_BARRIER_BIT */
+    persistent_publish((barriers & 0x00004000u) != 0, /* CLIENT_MAPPED_BUFFER_BARRIER_BIT */
+                       PUBLISH_BARRIER);
 }
 
 void *glMapBuffer(unsigned target, unsigned access) {
@@ -1014,6 +1089,8 @@ static void upload_changed(unsigned target, struct buffer_object_state *object) 
 unsigned char glUnmapBuffer(unsigned target) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map) return 0;
+    /* What a publish asked for before the unmap would have sent. */
+    if (object->sent && persistent_pending) persistent_settle();
     /* With GL_MAP_FLUSH_EXPLICIT_BIT the application said which ranges it
        wrote (glFlushMappedBufferRange, already uploaded); uploading the
        whole shadow would overwrite the rest of the range with zeros --
@@ -2790,7 +2867,7 @@ void *glFenceSync(unsigned condition, unsigned flags) {
         gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
         return NULL;
     }
-    persistent_publish(0);
+    persistent_publish(0, PUBLISH_FENCE);
     uintptr_t serial = atomic_fetch_add_explicit(&sync_next, 1, memory_order_relaxed);
     size_t start = serial % SYNC_SLOTS;
     uintptr_t generation = serial / SYNC_SLOTS + 1;
@@ -3990,7 +4067,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     gexgl_wl_follow_size(s);
     gexgl_x11_follow_size(s);
     gexgl_wl_commit(s);
-    persistent_publish(0);
+    persistent_publish(0, PUBLISH_SWAP);
     CMD0(GEXGL_PRESENT);
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */
