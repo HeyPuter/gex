@@ -1858,12 +1858,14 @@ mod lazy_tests {
     /// included), or a time set: what a page's persist store snapshots.
     #[test]
     fn written_lists_what_the_program_changed() {
-        set_lazy_fetch(counting);
+        // The module's one fetcher (the first set wins, and the tests run in
+        // parallel), and a URL it serves.
+        set_lazy_fetch(fake);
         let fs = TmpFs::new();
         for f in ["a/kept", "a/wrote", "a/cut", "a/moved", "a/timed", "d/in"] {
             fs.add_file(f, b"seed".to_vec());
         }
-        fs.add_lazy("/a/lazy", 5, "/l");
+        fs.add_lazy("/a/lazy", 5, "/data/f");
         assert!(fs.written().is_empty());
         let mut buf = [0u8; 4];
         fs.open("a/kept", oflags::O_RDONLY, 0).unwrap().read_at(0, &mut buf).unwrap();
