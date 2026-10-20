@@ -704,7 +704,8 @@ async function runProgramHere(
     // (handed to `onSystem`) is called -- a desktop whose first windows
     // draw no GL does not download it.
     glLazy = false,
-    // Where the page compositor's Mesa comes from (DomDesktop only): `(name)
+    // Where the page compositor's Mesa comes from (DomDesktop and the scene
+    // compositor, whose worker gets the bytes): `(name)
     // => Promise<Uint8Array|null>` for 'gex-wgpu-replay.js', '.wasm' and
     // '.deferred.wasm', null for "fetch it as a file". app.js answers from
     // the site's packed files and the page's cache (mesa-gl.js `source`).
@@ -857,6 +858,7 @@ async function runProgramHere(
           api: 'core',
           backend: glBackend,
           canvasBlit: pageParams().get('glcanvas') === '1',
+          source: glSource,
         };
         // `glLazy`: Mesa (about 20 MB before compression) is fetched when
         // the embedder first asks (`onSystem`'s `startGl`), not at boot.
