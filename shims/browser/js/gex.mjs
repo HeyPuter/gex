@@ -956,6 +956,8 @@ export class Gex {
   #kernel = null;
   // This Worker's shim stack, claimed on the way in. See `#workerStack`.
   #stackTop = null;
+  /** The slot went back (`releaseWorker`): nothing may call in again. */
+  #released = false;
   /** This instance is a forked child's first: its slot bits are its parent's. */
   #forkChild = false;
   /** A forked child's inherited regions' ends, for its first arena claim. */
@@ -1296,6 +1298,16 @@ export class Gex {
 
   releaseWorker() {
     if (this.#stackTop === null) return;
+    // The census first: its timer calls into this instance every 3 s
+    // (gex_alloc, gex_wait_census) and only `close` stopped it, so an exited
+    // thread's Worker, alive until the host ends it, could tick on the stack
+    // and thread-locals the slot's next holder -- the process's next thread --
+    // already runs on. Pairs with the slot claim in `gex_worker_init`.
+    if (this.#census) {
+      clearInterval(this.#census);
+      this.#census = null;
+    }
+    this.#released = true;
     try { this.#shim?.exports?.gex_worker_release?.(); } catch {}
     this.#stackTop = null;
   }
@@ -2570,6 +2582,8 @@ export class Gex {
     if (!e?.gex_wait_census) return;
     let last = '';
     this.#census = setInterval(() => {
+      // Never after the slot went back (`releaseWorker`).
+      if (this.#released) return;
       const p = e.gex_alloc(512) >>> 0;
       const n = e.gex_wait_census(p, 512) >>> 0;
       if (n) {
