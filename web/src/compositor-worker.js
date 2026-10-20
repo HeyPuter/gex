@@ -1837,6 +1837,8 @@ async function startGl(m, canvas) {
     wgslCache: m.wgslCache,
     wgpuStats: m.wgpuStats,
     glTrace: m.glTrace,
+    // The page's packed, cached copies (compositor.js `hostGl`).
+    ...(m.sources ? { source: (name) => m.sources[name] ?? null } : {}),
     gpu: await requestGexDevice(),
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');

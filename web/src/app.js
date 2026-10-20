@@ -415,20 +415,31 @@ async function begin(opts, base, at, state, meter) {
   mark('fetching');
   const zstd = zstdLoader(at(b.zstd ?? 'vendor/zstddec-stream.mjs'));
   const pack = b.pack ? fetchJson(at(b.pack)).catch(() => ({})) : Promise.resolve({});
-  // The lazy files' list, beside the bundle rather than after it.
-  const lazyList = b.lazy ? fetchJson(at(b.lazy), 'the lazy files\' list') : null;
+  const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore(), files: fileStore() };
+  // The lazy files' list, beside the bundle rather than after it. Packed
+  // (pack.json names it, with its bytes' hash) it comes compressed and is
+  // kept in the page's cache like the bundle: FL's is 5.8 MB of JSON, which
+  // a visit fetched again whenever the HTTP cache did not keep it.
+  const lazyList = b.lazy ? (async () => {
+    const href = at(b.lazy);
+    if (!(await packedEntry(href, fetcher))?.h) return fetchJson(href, 'the lazy files\' list');
+    const bytes = await fetchShared(href, fetcher);
+    return JSON.parse(new TextDecoder().decode(bytes));
+  })() : null;
   lazyList?.catch(() => {});
   // The background fill's list (eject-site.mjs --late): lazy files the page
   // downloads once the boot's files are in, while the guest runs.
   const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
-  const fetcher = { pack, zstd, base, state, meter, pieces: pieceStore(), files: fileStore() };
   // The page compositor's Mesa, packed and kept (`mesaSource`); fetched in
   // the background once the boot's and the fill's downloads are done.
   // Not before the start-up is over (\`ready\`) and the boot's downloads,
   // the fill's included, are done, and then after a pause: the program's
   // first seconds after its first frame (the shell's taskbar, its tray)
   // still read lazy files, which the download would share the link with.
-  const mesa = gl && !compositor ? mesaSource(fetcher, at) : null;
+  // The scene compositor's Mesa too: compositor.js resolves the source on
+  // the page and hands its bytes to the compositor's worker (FL: 20 MB of
+  // Mesa fetched afresh on every visit, unpacked, before this).
+  const mesa = gl ? mesaSource(fetcher, at) : null;
   const mesaWait = { ready: false, fetched: false, started: false };
   const prefetchMesa = (why) => {
     mesaWait[why] = true;
@@ -452,9 +463,9 @@ async function begin(opts, base, at, state, meter) {
       d.files++;
       d.total += (await packedEntry(href, fetcher))?.zsize ?? 0;
     }
-    // The runtime's modules, the ones the site packed (the rest load as
-    // they always did, outside these counts).
-    for (const href of Object.values(runtimeUrls())) {
+    // The runtime's modules and the lazy files' list, the ones the site
+    // packed (the rest load as they always did, outside these counts).
+    for (const href of [...Object.values(runtimeUrls()), ...(b.lazy ? [at(b.lazy)] : [])]) {
       const e = await packedEntry(href, fetcher);
       if (e) { d.files++; d.total += e.zsize ?? 0; }
     }

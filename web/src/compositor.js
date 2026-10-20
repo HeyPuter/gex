@@ -61,7 +61,18 @@ export class Compositor {
    * Not on the page: the frames have to be textures in the context that draws
    * the scene, or a GL window costs a readback and an upload every frame. The
    * ring is the same shared one the page-side device would have served. */
-  hostGl(channel, opts = {}) {
+  async hostGl(channel, opts = {}) {
+    // `opts.source` (runtime.js `glSource`): Mesa's files from the site's
+    // pack and the page's cache, read here (a function does not cross to the
+    // worker) and handed over as bytes; a file it has not is fetched there.
+    const { source, ...rest } = opts;
+    let sources = null;
+    if (typeof source === 'function') {
+      const names = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'];
+      const got = await Promise.all(names.map((n) => Promise.resolve().then(() => source(n)).catch(() => null)));
+      if (got.every(Boolean)) sources = Object.fromEntries(names.map((n, i) => [n, got[i]]));
+    }
+    opts = sources ? { ...rest, sources } : rest;
     return new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {
         if (m.kind !== 'gl-ready' && m.kind !== 'gl-failed') return;
