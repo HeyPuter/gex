@@ -3325,10 +3325,10 @@ export class Gex {
    */
   async adoptThread(shimWasm, guestWasm, thread) {
     this.#threaded();
+    this.#threadTid = thread.tid;
     await this.attach(shimWasm, guestWasm, { devices: false });
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
-    this.#threadTid = thread.tid;
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     // Gone before its Worker came up: the process exec'd (the other threads go
     // with the old program) or ended. Nothing to run, and nothing wrong.
