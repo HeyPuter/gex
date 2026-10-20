@@ -292,6 +292,11 @@ pub fn loop_heads<'b>(blocks: impl Iterator<Item = &'b Block>) -> std::collectio
 }
 
 /// The region grown at `block`, if any (and regions are on).
+/// The region `block` would head, if any (diagnostics: t1sweep).
+pub fn region_members(block: &Block, cx: &Context<'_>) -> Option<Vec<u64>> {
+    region_at(block, cx)
+}
+
 fn region_at(block: &Block, cx: &Context<'_>) -> Option<crate::region::Region> {
     if region_limit() <= 1 || cx.loop_heads.is_some_and(|h| !h.contains(&block.start)) {
         return None;
