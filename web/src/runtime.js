@@ -266,21 +266,22 @@ class TerminalEnv extends Env {
     if (this.closed) return;
     if (this.tty) {
       // Straight into the discipline; what comes back as echo is what a terminal
-      // shows, and nothing when the program has taken echo over.
-      if (this.tty.input(data)) {
-        const echo = this.tty.drainEcho();
+      // shows, and nothing when the program has taken echo over. An answer
+      // later, from the terminal's Worker (tty.mjs `RemoteTty`), or now from
+      // the single-thread build's: chained, so keys stay in the order typed.
+      this.keys = (this.keys ?? Promise.resolve()).then(async () => {
+        const { echo, ready } = await this.tty.key(data);
         if (echo) this.term.write(echo);
-      }
-      // A guest already parked waiting for input is woken inside the kernel;
-      // one that gave the stack back to JavaScript is waiting on this.
-      const ready = this.tty.ready();
-      if (ready !== 0 && this.waiter) {
-        const w = this.waiter;
-        this.waiter = null;
-        // `true` rather than the bytes: they are already in the guest's read
-        // queue, and handing them over here would deliver them twice.
-        w(ready < 0 ? false : true);
-      }
+        // A guest already parked waiting for input is woken inside the kernel;
+        // one that gave the stack back to JavaScript is waiting on this.
+        if (ready !== 0 && this.waiter) {
+          const w = this.waiter;
+          this.waiter = null;
+          // `true` rather than the bytes: they are already in the guest's read
+          // queue, and handing them over here would deliver them twice.
+          w(ready < 0 ? false : true);
+        }
+      }).catch((e) => console.warn(`[gex] terminal: ${e?.message ?? e}`));
       return;
     }
     if (this.#raw()) {
@@ -344,7 +345,10 @@ class TerminalEnv extends Env {
    */
   async readStdin() {
     if (this.tty) {
-      const ready = this.tty.ready();
+      // Asked of the terminal's Worker, which answers in the order asked: a
+      // key sent before this is counted in it, and one sent after finds the
+      // waiter set below (its answer comes in a later task than this one).
+      const ready = await this.tty.ready();
       if (ready < 0) return false;
       if (ready > 0) return true;
       return new Promise((resolve) => {
@@ -1243,7 +1247,8 @@ async function runProgramHere(
   // A resize is `SIGWINCH` to the foreground group and one write to the shared
   // terminal, not a message to each process.
   const resize = term.onResize(({ rows, cols }) => {
-    if (sharedTty) sharedTty.resize(rows, cols);
+    // A promise from the terminal's Worker; nothing to wait for.
+    if (sharedTty) Promise.resolve(sharedTty.resize(rows, cols)).catch(() => {});
     else host.resize(rows, cols);
   });
   onSystem?.({ host, kernel, tty: sharedTty, compositor, startGl });

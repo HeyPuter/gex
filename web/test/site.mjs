@@ -795,8 +795,9 @@ async function typeInto(port, text) {
   // say the shell is not reading; none and no echo say the keys never came.
   await new Promise((r) => setTimeout(r, 3000));
   const tty = await b.send('Runtime.evaluate', {
-    expression: `(() => { const t = globalThis.gexTty; return t ? 'tty ready=' + t.ready() + ' lflag=0x' + t.lflag().toString(16) : 'no shared tty'; })()`,
+    expression: `(async () => { const t = globalThis.gexTty; return t ? 'tty ready=' + (await t.ready()) + ' lflag=0x' + (await t.lflag()).toString(16) : 'no shared tty'; })()`,
     returnByValue: true,
+    awaitPromise: true,
   }, sessionId);
   b.close();
   return `${focus.result?.value}; ${tty.result?.value}`;
