@@ -1085,6 +1085,18 @@ async function handle(msg) {
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    // TEST (GEX_DEBUG_PANIC, tests/browser-panic.sh): the shim panics on purpose.
+    if (msg.debugPanic) {
+      try {
+        ex.gex_debug_panic?.(msg.debugPanic);
+      } catch (e) {
+        const again = ex.gex_panic_reporting?.()
+          ? '; it panicked again inside the panic report, whose message is lost (the first is above)'
+          : '';
+        console.error(`gex: the shim trapped in gex_debug_panic (${e.message})${again}`);
+        throw e;
+      }
+    }
     if (msg.spGuard) ex.gex_set_sp_guard?.(1);
     if (msg.trapPc) ex.gex_set_trap_pc?.(BigInt(msg.trapPc));
     if (msg.pregrow) ex.gex_set_pregrow?.(1);
