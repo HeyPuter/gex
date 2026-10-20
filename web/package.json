@@ -9,7 +9,7 @@
     "assets": "./build-assets.sh"
   },
   "keywords": [],
-  "author": "",
+  "author": "Puter Technologies Inc.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "devDependencies": {
