@@ -1583,6 +1583,22 @@ class Compositor {
   }
 
   key(code, pressed, mods, time) {
+    // No window has the keyboard: a placed window's client never said it is
+    // active (Momodora's Wine window, placed, never activated, so every key
+    // was dropped). The topmost toplevel gets it, as gexc's native
+    // compositor does (shims/native/src/wayland.rs, route). Only when no
+    // window has it (a focused window keeps it), and only to a toplevel that
+    // is mapped (has committed a buffer) and on the output: not a minimized
+    // Win32 window parked at -32000,-32000.
+    if (!this.#focus && pressed) {
+      const shown = (w) => w?.role === ROLE_TOPLEVEL && (w.info?.serial ?? 0) > 0 && w.width > 0 && w.height > 0
+        && w.x < this.#outW && w.y < this.#outH && w.x + w.width > 0 && w.y + w.height > 0;
+      const top = [...this.#order].reverse().find((o) => shown(this.#windows.get(o)));
+      if (top) {
+        this.#note(`no window has the keyboard; it goes to the top one, ${top}`);
+        this.#focusWindow(top);
+      }
+    }
     const win = this.#focus ? this.#windows.get(this.#focus) : null;
     if (!win) return;
     sendEvent(this.#channel, win.block, EV_MODS, mods, 0, 0, 0, win.client, 0);
